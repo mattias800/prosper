@@ -372,12 +372,24 @@ std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
          << rate.window_seconds
          << ",\"published_frames\":" << rate.published
          << ",\"distinct_frames\":" << rate.distinct
+         // THE HEADLINE: the reciprocal of the median interval between distinct frames, and the
+         // share of the window spent producing at roughly that rate. `typical_fps_measured` false
+         // means fewer than two distinct frames arrived, so `typical_fps` is absent rather than
+         // zero -- a consumer must render it as "--" and never as a rate.
+         << ",\"typical_fps_measured\":" << (rate.typical_measured ? "true" : "false")
+         << ",\"typical_fps\":" << std::fixed << std::setprecision(3) << rate.typical_fps
+         << ",\"typical_interval_seconds\":" << std::fixed << std::setprecision(6)
+         << rate.typical_interval_seconds
+         << ",\"interval_samples\":" << rate.interval_samples
+         << ",\"active_fraction\":" << std::fixed << std::setprecision(4) << rate.active_fraction
+         // Wall-clock averages over the whole window. True, and a poor summary of any route that
+         // pauses -- see gpu/present/present_frame_rate.hpp.
          << ",\"distinct_fps\":" << std::fixed << std::setprecision(3) << rate.distinct_fps
          << ",\"presented_fps\":" << std::fixed << std::setprecision(3) << rate.presented_fps
          << ",\"distinct_frame_fraction\":" << std::fixed << std::setprecision(6)
          << rate.distinct_fraction
-         << ",\"mostly_retained\":"
-         << (prosper::gpu::frame_rate_is_mostly_retained(rate) ? "true" : "false")
+         << ",\"mostly_unchanged\":"
+         << (prosper::gpu::frame_rate_is_mostly_unchanged(rate) ? "true" : "false")
          // The guest's own terminal state, so a batch consumer can filter runs whose guest died
          // without re-reading the run log. Addresses are hex strings, not JSON numbers: a 64-bit
          // guest address does not survive a double-typed JSON parser.

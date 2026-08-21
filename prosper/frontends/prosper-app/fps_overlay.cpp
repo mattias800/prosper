@@ -13,8 +13,39 @@
 namespace prosper::frontend {
 namespace {
 
+// ImGui_ImplVulkan_CreateFontsTexture() returns `true` unconditionally: every one of its ~15 error
+// sites goes through CheckVkResultFn and then falls through to `return true`
+// (imgui_impl_vulkan.cpp:194). So a `if (!ImGui_ImplVulkan_CreateFontsTexture())` guard is DEAD
+// CODE, and a real upload failure would leave this class believing the atlas exists.
+//
+// That is not a cosmetic dead branch. On failure `io.Fonts->SetTexID()` is never reached, so
+// `bd->FontTexture.DescriptorSet` stays null -- and `ImGui_ImplVulkan_NewFrame()` retries the
+// creation on EVERY recorded frame (imgui_impl_vulkan.cpp:1201), which is precisely the unlocked
+// vkQueueSubmit on a shared queue that building the atlas in init() exists to prevent. A silent
+// failure would therefore re-open the race rather than merely losing the counter.
+//
+// The callback has no user pointer, so the failure is latched here. `font_upload_failed` is cleared
+// immediately before the call and read immediately after, on one thread, which is the whole extent
+// of the contract.
+bool g_overlay_vk_failed = false;
+
 void overlay_vk_result(VkResult r) {
-    if (r != VK_SUCCESS) std::fprintf(stderr, "[fps] Vulkan error %d in the overlay\n", (int)r);
+    if (r == VK_SUCCESS) return;
+    g_overlay_vk_failed = true;
+    std::fprintf(stderr, "[fps] Vulkan error %d in the overlay\n", (int)r);
+}
+
+// Build (or rebuild) the font atlas, and actually establish that it worked.
+//
+// Two independent checks, because neither alone is sufficient: the latched VkResult catches a driver
+// error, and the texture id catches any path that returned without uploading. The id is the real
+// POSTCONDITION -- it is what NewFrame() tests before deciding to retry -- so checking it is what
+// guarantees the lazy path stays closed.
+bool upload_font_atlas() {
+    g_overlay_vk_failed = false;
+    ImGui_ImplVulkan_CreateFontsTexture();
+    if (g_overlay_vk_failed) return false;
+    return ImGui::GetIO().Fonts->TexID != 0;
 }
 
 // ImGui's default font is rasterized at 13 px. At 4K that is unreadable, so the atlas is built at a
@@ -120,7 +151,7 @@ bool FpsOverlay::init(VkInstance instance, VkPhysicalDevice phys, VkDevice devic
     // conditional correctness that stops being true when the flag moves.
     {
         std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
-        if (!ImGui_ImplVulkan_CreateFontsTexture()) {
+        if (!upload_font_atlas()) {
             std::fprintf(stderr, "[fps] font atlas upload failed; the counter is off\n");
             ImGui_ImplVulkan_Shutdown();
             shutdown();
@@ -231,11 +262,17 @@ bool FpsOverlay::recreate_swapchain(VkFormat format, const std::vector<VkImage>&
         ImFontConfig font{};
         font.SizePixels = 13.0f * wanted;
         io.Fonts->AddFontDefault(&font);
-        // ScaleAllSizes is cumulative, so apply the RATIO rather than the new absolute scale.
-        ImGui::GetStyle().ScaleAllSizes(wanted / scale_);
+        // Rebuild the style from DEFAULTS and scale once, rather than applying a ratio to the
+        // already-scaled one. ImGuiStyle::ScaleAllSizes truncates every field (imgui.cpp:
+        // `ImTrunc(x * scale_factor)`), so scaling down and back up does not round-trip: a 1 px
+        // border scaled to 0 is 0 for the rest of the process, and a window that goes 4K -> 720p ->
+        // 4K would permanently lose its padding and borders.
+        ImGui::GetStyle() = ImGuiStyle();
+        ImGui::StyleColorsDark();
+        ImGui::GetStyle().ScaleAllSizes(wanted);
         scale_ = wanted;
         std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
-        if (!ImGui_ImplVulkan_CreateFontsTexture()) {
+        if (!upload_font_atlas()) {
             std::fprintf(stderr, "[fps] font atlas rebuild failed after a resize; the counter is off\n");
             shutdown();
             return false;

@@ -12,6 +12,15 @@
 // through the ordinary publish path (gpu/present/present_frame_rate.hpp; instrument trap 90; the
 // R-Type Delta regression #2783). So the distinct rate is always first, and the presented rate is
 // always labelled.
+//
+// WHY THIS SHOWS THE AVERAGE WHERE THE SUMMARY LINE SHOWS A MEDIAN
+// ----------------------------------------------------------------
+// `present_frame_rate.hpp` argues that a run average is a bad headline, because a route that pauses
+// averages its producing rate against its idling. That argument is about a RUN. This HUD measures a
+// ROLLING ONE-SECOND WINDOW, where there is nothing for an average to average over -- a one-second
+// mean of a 60 fps title is 60, and of a paused one is 0, which is exactly what a live counter
+// should say. The median machinery is deliberately not used here: it is cumulative for the whole
+// process and would turn the HUD into a run summary that stops responding to what is on screen.
 
 #include "gpu/present/present_frame_rate.hpp"
 
@@ -47,9 +56,14 @@ inline std::vector<std::string> fps_hud_lines(const prosper::gpu::FrameRate& rat
                   static_cast<unsigned long long>(distinct_total));
     std::vector<std::string> lines{headline, detail};
     // Stated in words, not left to be inferred from two numbers. The whole failure mode is a reader
-    // taking the healthy-looking number, so the warning has to be prose rather than arithmetic.
-    if (prosper::gpu::frame_rate_is_mostly_retained(rate))
-        lines.emplace_back("RETAINED FRAME - not this title's rate");
+    // taking the healthy-looking number, so this has to be prose rather than arithmetic.
+    //
+    // It says PICTURE NOT CHANGING, not "retained frame". A static menu and a re-served retained
+    // frame are indistinguishable from this metric by construction, and an earlier wording asserted
+    // the second -- which fired on a rung-6 title's own title screen. The HUD reports what it can
+    // see.
+    if (prosper::gpu::frame_rate_is_mostly_unchanged(rate))
+        lines.emplace_back("picture not changing");
     return lines;
 }
 

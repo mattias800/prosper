@@ -27,6 +27,55 @@
 // and the divergence is itself the diagnostic: `distinct 0.0 / presented 59.8` is a frozen picture
 // being re-served at vblank, not a game running at 60 fps.
 //
+// WHY A RUN AVERAGE IS NOT THE HEADLINE, AND WHAT IS
+// ---------------------------------------------------
+// Both rates above are averages over wall clock, and that makes them a bad summary of any route
+// that pauses. Measured on *The Messenger* over 380 s at native 1080p: `distinct 3.0 fps`, while the
+// per-sample counters show the rate was either ~15-23 fps or EXACTLY zero, with nothing in between
+// — 120 consecutive seconds of it a title screen where not one of ~24,000 publications differed.
+// 3.0 is a true average of a bimodal signal and describes neither mode. It also contradicts the
+// July performance pass, which measured this title's first level at 12-24 fps; a reader would
+// reasonably conclude a regression that never happened.
+//
+// THE REAL FIX IS THE WINDOW, NOT THE STATISTIC. No single scalar can describe a bimodal sample;
+// every candidate misleads somewhere, so arguing about which one to use is choosing which way to be
+// wrong. A framerate is only meaningful over a window in which the title was doing ONE thing — and
+// the record it ends up in commits to that anyway, because it names a scene. Measure gameplay over
+// gameplay. If a route never leaves its menus, the honest output is no framerate at all rather than
+// a figure describing a title screen.
+//
+// What follows exists to make that discipline CHECKABLE rather than to substitute for it: the pair
+// below says whether the window you chose actually was homogeneous, and a run average is only worth
+// quoting when it says yes.
+//
+//   typical fps — the reciprocal of the MEDIAN interval between consecutive distinct frames.
+//
+// A median over intervals weights by FRAME, not by time: a 120-second pause is one long interval,
+// not 120 seconds of pull, so idling cannot drag the figure down. It needs no threshold and no
+// window, and it is the ordinary way frame times are reported.
+//
+// It is never quoted alone, because on its own it could describe two frames half a second apart in
+// an otherwise dead run. It travels with:
+//
+//   active fraction — the share of the window spent producing frames at roughly the typical rate.
+//
+// **Read `active_fraction` as a verdict on your WINDOW, not as a property of the title.** Near 100%
+// means the window was homogeneous, so the average and the typical rate agree and either is
+// quotable. Well below it means the window mixed two regimes and no single number from it means
+// anything — re-measure over a narrower window rather than reaching for a different statistic.
+//
+// It is a percentage rather than a rate so it cannot be misread as a rival framerate. Together the
+// two separate the three cases that matter, and no pair of averages can:
+//
+//   19.8 fps, 97% active   a homogeneous gameplay window — THIS is what a record is made from
+//    1.0 fps, 98% active   homogeneous and genuinely slow — the "we have work to do" bucket
+//   18.5 fps, 62% active   a mixed window: real, but do not file it; narrow the window and re-run
+//     -- fps,  0% active   the title produced nothing: the R-Type Delta shape
+//
+// The `--` case is load-bearing. A frozen title must never read as a high framerate OR as an absent
+// one, so fewer than two distinct frames yields no rate at all rather than a number, and the 0%
+// beside it says why.
+//
 // WHAT "DIFFERENT CONTENT" MEANS HERE, EXACTLY
 // --------------------------------------------
 // Two publications are the same frame when `frame_content_signature` agrees on them. The signature
@@ -79,6 +128,32 @@ namespace prosper::gpu {
 constexpr size_t kFrameSignatureBlockBytes = 4096;
 constexpr size_t kFrameSignatureBytesPerBlock = 16;
 
+// Inter-distinct-frame intervals are bucketed rather than stored. A histogram costs the same for a
+// ten-second run and an eight-hour one, which matters because this accumulates in the present layer
+// for every title whether or not anyone asked for a framerate. 0.5 ms to ~90 s at 1.1x per bucket,
+// which costs about 2 KiB.
+//
+// The growth factor IS the accuracy of every framerate this module reports: a median recovered as a
+// bucket's geometric midpoint is within sqrt(growth) of the truth, so 1.1 gives +/-4.9% and 1.25
+// would give +/-11.8%. 1.25 was the first choice and it was too coarse -- it recovered a known 1.000
+// fps signal as 1.106 fps, and these figures get filed in game trackers and compared across
+// releases. `interval_estimator_is_accurate` in the tests pins this against known inputs, so a
+// future change to these constants has to face the tolerance rather than quietly widen it.
+constexpr size_t kIntervalBuckets = 128;
+constexpr double kIntervalMinSeconds = 0.0005;
+constexpr double kIntervalGrowth = 1.1;
+// Worst-case relative error of a recovered interval, from the bucket width above. Exposed so the
+// tests assert the DOCUMENTED tolerance rather than a number somebody tuned until it passed.
+constexpr double kIntervalRelativeError = 0.05;
+
+// An interval counts as ACTIVE when it is no longer than this multiple of the run's typical
+// interval. Deliberately a multiple rather than a fixed duration: titles here range from ~1 fps to
+// over 200 fps, and any absolute cutoff would classify one end of that range wrongly. At 60 fps
+// (16.7 ms typical) a gap over 67 ms is a pause; at 1 fps (1 s typical) a gap over 4 s is. The
+// constant shapes only the QUALIFIER -- the headline rate is a percentile and has no threshold in
+// it at all, which is the property that makes it quotable.
+constexpr double kActiveIntervalMultiple = 4.0;
+
 // A bounded-cost content signature of one frame. Dimensions and byte count are folded in, so a
 // resolution change is a content change even in the (impossible in practice) event that the sampled
 // bytes agree. `pixels` may be null only when `bytes` is 0.
@@ -99,12 +174,32 @@ public:
     double first_publication_seconds() const { return first_; }
     double last_publication_seconds() const { return last_; }
 
+    // Median interval between consecutive distinct frames, in seconds. Zero means "not measured":
+    // fewer than two distinct frames, so there is no interval to take a median of. Zero is NOT a
+    // fast frame time and callers must not treat it as one -- see FrameRate::typical_measured.
+    double typical_interval_seconds() const;
+    // Seconds spent in intervals no longer than kActiveIntervalMultiple x the typical interval.
+    double active_seconds() const;
+    uint64_t interval_samples() const { return interval_samples_; }
+
 private:
+    void record_interval(double seconds);
+    size_t bucket_for(double seconds) const;
+
     uint64_t published_ = 0;
     uint64_t distinct_ = 0;
     uint64_t last_signature_ = 0;
     double first_ = 0;
     double last_ = 0;
+    // Time of the previous DISTINCT publication, which is what the intervals are between.
+    double last_distinct_ = 0;
+    bool have_distinct_ = false;
+    uint64_t interval_samples_ = 0;
+    // Per bucket: how many intervals landed here, and how much wall time they account for. The
+    // counts give the median; the seconds give the active share, and the two cannot disagree
+    // because they are accumulated from the same event.
+    uint64_t interval_counts_[kIntervalBuckets] = {};
+    double interval_seconds_[kIntervalBuckets] = {};
 };
 
 // A reading of the process-wide counters, taken at `now_seconds` on the module's own monotonic
@@ -115,6 +210,13 @@ struct PresentRateSnapshot {
     double now_seconds = 0;                  // when this snapshot was taken
     double first_publication_seconds = 0;    // 0 when nothing has been published
     double last_publication_seconds = 0;
+    // Derived from the interval histogram, which is cumulative for the whole process and therefore
+    // cannot be differenced between two snapshots. Meaningful only via
+    // frame_rate_since_first_publication; frame_rate_between leaves the corresponding FrameRate
+    // fields unmeasured rather than computing something that would look valid and not be.
+    double typical_interval_seconds = 0;     // 0 => fewer than two distinct frames
+    double active_seconds = 0;
+    uint64_t interval_samples = 0;
 };
 
 // Both rates over one window, plus the raw counts they were derived from. The counts travel with
@@ -127,8 +229,19 @@ struct FrameRate {
     uint64_t published = 0;
     uint64_t distinct = 0;
     double presented_fps = 0;
-    double distinct_fps = 0;
+    double distinct_fps = 0;      // the run AVERAGE -- see the header note on why this is not the headline
     double distinct_fraction = 0; // distinct / published, 0 when nothing was published
+
+    // THE HEADLINE. `typical_measured` false means fewer than two distinct frames arrived, which is
+    // a different claim from 0 fps and must be rendered differently ("--", never "0.0").
+    bool typical_measured = false;
+    double typical_fps = 0;
+    double typical_interval_seconds = 0;
+    uint64_t interval_samples = 0;
+    // Share of the window spent producing frames at roughly the typical rate, in [0, 1]. Always
+    // shown beside typical_fps: on its own the headline could describe two frames half a second
+    // apart in an otherwise dead run, and this is the field that says so.
+    double active_fraction = 0;
 };
 
 // Window = [first publication, the moment the snapshot was taken]. Wall clock, not "time between
@@ -138,27 +251,55 @@ FrameRate frame_rate_since_first_publication(const PresentRateSnapshot& snapshot
 
 // Window = [earlier, later]. Returns an unmeasured result if the counters moved backwards, which
 // can only mean a reset happened between the two readings.
+//
+// `typical_fps` and `active_fraction` are NOT filled in here, and `typical_measured` stays false: a
+// histogram accumulated since process start cannot be differenced. Callers that want a live rate
+// over a short window (prosper-app's HUD) should use `distinct_fps`, which over a one-second window
+// is not meaningfully an average of anything.
 FrameRate frame_rate_between(const PresentRateSnapshot& earlier, const PresentRateSnapshot& later);
 
-// "distinct 3.4 fps / presented 59.8 fps over 60.0 s (204 of 3590 published frames carried new
-// content, 5.7%)". Distinct comes FIRST in every rendering of this in the project, because a reader
-// skimming a log line takes the first number, and the first number must be the honest one.
+// Two lines. The first is the headline and its qualifier and nothing else; the second is every
+// number it was derived from, so the headline can be checked without being competed with:
+//
+//   18.5 fps while producing frames, 62% of the 380.0 s run active
+//   (1142 distinct of 78743 published; run average 3.0 fps; presented 207.2 fps)
+//
+// A run that produced fewer than two distinct frames gets "-- fps ... 0% active" and a sentence
+// naming the count, because that is the case a number of any kind would misrepresent.
 std::string format_frame_rate(const FrameRate& rate);
 
 // A compact form for burning into an image or drawing in a HUD:
-// "3.4 fps  (59.8 presented)  3840x2160".
+// "18.5 fps  62% active  3840x2160". Falls back to the run average when the typical rate is not
+// available (a short window, or frame_rate_between), and to "--" when nothing was produced.
 std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint32_t height);
 
-// True when publications kept arriving but almost none of them carried new content — i.e. the
-// reader is looking at the R-Type Delta shape and MUST NOT quote the presented rate.
+// True when publications kept arriving but almost none of them carried new content.
 //
-// This is a labelling heuristic layered on two exact numbers, never a substitute for them: the
-// thresholds are named parameters precisely so nobody has to guess what "almost none" meant. It
-// deliberately keys on the FRACTION rather than on an absolute distinct rate, because titles in
-// this project legitimately run at ~1 fps and an absolute threshold would call those frozen.
-bool frame_rate_is_mostly_retained(const FrameRate& rate,
-                                   uint64_t min_published = 30,
-                                   double max_distinct_fraction = 0.5);
+// READ THE NAME LITERALLY. It says UNCHANGED, not "retained", and the difference is the whole
+// caveat: this predicate CANNOT distinguish
+//
+//   (a) the renderer re-serving its retained frame because a submit produced no present source
+//       — a defect, the R-Type Delta (#2783) shape; from
+//   (b) a title sitting on a static picture — a menu, a title screen, a pause — where publishing
+//       the same image repeatedly is completely correct.
+//
+// Both look identical from here BY CONSTRUCTION: in each case the bytes do not change. An earlier
+// version of this was called `..._is_mostly_retained` and its caller printed a warning naming the
+// renderer, which fired on *The Messenger*'s own title screen — a rung-6 title, on its guarded
+// route — and told the reader to go and investigate a renderer defect that was not there. A
+// measurement that manufactures phantom defects in a tool whose output lands in game trackers is
+// worse than no measurement, so the name states the observation and nothing about its cause.
+//
+// `active_fraction` is what separates (a) from (b): a static menu still produced frames before it
+// arrived, so its active share is non-zero; a title that produced nothing has an absent typical rate
+// and 0% active. Any caller that reports this predicate must report that alongside it.
+//
+// The thresholds are named parameters so nobody has to guess what "almost none" meant, and the
+// predicate keys on the FRACTION rather than an absolute rate because titles here legitimately run
+// at ~1 fps and an absolute threshold would call those frozen.
+bool frame_rate_is_mostly_unchanged(const FrameRate& rate,
+                                    uint64_t min_published = 30,
+                                    double max_distinct_fraction = 0.5);
 
 // ---- process-wide counters, fed by the present layer ---------------------------------------
 //

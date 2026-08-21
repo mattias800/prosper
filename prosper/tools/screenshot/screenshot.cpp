@@ -934,17 +934,24 @@ int main(int argc, char** argv) {
     // arrive, on this one line, without opening the manifest.
     // The framerate, on its own line, distinct rate FIRST. A reader skimming takes the first
     // number, so the first number has to be the one that cannot lie about a frozen title.
+    // Two lines: the headline plus its qualifier, then everything it was derived from.
     fprintf(stderr, "[shot] fps: %s\n", gpu::format_frame_rate(run_rate).c_str());
-    if (gpu::frame_rate_is_mostly_retained(run_rate))
+    if (gpu::frame_rate_is_mostly_unchanged(run_rate))
         fprintf(stderr,
-                "[shot] WARNING: only %.1f%% of the %llu published frames carried new content. The "
-                "renderer re-publishes its retained frame when a submit produces no present source, "
-                "so the PRESENTED rate above (%.1f fps) is not this title's framerate -- read the "
-                "distinct rate (%.1f fps). This is the R-Type Delta (#2783) shape; check the "
-                "renderer's [rtt] PRESENT SOURCE EXTENT MISMATCH lines.\n",
+                "[shot] NOTE: only %.1f%% of the %llu published frames carried new content, so the "
+                "presented rate (%.1f fps) is not this title's framerate.\n"
+                "[shot]       THIS IS NOT BY ITSELF A DEFECT, and this tool cannot tell you whether "
+                "it is one. A title sitting on a menu, a title screen or a pause publishes an "
+                "unchanging picture too, and that is correct behaviour -- it is indistinguishable "
+                "here from the renderer re-serving a retained frame, because in both cases the "
+                "bytes do not change.\n"
+                "[shot]       What separates them is the ACTIVE share above (%.0f%%): a title that "
+                "reached a static screen produced frames on the way there, while one that produced "
+                "nothing reports '-- fps, 0%% active'. Investigate the renderer's [rtt] PRESENT "
+                "SOURCE EXTENT MISMATCH lines only in the second case.\n",
                 run_rate.distinct_fraction * 100.0,
-                (unsigned long long)run_rate.published,
-                run_rate.presented_fps, run_rate.distinct_fps);
+                (unsigned long long)run_rate.published, run_rate.presented_fps,
+                run_rate.active_fraction * 100.0);
     if (fps_overlay)
         fprintf(stderr, "[shot] note: --fps-overlay was on, so every PNG this run wrote carries a "
                         "burned-in annotation. Say so in the caption; the manifest records it as "

@@ -406,7 +406,7 @@ int main() {
         CHECK(live_summary.find("\"distinct_fps\":60.000") != std::string::npos &&
               live_summary.find("\"presented_fps\":60.000") != std::string::npos &&
               live_summary.find("\"frame_rate_measured\":true") != std::string::npos &&
-              live_summary.find("\"mostly_retained\":false") != std::string::npos,
+              live_summary.find("\"mostly_unchanged\":false") != std::string::npos,
               "a live title's summary reports both rates at ~60 fps");
 
         const std::string frozen_summary = manifest_summary_json(
@@ -415,7 +415,7 @@ int main() {
               "a FROZEN title still publishes at 60 fps -- the number that must not stand alone");
         CHECK(frozen_summary.find("\"distinct_fps\":0.100") != std::string::npos &&
               frozen_summary.find("\"distinct_frames\":1") != std::string::npos &&
-              frozen_summary.find("\"mostly_retained\":true") != std::string::npos,
+              frozen_summary.find("\"mostly_unchanged\":true") != std::string::npos,
               "...and the same summary says so, in three independent fields");
 
         const std::string unmeasured = manifest_summary_json(

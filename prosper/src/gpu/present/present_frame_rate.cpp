@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -67,9 +68,67 @@ void FrameRateCounter::observe(uint64_t signature, double at_seconds) {
     const bool changed = published_ == 0 || signature != last_signature_;
     if (published_ == 0) first_ = at_seconds;
     published_++;
-    if (changed) distinct_++;
+    if (changed) {
+        distinct_++;
+        // Intervals are between consecutive DISTINCT frames, which is the whole point: the gap
+        // between two publications of the same picture is not a frame time.
+        if (have_distinct_) record_interval(at_seconds - last_distinct_);
+        last_distinct_ = at_seconds;
+        have_distinct_ = true;
+    }
     last_signature_ = signature;
     last_ = at_seconds;
+}
+
+size_t FrameRateCounter::bucket_for(double seconds) const {
+    if (seconds <= kIntervalMinSeconds) return 0;
+    const double steps = std::log(seconds / kIntervalMinSeconds) / std::log(kIntervalGrowth);
+    if (steps >= static_cast<double>(kIntervalBuckets - 1)) return kIntervalBuckets - 1;
+    return static_cast<size_t>(steps) + 1;
+}
+
+void FrameRateCounter::record_interval(double seconds) {
+    if (!(seconds > 0)) return;   // also rejects NaN
+    const size_t bucket = bucket_for(seconds);
+    interval_counts_[bucket]++;
+    interval_seconds_[bucket] += seconds;
+    interval_samples_++;
+}
+
+double FrameRateCounter::typical_interval_seconds() const {
+    if (interval_samples_ == 0) return 0;   // no interval exists; NOT a fast frame time
+    // The median BY COUNT. Weighting by frame rather than by time is exactly what makes this immune
+    // to idling: a two-minute pause contributes one sample, not two minutes of pull.
+    const uint64_t half = interval_samples_ / 2;
+    uint64_t seen = 0;
+    for (size_t i = 0; i < kIntervalBuckets; i++) {
+        seen += interval_counts_[i];
+        if (seen > half) {
+            const double high =
+                kIntervalMinSeconds * std::pow(kIntervalGrowth, static_cast<double>(i));
+            if (i == 0) return high;
+            const double low =
+                kIntervalMinSeconds * std::pow(kIntervalGrowth, static_cast<double>(i - 1));
+            // Geometric midpoint: the right centre for log-spaced edges.
+            return std::sqrt(low * high);
+        }
+    }
+    return 0;
+}
+
+double FrameRateCounter::active_seconds() const {
+    const double typical = typical_interval_seconds();
+    if (typical <= 0) return 0;
+    const double cutoff = typical * kActiveIntervalMultiple;
+    double active = 0;
+    for (size_t i = 0; i < kIntervalBuckets; i++) {
+        if (interval_counts_[i] == 0) continue;
+        // Attribute a whole bucket by its own MEAN interval, so a bucket straddling the cutoff is
+        // decided by where its intervals actually are rather than by its nominal edges.
+        const double mean = interval_seconds_[i] / static_cast<double>(interval_counts_[i]);
+        if (mean <= cutoff) active += interval_seconds_[i];
+    }
+    return active;
 }
 
 void FrameRateCounter::reset() { *this = FrameRateCounter{}; }
@@ -94,7 +153,18 @@ FrameRate make_rate(uint64_t published, uint64_t distinct, double window_seconds
 
 FrameRate frame_rate_since_first_publication(const PresentRateSnapshot& s) {
     if (s.published == 0) return make_rate(0, 0, 0);
-    return make_rate(s.published, s.distinct, s.now_seconds - s.first_publication_seconds);
+    FrameRate r = make_rate(s.published, s.distinct, s.now_seconds - s.first_publication_seconds);
+    r.interval_samples = s.interval_samples;
+    r.typical_interval_seconds = s.typical_interval_seconds;
+    // Fewer than two distinct frames means there is no interval, so there is no typical rate. That
+    // is reported as ABSENT rather than as zero: "0.0 fps" is a measurement and this is not one.
+    if (s.typical_interval_seconds > 0) {
+        r.typical_measured = true;
+        r.typical_fps = 1.0 / s.typical_interval_seconds;
+    }
+    if (r.window_seconds > 0)
+        r.active_fraction = std::min(1.0, s.active_seconds / r.window_seconds);
+    return r;
 }
 
 FrameRate frame_rate_between(const PresentRateSnapshot& earlier, const PresentRateSnapshot& later) {
@@ -107,7 +177,7 @@ FrameRate frame_rate_between(const PresentRateSnapshot& earlier, const PresentRa
 }
 
 std::string format_frame_rate(const FrameRate& rate) {
-    char text[256];
+    char text[512];
     if (!rate.measured) {
         std::snprintf(text, sizeof text,
                       "not measured (%llu published, %llu distinct, %.3f s window)",
@@ -115,28 +185,47 @@ std::string format_frame_rate(const FrameRate& rate) {
                       static_cast<unsigned long long>(rate.distinct), rate.window_seconds);
         return text;
     }
+    // The headline and its qualifier on the first line and nothing else; everything the headline was
+    // derived from on the second. A reader who quotes the first line quotes a rate that idling
+    // cannot have dragged down, and a percentage that stops it being quoted bare.
+    if (!rate.typical_measured) {
+        std::snprintf(text, sizeof text,
+                      "-- fps while producing frames, 0%% of the %.1f s run active\n"
+                      "     the title produced %llu distinct frame(s) in %llu publications "
+                      "(presented %.1f fps) -- there is no framerate to report",
+                      rate.window_seconds,
+                      static_cast<unsigned long long>(rate.distinct),
+                      static_cast<unsigned long long>(rate.published), rate.presented_fps);
+        return text;
+    }
     std::snprintf(text, sizeof text,
-                  "distinct %.1f fps / presented %.1f fps over %.1f s "
-                  "(%llu of %llu published frames carried new content, %.1f%%)",
-                  rate.distinct_fps, rate.presented_fps, rate.window_seconds,
+                  "%.1f fps while producing frames, %.0f%% of the %.1f s run active\n"
+                  "     %llu distinct of %llu published; run average %.1f fps; presented %.1f fps",
+                  rate.typical_fps, rate.active_fraction * 100.0, rate.window_seconds,
                   static_cast<unsigned long long>(rate.distinct),
                   static_cast<unsigned long long>(rate.published),
-                  rate.distinct_fraction * 100.0);
+                  rate.distinct_fps, rate.presented_fps);
     return text;
 }
 
 std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint32_t height) {
-    char text[128];
-    if (!rate.measured) {
-        std::snprintf(text, sizeof text, "-- fps  %ux%u", width, height);
+    char text[160];
+    if (!rate.measured || (!rate.typical_measured && rate.distinct <= 1)) {
+        std::snprintf(text, sizeof text, "-- fps  0%% active  %ux%u", width, height);
         return text;
     }
-    std::snprintf(text, sizeof text, "%.1f fps  (%.1f presented)  %ux%u",
-                  rate.distinct_fps, rate.presented_fps, width, height);
+    if (!rate.typical_measured) {
+        // A measured window with no interval histogram behind it (frame_rate_between). The average
+        // is the only rate available; it is labelled so it cannot be read as the typical one.
+        std::snprintf(text, sizeof text, "%.1f fps avg  %ux%u", rate.distinct_fps, width, height);
+        return text;
+    }
+    std::snprintf(text, sizeof text, "%.1f fps  %.0f%% active  %ux%u",
+                  rate.typical_fps, rate.active_fraction * 100.0, width, height);
     return text;
 }
 
-bool frame_rate_is_mostly_retained(const FrameRate& rate, uint64_t min_published,
+bool frame_rate_is_mostly_unchanged(const FrameRate& rate, uint64_t min_published,
                                    double max_distinct_fraction) {
     return rate.published >= min_published && rate.distinct_fraction < max_distinct_fraction;
 }
@@ -163,6 +252,9 @@ PresentRateSnapshot present_rate_snapshot() {
     out.distinct = g_rate.distinct();
     out.first_publication_seconds = g_rate.first_publication_seconds();
     out.last_publication_seconds = g_rate.last_publication_seconds();
+    out.typical_interval_seconds = g_rate.typical_interval_seconds();
+    out.active_seconds = g_rate.active_seconds();
+    out.interval_samples = g_rate.interval_samples();
     return out;
 }
 

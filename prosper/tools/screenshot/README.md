@@ -116,7 +116,7 @@ When the two diverge the run says so outright:
 ```
 
 The summary line carries `distinct_fps`, `presented_fps`, `published_frames`, `distinct_frames`,
-`distinct_frame_fraction`, `mostly_retained` and `frame_rate_window_seconds`. **`frame_rate_measured:
+`distinct_frame_fraction`, `mostly_unchanged` and `frame_rate_window_seconds`. **`frame_rate_measured:
 false` is not 0 fps** — it means nothing was ever published, which is a different claim.
 
 Each *sample* line carries `published_frames` and `distinct_frames` as raw counters at that moment,
@@ -127,7 +127,7 @@ question a stored manifest usually has to answer.
 The window for the summary rate is *first publication → end of sampling*, wall clock. A title that
 stops publishing therefore decays toward zero rather than freezing at whatever it last managed.
 
-#### The summary rate is a run AVERAGE — choose the window before you quote it
+#### Choose the window before you quote anything
 
 **A route that spends most of its time on menus, loading screens and waits will report a low distinct
 rate, and that rate is not the title's gameplay framerate.** Measured on *The Messenger*
@@ -143,10 +143,15 @@ screen — a still image, where **not one of roughly 24,000 publications differe
 predecessor**, which is the counter working correctly on a genuinely static picture. Averaging that
 against the animated stretches produces a number that describes neither.
 
-So: **an `FPS record:` must be measured over a window in which the title is doing the thing being
-recorded**, which is exactly what the record's `scene` field commits you to. Get there with
-`--warmup-seconds` past the route, or recover any window afterwards from the manifest by subtracting
-two sample lines:
+**No statistic repairs a mixed window; only a narrower window does.** A framerate means something
+only over a stretch in which the title was doing one thing, and an `FPS record:` line commits to that
+by naming a scene. So measure `gameplay` over gameplay: get there with `--warmup-seconds` past the
+route, or recover any sub-window afterwards from the manifest by subtracting two sample lines. If a
+route never reaches the scene, the honest record is `none` — an explicit absence beats a number
+describing a title screen.
+
+`active_fraction` in the summary is the check on that: near 100% means the window was homogeneous and
+the rate is worth quoting; well below means it was not.
 
 ```bash
 python3 - <<'EOF'

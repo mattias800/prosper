@@ -122,15 +122,25 @@ FPS_RE = re.compile(r"^FPS record:\s*(?P<value>\S.*?)\s*$", re.M)
 # The scene and frontend fields require a non-space character. `[^;]+?` alone accepted `; ; ;`, which
 # parses to a framerate with an empty scene and an empty frontend -- precisely the bare number this
 # grammar exists to reject, wearing the shape of a full record.
+#
+# THE RATE IS "WHILE PRODUCING", NOT AN AVERAGE, and the active percentage is mandatory beside it.
+# A run average over a route that visits a menu describes neither what the title does nor what it
+# does not: *The Messenger* measured 3.0 fps average over 380 s while actually alternating between
+# ~15-23 fps and exactly zero. Filing 3.0 would put a title the July performance pass measured at
+# 12-24 fps into the "we have work to do" bucket, and that bucket decision is the whole purpose of
+# this column. So the record carries the rate the title runs at WHILE RUNNING, qualified by how much
+# of the run that was. `--` is the honest rate for a title that produced fewer than two distinct
+# frames, and it is required to pair with 0% active.
 FPS_RECORD_RE = re.compile(
-    r"^(?P<distinct>\d+(?:\.\d+)?)\s+distinct\s*/\s*(?P<presented>\d+(?:\.\d+)?)\s+presented"
-    r"\s+at\s+(?P<width>\d+)[xX](?P<height>\d+)"
+    r"^(?P<fps>--|\d+(?:\.\d+)?)\s+fps\s+while\s+producing\s*,\s*"
+    r"(?P<active>\d{1,3})%\s+active"
+    r"\s*;\s*(?P<width>\d+)[xX](?P<height>\d+)"
     r"\s*;\s*(?P<scene>[^;\s][^;]*?)"
     r"\s*;\s*(?P<frontend>[^;\s][^;]*?)"
     r"\s*;\s*(?P<date>\d{4}-\d{2}-\d{2})$"
 )
 
-FPS_FORM = ("FPS record: <distinct> distinct / <presented> presented at <W>x<H>; "
+FPS_FORM = ("FPS record: <fps> fps while producing, <N>% active; <W>x<H>; "
             "<what was running>; <frontend>; <YYYY-MM-DD>")
 
 # Common resolutions get their usual short name so the column stays narrow; anything else is
@@ -343,19 +353,36 @@ def parse_fps_record(body: str, where: str, name: str) -> dict | None:
             "%s (%s): the 'FPS record:' date %r is not a real calendar date."
             % (where, name, m.group("date"))
         )
-    distinct = float(m.group("distinct"))
-    presented = float(m.group("presented"))
-    if distinct > presented:
+    active = int(m.group("active"))
+    if active > 100:
         raise ParseError(
-            "%s (%s): the 'FPS record:' line reports %.1f distinct frames per second against\n"
-            "        %.1f presented. Distinct publications are a SUBSET of publications, so this\n"
-            "        is either a transposed pair or two numbers from different runs."
-            % (where, name, distinct, presented)
+            "%s (%s): the 'FPS record:' line claims %d%% active. A share of the run cannot exceed\n"
+            "        100%%." % (where, name, active)
+        )
+    measured = m.group("fps") != "--"
+    fps = float(m.group("fps")) if measured else None
+    # `--` means fewer than two distinct frames, which is only reachable when the title produced
+    # essentially nothing -- so it cannot coexist with a non-zero active share. The pairing is the
+    # R-Type Delta shape's signature and a record that breaks it is describing two different runs.
+    if not measured and active != 0:
+        raise ParseError(
+            "%s (%s): the 'FPS record:' line reports no rate ('--') but %d%% active. '--' means\n"
+            "        fewer than two distinct frames were produced, which cannot leave the run\n"
+            "        active for any of its length."
+            % (where, name, active)
+        )
+    if measured and fps == 0:
+        raise ParseError(
+            "%s (%s): the 'FPS record:' line reports 0 fps. A title that produced frames has a\n"
+            "        rate; one that produced none has no rate at all and is written '--'.\n"
+            "        '0' is neither, and is the reading this column exists to prevent."
+            % (where, name)
         )
     return {
         "none": False,
-        "distinct": distinct,
-        "presented": presented,
+        "measured": measured,
+        "fps": fps,
+        "active": active,
         "width": int(m.group("width")),
         "height": int(m.group("height")),
         "scene": m.group("scene").strip(),
@@ -531,7 +558,7 @@ user-facing overview, and its markers are a chart, not a rung scale.
 | **Rung** | The highest **ticked** rung, 0 if none. |
 | **Ladder** | Every ticked rung, `-` for unticked. **The ladder is legitimately non-contiguous** on some titles -- PR #1696 and #1676 deliberately took titles from rung 3/4 to rung 6 without rung 5, because a reviewed gameplay guard is evidenced by its own route and thresholds and never depended on a hardware oracle. `1234-6` is a real state, not an editing slip. |
 | **Guard** | From `prosper/tools/snapshot/snapshots.json`, matched on title ID -- not from the tracker's prose, so it cannot disagree with the registry. |
-| **FPS** | The tracker's `FPS record:` line. `-` means **no tracker line exists**; `none` means somebody looked and there is no measurement. See below. |
+| **FPS** | The tracker's `FPS record:` line: the rate while the title was producing frames, and the share of the run that was. `-` means **no tracker line exists**; `none` means somebody looked and there is no measurement; `--` means the title produced nothing. See below. |
 | **Oracle** | The tracker's `Oracle record:` line, verbatim. `none` means **no PS5 hardware comparison is on record** (see #2730). Not to be confused with `snapshots.json`'s `structural_references`, which are luminance signatures generated from prosper's own runs -- a *regression* reference, not a hardware oracle. |
 | **Open blockers** | Issues/PRs cited in the tracker's `## Current blocker(s)` section that are still open. Cited-and-closed entries are omitted; a tracker citing nothing shows `-`. |
 | **Status doc** | First `prosper/docs/*_STATUS.md` referenced by the tracker, else its first `prosper/docs/*.md`. `-` means the tracker references neither. |
@@ -539,17 +566,43 @@ user-facing overview, and its markers are a chart, not a rung scale.
 A `-` is an **explicit absence**, never a parse failure: the generator aborts on anything it
 cannot parse and writes no file at all, so a row that is present is a row that was read.
 
-### The FPS column: two numbers, and the first one is the honest one
+### The FPS column: the rate while producing, and how much of the run that was
 
-`**3.4** / 59.8 fps` reads **3.4 distinct frames per second, 59.8 publications per second**, and the
-gap between them is information rather than noise. prosper re-publishes the frame it retained
-whenever a submit produces no usable present source, and that re-serve goes through the ordinary
-publish path -- so a title whose picture is completely frozen keeps publishing at the display's
-rate. A framerate counted from publications reads **full speed for a frozen title**; that is
-instrument trap 90, and it is exactly the R-Type Delta regression #2783, which hid for nine days
-behind a healthy-looking present rate. **Quote the first number. When the two are far apart, the
-title has a defect and neither number is its framerate.**
-(`prosper/src/gpu/present/present_frame_rate.hpp` carries the argument in full.)
+`**18.5** fps · 62% active` reads **18.5 frames per second while the title was producing frames**,
+which it did for **62%** of the measured run. Both halves are required, and the second is a
+percentage rather than a rate precisely so it cannot be quoted as a rival framerate.
+
+Three states, and the column has to keep them apart:
+
+| Cell | Reading |
+| --- | --- |
+| `**19.8** fps · 97% active` | A homogeneous window. This is what a record should be made from. |
+| `**1.0** fps · 98% active` | Homogeneous and genuinely slow. The "we have work to do" bucket. |
+| `**18.5** fps · 62% active` | A **mixed** window -- real, but it should not have been filed. Narrow the window and re-measure. |
+| `**--** fps · 0% active` | The title produced nothing. The R-Type Delta shape (#2783) -- see below. |
+
+**Measure over a window where the title was doing ONE thing.** The line names a scene, so it has
+already committed to that: measure `gameplay` over gameplay. Mixing regimes is what makes a
+framerate meaningless, and no choice of statistic repairs it -- *The Messenger* measured 3.0 fps
+averaged over 380 s while alternating between ~15-23 fps and **exactly zero**, including 120
+consecutive seconds where not one of roughly 24,000 publications differed from its predecessor. The
+July performance pass measured that title's first level at 12-24 fps, so filing 3.0 would have
+manufactured a regression that never happened.
+
+**That is what the active share is for: it is a verdict on your window, not on the title.** Near 100%
+means the window was homogeneous and the number is worth filing. Well below it means the window mixed
+a menu with gameplay -- narrow the window and measure again rather than filing the mixture. **If a
+route never reaches the scene you want to record, file `none` and no number at all.** An explicit
+absence is worth more than a figure that describes a title screen.
+
+**Why the `--` matters.** prosper re-publishes the frame it retained whenever a submit produces no
+usable present source, so a title whose picture is completely frozen keeps publishing at the
+display's rate. A framerate counted from publications reads **full speed for a frozen title** --
+instrument trap 90, and the R-Type Delta regression #2783, which hid for nine days behind a
+healthy-looking present rate. A title that produced fewer than two distinct frames therefore has no
+rate at all, written `--`, and the `0% active` beside it says why. It is never rendered as `0.0`,
+which would be a measurement. (`prosper/src/gpu/present/present_frame_rate.hpp` carries the argument
+in full, including why the headline is a median over frame intervals and needs no threshold.)
 
 The rest of the cell is not decoration: a framerate means nothing without its conditions. Resolution,
 what was on screen, and which frontend measured it all move the number by more than the differences
@@ -559,16 +612,17 @@ as current.
 To record one, add exactly one line anywhere in the tracker body:
 
 ```
-FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; screenshot; 2026-08-21
+FPS record: 18.5 fps while producing, 62% active; 3840x2160; gameplay; screenshot; 2026-08-21
+FPS record: -- fps while producing, 0% active; 1920x1080; title screen; screenshot; 2026-08-21
 FPS record: none
 ```
 
 The line is **optional** -- a tracker without one renders `-` and parses fine -- but it is **strictly
 validated when present**, and a malformed one fails the whole run and names the tracker. That is on
 purpose: a required field would take the entire projection down the day it landed, while a loosely
-parsed one would decay into bare numbers, and a bare framerate is not a measurement. Get both rates
-from `tools/screenshot`'s summary line or the `distinct_fps` / `presented_fps` fields of its manifest,
-or from `prosper-app --fps`.
+parsed one would decay into bare numbers, and a bare framerate is not a measurement. Take both values
+straight from `tools/screenshot`'s summary line, or from the `typical_fps` / `active_fraction` fields
+of its manifest.
 
 """
 
@@ -598,12 +652,19 @@ def _cell(text: str) -> str:
 def _fps_cell(fps: dict | None) -> str:
     """Render one framerate record for the table.
 
-    BOTH rates are shown, distinct first and bold. Showing only the distinct rate would be tidier
-    and would throw away the diagnostic: a large gap between the two means prosper was re-publishing
-    a retained frame rather than the title running fast, which is a defect the table can surface for
-    free. No threshold is applied here on purpose -- a judgment call encoded in the generator would
-    be a second, drifting copy of the one in
-    prosper/src/gpu/present/present_frame_rate.hpp. The reader compares two numbers.
+    Two facts, one headline: the rate while producing frames, and the share of the run that was.
+    Neither is optional, and the second is deliberately NOT a rate -- a percentage cannot be quoted
+    as a framerate, which is what stops the first number travelling alone.
+
+    The three states a reader has to be able to tell apart, and how they render:
+
+        **18.5** fps · 62% active    healthy; it also visited a menu
+        **1.0** fps · 98% active     genuinely slow THROUGHOUT -- the "work to do" bucket
+        **--** fps · 0% active       produced nothing (the R-Type Delta shape, #2783)
+
+    No threshold is applied here on purpose: the values are carried verbatim from the tracker, and a
+    judgment encoded in the generator would be a second, drifting copy of the one in
+    prosper/src/gpu/present/present_frame_rate.hpp.
     """
     if fps is None:
         return "-"
@@ -612,8 +673,12 @@ def _fps_cell(fps: dict | None) -> str:
     resolution = RESOLUTION_NAMES.get(
         (fps["width"], fps["height"]), "%dx%d" % (fps["width"], fps["height"])
     )
-    return "**%.1f** / %.1f fps · %s · %s · %s · %s" % (
-        fps["distinct"], fps["presented"], resolution, fps["scene"], fps["frontend"], fps["date"]
+    # The rate the title runs at WHILE RUNNING, then how much of the run that was. The second field
+    # is a percentage rather than a rate, so it cannot be mistaken for a rival framerate -- which is
+    # exactly why it is the qualifier rather than a second fps figure. `--` never becomes a number.
+    rate = "**--**" if not fps["measured"] else "**%.1f**" % fps["fps"]
+    return "%s fps · %d%% active · %s · %s · %s · %s" % (
+        rate, fps["active"], resolution, fps["scene"], fps["frontend"], fps["date"]
     )
 
 
@@ -791,12 +856,13 @@ def selftest() -> int:
     if parse_tracker(_issue(), {})["fps"] is not None:
         failures.append("a tracker with no FPS record did not parse as absent")
 
-    fps_line = ("FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; "
+    fps_line = ("FPS record: 18.5 fps while producing, 62% active; 3840x2160; gameplay; "
                 "screenshot; 2026-08-21\n")
     recorded = parse_tracker(_issue(body=_GOOD_BODY + fps_line), {})["fps"]
     for field, got, want in [
-        ("fps.distinct", recorded["distinct"], 3.4),
-        ("fps.presented", recorded["presented"], 59.8),
+        ("fps.measured", recorded["measured"], True),
+        ("fps.fps", recorded["fps"], 18.5),
+        ("fps.active", recorded["active"], 62),
         ("fps.width", recorded["width"], 3840),
         ("fps.height", recorded["height"], 2160),
         ("fps.scene", recorded["scene"], "gameplay"),
@@ -809,7 +875,7 @@ def selftest() -> int:
     # `screenshot --fps-overlay` burns `3840X2160`, so that spelling must parse: a grammar that
     # rejects the output of the tool that produced the measurement fails CI on a correct record.
     upper_x = parse_tracker(
-        _issue(body=_GOOD_BODY + "FPS record: 3.4 distinct / 59.8 presented at 3840X2160; "
+        _issue(body=_GOOD_BODY + "FPS record: 18.5 fps while producing, 62% active; 3840X2160; "
                                  "gameplay; screenshot; 2026-08-21\n"), {})["fps"]
     if upper_x["width"] != 3840 or upper_x["height"] != 2160:
         failures.append("the uppercase 3840X2160 spelling the fps overlay burns did not parse")
@@ -831,8 +897,17 @@ def selftest() -> int:
     # Both numbers, distinct first and bold. A cell carrying only the presented rate would report a
     # frozen title as fast, which is the whole reason this column stores two numbers (#2783).
     recorded_cell = _rendered_fps_cell(parse_tracker(_issue(body=_GOOD_BODY + fps_line), {}))
-    if not recorded_cell.startswith("**3.4** / 59.8 fps"):
-        failures.append("the FPS cell is %r; it must LEAD with the distinct rate" % recorded_cell)
+    if not recorded_cell.startswith("**18.5** fps · 62% active"):
+        failures.append("the FPS cell is %r; it must lead with the producing rate and its "
+                        "active share" % recorded_cell)
+    # A title that produced nothing must render as an ABSENT rate, never as a number. This is the
+    # arm that would fail if `--` were ever coerced to 0.0 somewhere between parse and render.
+    nothing_cell = _rendered_fps_cell(parse_tracker(
+        _issue(body=_GOOD_BODY + "FPS record: -- fps while producing, 0% active; 1920x1080; "
+                                 "title screen; screenshot; 2026-08-21\n"), {}))
+    if not nothing_cell.startswith("**--** fps · 0% active"):
+        failures.append("a title that produced nothing rendered as %r, not '**--** fps · 0%% active'"
+                        % nothing_cell)
     for condition in ("4K", "gameplay", "screenshot", "2026-08-21"):
         if condition not in recorded_cell:
             failures.append("the FPS cell dropped %r -- the number is meaningless without it"
@@ -845,33 +920,46 @@ def selftest() -> int:
         ),
         (
             "a bare FPS number with no conditions",
-            _issue(body=_GOOD_BODY + "FPS record: 3.4\n"),
+            _issue(body=_GOOD_BODY + "FPS record: 18.5\n"),
         ),
         (
             "an FPS record missing its date",
             _issue(body=_GOOD_BODY +
-                   "FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; screenshot\n"),
+                   "FPS record: 18.5 fps while producing, 62% active; 3840x2160; gameplay; "
+                   "screenshot\n"),
         ),
         (
-            "an FPS record with only one rate",
+            "an FPS record with no active share",
             _issue(body=_GOOD_BODY +
-                   "FPS record: 3.4 fps at 3840x2160; gameplay; screenshot; 2026-08-21\n"),
+                   "FPS record: 18.5 fps; 3840x2160; gameplay; screenshot; 2026-08-21\n"),
         ),
         (
-            "more distinct frames than published ones",
+            "an active share above 100%",
             _issue(body=_GOOD_BODY +
-                   "FPS record: 59.8 distinct / 3.4 presented at 3840x2160; gameplay; "
+                   "FPS record: 18.5 fps while producing, 140% active; 3840x2160; gameplay; "
+                   "screenshot; 2026-08-21\n"),
+        ),
+        (
+            "no rate but a non-zero active share",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: -- fps while producing, 62% active; 3840x2160; gameplay; "
+                   "screenshot; 2026-08-21\n"),
+        ),
+        (
+            "a rate of exactly zero, which is neither a measurement nor an absence",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: 0 fps while producing, 0% active; 3840x2160; gameplay; "
                    "screenshot; 2026-08-21\n"),
         ),
         (
             "an FPS record with an empty scene and frontend",
             _issue(body=_GOOD_BODY +
-                   "FPS record: 3.4 distinct / 59.8 presented at 3840x2160; ; ; 2026-08-21\n"),
+                   "FPS record: 18.5 fps while producing, 62% active; 3840x2160; ; ; 2026-08-21\n"),
         ),
         (
             "an FPS record dated 2026-13-45",
             _issue(body=_GOOD_BODY +
-                   "FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; "
+                   "FPS record: 18.5 fps while producing, 62% active; 3840x2160; gameplay; "
                    "screenshot; 2026-13-45\n"),
         ),
         (

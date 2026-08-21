@@ -21,6 +21,7 @@
 #include "gpu/present/present_frame_rate.hpp"
 #include "gpu/present/videoout_present.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +38,22 @@ static int fails = 0;
 namespace {
 
 constexpr uint32_t kW = 64, kH = 64;
+
+// Everything the counter knows, as the snapshot a consumer would take. Kept in one place so an arm
+// cannot accidentally leave the interval fields at zero and then "prove" the typical rate is absent.
+PresentRateSnapshot snapshot_of(const FrameRateCounter& counter, double now_seconds) {
+    PresentRateSnapshot s;
+    s.published = counter.published();
+    s.distinct = counter.distinct();
+    s.first_publication_seconds = counter.first_publication_seconds();
+    s.last_publication_seconds = counter.last_publication_seconds();
+    s.typical_interval_seconds = counter.typical_interval_seconds();
+    s.active_seconds = counter.active_seconds();
+    s.interval_samples = counter.interval_samples();
+    s.now_seconds = now_seconds;
+    return s;
+}
+
 constexpr size_t kBytes = static_cast<size_t>(kW) * kH * 4;   // 16384
 
 // A frame whose bytes are a deterministic function of `variant`. Every byte differs between
@@ -125,19 +142,17 @@ void live_title_reports_its_real_rate() {
     for (int i = 0; i < 600; i++)
         counter.observe(signature_of(frame(static_cast<uint8_t>(i % 251))), i / 60.0);
 
-    PresentRateSnapshot snapshot;
-    snapshot.published = counter.published();
-    snapshot.distinct = counter.distinct();
-    snapshot.first_publication_seconds = counter.first_publication_seconds();
-    snapshot.now_seconds = 600 / 60.0;
-
-    const FrameRate rate = frame_rate_since_first_publication(snapshot);
+    const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, 600 / 60.0));
     CHECK(rate.measured, "a live title's rate is measured");
     CHECK(rate.published == 600, "every publication is counted");
     CHECK(rate.distinct == 600, "every publication carried new content");
     CHECK(rate.presented_fps > 55 && rate.presented_fps < 65, "presented rate is ~60 fps");
     CHECK(rate.distinct_fps > 55 && rate.distinct_fps < 65, "distinct rate is ~60 fps");
-    CHECK(!frame_rate_is_mostly_retained(rate), "a live title is not labelled mostly-retained");
+    CHECK(rate.typical_measured && rate.typical_fps > 55 && rate.typical_fps < 65,
+          "the TYPICAL rate is ~60 fps too -- with no idling, headline and average agree");
+    CHECK(rate.active_fraction > 0.95,
+          "a title producing frames throughout is ~100% active");
+    CHECK(!frame_rate_is_mostly_unchanged(rate), "a live title is not labelled mostly-retained");
 }
 
 // THE ARM. Identical timing and identical publication count to the live case above; the ONLY
@@ -148,23 +163,28 @@ void frozen_title_does_not_report_full_speed() {
     for (int i = 0; i < 600; i++)
         counter.observe(signature_of(retained), i / 60.0);
 
-    PresentRateSnapshot snapshot;
-    snapshot.published = counter.published();
-    snapshot.distinct = counter.distinct();
-    snapshot.first_publication_seconds = counter.first_publication_seconds();
-    snapshot.now_seconds = 600 / 60.0;
-
-    const FrameRate rate = frame_rate_since_first_publication(snapshot);
+    const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, 600 / 60.0));
     CHECK(rate.published == 600, "a frozen title still PUBLISHES at full rate");
     CHECK(rate.presented_fps > 55 && rate.presented_fps < 65,
           "...so its presented rate is ~60 fps, which is exactly the trap");
     CHECK(rate.distinct == 1, "only the first publication carried new content");
     CHECK(rate.distinct_fps < 1.0, "the distinct rate does NOT report full speed");
-    CHECK(frame_rate_is_mostly_retained(rate), "a frozen title is labelled mostly-retained");
+    CHECK(frame_rate_is_mostly_unchanged(rate), "a frozen title is labelled mostly-retained");
+
+    // The headline must be ABSENT, not zero and not fast. One distinct frame yields no interval, so
+    // there is nothing to take a median of -- and reporting "0.0 fps" would be a measurement where
+    // none exists. The 0% beside it is what makes the absence legible.
+    CHECK(!rate.typical_measured && rate.typical_fps == 0,
+          "a frozen title has NO typical rate rather than a zero one");
+    CHECK(rate.active_fraction == 0, "...and is 0% active");
 
     const std::string text = format_frame_rate(rate);
-    CHECK(text.find("distinct 0.1 fps") == 0,
-          "the formatted line leads with the distinct rate, not the presented one");
+    CHECK(text.find("-- fps while producing frames, 0% of the") == 0,
+          "the formatted headline reads '-- fps ... 0% active', never a number");
+    CHECK(text.find("there is no framerate to report") != std::string::npos,
+          "...and says so in words");
+    CHECK(format_frame_rate_short(rate, 1920, 1080) == "-- fps  0% active  1920x1080",
+          "the compact form a HUD or an overlay burns says the same thing");
 }
 
 // The same freeze, but with a DIFFERENT buffer holding identical bytes each time. The renderer's
@@ -180,6 +200,76 @@ void frozen_title_with_distinct_buffers_is_still_frozen() {
     CHECK(counter.distinct() == 1, "identical pictures in different buffers are one distinct frame");
 }
 
+// THE ARM FOR THE HEADLINE. This is The Messenger's measured shape, reproduced exactly: bursts of
+// real frames around a long idle stretch, where the run AVERAGE describes neither mode.
+//
+// A title that renders at 20 fps and then sits on a menu is a 20 fps title. Averaging it to 4 puts
+// it in the "we have work to do" bucket it does not belong in -- and that bucket decision is what
+// the number is for. So the headline is a median over intervals, which weights by FRAME: the
+// 120-second pause below is ONE interval, not 120 seconds of pull.
+void a_title_that_pauses_reports_its_producing_rate() {
+    FrameRateCounter counter;
+    double t = 0;
+    auto burst = [&](int frames) {
+        for (int i = 0; i < frames; i++) {
+            counter.observe(signature_of(frame(static_cast<uint8_t>(i % 251))), t);
+            t += 1.0 / 20.0;                       // 20 fps while producing
+        }
+    };
+    burst(300);                                    // 15 s of real frames
+    const std::vector<uint8_t> held = frame(200);
+    for (int i = 0; i < 2400; i++) {               // 120 s of a frozen picture, republished at 20 Hz
+        counter.observe(signature_of(held), t);
+        t += 1.0 / 20.0;
+    }
+    burst(300);                                    // 15 s more
+
+    const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, t));
+
+    // What the average says, and why it is not quotable: 601 distinct frames over 150 seconds.
+    CHECK(rate.distinct_fps > 3.5 && rate.distinct_fps < 4.5,
+          "the run AVERAGE is ~4 fps -- a true number that describes neither mode");
+
+    // What the headline says.
+    CHECK(rate.typical_measured, "a title that produced frames has a typical rate");
+    CHECK(rate.typical_fps > 17 && rate.typical_fps < 23,
+          "the TYPICAL rate is ~20 fps: the rate it runs at while it is running");
+    CHECK(rate.active_fraction > 0.12 && rate.active_fraction < 0.30,
+          "...and it was active for ~20% of the run, which is what stops 20 fps being quoted bare");
+
+    // The three cases the pair has to separate, checked against each other rather than in isolation.
+    // A slow-but-healthy title is the one an absolute threshold would misfile, so it is here.
+    FrameRateCounter slow;
+    for (int i = 0; i < 150; i++) slow.observe(signature_of(frame(static_cast<uint8_t>(i % 251))), i * 1.0);
+    const FrameRate slow_rate = frame_rate_since_first_publication(snapshot_of(slow, 150.0));
+    CHECK(slow_rate.typical_measured &&
+              std::fabs(slow_rate.typical_fps - 1.0) <= kIntervalRelativeError * 1.0 + 1e-9,
+          "a genuinely 1 fps title reports 1 fps, within the documented bucket tolerance");
+    CHECK(slow_rate.active_fraction > 0.95,
+          "...at ~100% active -- LOW AND ACTIVE is the 'we have work to do' bucket, and it is "
+          "distinguishable from fast-then-idle only because both numbers are reported");
+    CHECK(slow_rate.typical_fps < rate.typical_fps && slow_rate.active_fraction > rate.active_fraction,
+          "the slow title and the paused title differ in BOTH fields, in opposite directions");
+}
+
+// The recovered rate must match a known input to within the tolerance the header states. Without
+// this, the bucket constants could be widened for memory and the numbers would quietly get worse --
+// and these figures are filed in game trackers and compared across releases.
+void interval_estimator_is_accurate() {
+    for (double fps : {0.5, 1.0, 5.0, 20.0, 30.0, 60.0, 144.0}) {
+        FrameRateCounter counter;
+        const double dt = 1.0 / fps;
+        for (int i = 0; i < 200; i++)
+            counter.observe(signature_of(frame(static_cast<uint8_t>(i % 251))), i * dt);
+        const double got = 1.0 / counter.typical_interval_seconds();
+        char message[128];
+        std::snprintf(message, sizeof message,
+                      "a known %.1f fps signal is recovered as %.2f fps (within %.0f%%)",
+                      fps, got, kIntervalRelativeError * 100.0);
+        CHECK(std::fabs(got - fps) <= kIntervalRelativeError * fps + 1e-9, message);
+    }
+}
+
 void window_math() {
     PresentRateSnapshot a, b;
     a.published = 100; a.distinct = 100; a.now_seconds = 10.0;
@@ -187,10 +277,13 @@ void window_math() {
 
     const FrameRate window = frame_rate_between(a, b);
     CHECK(window.measured, "a window between two snapshots is measured");
+    CHECK(!window.typical_measured && window.typical_fps == 0 && window.active_fraction == 0,
+          "a differenced window claims NO typical rate: a cumulative histogram cannot be "
+          "subtracted, and a plausible wrong number is worse than an absent one");
     CHECK(window.published == 300 && window.distinct == 5, "the window subtracts both counters");
     CHECK(window.presented_fps > 59.9 && window.presented_fps < 60.1, "300 publications / 5 s");
     CHECK(window.distinct_fps > 0.9 && window.distinct_fps < 1.1, "5 distinct frames / 5 s");
-    CHECK(frame_rate_is_mostly_retained(window),
+    CHECK(frame_rate_is_mostly_unchanged(window),
           "a title that froze DURING the window is caught by the window, not only by the run total");
 
     // A reset between the readings must produce "no measurement", never a wrapped one.
@@ -249,6 +342,8 @@ int main() {
     std::printf("== live title ==\n");                   live_title_reports_its_real_rate();
     std::printf("== FROZEN title (the arm) ==\n");       frozen_title_does_not_report_full_speed();
     std::printf("== frozen, distinct buffers ==\n");     frozen_title_with_distinct_buffers_is_still_frozen();
+    std::printf("== a title that pauses (the arm) ==\n"); a_title_that_pauses_reports_its_producing_rate();
+    std::printf("== estimator accuracy ==\n");           interval_estimator_is_accurate();
     std::printf("== window arithmetic ==\n");            window_math();
     std::printf("== present-layer wiring ==\n");         present_layer_wiring();
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

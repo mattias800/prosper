@@ -45,7 +45,7 @@ int main() {
         CHECK(contains(lines, "60.0 presented"), "the presented rate is shown and labelled");
         CHECK(contains(lines, "1920x1080"), "the resolution is shown -- an fps has no meaning without it");
         CHECK(contains(lines, "3600 frames"), "the population behind the rate is shown");
-        CHECK(!contains(lines, "RETAINED"), "a healthy title is not warned about");
+        CHECK(!contains(lines, "not changing"), "a healthy title is not warned about");
     }
 
     // THE ARM. Identical publication rate; the content never changes. The headline must NOT read 60.
@@ -55,8 +55,11 @@ int main() {
               "a frozen title's HEADLINE is 0.0 fps, not the 60 it is publishing");
         CHECK(contains(lines, "60.0 presented"),
               "...the presented rate is still shown, so the divergence is visible rather than hidden");
-        CHECK(contains(lines, "RETAINED FRAME"),
-              "...and the reader is told in words that this is not the title's rate");
+        CHECK(contains(lines, "picture not changing"),
+              "...and the reader is told in words that the picture is not advancing");
+        CHECK(!contains(lines, "retained") && !contains(lines, "RETAINED"),
+              "...without asserting the RENDERER as the cause: a static menu is indistinguishable "
+              "from a re-served retained frame here, and naming the second manufactures a defect");
     }
 
     // A title genuinely running slowly is NOT a frozen one, and must not be labelled as one. This is
@@ -65,8 +68,8 @@ int main() {
     {
         const std::vector<std::string> lines = fps_hud_lines(window(1, 1, 1.0), 3840, 2160, 42);
         CHECK(lines[0] == "1.0 fps", "a genuinely 1 fps title reports 1.0 fps");
-        CHECK(!contains(lines, "RETAINED"),
-              "a slow-but-live title is not labelled retained -- every publication carried content");
+        CHECK(!contains(lines, "not changing"),
+              "a slow-but-live title is not warned about -- every publication carried content");
     }
 
     // Before anything is published there is no rate. "-- fps" is a different claim from "0.0 fps",
