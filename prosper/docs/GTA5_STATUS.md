@@ -110,6 +110,259 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **The full offline dissection pipeline is verified end to end on a fresh gameplay bundle, and the
+  exact invocations are recorded because three of the four are easy to get wrong.** Captured on the
+  stable four-decline baseline: **1.7 GB, 75 submits, 1,415 operations**, replays `RC=0`, and the
+  replayed composite is pixel-identical in content to the live frame (HUD, radar, tutorial text over
+  black) — so the bundle is faithful and the frame is deterministic offline.
+
+  ```bash
+  # 1. replay, and emit a target by extent
+  gpu_replay --bundle F.prgbundle --bundle-output-target 3840x2160 out.bmp
+  # 2. extract ONE submit to a .prgcap  (--bundle is INCOMPATIBLE with --inspect-only)
+  gpu_replay --bundle F.prgbundle --bundle-extract-submit <submit-no> sub.prgcap
+  # 3. inspect that
+  gpu_replay --inspect-only sub.prgcap
+  # 4. emit a named target after an operation -- the address needs 0x, and the op must be one
+  #    whose draw actually WRITES that address
+  gpu_replay --output-target-after 140:0x2058720000 sub.prgcap g.bmp
+  ```
+
+  Three traps, all hit: `--bundle` and `--inspect-only` are mutually exclusive (the parenthetical in
+  `CLAUDE.md` — "via `--bundle-extract-submit`" — governs all three dissection flags, not just
+  `--dump-resource`); the address in `--output-target-after` is parsed with `strtoull(..., 0)`, so a
+  leading-zero form is read as **octal** and silently fails the parse; and the operation must be one
+  that writes the target, or the tool refuses with `does not write addr=`.
+
+  **What the dissection found, and its limits.** In this frame's 302-operation submit, **297 draws
+  bind the three 4K G-buffer surfaces (`0x2085de0000`, `0x2083e00000`, `0x2081e20000`) and write none
+  of them — `cwm=0` on every one**, independently reproducing the same observation this document
+  records for its own frame's equivalent submit. The submit that does write 4K is a different one,
+  where `0x2058720000` takes **137 draws at `cwm=f`**; dumped after operation 140 it is **15%
+  non-zero with 88 distinct colours and shows the radar only — no world geometry**.
+
+  **That is one target at one operation and does NOT falsify** the resolved chain's "the world is
+  drawn, complete" claim, which rests on 521 dumps across the whole frame. It is recorded as a
+  starting point with a working recipe, not as a contradiction. The artifact is retained on the dev
+  box so the survey does not need another 14-minute route run. (2026-08-21.)
+
+  **Cost note for whoever runs the full survey — do NOT scan operations blindly.** Each
+  `--output-target-after` invocation re-loads the whole `.prgcap` (116 MB for one submit here), so a
+  descending scan over a 300-operation submit is 300 full loads for a single target. A sweep written
+  that way does not finish. Take the writing draw index `D` straight out of the `--inspect-only`
+  listing instead and scan the narrow window `D .. D+80`: operation and draw indices differ only by
+  the number of interleaved computes, measured at +5 in one submit here and +17 in another, so a
+  window that size is generous. The addresses to cover are the ones whose draws carry a non-zero
+  `cwm`; in this frame's post chain that is `0x2056740000`, `0x2058720000`, `0x205a700000`,
+  `0x205f1a0000`, `0x205fa20000`, `0x20602a0000`, plus `0x215ed10000` and `0x20471e0000`. And record
+  the extent the dump ACTUALLY returned: `0x205f1a0000` declares `extent=3840x2160` on its draws and
+  came back 1920x1080 at operation 61, so an address does not pin a resolution within a frame.
+  (2026-08-21.)
+
+- **`0x413dc6700`'s SRT slot dw0 carries a LOW-BIT TAG on exactly half its observations — and
+  prosper's GTA V packed-pointer path is never reached on this run.** `PROSPER_SRTDUMP=1` on a routed
+  run with the other three hangers declined:
+
+  | SRT slot | pointer observations | low bit set |
+  | --- | ---: | ---: |
+  | **dw0** | 2,140 | **1,074 (50%)** |
+  | dw12 | 88 | **0 (0%)** |
+
+  A 50/50 split on one slot and 0/88 on another is a **flag**, not corruption or misalignment — the
+  addresses read `…c1`, `…741`, `…8c1`, `…081`, each exactly +1 from the `…c0/…740/…8c0/…080` that
+  prosper's own writeback lines use for the same buffers, so prosper is already dropping the bit
+  somewhere. **1,793 of the dumps report `nz=2/2`** (non-empty payloads), so this is the resolved
+  regime and not the empty-SRT startup window that has voided earlier readings here.
+
+  **CORRECTED WITHIN THE HOUR — the tagged slot is NOT one of the five V# pointers.** This entry
+  first said the alternating bit sits on "the slot the five V#s are built from", and built a
+  double-buffer-parity argument on it. That is **wrong**. This program loads its five 64-bit pointers
+  at `+0x18/+0x20/+0x28/+0x30/+0x50` (§ *The first 88 folds see an EMPTY SRT*), i.e. dwords **6, 8,
+  10, 12 and 20**. The slot carrying the 50% tag is **dw0 — byte offset 0, not among them**; and the
+  only one of the five that the dump resolved, **dw12 (`+0x30`), is 0 of 88 odd**. Its pointer values
+  also sit in the `0x209c…` range, which is where the 120-byte bindings live, not the `0x20f848…`
+  traversal tables.
+
+  So the parity reading is **not supported by this measurement**: the slot that alternates is not a
+  V# source, and the V# source that was observed does not alternate. What survives is the bare fact
+  in the table — one SRT slot carries a low-bit flag on half its observations, and prosper drops that
+  bit — with **no established connection to the traversal buffers or to the two orientations**.
+
+  Recorded rather than deleted because it is the fourth mechanism this issue has seen proposed and
+  refuted in a day, and because I published the wrong version to the doc, the PR and the issue thread
+  before checking which dword offsets the five pointers actually occupy — a check that was two lines
+  further up this same document.
+
+  **`packed_pointer` logs zero lines in this run**, so `rdna2_gta5_packed_pointer.cpp` — prosper's
+  existing facility for exactly this class of GTA V pointer — is not engaged for this program.
+
+  **What is measured and what is not.** Measured: the counts above, the +1 relationship to the
+  writeback addresses, the non-empty regime, the zero packed-pointer hits. **Not** measured, and not
+  to be assumed: that the bit *means* parity, that masking it is wrong, or that honouring it would
+  change which buffer resolves. The next arm is direct — correlate the bit against the observed
+  orientation fold by fold; if the bit tracks the A/B split, it is the selector. (2026-08-21.)
+
+- **The overlapping views carry DIFFERENT STRIDES — 16 and 4 — over the same guest memory, and the
+  four "ping-pong" buffers land at offsets 0, 8252, 33024 and 66044 from one span base.** Measured
+  2026-08-21 from the binding declarations, all exact:
+
+  | resource | base | size | stride | records |
+  | --- | --- | ---: | ---: | ---: |
+  | `0x413e1c300`'s span | `0x20f8482140` | 33,024 | **16** | 2064 |
+  | the traversal table | `0x20f848417c` | 8,252 | **4** | 2063 |
+
+  Placing the four observed buffer addresses against that span base gives offsets **0**, **8,252**,
+  **33,024** and **66,044**. Three of those are exact structure: 8,252 is one table-size in;
+  33,024 is *precisely* the span's end address, i.e. the next block's base. **The fourth is not:
+  66,044 is 2 x 33,024 minus 4 — one 4-byte record short.**
+
+  So the memory is simultaneously described as 2064 records of 16 bytes and as 2063 records of
+  4 bytes, and the "ping-pong pair" is not two instances of one field: `…417c` is *one table into
+  block 0* while `…a240` is *offset 0 of block 1*. That is an odd shape for a double-buffer, and it
+  sits directly on the addressing suspicion raised by the 2-cycle structure above.
+
+  **What this is and is not.** The strides, sizes, bases and offsets are read from the run's own
+  binding declarations and the arithmetic is exact. **Not** established: that a regular array is
+  intended, that the 4-byte shortfall at 66,044 is wrong rather than deliberate, or which of the two
+  strides describes the guest's real record. All of that needs the guest's own structure, not more
+  address arithmetic — and address arithmetic is precisely where a plausible-looking wrong answer is
+  easiest to produce.
+
+  **Instrument note, because it cost a run.** `[parentscan]` is gated on `stride == 4`
+  (`buffer.resource->stride == 4u`), so it **cannot** scan the stride-16 span. An attempt to read the
+  neighbouring view of the same bytes with `PROSPER_COMPUTE_PARENTSCAN=413e1c300` produced **zero**
+  scan lines for ten minutes — inert by construction, not a negative result. The "compare the two
+  views" arm named above therefore needs an instrument that does not assume a 4-byte record.
+  (2026-08-21.)
+
+- **The cyclic table holds STRUCTURED data, not uninitialised garbage — and every cycle sampled is a
+  2-CYCLE between a pair of records whose words differ only in bit 30.** `[parentscan-ring]` samples
+  from the run that took the device loss (2026-08-21):
+
+  ```
+  idx=412 word=0x00000cf2 -> next=414      idx=414 word=0x40000ce2 -> next=412
+  idx=420 word=0x00000d32 -> next=422      idx=422 word=0x40000d22 -> next=420
+  idx=428 word=0x00000d72 -> next=430      idx=430 word=0x40000d62 -> next=428
+  ```
+
+  Read against the guest's own extract (`v_bfe_u32 v1, v1, 3, 27` at pc95 — bits [3:29], so bit 30 is
+  masked off): `0x00000cf2 >> 3 = 414` and `0x40000ce2 >> 3 & 0x7ffffff = 412`. The pair points at
+  itself.
+
+  **What the shape rules out.** Every sampled word carries low-three-bits `= 2` and each pair
+  differs by exactly `0x10` in the index field and by bit 30 (`0x40000000`); the pairs are
+  `(n, n+2)` and the pairs themselves are spaced 8 apart. Uninitialised memory does not look like
+  this, and neither does a random functional graph — whose cycle-length distribution would not be
+  uniformly 2. So **"prosper never populated this allocation" is dead**, and so is "the traversal
+  walks noise". The records are real and regular.
+
+  **What it does not establish**, and this is where the next session should start rather than
+  assume: whether bit 30 is a flag the *consumer* is meant to honour (a parent/last-sibling marker,
+  say), whether the traversal is reading the intended field at all, or whether prosper's V# base or
+  stride for this binding is off by a record so that each entry returns its neighbour's link. All
+  three produce exactly this signature. The guest's own extract ignores bit 30, so if the pairing is
+  real data correctly read, the same 2-cycle would hang a PS5 — which makes "correctly read" the
+  least likely of the three and puts the *addressing* of this binding first in line.
+
+  Cheap next arm: dump the same records through a different binding's view of that memory (§ *four
+  span granularities*, above) and compare — if the neighbouring 33,024-byte view yields different
+  words at the same guest addresses, the addressing is wrong; if identical, the data is. (2026-08-21.)
+
+- **A STABLE 840 s baseline exists: decline all FOUR hanging programs and the route runs clean, with
+  a composite that never stales.** Measured 2026-08-21, `tools/screenshot`,
+  `PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700,0x413e14900,0x413e16400,0x413d88400`:
+
+  ```
+  done: 42/42 screenshot(s)  stop=request-satisfied  source-distinct=42  pixel-distinct=42
+        max-source-stale=0.0s  max-pixel-stale=0.0s  guest=running  status=ok
+  ```
+
+  **Zero device losses across the whole 840 s**, and **42 of 42 frames pixel-distinct** — the
+  composite is live end to end rather than the frozen-after-loss pattern every earlier configuration
+  shows. Compare: the previous best in this document is a 400 s run that was *capped* at 400 s and
+  did not finish the route, and the runs recorded beside it lose the device and then hold an
+  identical CRC for the remainder. This one finishes on its own terms.
+
+  Reaching this needed the fourth program (§ *A FOURTH program hangs*); the three-program decline
+  still lost the device.
+
+  **This is a platform, NOT a result about the hang — and the distinction is the point.** Declining a
+  program removes its hang *and* its output. `0x413dc6700` is the one program measurably feeding the
+  lighting, so the world being absent here is exactly what a needed-but-skipped producer looks like.
+  **Nothing in this run bears on whether fixing the hang would light the world.** § *Skipping is not
+  fixing* already says this; it is repeated here because a clean 42/42 `status=ok` line is unusually
+  easy to mistake for a passing result.
+
+  What it is good for: every further experiment on this title now has a configuration that reaches
+  gameplay, stays there, and never loses the device — so a lever's effect can be read without the
+  confound of a run that dies at a different moment each time. Given that submit ordering varies run
+  to run (#2516), that confound has been present in most measurements taken here. (2026-08-21.)
+
+- **A NAMED MECHANISM for the producer/consumer gap: eight programs reach the traversal table through
+  FOUR different span granularities, and prosper gives overlapping guest ranges independent host
+  buffers.** `PROSPER_COMPUTE_ADDRESS_WATCH=0x20f848417c` on a routed run, **22,327 hits**:
+
+  | program(s) | base | size |
+  | --- | --- | ---: |
+  | `0x413cea300` | `0x20f8480000` | 347,040 |
+  | `0x413d88400` | `0x20f8480100` | 132,032 |
+  | `0x413ce3400`, `0x413ce6000`, `0x413cee500`, `0x413e1c300` | `0x20f8482140` | 33,024 |
+  | `0x413dc3400`, `0x413dc6700` | `0x20f848417c` | **8,252** |
+
+  Six programs bind a span that *contains* the table; two bind the 8,252-byte table itself. The
+  33,024-byte span is four consecutive tables, so the whole ping-pong set lives inside one resource
+  from four programs' point of view and as separate resources from the traversal's.
+
+  **Why that is a hazard here, read from the source rather than assumed.** Each resource is
+  materialized into its own `VkBuffer`. The in-dispatch alias check refuses to share one unless
+  `gpu_addr` **and** `size` match exactly (plus several other fields), so an 8,252-byte table and a
+  33,024-byte span over the same bytes are two independent host copies. Persistent buffers are cached
+  on `ComputeBufferCacheKey{gpu_addr, host_data, bytes, materialization}`, and
+  `invalidate_cached_buffer_source` takes **that exact key** — there is no overlap-keyed
+  invalidation. So a write through the span's copy does not invalidate the table's cached copy, and a
+  read through the table's copy can see bytes that predate it.
+
+  That is exactly the shape the measurements demand: prosper's own writes are clean 43/43 (above),
+  the reading program did not write the cyclic table (`changed=0`, above), and yet the table it reads
+  is cyclic. A stale copy is a producer/consumer gap that needs no corrupting writer — which is also
+  why every attempt to name a corrupting *program* has failed.
+
+  **The WITHIN-program case is NOT the bug — checked, because it looks exactly like one.** The same
+  census shows `0x413dc6700` reaching this memory through **nine** bindings at one identical
+  `base=0x20f848417c size=8252`: loads at bindings 4/5/8 (fetch-pc 53/65/**91**, the traversal read)
+  and stores at 28/30/31/32/33/34 (fetch-pc **618/629/641/653/665/677** — the six phase-2 stores).
+  Nine resources over one span is a natural place to suspect lost updates, and the writeback log
+  *looks* damning: binding 4 reports `changed=641` while binding 8 reports `changed=0` on the same
+  address. It is benign. The alias check's conditions are all satisfied here, and on a match
+  `buffers[i]` takes the owner's `buffer` and `memory` and the owner inherits `writable` — one
+  VkBuffer, one writeback by the owner, `changed=0` on every alias by construction. So the six stores
+  and the traversal load share storage exactly as they should, and this program does **not** lose its
+  own writes. The hazard above is strictly the **cross-program, cross-dispatch** one, where the spans
+  differ and the persistent cache keys differ with them.
+
+  **REFUTED, same day, by the size gate — the persistent cache is NOT the vector.**
+  `persistent_compute_buffer_enabled()` ends `return enabled && bytes >= (1u << 20)`: the persistent
+  buffer cache applies only at **1 MiB and above**. Every span in the table above is far below it —
+  347,040 / 132,032 / 33,024 / **8,252** bytes — so **none of these resources is ever persistently
+  cached**, and the cross-dispatch staleness argument cannot operate on them. Each dispatch creates
+  its buffer, uploads from guest memory, and writes back.
+  The measured half of this entry stands (eight programs, four granularities, 22,327 hits, the
+  exact-match alias condition, the exact-key invalidation); the *inference* built on top of it does
+  not. Recorded rather than deleted because the reasoning was checkable in one line and I did not
+  check it before writing the entry.
+  **The consequence is a real narrowing, and it points the opposite way:** if every dispatch reads
+  these tables fresh from guest memory, then the cyclic graph the traversal consumes is genuinely
+  *in guest memory* — not an artifact of prosper's buffer management. Combined with "prosper's own
+  writes are clean 43/43" and "the reading dispatch did not write it (`changed=0`)", what remains is
+  a producer that is not the measured compute chain: the guest's own CPU-side construction over
+  inputs prosper supplied, or a GPU path outside these dispatches.
+
+  **What is measured and what is not.** Measured: everything listed above. **Not** measured: that a
+  lost update actually occurs on this route — no arm yet shows a specific write through one range
+  failing to appear through another. That is the next experiment, and it is cheap: watch one address
+  through both granularities across a dispatch pair and compare the bytes. Until then this is a
+  mechanism with strong circumstantial support, not a demonstrated defect. (2026-08-21.)
+
 - **PROSPER'S OWN WRITES ARE CLEAN: every table it actually writes comes out acyclic and fully
   terminating, 43 of 43.** This is the causal test done *within a single dispatch* — scanning the
   table after the dispatch that wrote it — so it is immune to the cross-dispatch attribution error
@@ -391,6 +644,7 @@ the next one, and no run has yet finished the route with zero device losses.
 | 1 | `0x413dc6700` | *(nothing)* | `submit=9016 dispatch=40` |
 | 2 | `0x413e14900` | #1 | `submit=34930 dispatch=135` |
 | 3 | `0x413e16400` | #1, #2 | `submit=3628 dispatch=2946` |
+| 4 | `0x413d88400` | #2, #3 declined + #1 trip-bounded | `submit=4476 dispatch=54` (2026-08-21) |
 
 The submit indices are **not** monotonic down the table, and that is not a typo: each row is a
 different run whose trajectory changed when a program was declined, and submit ordering already varies
@@ -402,6 +656,28 @@ program, which cannot reveal a second — it only moves the loss past where most
 three declined a run reached **400 s** with zero losses, but that run was **capped at 400 s and did not
 finish the route**, so it is not a zero-loss completion and does not close the search. Read the two
 sentences together: three is what declining twice revealed, not a total.
+
+**A FOURTH program hangs, found 2026-08-21, and it extends the lower bound rather than closing it.**
+Routed run with `0x413e14900` and `0x413e16400` declined and `0x413dc6700` trip-bounded
+(`PROSPER_CFG_TRIP_BOUND=4096 _PROGRAM=0x413dc6700 _PHASE=0`, **647 HIT lines**, so the bound was
+genuinely armed and firing). The device still went:
+
+```
+[compute] fatal Vulkan device loss stage=queue-submit result=VK_ERROR_DEVICE_LOST(-4)
+          program=0x413d88400 submit=4476 dispatch=54 order=4205; disabling live compute
+```
+
+`0x413d88400` was already in this document as a resource-census entry — it binds `0x20f8480100`
+size 132,032, one of the four span granularities over the traversal table — but had never been seen
+taking the device. It is the same pattern the table above records: each decline reveals the next one,
+so four is still a lower bound.
+
+**Consequence for the trip-bound lever's reported result.** That loss lands at ~100 s, well before
+gameplay: the composite CRC freezes at shot 04 (100 s) and is byte-identical for the remaining
+740 s of the run. So this run cannot speak to the "~7x more distinct colours" measurement recorded
+below — it never reached the state that measurement describes, and the two are not in conflict.
+Submit ordering varies run to run on this title (#2516), so which program takes the device first
+varies with it.
 
 **`0x413e16400` is the first with a named fallback cause**, from the reporter added in #2684:
 
