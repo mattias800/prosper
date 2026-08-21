@@ -2559,20 +2559,37 @@ HLE(k_amm_get_va_ranges) {
     // SAFELY: it stores the base at state+0xeca8, and its heap-grow path tests that slot for zero
     // (eboot+0xdbbdc6) and takes its own no-AMM branch. Raised in review.
     //
-    // The caveat a reviewer raised about that zero, checked rather than inherited. The guest also
-    // classifies pointers against the window at eboot+0xda0f5e:
+    // What the zero costs, stated the right way round. This comment previously claimed the opposite
+    // and the correction is worth keeping visible, because the mistake was not a misread
+    // instruction — the disassembly was right — it was substituting the value I EXPECTED for the
+    // one the guest computes from it.
     //
-    //     rdx = 0x100000000 + state[0xecd0]      ; 4 GiB + the AMM size
-    //     rcx = ptr - state[0xeca8]              ; ptr - the AMM base
+    // The guest classifies pointers against the window at eboot+0xda0f5e:
+    //
+    //     rdx = 0x100000000 + state[0xecd0]      ; 4 GiB + the AMM SIZE
+    //     rcx = ptr - state[0xeca8]              ; ptr - the AMM BASE
     //     cmp %rdx,%rcx ; jbe 0xda0fad           ; taken => treat as AMM memory
     //
-    // With base and size both zero that reduces to "ptr <= 4 GiB", so the AMM arm is taken for any
-    // pointer below 4 GiB and for nothing above it. No guest pointer is below 4 GiB — the eboot
-    // maps at 0x410000000 and the auto-map region starts at 0x2000000000 — so on this path the arm
-    // is unreachable for a real pointer, which is why the zero stands. It is worth knowing rather
-    // than worth changing: the path is reachable only when the 68 GiB reservation itself fails,
-    // which announces itself loudly, and the only alternative answer is the stack residue that
-    // produced the 0x1d0000 fault in the first place.
+    // The base is zero here. The SIZE IS NOT. The initialiser derives it as
+    // min(requested, span - 4 GiB) at eboot+0xdbf532-0xdbf538, and on a zero window `span - 4 GiB`
+    // UNDERFLOWS to 0xffffffff00000000, so the `cmovb` picks the other operand — the guest's own
+    // request, 0x8000000000. That lands at state+0xecd0 via eboot+0xdbf62f, which is where both
+    // bail branches jump AND what straight-line execution reaches. (Neither bail even fires:
+    // 0x8000000000 is not < 0x8020, and the `je` needs a base of exactly -4 GiB.)
+    //
+    // So rdx = 0x8100000000 and the arm is taken for every pointer below 516 GiB — which is EVERY
+    // real guest pointer: the eboot maps at 0x410000000 and the auto-map region starts at
+    // 0x2000000000. The classifier answers "this is AMM memory" for all of them, and misses only
+    // addresses above 516 GiB, i.e. exactly where the window would have been had it been reserved.
+    //
+    // Zero is still the right answer, and for a reason that is not "it is harmless": a NON-zero
+    // base would defeat the gate that actually saves this path. The heap-grow path tests
+    // state+0xeca8 for zero at eboot+0xdbbdc6 and takes its own no-AMM branch, so nothing is ever
+    // mapped into the window that does not exist. That gate is doing all of the work, and the
+    // residual risk is whatever else consults the classifier afterwards — which is NOT established.
+    // Tracked as #2889 rather than papered over with a confident sentence. Reachable only when the
+    // 68 GiB reservation itself fails, which announces itself loudly, and the only alternative
+    // answer on this path is the stack residue that produced the 0x1d0000 fault in the first place.
     *(uint64_t*)a0 = ok ? base : 0;          // both validated above, before anything was reserved
     *(uint64_t*)a1 = ok ? base + size : 0;
     if (a2 > 0xffff) *(uint64_t*)a2 = 0;
