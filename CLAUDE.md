@@ -64,7 +64,7 @@ For anything title- or subsystem-specific, use the table in the next section rat
 
 ## Where the project stands (2026-08-17)
 
-`COMPATIBILITY.md` is authoritative for the **user-facing per-title milestones** — 39 tracked titles
+`COMPATIBILITY.md` is authoritative for the **user-facing per-title milestones** — 40 tracked titles
 at this refresh. Do not duplicate its rung counts here; read it, then open the one doc named below for
 whatever you are about to touch. This section is a map, not a status report. Long-lived `tracker:game`
 issues and their comments carry each active title's current development rung, route, blockers and
