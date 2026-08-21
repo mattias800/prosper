@@ -1622,7 +1622,32 @@ inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, u
 struct PcrelTables {
     std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf;
     std::unordered_map<uint32_t, std::vector<uint32_t>> smem;
+    // TYPED consumer of the same idiom (#2859). Sonic Frontiers' three Cyber Space scene kernels
+    // build the identical getpc V# and read it with `tbuffer_load_format_x ..., s[0:3], 0 offen`,
+    // twice each. Kept in its own map rather than merged into `mubuf` because the two are admitted
+    // under different predicates: an MTBUF site is only foldable when its BUF_FMT performs NO
+    // conversion (see the case below), and a shared map would let the untyped rules speak for a
+    // typed site.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mtbuf;
 };
+
+// True when a typed-buffer BUF_FMT stores exactly 32 bits per component and applies no conversion,
+// so a typed fetch of `components` components is byte-identical to the same number of raw dwords.
+// rdna2_buffer_format maps 20/21/22 to Uint32/Sint32/Float32 (n=1), 62/63/64 (n=2), 72/73/74 (n=3)
+// and 75/76/77 (n=4); every other value either narrows, normalizes or packs. The component count
+// must MATCH the opcode's, because a typed load whose format is narrower than the opcode
+// default-fills the missing components (0,0,0,1) instead of reading them.
+// CONFIDENCE: HIGH — the identity is the format table's own definition. The live-evidence case is
+// BUF_FMT 22 (`32_FLOAT`, one component); the rest of the family is admitted by the same argument.
+inline bool rdna2_buffer_format_is_raw_dwords(uint32_t format, uint32_t components) {
+    switch (format) {
+        case 20: case 21: case 22: return components == 1;
+        case 62: case 63: case 64: return components == 2;
+        case 72: case 73: case 74: return components == 3;
+        case 75: case 76: case 77: return components == 4;
+        default: return false;
+    }
+}
 
 inline PcrelTables detect_pcrel_tables(
         const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords,
@@ -1748,6 +1773,33 @@ inline PcrelTables detect_pcrel_tables(
             case Rdna2Format::VOP3:
                 if (in.sdst.kind == OperandKind::SGPR) { kill(in.sdst.value); kill(in.sdst.value + 1); }
                 break;
+            case Rdna2Format::MTBUF: {
+                // Same proof as the MUBUF case below, with two extra obligations: the typed format
+                // must be a pure 32-bit-per-component pass-through (so the fold copies dwords, not
+                // converted texels), and TFE must be off (its trailing status word is not modelled).
+                if (in.opcode > 0x03u || in.mtbuf_tfe) break;      // typed LOADS only, no status
+                const uint32_t components = in.opcode + 1u;
+                if (!rdna2_buffer_format_is_raw_dwords(in.mtbuf_format, components)) break;
+                const int sb = in.src[1].value;
+                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
+                const uint32_t nrec = kconst[sb + 2];
+                const bool idxen = (in.literal >> 13) & 1u;
+                const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                   (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const uint64_t off = pcoff[sb];
+                uint32_t newest = 0;
+                for (int r : {sb, sb + 1, sb + 2}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
+                bool entered = false;
+                for (uint32_t t : br_targets) if (t > newest && t <= in.pc) { entered = true; break; }
+                if (entered) break;
+                if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
+                    off / 4 + nrec / 4 > dwords) break;
+                if (required_dwords)
+                    *required_dwords = std::max(*required_dwords,
+                                                static_cast<size_t>(off / 4 + nrec / 4));
+                out.mtbuf[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
+                break;
+            }
             case Rdna2Format::MUBUF: {
                 if (in.opcode < 0xCu || in.opcode > 0xFu) break;   // raw loads only
                 const int sb = in.src[1].value;                    // SRSRC base SGPR of the V# quad

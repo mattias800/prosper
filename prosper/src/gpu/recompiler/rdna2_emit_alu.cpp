@@ -1063,7 +1063,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Accepted ONLY when the pcrel pre-pass FOLDED an embedded-table load from this
                 // shader — the pair then only feeds that folded chain. Otherwise the PC would flow
                 // into unmodeled address math: keep rejecting.
-                if (rs.mubuf_pcrel_tables.empty() && rs.smem_pcrel_tables.empty()) {
+                if (rs.mubuf_pcrel_tables.empty() && rs.smem_pcrel_tables.empty() &&
+                    rs.mtbuf_pcrel_tables.empty()) {
                     ok = false; return true;
                 }
                 for (int k = 0; k < 2; k++) {
@@ -5654,9 +5655,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // table bytes live inside the shader blob — detect_pcrel_tables already copied them out.
             // Fold to a compile-time constant lookup: dword index = (inst offset + offen VADDR) >> 2;
             // out-of-range indexes read 0 (the hardware's OOB contract for a bounded V#).
-            if (!is_format && !is_store && !is_atomic && !raw_subword) {
-                auto pt = rs.mubuf_pcrel_tables.find(in.pc);
-                if (pt != rs.mubuf_pcrel_tables.end()) {
+            //
+            // The TYPED consumer of the same idiom (#2859) folds identically. Sonic Frontiers' three
+            // Cyber Space scene kernels build the V# exactly as above and read it with
+            // `tbuffer_load_format_x v, v, s[0:3], 0 offen` at BUF_FMT 22 (`32_FLOAT`), twice each --
+            // so the untyped-only guard, not the idiom, is what refused them. detect_pcrel_tables
+            // admits an MTBUF site only when its format stores 32 bits per component and its
+            // component count matches the opcode, which makes the typed fetch a raw dword copy; that
+            // proof is what licenses relaxing `is_format` here, and only for a pc it recorded.
+            const bool mtbuf_pcrel_fold = in.fmt == Rdna2Format::MTBUF &&
+                                          rs.mtbuf_pcrel_tables.count(in.pc) != 0;
+            if ((!is_format || mtbuf_pcrel_fold) && !is_store && !is_atomic && !raw_subword) {
+                const auto& pcrel_tables = mtbuf_pcrel_fold ? rs.mtbuf_pcrel_tables
+                                                            : rs.mubuf_pcrel_tables;
+                auto pt = pcrel_tables.find(in.pc);
+                if (pt != pcrel_tables.end()) {
                     const std::vector<uint32_t>& tab = pt->second;
                     uint32_t addr = b.uconst(offset);
                     if (offen) { Operand ov{OperandKind::VGPR, in.src[0].value};
@@ -7166,13 +7179,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     std::fprintf(stderr,
                                  "[mimg-mip] program=0x%llx image_load_mip declined pc=%u shape=%d "
                                  "proven_zero_mip=%d img_dim=%u/%u samples=%u mips=%u mip_tail=%d "
-                                 "compressed=%d array_in_gfx=%d\n",
+                                 "compressed=%d array_in_gfx=%d addr=0x%llx %ux%ux%u fmt=%d "
+                                 "tile=%u dmask=0x%x unorm=%u glc=%u layer_stride=%u\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  (int)rdna2_mimg_zero_mip_shape(in),
                                  (int)res->proven_zero_mip, res->img_dim, in.mimg_dim,
                                  res->sample_count, res->declared_mip_levels,
                                  (int)res->in_mip_tail, (int)res->compression_enabled,
-                                 (int)(in.mimg_dim == 5u && !b.is_compute));
+                                 (int)(in.mimg_dim == 5u && !b.is_compute),
+                                 (unsigned long long)res->gpu_addr, res->width, res->height,
+                                 res->depth, (int)res->format, res->tile_mode, in.mimg_dmask,
+                                 in.mimg_unorm, in.mimg_glc, res->layer_stride_bytes);
                 ok = false;
                 return true;
             }

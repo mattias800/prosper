@@ -2801,6 +2801,72 @@ int main() {
                             std::size(pcrel_table_vs_after_saved_mask), nullptr).empty(),
           "a scalar write ends a saved B64 mask lifetime: the recycled pair reads as data (#2783)");
 
+    // TYPED consumer of the same PC-relative embedded table (#2859). Sonic Frontiers' three Cyber
+    // Space scene kernels (`0x2005714000`, `0x2005717e00`, `0x200571bd00`) build the identical
+    // getpc V# and read it with `tbuffer_load_format_x v10, v10, s[0:3], 0 offen` -- word0
+    // 0xe8b01000, which is the exact word0 used by the third arm below. Before the MTBUF case in
+    // detect_pcrel_tables the table never folded, so `s_getpc_b64` had nothing to justify it and
+    // rejected, and each program's terminal reject was that getpc.
+    //
+    // Every arm keeps the layout of the untyped control above byte-for-byte, so the s_getpc offset
+    // and the table's dword index are unchanged and the ONLY difference is the load instruction.
+    const uint32_t pcrel_table_vs_typed_xyzw[] = {
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe801f00u,               // s_getpc_b64 s[0:1] (next PC byte = 16)
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0 (table byte = 56)
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0
+        0xea6b1000u, 0x80000004u,  // tbuffer_load_format_xyzw v[0:3], v4, s[0:3], 0 fmt:32_32_32_32_FLOAT offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x03020100u,  // exp pos0, v0, v1, v2, v3
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    CHECK(!recompile_vertex(pcrel_table_vs_typed_xyzw,
+                            std::size(pcrel_table_vs_typed_xyzw), nullptr).empty(),
+          "a TYPED 32-bit embedded-table load folds the same PC-relative table (#2859)");
+
+    // The predicate is a restriction, not a widening: the same program with a CONVERTING typed
+    // format (BUF_FMT 65 = 16_16_16_16_UNORM) has no raw-dword identity, so the fold must NOT be
+    // offered and the getpc must still reject. Without this arm the change above is
+    // indistinguishable from "accept every MTBUF".
+    const uint32_t pcrel_table_vs_typed_converting[] = {
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe801f00u,               // s_getpc_b64 s[0:1]
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0
+        0xea0b1000u, 0x80000004u,  // tbuffer_load_format_xyzw ... fmt:16_16_16_16_UNORM offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x03020100u,  // exp pos0, v0, v1, v2, v3
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    CHECK(recompile_vertex(pcrel_table_vs_typed_converting,
+                           std::size(pcrel_table_vs_typed_converting), nullptr).empty(),
+          "a CONVERTING typed format is still refused the embedded-table fold (#2859)");
+
+    // The live shape itself: one component, BUF_FMT 22 (`32_FLOAT`). word0 here is byte-identical
+    // to Sonic Frontiers' own instruction; only the register numbers differ.
+    const uint32_t pcrel_table_vs_typed_x[] = {
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe801f00u,               // s_getpc_b64 s[0:1]
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0
+        0xe8b01000u, 0x80000004u,  // tbuffer_load_format_x v0, v4, s[0:3], 0 fmt:32_FLOAT offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x00000000u,  // exp pos0, v0, v0, v0, v0
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    CHECK(!recompile_vertex(pcrel_table_vs_typed_x,
+                            std::size(pcrel_table_vs_typed_x), nullptr).empty(),
+          "Sonic Frontiers' own tbuffer_load_format_x embedded-table word folds (#2859)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
