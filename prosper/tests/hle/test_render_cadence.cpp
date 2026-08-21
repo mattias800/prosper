@@ -29,11 +29,14 @@ using prosper::render_cadence_override_percent;
 int main() {
     constexpr uint64_t kMin = 256;
 
-    // No cadence requested -> "inert" is not a verdict the run can earn, however DMA behaves.
+    // No cadence requested -> "inert" is not a verdict the run can earn, however DMA behaves. The
+    // counters here are deliberately the fully-inert shape, so this arm fails if the
+    // `requested_cadence <= 1` guard is deleted; giving it {4096,0,0} would make it pass through the
+    // min-samples guard instead and pin nothing.
     {
-        const RenderCadenceCounters c{4096, 0, 0};
+        const RenderCadenceCounters c{4096, 3840, 3840};
         CHECK(!render_cadence_is_inert(1, c, kMin),
-              "every=1 requests no sparse phase, so it is never reported inert");
+              "every=1 requests no sparse phase, so it is never inert even when every skip is forced");
     }
 
     // The Plucky Squire shape: every skip the cadence asked for was rendered anyway.

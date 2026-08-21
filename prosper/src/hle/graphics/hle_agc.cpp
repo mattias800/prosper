@@ -1870,6 +1870,11 @@ static void report_render_cadence(unsigned requested_cadence, bool cadence_wante
     static const bool log_enabled = getenv("PROSPER_RENDER_CADENCE_LOG") != nullptr;
     constexpr uint64_t kLogInterval = 2048;           // periodic line, opt-in
     constexpr uint64_t kWarnAfterSkipsWanted = 256;   // enough to be a rate, not a coincidence
+    // Cadence 1 with logging off is the default path of every ordinary run: there is no sparse phase
+    // to be inert and no line to print, so take nothing on the submit path. This also means the
+    // counters freeze where PROSPER_RENDER_EVERY_FOR_MS hands the cadence back, which is the honest
+    // denominator for a "% of requested skips" figure -- the cadence-1 tail requested no skips.
+    if (requested_cadence <= 1 && !log_enabled) return;
     static std::mutex mu;
     static prosper::RenderCadenceCounters counters;
     static bool warned = false;
@@ -1898,7 +1903,7 @@ static void report_render_cadence(unsigned requested_cadence, bool cadence_wante
                 (unsigned long long)snapshot.skips_wanted);
     if (log_now)
         fprintf(stderr,
-                "[render-cadence] draw_submits=%llu requested_every=%u skips_wanted=%llu "
+                "[render-cadence] draw_submits=%llu cadence_now=%u skips_wanted=%llu "
                 "dma_forced=%llu (%.1f%% of requested skips)\n",
                 (unsigned long long)snapshot.draw_submits, requested_cadence,
                 (unsigned long long)snapshot.skips_wanted,

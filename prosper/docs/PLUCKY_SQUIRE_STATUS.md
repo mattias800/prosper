@@ -131,7 +131,10 @@ read together.
 
 **1. The guest's tick rate collapses when the 3D world comes up.** `PROSPER_PAD_SCRIPT_LOG=1` carries
 the guest's own pad-read counter, and the UE4 log prefix carries `GFrameCounter`; the two agree, which
-is what makes this a guest-side measurement rather than a renderer one:
+is what makes this a guest-side measurement rather than a renderer one. The table counts **guest
+polls**; the flip rate that drives the clock below is the same quantity to within the tick-to-flip
+ratio (UE polls the pad once per game tick and flips once per rendered frame), so the two are used
+interchangeably here and the small difference is inside the model's error bar:
 
 | phase | guest polls/s |
 | --- | --- |
@@ -153,10 +156,13 @@ Checked numerically against the title's own logic clock rather than assumed: ove
 pre-cutscene window the guest flipped ~2.3/s, predicting 221 x 2.3 x 16.7 ms = **8.5 s** of game time;
 the game's `LOGIC:` stamps moved 3.577 -> 11.222, i.e. **7.6 s**.
 
-**Multiply the two and the wall is exact.** At 0.19 flips/s the cutscene's clock runs at
+**Multiply the two and the wall follows.** At 0.19 flips/s the cutscene's clock runs at
 0.19 x 16.7 ms = **~3 ms of game time per second of wall clock, ~0.3% of real time**. The intro is
-~60 s of game time, so a default-cadence run needs **~5-6 hours** to finish it. The 1,200 s run that
-"never reached gameplay" bought about **3.5 seconds** of it.
+~60 s of game time, so a default-cadence run needs **hours** to finish it; the 1,200 s run that
+"never reached gameplay" bought a few seconds of it. Treat the model as an order-of-magnitude
+account, not a stopwatch — it over-predicted the one interval it was checked against by ~11% (8.5 s
+predicted, 7.6 s measured), because not every guest tick is a flip and the intro's exact length is
+not measured. The conclusion survives any correction that size: nothing near 1,200 s is enough.
 
 So this title's rung-3 blocker is a renderer-throughput problem wearing a progression problem's
 clothes. Nothing about the cutscene logic, the route, or the two absent fog programs is implicated.
