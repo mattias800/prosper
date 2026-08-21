@@ -584,8 +584,16 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   and deliberately unaffected behavior, record risks, and list the exact build/test/snapshot commands and
   results. PRs that advance a game's visible progression must attach representative screenshots and identify
   the title, platform, and reached checkpoint; black or diagnostic-only captures are not progression evidence.
-  Use direct, unmodified frontend captures and name the frontend plus the run route in each caption; output
+  Use direct frontend captures and name the frontend plus the run route in each caption; output
   produced by forced guest-state diagnostics may illustrate an investigation but is not acceptance evidence.
+  - **What "unaltered" forbids is misrepresenting the progress, not annotating it.** The rule exists so a
+    screenshot cannot be made to show more than the emulator actually achieved. So: no retouching, no
+    compositing several frames into one, no substituting artwork or an icon for something that did not
+    render, no cherry-picked frame passed off as the steady state, and no forcing guest state to
+    manufacture a better-looking frame. **Annotation that prosper itself draws over its own output is
+    fine and often better** — an fps counter, a timestamp, a route or frame ordinal. Those add measured
+    facts about the run; they do not change what the run rendered. Keep annotation legible and out of
+    the way of whatever the capture is evidence *for*, and say in the caption that it is on.
   Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern.
