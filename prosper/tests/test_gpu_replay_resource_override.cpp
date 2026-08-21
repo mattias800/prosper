@@ -94,7 +94,7 @@ int main() {
               replay.items[0].prt->resources[1].host_data == original_neighbour_pointer &&
               neighbour == std::vector<uint8_t>({0xaa, 0xbb, 0xcc, 0xdd}),
           "unselected stage and binding retain their original objects and bytes");
-    CHECK(applied.target.item_index == 0 && applied.target.resource_index == 0 &&
+    CHECK(applied.target.item_index == prosper::tools::ItemIndex{0} && applied.target.resource_index == 0 &&
               applied.target.gpu_addr == 0x12345000 && applied.target.captured_size == 4,
           "installed override reports exact draw-resource identity and captured span");
 

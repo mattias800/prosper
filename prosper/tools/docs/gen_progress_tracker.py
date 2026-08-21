@@ -152,7 +152,7 @@ EXPECTED_RUNGS = 6
 RUNG_NAMES = {
     1: "any real graphics",
     2: "title screen",
-    3: "gameplay with real GPU draws",
+    3: "gameplay with the scene rendering",
     4: "manual visual verification",
     5: "PS5 hardware-oracle comparison",
     6: "reviewed automatic gameplay snapshot guard",

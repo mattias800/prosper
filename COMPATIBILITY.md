@@ -8,9 +8,10 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
-**Looking for what is new?** [`SCREENSHOTS.md`](SCREENSHOTS.md) is every checked-in screenshot in
-reverse-chronological order — read down from the top and stop at one you have seen. This file is
-organised by title instead, so it answers "how far does X get" rather than "what changed lately".
+**Looking for what is new?** [`BLOG.md`](BLOG.md) is the progress blog: every checked-in screenshot
+newest-first, with the story around the ones worth a story. Read down from the top and stop at one
+you have seen. This file is organised by title instead, so it answers "how far does X get" rather
+than "what changed lately".
 
 This page is the **user-facing overview** and is written by hand. For the same titles as a
 machine-readable index — rung, ladder, snapshot guard, hardware-oracle record, open blockers —
@@ -31,11 +32,11 @@ Last updated: 2026-08-17
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then a decoded 4K animated intro still running at 420 s; no title screen observed; movie chroma is collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route now reaches Cyber Space gameplay, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay in the guest, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
-| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Gameplay entry: HUD and radar render; 3D world absent | [#1873](https://github.com/mattias800/prosper/issues/1873) |
+| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Story Mode reached in the guest; HUD and radar render over an absent 3D world | [#1873](https://github.com/mattias800/prosper/issues/1873) |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Opening chapter in Estard — the game writes a save and renders the world; free player control not yet demonstrated, composite severely degraded | [#1874](https://github.com/mattias800/prosper/issues/1874) |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First-level gameplay | [#1875](https://github.com/mattias800/prosper/issues/1875) |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Level 1 gameplay | [#1876](https://github.com/mattias800/prosper/issues/1876) |
@@ -68,37 +69,39 @@ Last updated: 2026-08-17
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-twelve of the twenty-six titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
+ten of the twenty-four titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
 at two different rungs. Counting markers gives a different — and wrong — answer.
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached** with real GPU draws (rung 3 or better) | 26 |
-| **Title screen or menu** reached, gameplay not yet reached (rung 2) | 12 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 24 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
 | Total tracked | 39 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
-It includes *Grand Theft Auto V*, which enters Story Mode with a correct HUD and radar over an absent
-3D world, *Sonic Frontiers*, which reaches a running Cyber Space stage whose world is entirely black,
-and *Syberia: Remastered*, whose gameplay composite is degraded. **Three of the 23 therefore reach
-gameplay without a visible world.** That is a deliberate reading of the ladder, not an oversight: rung
-3 asks for gameplay with real GPU draws, and a HUD over a running stage clock is real draws. If the
-project would rather rung 3 require a visible world, all three rows move together.
+**Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
+deliberately loose — a scene a person would recognise as the game — so *degraded* still counts:
+*Syberia: Remastered*'s composite is degraded and *The House of the Dead 2*'s world carries severe
+defects, and both are rung 3. **Absent does not count.** *Grand Theft Auto V* and *Sonic Frontiers*
+each reach the game loop in the guest, with a correct HUD over a world that never draws; both are
+**rung 2**, and their milestone text says what they reached. They have genuinely got further than a
+title stuck at a menu — the text carries that, not the number.
 
 ### Where the titles accumulate
 
-The 12 titles that stop at a title screen or menu, by the engine recorded in the table:
+The 14 titles below gameplay — a title screen or menu, or gameplay reached without a rendered world — by the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 8 × UE4, 1 × UE5, 1 unversioned | 10 |
-| Custom (Ancient), ASOBI — one each | 2 |
+| Custom (Ancient), ASOBI, RAGE, Hedgehog Engine 2 — one each | 4 |
 
 **Every Unreal title in the table is in this group.** Ten of the 39 rows are Unreal; all ten reach a
 title screen and none has reached gameplay. The distribution is the mirror image on the other side:
-19 of the 26 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows — and **no Unity title
-remains below gameplay.** The rung-2 group is now ten Unreal titles plus *Earthion* and *Astro Bot*.
+19 of the 24 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows — and **no Unity title
+remains below gameplay.** The rung-2 group is ten Unreal titles plus *Earthion*, *Astro Bot*, and the
+two that reach the game loop without a world, *Grand Theft Auto V* and *Sonic Frontiers*.
 
 **This is an observation about where titles accumulate, not a claim that the ten Unreal titles share
 one root cause.** A common cause is an untested hypothesis, and the per-title records currently cut

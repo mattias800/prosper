@@ -3,12 +3,39 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 
 #include <cstdio>
+#include <type_traits>
 
 using namespace prosper;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
                          else std::printf("  [ok]   %s\n", m); } while (0)
+
+// The seam this file guards is a TYPE property, so pin it as one: if any of these three index
+// spaces ever collapses back into a bare integer, or into each other, this stops compiling. That is
+// the whole mechanism -- #2739 seam 2 was a silent implicit conversion, and a runtime CHECK cannot
+// observe a conversion that the compiler performs for you.
+static_assert(!std::is_convertible_v<prosper::tools::ItemIndex, prosper::tools::OperationIndex>,
+              "an item index must not convert to an operation index");
+static_assert(!std::is_convertible_v<prosper::tools::OperationIndex, prosper::tools::ItemIndex>,
+              "an operation index must not convert to an item index");
+static_assert(!std::is_convertible_v<prosper::tools::DrawIndex, prosper::tools::ItemIndex>,
+              "a draw ordinal must not convert to an item index");
+static_assert(!std::is_convertible_v<size_t, prosper::tools::DrawIndex>,
+              "a bare integer must not implicitly become a draw ordinal");
+static_assert(!std::is_convertible_v<prosper::tools::ItemIndex, size_t>,
+              "an item index must not decay to a bare integer");
+// Asymmetry is a hole: with only the ItemIndex decay pinned, collapsing OperationIndex or DrawIndex
+// alone back to a bare integer passed every assertion here AND the runtime CHECK below. Each space
+// gets its own, so no single one can quietly rejoin the integers.
+static_assert(!std::is_convertible_v<prosper::tools::OperationIndex, size_t>,
+              "an operation index must not decay to a bare integer");
+static_assert(!std::is_convertible_v<prosper::tools::DrawIndex, uint64_t>,
+              "a draw ordinal must not decay to a bare integer");
+static_assert(!std::is_convertible_v<prosper::tools::ItemIndex, prosper::tools::DrawIndex>,
+              "an item index must not convert to a draw ordinal");
+static_assert(prosper::tools::raw(prosper::tools::ItemIndex{7}) == 7u,
+              "raw() round-trips the underlying value");
 
 int main() {
     std::printf("== test_gpu_replay_shader_dump ==\n");
@@ -102,9 +129,15 @@ int main() {
     CHECK(vs == &replay.raw_shader_versions[1] && fs == &replay.raw_shader_versions[0] &&
               main == &replay.raw_shader_versions[2],
           "selector resolves a semantic draw ID instead of a compact item offset");
-    CHECK(tools::replay_item_index_for_draw(replay, 11) == 1 &&
-              tools::replay_operation_index_for_draw(replay, 11) == 2 &&
-              tools::replay_item_index_for_draw(replay, 1) == SIZE_MAX,
+    // Draw 11 resolves to item 1 but operation 2 -- the two spaces DIVERGE in this fixture, which
+    // is what makes the next assertion meaningful rather than a tautology. Before these were
+    // distinct types both results were bare size_t, so either function's answer satisfied either
+    // comparison and the mix-up that caused #2739 seam 2 compiled silently.
+    CHECK(tools::replay_item_index_for_draw(replay, tools::DrawIndex{11}) == tools::ItemIndex{1} &&
+              tools::replay_operation_index_for_draw(replay, tools::DrawIndex{11}) ==
+                  tools::OperationIndex{2} &&
+              tools::replay_item_index_for_draw(replay, tools::DrawIndex{1}) ==
+                  tools::kNoItemIndex,
           "draw IDs map across compact-item holes and mixed operation indices");
     CHECK(!tools::select_realized_raw_shader(replay, "2:vs", error) &&
               error.find("realized draw 2 not found") != std::string::npos,
