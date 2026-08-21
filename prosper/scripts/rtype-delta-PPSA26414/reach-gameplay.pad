@@ -7,9 +7,14 @@
 # run A is the R-9 over the city with the stage HUD ("2 BEAM", charge gauge, score); run B was a few
 # seconds earlier in the same stage, on its READY banner.
 #
-# BOTH VALIDATION RUNS WERE ON 27dfd713, NOT ON MASTER. On master the same route reaches the same
-# place in the guest and prosper draws none of it (#2783), so the route can be validated end to end
-# only on a build from before that regression. The timeline below is from master runs of
+# THE TWO VALIDATION RUNS ABOVE WERE ON 27dfd713, NOT ON MASTER: when they were made, master
+# reached the same place in the guest and prosper drew none of it (#2783), so the route could then
+# be validated end to end only on a build from before that regression. #2783 IS NOW FIXED (#2799 --
+# a saved wave-mask alias must not outlive its SGPR pair), and that fix's own A/B ran THIS file on
+# the repaired build: 46 of 46 distinct late frame CRCs, peak 2,073,434 non-black pixels, zero
+# PRESENT SOURCE EXTENT MISMATCH. So the route validates on master now; the 27dfd713 provenance
+# below is kept because it is where these particular numbers came from. The timeline below is from
+# master runs of
 # explore-v2.pad, with which this file's t=1..82 s menu phase is byte-identical; what this file adds
 # is the tail from t=86 s, a 1 s Cross cadence for stage 1 rather than v2's 3 s menu cadence.
 #
