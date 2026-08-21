@@ -1,6 +1,8 @@
 #pragma once
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "realized_shader_dump.hpp"
+#include "replay_indices.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -45,7 +47,9 @@ struct OutputTarget {
 // compare every field; looking the format up again by address would allow a later alias/version to
 // masquerade as the requested surface.
 struct OutputTargetAfterOperation {
-    size_t operation_index = SIZE_MAX;
+    // Typed: an index into replay.operations, not a draw ordinal and not an item index.
+    // See replay_indices.hpp for the defect that motivated separating them.
+    prosper::tools::OperationIndex operation_index = prosper::tools::kNoOperationIndex;
     uint64_t guest_addr = 0;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -55,7 +59,8 @@ struct OutputTargetAfterOperation {
     bool fixed_function_resolve = false;
 
     explicit operator bool() const {
-        return operation_index != SIZE_MAX && guest_addr && width && height && format &&
+        return operation_index != prosper::tools::kNoOperationIndex && guest_addr && width &&
+               height && format &&
                draw_index != UINT64_MAX && slot < kColorTargetCount;
     }
 };
@@ -114,16 +119,24 @@ inline uint32_t replay_color_write_mask(const DrawItem& draw, uint32_t slot) {
 // raw color1 binding is the destination even though the pixel shader exports nothing and therefore
 // has a zero shader/write mask; raw color0 is only the source and must never be reported as output.
 inline OutputTargetAfterSelection replay_output_target_after_operation(
-    const GpuReplayFrame& replay, size_t operation_index, uint64_t guest_addr) {
-    if (operation_index >= replay.operations.size())
+    const GpuReplayFrame& replay, prosper::tools::OperationIndex operation_index,
+    uint64_t guest_addr) {
+    if (prosper::tools::raw(operation_index) >= replay.operations.size())
         return {OutputTargetAfterStatus::InvalidOperation, {}};
-    const auto& operation = replay.operations[operation_index];
+    const auto& operation = replay.operations[prosper::tools::raw(operation_index)];
     if (operation.kind != SubmitOperationKind::Draw)
         return {OutputTargetAfterStatus::NonDrawOperation, {}};
     if (!operation.realized)
         return {OutputTargetAfterStatus::UnrealizedOperation, {}};
-    const auto found = std::find_if(replay.items.begin(), replay.items.end(),
-        [&](const DrawItem& draw) { return draw.draw_index == operation.source_index; });
+    // The shared lookup, not a fourth hand-rolled copy: #2739 seam 2 was partly a hand-rolled loop
+    // at a call site that omitted a filter the shared helper applies, and every copy is another
+    // place for that to happen again.
+    const auto found_index =
+        prosper::tools::replay_item_index_for_draw(
+            replay, prosper::tools::DrawIndex{operation.source_index});
+    const auto found = found_index == prosper::tools::kNoItemIndex
+        ? replay.items.end()
+        : replay.items.begin() + static_cast<std::ptrdiff_t>(prosper::tools::raw(found_index));
     if (found == replay.items.end())
         return {OutputTargetAfterStatus::DrawUnavailable, {}};
 
@@ -166,7 +179,7 @@ inline OutputTargetAfterSelection replay_output_target_after_operation(
 // full even if it happens to contain the same operation/address pair.
 inline BundleOutputTargetAfterSelection replay_bundle_output_target_after_operation(
     const GpuReplayFrame& replay, size_t current_submit_index, size_t selected_final_submit_index,
-    size_t operation_index, uint64_t guest_addr) {
+    prosper::tools::OperationIndex operation_index, uint64_t guest_addr) {
     if (current_submit_index != selected_final_submit_index) return {};
     return {true, replay_output_target_after_operation(replay, operation_index, guest_addr)};
 }
@@ -183,8 +196,11 @@ inline OutputTarget replay_last_target_matching_extent(const GpuReplayFrame& rep
     for (size_t operation_index = 0; operation_index < count; ++operation_index) {
         const auto& operation = replay.operations[operation_index];
         if (!operation.realized || operation.kind != SubmitOperationKind::Draw) continue;
-        const auto draw = std::find_if(replay.items.begin(), replay.items.end(),
-            [&](const auto& item) { return item.draw_index == operation.source_index; });
+        const auto draw_index = prosper::tools::replay_item_index_for_draw(
+            replay, prosper::tools::DrawIndex{operation.source_index});
+        const auto draw = draw_index == prosper::tools::kNoItemIndex
+            ? replay.items.end()
+            : replay.items.begin() + static_cast<std::ptrdiff_t>(prosper::tools::raw(draw_index));
         if (draw == replay.items.end() || !draw->color0_base ||
             draw->color0_width != width || draw->color0_height != height)
             continue;
@@ -213,8 +229,11 @@ inline OutputExtent replay_output_extent(const GpuReplayFrame& replay, OutputExt
         for (size_t operation_index = 0; operation_index < count; ++operation_index) {
             const auto& operation = replay.operations[operation_index];
             if (!operation.realized || operation.kind != SubmitOperationKind::Draw) continue;
-            const auto draw = std::find_if(replay.items.begin(), replay.items.end(),
-                [&](const auto& item) { return item.draw_index == operation.source_index; });
+            const auto draw_index = prosper::tools::replay_item_index_for_draw(
+                replay, prosper::tools::DrawIndex{operation.source_index});
+            const auto draw = draw_index == prosper::tools::kNoItemIndex
+                ? replay.items.end()
+                : replay.items.begin() + static_cast<std::ptrdiff_t>(prosper::tools::raw(draw_index));
             if (draw != replay.items.end()) select_draw(*draw);
         }
     }
