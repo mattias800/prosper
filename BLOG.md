@@ -35,6 +35,28 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-21
 
+### Why The Plucky Squire's cutscene never ends
+
+No picture for this one — it is a measurement, and it replaced a guess that had been sitting in the
+notes as the frontier.
+
+The record said the route "stops driving input at 525 s", implying the cutscene was waiting for a
+button. It is not waiting at all. It advances roughly **300x too slowly to finish**, and two facts
+multiply into that:
+
+- the guest's tick rate **collapses 147x** when the 3D world streams in — about 25 polls per second
+  in the menus, **0.19** once the level loads;
+- in-game time advances **per flip, not per second**. That is deliberate and correct — each flip is
+  budgeted one refresh interval — but it means the game clock moves ~16.7 ms per flip however long
+  that flip actually took.
+
+At 0.19 flips per second, a 60-second intro needs hours. The 1,200-second run that "never reached
+gameplay" had bought a few seconds of it.
+
+It is demonstrated rather than argued: raising only the flip rate walks the guest straight past the
+intro to the storybook camera. So the wall is throughput, and the title is CPU-bound in texture
+realization — the GPU sits at 5-16% throughout.
+
 ### Two more titles reach gameplay — and one reaches it in the dark
 
 **Beneath** (`PPSA27640`) plays. This is the opening dive aboard the science ship: the waypoint

@@ -602,6 +602,27 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     fine and often better** — an fps counter, a timestamp, a route or frame ordinal. Those add measured
     facts about the run; they do not change what the run rendered. Keep annotation legible and out of
     the way of whatever the capture is evidence *for*, and say in the caption that it is on.
+  - **A PR that adds a screenshot adds a `BLOG.md` entry in the same PR.** `BLOG.md` is the progress
+    blog — hand-written, newest first — and it is the file the project owner actually reads to see
+    what is new. It is **not** generated, so nothing backfills a missing entry and nothing goes red
+    when one is skipped: the picture simply never surfaces, which is the whole failure this file
+    exists to prevent.
+    Put the entry at the top under a `## YYYY-MM-DD` heading, with the image and a sentence about
+    **what you are looking at** — not what the change was. The commit subject already says what the
+    change was, and that is exactly what made the old generated feed useless. A paragraph when a
+    title finally does something ("we finally reached gameplay in X, look"), one line when it is just
+    another capture.
+    Write it even when the news is bad or the picture is ugly: *Sonic Frontiers*' black-world capture
+    is in there precisely because the honest record is the point. And write it even when the rung did
+    **not** move — a capture of a title that got further and still fell short is worth more than
+    silence.
+    **A finding with no picture is welcome too**, and this is the half that gets skipped: a lane that
+    measures something surprising and ships no screenshot currently leaves no trace anywhere the owner
+    reads. *The Plucky Squire*'s cutscene turning out to advance 300x too slowly — because the guest's
+    tick rate collapses 147x when the 3D world streams in, and in-game time advances per flip rather
+    than per second — is a better read than most screenshots, and it went unwritten because the PR
+    happened to contain no image. Keep those short, and skip them when there is genuinely nothing a
+    reader would enjoy; a blog nobody wants to read is worse than a thin one.
   Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern.
