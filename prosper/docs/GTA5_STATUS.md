@@ -5559,9 +5559,12 @@ disabled process-wide, the indirect latch drops every remaining draw, and skippi
 yields zero device losses and the first real scene content this title has produced. The mechanism
 inside the shader is not established, and the "183 must become 0" oracle is void.
 
-The pointer-chase loop is now *less* likely to be the hang: it is one of three dispatcher loops in the
-module, and it is the one just shown to be bounded at 11 iterations on the hanging dispatch's own
-data. The other two are unexamined.
+The pointer-chase loop is now *less* likely to be the hang: it is bounded at 11 iterations on the
+hanging dispatch's own data. **Superseded in one respect — see "`0x413dc6700` has exactly ONE loop"
+below.** The "three dispatcher loops" are prosper's own, one per barrier-delimited phase, not three
+guest loops: the guest program has a single back-edge and no indirect branches, and it is this one. So
+"the other two are unexamined" is a statement about our CFG lowering, and the phases those two wrap
+contain no guest loop at all.
 
 ## The first 88 folds see an EMPTY SRT — and a capture taken during them is unrepresentative
 
@@ -5637,6 +5640,86 @@ bases resolved across a *whole run*, not one dispatch's. This program runs many 
 **different tables**, and attributing one dispatch's buffer to another is precisely the error that
 produced the retracted cyclic-table root cause. Re-deriving the link graph from `0x20f848417c` and
 finding it acyclic reproduces the *succeeding* dispatch's measurement, not the hanging one's.
+
+## `0x413dc6700` has exactly ONE loop, and the runaway exceeds what its data can justify by ~100x
+
+Measured 2026-08-21 from `shader_inspect`'s disassembly of the raw dump. This is **ISA structure**, so
+unlike the SPIR-V dissection voided by #2794 it is unaffected by the empty-SRT startup window — the
+fold changes which memory ops survive, never which branches exist.
+
+| phase | guest pc | instrs | MUBUF | DS | **back-edges** | fwd branches | blocks |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0..115 | 90 | 5 | 1 | **1** | 6 | 14 |
+| 1 | 116..129 | 12 | 0 | 2 | **0** | 1 | 2 |
+| 2 | 130..902 | 679 | 36 | 2 | **0** | 38 | 72 |
+
+**The whole program has one back-edge and zero indirect branches** (no `s_setpc_b64`/`s_swappc_b64`).
+The block counts are an independent census (leaders = branch targets + fall-throughs) and they agree
+with the ordinal→pc map the emitter itself announces when a bound arms: phase 0 prints 15 ordinals,
+the last being the empty `pc116..<116` terminator.
+
+### Guest loops and dispatcher loops are DIFFERENT OBJECTS — this file has invited the conflation
+
+An earlier line here said the pointer chase "is one of three dispatcher loops in the module" and that
+"the other two are unexamined". Those three are **prosper's own**: `rdna2_emit_cfg.cpp` emits one
+dispatcher per barrier-delimited phase (`b.cfg_phase_ordinal++`), which is what
+`PROSPER_CFG_TRIP_BOUND_PHASE` selects. The guest has **one** loop, in phase 0. So "examine the other
+two" is a question about **our lowering**, not about the guest program — and phases 1 and 2 wrap code
+with no guest loop at all, which makes any repeated visit there unambiguously ours.
+
+### The loop, and why it cannot self-limit
+
+```
+88: v_mov_b32     v2, s22            ; save step count
+89: v_cmpx_ne_u32 exec, 0, v1        ; lanes whose link is 0 drop out
+90: s_cbranch_execz -> 98            ; the ONLY exit
+91: buffer_load_dword v1, v1, s[0:3] idxen
+93: s_add_i32     s22, s22, 1        ; incremented, NEVER compared
+95: v_bfe_u32     v1, v1, 3, 27      ; next = (word >> 3) & 0x7FFFFFF
+97: s_branch -> 88                   ; UNCONDITIONAL back-edge
+```
+
+`s22` is a step *count*, not a bound; nothing in the body tests it. EXEC is saved to VCC at pc 85 and
+restored at pc 98, so the loop is a standard "chase until every lane hits a zero link" with no trip
+limit of its own. **Termination is entirely a property of loaded data.**
+
+### The contradiction
+
+`scan_parent_array`'s link function is `(words[i] >> 3) & 0x7FFFFFFu` — **exactly** the shader's
+`v_bfe_u32 v1, v1, 3, 27`. So the acyclic verdict on the hanging dispatch's table is not an instrument
+artifact: the offline walk follows the same edges the shader does. With longest chain 11 (13–16 in
+other samples) and 2 of phase 0's 14 blocks inside the loop, the dispatcher ceiling is
+`12 + 2x11 = 34` trips.
+
+**Measured: 4,096 trips, on 11 separate dispatches** (`trips=4096 dispatch-range=6..14`, submit 5620,
+dispatches 38..42 among them). Roughly **100x** the ceiling the data allows.
+
+### What the witness can and cannot localise
+
+The extremes are **sound**: they are updated on every back-edge traversal, reading `pc_var` *before*
+the `hit` predicate, so the cap's own truncation does not contaminate them
+(`rdna2_emit_cfg.cpp:4917`). `dispatch-range=6..14` therefore establishes something real —
+**ordinals 0..5 (guest pc 0..73) are never revisited**, so the runaway is confined to the phase's
+second half, and the single loop (ordinals 8 = `pc88..<91`, 9 = `pc91..<98`) lies inside that span.
+
+**They cannot say more than that.** A run concentrating its trips in `{8,9}` and a state machine
+genuinely cycling across `6..14` produce an identical min/max record, and those two have different
+fixes — the first says our lowering is not honouring the `v_cmpx` → EXEC → `s_cbranch_execz` exit, the
+second says our dispatcher revisits blocks the guest does not. Separating them needs a per-ordinal
+visit histogram (**#2858**).
+
+### Also settled here
+
+- **Both `s_barrier`s (pc 116, 129) are reached unconditionally by every wave.** No forward branch
+  skips either, and no earlier branch exits to `endpgm` before them, so they are uniform — consistent
+  with the barrier lever having been inert (trap 164).
+- **#2542's positive control passes but does not cover this.** It shows per-lane EXEC narrowing and
+  the cross-lane `execz` vote are correct — with a body that "decrements the index instead of chasing
+  a buffer". So it exercises the exit *mechanism* and never the loaded value the exit *depends on*.
+  A candidate mechanism that fits every observation without requiring corruption — lanes walking past
+  the extent `scan_parent_array` classified, so no zero link is ever met — is recorded as a
+  **hypothesis** on #2858, along with the `PROSPER_DYNTRACE_ADDR` check that would settle it before
+  anyone touches the recompiler.
 
 ## Other open defects
 
