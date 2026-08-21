@@ -25,6 +25,15 @@ static_assert(!std::is_convertible_v<size_t, prosper::tools::DrawIndex>,
               "a bare integer must not implicitly become a draw ordinal");
 static_assert(!std::is_convertible_v<prosper::tools::ItemIndex, size_t>,
               "an item index must not decay to a bare integer");
+// Asymmetry is a hole: with only the ItemIndex decay pinned, collapsing OperationIndex or DrawIndex
+// alone back to a bare integer passed every assertion here AND the runtime CHECK below. Each space
+// gets its own, so no single one can quietly rejoin the integers.
+static_assert(!std::is_convertible_v<prosper::tools::OperationIndex, size_t>,
+              "an operation index must not decay to a bare integer");
+static_assert(!std::is_convertible_v<prosper::tools::DrawIndex, uint64_t>,
+              "a draw ordinal must not decay to a bare integer");
+static_assert(!std::is_convertible_v<prosper::tools::ItemIndex, prosper::tools::DrawIndex>,
+              "an item index must not convert to a draw ordinal");
 static_assert(prosper::tools::raw(prosper::tools::ItemIndex{7}) == 7u,
               "raw() round-trips the underlying value");
 
