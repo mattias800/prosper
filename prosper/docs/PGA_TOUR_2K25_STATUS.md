@@ -133,8 +133,10 @@ Other unimplemented NIDs seen on the same boot, none of which is implicated in t
 
 ## Rendering
 
-Not yet assessable, and deliberately not called a defect. The single frame the run captured before
-dying is pure black (1 distinct colour over 3840x2160), and the renderer says why:
+Not yet assessable, and deliberately not called a defect. Every frame captured is pure black — 1
+distinct colour over 3840x2160 — and that is not an artifact of the sampling interval: a second run
+at `--seconds 1` (30 requested, `--allow-guest-fault --no-stop-after-guest-fault`) captured 3 frames
+before the fault and all 3 are uniformly black. The renderer says why:
 
 ```
 [rtt] GUEST SCANOUT #1: no present source and no renderer target at the flipped buffer 0x0
