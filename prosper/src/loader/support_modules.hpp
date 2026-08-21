@@ -11,8 +11,9 @@
 // condition wait 81 ms into the boot — before `run_entry`, before a single asset is read.
 //
 // **Measure the blast radius before adding a flag here, and state it.** Over the 47 dumps on the
-// development box, 42 ship this PRX: 40 keep it (20 vouched by their own eboot, 20 by
-// `Media/Plugins/PSN.prx` or `PSNCore.prx`, both fixed non-candidate inputs) and **2** lose it —
+// development box, 42 ship this PRX: 40 keep it (19 vouched by their own eboot, 21 by
+// `Media/Plugins/PSN.prx` or `PSNCore.prx`, both fixed non-candidate inputs; no dump is vouched by
+// both, so the two buckets partition the 40) and **2** lose it —
 // PPSA03130, which is the point, and **`PPSA03831` Sonic Frontiers**, which was not. Nothing in CI
 // would have caught the second: it has no snapshot guard. It is believed safe because import
 // resolution in `linker.cpp` is by NID and neither title has a single import whose NID this module

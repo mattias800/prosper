@@ -114,7 +114,7 @@ import tables of the non-candidate inputs:
 | --- | --- |
 | dumps present | 47 |
 | ship `sce_module/libSceNpCppWebApi.prx` | 42 |
-| **KEEP** — a non-candidate imports the name | **40** (20 via their own `eboot.bin`, incl. `PPSA05325` *Sonic Origins*; 20 via `Media/Plugins/PSN.prx` / `PSNCore.prx`, both fixed non-candidate inputs) |
+| **KEEP** — a non-candidate imports the name | **40** — **19** via their own `eboot.bin` (incl. `PPSA05325` *Sonic Origins*) and **21** via `Media/Plugins/PSN.prx` / `PSNCore.prx`, both fixed non-candidate inputs. No dump is vouched by both, so the buckets partition the 40 |
 | **DROP** — nobody imports it | **2**: `PPSA03130` (intended) and **`PPSA03831` *Sonic Frontiers*** |
 
 *Sonic Frontiers* is a tracked title at rung 2 with an open lane, and **no snapshot guard**, so
