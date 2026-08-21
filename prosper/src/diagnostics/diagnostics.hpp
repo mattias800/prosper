@@ -1,12 +1,23 @@
 // diagnostics.hpp — Single include entry point for prosper diagnostics.
 //
-// When PROSPER_DIAGNOSTICS is OFF (default), this header compiles to zero-cost
-// stubs: all calls inline to empty functions with no overhead.
+// When PROSPER_DIAGNOSTICS is OFF (default), the event-history and JSON-report layer compiles
+// away: recording a phase stores nothing and publishes nothing.
 //
 // When ON, the full observer-only diagnostics layer is available for boot
 // timeline capture, event subscription, and JSON report generation.
+//
+// `record_boot_phase()` is the ONE exception to that split, and it is deliberate. In BOTH builds it
+// forwards to `log_boot_phase()`, whose only cost when unselected is a call and a cached bool test,
+// seven times in the lifetime of the process. This header used to promise "zero-cost stubs", and
+// keeping that promise literally is what made the boot phases unobservable in every shipped build:
+// a `boot_program()` that hangs inside `run_guest_inits()` printed nothing, and no runtime switch
+// could make it print, because the instrumentation had been compiled out months earlier. See
+// boot_phase_log.hpp. The recording/reporting layer is still fully compiled out; only the one
+// stderr line survives, and only when PROSPER_BOOTPHASE asks for it.
 
 #pragma once
+
+#include "boot_phase_log.hpp"
 
 #ifdef PROSPER_DIAGNOSTICS
 #include "core/types.hpp"
@@ -54,8 +65,8 @@ public:
     void clear() {}
 };
 
-// Inline stubs — compiler optimizes these away entirely.
-inline void record_boot_phase(BootPhase) {}
+// The history/reporting side is stubbed away; the phase LINE is not (see the note at the top).
+inline void record_boot_phase(BootPhase p) { log_boot_phase(static_cast<unsigned>(p)); }
 
 } // namespace prosper::diagnostics
 

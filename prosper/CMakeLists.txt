@@ -69,11 +69,18 @@ include(cmake/ProsperBuildRevision.cmake)
 prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOURCE_DIR}/..")
 
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
-# Exclude diagnostics sources when feature is disabled (default).
-# When enabled, PROSPER_DIAGNOSTICS define activates the real implementation;
-# the headers always compile (stubs when disabled).
+# Exclude the diagnostics HISTORY/REPORT layer when the feature is disabled (default). When enabled,
+# the PROSPER_DIAGNOSTICS define activates the real implementation; the headers always compile
+# (stubs when disabled).
+#
+# Scoped to core/ and storage/ deliberately: src/diagnostics/boot_phase_log.cpp must be in EVERY
+# build. It is the one file here that answers "where did boot_program() stop?", and boot_program()
+# runs guest code (run_guest_inits), so a title can sit inside it indefinitely while every frontend
+# prints nothing. An instrument for that has to exist in the default build — excluding it with the
+# rest of the folder is how the boot phases came to be unprintable in every build the project
+# shipped. See src/diagnostics/AGENTS.md.
 if(NOT PROSPER_DIAGNOSTICS)
-  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/diagnostics/")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/diagnostics/(core|storage)/")
 endif()
 if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
@@ -1169,6 +1176,21 @@ if(TARGET prosper_core)
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
   target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)
   add_test(NAME diagnostics_disabled_stubs COMMAND test_diagnostics_disabled)
+
+  # The boot-phase LINE is reachable in a default build (no PROSPER_DIAGNOSTICS), driven only by
+  # PROSPER_BOOTPHASE. Deliberately registered outside the PROSPER_DIAGNOSTICS block: the property
+  # under test is that the default build — the one everybody actually runs — can be made to say
+  # where boot_program() stopped.
+  # Which bundled support PRXs are preloaded at all. Pure policy: no dump, no SELF parser, no
+  # filesystem — so both the DROP and the KEEP direction are checkable in ordinary CI.
+  add_executable(test_support_modules tests/loader/test_support_modules.cpp
+                                      src/loader/support_modules.cpp)
+  target_include_directories(test_support_modules PRIVATE src)
+  add_test(NAME loader_support_modules COMMAND test_support_modules)
+
+  add_executable(test_boot_phase_log tests/diagnostics/test_boot_phase_log.cpp)
+  target_link_libraries(test_boot_phase_log PRIVATE prosper_core)
+  add_test(NAME diagnostics_boot_phase_log COMMAND test_boot_phase_log)
 
   # Diagnostics: enabled-path and JSON tests (only when feature is built).
   if(PROSPER_DIAGNOSTICS)

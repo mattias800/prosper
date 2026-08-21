@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <set>
 #include <system_error>
 #include <vector>
 
@@ -97,6 +98,7 @@ std::vector<std::string> discover_extra_plugin_modules(
 #include "host/image/runtime_module_load.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "self/module.hpp"     // PT_SCE_PROCPARAM
+#include "loader/support_modules.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -119,6 +121,51 @@ namespace prosper {
 // boot_program now calls it, so the two cannot drift. Note it PRINTS while it works (auto-link and
 // case-correction lines) -- that output is part of the loader's existing behaviour and is now also
 // visible to any other caller.
+// Resolve every `only_if_imported` input against what the other inputs actually import. The POLICY
+// lives in src/loader/support_modules.hpp as a pure function so it can be tested without a dump;
+// this function only supplies it with parsed data and reports what it decided.
+//
+// Cost is one extra `Module::load` per non-candidate input, and only for a title that ships such a
+// file at all. A module that fails to parse contributes no imports, so it is reported out loud:
+// "could not read the importer" and "the importer imports nothing" must not look the same.
+template <typename Say>
+void drop_unimported_support_modules(std::vector<LinkInput>& in, const Say& say) {
+    bool any = false;
+    for (const auto& e : in) if (e.only_if_imported) { any = true; break; }
+    if (!any) return;
+
+    // Names still needing a voucher. Parsing stops as soon as every candidate has one, because the
+    // scan is a second full `Module::load` of modules the linker is about to parse again -- 13-27 ms
+    // each on a warm cache, and the eboot is the largest file in the dump. The eboot is first in the
+    // list and vouches for 19 of the 42 dumps here, so for those the scan parses exactly one module.
+    std::set<std::string> unvouched;
+    for (const auto& e : in)
+        if (e.only_if_imported) unvouched.insert(support_module_lib_name(e.path));
+
+    std::vector<std::vector<std::string>> imports_by_index(in.size());
+    for (size_t i = 0; i < in.size() && !unvouched.empty(); ++i) {
+        if (in[i].only_if_imported) continue;          // a candidate cannot vouch for itself
+        std::string perr;
+        if (auto m = Module::load(in[i].path, &perr)) {
+            for (const auto& imp : m->imports) {
+                imports_by_index[i].push_back(imp.lib_name);
+                unvouched.erase(imp.lib_name);
+            }
+        } else {
+            say("only-if-imported: cannot parse %s (%s); its imports are unknown, so it vouches "
+                "for nothing\n", in[i].path.c_str(), perr.c_str());
+        }
+    }
+
+    for (size_t idx : unimported_support_module_indices(in, imports_by_index)) {
+        // Loud: a dropped module is invisible afterwards, and this is the line the next person
+        // debugging a missing export will need.
+        say("support module SKIPPED: %s -- no linked module imports %s, so its module_start is not "
+            "run\n", in[idx].path.c_str(), support_module_lib_name(in[idx].path).c_str());
+        in.erase(in.begin() + (ptrdiff_t)idx);
+    }
+}
+
 std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
     // `verbose` exists only so a TOOL can call this without corrupting its own stdout: the
     // four prints below are the loader's, and nid_census --tsv writes machine-readable rows to
@@ -167,7 +214,9 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
         // loading is not implemented yet (#639), so preload an optional copy from sce_module just as
         // we do for lazy Unity audio plugins. Keep it before libc so reverse init order initializes
         // libc first. Absent-file filtering leaves every title without this PRX unchanged.
-        { d + "/sce_module/libSceNpCppWebApi.prx", BOOT_NPCPPWEBAPI },
+        // `only_if_imported`: Sonic Origins imports this statically, PPSA03130 ships the same file
+        // and does not. Loading it runs its module_start, which on PPSA03130 deadlocks the boot.
+        { d + "/sce_module/libSceNpCppWebApi.prx", BOOT_NPCPPWEBAPI, false, true },
         { d + "/sce_module/libc.prx", BOOT_LIBC },
     };
     // #1609: the fixed list above only names plugins some earlier title needed. Link whatever else
@@ -222,6 +271,7 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
         if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
         else { say("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
     }
+    drop_unimported_support_modules(in, say);
     return in;
 }
 
