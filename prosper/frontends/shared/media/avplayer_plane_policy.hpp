@@ -14,10 +14,19 @@
 //
 // The test is deliberately narrower than "any RG8 texture": several established game paths still
 // rely on the historical coverage broadcast for their own two-channel surfaces. What keeps it narrow
-// is the PAIR -- a two-channel linear Unorm8 surface is only claimed when the same draw also binds a
-// single-channel linear Unorm8 surface whose row is exactly its row in bytes and whose height is
-// exactly twice its own, at the identical physical pitch. An ordinary two-channel game texture has
-// no such partner.
+// is the PAIR -- a two-channel surface is only claimed when the same draw also binds a
+// single-channel partner of the same tile mode, same element format, one-layer 2D, whose width is
+// exactly twice its own, whose height is (h+1)/2, and whose bytes do not overlap it. An ordinary
+// two-channel game texture has no such partner.
+//
+// One clause listed here previously that is NOT doing the work, recorded so nobody credits it:
+// "at the identical physical pitch". When neither descriptor declares `linear_row_pitch_bytes` --
+// which is the case for both live fixtures -- both pitches are derived from the widths by
+// `linear_sampled_row_pitch`, and the width relation two lines above has already forced them equal.
+// The comparison then cannot fail, so it narrows nothing. It IS a real check when at least one
+// descriptor declares a pitch, which is why it stays; it is simply not evidence in the measured
+// case, and a file whose whole job is to record why the predicate is narrow must not overstate what
+// is narrowing it.
 #pragma once
 
 #include "gpu/resources/shader_resources.hpp"

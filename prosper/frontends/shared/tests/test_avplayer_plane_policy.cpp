@@ -231,8 +231,14 @@ int main() {
         CHECK(v.reason == AvpChromaReason::UnrecognisedSwizzle);
     }
     {
+        // MISMATCHED tile modes disqualify the pair. This arm used to be labelled "a GPU-tiled
+        // surface is not a staged plane", which is the exact belief this change falsified — tiled
+        // pairs ARE admitted now. It still fails, but for the honest reason: the sibling luma is
+        // linear while this chroma is SW_64KB_R_X, so the two are not two planes of one picture.
+        // Left in place rather than deleted, because "tiled is fine, mixed is not" is precisely the
+        // distinction a future widening is most likely to erase.
         ShaderResource tiled = rtype_chroma_plane();
-        tiled.tile_mode = 27;                          // a GPU-tiled surface is not a staged plane
+        tiled.tile_mode = 27;                          // SW_64KB_R_X, against a linear sibling
         const std::vector<ShaderResource> table{rtype_luma_plane(), tiled};
         CHECK(!classify(tiled, table).match);
     }
