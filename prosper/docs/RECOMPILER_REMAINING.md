@@ -264,6 +264,75 @@ narrower liveness-proved form, and #134's `kernel X2 … is REJECTED` must not b
 Both of those are their titles' *main-view* volumes, so *Plucky Squire* and *Little Nightmares III*
 keep their main froxel pass absent. #2741, #2747.
 
+## A saved wave-mask alias is not permanent provenance — **FIXED** (2026-08-20)
+
+`RegState::sreg_bool` maps an SGPR root to the Bool spelling of the wave mask that physical pair
+holds. `record_scalar_write`'s erase loop is guarded by `rs.sreg_bool_b32.contains(reg)`, so it ended
+that lifetime **only for the Wave32 B32 spelling**: a saved **B64** mask stayed keyed on its root
+register for the rest of the shader, surviving every later scalar write to it.
+
+That was invisible while nothing treated the alias as a liveness fact. #2481's `operand_bits` reject
+(`904e05ad`, 2026-08-11) does treat it as one — a data read of a word whose root is in `sreg_bool` is
+refused, on the grounds that "a persisted B64 wave mask has no ordinary scalar dword" — so an
+unbounded lifetime turned an ordinary recycled register into a shader-wide reject.
+
+**The shape that hits it is a compiler idiom, not a corner case.** Save a mask into a scratch SGPR
+pair; later reuse the pair for a PC-relative embedded-table address. R-Type Delta's
+`shader/sprite_i_vv.ags` does exactly that: `s_cselect_b64 s[0:1], exec, 0` in the NGG fetch prologue
+at pc 38, then `s_getpc_b64 s[0:1]` / `s_add_u32 s0, lit, s0` / `s_addc_u32 s1, 0, s1` at pc 303-306.
+The add rejected with `mode=unresolved-operand`, the vertex stage returned `{}`, and every sprite draw
+in the title was dropped for nine days (#2783).
+
+The transfer function now follows `expire_wave64_mask_half`'s existing rule for the promoted-half
+spelling, deliberately narrower: that one expires on **either** word of the pair, this one only on the
+root. Three scoping decisions are deliberate, and each was forced by a failing arm rather than chosen:
+
+* **The snapshot is taken before `emit_alu`.** `record_scalar_write` runs *after* the emitter has
+  already materialized the new lifetime, so "was this alias here, with this exact Bool id, before?"
+  is the only way to tell a stale entry from one this same instruction published. Classifying
+  publishers syntactically is not enough: `scalar_write_is_b64_mask` knows the SOP1/SOP2/VOPC/VOP3B
+  writers, but the `vgpr_lane_mask_slots` path in `emit_alu` republishes a spilled mask alias from
+  `v_readlane` with no syntactic marker at all, and a syntactic guard silently dropped it. The id
+  comparison is a *proxy* for "did not publish", and that same reload is the one publisher that could
+  in principle re-store an identical id. If it were reached the alias would be dropped, and the
+  outcome is **fail-visible, not silent**: `src_mask` resolves a missing `sreg_bool` entry to 0 and
+  every Bool-domain consumer then clears `ok` (`rdna2_emit_alu.cpp` `:794`, `:817`, `:873`, `:1058`,
+  `:1074`), so the stage rejects. Silent zero is the *data*-domain outcome only. The residual is
+  therefore bounded by being loud, not by being harmless — and it is the same failure class this
+  change repairs, which is the reason to keep it in view rather than to discount it.
+* **Only the ROOT word ends the lifetime**, and that is measured, not reasoned. Expiring on either
+  word of the pair rejected **19** arms of `test_recompile_coverage`. Traced on the first of them
+  ("a nested varying-VCC compute CFG preserves spilled EXEC"): its Wave64 EXEC reload keys the
+  reconstructed mask on the **low** word (`v_readlane s14` → `sreg_bool[14]`, through the *non-native*
+  `vgpr_lane_mask_slots` branch, which erases `sreg_wave64_mask_half` so the
+  `publishes_wave64_mask_half` guard does not apply) and then writes the **high** word
+  (`v_readlane s15`). Ending the lifetime on that high-word write destroyed the alias the very next
+  instruction consumes, and `s_mov_b64 exec, s[14:15]` rejected. A high-word-only overwrite by
+  unrelated scalar data therefore stays conservative — a **pre-existing** gap, not one introduced
+  here, since before this nothing ended a B64 alias at all.
+* **VCC (106/107) is out of scope — and not because it is unreachable.** SGPR-kind operands really
+  can carry 106/107 (`sgpr()` masks to 7 bits, `rdna2_decode.cpp`), and SOPK's read-modify-write forms
+  read their own destination through `val(in.dst)`, so `s_mulk_i32 vcc_lo, imm` does reach
+  `operand_bits` with an SGPR-kind 106. What makes VCC different is that its mask state is *mirrored*
+  in `rs.vcc`: expiring `sreg_bool[106]` without a matching policy for `rs.vcc` would leave the two
+  spellings disagreeing, which is a separate change with its own risk and would also alter
+  established behaviour for every `s_bfe_u32 vcc_lo` NGG preamble. No observed defect requires it —
+  reaching the reject through VCC additionally needs a writer that overwrites VCC_LO while leaving no
+  scalar SSA value behind, because `operand_bits` consults `rs.sreg` first. Recorded as **#2804** so
+  the scoping decision is not mistaken for a proof of impossibility.
+
+The regression arm is in `test_recompile_coverage` (pure, no Vulkan): the already-proven "T12 vertex"
+PC-relative-table program as a positive control, and the identical program preceded by the mask save
+into the pair it reuses. Only the second fails without the fix.
+
+**Which way the exposure runs, stated precisely**, because "it only shortens a lifetime" is true of
+the *state* and misleading about *acceptance*. Shortening a `sreg_bool` lifetime is two-directional:
+a **data**-domain read of the recycled word goes reject → accept (the repair), while a **Bool**-domain
+read of a word this model now considers dead goes accept → reject. That is not hypothetical — it is
+exactly what the 19-arm result above measured, and it is why the root-only rule exists. The residual
+risk is therefore a shader whose mask prosper believes is dead and hardware does not; it fails loudly
+if it happens.
+
 ## Ruled out
 
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
@@ -272,6 +341,7 @@ without contradictory new evidence.
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
+| A `[recompile-reject] mode=unresolved-operand` on an instruction with **no descriptor operand** -- a plain `s_add_u32 s0, lit, s0` -- means the resource table is incomplete | **Falsified.** `unresolved-operand` says only that the lowering exists and *some* operand did not resolve. It is equally raised when a scalar source has no representable dword in the per-invocation model, including because a **stale saved-mask alias** still claims the register. #2783's reject was on an instruction whose only SGPR source was recycled scratch, and no descriptor was involved at any point. Read *which* operand failed -- the reject line prints every source's kind -- before assuming the descriptor. | #2783 |
 | GTA V's `unresolved-operand` rejects at **VCC reads** (`v_mov_b32 v1, vcc_lo`, `v_add_nc_u32 v0, vcc_lo, v0`) mean prosper's **VCC-as-scalar-scratch model is too narrow** — it admits VCC_LO scalar writes only through an enumerated packet list (`is_wave64_vcc_lo_scalar_cselect` (then named `is_gtav_…`), `is_wave64_vcc_lo_scalar_b32_candidate`, `b32_vcc_scalar_write`), and GTA V also writes VCC_LO with `s_lshl_b32`, `s_mulk_i32`, `s_add_i32`, `s_min_i32` and `v_readfirstlane_b32` | **Falsified — the reject is a symptom three instructions downstream of an unrelated cause.** Widening the write predicate to admit `s_lshl_b32`, extending it in the wave64 MUST dataflow, and adding a dual-domain admission all leave the terminal byte-identical, tested one at a time and then together. `operand_bits` was never the gap either: its `Special` case already reads `rs.sreg[106]` for 106..124. Instrumenting the dataflow gave the actual chain for `0x413d88400`: pc47 `s_mov_b32 s6, s14` makes s6 a MUST scalar word; pc337 **`s_bcnt1_i32_b64 s6, exec`** erases that fact, because `wave64_mask_reduction_source` deliberately returned −1 for architectural EXEC ("already resolved from architectural state by emit_alu"); pc351 `s_lshl_b32 vcc_lo, s6, 2` therefore has a non-scalar source, so VCC_LO's own scalar lifetime is dropped at the pc353 block boundary, and the failure finally surfaces at pc354 in a different register file. emit_alu *can* materialize the reduction, which is why the same packets compile fine inside one block — the coverage arm proving that had passed throughout. **A reject PC names where a fact was consumed, not where it was lost; instrument the MUST dataflow before widening any predicate at the reject site.** | #2481 |
 | A synthetic kernel reproducing that shape (EXEC popcount, a guard, a consume past the merge) is enough to regression-test it | **Falsified.** Three synthetic shapes were built, including one whose guarded block contains an unpredicated scalar write live at the merge specifically to defeat `safe_execz_branches`. All three compiled on **both** sides of the fix: the structured/linearizing routes claim them before the CFG dispatcher — whose block-entry filter is the defect — ever runs. The exact production kernel plus its exact routed resource table **does** discriminate, and that is what `test_exec_population_count` pins; whether some smaller synthetic could also discriminate was not established, so read this row as "three attempts failed" rather than as a proof of minimality. | #2481 |
 | GTA V's counted **`structured emission stopped` sites are an independent CFG family** that needs 28 separate structurizer fixes | **Falsified by program-tagged terminals and offline retries.** The message is a wrapper emitted after compact structured emission has already stopped at an earlier instruction/resource rejection. In the phase-anchored 28-tuple census every wrapper's `next-pc` matched the same invocation's earlier terminal PC; later exact fixes at `0x413cf6100`, `0x413cf5400`, `0x413e19200`, `0x413e1ac00`, and `0x413cf9200` removed the wrapper without any structurizer change. `0x413ce2a00` is the complementary positive control: compact route selection declines on a bottom-tested EXEC loop, but the generic dispatcher compiles it successfully, so its `backward else` line is route-selection noise rather than a skip. Attribute only program-tagged terminal records; stderr from concurrent shader compilations interleaves. | #2481 |
