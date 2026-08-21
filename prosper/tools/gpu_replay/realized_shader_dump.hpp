@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "replay_indices.hpp"
 
 #include <cerrno>
 #include <cstdint>
@@ -43,23 +44,29 @@ inline RecompiledShaderView recompiled_shader_view(const gpu::DrawItem& draw,
                   : RecompiledShaderView{&draw.fs_words(), static_cast<bool>(draw.fs_shared)};
 }
 
-inline size_t replay_item_index_for_draw(const gpu::GpuReplayFrame& replay,
-                                         uint64_t draw_index) {
+// Returns an ITEM index -- into replay.items, realized draws only. See replay_indices.hpp for why
+// the return type is not interchangeable with the operation lookup's below.
+inline ItemIndex replay_item_index_for_draw(const gpu::GpuReplayFrame& replay,
+                                            DrawIndex draw_index) {
     for (size_t item_index = 0; item_index < replay.items.size(); ++item_index)
-        if (replay.items[item_index].draw_index == draw_index) return item_index;
-    return SIZE_MAX;
+        if (replay.items[item_index].draw_index == raw(draw_index))
+            return ItemIndex{item_index};
+    return kNoItemIndex;
 }
 
-inline size_t replay_operation_index_for_draw(const gpu::GpuReplayFrame& replay,
-                                              uint64_t draw_index) {
+// Returns an OPERATION index -- into replay.operations, which interleaves draws and computes. Also
+// filters on `realized`, which a hand-rolled loop at the call site did not, and that omission is
+// half of the defect recorded in replay_indices.hpp.
+inline OperationIndex replay_operation_index_for_draw(const gpu::GpuReplayFrame& replay,
+                                                      DrawIndex draw_index) {
     for (size_t operation_index = 0; operation_index < replay.operations.size();
          ++operation_index) {
         const auto& operation = replay.operations[operation_index];
         if (operation.kind == gpu::SubmitOperationKind::Draw && operation.realized &&
-            operation.source_index == draw_index)
-            return operation_index;
+            operation.source_index == raw(draw_index))
+            return OperationIndex{operation_index};
     }
-    return SIZE_MAX;
+    return kNoOperationIndex;
 }
 
 inline bool parse_realized_shader_selector(const std::string& spec,
@@ -89,12 +96,13 @@ inline const std::vector<uint32_t>* select_recompiled_shader(
         error = "invalid shader selector " + spec;
         return nullptr;
     }
-    const size_t item_index = replay_item_index_for_draw(replay, selector.draw_index);
-    if (item_index == SIZE_MAX) {
+    const ItemIndex item_index =
+        replay_item_index_for_draw(replay, DrawIndex{selector.draw_index});
+    if (item_index == kNoItemIndex) {
         error = "realized draw " + std::to_string(selector.draw_index) + " not found";
         return nullptr;
     }
-    const auto selection = recompiled_shader_view(replay.items[item_index], selector.vertex);
+    const auto selection = recompiled_shader_view(replay.items[raw(item_index)], selector.vertex);
     shared = selection.shared;
     error.clear();
     return selection.words;
@@ -107,12 +115,13 @@ inline const gpu::GpuCaptureRawShaderVersion* select_realized_raw_shader(
         error = "invalid realized-shader selector " + spec;
         return nullptr;
     }
-    const size_t item_index = replay_item_index_for_draw(replay, selector.draw_index);
-    if (item_index == SIZE_MAX) {
+    const ItemIndex item_index =
+        replay_item_index_for_draw(replay, DrawIndex{selector.draw_index});
+    if (item_index == kNoItemIndex) {
         error = "realized draw " + std::to_string(selector.draw_index) + " not found";
         return nullptr;
     }
-    const auto& draw = replay.items[item_index];
+    const auto& draw = replay.items[raw(item_index)];
     const uint32_t raw_index = selector.vertex_main
         ? draw.vs_chain_raw_shader_index
         : (selector.vertex ? draw.vs_raw_shader_index : draw.fs_raw_shader_index);
