@@ -255,7 +255,11 @@ PROSPER_PAD_SCRIPT=@<route>/reach-gameplay.pad PROSPER_SAVE0=<private dir> \
 ```
 
 **Guest program addresses are run-local — re-derive them from the `[compute-census]` per-program
-lines of the run you are in, not from this document.** `PROSPER_DBG_PROGRAM` then narrows the
+lines of the run you are in, not from this document.** And **read the program count on the census
+line first**: this route desynchronises when the host is busy, and an arm that stayed in the menus
+reports `over 5 program(s)` at the same denominator as one that reached the stage reports
+`over 30 program(s)`. Nothing else in the block distinguishes them. Check `uptime` first — on a
+shared machine the load that breaks the route is not yours and is not visible from the arm. `PROSPER_DBG_PROGRAM` then narrows the
 verbose recompiler stream to those addresses; `PROSPER_DBG=1` is ~1.5 GB here and desyncs the pad
 script before it reaches the stage.
 
@@ -265,7 +269,7 @@ At `262144 dispatch decisions over 32 program(s)`, **14 programs are listed and 
 `16x3`, i.e. 3840x135, 3840x270 and 3840x405 threads — and are the screen-space passes the world
 depends on.
 
-**All three now block on exactly one instruction.** #2790's handoff named two levers,
+**All three reach the CFG dispatcher's body.** #2790's handoff named two levers,
 `s_cbranch_execz` and `image_load_mip`; both were reject PCs printed by the *straight-line* emitter,
 which these programs only reach after two earlier routes decline. The first decline is ordinary
 route selection (`backward else`, `role=route-decline`); the second was a real defect in the Wave64
@@ -274,18 +278,138 @@ place the `wave64-ambiguous-mask-read` decline does not occur anywhere in the ru
 reach the CFG dispatcher's body, and all three stop at:
 
 ```text
-[mimg-mip] image_load_mip declined pc=… shape=0 proven_zero_mip=0 img_dim=5/1 samples=1
-           mips=12 mip_tail=0 compressed=0 array_in_gfx=0
+[mimg-mip] program=0x2005714000 image_load_mip declined pc=33 shape=0 proven_zero_mip=0
+           img_dim=5/1 samples=1 mips=12 mip_tail=0 compressed=0 array_in_gfx=0
+           addr=0x2026900000 2048x2048x1 dataformat=1 ncomp=2 tile=27 dmask=0x3 unorm=0 glc=0
+           layer_stride=0
 ```
 
-So the single live lever is `IMAGE_LOAD_MIP` where the *resource* declares `2D_ARRAY` with a
-**12-level mip chain** while the *instruction* addresses it `dim:2D`, and the mip operand is not one
-of the recognised provably-zero shapes. `rdna2_emit_alu.cpp` only ever specialises this op away after
-proving the mip is zero and the resource is single-level; a 12-mip resource has no such proof, so it
-declines. Implementing it means lowering a real guest LOD, not widening the proof —
-`CLAUDE.md`'s standing rule applies: do not make the reject accept by substituting a plausible
-constant, and there is a specific trap
-behind that here. Tracked as [#2818](https://github.com/mattias800/prosper/issues/2818).
+`IMAGE_LOAD_MIP` where the *resource* declares `2D_ARRAY` with a **12-level mip chain** while the
+*instruction* addresses it `dim:2D`, and the mip operand is not one of the recognised provably-zero
+shapes. `rdna2_emit_alu.cpp` only ever specialises this op away after proving the mip is zero and
+the resource is single-level; a 12-mip resource has no such proof, so it declines. Tracked as
+[#2818](https://github.com/mattias800/prosper/issues/2818).
+
+### `image_load_mip` is the FIRST blocker of at least two, not the only one (2026-08-21)
+
+**This section used to say "All three now block on exactly one instruction", and #2818's summary
+still says `IMAGE_LOAD_MIP` is "the single remaining blocker for all three". That is falsified.**
+Behind the MIMG decline, all three programs stop again on **`s_getpc_b64`**.
+
+The A/B is one variable in one binary: a **measurement-only** build (never merged, and it must never
+be) that accepts the declining `IMAGE_LOAD_MIP` as an ordinary LOD-0 `OpImageFetch`, discarding the
+guest's mip operand. That result is knowingly WRONG whenever the guest asks for a level other than
+zero — it exists only to answer "is anything behind this reject", and it is the cheapest instrument
+that can answer it, because the recompiler aborts at its first fatal site and therefore reports
+exactly one.
+
+| program | reject on master | reject with `IMAGE_LOAD_MIP` accepted |
+| --- | --- | --- |
+| `0x2005714000` | `pc=33 words=f0040308 fmt=14 op=0x1` (`image_load_mip`) | `pc=517 words=be801f00 fmt=1 op=0x1f` (`s_getpc_b64`) |
+| `0x2005717e00` | `pc=81 words=f0040308 fmt=14 op=0x1` | `pc=527 words=be801f00 fmt=1 op=0x1f` |
+| `0x200571bd00` | `pc=81 words=f0040308 fmt=14 op=0x1` | `pc=527 words=be801f00 fmt=1 op=0x1f` |
+
+**The census does not move**: 13 programs listed and every one `executed=0`, at
+`65536 dispatch decisions over 30 program(s)`, in both arms, with the three scene-width programs'
+skip counts unchanged (39 / 40 / 335 against 39 / 40 / 317). So this is the fourth measured instance
+of "a decline was cleared and nothing about the frame or the census changed", and the first where
+the reason is visibly that another decline was waiting one route further in.
+
+`s_getpc_b64` is rejected by `rdna2_emit_alu.cpp:1062` unless the PC-relative embedded-table
+pre-pass (`detect_pcrel_tables`, `rdna2_cfg_support.hpp`) folded a table load from this shader — the
+same family as R-Type Delta's #2783. **That half is now fixed** ([#2859](https://github.com/mattias800/prosper/issues/2859)):
+the pre-pass recognised an untyped (`MUBUF`) and a scalar (`SMEM`) consumer but not a **typed**
+one, and Frontiers' consumer is `tbuffer_load_format_x v10, v10, s[0:3], 0 offen` at BUF_FMT 22
+(`32_FLOAT`) — a one-component 32-bit typed format, which performs no conversion at all, so the
+existing constant-lookup fold was already exactly right for its *values*.
+
+The format was only half the proof, and the other half is the more interesting one because it is the
+one that would have been silently wrong. A FORMAT load also applies the descriptor's **DST_SEL**
+channel routing, which a raw `buffer_load_dword*` ignores — and Frontiers' own table descriptor
+carries word3 `0x10005004`, i.e. `DST_SEL = (X, 0, 0, 0)`. Its actual load writes only X and X is
+identity, so the live case is unaffected; a four-component typed fetch through that same descriptor
+would not have been. The typed fold therefore requires identity routing for the channels the opcode
+writes, as well as a conversion-free format. (Whether a typed fetch really does honour DST_SEL is
+`CONFIDENCE: MED` and prosper says it two different ways — see #2869 — but the obligation is
+fail-closed under either reading, so the guard is right regardless.)
+
+The declining `[mimg-mip]` line's sample above prints `dataformat=1 ncomp=2`: that `1` is prosper's
+own `DataFormat` ordinal (`Float32`), **not** the guest `IMG_FMT 64` named in the paragraph below it.
+The two numberings collide constantly and the field is labelled to keep them apart.
+
+### The blocker list for these three programs is exactly two, and one of them is now closed
+
+`tools/shader_inspect` on the `PROSPER_SHADER_DUMP` bytes answers "how many blockers" directly, and
+nobody had pointed it at these programs. Its generic-coverage enumeration lists every instruction
+the per-instruction emitter refuses:
+
+```text
+$ shader_inspect exec_cs_2005714000.bin
+generic-coverage total=437 alu=420 exp=0 table=3 unsupported=14 first=MIMG/0x1
+generic-unsupported pc=0033 fmt=MIMG op=0x1        <- image_load_mip (#2818)
+generic-unsupported pc=0344 fmt=SOPP op=0x8        <- s_cbranch_execz, lowered by the CFG dispatcher
+   ... eleven more SOPP branches ...
+generic-unsupported pc=0517 fmt=SOP1 op=0x1f       <- s_getpc_b64 (#2859)
+generic-unsupported pc=0536 fmt=SOP1 op=0x1f
+```
+
+All three programs give the same two non-branch families and nothing else. **Read that enumeration
+before costing out any single reject** — it is a static per-instruction pass, so it over-reports
+(the `SOPP` branches are fine, and it does not run `detect_pcrel_tables`, so it still lists a
+`s_getpc_b64` whose table the real pipeline folds), but it bounds the problem from above, which one
+terminal reject line can never do.
+
+And the pair is now measured to be the *whole* list. With #2859's fold in place **and** the same
+measurement-only LOD-0 build, in a routed `boot_trace` arm at
+`65536 dispatch decisions over 30 program(s)`, all three programs **disappear from the census skip
+list entirely** — 13 listed before, 10 after, and the three that left are exactly
+`0x2005714000` / `0x2005717e00` / `0x200571bd00`. The census lists only programs that skipped at
+least once, so leaving it means they recompiled and executed.
+
+So `IMAGE_LOAD_MIP` really is the last blocker for these three now — which is what #2818 claimed
+before it was true, and for a different reason.
+
+**How to rebuild the measurement arm** (it is deliberately not in the tree — it renders wrong
+content whenever the guest asks for a level other than zero, and a screenshot from it would be
+believed): in `rdna2_emit_alu.cpp`, immediately before the `is_zero_mip_load && (...)` decline,
+accept the instruction when an env switch is set and `res->sample_count == 1 &&
+!res->compression_enabled`. Execution then falls through to the ordinary `image_fetch_2d` at LOD 0.
+Run it only under `PROSPER_COMPUTE_TRANSLATE_ONLY=1`, where nothing is submitted.
+
+**The generalisable rule, and it cost this lane its first two hours: a terminal reject line is a
+lower bound of one.** It names the site the recompiler stopped at, which is the first fatal one on
+whatever route it took — never how many more are behind it. Before costing out a fix for a named
+blocker, spend one arm proving there is nothing behind it.
+
+### Where the guest's mip levels actually are
+
+The `[mimg-mip]` line now carries the resource's identity, and with `PROSPER_TDUMP=1` the picture is
+unambiguous. The declining resource is **2048x2048, `IMG_FMT 64` (32_32_FLOAT -> RG32F),
+`type=13` (2D_ARRAY) with `depth=1`, `tile_mode=27` (SW_64KB_R_X), `BASE_LEVEL=0`, `LAST_LEVEL=11`,
+`MAX_MIP=11`** — a complete 12-level pyramid of a 2048x2048 two-channel float surface, which is
+exactly 12 levels for a 2048-wide chain.
+
+And the guest binds **thirteen** descriptors to one such allocation:
+
+```text
+[tdump] t=2025e500 c4000000 01ffc1ff d1b0022c 00000000 007000b0 ... mips=0..0  max_mip=11 depth=1
+[tdump] t=2025e500 c4000000 01ffc1ff d1b1122c 00000000 007000b0 ... mips=1..1  max_mip=11 depth=1
+        ... one per level ...
+[tdump] t=2025e500 c4000000 01ffc1ff d1bbb22c 00000000 007000b0 ... mips=11..11 max_mip=11 depth=1
+[tdump] t=2025e500 c4000000 01ffc1ff d1bb022c 00000000 007000b0 ... mips=0..11 max_mip=11 depth=1
+```
+
+Twelve **single-level** views, one per level, plus one **whole-chain** view. That is a pyramid the
+guest builds itself: each level is written through its own single-level descriptor and the finished
+pyramid is read back through the chain descriptor at a runtime LOD.
+
+**So the guest's mip levels are ordinary guest memory**, at the byte offsets
+`tiled_mip_level_layout` already computes — and prosper's existing single-level path places each of
+them correctly *today*, one descriptor at a time (`image_base_level_view` applies `BASE_LEVEL`'s
+`mip_offset`, and SW_64KB_R_X is one of the tile modes it supports, tail included). What prosper
+cannot do is view them together. That matters for whoever takes #2818, because it says the faithful
+implementation **uploads real guest bytes** rather than synthesizing levels, and the machinery to
+locate each one is already written and already exercised by the guest's own twelve descriptors.
 
 **What the renderer can and cannot do with mips today**, because getting this wrong sends the next
 investigation to the wrong file:
@@ -340,5 +464,8 @@ to remember to update it. The last one did not (review of #2820).
 | Pressing confirm often enough clears the notice queue | **Falsified.** 405 confirms at 20-flip spacing reached exactly the same state as 6 did; 12 confirms at 40-flip spacing cleared it. Presses landing inside a page's transition animation are discarded, so spacing decides the outcome and volume does not. |
 | The black world in the stage is an artifact of `--warmup-seconds` skipping the renderer past the stage's setup | **Falsified by a control arm.** With `--warmup-seconds 90` the renderer is live continuously from flip 1517, before `GameModeStage` loads at flip ~2900, and the same HUD-over-black frames appear from flip 3429 to 4325 with the same 2880-wide composited rect. (#2790.) |
 | The black world is a compositing/present defect | **Falsified as the primary cause.** Sixteen of the stage's thirty-two compute programs have `executed=0`, three of them 2880-thread-wide screen-space passes; and the same build composites the in-engine cutscene correctly at full width. The composite is downstream of a scene target that was never shaded. (#2790.) |
-| The three scene-target-width stage programs are blocked by `s_cbranch_execz` and `image_load_mip`, the encodings their reject lines name | **Half falsified.** Both were reported by the straight-line emitter, two routes downstream of the decline that mattered. Live, with `PROSPER_DBG_PROGRAM` on each address, the CFG dispatcher declined `wave64-ambiguous-mask-read` at pc481 / pc481 / pc471 — one missing entry in `scalar_alu_source_words`, which charged `v_lshl_add_u32 v7, v6, 2, vcc_lo` (a 32-bit read of VCC_LO used as scalar scratch) the whole VCC pair. With it fixed that decline occurs **0** times, all three reach the dispatcher body, and all three converge on `image_load_mip` alone. **`s_cbranch_execz` is dead as a lever here** — the dispatcher lowers it fine. See `RECOMPILER_REMAINING.md` § Ruled out. |
-| Fixing a recompiler decline that unblocks these programs will change the frame | **Not established, and twice now it has not.** #2758 took `executed=0` to `executed=6` with no image change; #2801 cleared five SCC-site declines with no image change; this change cleared three dispatcher declines with **no census change at all** (14 listed, all `executed=0`, both arms at `262144 dispatch decisions over 32 program(s)`) and no composite change. Measure the composite separately — non-black percentage and bounding box — before claiming anything about the world. |
+| The three scene-target-width stage programs are blocked by `s_cbranch_execz` and `image_load_mip`, the encodings their reject lines name | **Half falsified.** Both were reported by the straight-line emitter, two routes downstream of the decline that mattered. Live, with `PROSPER_DBG_PROGRAM` on each address, the CFG dispatcher declined `wave64-ambiguous-mask-read` at pc481 / pc481 / pc471 — one missing entry in `scalar_alu_source_words`, which charged `v_lshl_add_u32 v7, v6, 2, vcc_lo` (a 32-bit read of VCC_LO used as scalar scratch) the whole VCC pair. With it fixed that decline occurs **0** times, all three reach the dispatcher body, and all three converge on `image_load_mip`. **`s_cbranch_execz` is dead as a lever here** — the dispatcher lowers it fine. See `RECOMPILER_REMAINING.md` § Ruled out. (This row said "`image_load_mip` **alone**"; the row below falsifies the *alone*, not the rest of it — `s_getpc_b64` is waiting behind the MIMG site.) |
+| Fixing a recompiler decline that unblocks these programs will change the frame | **Not established, and twice now it has not.** #2758 took `executed=0` to `executed=6` with no image change; #2801 cleared five SCC-site declines with no image change; this change cleared three dispatcher declines with **no census change at all** (14 listed, all `executed=0`, both arms at `262144 dispatch decisions over 32 program(s)`) and no composite change. A fourth instance is the row below: accepting `image_load_mip` moves the reject on and changes neither the census nor the frame, because another decline is waiting behind it. Measure the composite separately — non-black percentage and bounding box — before claiming anything about the world. |
+| `IMAGE_LOAD_MIP` is the single remaining blocker for the three scene-width stage programs (#2818, and this document's own earlier wording) | **Falsified by a one-variable A/B.** A measurement-only build that accepts the declining `IMAGE_LOAD_MIP` at LOD 0 moves all three programs' terminal reject from the MIMG site to **`s_getpc_b64`** (`be801f00`, SOP1 op 0x1f) at pc 517 / 527 / 527, and leaves the census byte-for-byte where it was — 13 listed, all `executed=0`, at `65536 dispatch decisions over 30 program(s)`. `image_load_mip` is the first of two blockers, and the second — the PC-relative embedded-table fold refusing a TYPED consumer — is fixed by this PR (#2859). With both cleared the three programs leave the census skip list entirely, so the pair is the complete list. **A terminal reject line is a lower bound of one**: the recompiler aborts at its first fatal site, so it can never say how many are behind it; `tools/shader_inspect`'s generic-coverage enumeration bounds it from above in one command. (#2859, this document.) |
+| A live `tools/screenshot` arm may use `--warmup-seconds` to reach the stage faster on this route | **Falsified in two arms, and the failure is silent.** `--warmup-seconds` suppresses Vulkan rendering, which raises the guest's flip rate to ~17-18/s (6,994 flips in 420 s on one arm, 1,669 in 90 s on another) against ~3.2-3.5/s once the renderer is live — but the boot's own progression is paced by asset loading and movie playback in WALL CLOCK, not by flips, so a flip-anchored route fires its windows against a guest that is nowhere near the state they were authored for. At `--warmup-seconds 90` the five `up` presses at f1700-f1940 were delivered ~50 s BEFORE the main menu existed, and the arm then activated "Extras" with the f2100 confirm and sat in the notices list for the rest of the run (open the frames: sample 7 is the title screen with the cursor still on "Extras", sample 24 is the "Update Details" notice page). At `--warmup-seconds 420` the same route produced **40 identical all-black 3840x2160 frames, one distinct frame in 3,752 publications, and 5 compute programs seen** — which reads exactly like "this title renders nothing", and is apparatus. Run the live arm with **no warmup**; the CPU-only `boot_trace` arm is the fast loop and it does reach the stage. (This document.) |
+| A routed `boot_trace` arm on this title reaches `GameModeStage` reliably, so its census can be read without checking | **Falsified — it desynchronises under HOST LOAD, and the failure is silent.** Measured across nine routed arms on one host, same route: the ones taken while the machine was quiet reached the stage (`65536 dispatch decisions over 30 program(s)`); the ones taken while other agents were building and linking on the same box did not (`over 5 program(s)` at the same denominator, having sat in the menus for the whole run). `uptime` read a load average of **28** during the failing streak. This is the same mechanism as the `--warmup-seconds` row above — the route's windows are anchored on display flips while the boot's own progression is paced by asset loading and movie playback in wall clock, so anything that moves the flip rate relative to wall clock moves the inputs off their targets. On a shared machine that is **not observable from inside the arm**, so: check `uptime` before starting, and **read the program count on the census line before believing anything in the block.** 5 means the arm never left the menus and every number under it is about a different part of the game; 30 means it is in the stage. A census quoted without that number is worthless. (This document.) |

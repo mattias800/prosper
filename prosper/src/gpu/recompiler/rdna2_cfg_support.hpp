@@ -1622,7 +1622,54 @@ inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, u
 struct PcrelTables {
     std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf;
     std::unordered_map<uint32_t, std::vector<uint32_t>> smem;
+    // TYPED consumer of the same idiom (#2859). Sonic Frontiers' three Cyber Space scene kernels
+    // build the identical getpc V# and read it with `tbuffer_load_format_x ..., s[0:3], 0 offen`,
+    // twice each. Kept in its own map rather than merged into `mubuf` because the two are admitted
+    // under different predicates: an MTBUF site is only foldable when its BUF_FMT performs NO
+    // conversion (see the case below), and a shared map would let the untyped rules speak for a
+    // typed site.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mtbuf;
 };
+
+// True when a typed-buffer BUF_FMT stores exactly 32 bits per component and applies no conversion,
+// so a typed fetch of `components` components is byte-identical to the same number of raw dwords.
+// rdna2_buffer_format maps 20/21/22 to Uint32/Sint32/Float32 (n=1), 62/63/64 (n=2), 72/73/74 (n=3)
+// and 75/76/77 (n=4); every other value either narrows, normalizes or packs. The component count
+// must MATCH the opcode's, because a typed load whose format is narrower than the opcode
+// default-fills the missing components (0,0,0,1) instead of reading them.
+// CONFIDENCE: HIGH, and the reason is a mitigation rather than the table's authority. The table it
+// reads (`agc_shader_layout.cpp:137`) labels itself "HIGH on the anchors, MED on the rest", and of
+// these twelve only 64/74/77 are anchors — the live case, BUF_FMT 22, is not. What makes HIGH
+// defensible is that for all twelve the NON-folded path is also a plain dword copy
+// (`rdna2_emit_alu.cpp`, `value = load_dword(kidx);  // raw 32-bit component`), so a wrong row here
+// would make the fold wrong in exactly the way the ordinary path is already wrong. The fold
+// introduces no divergence of its own.
+inline bool rdna2_buffer_format_is_raw_dwords(uint32_t format, uint32_t components) {
+    switch (format) {
+        case 20: case 21: case 22: return components == 1;
+        case 62: case 63: case 64: return components == 2;
+        case 72: case 73: case 74: return components == 3;
+        case 75: case 76: case 77: return components == 4;
+        default: return false;
+    }
+}
+
+// True when a V# word3's DST_SEL routes the first `components` channels straight through, so a
+// TYPED fetch returns the stored dwords in their stored order.
+//
+// This does not apply to the untyped fold: a raw `buffer_load_dword*` ignores DST_SEL entirely. A
+// FORMAT load does not, and getting it wrong is silent -- Sonic Frontiers' own embedded-table V#
+// carries word3 = 0x10005004, i.e. DST_SEL = (X, 0, 0, 0), so a four-component typed fetch through
+// that same descriptor would return the stored X and three CONSTANT ZEROES, not four dwords. Its
+// actual load is `tbuffer_load_format_x`, which writes only X, and X is identity -- but a fold that
+// checked only the format would have been wrong for the neighbouring shape and could not have said
+// so. Selector fields for components the opcode does not write are not examined.
+// DST_SEL is v[3][11:0], three bits per channel; SQ_SEL identity is 4/5/6/7 (X/Y/Z/W).
+inline bool rdna2_buffer_dst_sel_is_identity(uint32_t descriptor_word3, uint32_t components) {
+    for (uint32_t channel = 0; channel < components && channel < 4u; ++channel)
+        if (((descriptor_word3 >> (3u * channel)) & 0x7u) != 4u + channel) return false;
+    return true;
+}
 
 inline PcrelTables detect_pcrel_tables(
         const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords,
@@ -1748,6 +1795,50 @@ inline PcrelTables detect_pcrel_tables(
             case Rdna2Format::VOP3:
                 if (in.sdst.kind == OperandKind::SGPR) { kill(in.sdst.value); kill(in.sdst.value + 1); }
                 break;
+            case Rdna2Format::MTBUF: {
+                // Same proof as the MUBUF case below, with two extra obligations: the typed format
+                // must be a pure 32-bit-per-component pass-through (so the fold copies dwords, not
+                // converted texels), and TFE must be off (its trailing status word is not modelled).
+                if (in.opcode > 0x03u || in.mtbuf_tfe) break;      // typed LOADS only, no status
+                const uint32_t components = in.opcode + 1u;
+                if (!rdna2_buffer_format_is_raw_dwords(in.mtbuf_format, components)) break;
+                const int sb = in.src[1].value;
+                // word3 is required here and not in the untyped case below: a FORMAT load applies the
+                // descriptor's DST_SEL and a raw load does not.
+                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2) ||
+                    !kconst.count(sb + 3) ||
+                    !rdna2_buffer_dst_sel_is_identity(kconst[sb + 3], components)) break;
+                const uint32_t nrec = kconst[sb + 2];
+                const bool idxen = (in.literal >> 13) & 1u;
+                const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                   (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const uint64_t off = pcoff[sb];
+                // Entry soundness. A fact established at pc F is invalid at the load if control can
+                // ENTER the stream at a branch target T with F < T <= load_pc, because on that path
+                // F never executed. Every contributing register carries that obligation, so the
+                // bound is the OLDEST fact, not the newest: a maximum protects only the last
+                // register written and silently admits a branch that entered after an earlier one.
+                // (The MUBUF and SMEM cases below still use a maximum and have the same hole —
+                // #2862. Deliberately not changed here: this is the typed path's own predicate, and
+                // widening the fix to the untyped ones needs its own evidence and its own arms.)
+                uint32_t oldest = UINT32_MAX;
+                bool entered = false;
+                for (int r : {sb, sb + 1, sb + 2, sb + 3}) {
+                    auto it = fact_pc.find(r);
+                    if (it == fact_pc.end()) { entered = true; break; }   // no proven fact at all
+                    if (it->second < oldest) oldest = it->second;
+                }
+                if (!entered)
+                    for (uint32_t t : br_targets) if (t > oldest && t <= in.pc) { entered = true; break; }
+                if (entered) break;
+                if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
+                    off / 4 + nrec / 4 > dwords) break;
+                if (required_dwords)
+                    *required_dwords = std::max(*required_dwords,
+                                                static_cast<size_t>(off / 4 + nrec / 4));
+                out.mtbuf[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
+                break;
+            }
             case Rdna2Format::MUBUF: {
                 if (in.opcode < 0xCu || in.opcode > 0xFu) break;   // raw loads only
                 const int sb = in.src[1].value;                    // SRSRC base SGPR of the V# quad
