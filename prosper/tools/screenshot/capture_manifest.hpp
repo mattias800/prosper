@@ -1,5 +1,7 @@
 #pragma once
 
+#include "gpu/present/present_frame_rate.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,13 @@ struct CaptureObservation {
     uint32_t height = 0;
     uint32_t pixel_crc32 = 0;
     double elapsed_seconds = 0;
+    // The present layer's frame counters AT THIS SAMPLE, carried raw rather than as a rate.
+    // Two sample lines subtract to give the framerate over any window of the run, which is what a
+    // reader chasing "when did it slow down" actually needs; a single pre-computed rate answers one
+    // question and hides the rest. `distinct_frames` counts publications whose CONTENT changed --
+    // see gpu/present/present_frame_rate.hpp for why the other number cannot be trusted alone.
+    uint64_t published_frames = 0;
+    uint64_t distinct_frames = 0;
     uint32_t distinct_rgb_colors = 0;
     uint64_t nonblack_rgb_pixels = 0;
     uint64_t average_hash = 0;
@@ -186,6 +195,10 @@ struct CaptureRunConfig {
     int min_pixel_distinct_frames = 0;
     double max_pixel_stale_seconds = -1;
     bool require_composited_frame = false;
+    // Was `--fps-overlay` on? Recorded because the annotation is baked into every PNG this run
+    // wrote, and a reader comparing two runs' images must be able to tell that apart from a
+    // rendering change.
+    bool fps_overlay = false;
     uint64_t min_present_count = 0;
     uint64_t min_frame_seq = 0;
     bool required_crc32_set = false;
@@ -240,8 +253,13 @@ std::string manifest_sample_json(int index, const std::string& png_path,
 // it, which is the shape of the defect this signature exists to prevent (#2007). `stop` is required
 // for the same reason: a short artifact set that does not say why it is short is the same legibility
 // defect one level down (#2584). It also supplies the `timed_out` field, so the two cannot disagree.
+// `rate` is required for the same reason the guest state is: a summary that omits the framerate
+// while the tool measured one is a summary a consumer will fill in by guessing. It carries BOTH
+// rates, and the field names say which is which -- `presented_fps` alone would reproduce exactly the
+// reading that let #2783 hide (gpu/present/present_frame_rate.hpp).
 std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
                                   const CaptureTracker& tracker, const RunVerdict& verdict,
-                                  const GuestOutcome& guest, bool allow_guest_fault);
+                                  const GuestOutcome& guest, bool allow_guest_fault,
+                                  const prosper::gpu::FrameRate& rate);
 
 } // namespace prosper::screenshot

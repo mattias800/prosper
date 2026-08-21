@@ -1,5 +1,6 @@
 // videoout_present.cpp — see videoout_present.hpp.
 #include "gpu/present/videoout_present.hpp"
+#include "gpu/present/present_frame_rate.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "host/platform/lifecycle.hpp"
 #include <atomic>
@@ -44,6 +45,12 @@ void present_write_frame(const void* pixels, uint32_t w, uint32_t h, PresentFram
 void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
                          uint32_t w, uint32_t h, PresentFrameOrigin origin) {
     if (!pixels || !w || !h || pixels->size() != (size_t)w * h * 4) return;
+    // Count this publication AND whether it carried new content, before the present mutex. A
+    // framerate derived from g_frame_seq alone reads full speed for a title whose every frame is the
+    // renderer's re-served retained one -- the R-Type Delta (#2783) shape, and instrument trap 90.
+    // present_frame_rate.hpp is the whole argument; the cost here is a 0.4%-of-the-frame sampled
+    // hash outside the lock.
+    note_present_publication(pixels->data(), pixels->size(), w, h);
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame = std::move(pixels);
     g_frame_w = w; g_frame_h = h;
@@ -183,6 +190,9 @@ bool present_snapshot(PresentSnapshot& out) {
 void present_reset() {
     videoout_reset_front();
     g_present_count.store(0, std::memory_order_relaxed);
+    // The framerate counters are part of "what the present layer has published", so they clear with
+    // it. Leaving them would make a test that resets the layer measure across the reset boundary.
+    reset_present_rate();
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame.reset(); g_frame_w = g_frame_h = 0;
     g_frame_guest_present_count = 0;
