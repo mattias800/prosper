@@ -144,6 +144,7 @@ of its manifest.
 | Dragon Quest VII Reimagined | `PPSA17942` | 2 | `12----` | - | - | none | [#1486](https://github.com/mattias800/prosper/issues/1486), [#1588](https://github.com/mattias800/prosper/issues/1588), [#1706](https://github.com/mattias800/prosper/issues/1706), [#2778](https://github.com/mattias800/prosper/issues/2778) | [#1874](https://github.com/mattias800/prosper/issues/1874) | [`DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md) |
 | Earthion | `PPSA28061` | 2 | `12----` | - | - | none | - | [#1880](https://github.com/mattias800/prosper/issues/1880) | - |
 | Grand Theft Auto V | `PPSA04263` | 2 | `12----` | - | - | none | [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
+| Hi-Fi RUSH | `PPSA17168` | 2 | `12----` | **0.5** fps · 9% active · 4K · title screen, default launch, no pad · tools/screenshot · 2026-08-21 | - | none | - | [#2891](https://github.com/mattias800/prosper/issues/2891) | - |
 | Little Nightmares III | `PPSA05143` | 2 | `12----` | - | - | none | [#2014](https://github.com/mattias800/prosper/issues/2014), [#2022](https://github.com/mattias800/prosper/issues/2022), [#2028](https://github.com/mattias800/prosper/issues/2028), [#1977](https://github.com/mattias800/prosper/issues/1977) | [#1893](https://github.com/mattias800/prosper/issues/1893) | [`LITTLE_NIGHTMARES_3_STATUS.md`](prosper/docs/LITTLE_NIGHTMARES_3_STATUS.md) |
 | Nikoderiko: The Magical World | `PPSA23760` | 2 | `12----` | - | - | none | [#1607](https://github.com/mattias800/prosper/issues/1607) | [#1885](https://github.com/mattias800/prosper/issues/1885) | [`NIKODERIKO_STATUS.md`](prosper/docs/NIKODERIKO_STATUS.md) |
 | Sonic Frontiers | `PPSA03831` | 2 | `12----` | - | - | none | [#2206](https://github.com/mattias800/prosper/issues/2206), [#657](https://github.com/mattias800/prosper/issues/657) | [#1891](https://github.com/mattias800/prosper/issues/1891) | [`SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) |
@@ -172,10 +173,10 @@ of its manifest.
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 2 |
 | 3 -- gameplay with the scene rendering | 8 |
-| 2 -- title screen | 13 |
+| 2 -- title screen | 14 |
 | 1 -- any real graphics | 1 |
 | 0 -- not started | 11 |
 
-**4 of 49** trackers record a PS5 hardware-oracle comparison; the rest carry
+**4 of 50** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.

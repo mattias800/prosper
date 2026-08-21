@@ -1,0 +1,226 @@
+# Hi-Fi RUSH (PPSA17168) -- title screen, first-boot language wizard, and on.
+#
+# Anchors are wall-clock seconds from the FIRST PAD POLL, not from process
+# start, so the route is robust to how long the IoStore asset load takes -- on
+# this title that varies by more than a minute between a cold and a warm page
+# cache on the same machine.
+#
+# Windows are 3 s wide because a range shorter than the interval between pad
+# polls can be missed entirely (tools/AGENTS.md).
+#
+# Run with PROSPER_PAD_SCRIPT_LOG=1 so the route reports the transitions it
+# actually delivered -- without it this route cannot tell "the guest ignored
+# the input" from "the input was never applied".
+#
+# THE ROUTE IS A THREE-BEAT CYCLE, AND THE MIDDLE BEAT IS THE WHOLE POINT:
+#
+#     cross   -- confirm / Next
+#     left    -- move a Yes/No dialog's selection off its default
+#     cross   -- confirm again
+#
+# A cross-only route does NOT get past the language wizard, and it fails in the
+# way that looks like a renderer wall rather than an input problem: pressing
+# Next raises a "Continue with these settings?" dialog whose cursor starts on
+# the RIGHT-HAND option, so every cross answers it in the negative and returns
+# to the same page. Measured 2026-08-21 -- a 1168 s cross-only run cycled
+# through that loop for its whole length with the guest healthy throughout.
+# Same shape as the Tales of Graces f new-game dialogs (docs/TALES_GRACES_STATUS.md).
+
+15-18:cross
+22-25:left
+29-32:cross
+36-39:cross
+43-46:left
+50-53:cross
+57-60:cross
+64-67:left
+71-74:cross
+78-81:cross
+85-88:left
+92-95:cross
+99-102:cross
+106-109:left
+113-116:cross
+120-123:cross
+127-130:left
+134-137:cross
+141-144:cross
+148-151:left
+155-158:cross
+162-165:cross
+169-172:left
+176-179:cross
+183-186:cross
+190-193:left
+197-200:cross
+204-207:cross
+211-214:left
+218-221:cross
+225-228:cross
+232-235:left
+239-242:cross
+246-249:cross
+253-256:left
+260-263:cross
+267-270:cross
+274-277:left
+281-284:cross
+288-291:cross
+295-298:left
+302-305:cross
+309-312:cross
+316-319:left
+323-326:cross
+330-333:cross
+337-340:left
+344-347:cross
+351-354:cross
+358-361:left
+365-368:cross
+372-375:cross
+379-382:left
+386-389:cross
+393-396:cross
+400-403:left
+407-410:cross
+414-417:cross
+421-424:left
+428-431:cross
+435-438:cross
+442-445:left
+449-452:cross
+456-459:cross
+463-466:left
+470-473:cross
+477-480:cross
+484-487:left
+491-494:cross
+498-501:cross
+505-508:left
+512-515:cross
+519-522:cross
+526-529:left
+533-536:cross
+540-543:cross
+547-550:left
+554-557:cross
+561-564:cross
+568-571:left
+575-578:cross
+582-585:cross
+589-592:left
+596-599:cross
+603-606:cross
+610-613:left
+617-620:cross
+624-627:cross
+631-634:left
+638-641:cross
+645-648:cross
+652-655:left
+659-662:cross
+666-669:cross
+673-676:left
+680-683:cross
+687-690:cross
+694-697:left
+701-704:cross
+708-711:cross
+715-718:left
+722-725:cross
+729-732:cross
+736-739:left
+743-746:cross
+750-753:cross
+757-760:left
+764-767:cross
+771-774:cross
+778-781:left
+785-788:cross
+792-795:cross
+799-802:left
+806-809:cross
+813-816:cross
+820-823:left
+827-830:cross
+834-837:cross
+841-844:left
+848-851:cross
+855-858:cross
+862-865:left
+869-872:cross
+876-879:cross
+883-886:left
+890-893:cross
+897-900:cross
+904-907:left
+911-914:cross
+918-921:cross
+925-928:left
+932-935:cross
+939-942:cross
+946-949:left
+953-956:cross
+960-963:cross
+967-970:left
+974-977:cross
+981-984:cross
+988-991:left
+995-998:cross
+1002-1005:cross
+1009-1012:left
+1016-1019:cross
+1023-1026:cross
+1030-1033:left
+1037-1040:cross
+1044-1047:cross
+1051-1054:left
+1058-1061:cross
+1065-1068:cross
+1072-1075:left
+1079-1082:cross
+1086-1089:cross
+1093-1096:left
+1100-1103:cross
+1107-1110:cross
+1114-1117:left
+1121-1124:cross
+1128-1131:cross
+1135-1138:left
+1142-1145:cross
+1149-1152:cross
+1156-1159:left
+1163-1166:cross
+1170-1173:cross
+1177-1180:left
+1184-1187:cross
+1191-1194:cross
+1198-1201:left
+1205-1208:cross
+1212-1215:cross
+1219-1222:left
+1226-1229:cross
+1233-1236:cross
+1240-1243:left
+1247-1250:cross
+1254-1257:cross
+1261-1264:left
+1268-1271:cross
+1275-1278:cross
+1282-1285:left
+1289-1292:cross
+1296-1299:cross
+1303-1306:left
+1310-1313:cross
+1317-1320:cross
+1324-1327:left
+1331-1334:cross
+1338-1341:cross
+1345-1348:left
+1352-1355:cross
+1359-1362:cross
+1366-1369:left
+1373-1376:cross
+1380-1383:cross
+1387-1390:left
+1394-1397:cross
