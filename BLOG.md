@@ -92,7 +92,58 @@ I/O-stalled by an unrelated archive extraction the whole time, and a warm page c
 disk reads" number was measuring the wrong thing entirely — the read *syscalls* were climbing fine.
 A mutex wait is not proof of a deadlock. The holder may just be slow.
 
-## 2026-08-21
+### Sonic Frontiers' black world had two locks on the door, not one
+
+No picture in this one — the world is still black. What changed is that we now know how far away it
+is, and the number is smaller than it looked.
+
+The Cyber Space stage reaches gameplay with a running clock, and the world behind the HUD is black
+because sixteen of the stage's compute programs never execute. Three of them are the ones that
+matter: screen-width passes over the frame the player is supposed to see. Their reject line has
+named `image_load_mip` for a while, and the issue tracking it said so: *the* single remaining
+blocker.
+
+A reject line cannot say that. The recompiler stops at the **first** instruction it cannot lower and
+reports that one; it has no way to tell you what is behind it. So we built a throwaway measurement
+build — accept `image_load_mip` at LOD 0, knowingly wrong, never merged, run it where nothing is
+submitted — purely to ask "and then what?". And then the same three programs stopped again, all of
+them, on `s_getpc_b64`.
+
+That second lock turned out to be a small one. The compiler had put a little constant table straight
+into the shader blob and addressed it PC-relatively, which prosper already folds — but only when the
+table is read back with an *untyped* load. Frontiers reads it with a typed one,
+`tbuffer_load_format_x` at `32_FLOAT`, which is a 32-bit format that converts nothing, so the bytes
+it fetches are the bytes that are there. The fold was already correct for it; a guard spelled
+"untyped only" was the whole obstacle. That is what this PR fixes.
+
+Two things nearly went wrong on the way, and both are the same shape — a check that looked like a
+check. A typed fetch also honours the descriptor's channel routing, which the untyped one ignores,
+and this game's table descriptor routes three of its four channels to a constant zero; the first
+version of the fix only looked at the format, which would have been right here and silently wrong one
+instruction over. And the test written to pin the *second* correction passed under a mutation that
+deliberately broke the thing it was pinning — it was asserting "did the program compile", and that
+program does not compile for an unrelated reason, so it could never have failed. It asks the detector
+directly now.
+
+With both cleared, all three programs vanish from the skipped list — they recompile and they run.
+(Only one of the two is fixed here. The other is still open, so this measurement was taken with a
+throwaway build that waves the mip instruction through at level zero — deliberately wrong output,
+never merged, run where nothing is submitted. It answers "is anything else in the way", and the
+answer is no.)
+
+```text
+before   [compute-census] 65536 dispatch decisions over 30 program(s)   13 programs listed, all executed=0
+after    [compute-census] 65536 dispatch decisions over 30 program(s)   10 programs listed
+         gone: 0x2005714000 (3840x135)  0x2005717e00 (3840x405)  0x200571bd00 (3840x270)
+```
+
+So the remaining work on those three really is one instruction now, which is what everyone thought
+yesterday and was not true yesterday. And we know what it has to read: the guest builds itself a
+2048x2048 two-channel float pyramid and binds **thirteen** descriptors to it — one per mip level to
+write each one, plus one whole-chain view to read the finished thing back. The levels are sitting in
+guest memory the whole time, at offsets prosper already computes correctly for each of those twelve
+single-level descriptors. It just has never been able to look at them together.
+
 
 ### The Messenger's title screen runs at 206 fps and 0 fps at the same time
 

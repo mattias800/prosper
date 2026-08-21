@@ -3597,6 +3597,7 @@ bool emit_cfg_state_machine(
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
+        state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;
         return state;
     };
     auto save_state = [&](const RegState& state, uint32_t dispatch) {
@@ -5649,6 +5650,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         PcrelTables tables = detect_pcrel_tables(ins, code, dwords);
         rs.mubuf_pcrel_tables = std::move(tables.mubuf);
         rs.smem_pcrel_tables = std::move(tables.smem);
+        rs.mtbuf_pcrel_tables = std::move(tables.mtbuf);
     }
     std::unordered_set<uint32_t> local_dead_masks;
     if (!inherited_dead_masks) local_dead_masks = dead_wave_mask_writes(ins);

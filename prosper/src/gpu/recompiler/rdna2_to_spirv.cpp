@@ -3651,6 +3651,11 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             });
             return wrote_data && safe;
         };
+        // MUBUF-only is DELIBERATE, not an oversight now that `output_tables.mtbuf` exists three
+        // lines up (#2859). This gate is a narrowing allow-list for the byte-exact Astro Bot
+        // compacted-output wrapper; admitting a typed consumer would widen an NGG output gate with no
+        // title evidence behind it. A typed embedded table still FOLDS -- it just does not open this
+        // gate, which is the conservative direction.
         auto embedded_output_load = [&](const Rdna2Inst& candidate) {
             if (candidate.fmt != Rdna2Format::MUBUF || candidate.mubuf_lds)
                 return false;
