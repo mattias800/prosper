@@ -1,0 +1,134 @@
+# Grand Theft Auto V (PPSA04263) — route to the in-game SETTINGS tab of the pause menu.
+#
+# Motive: a user reported that selecting the game's own Performance graphics mode makes some world
+# content render (#2863). This title's missing 3D world is its open frontier, and the traversal table
+# at the centre of that investigation is a ray-tracing BVH whose IMAGE_BVH_INTERSECT_RAY consumers do
+# not compile — so a game-side setting that reduces the RT path is a cleaner instrument than any
+# emulator lever, because it has none of the cascade a declined dispatch causes. This route exists to
+# reproduce that report under measurement.
+#
+# ESTABLISHED BY CAPTURE, not from memory of the retail game (discover-pause-menu.pad + a 160-shot
+# series, 2026-08-21):
+#   * OPTIONS opens the pause menu, and it opens on the MAP tab.
+#   * The tab bar reads:  < MAP | BRIEF | STATS | SETTINGS | GAME | ONLINE >
+#     so SETTINGS is THREE tabs right of where the menu lands.
+#   * The prompt bar confirms the verbs: Browse L1/R1, Hide Menu (Triangle), Back (Circle),
+#     Select (Cross).
+#
+# ---------------------------------------------------------------------------------------------
+# WHY EVERYTHING AFTER BOOT IS ANCHORED IN SECONDS
+#
+# The flip rate COLLAPSES once gameplay is reached. Measured: the last flip-anchored press f3600
+# fired at 85.6 s, and over the remaining 315 s of a 401 s run fewer than 400 further flips occurred
+# (~1.3/s, against ~42/s during boot); the run summary reports 1,295 distinct frames of 11,932
+# published, "9% of the run active". A flip-anchored press placed after gameplay may therefore never
+# fire at all — the first version of this route put OPTIONS at f7000 and NONE of the post-gameplay
+# presses executed, which looked exactly like a route that had failed rather than one whose anchors
+# were unreachable.
+#
+# pad.cpp:207 — a leading 'f' selects flips, 'p' selects pad reads, and anything else is SECONDS.
+# Boot stays flip-anchored, where flips are plentiful and wall-clock varies with disk load; every
+# press after story entry is seconds-anchored, where wall-clock is the only thing still moving.
+# ---------------------------------------------------------------------------------------------
+
+# --- Boot -> title card -> main menu ------------------------------------------------------------
+f600-620:cross
+f800-820:cross
+f1000-1020:cross
+f1200-1220:cross
+f1400-1420:cross
+f1600-1620:cross
+f1800-1820:cross
+f2000-2020:cross
+f2200-2220:cross
+f2400-2420:cross
+
+# --- ONLINE -> GTA+ -> STORY, then enter ---------------------------------------------------------
+# Four R1, not two: in one run only one of two registered and the following Cross entered GTA+. STORY
+# is the rightmost tab, so a press that lands when already there clamps rather than overshooting.
+f2600-2620:r1
+f2700-2720:r1
+f2800-2820:r1
+f2880-2900:r1
+f3000-3020:cross
+
+# f3300 and f3600 from reach-story-mode.pad are DELIBERATELY ABSENT, and the reason is a trap worth
+# stating plainly: a flip RANGE is not a fixed duration. `f3600-3620` spans 20 flips, which is about
+# half a second during boot at ~42 flips/s -- and about NINETEEN SECONDS once the rate collapses to
+# ~2/s after gameplay. Measured here: that single entry held Cross from 147.4 s to 166 s, landing on
+# top of the R1 presses at 152 s and 164 s (the log shows `cross+r1`), and the held Cross closed the
+# pause menu again. The run ended back in gameplay with the radar up, looking like a route that never
+# opened the menu rather than one that opened and then dismissed it.
+#
+# The seconds-anchored Crosses below cover story entry on their own -- they fired at f3545..f3562,
+# i.e. gameplay was already reached -- so nothing is lost by dropping these two.
+
+# --- Through the save-slot / Resume Story prompts, in SECONDS -------------------------------------
+# The reach-story-mode.pad equivalents are f4000..f6000. Those still fire, but by then the flip rate
+# has collapsed, so f4000 lands around 245 s — i.e. in the MIDDLE of the menu navigation below, where
+# a stray Cross selects whatever row is highlighted. Observed doing exactly that. Anchoring them in
+# seconds keeps them where they belong: after story entry and comfortably before the menu opens.
+90-92:cross
+96-98:cross
+102-104:cross
+108-110:cross
+
+# --- Open the pause menu and cross to SETTINGS ---------------------------------------------------
+#
+# 150 s, not 120 s, and the margin is the whole reason. Measured across three runs: with a 120 s
+# anchor the menu opened in two of them (open windows t~168-260 s and t~170-320 s) and NEVER opened in
+# the third, whose boot ran slow -- its main-menu window stretched to 82 s where the others ended at
+# 58-64 s. A press aimed at gameplay that arrives while the title is still in the story-entry flow is
+# simply lost. Wall-clock cost of the later anchor is 30 s; the cost of the earlier one is a wasted
+# run, so the trade is not close.
+#
+# Detection method worth reusing: menu-open frames are trivially separable from gameplay by mean
+# luminance (menu ~15-40, black-world gameplay ~0.3-2.2), so a screenshot series can be scanned for
+# "was the menu ever open, and when" without opening a single image.
+150-152:options
+
+# THREE R1 to reach SETTINGS from MAP. Spaced 12 s so no press is eaten by the tab-change animation,
+# and right-only so an eaten press costs a tab rather than reversing direction. Unlike the main
+# menu's STORY tab, SETTINGS is NOT the rightmost entry -- GAME and ONLINE sit to its right -- so
+# extra presses here are NOT free and the count must be exact.
+170-172:r1
+182-184:r1
+194-196:r1
+
+# Enter the SETTINGS list. Prompt bar: "Select (Cross)".
+210-212:cross
+
+# --- Into the Display category -------------------------------------------------------------------
+# Measured from the captured SETTINGS page: the category list reads, top to bottom,
+#   Controls (selected on entry) | Audio | Camera | Display | Voice Chat | Notifications |
+#   Rockstar Editor | Saving | Motion Sensor Function
+# so Display is THREE Down presses from where the list lands. There is no "Graphics" category; the
+# graphics/performance mode selector is expected under Display, which is what the next capture
+# checks.
+228-230:down
+238-240:down
+248-250:down
+
+# --- STATE OF THIS ROUTE, 2026-08-21 -------------------------------------------------------------
+#
+# VALIDATED: reaches the pause menu and lands on the SETTINGS tab. Captured twice, from two runs with
+# different boot speeds. One of those runs also rendered the SETTINGS page fully -- the category list
+# reads Controls / Audio / Camera / Display / Voice Chat / Notifications / Rockstar Editor / Saving /
+# Motion Sensor Function, with the Controls pane on the right.
+#
+# NOT VALIDATED: everything past entering the list. The SETTINGS sub-page LOAD TIME VARIES between
+# runs -- in one it was populated by t~218 s, in another it was still showing its spinner at t~224 s,
+# so the Cross at 210 s landed on an unloaded page and the three Down presses went nowhere. Do not
+# treat the Display navigation below as established; it is a hypothesis about a list whose position
+# was read from a different run.
+#
+# NEXT STEP for whoever continues: give the sub-page a much larger settle (Cross at ~240 s, Downs from
+# ~270 s) and extend the capture window past 360 s, or better, find a load-completion signal to key
+# on rather than guessing a constant. The graphics/performance mode selector has NOT been located
+# yet -- there is no "Graphics" category, so Display is the candidate and that is all.
+#
+# A CHEAP INSTRUMENT worth reusing on any menu route: mean frame luminance separates a bright menu
+# page (~15-40) from this title's black-world gameplay (~0.3-2.2), so a screenshot series can be
+# scanned for "was the menu open, and when" without opening a single image. Caveat that cost a wrong
+# conclusion here: it detects a BRIGHT PAGE, not an open menu -- the MAP tab is dark and reads as
+# gameplay -- so a null from it means "no bright page", never "the menu never opened".
