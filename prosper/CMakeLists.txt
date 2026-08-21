@@ -1183,6 +1183,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_module_path_policy PRIVATE prosper_core)
   add_test(NAME module_path_policy COMMAND test_module_path_policy)
 
+  # dump_hygiene classifies files in a game dump that prosper must never load, and can delete them.
+  # Its control arms matter more than its positive ones: during development it twice classified
+  # AUTHENTIC dump content as removable. The suite pins both regressions and the guards behind them.
+  add_test(NAME dump_hygiene_classifier
+           COMMAND ${Python3_EXECUTABLE} -m unittest tests.tools.test_dump_hygiene
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
   target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)
