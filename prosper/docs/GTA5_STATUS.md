@@ -139,9 +139,22 @@ conclusion; it sharpens what "essentially all black" looks like.
   is cyclic. A stale copy is a producer/consumer gap that needs no corrupting writer — which is also
   why every attempt to name a corrupting *program* has failed.
 
+  **The WITHIN-program case is NOT the bug — checked, because it looks exactly like one.** The same
+  census shows `0x413dc6700` reaching this memory through **nine** bindings at one identical
+  `base=0x20f848417c size=8252`: loads at bindings 4/5/8 (fetch-pc 53/65/**91**, the traversal read)
+  and stores at 28/30/31/32/33/34 (fetch-pc **618/629/641/653/665/677** — the six phase-2 stores).
+  Nine resources over one span is a natural place to suspect lost updates, and the writeback log
+  *looks* damning: binding 4 reports `changed=641` while binding 8 reports `changed=0` on the same
+  address. It is benign. The alias check's conditions are all satisfied here, and on a match
+  `buffers[i]` takes the owner's `buffer` and `memory` and the owner inherits `writable` — one
+  VkBuffer, one writeback by the owner, `changed=0` on every alias by construction. So the six stores
+  and the traversal load share storage exactly as they should, and this program does **not** lose its
+  own writes. The hazard above is strictly the **cross-program, cross-dispatch** one, where the spans
+  differ and the persistent cache keys differ with them.
+
   **What is measured and what is not.** Measured: the eight programs, the four granularities, the
-  22,327 hits, the exact-match alias condition and the exact-key invalidation. **Not** measured: that
-  a lost update actually occurs on this route — no arm yet shows a specific write through one range
+  22,327 hits, the exact-match alias condition, the exact-key invalidation, and the within-program
+  aliasing being correct. **Not** measured: that a lost update actually occurs on this route — no arm yet shows a specific write through one range
   failing to appear through another. That is the next experiment, and it is cheap: watch one address
   through both granularities across a dispatch pair and compare the bytes. Until then this is a
   mechanism with strong circumstantial support, not a demonstrated defect. (2026-08-21.)
