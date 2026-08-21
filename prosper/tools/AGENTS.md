@@ -265,6 +265,12 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   for slow software rendering,
   and the pixel-distinct/pixel-stale assertions when visible progression matters. Source publication
   counts alone do not prove that the image changed; see `screenshot/README.md`.
+  Every run also reports a **framerate, as two numbers**: `distinct_fps` counts guest frames whose
+  content changed, `presented_fps` counts publications. Quote the first. The renderer re-publishes
+  its retained frame when a submit produces no present source, so a presented rate reads full speed
+  for a frozen title -- that is instrument trap 90 as a counter, and it is what let #2783 hide for
+  nine days. `--fps-overlay` burns the rate and its conditions into each PNG; it is off by default,
+  and no content metric in the tool ever sees the annotation.
   A run whose **primary guest thread dies** now reports `guest=faulted status=GUEST-FAULT` and exits
   non-zero instead of `status=ok` (#2007), and the manifest summary carries `guest_state` and the
   fault address. Pass `--allow-guest-fault` only when the route deliberately samples a crashing

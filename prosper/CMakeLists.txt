@@ -507,12 +507,24 @@ if(TARGET prosper_core)
 
   # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
   add_executable(test_capture_manifest tests/test_capture_manifest.cpp
-                                       tools/screenshot/capture_manifest.cpp)
+                                       tools/screenshot/capture_manifest.cpp
+                                       # The framerate the manifest reports. A pure TU with no
+                                       # dependency beyond the standard library, so it links here
+                                       # without dragging prosper_core (or Vulkan) into the test.
+                                       src/gpu/present/present_frame_rate.cpp)
   # `src` and the revision library are for `build_revision.hpp` only: the run header records the
   # revision the binary was compiled from, so the manifest self-describes. Still no Vulkan, no dump.
   target_include_directories(test_capture_manifest PRIVATE tools/screenshot src)
   target_link_libraries(test_capture_manifest PRIVATE prosper_build_revision)
   add_test(NAME capture_manifest COMMAND test_capture_manifest)
+
+  # The burned-in fps annotation (`screenshot --fps-overlay`). Rasterizing text into an RGBA buffer
+  # is pure, and an overlay that silently draws nothing looks exactly like one that was never asked
+  # for -- so it is asserted on pixels, here, without a device.
+  add_executable(test_overlay_text tests/test_overlay_text.cpp
+                                   tools/screenshot/overlay_text.cpp)
+  target_include_directories(test_overlay_text PRIVATE tools/screenshot)
+  add_test(NAME overlay_text COMMAND test_overlay_text)
 
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
   # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
@@ -839,6 +851,14 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_pad_overlay PRIVATE src frontends/prosper-app)
   target_link_libraries(test_prosper_app_pad_overlay PRIVATE prosper_core)
   add_test(NAME prosper_app_pad_overlay COMMAND test_prosper_app_pad_overlay)
+
+  # WHAT the --fps counter says, kept out of the ImGui/Vulkan overlay that draws it. The order of the
+  # two rates is the load-bearing part: a HUD that led with the PRESENTED rate would read ~60 fps for
+  # a frozen title (#2783).
+  add_executable(test_prosper_app_fps_hud frontends/prosper-app/test_fps_hud.cpp
+                                          src/gpu/present/present_frame_rate.cpp)
+  target_include_directories(test_prosper_app_fps_hud PRIVATE src frontends/prosper-app)
+  add_test(NAME prosper_app_fps_hud COMMAND test_prosper_app_fps_hud)
 
   # Which key is which pad control (#2234). No SDL here: the frontend keeps the Key -> scancode
   # table and the mapping itself lives in a header, so this runs in the core suite on every host.
@@ -1594,6 +1614,13 @@ if(TARGET prosper_core)
   target_include_directories(test_gpu_capture_bundle PRIVATE tests)
   target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
   add_test(NAME gpu_capture_bundle_roundtrip COMMAND test_gpu_capture_bundle)
+
+  # Framerate must count DISTINCT guest frames, not publications: the renderer re-serves its retained
+  # frame through the ordinary publish path, so a present-counting fps reads full speed for a frozen
+  # title (#2783 / instrument trap 90). Pure -- no Vulkan, no dump.
+  add_executable(test_present_frame_rate tests/gpu/present/test_present_frame_rate.cpp)
+  target_link_libraries(test_present_frame_rate PRIVATE prosper_core)
+  add_test(NAME present_frame_rate COMMAND test_present_frame_rate)
 
   # Native-speed append-only submit/present timeline: portable framing, checksums, and truncated-tail
   # recovery are pure and must not depend on Vulkan or a game dump.
@@ -2393,7 +2420,8 @@ endif()
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   if(WIN32)
     add_executable(screenshot tools/screenshot/screenshot.cpp
-                              tools/screenshot/capture_manifest.cpp)
+                              tools/screenshot/capture_manifest.cpp
+                              tools/screenshot/overlay_text.cpp)
                               # Spells a `shared/...` include, which resolves from `frontends`.
                               target_include_directories(screenshot PRIVATE frontends)
     target_include_directories(screenshot PRIVATE src tools/screenshot)
@@ -2403,7 +2431,8 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     find_package(ZLIB QUIET)
     if(ZLIB_FOUND)
       add_executable(screenshot tools/screenshot/screenshot.cpp
-                                tools/screenshot/capture_manifest.cpp)
+                                tools/screenshot/capture_manifest.cpp
+                                tools/screenshot/overlay_text.cpp)
                                 # Spells a `shared/...` include, which resolves from `frontends`.
                                 target_include_directories(screenshot PRIVATE frontends)
       target_include_directories(screenshot PRIVATE src tools/screenshot)
@@ -2633,7 +2662,8 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     endif()
 
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
-                               frontends/prosper-app/library_media.cpp)
+                               frontends/prosper-app/library_media.cpp
+                               frontends/prosper-app/fps_overlay.cpp)
     target_include_directories(prosper-app PRIVATE src third_party/stb)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
                                               prosper_performance_capture)

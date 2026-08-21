@@ -35,6 +35,39 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-21
 
+### The Messenger's title screen runs at 206 fps and 0 fps at the same time
+
+<p align="center"><img src="assets/screenshots/messenger-title-fps-overlay.png" alt="The Messenger's title screen with a burned-in overlay reading 2.9 FPS (206.3 PRESENTED) 1920X1080"></p>
+
+That counter is burned in by the new `screenshot --fps-overlay`, and both numbers are true. prosper
+handed this picture to the display **206 times a second**. Across one 120-second stretch of that run
+it published **25,015 frames and exactly one of them differed** from the frame before it. It is a
+still image being re-served at full speed.
+
+Nothing is wrong here: it is a title screen, and a title screen is allowed to sit still. The point is
+that **a framerate counted from presents cannot tell this apart from a hung game.** That is not
+hypothetical — it is how R-Type Delta's regression (#2783) hid for nine days while the guest reached
+stage 1 and every presented frame was the same retained one. Any counter we shipped that reported
+"206 fps" here would have reported it there too.
+
+So prosper now counts **distinct guest frames** — publications whose pixels actually changed — and
+every place a framerate appears shows both, honest number first. `PROGRESS_TRACKER.md` has an FPS
+column for it, sourced from a new `FPS record:` line in the game trackers.
+
+### And the first real number: Blue Prince at 4.7 fps
+
+<p align="center"><img src="assets/screenshots/blue-prince-cinematic-fps-overlay.png" alt="Blue Prince's opening cinematic — a blueprint of Mount Holly — with an overlay reading 4.7 FPS 94% ACTIVE 1920X1080"></p>
+
+The Day One opening cinematic, at native 1080p with no snapshot acceleration, over fifteen minutes.
+**4.7 frames per second, and 95% of the run was spent producing them** — that second number is what
+says the measurement is honest rather than an average of a fast stretch and a frozen one. The rate
+never left the 4.53–4.80 band across all 59 windows. (The overlay in the shot reads 94%, because it
+is the running figure at that moment; 95% is where the full run finished.)
+
+This is the "we have work to do" end of the scale, and it is now written down where you can find it
+without re-running anything. For comparison the same instrument reads The Messenger's animated
+stretches at 15–23 fps.
+
 ### Why The Plucky Squire's cutscene never ends
 
 No picture for this one — it is a measurement, and it replaced a guess that had been sitting in the
