@@ -23,7 +23,9 @@ Two properties of the link that surprise people, both load-bearing:
 - **Linking a module runs its `module_start`, which is guest code.** Adding a module to the
   candidate list is therefore not a free "make its exports available"; it can block the boot
   forever. `LinkInput::only_if_imported` exists because a module preloaded for one title deadlocked
-  an unrelated title that merely shipped the same file.
+  an unrelated title that merely shipped the same file. **Changing that list changes every title
+  that ships the file** — census the dumps before and after, and write the number down; the first
+  use of the flag turned out to affect two titles where the author had checked one.
 
 Init functions run in **reverse list order**, so a dependency must be placed *after* its dependent —
 `libc.prx` goes last precisely so it initializes first. Get this wrong and the symptom is a module

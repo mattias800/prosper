@@ -47,6 +47,20 @@ int main() {
     CHECK(support_module_lib_name("libc.prx") == "libc", "a bare filename works");
     CHECK(support_module_lib_name("/d/libfmodstudio.sprx") == "libfmodstudio", "the .sprx extension is stripped");
 
+    // --- the basename rule is NOT general, and it fails CLOSED --------------------------------
+    // Pinned so the limitation is visible rather than latent. These three are real spellings from
+    // PPSA03130's own import table: two of them the basename rule cannot produce. Nothing is broken
+    // today (the only module using the flag is spelled consistently), but the next person to set
+    // `only_if_imported` on a `.native.prx` would get a SILENT wrong drop, because a name that does
+    // not match reads exactly like a module nobody imports.
+    CHECK(support_module_lib_name("/d/libSceMsgDialog.native.prx") == "libSceMsgDialog.native",
+          "NATIVE: the basename rule keeps a '.native' stem (this one matches the real import)");
+    CHECK(support_module_lib_name("/d/libSceAjm.native.prx") != "libSceAjm",
+          "NATIVE (fails closed): the rule CANNOT derive 'libSceAjm', which is how the real "
+          "libSceAjm.native.prx is imported -- do not set only_if_imported on it without a mapping");
+    CHECK(support_module_lib_name("/d/libSceSaveData.native.prx") != "libSceSaveData_native",
+          "NATIVE (fails closed): nor 'libSceSaveData_native', the real spelling for that one");
+
     // --- the DROP direction: nobody imports it -------------------------------------------------
     {
         std::vector<LinkInput> in = { ordinary("/d/eboot.bin"), candidate("/d/sce_module/libSceNpCppWebApi.prx") };

@@ -134,12 +134,23 @@ void drop_unimported_support_modules(std::vector<LinkInput>& in, const Say& say)
     for (const auto& e : in) if (e.only_if_imported) { any = true; break; }
     if (!any) return;
 
+    // Names still needing a voucher. Parsing stops as soon as every candidate has one, because the
+    // scan is a second full `Module::load` of modules the linker is about to parse again -- 13-27 ms
+    // each on a warm cache, and the eboot is the largest file in the dump. The eboot is first in the
+    // list and vouches for 20 of the 42 dumps here, so the common case parses exactly one module.
+    std::set<std::string> unvouched;
+    for (const auto& e : in)
+        if (e.only_if_imported) unvouched.insert(support_module_lib_name(e.path));
+
     std::vector<std::vector<std::string>> imports_by_index(in.size());
-    for (size_t i = 0; i < in.size(); ++i) {
+    for (size_t i = 0; i < in.size() && !unvouched.empty(); ++i) {
         if (in[i].only_if_imported) continue;          // a candidate cannot vouch for itself
         std::string perr;
         if (auto m = Module::load(in[i].path, &perr)) {
-            for (const auto& imp : m->imports) imports_by_index[i].push_back(imp.lib_name);
+            for (const auto& imp : m->imports) {
+                imports_by_index[i].push_back(imp.lib_name);
+                unvouched.erase(imp.lib_name);
+            }
         } else {
             say("only-if-imported: cannot parse %s (%s); its imports are unknown, so it vouches "
                 "for nothing\n", in[i].path.c_str(), perr.c_str());

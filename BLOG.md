@@ -69,11 +69,28 @@ reaches `BOOT_COMPLETE` in 70 ms and runs.
 So a module preloaded for one title had been silently wedging another, and the fix is to preload it
 only when something actually imports it.
 
-Behind that wall the title is still at rung 0, and honestly so: it boots, streams assets, and drives
-a 4K present loop at ~19 flips a second — 2,054 flips in one run — while prosper composites exactly
-nothing. Every sample is a raw guest scanout, one distinct colour, zero non-black pixels. The next
-wall is that no pass produces a present source at all. That is the interesting problem, and it is a
-much better place to be than a deadlock.
+Which raised the obvious question a reviewer asked and I had not: *how many titles does that change?*
+I had checked two. The answer is a census — of 47 dumps here, 42 ship that PRX, 40 keep it, and two
+lose it: this title, and **Sonic Frontiers**, which nobody had looked at and which has no snapshot
+guard to notice. It appears to be harmless (import resolution is by NID, and not one of the 41,638
+NIDs that module exports is imported by anything in Frontiers' link graph) but "appears to be" is the
+honest phrasing, and a confirming boot of Frontiers belongs to the lane that owns it. A flag on a
+shared list is never a two-title question.
+
+Behind that wall the title is still at rung 0, and honestly so. On the real dump with the fix in, it
+boots in 91 ms, streams its assets, and drives a 4K present loop at ~21 flips a second — while prosper
+composites exactly nothing. Every sample is a raw guest scanout: one distinct colour, zero non-black
+pixels, `published_frames=0`. Two runs on two different trees agree, so it is not an artifact. The
+next wall is that no pass produces a present source at all — an ordinary graphics problem, and a much
+better place to be than a deadlock.
+
+One footnote worth keeping, because it nearly became a finding. Mid-run the thing looked *parked*: 1 %
+CPU, no disk reads, eighteen threads asleep, and exactly one of them — Wwise's `AK::BankManager` —
+blocked on a mutex while everything else waited on conditions. That asymmetry reads like a deadlock
+with a culprit's name attached. It wasn't; the run resumed thirty seconds later. The box was 70-90 %
+I/O-stalled by an unrelated archive extraction the whole time, and a warm page cache meant the "no
+disk reads" number was measuring the wrong thing entirely — the read *syscalls* were climbing fine.
+A mutex wait is not proof of a deadlock. The holder may just be slow.
 
 ## 2026-08-21
 

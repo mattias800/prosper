@@ -45,7 +45,13 @@ struct LinkInput {
     // `sce_module/libSceNpCppWebApi.prx` and never imports it — its own NP library is the unrelated
     // `libSceNpWebApi2` — and that module's `module_start` deadlocks in a condition wait 81 ms into
     // the boot, before `run_entry`, taking the whole title to rung 0. The preload was added for
-    // *Sonic Origins*, which does import it, and stays correct there.
+    // *Sonic Origins*, which does import it and keeps it.
+    //
+    // **Setting this flag changes every title that ships the file, so census them.** For this one:
+    // of 47 dumps, 42 ship it, 40 keep it, and **two** lose it — PPSA03130 and `PPSA03831`
+    // *Sonic Frontiers*, which is a tracked title with no snapshot guard. See
+    // `loader/support_modules.hpp` for the full census and the NID-overlap analysis behind
+    // "believed safe".
     bool only_if_imported = false;
 };
 

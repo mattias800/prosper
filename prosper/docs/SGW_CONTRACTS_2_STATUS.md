@@ -5,11 +5,19 @@
 
 ## Where it stands (2026-08-21)
 
-**Rung 0 on a default launch, and the wall is named and proven.** The boot deadlocks **81 ms in**,
-inside `run_guest_inits()` — before `run_entry`, before any asset is read, before the renderer is
-ever asked for a frame. The blocking frame is the `module_start` of
-**`sce_module/libSceNpCppWebApi.prx`**, a module **this title never imports**: prosper preloads it
-because the file exists, under a rule added for *Sonic Origins*.
+**Rung 0 — but two walls deep now, not one, and the first is fixed.**
+
+Before this lane, the boot deadlocked **81 ms in**, inside `run_guest_inits()` — before `run_entry`,
+before any asset was read, before the renderer was ever asked for a frame. The blocking frame was the
+`module_start` of **`sce_module/libSceNpCppWebApi.prx`**, a module **this title never imports**:
+prosper preloaded it because the file exists, under a rule added for *Sonic Origins*. That is fixed
+here.
+
+With it fixed, a default launch reaches `BOOT_COMPLETE` in **91 ms**, streams its assets, and drives a
+**4K present loop at ~21 flips/s** — and every frame is black, because no pass produces a present
+source at all. The title still renders nothing, so the rung does not move; but the frontier has moved
+from "the boot never starts" to "the renderer draws nothing", which is an ordinary graphics problem
+with concrete leads.
 
 ### The measurement
 
@@ -75,6 +83,61 @@ some other linked module names its library in its own import table. *Sonic Origi
 `src/loader/support_modules.hpp` so both directions are testable without a dump —
 `tests/loader/test_support_modules.cpp`.
 
+**The name match is verified against the title it must not break.** The filter derives the library
+name from the filename (`libSceNpCppWebApi.prx` -> `libSceNpCppWebApi`) and compares it against
+`Module::imports[].lib_name`, which `module.cpp:219` resolves from the importing module's own
+dynamic string table (`module.cpp:190`, DT tag `0x61000049`). *Sonic Origins* (`PPSA05325`) ships the
+same PRX and **does** import it, and its eboot spells the import exactly `libSceNpCppWebApi` — read
+straight out of its bytes, with no boot required:
+
+```text
+PPSA05325/eboot.bin :  2x "libSceNpCppWebApi"   1x "libSceNpCppWebApi_stub_weak"
+PPSA03130/eboot.bin :  0x "libSceNpCppWebApi"   (its NP library is libSceNpWebApi2)
+```
+
+So the two titles are separated by the exact string the filter tests, and the module is kept for the
+one that needs it. Checking this mattered: had importers spelled the name any other way, the filter
+would have silently dropped the module for *Sonic Origins* too, and the drop-direction test would
+have passed regardless.
+
+### The fix changes TWO titles, not one — and the second is *Sonic Frontiers*
+
+This was missed on the first pass and caught in review, and it is the kind of miss worth naming: the
+claim was framed as a two-title question (*Sonic Origins* keeps it, this title loses it) because
+those are the two titles that had been **looked at**. A flag on a shared preload list changes every
+title that ships the file, so the honest unit is a census, not a pair.
+
+Over the 47 dumps on the development box, matching each candidate's derived library name against the
+import tables of the non-candidate inputs:
+
+| | |
+| --- | --- |
+| dumps present | 47 |
+| ship `sce_module/libSceNpCppWebApi.prx` | 42 |
+| **KEEP** — a non-candidate imports the name | **40** (20 via their own `eboot.bin`, incl. `PPSA05325` *Sonic Origins*; 20 via `Media/Plugins/PSN.prx` / `PSNCore.prx`, both fixed non-candidate inputs) |
+| **DROP** — nobody imports it | **2**: `PPSA03130` (intended) and **`PPSA03831` *Sonic Frontiers*** |
+
+*Sonic Frontiers* is a tracked title at rung 2 with an open lane, and **no snapshot guard**, so
+nothing in CI would notice. It ships only `sce_module/{libSceNpCppWebApi,libc,libSceJobManager}.prx`
+and has no `Media/Plugins`, so its eboot is the only possible voucher — and the string
+`libSceNpCppWebApi` appears **0** times in its 64 MB eboot (the same grep on *Sonic Origins*' eboot
+returns 3, as a positive control).
+
+**Why it is believed safe, and where that belief stops.** `linker.cpp` resolves imports by **NID**;
+`lib_name` is carried but never consulted. So dropping a module can silently re-point any import
+whose NID it happened to own. Measured in review against `linker.cpp`'s own export predicate: the
+module exports **41,638 NIDs**, and the intersection with *Sonic Frontiers*' eboot (657 imports),
+`libc.prx` (103) and `libSceJobManager.prx` (144) is **zero** — as it is across all six of
+`PPSA03130`'s modules. No import in either link graph binds to it, so the first-definition-wins
+table cannot shift.
+
+What remains **unmeasured** for *Sonic Frontiers*: its `module_start` no longer runs, its image is
+not mapped, and ~41,600 names leave the global `sceKernelDlsym` table. **A confirming boot of
+`PPSA03831` was NOT taken** — that title belongs to another lane and is outside this lane's remit, so
+running it here would both exceed the remit and risk colliding with that lane's own measurements.
+This is recorded so the next reader knows the gap is deliberate and where to close it: one boot with
+`PROSPER_BOOTPHASE=1`, confirming `BOOT_COMPLETE` and the title screen.
+
 The rule is deliberately **narrow, and must not be generalised** to the optional preloads beside it.
 The Unity FMOD/Wwise/PSN plugins are preloaded *precisely because* nothing imports them statically:
 they are reached at runtime through `sceKernelDlsym` P/Invoke, appear in no import table, and this
@@ -82,10 +145,48 @@ test would drop every one of them. The test has an explicit arm for that (`RUNTI
 the mutation arm that makes the filter drop every candidate reddens only the `KEEP` check — which is
 what makes the keep direction load-bearing rather than decorative.
 
-### Behind the wall (arm B, so not a claim about the default route)
+### After the fix, on the real dump, default route (run C)
 
-With the module absent the guest boots and runs. In the first 158 s it read 208 MB and used 2.6 s of
-CPU across 18 threads, and had **not** presented a frame. Three imports fall to the return-0 default:
+The same measurement with the fix in place and **no symlink farm and no environment lever**:
+
+```text
+[bootphase] +90.9ms GUEST_INITS_RUNNING
+[bootphase] +91.0ms BOOT_COMPLETE          <- the phase that never arrived before
+```
+
+The guest then builds the whole CryEngine thread set — its own `pthread_setname` values survive, so
+gdb names them with no symbol work — streams assets, and reaches a **4K present loop at ~21 flips/s**
+(1,320 guest flips by t=363 s). **Every frame is black:**
+
+```
+11/11  source=raw_scanout   frame_seq=0   published_frames=0
+       nonblack_rgb_pixels=0   distinct_rgb_colors=1
+1364x  [render] frame N: Vulkan render FAILED (3840x2160)
+       [rtt] PRESENT SOURCE EXTENT MISMATCH: no pass produced a 3840x2160 present source
+             — px_front=none px_vo=none px_last=none, offered 0 bytes
+```
+
+So the title is **rung 0**: it executes, but nothing renders. That is the frontier now.
+
+> **A reading recorded here 10 minutes earlier was wrong, and is kept because the correction is the
+> point.** At t≈280 s this run looked *parked*: ~1 % CPU, no block-device reads, 18 threads all
+> sleeping, and — the detail that made it persuasive — exactly one thread, Wwise's
+> **`AK::BankManager`**, blocked in `k_mutex_lock` (`hle_kernel.cpp:850`) while every other thread sat
+> on a condition or a semaphore. That asymmetry reads like a deadlock with a named culprit. **It was
+> not one.** The run resumed and reached its present loop at t≈313 s; the bank manager was slow, not
+> stuck, on a box that was 70-90 % I/O-stalled by an unrelated extraction. It was labelled
+> `CONFIDENCE: MED` at the time precisely because *a mutex wait is not proof of a deadlock — the
+> holder may simply be slow*, and that caveat is the only reason a phantom wall did not get written
+> down as a finding. Two instruments disagreed and the disagreement was the signal: `read_bytes` said
+> zero while the read *syscall* count climbed (38 -> 378 -> 680 per 20 s), because a warm page cache
+> serves reads that never touch the block device.
+
+### The same picture on the modified tree (arm B), which is what makes it trustworthy
+
+Arm B — the symlink tree — reached the identical end state independently: **20/20 `raw_scanout`,
+`frame_seq=0`, `published_frames=0`, zero non-black pixels, one distinct colour**, over 2,054 guest
+flips. Two runs, two different trees, the same result, so the black frames are not an artifact of
+the farm. Three imports fall to the return-0 default:
 `pthread_attr_getschedparam` (`qlk9pSLsUmM`), `pthread_setprio` (`a2P9wYGeZvc`) and
 **`scePlayGoGetOptionalChunk`** (`g4AZyxpSAlA`) — the last is the one to watch, since a 0 with an
 unwritten out-parameter is the false-success shape and this is a chunk-installed query.
