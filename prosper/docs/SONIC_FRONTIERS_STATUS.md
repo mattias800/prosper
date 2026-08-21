@@ -112,6 +112,58 @@ no constants — so what it means is unresolved. Start from this rather than fro
 
 Both are filed as [#2206](https://github.com/mattias800/prosper/issues/2206).
 
+## The Cyber Space stage's compute frontier (2026-08-21)
+
+The route on [PR #2791](https://github.com/mattias800/prosper/pull/2791) reaches `GameModeStage` on
+Cyber Space `w6d01`; the HUD composites and the world behind it is black. `#2790` measured the cause
+as compute programs that never execute, and the census is the instrument:
+
+```bash
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_COMPUTE_TRANSLATE_ONLY=1 \
+PROSPER_COMPUTE_PROGRAM_CENSUS=1 \
+PROSPER_DBG_PROGRAM=0x2005714000,0x2005717e00,0x200571bd00 \
+PROSPER_PAD_SCRIPT=@<route>/reach-gameplay.pad PROSPER_SAVE0=<private dir> \
+  ./build/boot_trace <DUMP_ROOT>/PPSA03831-app0
+```
+
+**Guest program addresses are run-local — re-derive them from the `[compute-census]` per-program
+lines of the run you are in, not from this document.** `PROSPER_DBG_PROGRAM` then narrows the
+verbose recompiler stream to those addresses; `PROSPER_DBG=1` is ~1.5 GB here and desyncs the pad
+script before it reaches the stage.
+
+At `262144 dispatch decisions over 32 program(s)`, **14 programs are listed and every one is
+`executed=0`** (the census prints per-program detail only for programs that skipped at least once,
+#2745). Three of them dispatch at the display width — `240x135x1` groups of `16x1`, `16x2` and
+`16x3`, i.e. 3840x135, 3840x270 and 3840x405 threads — and are the screen-space passes the world
+depends on.
+
+**All three now block on exactly one instruction.** #2790's handoff named two levers,
+`s_cbranch_execz` and `image_load_mip`; both were reject PCs printed by the *straight-line* emitter,
+which these programs only reach after two earlier routes decline. The first decline is ordinary
+route selection (`backward else`, `role=route-decline`); the second was a real defect in the Wave64
+MUST dataflow, fixed by adding V_LSHL_ADD_U32 to `scalar_alu_source_words`' B32 list. With that in
+place the `wave64-ambiguous-mask-read` decline does not occur anywhere in the run, all three programs
+reach the CFG dispatcher's body, and all three stop at:
+
+```text
+[mimg-mip] image_load_mip declined pc=… shape=0 proven_zero_mip=0 img_dim=5/1 samples=1
+           mips=12 mip_tail=0 compressed=0 array_in_gfx=0
+```
+
+So the single live lever is `IMAGE_LOAD_MIP` where the *resource* declares `2D_ARRAY` with a
+**12-level mip chain** while the *instruction* addresses it `dim:2D`, and the mip operand is not one
+of the recognised provably-zero shapes. `rdna2_emit_alu.cpp` only ever specialises this op away after
+proving the mip is zero and the resource is single-level; a 12-mip resource has no such proof, so it
+declines. Implementing it means lowering a real guest LOD, not widening the proof —
+`CLAUDE.md`'s standing rule applies: do not make the reject accept by substituting a plausible
+constant. Tracked as
+[#2818](https://github.com/mattias800/prosper/issues/2818), which records why the existing
+"prove the mip is zero" route cannot simply be widened: `ResourceDesc::mip_levels` is interface-only
+and prosper materialises single-level images.
+
+**The census did not move when the MUST defect was fixed** — 14 programs, all `executed=0`, before
+and after at the same denominator — and neither did the composite. Both were measured, not assumed.
+
 ## Ruled out
 
 Thirteen rows, one line per falsified hypothesis with the evidence that killed it. Read this before
@@ -133,3 +185,5 @@ forming a new one. The first row is this document's own; the other twelve were e
 | Same defect as Little Nightmares III (#1962) | **Falsified — the opposite shape.** Here `present_count` climbed while `frame_seq` froze and submits kept arriving; there both froze together. |
 | `pixel_crc32=666f7b3f` links this to #1962 / #1982 | **No — it is just "black 3840×2160"** and recurs on unrelated titles. Never group by a black-frame hash. |
 | The frame going black shortly *before* the publish wall shares the wall's cause | **Falsified.** With the publish wall removed (#1990) the black survived unchanged; the last publishable frame was already black. Two defects. |
+| The three scene-target-width stage programs are blocked by `s_cbranch_execz` and `image_load_mip`, the encodings their reject lines name | **Half falsified.** Both were reported by the straight-line emitter, two routes downstream of the decline that mattered. Live, with `PROSPER_DBG_PROGRAM` on each address, the CFG dispatcher declined `wave64-ambiguous-mask-read` at pc481 / pc481 / pc471 — one missing entry in `scalar_alu_source_words`, which charged `v_lshl_add_u32 v7, v6, 2, vcc_lo` (a 32-bit read of VCC_LO used as scalar scratch) the whole VCC pair. With it fixed that decline occurs **0** times, all three reach the dispatcher body, and all three converge on `image_load_mip` alone. **`s_cbranch_execz` is dead as a lever here** — the dispatcher lowers it fine. See `RECOMPILER_REMAINING.md` § Ruled out. |
+| Fixing a recompiler decline that unblocks these programs will change the frame | **Not established, and twice now it has not.** #2758 took `executed=0` to `executed=6` with no image change; #2801 cleared five SCC-site declines with no image change; this change cleared three dispatcher declines with **no census change at all** (14 listed, all `executed=0`, both arms at `262144 dispatch decisions over 32 program(s)`) and no composite change. Measure the composite separately — non-black percentage and bounding box — before claiming anything about the world. |
