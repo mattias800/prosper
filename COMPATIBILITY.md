@@ -31,7 +31,7 @@ Last updated: 2026-08-17
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then a decoded 4K animated intro still running at 420 s; no title screen observed; movie chroma is collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; the menu heading draws the wrong string | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route now reaches Cyber Space gameplay, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
@@ -210,8 +210,18 @@ The boot previously stopped dead after the opening sequence, at a black screen. 
 entry. prosper did not implement it, and the unimplemented default answers `SCE_OK`, so the title
 believed a PS4 save had been mounted and spent every frame trying to open a mount point that was
 never created. **Known defects:** the menu heading draws the string "Try Again" where the game's
-logo belongs, and a panel that opens over the menu renders almost none of its text
-([#2206](https://github.com/mattias800/prosper/issues/2206)). See
+logo belongs, and the six main-menu entries do not always render their text
+([#2206](https://github.com/mattias800/prosper/issues/2206)).
+
+An input route now takes the title past the menu into gameplay:
+[`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`](prosper/scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad)
+clears the twelve-page boot notice queue that a no-input arm sits behind forever, moves the
+main-menu cursor from "Extras" to "New Game", and reaches `GameModeStage` on the Cyber Space stage
+`w6d01` — one hundred streamed terrain sectors, the stage HUD, Cyber Space BGM, and a stage clock
+that runs. **The world behind that HUD is black**: sixteen of the stage's thirty-two compute
+programs never execute, three of them full-screen passes over the scene target
+([#2790](https://github.com/mattias800/prosper/issues/2790)). That is the frontier for this title,
+and the Needle stack is shared with *Sonic Origins* and *Sonic Racing: CrossWorlds*. See
 [`docs/SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1891).
 
