@@ -64,20 +64,28 @@ Last updated: 2026-08-17
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Chapter 1 gameplay; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
+| *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2864](https://github.com/mattias800/prosper/issues/2864) |
 
 ## At a glance
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-ten of the twenty-four titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
-at two different rungs. Counting markers gives a different — and wrong — answer.
+ten of the twenty-four titles that reach gameplay are marked 🚧 rather than ✅, and the 🔬 rows sit at
+three different states — two at different rungs, and one not yet run at all. Counting markers gives a
+different — and wrong — answer.
+
+**"Not yet booted" is a real category, not a rung.** A dump can be present and never measured, and
+that is different from having been measured and found wanting. It is counted separately so an
+unmeasured title is never mistaken for a failing one — nine more dumps are arriving, and they will
+land here first.
 
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 24 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
-| Total tracked | 39 |
+| **Not yet booted** — dump present, never run | 1 |
+| Total tracked | 40 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
