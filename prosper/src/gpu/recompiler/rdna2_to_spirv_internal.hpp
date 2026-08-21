@@ -4172,6 +4172,20 @@ struct RegState {
     std::unordered_set<int> sreg_bool_b32;
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
+    // The DIRECT counterpart of sreg_srt: SGPR word -> the entry-time SGPR word it is an unmodified
+    // copy of. An indirect descriptor keeps its provenance across a copy because sreg_srt travels
+    // with it; a direct descriptor is keyed only by its REGISTER NUMBER (`by_sgpr_base`), so staging
+    // it into a scratch range with s_mov_b32 used to destroy its only key -- the moves make
+    // `sreg_range_written` true, which is exactly the guard that suppresses the direct lookup. The
+    // compiler idiom that does this is "stage several descriptors, copy the selected one into one
+    // SRSRC range" (#1773; #273 added sreg_srt propagation because the INDIRECT form of the same
+    // idiom broke DOLL's scene VS).
+    //
+    // This is a copy alias, not a claim about the descriptor's contents: it says only "these bits
+    // are still the bits the driver put in that entry-time register". Consumers must re-check that
+    // the ORIGIN is still unwritten (sreg_range_ud_alias does), so the alias never extends trust
+    // beyond what `by_sgpr_base` already grants the uncopied form.
+    std::unordered_map<int, int> sreg_ud_alias;
     // Immediate S_LOAD_DWORDX16 is typeless: it can be ordinary scalar data, or two adjacent
     // eight-dword T# descriptors. The latter is admitted only after a whole-stream use proof (see
     // proven_smem_x16_descriptor_loads). These are load PCs, not SRT keys: an x16 bundle contains
@@ -4513,6 +4527,26 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
 
     const bool vopc_b32_write = in.fmt == Rdna2Format::VOPC &&
         !vopc_is_cmpx(in.opcode) && rs.sreg_bool_b32.contains(in.dst.value);
+
+    // DIRECT-descriptor copy alias (#1773). Decide the origin from the state BEFORE the write loop
+    // below expires it: `s_mov_b32 sD, sS` may name the same register on both sides, and the loop
+    // marks the destination written. Only the one-word scalar move is admitted -- it is the form
+    // every observed staging idiom uses, and it cannot be a B64 mask copy. A source that is itself
+    // a live mask is excluded outright: those bits are a predicate, not descriptor words.
+    int ud_alias_dst = -1, ud_alias_origin = -1;
+    if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+        in.dst.kind == OperandKind::SGPR && in.src[0].kind == OperandKind::SGPR &&
+        in.dst.value <= 101 && in.src[0].value <= 101 &&
+        !rs.sreg_bool.contains(in.src[0].value) &&
+        !rs.sreg_bool_b32.contains(in.src[0].value)) {
+        const int src = in.src[0].value;
+        if (auto chained = rs.sreg_ud_alias.find(src); chained != rs.sreg_ud_alias.end())
+            ud_alias_origin = chained->second;      // a copy of a copy still names the origin
+        else if (!rs.sreg_written.contains(src))
+            ud_alias_origin = src;                  // still the entry-time value the driver supplied
+        if (ud_alias_origin >= 0) ud_alias_dst = in.dst.value;
+    }
+
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         // emit_alu has already materialized the new lifetime. Classify mask writers from the
         // instruction itself rather than inferring them from `sreg`: s_getpc_b64's folded form
@@ -4579,8 +4613,14 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             const int reg = base + static_cast<int>(word);
             rs.sreg_written.insert(reg);
             rs.sreg_input.erase(reg);
+            // Any write ends a copy alias for the register it lands on. This is the one place every
+            // scalar write form funnels through, which is why the alias is expired here rather than
+            // beside each of the ~50 sites that erase sreg_srt.
+            rs.sreg_ud_alias.erase(reg);
         }
     }, vopc_b32_write || vop3_b32_mask);
+
+    if (ud_alias_dst >= 0) rs.sreg_ud_alias[ud_alias_dst] = ud_alias_origin;
 }
 
 // emit_alu lives in rdna2_emit_alu.cpp -- 7,676 lines of instruction-family translation that is

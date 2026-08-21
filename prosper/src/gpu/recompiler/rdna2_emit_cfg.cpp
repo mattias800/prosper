@@ -934,6 +934,9 @@ void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sr
         rs.sreg_written.insert(reg);
         rs.sreg_input.erase(reg);
         rs.sreg_srt.erase(reg);
+        // A loop body that may write this register must not leave a copy alias standing: the alias
+        // was established on one iteration's path and says nothing about the next one (#1773).
+        rs.sreg_ud_alias.erase(reg);
     }
 }
 
@@ -6070,7 +6073,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
             rs.sreg_written.insert(then_written.begin(), then_written.end());
-            for (int reg : then_written) rs.sreg_input.erase(reg);
+            // A copy alias created on only one arm must not survive the merge (#1773).
+            for (int reg : then_written) { rs.sreg_input.erase(reg); rs.sreg_ud_alias.erase(reg); }
             if (then_bool != rs.sreg_bool || then_bool_b32 != rs.sreg_bool_b32) {
                 log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                          "counted-loop prelude changes mask domain");
@@ -6929,7 +6933,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
                     rs.sreg_written.insert(then_written.begin(), then_written.end());
-                    for (int reg : then_written) rs.sreg_input.erase(reg);
+                    // A copy alias created on only one arm must not survive the merge (#1773).
+                    for (int reg : then_written) { rs.sreg_input.erase(reg); rs.sreg_ud_alias.erase(reg); }
                     if (then_bool_b32 != rs.sreg_bool_b32) {
                         log_recompile_diagnostic(
                             b.diagnostic, "compute-struct-reject", "terminal",
