@@ -40,11 +40,15 @@
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
-#ifdef PROSPER_HAVE_LIBRARY_UI
-#include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
+// The --fps HUD is NOT part of the library view and must not be guarded by its macro: `Vk::overlay`
+// and every use site below are unconditional, so hiding the declaration behind
+// PROSPER_HAVE_LIBRARY_UI only compiles today because that macro happens to be defined
+// unconditionally wherever prosper-app is built. A latent break, not a working arrangement.
+#include "gpu/present/present_frame_rate.hpp"   // distinct-guest-frame rate (NOT a present rate)
 #include "fps_overlay.hpp"               // --fps: the ImGui HUD drawn OVER a running title
 #include "fps_hud.hpp"                   // ...and what it says, kept pure and unit-tested
-#include "gpu/present/present_frame_rate.hpp"   // distinct-guest-frame rate (NOT a present rate)
+#ifdef PROSPER_HAVE_LIBRARY_UI
+#include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
 #endif
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "shared/live/live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
@@ -1822,8 +1826,7 @@ int main(int argc, char** argv) {
             // owns it, and two presenters acquiring the same images would fight.
             if (libraryUi.ready()) {
                 fprintf(stderr, "[app] library view closed; presenting the game.\n");
-                fpsOverlay.shutdown();
-    libraryUi.shutdown();
+                libraryUi.shutdown();
             }
 #endif
             return true;
@@ -2121,9 +2124,13 @@ int main(int argc, char** argv) {
 #endif
             // The framebuffers point at the destroyed swapchain's images. Rebuilt, or the HUD turns
             // itself off -- never left pointing at freed images.
+            // On failure the HUD tears itself down but `showFps` stays set, so the `if (showFps)`
+            // block below rebuilds it from scratch on the next iteration -- which is the behaviour
+            // we want (a resize should not cost the counter for the rest of the run). Say that,
+            // rather than "now off", which the next iteration usually makes untrue.
             if (fpsOverlay.ready() &&
                 !fpsOverlay.recreate_swapchain(vk.scFormat, vk.scImages, vk.scExtent))
-                fprintf(stderr, "[app] the fps overlay lost its swapchain and is now off.\n");
+                fprintf(stderr, "[app] the fps overlay lost its swapchain; rebuilding it.\n");
         }
         const auto loopNow = std::chrono::steady_clock::now();
         if (timedDumpPending && loopNow >= nextTimedDump) {
@@ -2517,6 +2524,10 @@ int main(int argc, char** argv) {
         std::_Exit(exitCode);
     }
 
+    // Before SDL_Quit and before the device wait below, for the same reason the library view is:
+    // this releases ImGui and Vulkan objects while the device and the window still exist. The
+    // destructor would do it too, but main does not always return here.
+    fpsOverlay.shutdown();
 #ifdef PROSPER_HAVE_LIBRARY_UI
     // Before SDL_Quit: ImGui's SDL3 backend frees cursors and closes gamepads on shutdown, and the
     // destructor would otherwise run after SDL had already torn those down.

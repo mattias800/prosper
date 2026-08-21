@@ -79,6 +79,7 @@ discriminating fails there rather than passing everything downstream.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import shutil
@@ -113,11 +114,19 @@ FPS_RE = re.compile(r"^FPS record:\s*(?P<value>\S.*?)\s*$", re.M)
 # a presented rate reads full speed for a frozen title (prosper/src/gpu/present/present_frame_rate.hpp,
 # instrument trap 90, #2783). A record carrying only one number could not show that, and a reader
 # would have no way to tell which number they had been given.
+# `[xX]` because `screenshot --fps-overlay` burns the resolution with an UPPERCASE X (its 5x7 font is
+# uppercase-only), and the overlay is the most likely place somebody reads these numbers off. A
+# grammar that rejects its own tool's output would be a hard `--check` failure in CI for a record
+# that is factually correct.
+#
+# The scene and frontend fields require a non-space character. `[^;]+?` alone accepted `; ; ;`, which
+# parses to a framerate with an empty scene and an empty frontend -- precisely the bare number this
+# grammar exists to reject, wearing the shape of a full record.
 FPS_RECORD_RE = re.compile(
     r"^(?P<distinct>\d+(?:\.\d+)?)\s+distinct\s*/\s*(?P<presented>\d+(?:\.\d+)?)\s+presented"
-    r"\s+at\s+(?P<width>\d+)x(?P<height>\d+)"
-    r"\s*;\s*(?P<scene>[^;]+?)"
-    r"\s*;\s*(?P<frontend>[^;]+?)"
+    r"\s+at\s+(?P<width>\d+)[xX](?P<height>\d+)"
+    r"\s*;\s*(?P<scene>[^;\s][^;]*?)"
+    r"\s*;\s*(?P<frontend>[^;\s][^;]*?)"
     r"\s*;\s*(?P<date>\d{4}-\d{2}-\d{2})$"
 )
 
@@ -323,6 +332,16 @@ def parse_fps_record(body: str, where: str, name: str) -> dict | None:
             "        rejected deliberately: a framerate without its resolution, its scene, the\n"
             "        frontend that measured it and the date is not a measurement anybody can use."
             % (where, name, value, FPS_FORM)
+        )
+    # The shape regex accepts 2026-13-45; a calendar does not. A date nobody can place is exactly as
+    # useless as no date, and this is the field that stops a figure from a fixed-since regression
+    # being read as current.
+    try:
+        datetime.date.fromisoformat(m.group("date"))
+    except ValueError:
+        raise ParseError(
+            "%s (%s): the 'FPS record:' date %r is not a real calendar date."
+            % (where, name, m.group("date"))
         )
     distinct = float(m.group("distinct"))
     presented = float(m.group("presented"))
@@ -787,6 +806,14 @@ def selftest() -> int:
         if got != want:
             failures.append("parsed %s = %r, expected %r" % (field, got, want))
 
+    # `screenshot --fps-overlay` burns `3840X2160`, so that spelling must parse: a grammar that
+    # rejects the output of the tool that produced the measurement fails CI on a correct record.
+    upper_x = parse_tracker(
+        _issue(body=_GOOD_BODY + "FPS record: 3.4 distinct / 59.8 presented at 3840X2160; "
+                                 "gameplay; screenshot; 2026-08-21\n"), {})["fps"]
+    if upper_x["width"] != 3840 or upper_x["height"] != 2160:
+        failures.append("the uppercase 3840X2160 spelling the fps overlay burns did not parse")
+
     none_record = parse_tracker(_issue(body=_GOOD_BODY + "FPS record: none\n"), {})["fps"]
     if none_record != {"none": True}:
         failures.append("'FPS record: none' did not parse as an explicit absence")
@@ -835,6 +862,17 @@ def selftest() -> int:
             _issue(body=_GOOD_BODY +
                    "FPS record: 59.8 distinct / 3.4 presented at 3840x2160; gameplay; "
                    "screenshot; 2026-08-21\n"),
+        ),
+        (
+            "an FPS record with an empty scene and frontend",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: 3.4 distinct / 59.8 presented at 3840x2160; ; ; 2026-08-21\n"),
+        ),
+        (
+            "an FPS record dated 2026-13-45",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; "
+                   "screenshot; 2026-13-45\n"),
         ),
         (
             "two FPS records",

@@ -127,6 +127,41 @@ question a stored manifest usually has to answer.
 The window for the summary rate is *first publication → end of sampling*, wall clock. A title that
 stops publishing therefore decays toward zero rather than freezing at whatever it last managed.
 
+#### The summary rate is a run AVERAGE — choose the window before you quote it
+
+**A route that spends most of its time on menus, loading screens and waits will report a low distinct
+rate, and that rate is not the title's gameplay framerate.** Measured on *The Messenger*
+(`PPSA24651`) with `scripts/messenger/reach-first-level.pad`, 2026-08-21, 380 s at native 1080p:
+
+```
+[shot] fps: distinct 3.0 fps / presented 207.2 fps over 380.0 s (1142 of 78743 published frames carried new content, 1.5%)
+```
+
+3.0 fps is a true average and a useless summary. The per-sample counters show why: the distinct rate
+is either ~15-23 fps or exactly 0, with nothing in between. 120 consecutive seconds sat on the title
+screen — a still image, where **not one of roughly 24,000 publications differed from its
+predecessor**, which is the counter working correctly on a genuinely static picture. Averaging that
+against the animated stretches produces a number that describes neither.
+
+So: **an `FPS record:` must be measured over a window in which the title is doing the thing being
+recorded**, which is exactly what the record's `scene` field commits you to. Get there with
+`--warmup-seconds` past the route, or recover any window afterwards from the manifest by subtracting
+two sample lines:
+
+```bash
+python3 - <<'EOF'
+import json
+s=[json.loads(l) for l in open('manifest.jsonl') if '"type":"sample"' in l]
+a,b = s[20], s[-1]                      # any two samples
+dt = b['elapsed_seconds']-a['elapsed_seconds']
+print('distinct  %.2f fps' % ((b['distinct_frames']-a['distinct_frames'])/dt))
+print('presented %.1f fps' % ((b['published_frames']-a['published_frames'])/dt))
+EOF
+```
+
+That the two numbers are stored raw per sample, rather than as one pre-computed rate, is precisely so
+this is possible without re-running anything.
+
 ### `--fps-overlay`
 
 Burns a small annotation into the top-left of every PNG the run writes:

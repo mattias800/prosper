@@ -116,6 +116,24 @@ void blend(uint8_t* dst, const uint8_t src[4]) {
 
 } // namespace
 
+bool overlay_font_rows_are_well_formed(char* bad_glyph) {
+    auto rows_ok = [](const char* const* rows) {
+        for (int y = 0; y < kGlyphHeight; y++)
+            if (!rows[y] || std::strlen(rows[y]) != static_cast<size_t>(kGlyphWidth)) return false;
+        return true;
+    };
+    for (const Glyph& g : kFont)
+        if (!rows_ok(g.rows)) {
+            if (bad_glyph) *bad_glyph = g.code;
+            return false;
+        }
+    if (!rows_ok(kFallbackRows)) {
+        if (bad_glyph) *bad_glyph = '?';
+        return false;
+    }
+    return true;
+}
+
 bool overlay_font_has_glyph(char c) {
     const char wanted = normalize(c);
     for (const Glyph& g : kFont)
@@ -148,7 +166,13 @@ OverlayBox draw_overlay_text(std::vector<uint8_t>& rgba, uint32_t width, uint32_
     if (rgba.size() != static_cast<size_t>(width) * height * 4) return {};
     // An image too small to hold the annotation is left exactly as it was. Half an overlay is
     // neither legible nor honest, and a caller that gets an unchanged frame can say so.
-    if (box.x + box.width > static_cast<int>(width) ||
+    //
+    // Both ends are checked. The glyph loop below clamps in both directions, but the background
+    // fill does not -- it indexes `rgba[(y * width + x) * 4]` directly -- so a negative origin (a
+    // negative `style.margin`) would write before the buffer. No caller passes one today; the
+    // function's contract says it clips, and a one-sided guard does not.
+    if (box.x < 0 || box.y < 0 ||
+        box.x + box.width > static_cast<int>(width) ||
         box.y + box.height > static_cast<int>(height))
         return {};
 

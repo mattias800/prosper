@@ -424,7 +424,7 @@ int main(int argc, char** argv) {
                         "[--max-pixel-stale-seconds S] [--require-composited-frame] "
                         "[--min-present-count N] [--min-frame-seq N] [--require-crc32 N] "
                         "[--allow-guest-fault] [--no-stop-after-guest-fault] "
-                        "[--guest-fault-settle-seconds S]\n");
+                        "[--guest-fault-settle-seconds S] [--fps-overlay]\n");
         return 2;
     }
     if (every < 1) every = 1;

@@ -38,7 +38,18 @@ size_t changed_pixels(const std::vector<uint8_t>& a, const std::vector<uint8_t>&
 }
 
 void font_table_is_well_formed() {
-    // A row of the wrong length would walk off the end of a string literal during rasterization.
+    // A row of the wrong length walks off the end of a string literal during rasterization: the
+    // rasterizer indexes rows[gy][gx] for gx in [0, kGlyphWidth). The table is hand-authored, so
+    // this is asserted rather than assumed -- a typo'd row is invisible on inspection and out of
+    // bounds at runtime, and no pixel arm below would necessarily catch it.
+    char bad = 0;
+    if (!overlay_font_rows_are_well_formed(&bad)) {
+        std::printf("  [FAIL] glyph '%c' has a row that is not %d characters\n", bad, kGlyphWidth);
+        fails++;
+    } else {
+        std::printf("  [ok]   every glyph row is exactly %d characters\n", kGlyphWidth);
+    }
+
     // Checked through the public surface: every character the overlay can be asked to draw must
     // resolve to a glyph or to the deliberate fallback, and neither may crash or draw nothing.
     const std::string alphabet =
@@ -50,6 +61,22 @@ void font_table_is_well_formed() {
     CHECK(overlay_font_has_glyph('a') && overlay_font_has_glyph('z'),
           "lowercase resolves through upper-casing");
     CHECK(!overlay_font_has_glyph('~'), "an undocumented character reports no glyph");
+
+    // Rasterize every glyph the font has, once. The table check above proves the rows are the right
+    // LENGTH; this proves the rasterizer actually walks all of them, which is the arm that trips
+    // under ASan if a row is ever short. A glyph no other arm draws (say 'Q') is covered only here.
+    {
+        std::vector<uint8_t> sheet = flat_image(0);
+        const std::vector<uint8_t> blank = sheet;
+        OverlayStyle sheet_style;
+        sheet_style.scale = 1;
+        sheet_style.background[3] = 0;
+        std::vector<std::string> rows;
+        for (size_t i = 0; i < alphabet.size(); i += 40) rows.push_back(alphabet.substr(i, 40));
+        const OverlayBox drawn = draw_overlay_text(sheet, kW, kH, rows, sheet_style);
+        CHECK(drawn.width > 0 && changed_pixels(blank, sheet) > 0,
+              "every glyph in the font rasterizes without reading past its row");
+    }
 
     // The fallback must DRAW. An unsupported character rendering as blank is the silent-loss case.
     std::vector<uint8_t> image = flat_image(0x40);

@@ -35,11 +35,13 @@ bool contains(const std::vector<std::string>& lines, const std::string& needle) 
 } // namespace
 
 int main() {
-    // A healthy title: the two rates agree, and there is no warning to give.
+    // A healthy title. The two rates are deliberately DIFFERENT (55 distinct of 60 published): with
+    // both at 60 the headline check could not tell "the headline is the distinct rate" from "the
+    // headline is the presented rate", and the claim would rest entirely on the frozen arm below.
     {
-        const std::vector<std::string> lines = fps_hud_lines(window(60, 60, 1.0), 1920, 1080, 3600);
+        const std::vector<std::string> lines = fps_hud_lines(window(60, 55, 1.0), 1920, 1080, 3600);
         CHECK(lines.size() == 2, "a healthy title gets two lines");
-        CHECK(lines[0] == "60.0 fps", "the headline is the DISTINCT rate");
+        CHECK(lines[0] == "55.0 fps", "the headline is the DISTINCT rate, not the presented one");
         CHECK(contains(lines, "60.0 presented"), "the presented rate is shown and labelled");
         CHECK(contains(lines, "1920x1080"), "the resolution is shown -- an fps has no meaning without it");
         CHECK(contains(lines, "3600 frames"), "the population behind the rate is shown");

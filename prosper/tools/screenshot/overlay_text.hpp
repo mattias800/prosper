@@ -63,4 +63,11 @@ OverlayBox draw_overlay_text(std::vector<uint8_t>& rgba, uint32_t width, uint32_
 // hollow-box fallback.
 bool overlay_font_has_glyph(char c);
 
+// Every glyph row must be exactly kGlyphWidth characters: the rasterizer indexes rows[gy][gx] for
+// gx in [0, kGlyphWidth), so a short row reads past the end of a string literal. The table is
+// hand-authored, which is precisely why this is checked rather than trusted -- a typo'd row is
+// invisible on inspection and out of bounds at runtime. Returns the offending glyph's character in
+// `bad_glyph` when it fails, so the test can name it.
+bool overlay_font_rows_are_well_formed(char* bad_glyph = nullptr);
+
 } // namespace prosper::screenshot

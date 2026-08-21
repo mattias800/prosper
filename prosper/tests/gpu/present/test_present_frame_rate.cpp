@@ -21,6 +21,7 @@
 #include "gpu/present/present_frame_rate.hpp"
 #include "gpu/present/videoout_present.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -92,6 +93,30 @@ void signature_discriminates() {
     CHECK(frame_content_signature(nullptr, 0, 0, 0) ==
               frame_content_signature(nullptr, 0, 0, 0),
           "an empty frame has a stable signature rather than reading uninitialised memory");
+
+    // THE TAIL BRANCH. Every frame above is an exact multiple of the block size, so the explicit
+    // final-16-bytes read never mattered to any arm -- the block loop happened to cover the end.
+    // A frame whose byte count is NOT a multiple of the block size leaves the last partial block
+    // sampled only from its start, and without the tail read a change in the last few KiB would be
+    // invisible. That is the bottom-right of the image, which is exactly where a padded-footprint
+    // or a partially-composited frame differs (videoout_present.hpp's `padded_footprint`).
+    {
+        const size_t odd = 3 * kFrameSignatureBlockBytes + 777;   // deliberately not a multiple
+        std::vector<uint8_t> base(odd, 0xa5);
+        std::vector<uint8_t> tail_changed = base;
+        for (size_t i = odd - 8; i < odd; i++) tail_changed[i] = 0x5a;
+        CHECK(frame_content_signature(base.data(), odd, 1, 1) !=
+                  frame_content_signature(tail_changed.data(), odd, 1, 1),
+              "a change in the FINAL bytes of a non-block-multiple frame is seen");
+
+        // ...and a frame shorter than one sample window must not read past its end. Correctness
+        // here is memory safety, not sensitivity: the assertion is that this terminates and is
+        // stable, which under ASan/UBSan is a real check.
+        std::vector<uint8_t> tiny(kFrameSignatureBytesPerBlock - 3, 0x11);
+        CHECK(frame_content_signature(tiny.data(), tiny.size(), 1, 1) ==
+                  frame_content_signature(tiny.data(), tiny.size(), 1, 1),
+              "a frame shorter than one sample window signatures without reading past its end");
+    }
 }
 
 // 60 publications per second for 10 seconds, each carrying new content.
@@ -196,16 +221,18 @@ void present_layer_wiring() {
     CHECK(frozen.distinct == 1,
           "re-serving one retained frame 64 times is ONE distinct frame -- the #2783 shape");
 
-    const std::vector<uint8_t> base = frame(3);
+    // EIGHT DIFFERENT pictures, not two alternating ones: the whole frame varies per iteration, so
+    // "8 more distinct" is the property under test rather than "at least one of them registered".
+    // The assertion is exact for the same reason -- `>` would pass if seven of the eight were
+    // silently dropped, and an off-by-one in the counter is precisely what it should catch.
     for (int i = 0; i < 8; i++) {
-        auto fresh = std::make_shared<const std::vector<uint8_t>>(
-            frame_with_changed_block(base, static_cast<size_t>(i) * kFrameSignatureBlockBytes % (kBytes / 2)));
+        auto fresh = std::make_shared<const std::vector<uint8_t>>(frame(static_cast<uint8_t>(10 + i)));
         present_write_frame(fresh, kW, kH);
     }
     const PresentRateSnapshot after = present_rate_snapshot();
     CHECK(after.published == 72, "the eight new frames were published");
-    CHECK(after.distinct > frozen.distinct,
-          "a frame with new content advances the distinct counter through the real present path");
+    CHECK(after.distinct == frozen.distinct + 8,
+          "all eight advance the distinct counter through the real present path -- exactly eight");
 
     // A rejected publication (wrong byte count for the extent) must count as neither.
     auto wrong_extent = std::make_shared<const std::vector<uint8_t>>(std::vector<uint8_t>(16));

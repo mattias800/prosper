@@ -4,8 +4,11 @@
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 
+#include "gpu/execute/gpu_execute.hpp"   // shared_present_submit_mutex
+
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 
 namespace prosper::frontend {
 namespace {
@@ -97,6 +100,33 @@ bool FpsOverlay::init(VkInstance instance, VkPhysicalDevice phys, VkDevice devic
         shutdown();
         return false;
     }
+
+    // Build the font atlas HERE, under the present submit mutex, rather than letting
+    // ImGui_ImplVulkan_NewFrame() do it lazily on the first recorded frame.
+    //
+    // This is not tidiness. `ImGui_ImplVulkan_NewFrame` calls `ImGui_ImplVulkan_CreateFontsTexture`
+    // when no font descriptor exists yet (imgui_impl_vulkan.cpp:1201), and that function ends in
+    // `vkQueueSubmit(v->Queue, …)` followed by `vkQueueWaitIdle(v->Queue)` (:819, :822). Under
+    // PROSPER_APP_GPU_PRESENT `v->Queue` is the queue the app ADOPTED from the live renderer
+    // (main.cpp:574) and may alias the render queue, which is why both present paths serialize their
+    // submits through this mutex. `record()` runs while the present command buffer is being built,
+    // BEFORE that lock is taken -- so a lazy upload there would submit to a queue the renderer
+    // thread can be using concurrently, and vkQueueSubmit requires external synchronisation of the
+    // VkQueue. Doing it once, here, under the lock, closes that window; `NewFrame` then finds the
+    // descriptor already present and submits nothing for the rest of the process.
+    //
+    // Locked unconditionally rather than only when the queue is shared: init happens once, off the
+    // hot path, and a lock whose necessity depends on a flag read elsewhere is the kind of
+    // conditional correctness that stops being true when the flag moves.
+    {
+        std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
+        if (!ImGui_ImplVulkan_CreateFontsTexture()) {
+            std::fprintf(stderr, "[fps] font atlas upload failed; the counter is off\n");
+            ImGui_ImplVulkan_Shutdown();
+            shutdown();
+            return false;
+        }
+    }
     ready_ = true;
     std::fprintf(stderr, "[fps] overlay on (%ux%u, %.0fx text scale)\n",
                  extent.width, extent.height, scale_);
@@ -182,6 +212,35 @@ bool FpsOverlay::recreate_swapchain(VkFormat format, const std::vector<VkImage>&
     }
     destroy_render_target();
     if (!create_render_target(format, images, extent)) { shutdown(); return false; }
+
+    // Re-rasterize the font when the swapchain changes size class. Without this a run that starts
+    // windowed at 720p and goes fullscreen 4K keeps a 13 px HUD on a 2160 px surface, which defeats
+    // the point of a counter you are meant to be able to read off a screenshot.
+    //
+    // Safe to destroy and re-upload here because the caller has already drained the device before
+    // recreating the swapchain (main.cpp's swapchainDirty block calls vkDeviceWaitIdle), so nothing
+    // in flight still references the old atlas. The upload takes the present submit mutex for the
+    // same reason init() does: it ends in a vkQueueSubmit + vkQueueWaitIdle on a queue that may
+    // alias the renderer's.
+    const float wanted = scale_for(extent);
+    if (wanted != scale_) {
+        ScopedContext current(context_);
+        ImGui_ImplVulkan_DestroyFontsTexture();
+        ImGuiIO& io = ImGui::GetIO();
+        io.Fonts->Clear();
+        ImFontConfig font{};
+        font.SizePixels = 13.0f * wanted;
+        io.Fonts->AddFontDefault(&font);
+        // ScaleAllSizes is cumulative, so apply the RATIO rather than the new absolute scale.
+        ImGui::GetStyle().ScaleAllSizes(wanted / scale_);
+        scale_ = wanted;
+        std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
+        if (!ImGui_ImplVulkan_CreateFontsTexture()) {
+            std::fprintf(stderr, "[fps] font atlas rebuild failed after a resize; the counter is off\n");
+            shutdown();
+            return false;
+        }
+    }
     return true;
 }
 

@@ -34,10 +34,21 @@
 // frame that may be 33 MB, and a full hash of that at 60 Hz would cost more than the render.
 //
 // The sampling error is therefore real, and it is one-sided in the safe direction:
-//   * it can NEVER report a re-served frame as new  — identical bytes give an identical signature,
+//   * it can NEVER report a re-served frame as new — identical bytes give an identical signature,
 //     so the failure mode this module exists to catch cannot be laundered by the sampling;
 //   * it CAN miss a change too small and too scattered to hit a sampled window, which UNDER-reports
 //     the distinct rate.
+//
+// THE SCOPE OF THAT GUARANTEE: it holds for a SINGLE PUBLISHER, which is what prosper has. The
+// signature is computed before this module's lock and `present_write_frame` takes its own lock
+// separately, so two threads publishing concurrently could be observed in an order neither the
+// present layer nor the guest saw — a true X,X,Y,Y recorded as X,Y,X,Y, which counts 4 distinct
+// frames instead of 2. That is the OVER-reporting direction, the one the paragraph above says is
+// impossible, so the condition is stated rather than left implicit. Today publication is serialized
+// on the renderer thread (gpu_executor.cpp's two present_write_frame sites), and the app's
+// test-pattern path only runs when no guest is publishing. **If a second concurrent publisher is
+// ever added, this guarantee has to be re-established** — by folding the signature into the same
+// critical section as the publication, or by ordering both against one sequence number.
 // Concretely: any change to a contiguous run of at least
 // kFrameSignatureBlockBytes + kFrameSignatureBytesPerBlock bytes is guaranteed to be seen. The
 // distinct rate is thus a lower bound on the true rate of new frames, and it is documented as one
@@ -50,9 +61,21 @@
 
 namespace prosper::gpu {
 
-// One 16-byte window is hashed out of every 4 KiB. At 3840x2160 RGBA that reads 128 KiB of a 33 MB
-// frame (0.39%) and costs tens of microseconds; at 1280x720 it reads 14 KiB of 3.7 MB. Any change
-// to a contiguous run of >= 4096 + 16 bytes must contain a whole window and is therefore detected.
+// One 16-byte window is hashed out of every 4 KiB -- 0.391% of the frame at any resolution. Any
+// change to a contiguous run of >= 4096 + 16 bytes must contain a whole window and is therefore
+// detected.
+//
+// MEASURED, not estimated (Linux, -O2, 200 iterations per case, 2026-08-21):
+//
+//     3840x2160   92.1 us/frame   (31 MiB)
+//     1920x1080   14.4 us/frame   (7 MiB)
+//     1280x720     6.5 us/frame   (3 MiB)
+//
+// The 4K figure is the one that matters, and it is 0.55% of a 60 Hz frame budget -- against titles
+// in this project that presently render at between 1 and 25 fps, where it is not measurable. It is
+// also hashed OUTSIDE the present mutex (see note_present_publication), so it does not lengthen the
+// window in which a reader is blocked. Re-measure with the bench in the PR before quoting these on
+// other hardware; they are this machine's numbers, not a property of the algorithm.
 constexpr size_t kFrameSignatureBlockBytes = 4096;
 constexpr size_t kFrameSignatureBytesPerBlock = 16;
 
