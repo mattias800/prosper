@@ -110,12 +110,22 @@ inline bool sreg_range_written(const RegState& rs, int base, uint32_t words) {
 // An SRT tag describes the complete hardware descriptor, not merely its base SGPR. Accept it only
 // while every word still carries the same provenance; any partial overwrite makes the descriptor
 // unrepresentable even when the base word itself was untouched.
+inline bool sreg_srt_range_tag(const RegState& rs, int base, uint32_t words, uint32_t& tag) {
+    auto first = rs.sreg_srt.find(base);
+    if (first == rs.sreg_srt.end()) return false;
+    tag = first->second;
+    for (uint32_t word = 1; word < words; ++word) {
+        auto it = rs.sreg_srt.find(base + static_cast<int>(word));
+        if (it == rs.sreg_srt.end() || it->second != tag) return false;
+    }
+    return true;
+}
+
 // A DIRECT descriptor staged into `base` by copying it word-for-word out of entry-time user data
 // (#1773). Succeeds only for a FAITHFUL WHOLE-DESCRIPTOR move: every word `base + i` must alias
-// exactly `origin + i` for one origin, and every source word must still be unwritten. A partial,
-// permuted or partly-recomputed copy is a descriptor the shader assembled itself, which this must
-// not resolve -- binding the wrong resource renders silently wrong texels, which is strictly worse
-// than declining the draw.
+// exactly `origin + i` for one origin. A partial, permuted or partly-recomputed copy is a descriptor
+// the shader assembled itself, which this must not resolve -- binding the wrong resource renders
+// silently wrong texels, which is strictly worse than declining the draw.
 //
 // The load-bearing condition is applied where the alias is ESTABLISHED, not here: the source must
 // still have been entry-time user data at the moment of the copy (`record_scalar_write`). It is
@@ -123,7 +133,10 @@ inline bool sreg_range_written(const RegState& rs, int base, uint32_t words) {
 // SOURCE register cannot change what the DESTINATION already holds. Re-checking it would reject the
 // exact shape #1773 documents: Earthion stages s[9:16] into s[20:27] and then immediately reuses
 // s[12:19] for the second descriptor, so five of the origin words are overwritten before the sample.
-// The alias is invalidated by a write to the DESTINATION, which record_scalar_write handles.
+//
+// Two invariants carry that instead, and both live elsewhere: a write to the DESTINATION expires
+// the alias (`record_scalar_write`), and every control-flow join meets the two edges' claims
+// (`merge_ud_alias`). Neither is visible here, which is why they are named here.
 inline bool sreg_range_ud_alias(const RegState& rs, int base, uint32_t words, int& origin) {
     auto first = rs.sreg_ud_alias.find(base);
     if (first == rs.sreg_ud_alias.end()) return false;
@@ -136,16 +149,6 @@ inline bool sreg_range_ud_alias(const RegState& rs, int base, uint32_t words, in
     return true;
 }
 
-inline bool sreg_srt_range_tag(const RegState& rs, int base, uint32_t words, uint32_t& tag) {
-    auto first = rs.sreg_srt.find(base);
-    if (first == rs.sreg_srt.end()) return false;
-    tag = first->second;
-    for (uint32_t word = 1; word < words; ++word) {
-        auto it = rs.sreg_srt.find(base + static_cast<int>(word));
-        if (it == rs.sreg_srt.end() || it->second != tag) return false;
-    }
-    return true;
-}
 
 inline bool sopk_sets_full_flat_scratch_base(const Rdna2Inst& in) {
     if (in.fmt != Rdna2Format::SOPK || in.opcode != 0x13 ||

@@ -99,8 +99,11 @@ anything black on screen; that inference is what cost #1590 its first several se
 #1773, the separate recompiler gap that the same draw exercised, is **fixed** — a direct user-data
 descriptor staged with `s_mov_b32` now keeps its provenance, and on this title the recompiler
 recovers `ud_alias=s9` (the declared `offset_dw`). The draw is still declined, because the resource
-at that offset is dropped upstream by the guest defect above, and the route's frames are **28/28
-pixel-identical** before and after. Both facts are in `docs/EARTHION_STATUS.md`.
+at that offset is dropped upstream by the guest defect above, and **the composite does not change**:
+the route's three stable states (menu, HOW TO PLAY, black) are pixel-identical and no new content
+appears. Two runs of the same binary differ in 7 of 28 frames purely because the narration cycle's
+phase is not deterministic, so do not use a whole-run frame-identity count as a render oracle here.
+Both facts are in `docs/EARTHION_STATUS.md`.
 
 Those counts are for **this** route. A route that never opens the wrapper menu exercises a different
 program set: the touch-pad route produces exactly one `[mimg-unresolved]` line and zero

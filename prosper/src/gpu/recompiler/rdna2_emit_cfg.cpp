@@ -6040,6 +6040,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const auto then_bool = rs.sreg_bool;
             const auto then_bool_b32 = rs.sreg_bool_b32;
             const auto then_written = rs.sreg_written;
+            const auto then_ud_alias = rs.sreg_ud_alias;   // the then edge's copy-alias claims
             b.emit_branch(merge_label);
 
             rs = before;
@@ -6073,8 +6074,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
             rs.sreg_written.insert(then_written.begin(), then_written.end());
-            // A copy alias created on only one arm must not survive the merge (#1773).
-            for (int reg : then_written) { rs.sreg_input.erase(reg); rs.sreg_ud_alias.erase(reg); }
+            for (int reg : then_written) rs.sreg_input.erase(reg);
+            merge_ud_alias(rs, then_ud_alias);   // `rs` holds the else edge here (#1773)
             if (then_bool != rs.sreg_bool || then_bool_b32 != rs.sreg_bool_b32) {
                 log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                          "counted-loop prelude changes mask domain");
@@ -6130,6 +6131,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // anywhere in the loop is therefore not an invariant entry descriptor at header compile
         // time. An exact descriptor load in the header may establish fresh provenance afterward.
         invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
+        // Snapshot AFTER that invalidation: this is the alias state on the path that skips the body
+        // entirely (a top-tested loop may run zero times). Met against at the loop merge so an alias
+        // the BODY establishes cannot outlive it (#1773).
+        const auto loop_entry_ud_alias = rs.sreg_ud_alias;
         b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
         // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
         if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
@@ -6170,6 +6175,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // 6. Merge (loop exit): a condition-region reg keeps its exit-iteration (%check) value; a body-only
         //    reg (and scc/vcc) takes the header phi (its value when the loop exited).
         b.emit_label(merge);
+        merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
         for (auto& pr : phis) {
             if (pr.dom == 0)      rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
             else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
@@ -6628,6 +6634,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
             invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
+            // See the sibling loop above: the zero-trip path carries these aliases, not the body's.
+            const auto loop_entry_ud_alias = rs.sreg_ud_alias;
             b.emit_loopmerge(merge, cont); b.emit_branch(chk); b.emit_label(chk);
             // An EXEC-governed loop predicates vector writes. VCC/SCC-governed loops branch on their
             // represented predicate but do not themselves change EXEC, matching the hardware body.
@@ -6706,6 +6714,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
             b.emit_branch(hdr);
             b.emit_label(merge);
+            merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
             for (auto& pr : phis) {
                 if (pr.dom == 3 && (!vcc_chk || !rs.vcc)) return false;
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
@@ -6815,6 +6824,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     const bool pre_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
                     const auto pre_bool_b32 = rs.sreg_bool_b32;
+                    // The SKIPPED edge keeps the pre-branch bits, so it keeps the pre-branch copy
+                    // aliases. Anything the arm establishes is true on one edge only (#1773).
+                    const auto pre_ud_alias = rs.sreg_ud_alias;
                     uint32_t thenL = b.id(), mergeL = b.id();
                     b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
                     b.emit_label(thenL);
@@ -6879,6 +6891,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         rs.sreg_bool_narrowed.erase(reg);
                         if (reg == 106) rs.vcc = 0;
                     }
+                    merge_ud_alias(rs, pre_ud_alias);   // meet against the skipped edge (#1773)
                     lo = F.target_pc;   // continue after the merge (further sequential ifs handled here)
                 } else {
                     // IF/ELSE: then = [branch_pc+1, sb_pc) (its s_branch terminator is consumed);
@@ -6914,6 +6927,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
                     const auto then_bool_b32 = rs.sreg_bool_b32;
                     const auto then_written = rs.sreg_written;
+                    const auto then_ud_alias = rs.sreg_ud_alias;   // the then edge's alias claims
                     b.emit_branch(mergeL);
                     rs = pre;                               // else-arm starts from the pre-branch state
                     b.emit_label(elseL);
@@ -6933,8 +6947,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
                     rs.sreg_written.insert(then_written.begin(), then_written.end());
-                    // A copy alias created on only one arm must not survive the merge (#1773).
-                    for (int reg : then_written) { rs.sreg_input.erase(reg); rs.sreg_ud_alias.erase(reg); }
+                    for (int reg : then_written) rs.sreg_input.erase(reg);
+                    merge_ud_alias(rs, then_ud_alias);   // `rs` holds the else edge here (#1773)
                     if (then_bool_b32 != rs.sreg_bool_b32) {
                         log_recompile_diagnostic(
                             b.diagnostic, "compute-struct-reject", "terminal",

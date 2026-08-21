@@ -4182,9 +4182,18 @@ struct RegState {
     // idiom broke DOLL's scene VS).
     //
     // This is a copy alias, not a claim about the descriptor's contents: it says only "these bits
-    // are still the bits the driver put in that entry-time register". Consumers must re-check that
-    // the ORIGIN is still unwritten (sreg_range_ud_alias does), so the alias never extends trust
-    // beyond what `by_sgpr_base` already grants the uncopied form.
+    // are still the bits the driver put in that entry-time register".
+    //
+    // The load-bearing condition is applied where the alias is ESTABLISHED -- the source must still
+    // have been entry-time user data at the moment of the copy. It is deliberately NOT re-checked at
+    // consumption: a copy captures bits, so a later write to the SOURCE cannot change what the
+    // DESTINATION holds, and re-checking would decline the exact shape #1773 documents (the shader
+    // reuses five of the origin words for its second descriptor before the sample). The alias dies
+    // when the DESTINATION is written, which record_scalar_write does centrally.
+    //
+    // Because it is a claim about one register's bits, it is a PER-PATH fact and needs a meet at
+    // every control-flow join -- see merge_ud_alias. An alias that held on only one incoming edge
+    // would bind a descriptor the other edge never assembled.
     std::unordered_map<int, int> sreg_ud_alias;
     // Immediate S_LOAD_DWORDX16 is typeless: it can be ordinary scalar data, or two adjacent
     // eight-dword T# descriptors. The latter is admitted only after a whole-stream use proof (see
@@ -4491,6 +4500,23 @@ inline bool is_gtav_wave32_vcchi_scalar_packet(const Rdna2Inst& in) {
 
 inline bool allows_compute_scalar_vcc_bridge(const SpirvCompute& b) {
     return b.is_compute && b.allow_b32_masks && b.wave_size == 32;
+}
+
+// Meet for the direct-descriptor copy alias at a control-flow join (#1773). An alias asserts what
+// the bits in one register ARE, so after a join it holds only if BOTH incoming edges assert the
+// same thing; `other` is the alias map of the edge not currently in `rs`.
+//
+// This must be a meet and not an erase-by-written-set. `then_written` at the if/else joins is a
+// SNAPSHOT of the whole `sreg_written` set rather than a delta, and an alias can only exist on a
+// register that has been written -- so erasing by it drops every alias inherited from before the
+// branch (safe but useless) while keeping exactly the one-armed aliases that are unsound. The
+// skipped edge of an if-only region likewise carries the pre-branch aliases, not the arm's.
+inline void merge_ud_alias(RegState& rs, const std::unordered_map<int, int>& other) {
+    for (auto it = rs.sreg_ud_alias.begin(); it != rs.sreg_ud_alias.end(); ) {
+        auto edge = other.find(it->first);
+        if (edge == other.end() || edge->second != it->second) it = rs.sreg_ud_alias.erase(it);
+        else ++it;
+    }
 }
 
 inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,

@@ -89,9 +89,14 @@ guest asks a render-target group for index 1 when it created the group with one 
 resulting `0x8A6C0010`, and binds the untouched stack slot. It is a guest defect with no HLE in the
 chain.
 
-**The composite is unchanged: 28 of 28 frames pixel-identical** between the committed route run
-before and after the fix. Stated explicitly because the tempting reading of "a decline was cleared"
-is that something now draws, and here nothing does.
+**The composite does not change.** The route's three stable interior states — main menu, HOW TO
+PLAY, and black — are pixel-identical before and after, and **no new content appears in any frame**.
+Note the honest form of that claim: one pre-fix/post-fix pair came out 28/28 pixel-identical, but
+**two runs of the SAME post-fix binary are 21/28**, because the narration cycle's phase is not
+deterministic run to run. So 28/28 was a lucky alignment, not a determinism result — the frames that
+differ between any two runs are narration phases that every arm, pre-fix included, also produces.
+Stated at length because the tempting reading of "a decline was cleared" is that something now draws,
+and here nothing does.
 
 ## Ruled out
 
@@ -102,7 +107,7 @@ One line per dead hypothesis, the evidence, and where it lives. Do not re-derive
 | The rung-3 wall is **menu navigation** — the main menu needs Up/Down plus Cross to start a game | **Falsified.** The menu is the wrapper's options menu and has no start item; its seven rows are all wrapper controls. The game's own HOW TO PLAY page binds **Start to the TOUCHPAD**, not to any menu row. Adding directional navigation to the committed route cannot reach gameplay. | this PR |
 | Pressing Start (touchpad) leaves the narration and reaches the title screen | **Not observed, and the route is proven to have been delivered.** 13 touch-pad presses read by the guest (`PROSPER_PAD_SCRIPT_LOG=1`, `buttons=touchpad`) across 320 s; every frame black inside the bezel bar one narration line. Distinguish this from a route that never arrived — that check is why the log flag exists. | this PR |
 | The committed route's **OPTIONS presses are what hold the title at the menu**, so a Cross-only route would reach gameplay | **Falsified.** Cross-only, 28 frames / 336 s: no menu ever appears (which is the evidence that OPTIONS is the opener), and the picture is black throughout except one narration line at the end. Removing OPTIONS removes the menu, not the blackness. | this PR |
-| **#1773** — the `s_mov_b32` descriptor-copy provenance gap — is what drops Earthion's `pc=28` draw | **Falsified by fixing it.** With `sreg_ud_alias` live the alias resolves correctly to `s9`, and the draw is still declined because `by_sgpr_base(9)` finds nothing: the resource is dropped upstream by the degenerate-T# guard (#1590, a guest defect). Composite 28/28 pixel-identical before and after. Two independent causes; this removed one. Same shape as instrument trap 54. | this PR, #1773, #1590 |
+| **#1773** — the `s_mov_b32` descriptor-copy provenance gap — is what drops Earthion's `pc=28` draw | **Falsified by fixing it.** With `sreg_ud_alias` live the alias resolves correctly to `s9`, and the draw is still declined because `by_sgpr_base(9)` finds nothing: the resource is dropped upstream by the degenerate-T# guard (#1590, a guest defect). The composite does not change and no new content appears. Two independent causes; this removed one. Same shape as instrument trap 54. | this PR, #1773, #1590 |
 | A recompiler reject census on the gameplay route will name the blocker | **Void as run — there is nothing to census.** On the touch-pad route the entire run produces exactly **one** diagnostic line (`[mimg-unresolved]`) and **zero** `[recompile-reject]` / `[exec-recompile-reject]` lines. The route README's "rejected every frame, `occurrence=32768` in five minutes" describes the **menu** route, which exercises a different program set. Name the route before quoting a reject volume. | this PR |
 
 ## Instrument notes specific to this title
@@ -114,6 +119,10 @@ One line per dead hypothesis, the evidence, and where it lives. Do not re-derive
   dominates any whole-frame metric. Two of the three "states" a whole-frame CRC distinguishes on this
   title are the same black picture with a small animated indicator near the bottom edge
   (`~(1839, 2112)-(1991, 2121)` at 3840x2160) — a CRC change there is not a change in the picture.
+* **A whole-run frame-identity count is not a render oracle on this title.** Two runs of the *same*
+  binary on the committed route differ in 7 of 28 frames, because the narration cycle's phase is not
+  deterministic; one pre-fix/post-fix pair happened to come out 28/28. Compare the *set of interior
+  states* the run visits, not frame *i* against frame *i*.
 * `PROSPER_SHARPLOG=1` prints what the stage **declared** before the drop guards run; reach for it
   before concluding anything about descriptor recovery here (`docs/RESOURCE_BINDING.md` § Ruled out).
 

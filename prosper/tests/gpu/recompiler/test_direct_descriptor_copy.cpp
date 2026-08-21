@@ -164,6 +164,43 @@ int main() {
     CHECK(!recompiles(clobbered_source),
           "a copy whose source word was overwritten before the copy is still rejected");
 
+    // --- The DESTINATION-write expiry, which is the other half of the consumption rule ----------
+    // `sreg_range_ud_alias` deliberately does not re-check the origin, so everything rests on a
+    // write to the copy expiring its alias. Without this arm that expiry is asserted and not tested:
+    // deleting the `sreg_ud_alias.erase(reg)` in record_scalar_write leaves every other arm green.
+    std::vector<uint32_t> clobbered_copy = copied;
+    clobbered_copy.insert(clobbered_copy.begin() + 8,
+                          0xBE9B0381u);   // s_mov_b32 s27, 1 -- the copy is no longer the driver's
+    CHECK(!recompiles(clobbered_copy),
+          "a write to the COPY after it is staged expires the alias");
+
+    // A copy of a copy names the original, not the intermediate. Exercises the chained branch in
+    // record_scalar_write, which no other arm reaches.
+    std::vector<uint32_t> chained;
+    for (uint32_t i = 0; i < 8; ++i) chained.push_back(s_mov_b32(30 + i, 8 + i));   // s[30:37] <- s[8:15]
+    for (uint32_t i = 0; i < 8; ++i) chained.push_back(s_mov_b32(20 + i, 30 + i));  // s[20:27] <- s[30:37]
+    chained.push_back(kImageSampleDmask15);
+    chained.push_back(mimg_word1(0, 0, /*srsrc=*/20, /*ssamp=*/16));
+    chained.push_back(kEndpgm);
+    CHECK(recompiles(chained),
+          "a copy of a copy still names the original user-data words");
+
+    // --- Control flow: an alias is a per-path claim and needs a meet at every join --------------
+    // Staged inside a conditional block and consumed after it. On the skipped edge s[20:27] holds
+    // whatever it held before, which is NOT the descriptor -- so admitting this would bind a
+    // resource one path never assembled and render silently wrong texels on it.
+    //
+    // `s_cbranch_scc0` over the eight moves: the sample is reached on both edges, the copy on one.
+    std::vector<uint32_t> conditional;
+    conditional.push_back(0xBF068008u);                 // s_cmp_eq_u32 s8, 0   (sets SCC)
+    conditional.push_back(0xBF840008u);                 // s_cbranch_scc0 +8    (skip the copy)
+    for (uint32_t i = 0; i < 8; ++i) conditional.push_back(s_mov_b32(20 + i, 8 + i));
+    conditional.push_back(kImageSampleDmask15);
+    conditional.push_back(mimg_word1(0, 0, /*srsrc=*/20, /*ssamp=*/16));
+    conditional.push_back(kEndpgm);
+    CHECK(!recompiles(conditional),
+          "a copy staged on only one side of a branch does not resolve after the merge");
+
     printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }
