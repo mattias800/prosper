@@ -68,6 +68,12 @@ Last updated: 2026-08-17
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 | *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — nothing run against it yet | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — nothing run against it yet | [#2880](https://github.com/mattias800/prosper/issues/2880) |
+| *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2882](https://github.com/mattias800/prosper/issues/2882) |
+| *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2883](https://github.com/mattias800/prosper/issues/2883) |
+| *Little Nightmares II* | `PPSA02154` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2884](https://github.com/mattias800/prosper/issues/2884) |
+| *Spacebase Startopia* | `PPSA02846` | Unity 2020.3.1 / IL2CPP | 🔬 Not yet booted — nothing run against it yet | [#2887](https://github.com/mattias800/prosper/issues/2887) |
+| *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2885](https://github.com/mattias800/prosper/issues/2885) |
+| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 
 ## At a glance
 
@@ -86,8 +92,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 24 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Not yet booted** — tracked, no run attempted yet | 3 |
-| Total tracked | 43 |
+| **Not yet booted** — tracked, no run attempted yet | 9 |
+| Total tracked | 49 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
