@@ -5711,7 +5711,7 @@ trips — the `+1` because the loop's entry ordinal is dispatched once more than
 **Measured: 4,096 trips, on 11 separate dispatches** (`trips=4096 dispatch-range=6..14`, submit 5620,
 dispatches 38..42 among them). And 4,096 is the **cap**, not the loop's natural length — the run stopped
 there because the bound fired — so it is a **floor**. The excess over the data-implied ceiling is
-therefore **at least ~120x**, with no upper figure available from this instrument.
+therefore **at least ~117x**, with no upper figure available from this instrument.
 
 ### What the witness can and cannot localise
 
@@ -5735,8 +5735,10 @@ visit histogram (**#2858**).
 
 ### `0x413dc6700` is NOT a shipped fxdb shader (2026-08-21)
 
-Checked against the title's own shader archive — `fxdb/sga_prospero_final.awc`, magic `SGD2`, 43.4 MB
-("prospero" is the PS5 codename) — and against a 4,884-file extraction of it:
+Checked against the title's **two** shipped shader archives — `fxdb/sga_prospero_final.awc` (magic
+`SGD2`, 43.4 MB; "prospero" is the PS5 codename) and `fxdb/sga_prospero_final_init.awc`, which holds
+the 195 `final_init` members and is a *separate* file whose contents are absent from the big one — and
+against a 4,864-member extraction of them:
 
 | probe | result |
 | --- | --- |
@@ -5744,21 +5746,38 @@ Checked against the title's own shader archive — `fxdb/sga_prospero_final.awc`
 | first 128 / 64 / 32 bytes | absent |
 | the 7-dword loop body (pc 91..97) | absent |
 | `v_bfe_u32 v1,v1,3,27` + its MUBUF, as a pair | absent |
-| same probes against the **packed** `.awc` | absent |
+| same probes against **both packed archives** | absent |
 
-**The null is controlled, which is the only reason it is worth recording.** Positive controls run
-against the same corpus: 20 real bytes lifted out of one archive member match 1,051 files; **1,318 of
-4,884** members contain a MUBUF at all; the exact dword `0xe0302000` appears in **75** members; and a
-known member's first 64 bytes are present verbatim in the packed `.awc`. So the search machinery
-fires, the corpus contains comparable code, and the absence is a property of the subject.
+**The null is controlled, which is the only reason it is worth recording** — and the control that
+matters is not the machinery but a **positive instance of the class under test, drawn from a different
+source**. That exists here: of 20 independently live-dumped programs, **13 are byte-identical to
+archive members** (11 of the 13 that exceed 200 bytes). Same probe, same corpus, a shipped program
+found — so the probe can express the case, and `0x413dc6700`'s absence is a property of the subject
+rather than of the search.
 
-Two consequences. **The archive is a working naming oracle** — a live-dumped lighting program matched
-one member exactly, naming it `s5_182_raytraced_lighting_CS_RaytraceReflectionLightPass`, so live
-programs *can* be identified this way when they are shipped ones. And `0x413dc6700` is **not** among
-them, nor are any of the eight `lane-*` traversal-table writers, so whatever it is, it is not loaded
-from the fxdb — leaving runtime generation or another source, which is a narrower question than
-before. Note the archive members begin directly with RDNA2 ISA: the `_Wrapped` in their names is part
-of the shader's name, not a container, so byte comparison against a raw dump is valid.
+Supporting controls on the same corpus: 20 real bytes lifted from one member match 1,051 files;
+**1,318 of 4,864** members contain a MUBUF at all; the exact dword `0xe0302000` appears in **75**;
+`v_bfe_u32` occurs 1,888 times across 1,359 members and its exact dword `0xd5480001` in 83 — yet the
+`(3,27)` operand pair is absent everywhere. The size gap (13.2 MB extracted against 43.4 MB packed) is
+metadata being dropped, not members being missed: every sampled `final` and `ptfx_sprite` member is
+present verbatim in the packed file (250/250 and 95/95).
+
+Two consequences. **The archive is a working naming oracle**, on 13 exact matches rather than one —
+a live-dumped lighting program resolves to `s5_182_raytraced_lighting_CS_RaytraceReflectionLightPass`.
+And `0x413dc6700` is **not** among them, nor are any of the eight `lane-*` traversal-table writers.
+
+**The obvious objection — that a shipped shader could be relocated, patched or specialised at load
+time, so absence proves nothing — is answered empirically rather than dismissed.** For 11 of the 13
+matches the archived and runtime bytes are *identical*, so this title does not transform programs as a
+rule. The two residuals separate the failure modes and place `0x413dc6700` in the harmless one: one
+live program matches a member for 128 bytes and then diverges (transformation does happen, and it
+leaves a matching **prefix**), while `0x413dc6700` has no head match at **any** length. A
+shipped-then-diverged program would still match its prologue; this one never does.
+
+Byte comparison is valid because members begin directly with RDNA2 ISA — the `_Wrapped` in their names
+is part of the shader's name, not a container. Corpus-wide, 4,809 of 4,864 members open with a SOPP
+dword, there are only 16 distinct first dwords, and **4,627 open with `0xbfa00003`, which is this
+program's own first dword** — so a differing prologue cannot explain the miss.
 
 ### Also settled here
 
