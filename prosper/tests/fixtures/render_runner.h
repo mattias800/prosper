@@ -7826,7 +7826,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (use_depth) ++row.used_depth;
             if (depth_used_meaningfully) ++row.meaningful;
             if (use_depth && depth_used_meaningfully) ++row.claimed;
-            if (((++n) & (n - 1)) == 0 && n >= 256) {
+            // Increment SEQUENCED before the test -- see the same fix in live_renderer.cpp.
+            // `(++n) & (n - 1)` has no sequencing between the operands of `&`, so this
+            // throttle's cadence was undefined. Do not fold these back together.
+            ++n;
+            if ((n & (n - 1)) == 0 && n >= 256) {
                 fprintf(stderr, "[ds-slice] after %llu DS passes:\n", (unsigned long long)n);
                 for (const auto& e : tally)
                     fprintf(stderr,
