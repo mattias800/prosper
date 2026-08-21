@@ -269,6 +269,22 @@ def main() -> int:
                 except OSError as e:
                     print(f"  FAILED to remove {r['path']}: {e}", file=sys.stderr)
                     exit_code = 2
+            # Removing every file out of `fakelib/` leaves the directory behind, which still reads
+            # as "this dump carries a fakelib" to anyone who looks. Prune directories that the strip
+            # emptied -- only those, and only if they really are empty, so a rmdir can never take
+            # content with it.
+            for r in removable:
+                parent = (dump / r["path"]).parent
+                while parent != dump and parent.is_dir():
+                    try:
+                        next(parent.iterdir())
+                        break                      # not empty: stop, and leave it alone
+                    except StopIteration:
+                        parent.rmdir()
+                        print(f"  removed emptied directory {parent.relative_to(dump)}")
+                        parent = parent.parent
+                    except OSError:
+                        break
 
     if args.json:
         print(json.dumps(report, indent=2))
