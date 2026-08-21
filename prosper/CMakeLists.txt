@@ -1280,6 +1280,9 @@ if(TARGET prosper_core)
   add_executable(test_ampr_tracks_offset tests/hle/memory/test_ampr_tracks_offset.cpp)
   target_link_libraries(test_ampr_tracks_offset PRIVATE prosper_core)
   add_test(NAME ampr_tracks_offset COMMAND test_ampr_tracks_offset)
+  add_executable(test_ampr_amm tests/hle/memory/test_ampr_amm.cpp)
+  target_link_libraries(test_ampr_amm PRIVATE prosper_core)
+  add_test(NAME ampr_amm COMMAND test_ampr_amm)
 
   # GTA V (#1139/#1142) net-new HLE regression guards: sceKernelAprGetFileStat fills the real stat
   # (#1133) and sceAudioOut2GetSpeakerArrayMemorySize returns a non-zero allocation size (#1134). The
