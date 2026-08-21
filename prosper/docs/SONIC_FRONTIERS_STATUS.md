@@ -240,12 +240,83 @@ no constants — so what it means is unresolved. Start from this rather than fro
 
 Both are filed as [#2206](https://github.com/mattias800/prosper/issues/2206).
 
+## The Cyber Space stage's compute frontier (2026-08-21)
+
+The route on [PR #2791](https://github.com/mattias800/prosper/pull/2791) reaches `GameModeStage` on
+Cyber Space `w6d01`; the HUD composites and the world behind it is black. `#2790` measured the cause
+as compute programs that never execute, and the census is the instrument:
+
+```bash
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_COMPUTE_TRANSLATE_ONLY=1 \
+PROSPER_COMPUTE_PROGRAM_CENSUS=1 \
+PROSPER_DBG_PROGRAM=0x2005714000,0x2005717e00,0x200571bd00 \
+PROSPER_PAD_SCRIPT=@<route>/reach-gameplay.pad PROSPER_SAVE0=<private dir> \
+  ./build/boot_trace <DUMP_ROOT>/PPSA03831-app0
+```
+
+**Guest program addresses are run-local — re-derive them from the `[compute-census]` per-program
+lines of the run you are in, not from this document.** `PROSPER_DBG_PROGRAM` then narrows the
+verbose recompiler stream to those addresses; `PROSPER_DBG=1` is ~1.5 GB here and desyncs the pad
+script before it reaches the stage.
+
+At `262144 dispatch decisions over 32 program(s)`, **14 programs are listed and every one is
+`executed=0`** (the census prints per-program detail only for programs that skipped at least once,
+#2745). Three of them dispatch at the display width — `240x135x1` groups of `16x1`, `16x2` and
+`16x3`, i.e. 3840x135, 3840x270 and 3840x405 threads — and are the screen-space passes the world
+depends on.
+
+**All three now block on exactly one instruction.** #2790's handoff named two levers,
+`s_cbranch_execz` and `image_load_mip`; both were reject PCs printed by the *straight-line* emitter,
+which these programs only reach after two earlier routes decline. The first decline is ordinary
+route selection (`backward else`, `role=route-decline`); the second was a real defect in the Wave64
+MUST dataflow, fixed by adding V_LSHL_ADD_U32 to `scalar_alu_source_words`' B32 list. With that in
+place the `wave64-ambiguous-mask-read` decline does not occur anywhere in the run, all three programs
+reach the CFG dispatcher's body, and all three stop at:
+
+```text
+[mimg-mip] image_load_mip declined pc=… shape=0 proven_zero_mip=0 img_dim=5/1 samples=1
+           mips=12 mip_tail=0 compressed=0 array_in_gfx=0
+```
+
+So the single live lever is `IMAGE_LOAD_MIP` where the *resource* declares `2D_ARRAY` with a
+**12-level mip chain** while the *instruction* addresses it `dim:2D`, and the mip operand is not one
+of the recognised provably-zero shapes. `rdna2_emit_alu.cpp` only ever specialises this op away after
+proving the mip is zero and the resource is single-level; a 12-mip resource has no such proof, so it
+declines. Implementing it means lowering a real guest LOD, not widening the proof —
+`CLAUDE.md`'s standing rule applies: do not make the reject accept by substituting a plausible
+constant, and there is a specific trap
+behind that here. Tracked as [#2818](https://github.com/mattias800/prosper/issues/2818).
+
+**What the renderer can and cannot do with mips today**, because getting this wrong sends the next
+investigation to the wrong file:
+
+* The **graphics** path does build chains, gated to plain-2D (`img_dim == 1`), depth-1, non-storage,
+  non-RTT, RGBA8 sampled textures declaring `declared_mip_levels > 1`
+  (`tests/fixtures/render_runner.h:6044-6055` — that file is the live offscreen Vulkan backend,
+  included by `frontends/shared/live/live_renderer.cpp:39`). `tests/gpu/test_texture_mip_render.cpp`
+  is a registered ctest asserting a declared 3-level chain samples level 2.
+* The **compute** path does not: its single `VkImageCreateInfo` for guest images sets
+  `ici.mipLevels = 1` unconditionally (`frontends/shared/live/live_compute.cpp:7089`).
+* **And the graphics chain is GENERATED, not uploaded.** Staging carries level 0 only; levels
+  1..N-1 come from a linear-filtered `vkCmdBlitImage` cascade at upload time
+  (`render_runner.h:6257-6259`, `:7245`).
+
+Frontiers' resource misses that gate on two counts at once — it is `img_dim=5` (2D_ARRAY) and it is
+a compute binding. But the third bullet is the one that matters most for whoever takes #2818:
+widening the gate would produce levels **synthesized by downsampling level 0**, not the guest's own
+mip data. That would render, and it would be wrong, in the exact way the "no plausible constants"
+rule exists to prevent.
+
+**The census did not move when the MUST defect was fixed** — 14 programs, all `executed=0`, before
+and after at the same denominator — and neither did the composite. Both were measured, not assumed.
+
 ## Ruled out
 
 One line per falsified hypothesis with the evidence that killed it. Read this before forming a new
 one. Twelve rows were established on #1968 / #2023 and are copied here so they survive those issues
-being closed; the rest are this document's own. The count is deliberately not restated — a stated
-total is stale as soon as the next lane appends.
+being closed; the rest are this document's own. **Do not restate the row count in this paragraph** —
+a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
+to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
@@ -269,3 +340,5 @@ total is stale as soon as the next lane appends.
 | Pressing confirm often enough clears the notice queue | **Falsified.** 405 confirms at 20-flip spacing reached exactly the same state as 6 did; 12 confirms at 40-flip spacing cleared it. Presses landing inside a page's transition animation are discarded, so spacing decides the outcome and volume does not. |
 | The black world in the stage is an artifact of `--warmup-seconds` skipping the renderer past the stage's setup | **Falsified by a control arm.** With `--warmup-seconds 90` the renderer is live continuously from flip 1517, before `GameModeStage` loads at flip ~2900, and the same HUD-over-black frames appear from flip 3429 to 4325 with the same 2880-wide composited rect. (#2790.) |
 | The black world is a compositing/present defect | **Falsified as the primary cause.** Sixteen of the stage's thirty-two compute programs have `executed=0`, three of them 2880-thread-wide screen-space passes; and the same build composites the in-engine cutscene correctly at full width. The composite is downstream of a scene target that was never shaded. (#2790.) |
+| The three scene-target-width stage programs are blocked by `s_cbranch_execz` and `image_load_mip`, the encodings their reject lines name | **Half falsified.** Both were reported by the straight-line emitter, two routes downstream of the decline that mattered. Live, with `PROSPER_DBG_PROGRAM` on each address, the CFG dispatcher declined `wave64-ambiguous-mask-read` at pc481 / pc481 / pc471 — one missing entry in `scalar_alu_source_words`, which charged `v_lshl_add_u32 v7, v6, 2, vcc_lo` (a 32-bit read of VCC_LO used as scalar scratch) the whole VCC pair. With it fixed that decline occurs **0** times, all three reach the dispatcher body, and all three converge on `image_load_mip` alone. **`s_cbranch_execz` is dead as a lever here** — the dispatcher lowers it fine. See `RECOMPILER_REMAINING.md` § Ruled out. |
+| Fixing a recompiler decline that unblocks these programs will change the frame | **Not established, and twice now it has not.** #2758 took `executed=0` to `executed=6` with no image change; #2801 cleared five SCC-site declines with no image change; this change cleared three dispatcher declines with **no census change at all** (14 listed, all `executed=0`, both arms at `262144 dispatch decisions over 32 program(s)`) and no composite change. Measure the composite separately — non-black percentage and bounding box — before claiming anything about the world. |

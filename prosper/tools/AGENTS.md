@@ -393,6 +393,25 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   opcode. Before this was fixed the tool called 109 of 114 known-good shaders `rejected` and agents
   chased those false leads. **For a table-accurate verdict use `gpu_replay --inspect-only`**, which has
   the real descriptors from a capture. See `shader_inspect/README.md`.
+  **And a table-less run has no LAUNCH STATE either, which is a second, separate way its reject PC can
+  be a phantom.** With a default `ComputeShaderConfig` no user SGPR or workgroup-id register is seeded,
+  so the Wave64 MUST dataflow starts with an empty `scalar_words` and every proof resting on a launch
+  input fails offline that would hold live. Supply it — `PROSPER_SHADER_INSPECT_USER_SGPRS=N`,
+  `PROSPER_SHADER_INSPECT_TGID=xy`, `PROSPER_SHADER_INSPECT_LOCAL=16x3x1` (the census line's `local=`
+  is where the last comes from) — and check the offline PC against the live one before reasoning from
+  it. Sonic Frontiers' `0x2005717e00` declines at pc96 with the default config and at **pc481**, the
+  live PC, once the launch shape is given: 385 dwords and a different instruction apart (#2790).
+- **`PROSPER_DBG_PROGRAM=0x…[,0x…]`** — the verbose recompiler stream for NAMED guest program
+  addresses only. `PROSPER_DBG=1` enables every `[recompile-reject]`, `[compute-cfg]`,
+  `[compute-struct-reject]`, `[compute-cfg-reject]`, `[structured-wave-reject]` and `[divloop-reject]`
+  line for every shader in the title, which on a routed run is ~1.5 GB and slow enough to desync the
+  pad script that reaches the phase being diagnosed — so "which route declined THIS program, on the run
+  that reaches it" was a question the instrument could not be pointed at, and the offline substitute has
+  the launch-state trap above. This narrows the same stream to a handful of addresses at negligible
+  cost. It is also the only way to see a **route-decline** live: `record_terminal_reject_reason` keeps
+  the LAST non-consequent reason, so the census reports whatever the final fallback hit and every
+  earlier route's decline is invisible without the verbose stream. Take the addresses from the
+  `[compute-census]` per-program lines; they are run-local, so re-derive them per run (#2790).
 - **`imgdump/`** — decode/dump a guest texture to an image for inspection.
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,

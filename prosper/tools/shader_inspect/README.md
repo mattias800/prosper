@@ -107,6 +107,26 @@ real reject of a real defect, and it was still the wrong PC to reason from: the 
 different words and have different causes. Use the offline run to iterate quickly once you know the shape, and
 take the PC itself from the live `[compute] skip unsupported program …` line.
 
+**You can now supply the launch shape, and for any Wave64 MUST question you should.** Three
+environment variables seed the `ComputeShaderConfig` the tool otherwise leaves empty:
+
+```bash
+PROSPER_SHADER_INSPECT_USER_SGPRS=14 \
+PROSPER_SHADER_INSPECT_TGID=xy \
+PROSPER_SHADER_INSPECT_LOCAL=16x3x1 \
+PROSPER_DBG=1 ./build/shader_inspect exec_cs_2005717e00.bin --stage compute
+```
+
+`_USER_SGPRS=N` gives the launch `N` user SGPRs (`s0..sN-1`), `_TGID` enables the workgroup-id
+registers that follow them (any subset of `xyz`), and `_LOCAL=XxYxZ` sets the workgroup dimensions —
+the census line `local=16x3` is where those come from. Without them every SGPR the guest reads as
+launch input is absent from the initial `RegState`, so `scalar_words` starts empty and an ordinary
+`s_add_i32 vcc_lo, s14, 1` has a non-scalar source. Worked example (#2790): Sonic Frontiers'
+`0x2005717e00` declines offline at **pc96** with a default config and at **pc481** — the live PC, 385
+dwords later, and a completely different instruction — once `_USER_SGPRS=14 _TGID=xy` is supplied.
+The first is a phantom the instrument manufactured. Bracket the value if you do not know it: the
+right one is the smallest that makes the offline PC agree with the live `[compute] skip …` line.
+
 **For a table-accurate verdict, use `gpu_replay`**, which has the real descriptors from a capture:
 
 ```bash
