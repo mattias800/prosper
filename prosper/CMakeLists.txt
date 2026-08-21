@@ -829,6 +829,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_pad PRIVATE prosper_core)
   add_test(NAME pad_input COMMAND test_pad)
 
+  # Render-cadence inertness: when a retained DMA copy overrides EVERY skip PROSPER_RENDER_EVERY
+  # asked for, the run is a cadence-1 run wearing an `every=N` label and must say so (#2837).
+  add_executable(test_render_cadence tests/hle/test_render_cadence.cpp)
+  target_link_libraries(test_render_cadence PRIVATE prosper_core)
+  add_test(NAME render_cadence COMMAND test_render_cadence)
+
   add_executable(test_prosper_app_pad_overlay frontends/prosper-app/test_pad_overlay.cpp)
   target_include_directories(test_prosper_app_pad_overlay PRIVATE src frontends/prosper-app)
   target_link_libraries(test_prosper_app_pad_overlay PRIVATE prosper_core)
