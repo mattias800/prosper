@@ -153,6 +153,11 @@ describing a title screen.
 `active_fraction` in the summary is the check on that: near 100% means the window was homogeneous and
 the rate is worth quoting; well below means it was not.
 
+**It is not a check that anything was on screen.** "95% active" means frames kept *changing*, not
+that they showed a scene — a title rendering a changing black screen reads as 95% active. Pair the
+rate with `distinct_rgb_colors` / `nonblack_rgb_pixels` and open the PNGs before claiming a scene was
+rendered. A framerate is a statement about time, never about pixels.
+
 ```bash
 python3 - <<'EOF'
 import json

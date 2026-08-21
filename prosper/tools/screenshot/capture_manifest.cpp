@@ -377,7 +377,14 @@ std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
          // means fewer than two distinct frames arrived, so `typical_fps` is absent rather than
          // zero -- a consumer must render it as "--" and never as a rate.
          << ",\"typical_fps_measured\":" << (rate.typical_measured ? "true" : "false")
-         << ",\"typical_fps\":" << std::fixed << std::setprecision(3) << rate.typical_fps
+         // `null`, not 0.000, when there is no rate. The header's whole argument is that "0.0 fps is
+         // a measurement and this is not one" -- writing the measurement here would be that argument
+         // failing in this PR's own output. The same object already spells absence this way for
+         // `guest_fault_rip`.
+         << ",\"typical_fps\":";
+    if (rate.typical_measured) line << std::fixed << std::setprecision(3) << rate.typical_fps;
+    else                       line << "null";
+    line
          << ",\"typical_interval_seconds\":" << std::fixed << std::setprecision(6)
          << rate.typical_interval_seconds
          << ",\"interval_samples\":" << rate.interval_samples

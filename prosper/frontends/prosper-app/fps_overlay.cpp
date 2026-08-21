@@ -300,7 +300,18 @@ void FpsOverlay::shutdown() {
     // Owning the wait here rather than relying on a caller ordering it is the point: shutdown() is
     // also reached from init()'s failure branches and from recreate_swapchain()'s, and a rule that
     // holds only at one call site is one edit away from not holding.
-    if (device_) vkDeviceWaitIdle(device_);
+    //
+    // Under the present submit mutex when the app adopted the renderer's queue: vkDeviceWaitIdle
+    // carries an external-synchronisation requirement on EVERY queue of the device, so a guest
+    // submit racing it is the same defect the app's own swapchain-recreation drain guards against
+    // (main.cpp: "hold the submit mutex across the device drain so no guest submit races
+    // vkDeviceWaitIdle"). No deadlock: the wait only covers work already submitted, and a renderer
+    // blocked on the mutex adds none.
+    if (device_) {
+        std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
+        if (gpu::shared_present_active()) lk.lock();
+        vkDeviceWaitIdle(device_);
+    }
     if (context_) {
         // Deliberately NOT ScopedContext: it would capture `previous_ == context_` when shutdown is
         // called from inside one (init's and recreate_swapchain's failure paths), and restore a

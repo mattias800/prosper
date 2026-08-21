@@ -47,7 +47,7 @@ user-facing overview, and its markers are a chart, not a rung scale.
 | **Rung** | The highest **ticked** rung, 0 if none. |
 | **Ladder** | Every ticked rung, `-` for unticked. **The ladder is legitimately non-contiguous** on some titles -- PR #1696 and #1676 deliberately took titles from rung 3/4 to rung 6 without rung 5, because a reviewed gameplay guard is evidenced by its own route and thresholds and never depended on a hardware oracle. `1234-6` is a real state, not an editing slip. |
 | **Guard** | From `prosper/tools/snapshot/snapshots.json`, matched on title ID -- not from the tracker's prose, so it cannot disagree with the registry. |
-| **FPS** | The tracker's `FPS record:` line. `-` means **no tracker line exists**; `none` means somebody looked and there is no measurement. See below. |
+| **FPS** | The tracker's `FPS record:` line: the rate while the title was producing frames, and the share of the run that was. `-` means **no tracker line exists**; `none` means somebody looked and there is no measurement; `--` means the title produced nothing. See below. |
 | **Oracle** | The tracker's `Oracle record:` line, verbatim. `none` means **no PS5 hardware comparison is on record** (see #2730). Not to be confused with `snapshots.json`'s `structural_references`, which are luminance signatures generated from prosper's own runs -- a *regression* reference, not a hardware oracle. |
 | **Open blockers** | Issues/PRs cited in the tracker's `## Current blocker(s)` section that are still open. Cited-and-closed entries are omitted; a tracker citing nothing shows `-`. |
 | **Status doc** | First `prosper/docs/*_STATUS.md` referenced by the tracker, else its first `prosper/docs/*.md`. `-` means the tracker references neither. |
@@ -55,17 +55,43 @@ user-facing overview, and its markers are a chart, not a rung scale.
 A `-` is an **explicit absence**, never a parse failure: the generator aborts on anything it
 cannot parse and writes no file at all, so a row that is present is a row that was read.
 
-### The FPS column: two numbers, and the first one is the honest one
+### The FPS column: the rate while producing, and how much of the run that was
 
-`**3.4** / 59.8 fps` reads **3.4 distinct frames per second, 59.8 publications per second**, and the
-gap between them is information rather than noise. prosper re-publishes the frame it retained
-whenever a submit produces no usable present source, and that re-serve goes through the ordinary
-publish path -- so a title whose picture is completely frozen keeps publishing at the display's
-rate. A framerate counted from publications reads **full speed for a frozen title**; that is
-instrument trap 90, and it is exactly the R-Type Delta regression #2783, which hid for nine days
-behind a healthy-looking present rate. **Quote the first number. When the two are far apart, the
-title has a defect and neither number is its framerate.**
-(`prosper/src/gpu/present/present_frame_rate.hpp` carries the argument in full.)
+`**18.5** fps · 62% active` reads **18.5 frames per second while the title was producing frames**,
+which it did for **62%** of the measured run. Both halves are required, and the second is a
+percentage rather than a rate precisely so it cannot be quoted as a rival framerate.
+
+Three states, and the column has to keep them apart:
+
+| Cell | Reading |
+| --- | --- |
+| `**19.8** fps · 97% active` | A homogeneous window. This is what a record should be made from. |
+| `**1.0** fps · 98% active` | Homogeneous and genuinely slow. The "we have work to do" bucket. |
+| `**18.5** fps · 62% active` | A **mixed** window -- real, but it should not have been filed. Narrow the window and re-measure. |
+| `**--** fps · 0% active` | The title produced nothing. The R-Type Delta shape (#2783) -- see below. |
+
+**Measure over a window where the title was doing ONE thing.** The line names a scene, so it has
+already committed to that: measure `gameplay` over gameplay. Mixing regimes is what makes a
+framerate meaningless, and no choice of statistic repairs it -- *The Messenger* measured 3.0 fps
+averaged over 380 s while alternating between ~15-23 fps and **exactly zero**, including 120
+consecutive seconds where not one of roughly 24,000 publications differed from its predecessor. The
+July performance pass measured that title's first level at 12-24 fps, so filing 3.0 would have
+manufactured a regression that never happened.
+
+**That is what the active share is for: it is a verdict on your window, not on the title.** Near 100%
+means the window was homogeneous and the number is worth filing. Well below it means the window mixed
+a menu with gameplay -- narrow the window and measure again rather than filing the mixture. **If a
+route never reaches the scene you want to record, file `none` and no number at all.** An explicit
+absence is worth more than a figure that describes a title screen.
+
+**Why the `--` matters.** prosper re-publishes the frame it retained whenever a submit produces no
+usable present source, so a title whose picture is completely frozen keeps publishing at the
+display's rate. A framerate counted from publications reads **full speed for a frozen title** --
+instrument trap 90, and the R-Type Delta regression #2783, which hid for nine days behind a
+healthy-looking present rate. A title that produced fewer than two distinct frames therefore has no
+rate at all, written `--`, and the `0% active` beside it says why. It is never rendered as `0.0`,
+which would be a measurement. (`prosper/src/gpu/present/present_frame_rate.hpp` carries the argument
+in full, including why the headline is a median over frame intervals and needs no threshold.)
 
 The rest of the cell is not decoration: a framerate means nothing without its conditions. Resolution,
 what was on screen, and which frontend measured it all move the number by more than the differences
@@ -75,23 +101,24 @@ as current.
 To record one, add exactly one line anywhere in the tracker body:
 
 ```
-FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; screenshot; 2026-08-21
+FPS record: 18.5 fps while producing, 62% active; 3840x2160; gameplay; screenshot; 2026-08-21
+FPS record: -- fps while producing, 0% active; 1920x1080; title screen; screenshot; 2026-08-21
 FPS record: none
 ```
 
 The line is **optional** -- a tracker without one renders `-` and parses fine -- but it is **strictly
 validated when present**, and a malformed one fails the whole run and names the tracker. That is on
 purpose: a required field would take the entire projection down the day it landed, while a loosely
-parsed one would decay into bare numbers, and a bare framerate is not a measurement. Get both rates
-from `tools/screenshot`'s summary line or the `distinct_fps` / `presented_fps` fields of its manifest,
-or from `prosper-app --fps`.
+parsed one would decay into bare numbers, and a bare framerate is not a measurement. Take both values
+straight from `tools/screenshot`'s summary line, or from the `typical_fps` / `active_fraction` fields
+of its manifest.
 
 | Title | Title ID | Rung | Ladder | FPS | Guard | Oracle | Open blockers | Tracker | Status doc |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Alex Kidd in Miracle World DX | `PPSA02664` | 6 | `123456` | - | `alexkidd-gameplay` | [comment](https://github.com/mattias800/prosper/issues/710#issuecomment-4972898604) | [#710](https://github.com/mattias800/prosper/issues/710) | [#1875](https://github.com/mattias800/prosper/issues/1875) | [`PPSA02664_BLACK_WORLD.md`](prosper/docs/PPSA02664_BLACK_WORLD.md) |
 | Asterix & Obelix: Slap Them All! | `PPSA08576` | 6 | `1234-6` | - | `asterix-gameplay` | none | - | [#1877](https://github.com/mattias800/prosper/issues/1877) | - |
 | Blasphemous 2 | `PPSA13579` | 6 | `1234-6` | - | `blasphemous2-gameplay` | none | - | [#1867](https://github.com/mattias800/prosper/issues/1867) | - |
-| Blue Prince | `PPSA25009` | 6 | `123456` | - | `blue-prince-hall`, `blue-prince-title` | [`issue-1287-hall-live-vs-oracle.png`](prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.png) | [#1287](https://github.com/mattias800/prosper/issues/1287), [#1284](https://github.com/mattias800/prosper/issues/1284), [#1733](https://github.com/mattias800/prosper/issues/1733), [#1178](https://github.com/mattias800/prosper/issues/1178) | [#1808](https://github.com/mattias800/prosper/issues/1808) | [`BLUE_PRINCE_STATUS.md`](prosper/docs/BLUE_PRINCE_STATUS.md) |
+| Blue Prince | `PPSA25009` | 6 | `123456` | **4.7** fps · 95% active · 1080p · opening cinematic · screenshot · 2026-08-21 | `blue-prince-hall`, `blue-prince-title` | [`issue-1287-hall-live-vs-oracle.png`](prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.png) | [#1287](https://github.com/mattias800/prosper/issues/1287), [#1284](https://github.com/mattias800/prosper/issues/1284), [#1733](https://github.com/mattias800/prosper/issues/1733), [#1178](https://github.com/mattias800/prosper/issues/1178) | [#1808](https://github.com/mattias800/prosper/issues/1808) | [`BLUE_PRINCE_STATUS.md`](prosper/docs/BLUE_PRINCE_STATUS.md) |
 | Dead Cells | `PPSA15552` | 6 | `123456` | - | `dead-cells-gameplay` | [comment](https://github.com/mattias800/prosper/issues/566#issuecomment-4952168468) | - | [#1866](https://github.com/mattias800/prosper/issues/1866) | [`DEAD_CELLS_STATUS.md`](prosper/docs/DEAD_CELLS_STATUS.md) |
 | Evergate | `PPSA01885` | 6 | `1234-6` | - | `evergate-gameplay`, `evergate-title` | none | - | [#1868](https://github.com/mattias800/prosper/issues/1868) | - |
 | Greak: Memories of Azur | `PPSA02849` | 6 | `1234-6` | - | `greak-gameplay` | none | - | [#1887](https://github.com/mattias800/prosper/issues/1887) | - |

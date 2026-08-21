@@ -932,9 +932,9 @@ int main(int argc, char** argv) {
     // `saved/requested` and `stop=` travel together: a reader who sees fewer PNGs than requested
     // must be able to tell a truncated harness from a run that stopped because nothing new could
     // arrive, on this one line, without opening the manifest.
-    // The framerate, on its own line, distinct rate FIRST. A reader skimming takes the first
-    // number, so the first number has to be the one that cannot lie about a frozen title.
-    // Two lines: the headline plus its qualifier, then everything it was derived from.
+    // Two lines: the headline plus its qualifier, then everything it was derived from. A reader
+    // skimming takes the first number, so the first number has to be the one that cannot lie about
+    // a frozen title.
     fprintf(stderr, "[shot] fps: %s\n", gpu::format_frame_rate(run_rate).c_str());
     if (gpu::frame_rate_is_mostly_unchanged(run_rate))
         fprintf(stderr,

@@ -64,6 +64,18 @@
 // quotable. Well below it means the window mixed two regimes and no single number from it means
 // anything — re-measure over a narrower window rather than reaching for a different statistic.
 //
+// **IT IS NOT A CONTENT ORACLE, AND THE FAILURE IS SEDUCTIVE.** "95% active" says frames kept
+// CHANGING; it says nothing about whether anything was on them. Measured on *Blue Prince* over
+// 899.6 s: `4.7 fps while producing frames, 95% active` — a reading that looks like a clean
+// homogeneous measurement, and one of whose samples is a uniform near-black frame. The run was in
+// fact fine (57 of 60 samples fully non-black, peaking at 128,506 distinct colours), but nothing in
+// THIS module could have told you that, and a black-screened title rendering a changing black
+// screen would report exactly the same 95%.
+//
+// Content is `tools/screenshot`'s job and it already measures it: `distinct_rgb_colors` and
+// `nonblack_rgb_pixels` per sample, and the pixel-distinct assertions. Pair a rate with those before
+// believing a scene was rendered — a framerate is a statement about time, never about pixels.
+//
 // It is a percentage rather than a rate so it cannot be misread as a rival framerate. Together the
 // two separate the three cases that matter, and no pair of averages can:
 //
@@ -133,12 +145,25 @@ constexpr size_t kFrameSignatureBytesPerBlock = 16;
 // for every title whether or not anyone asked for a framerate. 0.5 ms to ~90 s at 1.1x per bucket,
 // which costs about 2 KiB.
 //
-// The growth factor IS the accuracy of every framerate this module reports: a median recovered as a
-// bucket's geometric midpoint is within sqrt(growth) of the truth, so 1.1 gives +/-4.9% and 1.25
-// would give +/-11.8%. 1.25 was the first choice and it was too coarse -- it recovered a known 1.000
-// fps signal as 1.106 fps, and these figures get filed in game trackers and compared across
-// releases. `interval_estimator_is_accurate` in the tests pins this against known inputs, so a
-// future change to these constants has to face the tolerance rather than quietly widen it.
+// THE GROWTH FACTOR IS THE ACCURACY OF EVERY FRAMERATE THIS MODULE REPORTS, and the bound is
+// analytic rather than tuned. A true interval anywhere in a bucket is reported as that bucket's
+// geometric midpoint sqrt(lo*hi), and the bucket spans [lo, lo*growth], so the worst case is at
+// either edge and equals sqrt(growth) - 1 exactly:
+//
+//     growth 1.10  ->  sqrt(1.10) - 1  =  4.88%     <- chosen
+//     growth 1.25  ->  sqrt(1.25) - 1  = 11.80%
+//
+// 1.25 was the first choice and it was too coarse: it recovered a known 1.000 fps signal as 1.106
+// fps, caught by the accuracy arm below. These figures get filed in game trackers and compared
+// across releases, so if a future reader is tempted to widen the bucket to save the ~2 KiB, that is
+// the arithmetic to face -- and `interval_estimator_is_accurate` will fail rather than let the
+// numbers quietly get worse.
+//
+// ABOVE THE RANGE, the top bucket saturates: it merges the last normal bucket with the overflow, so
+// any interval longer than ~82.1 s is reported as ~86.1 s rather than clamped to 90. That cannot
+// reach `active_seconds` (which sums true durations, never bucket midpoints) and cannot move the
+// median unless a title produces a frame less often than every 82 seconds -- at which point the
+// distinction between "very slow" and "slower still" is not one anybody is reading this for.
 constexpr size_t kIntervalBuckets = 128;
 constexpr double kIntervalMinSeconds = 0.0005;
 constexpr double kIntervalGrowth = 1.1;

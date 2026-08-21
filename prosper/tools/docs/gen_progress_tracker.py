@@ -114,6 +114,12 @@ FPS_RE = re.compile(r"^FPS record:\s*(?P<value>\S.*?)\s*$", re.M)
 # a presented rate reads full speed for a frozen title (prosper/src/gpu/present/present_frame_rate.hpp,
 # instrument trap 90, #2783). A record carrying only one number could not show that, and a reader
 # would have no way to tell which number they had been given.
+# `(?:\s+frames)?` because `format_frame_rate` prints "18.5 fps while producing FRAMES, 62% of the
+# 380.0 s run active" and the README tells people to take the values straight from that line. A
+# grammar that rejects its own generator's output does not read as "the grammar is narrow", it reads
+# as "the feature is broken" -- and the first person to use this will follow the documentation, paste
+# the tool's output, and be right. Same class as the `3840X2160` trap below.
+#
 # `[xX]` because `screenshot --fps-overlay` burns the resolution with an UPPERCASE X (its 5x7 font is
 # uppercase-only), and the overlay is the most likely place somebody reads these numbers off. A
 # grammar that rejects its own tool's output would be a hard `--check` failure in CI for a record
@@ -132,7 +138,7 @@ FPS_RE = re.compile(r"^FPS record:\s*(?P<value>\S.*?)\s*$", re.M)
 # of the run that was. `--` is the honest rate for a title that produced fewer than two distinct
 # frames, and it is required to pair with 0% active.
 FPS_RECORD_RE = re.compile(
-    r"^(?P<fps>--|\d+(?:\.\d+)?)\s+fps\s+while\s+producing\s*,\s*"
+    r"^(?P<fps>--|\d+(?:\.\d+)?)\s+fps\s+while\s+producing(?:\s+frames)?\s*,\s*"
     r"(?P<active>\d{1,3})%\s+active"
     r"\s*;\s*(?P<width>\d+)[xX](?P<height>\d+)"
     r"\s*;\s*(?P<scene>[^;\s][^;]*?)"
@@ -879,6 +885,14 @@ def selftest() -> int:
                                  "gameplay; screenshot; 2026-08-21\n"), {})["fps"]
     if upper_x["width"] != 3840 or upper_x["height"] != 2160:
         failures.append("the uppercase 3840X2160 spelling the fps overlay burns did not parse")
+
+    # The exact phrasing `format_frame_rate` prints. The README says to copy from that line, so this
+    # is the spelling a first-time user will actually paste.
+    tool_phrasing = parse_tracker(
+        _issue(body=_GOOD_BODY + "FPS record: 18.5 fps while producing frames, 62% active; "
+                                 "3840x2160; gameplay; screenshot; 2026-08-21\n"), {})["fps"]
+    if tool_phrasing is None or tool_phrasing["fps"] != 18.5 or tool_phrasing["active"] != 62:
+        failures.append("the tool's own 'while producing frames,' phrasing did not parse")
 
     none_record = parse_tracker(_issue(body=_GOOD_BODY + "FPS record: none\n"), {})["fps"]
     if none_record != {"none": True}:
