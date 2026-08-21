@@ -4280,6 +4280,8 @@ struct RegState {
     // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
     std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf_pcrel_tables;
     std::unordered_map<uint32_t, std::vector<uint32_t>> smem_pcrel_tables;
+    // Typed consumer of the same idiom, admitted only for conversion-free 32-bit formats (#2859).
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mtbuf_pcrel_tables;
     // SCALAR-SPILL VGPR (#273 — DOLL's big post PS): the compiler packs excess wave-uniform scalars
     // into one VGPR's lanes via `v_writelane_b32 vN, sX, <const lane>` and reads them back with
     // `v_readlane_b32 sY, vN, <const lane>`. Per-invocation each (vgpr, lane) slot is just a named
