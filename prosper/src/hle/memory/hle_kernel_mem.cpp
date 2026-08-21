@@ -2558,6 +2558,21 @@ HLE(k_amm_get_va_ranges) {
     // residue exactly as before. An all-zero window is also the answer that makes the guest fail
     // SAFELY: it stores the base at state+0xeca8, and its heap-grow path tests that slot for zero
     // (eboot+0xdbbdc6) and takes its own no-AMM branch. Raised in review.
+    //
+    // The caveat a reviewer raised about that zero, checked rather than inherited. The guest also
+    // classifies pointers against the window at eboot+0xda0f5e:
+    //
+    //     rdx = 0x100000000 + state[0xecd0]      ; 4 GiB + the AMM size
+    //     rcx = ptr - state[0xeca8]              ; ptr - the AMM base
+    //     cmp %rdx,%rcx ; jbe 0xda0fad           ; taken => treat as AMM memory
+    //
+    // With base and size both zero that reduces to "ptr <= 4 GiB", so the AMM arm is taken for any
+    // pointer below 4 GiB and for nothing above it. No guest pointer is below 4 GiB — the eboot
+    // maps at 0x410000000 and the auto-map region starts at 0x2000000000 — so on this path the arm
+    // is unreachable for a real pointer, which is why the zero stands. It is worth knowing rather
+    // than worth changing: the path is reachable only when the 68 GiB reservation itself fails,
+    // which announces itself loudly, and the only alternative answer is the stack residue that
+    // produced the 0x1d0000 fault in the first place.
     *(uint64_t*)a0 = ok ? base : 0;          // both validated above, before anything was reserved
     *(uint64_t*)a1 = ok ? base + size : 0;
     if (a2 > 0xffff) *(uint64_t*)a2 = 0;
