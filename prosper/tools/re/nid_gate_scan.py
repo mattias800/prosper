@@ -46,7 +46,7 @@ Usage:
 Given a directory, every `eboot.bin` and `*.prx`/`*.sprx` under it is scanned.
 
 Example — the sysmodule gate (#2002); `0x805A1001` is SCE_SYSMODULE_ERROR_UNLOADED:
-    nid_gate_scan.py testdata/PPSA04263-app0 --nid fMP5NHUOaMk --const 0x805a1001
+    nid_gate_scan.py $PROSPER_GAME_ROOT/PPSA04263-app0 --nid fMP5NHUOaMk --const 0x805a1001
 
 `--all-nids` inverts the question: instead of "who branches on THIS value?", it answers **"which
 Sony answers does this title depend on at all?"** — every import, classified, in one pass. That is

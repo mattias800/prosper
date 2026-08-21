@@ -390,12 +390,27 @@ if(Python3_Interpreter_FOUND)
   endif()
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
-set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
+#
+# The relative fallback resolves to `<source>/../PPSA24651-app0`, which inside a git worktree is a
+# directory no dump lives in — that is instrument trap 126, where a build silently runs a SMALLER
+# suite and still prints "100% tests passed" with exit 0, because the percentage is of what ran.
+# Preferring $PROSPER_GAME_ROOT makes the common case resolve on its own without putting anybody's
+# local directory layout in this file. `-DGAME_DUMP=` still wins: a CACHE entry that already exists
+# is not overwritten by set(... CACHE ...).
+if(DEFINED ENV{PROSPER_GAME_ROOT})
+  set(GAME_DUMP "$ENV{PROSPER_GAME_ROOT}/PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
+else()
+  set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
+endif()
 set(HAVE_GAME_DUMP OFF)
 if(EXISTS "${GAME_DUMP}/eboot.bin")
   set(HAVE_GAME_DUMP ON)
 else()
-  message(STATUS "Game dump not found at ${GAME_DUMP} — skipping dump-backed tests")
+  # Loud, and says how to fix it: this message is the ONLY announcement, it happens once at configure
+  # time, and every later build inherits the reduced suite in silence.
+  message(WARNING "Game dump not found at ${GAME_DUMP} — dump-backed tests will be SKIPPED, so "
+                  "ctest will report a smaller count and still exit 0. Set PROSPER_GAME_ROOT or "
+                  "pass -DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0 if you did not intend this.")
 endif()
 
 # Which title `GAME_DUMP` actually points at (#1573). A handful of ctest cases assert against ONE
