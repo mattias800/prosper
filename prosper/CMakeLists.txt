@@ -1206,6 +1206,14 @@ if(TARGET prosper_core)
   target_include_directories(test_support_modules PRIVATE src)
   add_test(NAME loader_support_modules COMMAND test_support_modules)
 
+  # Which preloaded modules are started with a real SCE module-param descriptor. Pure policy over
+  # the fixed guest base map: no dump, no SELF parser, no filesystem — so both the inclusion and the
+  # exclusion direction are checkable in ordinary CI.
+  add_executable(test_module_start_params tests/host/image/test_module_start_params.cpp
+                                          src/host/image/module_start_params.cpp)
+  target_include_directories(test_module_start_params PRIVATE src)
+  add_test(NAME module_start_params COMMAND test_module_start_params)
+
   add_executable(test_boot_phase_log tests/diagnostics/test_boot_phase_log.cpp)
   target_link_libraries(test_boot_phase_log PRIVATE prosper_core)
   add_test(NAME diagnostics_boot_phase_log COMMAND test_boot_phase_log)
