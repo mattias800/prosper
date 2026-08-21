@@ -110,6 +110,42 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **The full offline dissection pipeline is verified end to end on a fresh gameplay bundle, and the
+  exact invocations are recorded because three of the four are easy to get wrong.** Captured on the
+  stable four-decline baseline: **1.7 GB, 75 submits, 1,415 operations**, replays `RC=0`, and the
+  replayed composite is pixel-identical in content to the live frame (HUD, radar, tutorial text over
+  black) — so the bundle is faithful and the frame is deterministic offline.
+
+  ```bash
+  # 1. replay, and emit a target by extent
+  gpu_replay --bundle F.prgbundle --bundle-output-target 3840x2160 out.bmp
+  # 2. extract ONE submit to a .prgcap  (--bundle is INCOMPATIBLE with --inspect-only)
+  gpu_replay --bundle F.prgbundle --bundle-extract-submit <submit-no> sub.prgcap
+  # 3. inspect that
+  gpu_replay --inspect-only sub.prgcap
+  # 4. emit a named target after an operation -- the address needs 0x, and the op must be one
+  #    whose draw actually WRITES that address
+  gpu_replay --output-target-after 140:0x2058720000 sub.prgcap g.bmp
+  ```
+
+  Three traps, all hit: `--bundle` and `--inspect-only` are mutually exclusive (the parenthetical in
+  `CLAUDE.md` — "via `--bundle-extract-submit`" — governs all three dissection flags, not just
+  `--dump-resource`); the address in `--output-target-after` is parsed with `strtoull(..., 0)`, so a
+  leading-zero form is read as **octal** and silently fails the parse; and the operation must be one
+  that writes the target, or the tool refuses with `does not write addr=`.
+
+  **What the dissection found, and its limits.** In this frame's 302-operation submit, **297 draws
+  bind the three 4K G-buffer surfaces (`0x2085de0000`, `0x2083e00000`, `0x2081e20000`) and write none
+  of them — `cwm=0` on every one**, independently reproducing the same observation this document
+  records for its own frame's equivalent submit. The submit that does write 4K is a different one,
+  where `0x2058720000` takes **137 draws at `cwm=f`**; dumped after operation 140 it is **15%
+  non-zero with 88 distinct colours and shows the radar only — no world geometry**.
+
+  **That is one target at one operation and does NOT falsify** the resolved chain's "the world is
+  drawn, complete" claim, which rests on 521 dumps across the whole frame. It is recorded as a
+  starting point with a working recipe, not as a contradiction. The artifact is retained on the dev
+  box so the survey does not need another 14-minute route run. (2026-08-21.)
+
 - **`0x413dc6700`'s SRT slot dw0 carries a LOW-BIT TAG on exactly half its observations — and
   prosper's GTA V packed-pointer path is never reached on this run.** `PROSPER_SRTDUMP=1` on a routed
   run with the other three hangers declined:
