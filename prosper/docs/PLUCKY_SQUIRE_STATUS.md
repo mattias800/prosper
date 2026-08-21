@@ -16,9 +16,16 @@ the authored chapter-one intro cutscene (`cam_cutscene_c01_intro`) with real GPU
 *`tools/screenshot` (headless frontend), unmodified 3840x2160 capture downscaled for the repository,
 checked-in `scripts/plucky-squire/reach-first-gameplay.pad` route, t = 1080 s.*
 
-**This is not rung 3.** A cutscene is not gameplay. The frontier is what happens after the intro
-sequence: the route as checked in stops driving input at 525 s, and no sample in a 1200 s run showed
-the storybook page or a controllable character.
+**This is not rung 3.** A cutscene is not gameplay.
+
+**The frontier was re-measured on 2026-08-21 (master `9dcf807f`) and it is not what this section
+originally guessed.** "The route stops driving input at 525 s" is true and irrelevant: the guest reads
+the input it is given and the cutscene is not waiting on a button. The cutscene is not waiting at all —
+it is *advancing about 300x too slowly to finish*, because the guest runs at ~0.19 flips/s once the 3D
+world is up and prosper's guest clock advances in-game time **per flip**. See
+[**## The wall is guest THROUGHPUT**](#the-wall-is-guest-throughput-and-the-reason-is-the-guest-clock-2026-08-21-master-9dcf807f)
+below and [#2839](https://github.com/mattias800/prosper/issues/2839); raising the flip rate alone
+carries the guest past the intro to the `Book_MAIN` storybook camera with no other change.
 
 ## Route and timing
 
@@ -85,6 +92,120 @@ Input is delivered and observed: `[pad-script]` lines carry the guest's own adva
 title fails to advance, the correct statement is "the guest read the input and did not act on it", not
 "the input was not delivered".
 
+### The title's own action map, read out of its own save
+
+The game writes `/savedata0/<TITLE_ID>/InputSettingsKeyMappings/ue4savegame.dpx.sav`, a UE4 `GVAS`
+blob whose `/Script/Storybook.UserInputKeyMappings` array is the complete
+`ActionName` -> `KeyName` table. It is plain enough to read with `strings`, and it settles button
+questions without guessing:
+
+| action | button |
+| --- | --- |
+| `UI_Select`, `Jump` | **Cross** (`Gamepad_FaceButton_Bottom`) |
+| `Pause` | **OPTIONS** (`Gamepad_Special_Right`) |
+| `UI_Cancel`, `Roll` | Circle (`Gamepad_FaceButton_Right`) |
+| `Action`, `UI_GoToGallery2` | Triangle (`Gamepad_FaceButton_Top`) |
+| `Attack`, `UI_GoToGallery1` | Square (`Gamepad_FaceButton_Left`) |
+| `Tool_1` / `Tool_2` | D-pad left / right |
+
+**There is no `Skip` action at all**, so a cutscene skip — if the title has one — goes through the
+`Pause` menu rather than a dedicated button. The Cross-only route is therefore correct for the menus
+(Cross *is* `UI_Select`), and the reason it does not clear the cutscene is not a mis-mapped button.
+
+### Wall-clock anchors cannot serve this title; use pad-read anchors
+
+`scripts/plucky-squire/reach-gameplay-reads.pad` is the same ladder written on the guest's own axis
+(`p<start>-<end>:button`, already parsed and unit-tested — `tests/input/test_pad.cpp:573`). With a 147x
+tick-rate spread between the menus and the cutscene, one wall-clock cadence cannot serve both ends: the
+5 s pulses that pace the menus are worth ~125 guest polls at the title screen and **one or two** once
+the 3D world is up, while a gap that feels brisk in a menu is over ten minutes of cutscene. Read
+anchors are invariant to that, and to the sampling cadence — the same file drives a default run and a
+`PROSPER_RENDER_EVERY` run without retiming. Verified to navigate logos, `SAVE FILES` and `PLAY STYLE`
+through to `FinishDeskLevelLoad`.
+
+## The wall is guest THROUGHPUT, and the reason is the guest clock (2026-08-21, master `9dcf807f`)
+
+The chapter-one intro cutscene is **not stuck** — it advances, roughly 300x too slowly to finish. What
+makes that fatal rather than merely slow is prosper's own guest-clock contract, so the two have to be
+read together.
+
+**1. The guest's tick rate collapses when the 3D world comes up.** `PROSPER_PAD_SCRIPT_LOG=1` carries
+the guest's own pad-read counter, and the UE4 log prefix carries `GFrameCounter`; the two agree, which
+is what makes this a guest-side measurement rather than a renderer one:
+
+| phase | guest polls/s |
+| --- | --- |
+| logos, title, `SAVE FILES`, `PLAY STYLE` | **~25** |
+| `Desk_C01` streaming | ~4-5 |
+| desk level up, pre-cutscene | ~2.1 |
+| chapter-one intro cutscene | **~0.17-0.20** |
+
+A **147x** spread, reproduced on four independent runs (0.198, 0.197, 0.198, 0.218 polls/s).
+
+**2. In-game time advances per FLIP, not per second.** `execute_submit_work` wraps its GPU work in
+`HostGpuClockScope(clock_budget_ns)` with a budget of **one refresh interval per flip**, and
+`guest_clock_host_gpu_end` (`src/hle/kernel/hle_kernel_time.cpp:208`) accumulates everything past that
+budget into `total_excess_ns`, which the guest clock subtracts. That is deliberate and right — a real
+console does not charge shader compilation and resource conversion to the guest's next frame delta —
+but it means the game's clock advances **~16.7 ms per flip regardless of how long the flip took**.
+
+Checked numerically against the title's own logic clock rather than assumed: over the 221 s
+pre-cutscene window the guest flipped ~2.3/s, predicting 221 x 2.3 x 16.7 ms = **8.5 s** of game time;
+the game's `LOGIC:` stamps moved 3.577 -> 11.222, i.e. **7.6 s**.
+
+**Multiply the two and the wall is exact.** At 0.19 flips/s the cutscene's clock runs at
+0.19 x 16.7 ms = **~3 ms of game time per second of wall clock, ~0.3% of real time**. The intro is
+~60 s of game time, so a default-cadence run needs **~5-6 hours** to finish it. The 1,200 s run that
+"never reached gameplay" bought about **3.5 seconds** of it.
+
+So this title's rung-3 blocker is a renderer-throughput problem wearing a progression problem's
+clothes. Nothing about the cutscene logic, the route, or the two absent fog programs is implicated.
+
+### Where the time goes
+
+`PROSPER_RENDER_TIMING=1`, cutscene windows, per **draw submit** (~24 of them per guest flip):
+
+```
+total=189-341 ms  build_resources=127-229 ms  backend=62-203 ms
+  build_resources: textures=657 bindings/submit, reused=434, 126-227 ms   <- dominant
+  backend:         pipeline=up to 133 ms, resources texture upload=47 ms
+```
+
+Not GPU-bound: `radeontop` reads **5-16%** during the cutscene, against the `vkcube` control of
+**56.31%** recorded in `CLAUDE.md` for this box. A gdb stack sample (10 samples) puts the guest's
+`RenderThread 1` in `sched_yield` via `prosper::k_pthread_yield` **10 of 10 times** while prosper's
+single `AgcSubmissionTh` does BC decode, `float_to_half`, `memmove` and `amdgpu_bo_alloc` inside
+`build_resources`. This is the same frontier as [#1177](https://github.com/mattias800/prosper/issues/1177)
+(Bendy, CPU detile dominates) and the Blue Prince `setup_resources` result in `CLAUDE.md`.
+
+### What that unlocks
+
+With the sampling cadence genuinely engaged (`PROSPER_RENDER_EVERY=16`, verified by the new
+`[render-cadence]` line — see *Instrument notes*), the cutscene runs at **2.71 polls/s, a 13.7x
+speedup**, and the game's logic clock advances past the intro: `SetTargetCamera()` leaves
+`cam_cutscene_c01_intro` for **`Book_MAIN`**, the storybook camera, at `LOGIC 0:30.8`. That is half
+the success condition this document set on 2026-08-19 ("a `SetTargetCamera()` to a non-cutscene
+camera **plus a frame showing** the C01 storybook page or a controllable character").
+
+**The other half is not met, so this is not rung 3.** Two things block it, and both are recorded
+rather than worked around:
+
+- **Accelerated frames are not progression evidence, and cannot be made into it by timing.** At
+  `every=16`/`32` most passes never render and the composite is black — the skipped submits are
+  different *passes* of one UE4 deferred frame, not repeats of it. Handing the cadence back with
+  `PROSPER_RENDER_EVERY_FOR_MS=700000` while the storybook camera was live produced frames that are
+  **solid black or solid white**, not a page.
+- **Whether that white is the accelerator's residue or a real composite defect is not separable on
+  this route**, because the only arm that could tell them apart — a default-cadence run that reaches
+  the same state — is the ~6-hour run the wall above forbids. Do not record it as either.
+
+  A trap worth inheriting: a solid-white 4K PNG is **166 KB**, so file size read as "real content
+  appeared" exactly when it had not. Open the frames.
+
+- The run then dies on a **deterministic** guest `SIGSEGV at addr=0x8, rip=image+0x16460f7`,
+  reproduced 2 of 2 at two different cadences — [#2841](https://github.com/mattias800/prosper/issues/2841),
+  the next blocker behind this one.
+
 ## Open defects
 
 - [#2741](https://github.com/mattias800/prosper/issues/2741) — two UE4 volumetric-fog compute programs
@@ -102,6 +223,28 @@ title fails to advance, the correct statement is "the guest read the input and d
 
 ## Ruled out
 
+- **"The pipeline cache is thrashing, and sizing it is the throughput lever."** The premise is true and
+  the conclusion is false — recorded together because the premise is seductive on its own. On a default
+  run the backend pipeline cache sits pinned at `entries=4096` (its cap) for the whole cutscene with
+  `misses ~= evictions` in every window (1 to 30 per submit, ~8.8 average, up to 133 ms/submit), which
+  is textbook capacity thrash. **`PROSPER_PIPELINE_CACHE_ENTRIES=16384` removes it completely** —
+  `evictions=0.0`, entries climbing 13,990 -> 15,005 — and the cutscene tick rate moves **0.198 ->
+  0.218 polls/s**, i.e. nothing beyond run-to-run spread. The misses were never capacity re-creations:
+  they are *first-time* pipeline creations, and this title had built >15,000 distinct pipelines and was
+  still climbing. Sizing the cache is worth doing for its own sake; it is not the throughput fix
+  (2026-08-21, [#2839](https://github.com/mattias800/prosper/issues/2839)).
+- **"`PROSPER_RENDER_EVERY` is inert on this title because `ordered_dma_requires_render` overrides
+  every submit."** **Void, and it was published as a conclusion before it was checked** — the lane's own
+  launcher re-exported `PROSPER_RENDER_EVERY=1` after the caller set 16, so the "accelerated" arm was a
+  cadence-1 run and its 3.92 present/s against a 3.17 baseline measured only run-to-run spread. With
+  the variable actually reaching the process the cadence works: `skips_wanted=23039 dma_forced=128`,
+  i.e. the DMA override fires on **0.6%** of requested skips, not 100%. The `[render-cadence]` line
+  added in #2837 exists because of this specific mistake and is what caught it — **quote
+  `requested_every=` from the run, never from the command you believe you typed.**
+- **"#2741's absent fog programs are why the world is dark / why gameplay is unreachable."** Not
+  reached by this lane's evidence either way for the darkness, but **excluded for the progression
+  question**: the guest advances to the storybook camera with both programs still absent, purely by
+  raising the flip rate. Whatever the two fog rejects cost, they do not gate the cutscene.
 - **"#2741 is this title's bug."** Falsified 2026-08-19 by a cross-title census on `2703a6c3`
   (#2747). *Little Nightmares III* rejects `0x30114c0000` at the **byte-identical** dword `be8e037c`
   (`s_mov_b32 s14, m0`) with the **byte-identical** dispatch `groups=30x17x64 local=8x8
@@ -137,6 +280,23 @@ title fails to advance, the correct statement is "the guest read the input and d
 
 ## Instrument notes
 
+- **A requested `PROSPER_RENDER_EVERY` is not a cadence you actually got.** `PROSPER_RENDER_CADENCE_LOG=1`
+  prints `[render-cadence] draw_submits=… requested_every=… skips_wanted=… dma_forced=… (…% of
+  requested skips)`, and an *un*gated one-shot `WARNING` fires when a retained DMA copy overrode every
+  skip the cadence asked for. Read `requested_every=` before believing any accelerated run: it reports
+  the value the process actually holds, which is how this lane discovered its own launcher had been
+  overwriting it (#2837). Measured here: `every=16` -> `dma_forced` **0.6%** of requested skips.
+- **`PROSPER_RENDER_EVERY` accelerates the guest and destroys the picture, in that order.** At
+  `every=16` the cutscene runs 13.7x faster and most sampled frames are **black**, because the skipped
+  submits are different *passes* of one UE4 deferred frame rather than repeats of it. Hand the cadence
+  back with `PROSPER_RENDER_EVERY_FOR_MS` well before any checkpoint you intend to photograph, and
+  budget for the fact that the tick rate returns to ~0.2/s the moment you do.
+- **The guest's own pad-read counter is the cheapest throughput instrument this title has.**
+  `PROSPER_PAD_SCRIPT_LOG=1` prints `read=` on every scripted transition; differencing it gives guest
+  polls/s with no renderer involvement. prosper's `[shot] (frame N, …)` counter is **not** this — it is
+  `present_frame_seq`, one per *draw submit*, and this title issues ~24 of those per guest flip, so the
+  two differ by more than an order of magnitude and only the pad-read one answers "is the game
+  advancing?".
 - `[compute] skip unsupported program` prints **once per program address**, so a run showing four skip
   lines says nothing about how many dispatches were lost. Always pair it with
   `PROSPER_COMPUTE_PROGRAM_CENSUS=1`, which prints executed/skipped ratios and dispatch grids.
