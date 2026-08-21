@@ -1896,9 +1896,11 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             // evidence because that submit realized all 30 operations, where the two coincide.
             // replay_operation_index_for_draw() also filters on `realized`, which the hand-rolled
             // loop did not.
-            const size_t overridden_operation = prosper::tools::replay_operation_index_for_draw(
-                replay, resource_override_draw_index);
-            if (overridden_operation == SIZE_MAX || overridden_operation >= operation_limit)
+            const prosper::tools::OperationIndex overridden_operation =
+                prosper::tools::replay_operation_index_for_draw(
+                    replay, prosper::tools::DrawIndex{resource_override_draw_index});
+            if (overridden_operation == prosper::tools::kNoOperationIndex ||
+                raw(overridden_operation) >= operation_limit)
                 std::fprintf(stderr,
                              "gpu_replay: WARNING the overridden draw (%llu) is NOT in this "
                              "submit's executed prefix (%llu of %llu operations), so it cannot "
@@ -2692,13 +2694,16 @@ int main(int argc, char** argv) {
             return 2;
         }
         const auto draw_label = static_cast<unsigned long long>(n);
-        const size_t item_index = prosper::tools::replay_item_index_for_draw(replay, n);
-        if (item_index != SIZE_MAX) {
-            auto& it = replay.items[item_index];
-            const size_t operation_index =
-                prosper::tools::replay_operation_index_for_draw(replay, n);
-            const long long operation_label = operation_index == SIZE_MAX
-                ? -1 : static_cast<long long>(operation_index);
+        const prosper::tools::ItemIndex item_index =
+            prosper::tools::replay_item_index_for_draw(replay, prosper::tools::DrawIndex{n});
+        if (item_index != prosper::tools::kNoItemIndex) {
+            auto& it = replay.items[raw(item_index)];
+            const prosper::tools::OperationIndex operation_index =
+                prosper::tools::replay_operation_index_for_draw(
+                    replay, prosper::tools::DrawIndex{n});
+            const long long operation_label =
+                operation_index == prosper::tools::kNoOperationIndex
+                    ? -1 : static_cast<long long>(raw(operation_index));
             const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
             const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
             std::vector<uint32_t> rebuilt_geometry;
@@ -2791,13 +2796,16 @@ int main(int argc, char** argv) {
             return 2;
         }
         const auto draw_label = static_cast<unsigned long long>(n);
-        const size_t item_index = prosper::tools::replay_item_index_for_draw(replay, n);
-        if (item_index != SIZE_MAX) {
-            auto& it = replay.items[item_index];
-            const size_t operation_index =
-                prosper::tools::replay_operation_index_for_draw(replay, n);
-            const long long operation_label = operation_index == SIZE_MAX
-                ? -1 : static_cast<long long>(operation_index);
+        const prosper::tools::ItemIndex item_index =
+            prosper::tools::replay_item_index_for_draw(replay, prosper::tools::DrawIndex{n});
+        if (item_index != prosper::tools::kNoItemIndex) {
+            auto& it = replay.items[raw(item_index)];
+            const prosper::tools::OperationIndex operation_index =
+                prosper::tools::replay_operation_index_for_draw(
+                    replay, prosper::tools::DrawIndex{n});
+            const long long operation_label =
+                operation_index == prosper::tools::kNoOperationIndex
+                    ? -1 : static_cast<long long>(raw(operation_index));
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
                 const auto interpolation = prosper::gpu::fragment_interpolation_layout(
@@ -2930,15 +2938,15 @@ int main(int argc, char** argv) {
             std::strtoull(list_resources_spec.c_str(), &draw_end, 0);
         const std::string stage = colon == std::string::npos
             ? std::string() : list_resources_spec.substr(colon + 1);
-        const size_t di = colon != std::string::npos &&
+        const prosper::tools::ItemIndex di = colon != std::string::npos &&
                           draw_end == list_resources_spec.c_str() + colon
-            ? prosper::tools::replay_item_index_for_draw(replay, draw_index) : SIZE_MAX;
-        if (di == SIZE_MAX || (stage != "vs" && stage != "ps")) {
+            ? prosper::tools::replay_item_index_for_draw(replay, prosper::tools::DrawIndex{draw_index}) : prosper::tools::kNoItemIndex;
+        if (di == prosper::tools::kNoItemIndex || (stage != "vs" && stage != "ps")) {
             std::fprintf(stderr, "gpu_replay: invalid selector %s (want DRAW:vs|ps)\n",
                          list_resources_spec.c_str());
             return 2;
         }
-        const auto* table = stage == "vs" ? replay.items[di].vrt.get() : replay.items[di].prt.get();
+        const auto* table = stage == "vs" ? replay.items[raw(di)].vrt.get() : replay.items[raw(di)].prt.get();
         if (!table) {
             std::printf("draw %llu %s: no captured resource table\n", draw_index, stage.c_str());
             return 0;
@@ -2964,14 +2972,14 @@ int main(int argc, char** argv) {
         if (c1 == std::string::npos || c2 == std::string::npos) { usage(argv[0]); return 2; }
         char* draw_end = nullptr;
         const unsigned long long draw_index = std::strtoull(dump_spec.c_str(), &draw_end, 0);
-        const size_t di = dump_spec[0] != '-' && draw_end == dump_spec.c_str() + c1
-            ? prosper::tools::replay_item_index_for_draw(replay, draw_index) : SIZE_MAX;
+        const prosper::tools::ItemIndex di = dump_spec[0] != '-' && draw_end == dump_spec.c_str() + c1
+            ? prosper::tools::replay_item_index_for_draw(replay, prosper::tools::DrawIndex{draw_index}) : prosper::tools::kNoItemIndex;
         std::string stage = dump_spec.substr(c1 + 1, c2 - c1 - 1);
         int binding = std::atoi(dump_spec.c_str() + c2 + 1);
-        if (di == SIZE_MAX || (stage != "vs" && stage != "ps")) {
+        if (di == prosper::tools::kNoItemIndex || (stage != "vs" && stage != "ps")) {
             std::fprintf(stderr, "gpu_replay: invalid resource selector %s\n", dump_spec.c_str()); return 2;
         }
-        const auto* table = stage == "vs" ? replay.items[di].vrt.get() : replay.items[di].prt.get();
+        const auto* table = stage == "vs" ? replay.items[raw(di)].vrt.get() : replay.items[raw(di)].prt.get();
         const prosper::gpu::ShaderResource* found = nullptr;
         if (table) for (const auto& resource : table->resources)
             if (static_cast<int>(resource.binding) == binding) { found = &resource; break; }

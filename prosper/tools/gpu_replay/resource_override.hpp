@@ -3,6 +3,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "realized_shader_dump.hpp"
+#include "replay_indices.hpp"
 
 #include <cstdint>
 #include <fstream>
@@ -26,7 +27,9 @@ struct ResourceOverrideSelector {
 };
 
 struct ResourceOverrideTarget {
-    size_t item_index = SIZE_MAX;
+    // Typed: this is an index into replay.items (realized draws only), NOT a draw ordinal and
+    // NOT an operation index. See replay_indices.hpp.
+    ItemIndex item_index = kNoItemIndex;
     size_t resource_index = SIZE_MAX;
     uint64_t gpu_addr = 0;
     uint64_t captured_size = 0;
@@ -121,12 +124,13 @@ inline bool find_resource_override_target(const gpu::GpuReplayFrame& replay,
                                           const ResourceOverrideSelector& selector,
                                           ResourceOverrideTarget& target,
                                           std::string& error) {
-    const size_t item_index = replay_item_index_for_draw(replay, selector.draw_index);
-    if (item_index == SIZE_MAX) {
+    const ItemIndex item_index =
+        replay_item_index_for_draw(replay, DrawIndex{selector.draw_index});
+    if (item_index == kNoItemIndex) {
         error = "realized draw " + std::to_string(selector.draw_index) + " not found";
         return false;
     }
-    const auto& draw = replay.items[item_index];
+    const auto& draw = replay.items[raw(item_index)];
     const auto& table = selector.stage == ResourceOverrideStage::Vertex ? draw.vrt : draw.prt;
     if (!table) {
         error = "draw " + std::to_string(selector.draw_index) + " " +
@@ -219,7 +223,7 @@ inline bool apply_resource_override(gpu::GpuReplayFrame& replay,
         return false;
     }
 
-    auto& draw = replay.items[target.item_index];
+    auto& draw = replay.items[raw(target.item_index)];
     auto& selected_table = selector.stage == ResourceOverrideStage::Vertex ? draw.vrt : draw.prt;
     const auto& original_resource = selected_table->resources[target.resource_index];
 
