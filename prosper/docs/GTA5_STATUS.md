@@ -1,7 +1,9 @@
 # Grand Theft Auto V (`PPSA04263`, RAGE) — status
 
-**Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws. The HUD, radar and
-tutorial text render; the 3D world does not.
+**Rung 2** on the bring-up ladder. The guest reaches routed gameplay entry with real GPU draws — the
+HUD, radar and tutorial text render — but the 3D world does not, and since #2834 rung 3 requires the
+gameplay scene to actually render. This is a demotion in the *number* only: nothing regressed, the bar
+moved. The milestone text is what carries how far this title has got.
 
 Tracker: **#1873**. Active frontier: **#2542** and **#2690** — #2542 names ONE hanging compute
 program and its title still calls it "the sole remaining cause"; there are at least three (#2690).
@@ -12,6 +14,155 @@ presses for a reason).
 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
+
+## THE SCENE COLOUR HAS A COMPUTE PRODUCER, AND EVERY INSTRUMENT USED TO HUNT IT WAS DRAW-SIDE (2026-08-21)
+
+`0x2063380000` — the buffer the final composite samples **24 times** and finds empty — **is written by
+compute, not by a draw.** Every instrument this document used to hunt its producer is a *draw*-side
+census (`PROSPER_TARGET_WATCH`, the colour-state records, `PROSPER_DRAW_CENSUS`), and a compute
+storage-image write is structurally invisible to all of them. That is why the producer has read as
+absent since 2026-08-16.
+
+Measured offline from a routed gameplay bundle (1.7 GB, 75 submits, the four hangers declined), so
+every line below is re-derivable without a run. In submit 50729 — the post chain, 62 draws and 20
+computes — two dispatches declare it:
+
+```
+compute[15] code=0x205b557400 local=16x16x1   CS STORAGE b=12 addr=0x2063380000 3840x2160 fmt=20
+compute[16] code=0x205b557800 local=16x16x1   CS STORAGE b= 8 addr=0x2063380000 3840x2160 fmt=20
+```
+
+`compute[15]` is identifiable from its own bindings as the **temporal upscale / scene resolve**:
+
+| binding | address | shape | role |
+| --- | --- | --- | --- |
+| CS TEX b=9 | `0x20471e0000` | 3840x2160 `rgba16f` | the lit scene |
+| CS TEX b=8 | `0x205c0a0000` | 1920x1080 `f11f11f10` | previous-frame colour |
+| CS TEX b=10 | `0x2067e40000` | 3840x2160, 2 components | motion vectors |
+| CS CB b=6 | `0x203e078930` | first4 = `1/1920, 1/1080, 1920, 1080` | source resolution |
+| **CS STORAGE b=12** | **`0x2063380000`** | **3840x2160 `Float10_11_11`** | **the composite's base tap** |
+
+So this document's own named missing operation — *"4K f16 `0x20471e0000` -> 4K f11f11f10
+`0x2063380000`, once per frame"* — **exists in the stream, decoded, recompiled and realized.**
+
+### A `groups=0x0x0` in a capsule is NOT evidence the dispatch ran empty — read this before quoting one
+
+The same capsule records **seven consecutive dispatches at `groups=0x0x0`**, `compute[10]` through
+`compute[16]`, bracketed on both sides by dispatches with real grids, all `realized=yes`. It is very
+tempting to publish that as the defect: the scene-resolve kernel dispatched over an empty grid, a
+no-op that leaves no reject, no skip line and no log output of any kind.
+
+**Do not.** `#1569` already establishes that a capture records an indirect dispatch whose argument
+buffer was unresolvable *at capture time* as exactly `groups=0x0x0`, with no field distinguishing it
+from a genuine zero-work dispatch — and on *Astro Bot* the four dispatches recorded that way are
+**known to execute live** with real, growing launch dimensions. So a capsule zero is ambiguous by
+construction, and this frame's seven are inside that ambiguity until a **live** measurement separates
+them.
+
+The discriminator is `PROSPER_INDIRECTLOG=1`, whose teardown census reports `ready` against
+`zero-args`, `zero-groups`, `unreadable` and `direct no-ops` on the live path, plus the per-dispatch
+`[agc-indirect] ZERO-ARGS dispatch dropped: args=… code=…` line added alongside this entry, which
+names *which program* was dropped rather than only how many were.
+
+### LIVE, and this is the half a capsule cannot give you: on a DEFAULT run, NOT ONE indirect compute dispatch resolves
+
+Two routed runs, `tools/screenshot`, `scripts/gta5/reach-story-mode.pad`, 4K, Linux/RADV, the four
+hangers declined, 840 s, `PROSPER_INDIRECTLOG=1`. Both finished `42/42 … status=ok guest=running`.
+
+| | default | `PROSPER_INDIRECT_APERTURE_RECOVERY=1` |
+| --- | ---: | ---: |
+| `[agc-indirect] dispatch … groups=` (resolved, ran) | **0** | `0x413dd3c00` x255, `0x413ce5200` x1 |
+| `[agc] indirect dispatch skipped: unreadable arguments` | 24 | — |
+| `[agc-indirect] args recovered into the guest VA aperture` | 0 | 24 |
+| `[agc-indirect] ZERO-ARGS dispatch dropped` | — | `0x413dd7300` x192, `0x413d11d00` x64 |
+
+**Zero resolved indirect compute dispatches across a whole default gameplay route.** Every one is
+refused at `0xf8480120` — the truncated form of `0x20f8480120`, inside this title's ray-tracing
+scratch region. That is a much larger statement than the "24 unreadable-argument skips" this document
+already records: the recovery switch is **off by default**, so on a default run GTA V's entire
+GPU-driven indirect compute chain is dropped.
+
+**The lever is verified in both directions**, which is what makes the zero a measurement rather than a
+silence: with recovery on, 24 recovery lines appear *and* the same dispatches come back with real,
+varied group counts (`dims=448x1x1 -> groups=7x1x1`, `6854x1x1 -> 108x1x1`). The instrument fires when
+there is something to fire on.
+
+**And a second population survives recovery.** Two programs read arguments that are readable and
+still degenerate — `dims=0x1x1` every time, i.e. `args[1]` and `args[2]` are correct and `args[0]` is
+zero. A partially-correct argument buffer is a producer/consumer gap, not an addressing one, and it is
+not the same defect as the truncation above.
+
+**Read every count in that table as a LOWER BOUND.** `[agc-indirect]` caps at 256 lines and the
+unreadable warning at 24; the ZERO-ARGS and resolved buckets both hit 256 exactly, so their *ratio*
+says nothing. The `[agc-indirect-census]` totals that would give proportions do not appear in either
+run, for a reason that is itself worth recording: the census is emitted from a function-local
+static's destructor, and `tools/screenshot` ends with `_exit()` (`screenshot.cpp:968`), which runs no
+static destructors. **A census written to make this reading falsifiable could not print under the
+frontend the project uses for evidence.** Fixed alongside this entry by also reporting on a
+power-of-two schedule.
+
+### What this changes, stated narrowly
+
+- **"The guest never runs the pass that fills it" is FALSIFIED.** The pass is present, decoded,
+  recompiled and realized, and it declares `0x2063380000` as its output. The guest issues it.
+- **"Which makes guest logic the leading remaining explanation"** — the conclusion this document drew
+  from the absence — no longer follows from that premise. The premise was an artifact of measuring a
+  compute write with draw-side instruments.
+- The `PROSPER_TARGET_WATCH=0x2063380000` result (**1 draw in 262,144**, a start-up clear) is still
+  correct and still means what it said. It simply cannot see a `CS STORAGE` binding, and neither can
+  the colour-state census beside it. Both nulls are **void for a compute producer**, not negative.
+
+### What is NOT established here
+
+**Whether the scene-resolve dispatch runs on the live path**, for the reason in the boxed section
+above. The capsule cannot answer it and neither can any offline replay of that capsule.
+
+Also not established: that a non-zero grid would fill the buffer with a correct scene. `0x20471e0000`,
+the upscaler's own input, is measured at **57.8% non-black with a mean luminance of 3.1/255** — it
+carries the frame but at a level that does not survive 8-bit conversion, which is the same
+"lit, at a level that does not survive conversion" state this document records for `0x20431c0000`.
+Fixing the dispatch grid and lighting the world are two claims, and only the first is in evidence.
+
+### The G-buffer, for the record
+
+Dumped from the same bundle, the frame's albedo `0x207de60000` (3840x2160 `rgba8`) is **42.2%
+non-black with 29,076 distinct colours** and shows the prologue bank interior — a character in a red
+jacket holding a rifle, a `CAUTION` sign, a door and the ceiling structure, all fully textured. The
+normals slot `0x2085de0000` covers the frame including the region the albedo leaves dark. So the
+geometry stage is not in question on this frame either, independently of the 2026-08-18 measurement.
+
+### Reject census for the same frame, with names
+
+Five operations fail to realize in this gameplay frame. Four are compute programs, and #2727's
+shader-name table names **all four**: every one is a **ray-traced shadow or reflection** stage.
+Submit 50667 is the frame's first work-carrying submit and **all three of its dispatches fail**, so
+the ray-traced pass is lost in its entirety.
+
+| submit | program | name (#2727) | terminal reject |
+| ---: | --- | --- | --- |
+| 50667 | `0x205b5e8600` | `raytraced_shadows_CS_ShadowRaytraceOccludedWave64_Shared` | SOP2 `s_cselect_b32 vcc_lo, vcc_lo, 0x7f` at pc 1421 (VCC_LO as scalar data) |
+| 50667 | `0x205b654a00` | `raytraced_lighting_CS_RaytraceReflection` | FLAT `global_store_dword` **SADDR=NULL** at pc 1207 |
+| 50667 | `0x205b657200` | `raytraced_lighting_CS_RaytraceReflectionDecalPass` | FLAT `global_store_dword` **SADDR=NULL** at pc 340 |
+| 50709 | `0x205b658800` | `raytraced_lighting_CS_RaytraceReflectionLightPass` | SOP1 `s_mov_b32 s6, m0` at pc 82 |
+| 50712 | `0x2042f49a00` | — (depth/stencil decompress) | MIMG `image_load_mip` at pc 16 |
+
+**`SADDR=NULL` is the 64-bit-VGPR-address form** — the exact case #2709 specifies and prosper cannot
+express. It is not incidental to these two programs: counting FLAT encodings by their `SADDR` field,
+`0x205b657200` issues **24 of 24** that way, `0x205b654a00` **16 of 17**, and `0x205b5e8600` **2 of 2**.
+So the ray-traced shadow chain is built on address-based memory throughout, and #2709 is a
+prerequisite for it rather than an unrelated feature. That is a **narrowing of #2709's scope, not a
+prediction about pixels** — this document's handoff records #2709 as unable to light the world on the
+grounds that `0x413dc6700`'s SRT is empty, which is a statement about a different program.
+
+The **`unsupported=` counts these programs carry (253, 156, 120, 79) are not the blocker and must not
+be quoted as one.** That field is `recompile_coverage`'s generic metric, which counts every SOPP
+branch as unsupported; on `0x205b5e8600` 47 of the 253 are `s_cbranch_scc0` alone. The terminal reject
+is the `[cfg-recompile-reject]` / `[recompile-reject]` line, which is what the table above records.
+
+`0x2042f49a00` is the cheapest of the five and its two failing terms are already named at the decline
+site (`rdna2_emit_alu.cpp`): `proven_zero_mip=0` and `compressed=1`. Its outputs `0x204da00000` and
+`0x204b1a0000` **are** consumed — by post-chain draws 0, 9 and 11 of submit 50729 — so it is not a
+dead end, contrary to what its absence from the composite's own sample list suggests.
 
 ## The F9 bundle works now, and the gameplay frame is dissectable offline (2026-08-19)
 
@@ -109,6 +260,32 @@ conclusion; it sharpens what "essentially all black" looks like.
   instructions (6 reads, 14 writes); whether all 20 are among the 79 is **not** established.
 
 ## Ruled out (2026-08-19)
+
+- **"Nothing writes the composite's scene-colour tap `0x2063380000`."** *FALSIFIED — and the null it
+  rested on was **VOID**, not negative.* Two compute dispatches in the post chain of a routed gameplay
+  frame declare that address as a `CS STORAGE` image: `0x205b557400` at binding 12 and `0x205b557800`
+  at binding 8, both 3840x2160 `Float10_11_11`. The first is identifiable from its own bindings as the
+  temporal upscale — it reads the lit 4K `rgba16f` scene `0x20471e0000`, the previous-frame colour,
+  the motion vectors, and a constant buffer whose first four floats are `1/1920, 1/1080, 1920, 1080`.
+  So this document's own named missing operation, *"4K f16 -> 4K f11f11f10, once per frame"*, is
+  present, decoded, recompiled and realized.
+  **Every instrument that produced the old conclusion is draw-side** — `PROSPER_TARGET_WATCH`
+  (1 draw in 262,144), the colour-state census (line 83 of 1,441,036), `PROSPER_DRAW_CENSUS` — and a
+  compute storage-image write is structurally invisible to all of them. Each of those measurements is
+  still correct about draws; none of them was ever evidence about a producer. The consequence for the
+  frontier is direct: *"which makes guest logic the leading remaining explanation"* no longer follows,
+  because its premise was an artifact of the instrument. (2026-08-21; see the section of the same date
+  at the top of this file.)
+
+- **A `groups=0x0x0` in a `.prgcap` means the dispatch ran with no workgroups.** *Not falsified —
+  **UNDECIDABLE OFFLINE**, and recorded here because the capsule for this title contains seven of them
+  in a row and they are extremely tempting to publish as the defect.* #1569 establishes that a capture
+  retains an indirect dispatch whose arguments were unresolvable **at capture time** as exactly
+  `groups=0x0x0`, with no field separating it from a genuine zero-work dispatch — and on *Astro Bot*
+  the four dispatches recorded that way are known to execute live with real, growing launch
+  dimensions. Only the live path can settle it: `PROSPER_INDIRECTLOG=1` now names the dropped program
+  in both shapes (`ZERO-ARGS dispatch dropped: … code=…` for indirect, `ZERO-GROUP direct dispatch
+  dropped: code=…` for direct). (2026-08-21.)
 
 - **The full offline dissection pipeline is verified end to end on a fresh gameplay bundle, and the
   exact invocations are recorded because three of the four are easy to get wrong.** Captured on the

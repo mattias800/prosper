@@ -21,6 +21,31 @@ something, write one line when it is just another capture.
 ```markdown
 ## 2026-08-21
 
+### Grand Theft Auto V: the world is in the G-buffer, four stages before the screen
+
+<p align="center"><img src="assets/screenshots/gta5-world-in-the-gbuffer.png" alt="Left: GTA V's G-buffer albedo, showing the prologue bank interior with a masked robber in a red jacket holding a rifle, a CAUTION sign and a door. Right: the frame that actually reaches the screen from the same route, black except for the radar, the tutorial caption and three faint light blooms."></p>
+
+On the left is the prologue bank heist — the masked robber, the `CAUTION` sign, the door, the ceiling
+ducts — read straight out of GTA V's albedo G-buffer at 4K. On the right is what the same route
+actually puts on screen. Both are prosper, on the same checked-in route, minutes apart; the left is an
+offline dump of an intermediate render target from a captured frame, the right a direct
+`tools/screenshot` capture. So the geometry, the vertex fetch, the texture decode and the materials
+are all *fine*, and have been for a while. The picture dies later.
+
+Where, specifically: the final composite samples one 4K buffer twenty-four times as its base layer,
+and that buffer is empty. This document has recorded for five days that "nothing writes it" — and
+that turns out to be an artifact of *how we looked*. Every instrument pointed at the question was a
+**draw**-side census, and the buffer's producer is a **compute** dispatch, which none of them can see.
+It is GTA V's temporal upscaler: it reads the lit 4K scene and the motion vectors, and declares the
+composite's base tap as its storage image. It has been sitting in the frame the whole time.
+
+The other half is uglier and simpler. On a default launch, across a full 840-second gameplay route,
+**not one** of GTA V's indirect compute dispatches ever executes — every single one is refused
+because its argument pointer arrives with the top byte missing, and the switch that repairs that is
+off by default. Turn it on and they come back with real group counts. That does not light the world
+on its own (it was tried, and the frame did not change), but "the entire GPU-driven compute chain is
+dropped by default" is not a thing that should have been true quietly.
+
 ### Beneath reaches gameplay
 
 <p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="..."></p>

@@ -9564,6 +9564,15 @@ enum class DispatchArgumentResolution : uint8_t { Ready, Noop, Invalid };
 // The counts are what make the reading falsifiable: `ready` versus `zero_args` over a whole route
 // answers "are the group counts ever actually produced", and a total that does not match the decoded
 // indirect-dispatch count means the census itself is mis-placed rather than the subject misbehaving.
+//
+// IT IS ALSO REPORTED AS IT GROWS, ON A POWER-OF-TWO SCHEDULE, AND THAT IS NOT REDUNDANT.
+// A teardown-only census is destroyed by `atexit`, and `tools/screenshot` -- the frontend this
+// project uses for progression evidence -- ends with `_exit()` (`screenshot.cpp`), which runs no
+// static destructors. So for as long as this census existed it could not print under the one
+// frontend most likely to be pointed at a GPU-driven title, and a routed 840 s Grand Theft Auto V
+// run with `PROSPER_INDIRECTLOG=1` produced exactly zero census lines. The counts that "make the
+// reading falsifiable" were unreachable in the case they were written for. Reporting on a
+// power-of-two schedule costs log2(N) lines and survives any exit path, including a crash.
 struct IndirectDispatchCensus {
     std::atomic<uint64_t> total{0};
     std::atomic<uint64_t> ready{0};
@@ -9571,17 +9580,29 @@ struct IndirectDispatchCensus {
     std::atomic<uint64_t> zero_groups{0};
     std::atomic<uint64_t> unreadable{0};
     std::atomic<uint64_t> direct_noop{0};
-    ~IndirectDispatchCensus() {
-        const uint64_t seen = total.load(std::memory_order_relaxed);
-        if (!seen || !std::getenv("PROSPER_INDIRECTLOG")) return;
+    void report(const char* when) const {
         std::fprintf(stderr,
-                     "[agc-indirect-census] indirect dispatches=%llu ready=%llu zero-args=%llu "
+                     "[agc-indirect-census] %s indirect dispatches=%llu ready=%llu zero-args=%llu "
                      "zero-groups=%llu unreadable=%llu (direct no-ops=%llu)\n",
-                     (unsigned long long)seen, (unsigned long long)ready.load(),
+                     when, (unsigned long long)total.load(std::memory_order_relaxed),
+                     (unsigned long long)ready.load(),
                      (unsigned long long)zero_args.load(),
                      (unsigned long long)zero_groups.load(),
                      (unsigned long long)unreadable.load(),
                      (unsigned long long)direct_noop.load());
+    }
+    // Call after every increment of `total`. `n` is the post-increment value, so the first dispatch
+    // reports immediately -- a route that decodes one indirect dispatch and drops it still leaves a
+    // line behind.
+    void report_on_schedule(uint64_t n) const {
+        if ((n & (n - 1)) != 0u) return;
+        if (!std::getenv("PROSPER_INDIRECTLOG")) return;
+        report("running");
+    }
+    ~IndirectDispatchCensus() {
+        const uint64_t seen = total.load(std::memory_order_relaxed);
+        if (!seen || !std::getenv("PROSPER_INDIRECTLOG")) return;
+        report("final");
     }
 };
 IndirectDispatchCensus& indirect_dispatch_census() {
@@ -9594,24 +9615,86 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
     resolved = source;
     if (!source.indirect) {
         const bool noop = direct_compute_dispatch_is_noop(source);
-        if (noop) indirect_dispatch_census().direct_noop.fetch_add(1, std::memory_order_relaxed);
+        if (noop) {
+            auto& c = indirect_dispatch_census();
+            // Name this one too, for the same reason the indirect zero-args branch is named: a
+            // capture records BOTH shapes as `groups=0x0x0` and #1569 says nothing distinguishes
+            // them offline, so "which program ran empty, and was it direct or indirect" is only
+            // answerable here. Same 256-line cap and same env gate as its sibling.
+            if (std::getenv("PROSPER_INDIRECTLOG")) {
+                static std::atomic<int> logged{0};
+                const ComputeLaunchDimensions launch = resolve_compute_launch(source);
+                if (logged.fetch_add(1) < 256)
+                    std::fprintf(stderr,
+                                 "[agc-indirect] ZERO-GROUP direct dispatch dropped: code=0x%llx "
+                                 "groups=%ux%ux%u\n",
+                                 static_cast<unsigned long long>(
+                                     source.state
+                                         ? compute_dispatch_code_addr(*source.state, source) : 0),
+                                 launch.groups_x, launch.groups_y, launch.groups_z);
+            }
+            // Schedule off direct_noop too: `total` counts only INDIRECT dispatches, so a title that
+            // decodes none of them and silently drops direct zero-dimension ones would otherwise
+            // leave no census line at all -- the same blind spot, one branch over.
+            c.report_on_schedule(c.direct_noop.fetch_add(1, std::memory_order_relaxed) + 1u);
+        }
         return noop ? DispatchArgumentResolution::Noop : DispatchArgumentResolution::Ready;
     }
     auto& census = indirect_dispatch_census();
-    census.total.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t seen = census.total.fetch_add(1, std::memory_order_relaxed) + 1u;
+    // Report on the way OUT, not here. The running line has to be internally consistent -- the
+    // comment above tells a reader that outcomes not summing to the total means the census is
+    // mis-placed, and reporting before this dispatch is classified would make that true on every
+    // line. Every return below bumps exactly one outcome counter first.
+    struct ScheduledReport {
+        const IndirectDispatchCensus& c; uint64_t n;
+        ~ScheduledReport() { c.report_on_schedule(n); }
+    } scheduled_report{census, seen};
     constexpr uint32_t kArgumentBytes = 3u * sizeof(uint32_t);
     if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
         !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
         static std::atomic<int> warned{0};
+        // The code address is the actionable half: "an indirect dispatch was skipped" is a volume,
+        // "THIS kernel was skipped" is a lead, and the two cost the same line.
         if (warned.fetch_add(1) < 24)
-            std::fprintf(stderr, "[agc] indirect dispatch skipped: unreadable arguments at 0x%llx\n",
-                         static_cast<unsigned long long>(source.indirect_args_addr));
+            std::fprintf(stderr,
+                         "[agc] indirect dispatch skipped: unreadable arguments at 0x%llx "
+                         "code=0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr),
+                         static_cast<unsigned long long>(
+                             source.state ? compute_dispatch_code_addr(*source.state, source) : 0));
         census.unreadable.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Invalid;
     }
     uint32_t args[3] = {};
     std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
     if (!args[0] || !args[1] || !args[2]) {
+        // Name the dropped PROGRAM, not just the count. The census above records how many
+        // dispatches read all-zero arguments, which answers "does this happen" but not "to what" --
+        // and in a GPU-driven post chain the answer to "to what" is the whole finding.
+        //
+        // Why a capture cannot substitute for this line: a `.prgcap` retains an indirect dispatch
+        // whose arguments were unresolvable AT CAPTURE TIME as `groups=0x0x0`, with no field
+        // separating that from a genuine zero-work dispatch (#1569) -- and on Astro Bot the four
+        // dispatches recorded that way execute perfectly well live. So an offline zero is ambiguous
+        // by construction and only the live path can settle it. Grand Theft Auto V (PPSA04263) is
+        // the case that motivated this: a routed gameplay capsule shows seven consecutive
+        // `groups=0x0x0` dispatches in the post chain, two of which (0x205b557400, 0x205b557800)
+        // declare the composite's base tap 0x2063380000 -- the buffer the final composite samples
+        // 24 times and finds empty. Whether those really run empty is exactly what this line
+        // reports and the capsule cannot.
+        if (std::getenv("PROSPER_INDIRECTLOG")) {
+            static std::atomic<int> logged{0};
+            const uint64_t code_addr = source.state
+                ? compute_dispatch_code_addr(*source.state, source) : 0;
+            if (logged.fetch_add(1) < 256)
+                std::fprintf(stderr,
+                             "[agc-indirect] ZERO-ARGS dispatch dropped: args=0x%llx code=0x%llx "
+                             "dims=%ux%ux%u\n",
+                             static_cast<unsigned long long>(source.indirect_args_addr),
+                             static_cast<unsigned long long>(code_addr),
+                             args[0], args[1], args[2]);
+        }
         census.zero_args.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
     }
