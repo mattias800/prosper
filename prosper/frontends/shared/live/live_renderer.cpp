@@ -3076,7 +3076,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // AvPlayer's exact chroma plane is interleaved RG8. Keeping it native halves
                         // the upload bytes and avoids CPU RGBA expansion while the descriptor swizzle
                         // preserves U/V. A pitch-padded source is copied row-by-row below.
-                        const bool native_rg8_sampled = avplayer_chroma_layout;
+                        //
+                        // LINEAR ONLY, and the classifier no longer implies it: since #2731 a
+                        // recognised chroma plane may be GPU-TILED (Sonic Origins stages both NV12
+                        // planes SW_64KB_S). This branch is a straight copy with no de-swizzle, so a
+                        // tiled plane taken through it would upload micro-tile order as if it were
+                        // scanline order -- a woven picture, worse than the collapse it replaced.
+                        // A tiled plane instead falls to the `bpt < 4` path below, which detiles at
+                        // the real 2-byte element size and then preserves both U and V because
+                        // avplayer_chroma_layout is set.
+                        const bool native_rg8_sampled = avplayer_chroma_layout && r.tile_mode == 0u;
                         // Storage-image atomics require a typed integer Vulkan view. Keep R32_UINT
                         // texels byte-exact through the existing 4-B read/detile path instead of
                         // silently normalizing the view to RGBA8_UNORM.

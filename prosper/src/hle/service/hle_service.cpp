@@ -706,9 +706,11 @@ HLE(s_videodec2_decode) {
                     snprintf(head + i * 3, 4, "%02x ", au[i]);
             }
             fprintf(stderr,
-                    "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu head=%s\n",
+                    "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu "
+                    "frame_ptr=0x%llx head=%s\n",
                     k, (unsigned long long)a0, (unsigned long long)input->data_size,
-                    (unsigned long long)frame->data_size, head);
+                    (unsigned long long)frame->data_size,
+                    (unsigned long long)frame->data, head);
         }
     }
     // Real decode through the backend's access-unit path (#2270).
@@ -799,6 +801,24 @@ HLE(s_videodec2_decode) {
                             "Answering NO PICTURE.\n",
                             pic.width, pic.height, (unsigned long long)pic.nv12_bytes);
             } else if (decoded == AuResult::Decoded) {
+                // ONE line, once per run, naming the exact NV12 layout prosper wrote and where.
+                // A guest reads that buffer through T# descriptors whose pitch, height and second-
+                // plane offset it chose itself, and the only way to tell a layout disagreement from
+                // a sampling defect is to have both numbers on one screen: this line supplies the
+                // producer's half, the renderer's [avpchroma] line the consumer's.
+                {
+                    static std::atomic<bool> said{false};
+                    if (!said.exchange(true))
+                        fprintf(stderr,
+                                "[vdec2] first picture: %ux%u NV12 y_stride=%u uv_stride=%u "
+                                "nv12_bytes=%llu -> guest buffer 0x%llx (%llu bytes); chroma plane "
+                                "starts at +%llu\n",
+                                pic.width, pic.height, pic.y_stride, pic.uv_stride,
+                                (unsigned long long)pic.nv12_bytes,
+                                (unsigned long long)frame->data,
+                                (unsigned long long)frame->data_size,
+                                (unsigned long long)((uint64_t)pic.y_stride * pic.height));
+                }
                 // Dump what the GUEST receives, not what the backend produced: the copy is part of
                 // what a reference comparison has to cover.
                 vdec_dump_picture(dst, (size_t)pic.nv12_bytes, pic.width, pic.height);

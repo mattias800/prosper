@@ -63,6 +63,84 @@ ShaderResource rtype_chroma_plane() {
     return r;
 }
 
+// Tales of Graces f Remastered (PPSA19991), measured live on the default route with
+// PROSPER_AVPCHROMA_LOG=1: the title drives sceVideodec2 and stages the decoded 1920x1088 NV12 into
+// two textures of its OWN, which do not touch. The luma plane ends at 0x2078643000 and the chroma
+// plane begins 0x111000 bytes later, so every adjacency form fails and the whole opening movie took
+// the coverage broadcast (#2731).
+constexpr uint64_t kTogfLumaAddr   = 0x2078423000ull;
+constexpr uint64_t kTogfChromaAddr = 0x2078754000ull;   // luma_end + 0x111000
+constexpr uint32_t kTogfPitch      = 2048;
+constexpr uint32_t kTogfLumaHeight = 1088;
+
+ShaderResource togf_luma_plane() {
+    ShaderResource r;
+    r.cls = ResourceClass::Texture;
+    r.format = DataFormat::Unorm8;
+    r.num_components = 1;
+    r.gpu_addr = kTogfLumaAddr;
+    r.width = kTogfPitch;
+    r.height = kTogfLumaHeight;
+    r.depth = 1;
+    r.img_dim = 1;
+    r.tile_mode = 0;
+    r.swizzle[0] = 4; r.swizzle[1] = 0; r.swizzle[2] = 0; r.swizzle[3] = 1;   // (R,0,0,1)
+    return r;
+}
+
+ShaderResource togf_chroma_plane() {
+    ShaderResource r;
+    r.cls = ResourceClass::Texture;
+    r.format = DataFormat::Unorm8;
+    r.num_components = 2;
+    r.gpu_addr = kTogfChromaAddr;
+    r.width = kTogfPitch / 2;          // 1024 RG8 texels == 2048 bytes
+    r.height = kTogfLumaHeight / 2;    // 544
+    r.depth = 1;
+    r.img_dim = 1;
+    r.tile_mode = 0;
+    r.swizzle[0] = 4; r.swizzle[1] = 5; r.swizzle[2] = 0; r.swizzle[3] = 1;   // (R,G,0,1)
+    return r;
+}
+
+// Sonic Origins (PPSA05325), measured live on the default route: the same sceVideodec2 staging, but
+// GPU-TILED. Both planes are SW_64KB_S (tile_mode 9) one-layer 2D arrays, and the pair is exactly
+// adjacent -- in the TILED size. A 3840x2160 8-bit surface is 0x870000 bytes tiled against 0x7e9000
+// tight, and it is the tiled figure that lands on the chroma plane's address. (#2731)
+constexpr uint64_t kSonicLumaAddr   = 0x2047870000ull;
+constexpr uint64_t kSonicChromaAddr = 0x20480e0000ull;
+constexpr uint32_t kSonicTileMode   = 9;   // SW_64KB_S
+
+ShaderResource sonic_luma_plane() {
+    ShaderResource r;
+    r.cls = ResourceClass::Texture;
+    r.format = DataFormat::Unorm8;
+    r.num_components = 1;
+    r.gpu_addr = kSonicLumaAddr;
+    r.width = 3840;
+    r.height = 2160;
+    r.depth = 1;
+    r.img_dim = 5;
+    r.tile_mode = kSonicTileMode;
+    r.swizzle[0] = 4; r.swizzle[1] = 0; r.swizzle[2] = 0; r.swizzle[3] = 1;   // (R,0,0,1)
+    return r;
+}
+
+ShaderResource sonic_chroma_plane() {
+    ShaderResource r;
+    r.cls = ResourceClass::Texture;
+    r.format = DataFormat::Unorm8;
+    r.num_components = 2;
+    r.gpu_addr = kSonicChromaAddr;
+    r.width = 1920;
+    r.height = 1080;
+    r.depth = 1;
+    r.img_dim = 5;
+    r.tile_mode = kSonicTileMode;
+    r.swizzle[0] = 4; r.swizzle[1] = 5; r.swizzle[2] = 0; r.swizzle[3] = 1;   // (R,G,0,1)
+    return r;
+}
+
 auto classify(const ShaderResource& r, const std::vector<ShaderResource>& table) {
     return classify_avplayer_chroma_plane(r, r.width, r.height, table);
 }
@@ -93,7 +171,7 @@ int main() {
         const std::vector<ShaderResource> table{rtype_luma_plane(), rtype_chroma_plane()};
         const auto v = classify(table[1], table);
         CHECK(v.match);
-        CHECK(v.reason == AvpChromaReason::MatchedSiblingLumaPlane);
+        CHECK(v.reason == AvpChromaReason::MatchedAdjacentLumaPlane);
         CHECK(v.sibling_luma_addr == kLumaAddr);
     }
 
@@ -104,7 +182,7 @@ int main() {
         const std::vector<ShaderResource> table{luma, chroma};
         const auto v = classify(chroma, table);
         CHECK(v.match);
-        CHECK(v.reason == AvpChromaReason::MatchedSiblingLumaPlane);
+        CHECK(v.reason == AvpChromaReason::MatchedAdjacentLumaPlane);
     }
 
     // ---- 4. A REAL multi-layer array is still rejected: its slices are not one contiguous plane,
@@ -116,7 +194,7 @@ int main() {
         const std::vector<ShaderResource> table{rtype_luma_plane(), chroma};
         const auto v = classify(chroma, table);
         CHECK(!v.match);
-        CHECK(v.reason == AvpChromaReason::NotNarrowLinearRg8);
+        CHECK(v.reason == AvpChromaReason::NotNarrowRg8Plane);
     }
     {
         ShaderResource chroma = rtype_chroma_plane();
@@ -133,7 +211,7 @@ int main() {
         const std::vector<ShaderResource> table{rtype_luma_plane(), chroma};
         const auto v = classify(chroma, table);
         CHECK(!v.match);
-        CHECK(v.reason == AvpChromaReason::NotNarrowLinearRg8);
+        CHECK(v.reason == AvpChromaReason::NotNarrowRg8Plane);
         // ... and the same malformed range on the SIBLING luma plane must not rescue a chroma plane
         // through the adjacency route either.
         ShaderResource luma = rtype_luma_plane();
@@ -163,7 +241,7 @@ int main() {
         const std::vector<ShaderResource> table{rtype_chroma_plane()};
         const auto v = classify(table[0], table);
         CHECK(!v.match);
-        CHECK(v.reason == AvpChromaReason::NoAdjacentLumaPlane);
+        CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
     }
     {
         // A sibling luma plane of the wrong height (not 2:1) is a different surface.
@@ -183,7 +261,7 @@ int main() {
         const std::vector<ShaderResource> table{luma, chroma};
         const auto v = classify(chroma, table);
         CHECK(v.match);
-        CHECK(v.reason == AvpChromaReason::MatchedSiblingLumaPlane);
+        CHECK(v.reason == AvpChromaReason::MatchedAdjacentLumaPlane);
     }
 
     // #2034: the same one-layer-2D-array predicate now gates the native R8 luma upload in
@@ -205,6 +283,117 @@ int main() {
         CHECK(!prosper::frontend::avp_plane_is_one_layer_2d(strided));
         ShaderResource mipped = luma;  mipped.layer_mip_offset_bytes = 0x40;
         CHECK(!prosper::frontend::avp_plane_is_one_layer_2d(mipped));
+    }
+
+    // ---- 7. #2731: a title that stages the two planes in SEPARATE allocations. Memory adjacency
+    // is evidence of an NV12 pair, never a requirement for one -- what makes the pair is the
+    // geometry, the shared physical pitch and the co-binding. Without this the whole decoded-video
+    // path collapses Cr onto Cb on every title that does its own staging. ----
+    {
+        const std::vector<ShaderResource> table{togf_luma_plane(), togf_chroma_plane()};
+        const auto v = classify(table[1], table);
+        // The gap is genuinely exercised: neither adjacency form can be reached from here.
+        const uint64_t luma_end = kTogfLumaAddr + uint64_t{kTogfPitch} * kTogfLumaHeight;
+        CHECK(luma_end != kTogfChromaAddr);
+        CHECK(((luma_end + 0xffffull) & ~uint64_t{0xffffull}) != kTogfChromaAddr);
+        CHECK(v.match);
+        CHECK(v.reason == AvpChromaReason::MatchedSeparateLumaPlane);
+        CHECK(v.sibling_luma_addr == kTogfLumaAddr);
+        CHECK(v.resolved_pitch == kTogfPitch);
+
+        // The luma plane of that same pair is still never a chroma plane.
+        CHECK(!classify(table[0], table).match);
+    }
+    {
+        // An ADJACENT pair still reports the stronger verdict, so the log keeps telling the two
+        // staging routes apart rather than flattening them into one.
+        ShaderResource chroma = togf_chroma_plane();
+        chroma.gpu_addr = kTogfLumaAddr + uint64_t{kTogfPitch} * kTogfLumaHeight;
+        const std::vector<ShaderResource> table{togf_luma_plane(), chroma};
+        const auto v = classify(chroma, table);
+        CHECK(v.match);
+        CHECK(v.reason == AvpChromaReason::MatchedAdjacentLumaPlane);
+    }
+    {
+        // Two planes of one picture are two DISJOINT ranges. A candidate that overlaps its
+        // supposed luma plane is one allocation read two ways, and must not be claimed.
+        ShaderResource chroma = togf_chroma_plane();
+        chroma.gpu_addr = kTogfLumaAddr + uint64_t{kTogfPitch} * 4u;   // inside the luma plane
+        const std::vector<ShaderResource> table{togf_luma_plane(), chroma};
+        const auto v = classify(chroma, table);
+        CHECK(!v.match);
+        CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
+    }
+    {
+        // The sibling luma plane's own DST_SEL is deliberately not constrained: GFX10 does not tie
+        // it to the component count, so the identity (R,G,B,A) remap is an ordinary descriptor for
+        // a one-component surface and must not disqualify a real plane pair.
+        ShaderResource luma = togf_luma_plane();
+        luma.swizzle[0] = 4; luma.swizzle[1] = 5; luma.swizzle[2] = 6; luma.swizzle[3] = 7;
+        const std::vector<ShaderResource> table{luma, togf_chroma_plane()};
+        const auto v = classify(table[1], table);
+        CHECK(v.match);
+        CHECK(v.reason == AvpChromaReason::MatchedSeparateLumaPlane);
+    }
+    {
+        // The pitch relation still has to hold across the gap: a separate allocation is not a
+        // licence to pair with any single-channel surface in the table.
+        ShaderResource luma = togf_luma_plane();
+        luma.linear_row_pitch_bytes = kTogfPitch + 256u;
+        const std::vector<ShaderResource> table{luma, togf_chroma_plane()};
+        CHECK(!classify(table[1], table).match);
+    }
+    {
+        ShaderResource luma = togf_luma_plane();
+        luma.height = kTogfLumaHeight - 2u;                    // no longer 2:1 against 544 rows
+        const std::vector<ShaderResource> table{luma, togf_chroma_plane()};
+        CHECK(!classify(table[1], table).match);
+    }
+
+    // ---- 8. #2731: a GPU-TILED plane pair. A tiled surface has no row pitch, so none of the pitch
+    // reasoning applies -- but its padded TILED size does land exactly on the second plane, which is
+    // the strongest evidence a pair can carry, so this route keeps adjacency as a requirement. ----
+    {
+        // The tiled size is load-bearing: the tight w*h figure misses the chroma plane entirely.
+        CHECK(prosper::gpu::tiled_surface_bytes(3840, 2160, kSonicTileMode, 0, 1u) ==
+              kSonicChromaAddr - kSonicLumaAddr);
+        CHECK(kSonicLumaAddr + uint64_t{3840} * 2160 != kSonicChromaAddr);
+
+        const std::vector<ShaderResource> table{sonic_luma_plane(), sonic_chroma_plane()};
+        const auto v = classify(table[1], table);
+        CHECK(v.match);
+        CHECK(v.reason == AvpChromaReason::MatchedAdjacentLumaPlane);
+        CHECK(v.sibling_luma_addr == kSonicLumaAddr);
+
+        CHECK(!classify(table[0], table).match);
+    }
+    {
+        // Two planes of one picture share a tile mode. A luma plane in a different swizzle is a
+        // different surface, and its size arithmetic would not even be comparable.
+        ShaderResource luma = sonic_luma_plane();
+        luma.tile_mode = 27;                                   // SW_64KB_R_X
+        const std::vector<ShaderResource> table{luma, sonic_chroma_plane()};
+        const auto v = classify(table[1], table);
+        CHECK(!v.match);
+        CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
+    }
+    {
+        // The tiled route does NOT inherit the separate-allocation licence: with no adjacency there
+        // is no pitch to corroborate the pair, so a detached tiled RG8 surface stays unclaimed.
+        ShaderResource chroma = sonic_chroma_plane();
+        chroma.gpu_addr = kSonicChromaAddr + 0x200000ull;
+        const std::vector<ShaderResource> table{sonic_luma_plane(), chroma};
+        const auto v = classify(chroma, table);
+        CHECK(!v.match);
+        CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
+    }
+    {
+        // A tiled 2-channel surface with no luma partner at all is an ordinary game texture and
+        // must keep the historical coverage broadcast.
+        const std::vector<ShaderResource> table{sonic_chroma_plane()};
+        const auto v = classify(table[0], table);
+        CHECK(!v.match);
+        CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
     }
 
     if (!failures) std::printf("avplayer_plane_policy: OK\n");
