@@ -110,6 +110,36 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **A STABLE 840 s baseline exists: decline all FOUR hanging programs and the route runs clean, with
+  a composite that never stales.** Measured 2026-08-21, `tools/screenshot`,
+  `PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700,0x413e14900,0x413e16400,0x413d88400`:
+
+  ```
+  done: 42/42 screenshot(s)  stop=request-satisfied  source-distinct=42  pixel-distinct=42
+        max-source-stale=0.0s  max-pixel-stale=0.0s  guest=running  status=ok
+  ```
+
+  **Zero device losses across the whole 840 s**, and **42 of 42 frames pixel-distinct** — the
+  composite is live end to end rather than the frozen-after-loss pattern every earlier configuration
+  shows. Compare: the previous best in this document is a 400 s run that was *capped* at 400 s and
+  did not finish the route, and the runs recorded beside it lose the device and then hold an
+  identical CRC for the remainder. This one finishes on its own terms.
+
+  Reaching this needed the fourth program (§ *A FOURTH program hangs*); the three-program decline
+  still lost the device.
+
+  **This is a platform, NOT a result about the hang — and the distinction is the point.** Declining a
+  program removes its hang *and* its output. `0x413dc6700` is the one program measurably feeding the
+  lighting, so the world being absent here is exactly what a needed-but-skipped producer looks like.
+  **Nothing in this run bears on whether fixing the hang would light the world.** § *Skipping is not
+  fixing* already says this; it is repeated here because a clean 42/42 `status=ok` line is unusually
+  easy to mistake for a passing result.
+
+  What it is good for: every further experiment on this title now has a configuration that reaches
+  gameplay, stays there, and never loses the device — so a lever's effect can be read without the
+  confound of a run that dies at a different moment each time. Given that submit ordering varies run
+  to run (#2516), that confound has been present in most measurements taken here. (2026-08-21.)
+
 - **A NAMED MECHANISM for the producer/consumer gap: eight programs reach the traversal table through
   FOUR different span granularities, and prosper gives overlapping guest ranges independent host
   buffers.** `PROSPER_COMPUTE_ADDRESS_WATCH=0x20f848417c` on a routed run, **22,327 hits**:
