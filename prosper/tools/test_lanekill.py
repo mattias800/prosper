@@ -146,38 +146,166 @@ def test_outside_any_worktree_is_undecidable(root: Path) -> None:
           lanekill.my_worktree(trees, str(outside)), None)
 
 
-def test_fails_closed_without_a_process_scan() -> None:
-    """With no readable /proc the tool must refuse, never fall through to 'nobody owns it'.
+def test_fails_closed_without_a_process_scan(root: Path) -> None:
+    """With no readable /proc the tool must refuse, and a LIVE MATCH IN MY OWN TREE must survive.
 
-    Platform-independent on purpose: this is the property that protects macOS and Windows, where
-    the real scan cannot run, so it must be verified where the real scan cannot run too.
+    The first version of this arm installed a lambda returning `([], False)` and then asserted the
+    lambda returned `([], False)`. That is a statement about the lambda. A reviewer deleted the
+    fail-closed gate from the tool and this arm stayed green, which is exactly the shape of test
+    this repository keeps paying for -- an assertion whose subject was never the code under test.
+
+    So: run `main()` for real with the scan forced unsupported, against a process that IS in this
+    worktree and WOULD be signalled if the gate were gone. The survivor is the assertion.
     """
-    original = lanekill.scan_processes
+    repo = build_repo(root)
+    wt = root / "wt-fc"
+    git(repo, "worktree", "add", "-q", "-b", "fc", str(wt))
+    victim = subprocess.Popen(["sleep", "120"], cwd=str(wt))
+    time.sleep(0.4)
+
+    original_scan = lanekill.scan_processes
+    original_argv = sys.argv[:]
+    cwd0 = os.getcwd()
     try:
         lanekill.scan_processes = lambda *a, **k: ([], False)  # type: ignore[assignment]
-        refs, supported = lanekill.scan_processes()
-        check("unsupported scan reports supported=False", supported, False)
-        check("unsupported scan yields no refs", refs, [])
+        os.chdir(str(wt))
+        sys.argv = ["lanekill.py", "sleep", "--yes"]
+        rc = lanekill.main()
+        time.sleep(0.3)
+        check("refuses with exit 2 when /proc is unreadable", rc, 2)
+        check("a live match in MY OWN tree survives the refusal", victim.poll(), None)
     finally:
-        lanekill.scan_processes = original  # type: ignore[assignment]
+        os.chdir(cwd0)
+        sys.argv = original_argv
+        lanekill.scan_processes = original_scan  # type: ignore[assignment]
+        if victim.poll() is None:
+            victim.kill()
+        victim.wait()
+
+
+# --------------------------------------------------------------------------- the decision itself
+#
+# Everything above tests ATTRIBUTION. A reviewer demonstrated that was not enough: mutating the
+# tool six ways -- each turning it into a cross-lane killer -- left every arm green, because every
+# arm called only `my_worktree()`. Deleting both live processes from the "positive" arm also left
+# it green. These arms exercise the code that decides to send a signal.
+
+
+class _T:
+    """Minimal stand-in for Worktree: `classify` and `attribute` use `.real` and `.holders`."""
+
+    def __init__(self, real, holders=()):
+        self.real = real
+        self.path = real
+        self.holders = list(holders)
+
+
+class _H:
+    def __init__(self, pid, kind):
+        self.pid = pid
+        self.kind = kind
+        self.comm = "x"
+        self.path = "/x"
+
+
+def test_classify_never_claims_another_tree() -> None:
+    """The mutation `t.real == mine.real` -> `True` must redden here."""
+    mine, other = _T("/w/a"), _T("/w/b")
+    ours, theirs, undec = lanekill.classify([1, 2, 3], {1: mine, 2: other}, mine)
+    check("only my tree's pid is ours", ours, [1])
+    check("another tree's pid is theirs", [p for p, _ in theirs], [2])
+    check("an unowned pid is undecidable", undec, [3])
+    check("an unowned pid is NOT ours", 3 in ours, False)
+    check("another tree's pid is NOT ours", 2 in ours, False)
+
+
+def test_disagreeing_strong_evidence_is_undecidable() -> None:
+    """cwd in one tree and exe in another: refuse, never pick by registration order.
+
+    The first version resolved this by whichever holder was visited last, so the verdict followed
+    `git worktree list` order and the same situation attributed both ways.
+    """
+    a = _T("/w/a", [_H(10, "cwd")])
+    b = _T("/w/b", [_H(10, "exe")])
+    owner, why = lanekill.attribute([a, b])
+    check("a split cwd/exe pid is attributed to nobody", 10 in owner, False)
+    check("and the refusal says why", "disagree" in why.get(10, ""), True)
+
+    # order must not change the answer -- this is the actual defect, so assert it directly
+    owner_rev, _ = lanekill.attribute([b, a])
+    check("reversing worktree order gives the same answer", 10 in owner_rev, False)
+
+
+def test_weak_evidence_is_not_ownership() -> None:
+    """An open fd or a mapping into a tree says the process READS there, not that it is yours."""
+    a = _T("/w/a", [_H(20, "fd")])
+    owner, why = lanekill.attribute([a])
+    check("an fd-only pid is attributed to nobody", 20 in owner, False)
+    check("and the refusal names the reason", "ownership" in why.get(20, ""), True)
+
+    b = _T("/w/b", [_H(21, "cwd"), _H(21, "map")])
+    owner2, _ = lanekill.attribute([b])
+    check("cwd still attributes even with a weak ref alongside", owner2[21].real, "/w/b")
+
+
+def test_end_to_end_spares_the_other_lane(root: Path) -> None:
+    """The whole tool, --yes, two live processes: exactly one dies.
+
+    This is the arm the six mutations were invisible to. It runs lanekill as a subprocess so the
+    census/`--yes` gate, the fail-closed gate and the exit code are all in the path.
+    """
+    repo = build_repo(root)
+    a, b = root / "wt-a", root / "wt-b"
+    git(repo, "worktree", "add", "-q", "-b", "e2e-a", str(a))
+    git(repo, "worktree", "add", "-q", "-b", "e2e-b", str(b))
+
+    mine = subprocess.Popen(["sleep", "120"], cwd=str(a))
+    other = subprocess.Popen(["sleep", "120"], cwd=str(b))
+    time.sleep(0.4)
+    try:
+        # census first: must kill NOTHING even though a match is ours
+        cen = subprocess.run([sys.executable, str(HERE / "lanekill.py"), "sleep"],
+                             cwd=str(a), capture_output=True, text=True)
+        time.sleep(0.3)
+        check("census exits 0", cen.returncode, 0)
+        check("census kills nothing (mine alive)", mine.poll(), None)
+        check("census kills nothing (theirs alive)", other.poll(), None)
+
+        run = subprocess.run([sys.executable, str(HERE / "lanekill.py"), "sleep", "--yes"],
+                             cwd=str(a), capture_output=True, text=True)
+        time.sleep(0.5)
+        check("--yes returns 1 having refused one", run.returncode, 1)
+        check("MY process was signalled", mine.poll() is not None, True)
+        check("THE OTHER LANE'S process survived", other.poll(), None)
+        check("output names the other lane", "ANOTHER LANE" in run.stdout, True)
+    finally:
+        for pr in (mine, other):
+            if pr.poll() is None:
+                pr.kill()
+            pr.wait()
 
 
 def main() -> int:
     if sys.platform != "linux":
-        print("lanekill: attribution needs /proc; the fail-closed arm is the portable one")
-        test_fails_closed_without_a_process_scan()
-        return 1 if FAILURES else 0
+        print("lanekill: attribution needs /proc, and the fail-closed arm now needs a live")
+        print("process to prove the refusal spared it -- so the whole suite is Linux-only.")
+        return 0
 
     for fn in (
         test_attribution_separates_two_trees,
         test_symlinked_cwd_still_attributes,
         test_outside_any_worktree_is_undecidable,
+        test_end_to_end_spares_the_other_lane,
+        test_fails_closed_without_a_process_scan,
     ):
         print(f"{fn.__name__}:")
         with tempfile.TemporaryDirectory() as td:
             fn(Path(td))
-    print("test_fails_closed_without_a_process_scan:")
-    test_fails_closed_without_a_process_scan()
+    for fn in (test_classify_never_claims_another_tree,
+               test_disagreeing_strong_evidence_is_undecidable,
+               test_weak_evidence_is_not_ownership):
+        print(f"{fn.__name__}:")
+        fn()
 
     print()
     if FAILURES:

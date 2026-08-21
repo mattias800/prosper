@@ -92,6 +92,69 @@ def my_worktree(trees: list[Worktree], cwd: str) -> Worktree | None:
         cur = parent
 
 
+STRONG_KINDS = ("cwd", "exe")
+
+
+def attribute(trees: list[Worktree]) -> tuple[dict[int, Worktree], dict[int, str]]:
+    """Attribute each pid to at most one worktree, refusing every ambiguous case.
+
+    ONLY `cwd` and `exe` constitute ownership. An `fd` or a memory mapping into a tree says the
+    process READS something there -- a build output, a log, a dump -- which is not the same claim
+    and must never authorise a kill.
+
+    When cwd and exe name DIFFERENT trees the answer is *undecidable*, not "pick one". The first
+    version of this function preferred whichever holder happened to be visited last, which made the
+    verdict depend on `git worktree list` ORDER: a binary in wt-a run from wt-b and a binary in
+    wt-b run from wt-a both attributed to wt-b. Same shape, opposite semantics, and the loser gets
+    its run killed under a line that says MINE. Undecidable is the only honest answer, and this
+    tool's whole purpose is that undecidable must not render as yours.
+    """
+    strong: dict[int, set[str]] = {}
+    weak: set[int] = set()
+    by_real: dict[str, Worktree] = {}
+    for t in trees:
+        by_real[t.real] = t
+        for h in t.holders:
+            if h.kind in STRONG_KINDS:
+                strong.setdefault(h.pid, set()).add(t.real)
+            else:
+                weak.add(h.pid)
+
+    owner: dict[int, Worktree] = {}
+    why: dict[int, str] = {}
+    for pid, reals in strong.items():
+        if len(reals) == 1:
+            owner[pid] = by_real[next(iter(reals))]
+        else:
+            why[pid] = f"cwd and exe disagree across {len(reals)} worktrees"
+    for pid in weak - set(strong):
+        why[pid] = "only an open fd or a mapping points into a worktree, which is not ownership"
+    return owner, why
+
+
+def classify(matches: list[int], owner_of: dict[int, Worktree], mine: Worktree
+             ) -> tuple[list[int], list[tuple[int, Worktree]], list[int]]:
+    """Split candidates into (ours, theirs, undecidable). Pure, so it can be tested directly.
+
+    Extracted because the first version of this file had it inline in `main()`, where no test
+    reached it: a reviewer mutated the tool six ways -- each turning it into a cross-lane killer --
+    and every arm stayed green, because every arm called only `my_worktree()`. The decision that
+    actually sends a signal now has arms of its own.
+    """
+    ours: list[int] = []
+    theirs: list[tuple[int, Worktree]] = []
+    undecidable: list[int] = []
+    for pid in matches:
+        t = owner_of.get(pid)
+        if t is None:
+            undecidable.append(pid)
+        elif t.real == mine.real:
+            ours.append(pid)
+        else:
+            theirs.append((pid, t))
+    return ours, theirs, undecidable
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Kill processes matching a name that belong to YOUR worktree.",
@@ -99,18 +162,24 @@ def main() -> int:
     )
     ap.add_argument("pattern", help="exact process name, as `pkill -x` matches it")
     ap.add_argument("--yes", action="store_true", help="actually signal the matches in your tree")
+    # A REASON string that is only echoed is theatre: nothing validates it and nothing durable
+    # records it, and `--any-tree ""` was falsy, so an empty reason silently degraded into a
+    # refusal that looked like an override. A bare boolean states the same thing honestly.
     ap.add_argument(
         "--any-tree",
-        metavar="REASON",
-        help="also signal matches OUTSIDE your tree. Requires a stated reason, which is printed "
-        "-- if you cannot state one, another lane is probably mid-run.",
+        action="store_true",
+        help="also signal matches OUTSIDE your tree. Another lane is probably mid-run.",
     )
     ap.add_argument("--signal", default="TERM", help="signal name, default TERM")
     args = ap.parse_args()
 
-    try:
-        sig = getattr(signal, f"SIG{args.signal.upper().removeprefix('SIG')}")
-    except AttributeError:
+    # `getattr(signal, "SIG" + name)` also resolves SIG_DFL and SIG_IGN, which are HANDLER
+    # constants (0 and 1), not signals. `--signal _dfl` then called os.kill(pid, 0) -- the
+    # existence probe -- and printed "signalled 1" while doing nothing at all. Match against the
+    # real signal set instead.
+    wanted = f"SIG{args.signal.upper().removeprefix('SIG')}"
+    sig = next((s for s in signal.Signals if s.name == wanted), None)
+    if sig is None:
         print(f"lanekill: unknown signal {args.signal!r}", file=sys.stderr)
         return 2
 
@@ -138,18 +207,11 @@ def main() -> int:
 
     attach_holders(trees, refs)
 
-    owner_of: dict[int, Worktree] = {}
     comm_of: dict[int, str] = {}
-    for t in trees:
-        for h in t.holders:
-            comm_of[h.pid] = h.comm
-            # cwd/exe are statements about the process itself; an fd or a mapping can point into
-            # a tree the process merely reads. Prefer the strong kinds when both are present.
-            if h.pid not in owner_of or h.kind in ("cwd", "exe"):
-                owner_of[h.pid] = t
-
     for pid, _kind, comm, _path in refs:
         comm_of.setdefault(pid, comm)
+
+    owner_of, why_of = attribute(trees)
 
     me = os.getpid()
     matches = sorted(p for p, c in comm_of.items() if c == args.pattern and p != me)
@@ -164,15 +226,7 @@ def main() -> int:
         except OSError:
             return "(gone)"
 
-    ours, theirs, unattributed = [], [], []
-    for pid in matches:
-        t = owner_of.get(pid)
-        if t is None:
-            unattributed.append(pid)
-        elif t.real == mine.real:
-            ours.append(pid)
-        else:
-            theirs.append((pid, t))
+    ours, theirs, unattributed = classify(matches, owner_of, mine)
 
     print(f"worktree: {mine.path}")
     print(f"{len(matches)} process(es) named {args.pattern!r}\n")
@@ -182,7 +236,8 @@ def main() -> int:
     for pid, t in theirs:
         print(f"  ANOTHER LANE  pid {pid}  [{os.path.basename(t.path)}]  {argv_of(pid)}")
     for pid in unattributed:
-        print(f"  UNATTRIBUTED  pid {pid}  {argv_of(pid)}")
+        print(f"  UNDECIDABLE   pid {pid}  {argv_of(pid)}")
+        print(f"                {why_of.get(pid, 'no reference into any worktree')}")
 
     if theirs or unattributed:
         print()
@@ -199,11 +254,10 @@ def main() -> int:
 
     targets = list(ours)
     if args.any_tree:
-        print(f"\n[--any-tree] {args.any_tree}")
-        print("  Overriding the ownership guard. This is recorded in this output on purpose.")
+        print("\n[--any-tree] overriding the ownership guard and signalling other lanes' matches.")
         targets += [p for p, _ in theirs] + unattributed
 
-    sent, vanished = 0, 0
+    sent, vanished, denied = 0, 0, 0
     for pid in targets:
         try:
             os.kill(pid, sig)
@@ -212,14 +266,16 @@ def main() -> int:
             vanished += 1
         except PermissionError:
             print(f"  cannot signal pid {pid}: permission denied", file=sys.stderr)
+            denied += 1
 
     print(f"\nsignalled {sent} with SIG{args.signal.upper().removeprefix('SIG')}"
           + (f", {vanished} had already exited" if vanished else ""))
     refused = len(theirs) + len(unattributed) if not args.any_tree else 0
     if refused:
         print(f"refused {refused} outside your tree")
-        return 1
-    return 0
+    if denied:
+        print(f"could not signal {denied} (permission denied)")
+    return 1 if (refused or denied) else 0
 
 
 if __name__ == "__main__":

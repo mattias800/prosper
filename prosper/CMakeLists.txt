@@ -155,11 +155,19 @@ if(Python3_Interpreter_FOUND)
   endif()
 
   # lanekill SIGNALS processes, so its arms are refusals first: a process in another worktree, a
-  # path that attributes to nothing, and a lookalike directory sharing a name prefix. Same
-  # Linux-only reasoning as above and for the same reason -- attribution reads /proc, and without
-  # one the tool fails closed rather than guessing. That fail-closed path is the one arm that
-  # runs on every platform, because it is the property protecting the platforms that cannot run
-  # the rest.
+  # path that attributes to nothing, a lookalike directory sharing a name prefix, and an
+  # end-to-end run where exactly one of two live processes dies.
+  #
+  # That end-to-end arm exists because the first version of this suite tested only ATTRIBUTION.
+  # A reviewer mutated the tool six ways -- each turning it into a cross-lane killer -- and every
+  # arm stayed green, because none of them reached the code that decides to send a signal. Each
+  # of those mutations now reddens, verified by re-running them.
+  #
+  # Linux-only, and that is a statement about the tool: attribution reads /proc. The fail-closed
+  # arm is Linux-only TOO, which is a deliberate narrowing -- it used to run everywhere by
+  # installing a stub and asserting the stub's own return value, which said nothing about
+  # lanekill and stayed green when the gate was deleted. It now runs main() against a live
+  # process in its own worktree and asserts the refusal spared it, which needs a real process.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME lanekill_tool
              COMMAND "${Python3_EXECUTABLE}"
