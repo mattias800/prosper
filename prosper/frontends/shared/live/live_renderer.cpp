@@ -4491,7 +4491,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 auto& seen_masks = masks[r.gpu_addr];
                                 seen_masks.first |= present_mask;   // any slice ever VALID
                                 seen_masks.second |= known_mask;    // any slice ever KNOWN
-                                if (((++samples) & (samples - 1)) == 0 && samples >= 64) {
+                                // Increment SEQUENCED before the test: `(++samples) & (samples - 1)`
+                                // reads and modifies `samples` with no sequencing between the
+                                // operands of `&`, so the throttle's cadence was whatever the
+                                // optimiser chose. That matters here beyond tidiness -- CLAUDE.md
+                                // tells readers to reason about this power-of-two schedule when
+                                // interpreting the log, and that reasoning is only sound if the
+                                // schedule is defined. Do not fold these back together.
+                                ++samples;
+                                if ((samples & (samples - 1)) == 0 && samples >= 64) {
                                     fprintf(stderr,
                                             "[cube-depth] residency after %llu cube samples "
                                             "(faces resident -> times seen):\n",
