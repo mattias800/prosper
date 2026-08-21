@@ -164,6 +164,7 @@ of its manifest.
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | - | [#2867](https://github.com/mattias800/prosper/issues/2867) | - |
 | Spacebase Startopia | `PPSA02846` | 0 | `------` | none | - | none | - | [#2887](https://github.com/mattias800/prosper/issues/2887) | - |
 | Stray | `PPSA02101` | 0 | `------` | none | - | none | - | [#2883](https://github.com/mattias800/prosper/issues/2883) | - |
+| The Lord of the Rings: Gollum | `PPSA06367` | 0 | `------` | **--** fps · 0% active · 1440p · one flat white composited clear before the boot dies at ~4 s · screenshot · 2026-08-22 | - | none | [#2898](https://github.com/mattias800/prosper/issues/2898) | [#2900](https://github.com/mattias800/prosper/issues/2900) | [`GOLLUM_STATUS.md`](prosper/docs/GOLLUM_STATUS.md) |
 | Unbound: Worlds Apart | `PPSA03274` | 0 | `------` | none | - | none | - | [#2886](https://github.com/mattias800/prosper/issues/2886) | - |
 | Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | - | [#2864](https://github.com/mattias800/prosper/issues/2864) | - |
 
@@ -176,8 +177,8 @@ of its manifest.
 | 3 -- gameplay with the scene rendering | 8 |
 | 2 -- title screen | 14 |
 | 1 -- any real graphics | 1 |
-| 0 -- not started | 12 |
+| 0 -- not started | 13 |
 
-**4 of 51** trackers record a PS5 hardware-oracle comparison; the rest carry
+**4 of 52** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
