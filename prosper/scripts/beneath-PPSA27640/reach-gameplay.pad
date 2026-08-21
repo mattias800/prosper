@@ -1,0 +1,197 @@
+# Beneath (PPSA27640) -- boot to gameplay: Science_Remake2, the opening dive.
+#
+# VALIDATED on Linux with hardware Vulkan (RADV, AMD Radeon 8060S / STRIX_HALO), native
+# 1920x1080, headless `tools/screenshot` frontend, PROSPER_RENDER=1, no render acceleration.
+#
+# THIS TITLE NEEDS PROSPER_NULL_PAGE=1 TO BOOT AT ALL. Without it the guest's primary thread dies
+# 1.1 s in with SIGSEGV at addr=0x8, rip=eboot+0xe44346 -- a frame-pointer-chain unwinder reading
+# the return-address slot of a NULL frame pointer. See docs/BENEATH_STATUS.md; the underlying
+# defect is tracked separately. Every window below is measured with that variable set.
+#
+# WHAT THE ROUTE HAS TO GET PAST, in the title's own words (strings from
+# Media/sharedassets4.assets, the localisation table):
+#
+#   title screen   " Press Any Button To Start "   (_Start)
+#   main menu      NEW GAME / LOAD GAME / OPTIONS / CREDITS / EXIT, NEW GAME preselected
+#   GAME MODE      SELECT DIFFICULTY -- TOURIST PASS / COLD REALITY / HARD BASTARD,
+#                  TOURIST PASS preselected (it renders in green in the capture)
+#   INTRO          Assets/LEVELS/INTRO/Intro.unity, a narration sequence
+#
+# Every one of those four gates is answered by CROSS, and CROSS is preselected on both lists, so
+# the opening ladder is Cross-only and self-synchronising: surplus presses simply wait on whatever
+# screen the boot happens to be on. Route timing is effectively wall-clock (#2764) -- the guest
+# polls the pad from early boot, not from the first interactive screen -- so the ladder is
+# deliberately long rather than tightly anchored.
+#
+# CROSS IS MEASURED HARMLESS IN-GAME for this title: the exploratory arm mashed it from t=87 s
+# (level14 open) to t=360 s without leaving the scene, changing scene, or faulting. That is what
+# lets the ladder run long enough to cover a slow boot.
+#
+# NO CROSS AFTER t=240. The stick windows below are movement in-game, but they are LIST NAVIGATION
+# on the main menu, and `up` on a preselected top entry can wrap onto EXIT. Ending the ladder
+# before the sticks start means a slow boot can still land a selection on EXIT but can never
+# CONFIRM it -- the route has no button left that would commit it.
+#
+# PROGRESS ORACLE IS THE UNITY SCENE INDEX, NOT PIXELS. Media/levelNN is the build-settings scene
+# index: Media/globalgamemanagers holds exactly 46 scene paths at contiguous offsets
+# 218784..221088, and Media/ holds exactly 46 levelNN files (level0..level45). 46 == 46,
+# index-for-index. Self-check: of the 12 levelNN files that carry a .resS streamed-resource
+# sidecar below level5, every one lands on a world scene (14,15,16,20,24,25,26,27,30,31,39,44)
+# and not one lands on a loading screen, so a mis-derived index would break that partition rather
+# than yield a plausible wrong answer.
+#
+#   level0  Preload            level4  Menu/MenuD (main menu)     level7  LOADING_SCREENS/LoadShip
+#   level1  Menu/Health_W      level5  INTRO/Intro                level14 SCIENCE_SHIP/Science_Remake2
+#   level2  Menu/ShaderPreload level6  LOADING_SCREENS/backMainMenu
+#   level3  Menu/Launcher
+#
+# GAMEPLAY DISCRIMINATOR: any world scene, i.e. levelN for N in
+# {14,15,16,18,20,24,25,26,27,28,30,31,34,39,42,44}. A new game loads level14 first, and level7
+# (LoadShip) is the loading screen that immediately precedes it.
+#
+# Measured on the validated run (PROSPER_FILELOG=1 open lines, timestamped against
+# PROSPER_PAD_SCRIPT_LOG elapsed=):
+#
+#   t~0     level0 + level1     preload
+#   t~6.5   level2 + level3     shader preload, launcher
+#   t~18    level4              main menu
+#   t~48.5  level5              INTRO
+#   t~84.5  level7              LoadShip
+#   t~87    level14             Science_Remake2 -- GAMEPLAY
+#
+# A second, independent content check that does not reuse the scene derivation: the waypoint HUD
+# marker ("39m", the _WaypointO / WAYPOINT DISTANCE readout) is drawn only in-world, and it is
+# visible in every gameplay sample.
+
+# --- phase 1: the opening ladder -- title screen, NEW GAME, GAME MODE, INTRO.
+#     Dense while the gates are expected, then sparse so a slow boot is still covered.
+3-3.5:cross
+6-6.5:cross
+9-9.5:cross
+12-12.5:cross
+15-15.5:cross
+18-18.5:cross
+21-21.5:cross
+24-24.5:cross
+27-27.5:cross
+30-30.5:cross
+33-33.5:cross
+36-36.5:cross
+39-39.5:cross
+42-42.5:cross
+45-45.5:cross
+48-48.5:cross
+51-51.5:cross
+54-54.5:cross
+57-57.5:cross
+60-60.5:cross
+63-63.5:cross
+66-66.5:cross
+69-69.5:cross
+72-72.5:cross
+75-75.5:cross
+78-78.5:cross
+81-81.5:cross
+84-84.5:cross
+87-87.5:cross
+90-90.5:cross
+93-93.5:cross
+96-96.5:cross
+99-99.5:cross
+102-102.5:cross
+105-105.5:cross
+108-108.5:cross
+111-111.5:cross
+114-114.5:cross
+117-117.5:cross
+120-120.5:cross
+
+# --- phase 2: slow-boot cover. Same Cross, thinned out; harmless once in-world.
+126-126.5:cross
+132-132.5:cross
+138-138.5:cross
+144-144.5:cross
+150-150.5:cross
+156-156.5:cross
+162-162.5:cross
+168-168.5:cross
+174-174.5:cross
+180-180.5:cross
+186-186.5:cross
+192-192.5:cross
+198-198.5:cross
+204-204.5:cross
+210-210.5:cross
+216-216.5:cross
+222-222.5:cross
+228-228.5:cross
+234-234.5:cross
+240-240.5:cross
+
+# --- phase 3: in-world movement. NO confirm button from here on (see the note above).
+#     Walk forward, then sweep the camera, then walk again -- the capture is meant to show the
+#     player moving through Science_Remake2, not a static first-person frame.
+250-256:left-stick-up
+257-259:right-stick-right
+260-266:left-stick-up
+267-269:right-stick-left
+270-276:left-stick-up
+277-279:right-stick-right
+280-286:left-stick-up
+287-289:right-stick-left
+290-296:left-stick-up
+297-299:right-stick-right
+300-306:left-stick-up
+307-309:right-stick-left
+310-316:left-stick-up
+317-319:right-stick-right
+320-326:left-stick-up
+327-329:right-stick-left
+330-336:left-stick-up
+337-339:right-stick-right
+340-346:left-stick-up
+347-349:right-stick-left
+350-356:left-stick-up
+357-359:right-stick-right
+360-366:left-stick-up
+367-369:right-stick-left
+370-376:left-stick-up
+377-379:right-stick-right
+380-386:left-stick-up
+387-389:right-stick-left
+390-396:left-stick-up
+397-399:right-stick-right
+400-406:left-stick-up
+407-409:right-stick-left
+410-416:left-stick-up
+417-419:right-stick-right
+420-426:left-stick-up
+427-429:right-stick-left
+430-436:left-stick-up
+437-439:right-stick-right
+440-446:left-stick-up
+447-449:right-stick-left
+450-456:left-stick-up
+457-459:right-stick-right
+460-466:left-stick-up
+467-469:right-stick-left
+470-476:left-stick-up
+477-479:right-stick-right
+480-486:left-stick-up
+487-489:right-stick-left
+490-496:left-stick-up
+497-499:right-stick-right
+500-506:left-stick-up
+507-509:right-stick-left
+510-516:left-stick-up
+517-519:right-stick-right
+520-526:left-stick-up
+527-529:right-stick-left
+530-536:left-stick-up
+537-539:right-stick-right
+540-546:left-stick-up
+547-549:right-stick-left
+550-556:left-stick-up
+557-559:right-stick-right
+560-566:left-stick-up
+567-569:right-stick-left

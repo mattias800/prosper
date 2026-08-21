@@ -62,19 +62,19 @@ Last updated: 2026-08-17
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🚧 Title screen, on a throttled route — a default run still dies in the guest allocator within seconds | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Chapter 1 gameplay; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
-| *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
+| *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## At a glance
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-six of the twenty titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
+seven of the twenty-one titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
 at two different rungs. Counting markers gives a different — and wrong — answer.
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached** with real GPU draws (rung 3 or better) | 20 |
-| **Title screen or menu** reached, gameplay not yet reached (rung 2) | 18 |
+| **Gameplay reached** with real GPU draws (rung 3 or better) | 21 |
+| **Title screen or menu** reached, gameplay not yet reached (rung 2) | 17 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
 | Total tracked | 39 |
 
@@ -84,17 +84,17 @@ It includes *Grand Theft Auto V*, which enters Story Mode with a correct HUD and
 
 ### Where the titles accumulate
 
-The 18 titles that stop at a title screen or menu, by the engine recorded in the table:
+The 17 titles that stop at a title screen or menu, by the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 8 × UE4, 1 × UE5, 1 unversioned | 10 |
-| Unity / IL2CPP, including Unity 6 | 4 |
+| Unity / IL2CPP, including Unity 6 | 3 |
 | Hedgehog Engine 2, Custom, Custom (Ancient), ASOBI — one each | 4 |
 
 **Every Unreal title in the table is in this group.** Ten of the 39 rows are Unreal; all ten reach a
 title screen and none has reached gameplay. The distribution is the mirror image on the other side:
-15 of the 20 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows.
+16 of the 21 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows.
 
 **This is an observation about where titles accumulate, not a claim that the ten Unreal titles share
 one root cause.** A common cause is an untested hypothesis, and the per-title records currently cut
@@ -516,10 +516,18 @@ The menu's background video is still not composited, so the BEGIN menu sits on a
 
 ## Beneath — `PPSA27640`
 
-<p align="center"><img src="assets/screenshots/beneath-title.png" alt="Beneath — title screen"></p>
+<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="Beneath — the opening dive aboard the science ship, with the waypoint HUD reading 21m and a character subtitle on screen"></p>
 
-A direct, unmodified native 1920×1080 frontend capture reaches the title screen and its `Press Any Button To Start`
-prompt. Gameplay has not yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1898).
+A direct, unmodified native 1920×1080 frontend capture reaches gameplay: the scripted route
+(`prosper/scripts/beneath-PPSA27640/reach-gameplay.pad`) drives the title screen, `NEW GAME`, the
+`SELECT DIFFICULTY` screen and the intro, then walks the opening dive in
+`Assets/LEVELS/SCIENCE_SHIP/Science_Remake2.unity`. The capture above is from that route; the
+waypoint HUD counts down as the route moves, and the title's own dialogue subtitles play.
+
+This title needs `PROSPER_NULL_PAGE=1` to boot — the Unity player walks its frame-pointer chain one
+hop past the terminal NULL frame pointer and reads the return-address slot at address `0x8`.
+See [`prosper/docs/BENEATH_STATUS.md`](prosper/docs/BENEATH_STATUS.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/1898).
 
 ## Reproducible routes
 
