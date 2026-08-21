@@ -4511,6 +4511,9 @@ inline bool allows_compute_scalar_vcc_bridge(const SpirvCompute& b) {
 // register that has been written -- so erasing by it drops every alias inherited from before the
 // branch (safe but useless) while keeping exactly the one-armed aliases that are unsound. The
 // skipped edge of an if-only region likewise carries the pre-branch aliases, not the arm's.
+//
+// `other` must be a distinct copy -- this erases from `rs` while iterating `other`, so passing
+// `rs.sreg_ud_alias` itself would be undefined. Every call site snapshots into its own `const auto`.
 inline void merge_ud_alias(RegState& rs, const std::unordered_map<int, int>& other) {
     for (auto it = rs.sreg_ud_alias.begin(); it != rs.sreg_ud_alias.end(); ) {
         auto edge = other.find(it->first);

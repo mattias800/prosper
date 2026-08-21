@@ -5768,6 +5768,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (phased.guarded) {
                 b.emit_branch(merge_label);
                 b.emit_label(merge_label);
+                // This join deliberately merges NOTHING -- no phis, and no meet for sreg_srt,
+                // sreg_bool, sreg_written or sreg_ud_alias. That is safe only because the peeled
+                // guard is TERMINAL: `tail` runs to ins.end(), so no guest instruction follows this
+                // label and nothing can consume a per-path fact that escaped it. If
+                // analyze_barrier_phased_compute is ever relaxed to peel a NON-terminal guard, every
+                // one of those domains becomes a silent hole here at once, and each needs the
+                // treatment the ordinary if-only region gets (#1773 added merge_ud_alias there).
             }
             if (initial_dispatch_active)
                 b.partial_barrier_phases_emitted = true;

@@ -149,7 +149,6 @@ inline bool sreg_range_ud_alias(const RegState& rs, int base, uint32_t words, in
     return true;
 }
 
-
 inline bool sopk_sets_full_flat_scratch_base(const Rdna2Inst& in) {
     if (in.fmt != Rdna2Format::SOPK || in.opcode != 0x13 ||
         in.dst.kind != OperandKind::SGPR)

@@ -201,6 +201,51 @@ int main() {
     CHECK(!recompiles(conditional),
           "a copy staged on only one side of a branch does not resolve after the merge");
 
+    // The SAFE direction of the same shape, and the reason it is not optional: the meet made
+    // pre-branch aliases SURVIVE a merge where the old erase-by-written-set destroyed them, and
+    // nothing else asserts that. It is also what keeps the arm above honest -- without a positive
+    // control of this shape, any later change that makes forward-if programs reject for an unrelated
+    // reason turns that negative arm into a silent pass.
+    //
+    // Same eight moves, but staged BEFORE the branch, so both edges carry the identical alias.
+    std::vector<uint32_t> before_branch;
+    for (uint32_t i = 0; i < 8; ++i) before_branch.push_back(s_mov_b32(20 + i, 8 + i));
+    before_branch.push_back(0xBF068008u);            // pc8:  s_cmp_eq_u32 s8, 0
+    before_branch.push_back(0xBF840002u);            // pc9:  s_cbranch_scc0 -> pc12
+    before_branch.push_back(0xBEA80381u);            // pc10: s_mov_b32 s40, 1  (arm body, unrelated)
+    before_branch.push_back(0xBEA90381u);            // pc11: s_mov_b32 s41, 1
+    before_branch.push_back(kImageSampleDmask15);    // pc12
+    before_branch.push_back(mimg_word1(0, 0, /*srsrc=*/20, /*ssamp=*/16));
+    before_branch.push_back(kEndpgm);
+    CHECK(recompiles(before_branch),
+          "a copy staged BEFORE a branch survives the merge and still resolves");
+
+    // A copy staged inside a LOOP body, consumed after the loop. A top-tested loop may run zero
+    // times, so the merge is reachable on a path where the copy never executed. This is the same
+    // hazard as the branch arm one construct over, and it is the arm that guards the SNAPSHOT
+    // PLACEMENT of the loop meets -- they are taken after `invalidate_loop_descriptor_provenance`,
+    // which is the subtlest thing in this change and the only part nothing else can catch.
+    //
+    // Loop shape is the proven-uniform VCCZ-exit loop from test_recompile_coverage (v1 <- inline 4
+    // makes the compare wave-uniform, so the compute shell structurizes it).
+    std::vector<uint32_t> loop_staged = {
+        0xBE800380u,               // pc0:  s_mov_b32 s0, 0
+        0x7E000280u,               // pc1:  v_mov_b32 v0, 0
+        0x7E020284u,               // pc2:  v_mov_b32 v1, 4
+        0x7D020200u,               // pc3:  v_cmp -> vcc            (loop header)
+        0xBF86000Cu,               // pc4:  s_cbranch_vccz +12 -> pc17 (exit)
+    };
+    for (uint32_t i = 0; i < 8; ++i)
+        loop_staged.push_back(s_mov_b32(20 + i, 8 + i));            // pc5..12: stage in the body
+    loop_staged.push_back(0x060000FFu); loop_staged.push_back(0x3E800000u);  // pc13: v_add_f32 v0,0.25,v0
+    loop_staged.push_back(0x81008100u);                              // pc15: s_add_i32 s0, s0, ...
+    loop_staged.push_back(0xBF82FFF2u);                              // pc16: s_branch -14 -> pc3
+    loop_staged.push_back(kImageSampleDmask15);                      // pc17
+    loop_staged.push_back(mimg_word1(0, 0, /*srsrc=*/20, /*ssamp=*/16));
+    loop_staged.push_back(kEndpgm);
+    CHECK(!recompiles(loop_staged),
+          "a copy staged inside a loop body does not resolve after the loop");
+
     printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }
