@@ -189,7 +189,7 @@ int main() {
     const RunVerdict failed_verdict = decide_run_verdict(true, running_guest, false);
     const std::string summary =
         manifest_summary_json(3, 5, SamplingStop::Timeout, tracker, failed_verdict, running_guest,
-                              false);
+                              false, prosper::gpu::FrameRate{});
     CHECK(summary.find("\"timed_out\":true") != std::string::npos &&
           summary.find("\"stop_reason\":\"timeout\"") != std::string::npos &&
           summary.find("\"pixel_distinct_frames\":2") != std::string::npos &&
@@ -237,7 +237,7 @@ int main() {
 
         const std::string fault_summary =
             manifest_summary_json(25, 25, SamplingStop::RequestSatisfied, tracker, fault_verdict,
-                                  faulted, false);
+                                  faulted, false, prosper::gpu::FrameRate{});
         CHECK(fault_summary.find("\"guest_state\":\"faulted\"") != std::string::npos &&
               fault_summary.find("\"guest_kind\":2") != std::string::npos &&
               fault_summary.find("\"guest_fault_rip\":\"0x410024055\"") != std::string::npos &&
@@ -255,7 +255,7 @@ int main() {
               "a guest that exits normally is recorded but does not fail the run");
         const std::string returned_summary =
             manifest_summary_json(5, 5, SamplingStop::RequestSatisfied, tracker, returned_verdict,
-                                  returned, false);
+                                  returned, false, prosper::gpu::FrameRate{});
         CHECK(returned_summary.find("\"guest_state\":\"returned\"") != std::string::npos &&
               returned_summary.find("\"guest_fault_rip\":null") != std::string::npos,
               "a normal guest exit is still visible in the manifest, with no fault address");
@@ -303,7 +303,7 @@ int main() {
         const RunVerdict fault_verdict = decide_run_verdict(false, faulted, false);
         const std::string early =
             manifest_summary_json(3, 25, SamplingStop::GuestFault, tracker, fault_verdict, faulted,
-                                  false);
+                                  false, prosper::gpu::FrameRate{});
         CHECK(early.find("\"saved\":3") != std::string::npos &&
               early.find("\"requested\":25") != std::string::npos &&
               early.find("\"stop_reason\":\"guest-fault\"") != std::string::npos &&
@@ -376,6 +376,72 @@ int main() {
         CHECK(CaptureRunConfig{}.guest_fault_settle_seconds == 1.0,
               "the settle-window default matches the tool's, so a direct producer gets the same "
               "policy the command line gives");
+    }
+
+    // Framerate reaches the artifact, and reaches it as TWO numbers. A manifest that carried only
+    // a presented rate would report a healthy figure for a title whose every publication is the
+    // renderer's re-served retained frame -- the R-Type Delta (#2783) reading. The metric itself is
+    // pinned in tests/gpu/present/test_present_frame_rate.cpp; what is under test here is that the
+    // JSON says which number is which, and that a sample line carries the counters a consumer needs
+    // to compute the rate over any window of its own choosing.
+    {
+        CaptureTracker tracker;
+
+        prosper::gpu::PresentRateSnapshot live;
+        live.published = 600; live.distinct = 600;
+        live.first_publication_seconds = 0; live.now_seconds = 10.0;
+        const prosper::gpu::FrameRate live_rate =
+            prosper::gpu::frame_rate_since_first_publication(live);
+
+        prosper::gpu::PresentRateSnapshot frozen;
+        frozen.published = 600; frozen.distinct = 1;
+        frozen.first_publication_seconds = 0; frozen.now_seconds = 10.0;
+        const prosper::gpu::FrameRate frozen_rate =
+            prosper::gpu::frame_rate_since_first_publication(frozen);
+
+        const RunVerdict ok_verdict{"ok", 0};
+        GuestOutcome running;
+        const std::string live_summary = manifest_summary_json(
+            5, 5, SamplingStop::RequestSatisfied, tracker, ok_verdict, running, false, live_rate);
+        CHECK(live_summary.find("\"distinct_fps\":60.000") != std::string::npos &&
+              live_summary.find("\"presented_fps\":60.000") != std::string::npos &&
+              live_summary.find("\"frame_rate_measured\":true") != std::string::npos &&
+              live_summary.find("\"mostly_retained\":false") != std::string::npos,
+              "a live title's summary reports both rates at ~60 fps");
+
+        const std::string frozen_summary = manifest_summary_json(
+            5, 5, SamplingStop::RequestSatisfied, tracker, ok_verdict, running, false, frozen_rate);
+        CHECK(frozen_summary.find("\"presented_fps\":60.000") != std::string::npos,
+              "a FROZEN title still publishes at 60 fps -- the number that must not stand alone");
+        CHECK(frozen_summary.find("\"distinct_fps\":0.100") != std::string::npos &&
+              frozen_summary.find("\"distinct_frames\":1") != std::string::npos &&
+              frozen_summary.find("\"mostly_retained\":true") != std::string::npos,
+              "...and the same summary says so, in three independent fields");
+
+        const std::string unmeasured = manifest_summary_json(
+            0, 5, SamplingStop::Timeout, tracker, ok_verdict, running, false,
+            prosper::gpu::FrameRate{});
+        CHECK(unmeasured.find("\"frame_rate_measured\":false") != std::string::npos &&
+              unmeasured.find("\"distinct_fps\":0.000") != std::string::npos,
+              "a run that published nothing reports NOT MEASURED rather than a confident 0 fps");
+
+        CaptureObservation timed;
+        timed.width = 1920; timed.height = 1080;
+        timed.elapsed_seconds = 12.5;
+        timed.published_frames = 750;
+        timed.distinct_frames = 12;
+        CaptureClassification classification;
+        const std::string sample = manifest_sample_json(4, "s.png", timed, classification, "");
+        CHECK(sample.find("\"published_frames\":750") != std::string::npos &&
+              sample.find("\"distinct_frames\":12") != std::string::npos,
+              "a sample line carries both counters, so any window of the run can be measured later");
+
+        CaptureRunConfig overlay_config;
+        overlay_config.fps_overlay = true;
+        CHECK(manifest_run_json(overlay_config).find("\"fps_overlay\":true") != std::string::npos,
+              "the run header records that the PNGs carry a burned-in annotation");
+        CHECK(manifest_run_json(CaptureRunConfig{}).find("\"fps_overlay\":false") != std::string::npos,
+              "...and that the default run's PNGs do not");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

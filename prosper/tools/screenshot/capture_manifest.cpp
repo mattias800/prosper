@@ -282,6 +282,7 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
          << ",\"max_pixel_stale_seconds\":" << std::fixed << std::setprecision(6)
          << c.max_pixel_stale_seconds
          << ",\"require_composited_frame\":" << (c.require_composited_frame ? "true" : "false")
+         << ",\"fps_overlay\":" << (c.fps_overlay ? "true" : "false")
          << ",\"min_present_count\":" << c.min_present_count
          << ",\"min_frame_seq\":" << c.min_frame_seq
          << ",\"allow_guest_fault\":" << (c.allow_guest_fault ? "true" : "false")
@@ -312,6 +313,11 @@ std::string manifest_sample_json(int index, const std::string& png_path,
          << ",\"source_seq\":" << o.source_seq
          << ",\"frame_seq\":" << o.frame_seq
          << ",\"present_count\":" << o.present_count
+         // The two frame counters, raw. Subtract them between any two samples to get the framerate
+         // over that window; `distinct_frames` is the one that does not read full speed for a title
+         // whose every publication is the renderer's re-served retained frame.
+         << ",\"published_frames\":" << o.published_frames
+         << ",\"distinct_frames\":" << o.distinct_frames
          << ",\"front_index\":" << o.front_index
          << ",\"width\":" << o.width << ",\"height\":" << o.height
          << ",\"pixel_crc32\":\"" << std::hex << std::setw(8) << std::setfill('0')
@@ -336,7 +342,8 @@ std::string manifest_sample_json(int index, const std::string& png_path,
 
 std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
                                   const CaptureTracker& tracker, const RunVerdict& verdict,
-                                  const GuestOutcome& guest, bool allow_guest_fault) {
+                                  const GuestOutcome& guest, bool allow_guest_fault,
+                                  const prosper::gpu::FrameRate& rate) {
     std::ostringstream line;
     line << "{\"type\":\"summary\",\"schema\":1,\"saved\":" << saved
          << ",\"requested\":" << requested
@@ -355,6 +362,22 @@ std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
          << tracker.max_pixel_stale_seconds()
          << ",\"max_frame_seq\":" << tracker.max_frame_seq()
          << ",\"max_present_count\":" << tracker.max_present_count()
+         // Framerate over [first publication .. end of sampling]. BOTH rates are emitted and
+         // `distinct_fps` is the honest one: `presented_fps` counts publications, and the renderer
+         // re-publishes its retained frame when a submit produces nothing, so presented_fps reads
+         // full speed for a frozen title (#2783). `frame_rate_measured` false means nothing was
+         // published, which is not the same claim as 0 fps.
+         << ",\"frame_rate_measured\":" << (rate.measured ? "true" : "false")
+         << ",\"frame_rate_window_seconds\":" << std::fixed << std::setprecision(6)
+         << rate.window_seconds
+         << ",\"published_frames\":" << rate.published
+         << ",\"distinct_frames\":" << rate.distinct
+         << ",\"distinct_fps\":" << std::fixed << std::setprecision(3) << rate.distinct_fps
+         << ",\"presented_fps\":" << std::fixed << std::setprecision(3) << rate.presented_fps
+         << ",\"distinct_frame_fraction\":" << std::fixed << std::setprecision(6)
+         << rate.distinct_fraction
+         << ",\"mostly_retained\":"
+         << (prosper::gpu::frame_rate_is_mostly_retained(rate) ? "true" : "false")
          // The guest's own terminal state, so a batch consumer can filter runs whose guest died
          // without re-reading the run log. Addresses are hex strings, not JSON numbers: a 64-bit
          // guest address does not survive a double-typed JSON parser.

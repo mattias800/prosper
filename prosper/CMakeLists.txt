@@ -507,12 +507,24 @@ if(TARGET prosper_core)
 
   # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
   add_executable(test_capture_manifest tests/test_capture_manifest.cpp
-                                       tools/screenshot/capture_manifest.cpp)
+                                       tools/screenshot/capture_manifest.cpp
+                                       # The framerate the manifest reports. A pure TU with no
+                                       # dependency beyond the standard library, so it links here
+                                       # without dragging prosper_core (or Vulkan) into the test.
+                                       src/gpu/present/present_frame_rate.cpp)
   # `src` and the revision library are for `build_revision.hpp` only: the run header records the
   # revision the binary was compiled from, so the manifest self-describes. Still no Vulkan, no dump.
   target_include_directories(test_capture_manifest PRIVATE tools/screenshot src)
   target_link_libraries(test_capture_manifest PRIVATE prosper_build_revision)
   add_test(NAME capture_manifest COMMAND test_capture_manifest)
+
+  # The burned-in fps annotation (`screenshot --fps-overlay`). Rasterizing text into an RGBA buffer
+  # is pure, and an overlay that silently draws nothing looks exactly like one that was never asked
+  # for -- so it is asserted on pixels, here, without a device.
+  add_executable(test_overlay_text tests/test_overlay_text.cpp
+                                   tools/screenshot/overlay_text.cpp)
+  target_include_directories(test_overlay_text PRIVATE tools/screenshot)
+  add_test(NAME overlay_text COMMAND test_overlay_text)
 
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
   # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
@@ -2348,7 +2360,8 @@ endif()
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   if(WIN32)
     add_executable(screenshot tools/screenshot/screenshot.cpp
-                              tools/screenshot/capture_manifest.cpp)
+                              tools/screenshot/capture_manifest.cpp
+                              tools/screenshot/overlay_text.cpp)
                               # Spells a `shared/...` include, which resolves from `frontends`.
                               target_include_directories(screenshot PRIVATE frontends)
     target_include_directories(screenshot PRIVATE src tools/screenshot)
@@ -2358,7 +2371,8 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     find_package(ZLIB QUIET)
     if(ZLIB_FOUND)
       add_executable(screenshot tools/screenshot/screenshot.cpp
-                                tools/screenshot/capture_manifest.cpp)
+                                tools/screenshot/capture_manifest.cpp
+                                tools/screenshot/overlay_text.cpp)
                                 # Spells a `shared/...` include, which resolves from `frontends`.
                                 target_include_directories(screenshot PRIVATE frontends)
       target_include_directories(screenshot PRIVATE src tools/screenshot)

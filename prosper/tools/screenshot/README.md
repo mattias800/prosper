@@ -36,6 +36,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--require-composited-frame] [--min-present-count N]
            [--min-frame-seq N] [--require-crc32 N] [--allow-guest-fault]
            [--no-stop-after-guest-fault] [--guest-fault-settle-seconds S]
+           [--fps-overlay]
 ```
 
 | Option | Default | Meaning |
@@ -63,6 +64,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--allow-guest-fault` | off | Do not fail the run when the guest's primary thread dies (deliberate fault-reproduction routes) |
 | `--no-stop-after-guest-fault` | off | Keep sampling the full request after the guest's primary thread dies |
 | `--guest-fault-settle-seconds S` | 1 | Quiescence required before that early stop: the guest must be dead **and** the present layer silent this long |
+| `--fps-overlay` | off | Burn the measured framerate and the run's conditions into every PNG (see below) |
 
 Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
@@ -87,6 +89,71 @@ progress. Use the pixel assertions for loading screens, frozen cinematics, and o
 Assertions preserve every PNG and the manifest, print the concrete failed condition, and exit nonzero.
 This lets an automated progression run distinguish "120 files written" from "120 advancing frames" or
 "the requested checkpoint was reached." A timeout or incomplete screenshot count is also a failure.
+
+## Framerate: two numbers, and the first one is the honest one
+
+Every run reports a framerate, on stdout and in the manifest summary:
+
+```
+[shot] fps: distinct 3.4 fps / presented 59.8 fps over 60.0 s (204 of 3590 published frames carried new content, 5.7%)
+```
+
+**`presented_fps` is publications per second. `distinct_fps` is publications whose CONTENT changed,
+per second. Quote the second one.** The renderer re-publishes the frame it retained whenever a submit
+produces no usable present source (`RetainedFrameAction::ServeRetained`), and that re-serve travels
+through the ordinary publish path — so the guest keeps flipping, the publication counter keeps
+climbing, and the screen never changes. A present-counting framerate reads **full speed for a
+completely frozen title**. That is instrument trap 90 as a number, and it is exactly the R-Type Delta
+regression #2783: for nine days the guest reached stage 1 while every presented frame was the same
+retained one. `prosper/src/gpu/present/present_frame_rate.hpp` carries the full argument, including
+what the content comparison samples and the one direction in which it can be wrong (it can
+under-report a change too small to sample; it can never report a re-served frame as new).
+
+When the two diverge the run says so outright:
+
+```
+[shot] WARNING: only 5.7% of the 3590 published frames carried new content. ...
+```
+
+The summary line carries `distinct_fps`, `presented_fps`, `published_frames`, `distinct_frames`,
+`distinct_frame_fraction`, `mostly_retained` and `frame_rate_window_seconds`. **`frame_rate_measured:
+false` is not 0 fps** — it means nothing was ever published, which is a different claim.
+
+Each *sample* line carries `published_frames` and `distinct_frames` as raw counters at that moment,
+so the framerate over any window of the run can be recovered afterwards by subtracting two samples.
+That is deliberately more useful than a single pre-computed rate: "when did it slow down" is the
+question a stored manifest usually has to answer.
+
+The window for the summary rate is *first publication → end of sampling*, wall clock. A title that
+stops publishing therefore decays toward zero rather than freezing at whatever it last managed.
+
+### `--fps-overlay`
+
+Burns a small annotation into the top-left of every PNG the run writes:
+
+```
+3.4 FPS  (59.8 PRESENTED)  3840X2160
+PPSA26414  SAMPLE 7  T+42.0S  BUILD 966391df
+ROUTE REACH-STAGE1
+```
+
+Off by default. This is admissible progression evidence — what CLAUDE.md's "unaltered capture" rule
+forbids is misrepresenting the progress, not annotating it, and an fps counter prosper draws over its
+own output adds measured facts about the run without changing what the run rendered. **Keep it clear
+of whatever the capture is evidence for, and say in the caption that it is on.** The manifest records
+it as `run.assertions.fps_overlay`, and the run log prints a reminder at the end.
+
+It stays off by default for two reasons that are about ergonomics rather than rules: a clean frame is
+what you want to diff against another run, and **no content metric in this tool ever sees the
+annotation**. The CRC32, the RGB colour count, the non-black pixel count, the perceptual hashes and
+the 16x9 luminance signature are all computed from the pristine frame; the overlay is drawn into a
+copy that only the PNG encoder sees. Snapshot guards compare exactly those metrics, so an overlaid
+capture and a clean one are identical to every assertion here.
+
+The annotation is drawn with a hand-authored 5x7 bitmap font
+(`prosper/tools/screenshot/overlay_text.hpp`) rather than a vendored one, and is uppercase-only. A
+character with no glyph renders as a hollow box, so a missing glyph is visible rather than silently
+dropped. The cell scales with the capture width: 1x below 1920, 2x at 1080p, 4x at 2160p.
 
 ## The guest dying is a failure of the run
 

@@ -50,6 +50,9 @@
 #include "host/image/boot_program.hpp"       // boot_program
 #include "host/image/exec_image.hpp"         // run_entry
 #include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
+#include "gpu/present/present_frame_rate.hpp" // distinct-guest-frame framerate (NOT a present rate)
+#include "overlay_text.hpp"                   // --fps-overlay: burn the rate into the image
+#include "build_revision.hpp"                // the revision the overlay reports for this binary
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "shared/live/live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
@@ -278,6 +281,17 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h,
 #endif
 }
 
+// The route as a short label for the annotation: the .pad file's stem, without directories or
+// extension. The full path is already in the manifest's `input_route`; what belongs on the image is
+// the thing a reader recognises.
+std::string route_label(const std::string& path) {
+    std::string label = path;
+    if (auto slash = label.find_last_of("/\\"); slash != std::string::npos)
+        label = label.substr(slash + 1);
+    if (auto dot = label.rfind('.'); dot != std::string::npos && dot != 0) label = label.substr(0, dot);
+    return label;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -294,6 +308,12 @@ int main(int argc, char** argv) {
     int render_every_arg = -1;
     uint64_t min_present_count = 0, min_frame_seq = 0, required_crc32 = 0;
     bool manifest_disabled = false, require_composited_frame = false, required_crc32_set = false;
+    // OFF by default. A capture with the annotation burned in IS admissible progression evidence
+    // (CLAUDE.md: what "unaltered" forbids is misrepresenting the progress, not annotating it), so
+    // this default is an ergonomics and reproducibility choice rather than a rules one: a clean
+    // frame is the right thing to diff against another run, and a snapshot guard's content metrics
+    // must never see the annotation.
+    bool fps_overlay = false;
     bool warmup_seconds_set = false, warmup_submits_set = false, allow_guest_fault = false;
     // Once the guest's primary thread is dead AND the present layer has been quiet this long, no
     // further sample can carry new information, so sampling stops (#2584). One second is long
@@ -367,6 +387,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--fps-overlay") fps_overlay = true;
         else if (a == "--require-composited-frame") require_composited_frame = true;
         else if (a == "--allow-guest-fault") allow_guest_fault = true;
         else if (a == "--no-stop-after-guest-fault") stop_after_guest_fault = false;
@@ -544,6 +565,7 @@ int main(int argc, char** argv) {
         run_config.min_pixel_distinct_frames = min_pixel_distinct_frames;
         run_config.max_pixel_stale_seconds = max_pixel_stale_seconds;
         run_config.require_composited_frame = require_composited_frame;
+        run_config.fps_overlay = fps_overlay;
         run_config.min_present_count = min_present_count;
         run_config.min_frame_seq = min_frame_seq;
         run_config.required_crc32_set = required_crc32_set;
@@ -722,28 +744,65 @@ int main(int argc, char** argv) {
                     filename << out << "/" << code << "_" << ts << "_"
                              << std::setw(pad) << std::setfill('0') << saved << ".png";
                     const std::string fn = filename.str();
+                    // EVERY metric below is computed from the PRISTINE frame, before any
+                    // annotation exists. `--fps-overlay` draws into a COPY that only the PNG sees:
+                    // a crc32, a perceptual hash or a luma signature taken from an annotated image
+                    // would describe the annotation as much as the frame, and the snapshot guards
+                    // compare exactly those. This ordering is the whole reason the overlay is safe
+                    // to have at all -- if it ever moves above these lines, `--fps-overlay` starts
+                    // silently changing what every content assertion in this tool measures.
+                    const uint32_t pixel_crc = crc32_bytes(snap.rgba.data(), snap.rgba.size());
+                    screenshot::CaptureObservation observation;
+                    observation.source = capture_source;
+                    observation.source_seq = snap.source_seq;
+                    observation.frame_seq = snap.frame_seq;
+                    observation.present_count = snap.present_count;
+                    observation.front_index = snap.front_index;
+                    observation.width = snap.width;
+                    observation.height = snap.height;
+                    observation.pixel_crc32 = pixel_crc;
+                    observation.elapsed_seconds = el;
+                    const gpu::PresentRateSnapshot rate_now = gpu::present_rate_snapshot();
+                    observation.published_frames = rate_now.published;
+                    observation.distinct_frames = rate_now.distinct;
+                    const auto content = screenshot::measure_pixel_content_rgba(snap.rgba);
+                    observation.distinct_rgb_colors = content.distinct_colors;
+                    observation.nonblack_rgb_pixels = content.nonblack_pixels;
+                    const auto perceptual = screenshot::perceptual_hashes_rgba(
+                        snap.rgba, snap.width, snap.height);
+                    observation.average_hash = perceptual.average;
+                    observation.difference_hash = perceptual.difference;
+                    observation.luma16x9 = screenshot::perceptual_luma16x9_rgba(
+                        snap.rgba, snap.width, snap.height);
+
+                    // The annotated copy, when asked for. An fps number with no conditions beside it
+                    // is a number that will be misread later, so the second line carries the title,
+                    // the sample ordinal, the elapsed time and the build the binary came from -- the
+                    // things that change what the first line means.
+                    const std::vector<uint8_t>* image = &snap.rgba;
+                    std::vector<uint8_t> annotated;
+                    if (fps_overlay) {
+                        annotated = snap.rgba;
+                        screenshot::OverlayStyle style;
+                        style.scale = screenshot::overlay_scale_for_width(snap.width);
+                        style.margin = 8 * style.scale;
+                        style.padding = 3 * style.scale;
+                        const gpu::FrameRate rate_so_far =
+                            gpu::frame_rate_since_first_publication(rate_now);
+                        char conditions[192];
+                        snprintf(conditions, sizeof conditions, "%s  SAMPLE %d  T+%.1fS  BUILD %.8s",
+                                 code.c_str(), saved, el, prosper::embedded_build_revision());
+                        std::vector<std::string> lines = {
+                            gpu::format_frame_rate_short(rate_so_far, snap.width, snap.height),
+                            conditions,
+                        };
+                        if (!input_route.empty()) lines.push_back("ROUTE " + route_label(input_route));
+                        screenshot::draw_overlay_text(annotated, snap.width, snap.height, lines, style);
+                        image = &annotated;
+                    }
+
                     std::string png_error;
-                    if (write_png(fn.c_str(), snap.rgba.data(), snap.width, snap.height, png_error)) {
-                        const uint32_t pixel_crc = crc32_bytes(snap.rgba.data(), snap.rgba.size());
-                        screenshot::CaptureObservation observation;
-                        observation.source = capture_source;
-                        observation.source_seq = snap.source_seq;
-                        observation.frame_seq = snap.frame_seq;
-                        observation.present_count = snap.present_count;
-                        observation.front_index = snap.front_index;
-                        observation.width = snap.width;
-                        observation.height = snap.height;
-                        observation.pixel_crc32 = pixel_crc;
-                        observation.elapsed_seconds = el;
-                        const auto content = screenshot::measure_pixel_content_rgba(snap.rgba);
-                        observation.distinct_rgb_colors = content.distinct_colors;
-                        observation.nonblack_rgb_pixels = content.nonblack_pixels;
-                        const auto perceptual = screenshot::perceptual_hashes_rgba(
-                            snap.rgba, snap.width, snap.height);
-                        observation.average_hash = perceptual.average;
-                        observation.difference_hash = perceptual.difference;
-                        observation.luma16x9 = screenshot::perceptual_luma16x9_rgba(
-                            snap.rgba, snap.width, snap.height);
+                    if (write_png(fn.c_str(), image->data(), snap.width, snap.height, png_error)) {
                         const auto classification = tracker.observe(observation, snap.rgba);
                         required_crc32_seen |= required_crc32_set && pixel_crc == required_crc32;
                         fprintf(stderr, "[shot] %d/%d  %s  (frame %llu, %.1fs%s, crc=%08x)\n",
@@ -852,11 +911,16 @@ int main(int argc, char** argv) {
                         "(%s). This is not treated as a failure -- a title may legitimately exit\n",
                 guest_outcome.detail.c_str());
 
+    // The run's framerate, measured over [first publication .. now]. Taken once, here, so the
+    // printed line and the manifest cannot disagree about it.
+    const gpu::FrameRate run_rate =
+        gpu::frame_rate_since_first_publication(gpu::present_rate_snapshot());
+
     screenshot::RunVerdict verdict =
         screenshot::decide_run_verdict(exit_code != 0, guest_outcome, allow_guest_fault);
     if (manifest) {
         const std::string summary = screenshot::manifest_summary_json(
-            saved, count, stop, tracker, verdict, guest_outcome, allow_guest_fault);
+            saved, count, stop, tracker, verdict, guest_outcome, allow_guest_fault, run_rate);
         if (fprintf(manifest, "%s\n", summary.c_str()) < 0 || fclose(manifest) != 0) {
             fprintf(stderr, "[shot] manifest close failed: %s: %s\n",
                     manifest_path.c_str(), strerror(errno));
@@ -868,6 +932,23 @@ int main(int argc, char** argv) {
     // `saved/requested` and `stop=` travel together: a reader who sees fewer PNGs than requested
     // must be able to tell a truncated harness from a run that stopped because nothing new could
     // arrive, on this one line, without opening the manifest.
+    // The framerate, on its own line, distinct rate FIRST. A reader skimming takes the first
+    // number, so the first number has to be the one that cannot lie about a frozen title.
+    fprintf(stderr, "[shot] fps: %s\n", gpu::format_frame_rate(run_rate).c_str());
+    if (gpu::frame_rate_is_mostly_retained(run_rate))
+        fprintf(stderr,
+                "[shot] WARNING: only %.1f%% of the %llu published frames carried new content. The "
+                "renderer re-publishes its retained frame when a submit produces no present source, "
+                "so the PRESENTED rate above (%.1f fps) is not this title's framerate -- read the "
+                "distinct rate (%.1f fps). This is the R-Type Delta (#2783) shape; check the "
+                "renderer's [rtt] PRESENT SOURCE EXTENT MISMATCH lines.\n",
+                run_rate.distinct_fraction * 100.0,
+                (unsigned long long)run_rate.published,
+                run_rate.presented_fps, run_rate.distinct_fps);
+    if (fps_overlay)
+        fprintf(stderr, "[shot] note: --fps-overlay was on, so every PNG this run wrote carries a "
+                        "burned-in annotation. Say so in the caption; the manifest records it as "
+                        "run.assertions.fps_overlay.\n");
     fprintf(stderr, "[shot] done: %d/%d screenshot(s) in %s; stop=%s source-distinct=%llu "
                     "pixel-distinct=%llu max-source-stale=%.1fs max-pixel-stale=%.1fs guest=%s "
                     "status=%s\n",
