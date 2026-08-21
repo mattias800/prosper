@@ -456,6 +456,7 @@ the next one, and no run has yet finished the route with zero device losses.
 | 1 | `0x413dc6700` | *(nothing)* | `submit=9016 dispatch=40` |
 | 2 | `0x413e14900` | #1 | `submit=34930 dispatch=135` |
 | 3 | `0x413e16400` | #1, #2 | `submit=3628 dispatch=2946` |
+| 4 | `0x413d88400` | #2, #3 declined + #1 trip-bounded | `submit=4476 dispatch=54` (2026-08-21) |
 
 The submit indices are **not** monotonic down the table, and that is not a typo: each row is a
 different run whose trajectory changed when a program was declined, and submit ordering already varies
@@ -467,6 +468,28 @@ program, which cannot reveal a second — it only moves the loss past where most
 three declined a run reached **400 s** with zero losses, but that run was **capped at 400 s and did not
 finish the route**, so it is not a zero-loss completion and does not close the search. Read the two
 sentences together: three is what declining twice revealed, not a total.
+
+**A FOURTH program hangs, found 2026-08-21, and it extends the lower bound rather than closing it.**
+Routed run with `0x413e14900` and `0x413e16400` declined and `0x413dc6700` trip-bounded
+(`PROSPER_CFG_TRIP_BOUND=4096 _PROGRAM=0x413dc6700 _PHASE=0`, **647 HIT lines**, so the bound was
+genuinely armed and firing). The device still went:
+
+```
+[compute] fatal Vulkan device loss stage=queue-submit result=VK_ERROR_DEVICE_LOST(-4)
+          program=0x413d88400 submit=4476 dispatch=54 order=4205; disabling live compute
+```
+
+`0x413d88400` was already in this document as a resource-census entry — it binds `0x20f8480100`
+size 132,032, one of the four span granularities over the traversal table — but had never been seen
+taking the device. It is the same pattern the table above records: each decline reveals the next one,
+so four is still a lower bound.
+
+**Consequence for the trip-bound lever's reported result.** That loss lands at ~100 s, well before
+gameplay: the composite CRC freezes at shot 04 (100 s) and is byte-identical for the remaining
+740 s of the run. So this run cannot speak to the "~7x more distinct colours" measurement recorded
+below — it never reached the state that measurement describes, and the two are not in conflict.
+Submit ordering varies run to run on this title (#2516), so which program takes the device first
+varies with it.
 
 **`0x413e16400` is the first with a named fallback cause**, from the reporter added in #2684:
 
