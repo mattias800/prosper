@@ -35,6 +35,47 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-21
 
+### Yakuza Kiwami allocates its entire game heap through a Sony API nobody had implemented
+
+No picture with this one — the title still does not render. The finding is what moved.
+
+*Yakuza Kiwami* (`PPSA31334`) died **0.0 seconds** into every boot, writing to address `0x1d0000`.
+That address is the tell: it is far too low to be a real guest pointer, and it is what you get when
+an allocator is handed a base address of roughly nothing and starts walking.
+
+The base came from `sceAmprAmmGetVirtualAddressRanges`. AMM is the memory-mapping half of
+libSceAmpr — the same command-buffer construct prosper already used for asynchronous **file reads**,
+pointed at pages instead of bytes — and this title runs its *whole* game heap through it: it asks
+AMM for up to 512 GiB of address space, hands it 10 GiB of physical memory, and then maps 2 MiB
+chunks in on demand for the rest of the run. All seven of the AMM entry points it needs fell to
+prosper's unimplemented default, which returns 0 and writes nothing.
+
+Returning 0 sounds harmless. It is not, when the guest is reading your *out-parameters*: the
+initialiser reaches that call on a path that never zeroes its own struct, so "wrote nothing" meant
+the allocator took its virtual-address window from whatever was left on the stack. Everything after
+that was the allocator faithfully doing what it was told.
+
+With AMM implemented the boot now reserves a real 68 GiB window, takes its 10 GiB pool, and services
+23 map commands before it gets somewhere new — far enough to initialise save data and start loading
+assets, where it stops with the game's own message:
+
+```
+Failed!! Load Devil2 Shader Archive
+Failed!! Load Ptc Shader Archive
+```
+
+That is the next wall, and it is a different one: `sceAmprAprCommandBufferReadFileGatherScatter`
+([#2872](https://github.com/mattias800/prosper/issues/2872)), the scatter/gather sibling of a file
+read prosper already implements. The archives never arrive, so the object is null, so the next
+method call dereferences it. Still rung 0 — but the fault moved from the memory allocator to the
+asset loader, which is the direction that counts. Tracker
+[#2864](https://github.com/mattias800/prosper/issues/2864).
+
+One footnote worth having: this turned out not to be a one-title fix. *Judgment* (`PPSA02739`),
+onboarded the same day, imports **all seven** of the same AMM entry points — and both of the follow-up
+gaps too, the scatter/gather read and AMM's `Unmap`. Checked by NID against its own import table,
+not inferred from the shared publisher.
+
 ### Our first CryEngine title deadlocks 81 ms in, on a library it never asked for
 
 No picture this time — the interesting thing about *Sniper Ghost Warrior Contracts 2* (`PPSA03130`)
