@@ -1969,6 +1969,77 @@ int main() {
                              native_linear_cfg17d).empty(),
           "the dual-domain write's own SCC carries to the consumer without a re-arming compare");
 
+    // Sonic Frontiers' three SCENE-TARGET-WIDTH stage kernels (#2790) all stopped on ONE VOP3
+    // source width, not on the `s_cbranch_execz` / `image_load_mip` their reject lines named. Each
+    // runs the byte-identical idiom below (live at pc479..481 in 0x2005717e00 and 0x200571bd00, and
+    // pc469..471 in 0x2005714000):
+    //
+    //     s_mul_i32      vcc_lo, s16, 12       VCC_LO as an ordinary 32-bit scalar scratch dword
+    //     s_mov_b64      s[6:7], exec
+    //     v_lshl_add_u32 v7, v6, 2, vcc_lo     a 32-BIT read of that scratch dword
+    //
+    // `scalar_alu_source_words` had no entry for V_LSHL_ADD_U32 and fell to the VOP3 fail-closed
+    // default of 2, so the Wave64 MUST transfer charged that read the whole PAIR and demanded
+    // VCC_HI be scalar data as well. VCC_HI is a live mask half at this join and can never be, so
+    // the CFG dispatcher declined `wave64-ambiguous-mask-read`, the stream fell to the
+    // straight-line emitter, and the reject that got reported was whatever IT reached first --
+    // 39 and 453 instructions earlier respectively. Same shape as #2481/#2801: a reject PC names
+    // where a fact was consumed, not where it was lost.
+    //
+    // The prefix reproduces the two facts the guest arrives with, and both are load-bearing:
+    //   * VCC is AMBIGUOUS at the join -- one predecessor leaves the pair a mask, the other leaves
+    //     VCC_LO scalar data -- which is what makes the transfer inspect the pair at all;
+    //   * VCC_LO is then republished as a MUST scalar word by a ONE-dword write, which by design
+    //     cannot clear the pair's ambiguity (a partial write resolves only the half it addresses).
+    // So at the consumer VCC_LO is provably scalar and VCC_HI provably is not, which is exactly the
+    // state that separates a dword read from a pair read.
+    const std::vector<uint32_t> frontiers_vop3_scalar_dword_source = {
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1 -> VCC is a real Wave64 mask
+        0xbf860001u,              // s_cbranch_vccz +1: two edges reach the next block
+        0xbeea0380u,              // s_mov_b32 vcc_lo, 0 -> scalar on the fall-through path only
+        0xbe900380u,              // s_mov_b32 s16, 0     (join block; one proved scalar source)
+        0x936a8c10u,              // exact site: s_mul_i32 vcc_lo, s16, 12
+        0xd7460007u, 0x01a90506u, // exact site: v_lshl_add_u32 v7, v6, 2, vcc_lo
+        0x7d840100u,              // complete VCC replacement before any pair consumer
+    };
+    std::vector<uint32_t> frontiers_vop3_dword_accept = frontiers_vop3_scalar_dword_source;
+    frontiers_vop3_dword_accept.insert(
+        frontiers_vop3_dword_accept.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(frontiers_vop3_dword_accept.data(),
+                             frontiers_vop3_dword_accept.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 dispatcher reads VCC_LO as one scalar dword through V_LSHL_ADD_U32");
+
+    // Positive control for the FIXTURE, and it is deliberately not drawn from the same place as the
+    // thing under test: V_ADD_LSHL_U32 is the direct sibling opcode, identical operand shape, and it
+    // was ALREADY classified B32. Substituting it at the same site must compile both before and
+    // after this change -- which is what establishes that the prefix really does present a scalar
+    // VCC_LO beside an ambiguous VCC_HI, rather than the arm above passing because the analysis
+    // never looked. It is a CONTROL, not a discriminator: it stays green under the mutation below.
+    std::vector<uint32_t> frontiers_vop3_sibling_opcode = frontiers_vop3_scalar_dword_source;
+    frontiers_vop3_sibling_opcode[5] = 0xd7470007u;   // v_add_lshl_u32 v7, v6, 2, vcc_lo
+    frontiers_vop3_sibling_opcode.insert(
+        frontiers_vop3_sibling_opcode.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(frontiers_vop3_sibling_opcode.data(),
+                             frontiers_vop3_sibling_opcode.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "control: the already-classified sibling V_ADD_LSHL_U32 compiles in the same stream");
+
+    // The unsafe direction, pinned. A genuine 64-bit PAIR consumer at the same site must still be
+    // refused: V_CNDMASK_B32's condition operand is the whole mask, and half of that pair is
+    // ambiguous here. If a future widening of the B32 list ever swept up a real mask reader, this
+    // arm reddens rather than the emulator silently reading a mask out of one scalar dword and a
+    // Function-variable placeholder.
+    std::vector<uint32_t> frontiers_vop3_pair_consumer = frontiers_vop3_scalar_dword_source;
+    frontiers_vop3_pair_consumer[5] = 0xd5010007u;   // v_cndmask_b32_e64 v7, v6, v6, vcc
+    frontiers_vop3_pair_consumer[6] = 0x01aa0d06u;
+    frontiers_vop3_pair_consumer.insert(
+        frontiers_vop3_pair_consumer.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(frontiers_vop3_pair_consumer.data(),
+                            frontiers_vop3_pair_consumer.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "a true VCC PAIR read at the same site stays refused while the high half is ambiguous");
+
     // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
     // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
     // SCC. A dispatcher placeholder at that read makes the instruction itself unrepresentable;

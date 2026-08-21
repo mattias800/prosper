@@ -162,6 +162,47 @@ int main(int argc, char** argv) {
                 config.wave_size = static_cast<uint32_t>(std::strtoul(wave, nullptr, 0));
             if (const char* native = std::getenv("PROSPER_SHADER_INSPECT_NATIVE_SUBGROUP"))
                 config.native_subgroup_size = static_cast<uint32_t>(std::strtoul(native, nullptr, 0));
+            // A default-constructed config launches with NO user SGPRs and no workgroup-id
+            // registers, so every SGPR the guest reads as a launch input is absent from the
+            // recompiler's initial RegState -- and the Wave64 MUST dataflow therefore starts with an
+            // empty scalar-word set. That is not a neutral simplification: an ordinary
+            // `s_add_i32 vcc_lo, s14, 1` then has a non-scalar source, VCC_LO never becomes a MUST
+            // scalar word, and the analysis declines at a site the live translation never reaches.
+            // A reader who does not know that reads the decline as a shader defect. These make the
+            // launch shape supplied rather than assumed; leave them unset for the historical
+            // behaviour.
+            if (const char* user = std::getenv("PROSPER_SHADER_INSPECT_USER_SGPRS"))
+                config.user_sgprs.assign(std::strtoul(user, nullptr, 0), 0u);
+            if (const char* tgid = std::getenv("PROSPER_SHADER_INSPECT_TGID")) {
+                config.tgid_x_en = std::strchr(tgid, 'x') != nullptr;
+                config.tgid_y_en = std::strchr(tgid, 'y') != nullptr;
+                config.tgid_z_en = std::strchr(tgid, 'z') != nullptr;
+            }
+            if (const char* local = std::getenv("PROSPER_SHADER_INSPECT_LOCAL")) {
+                // Each axis must parse to a non-zero extent. A silently-accepted zero would be
+                // worse than the default it replaced: a workgroup of 0 is not a launch shape any
+                // guest has, and the whole point of this switch is to stop the tool reasoning from
+                // a shape nobody supplied (review of #2820).
+                char* cursor = nullptr;
+                unsigned long axis[3] = {config.local_x, config.local_y, config.local_z};
+                const char* at = local;
+                bool ok = true;
+                for (int i = 0; i < 3 && ok; ++i) {
+                    axis[i] = std::strtoul(at, &cursor, 0);
+                    ok = cursor != at && axis[i] != 0;
+                    if (!ok || !*cursor) break;
+                    at = cursor + 1;
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "PROSPER_SHADER_INSPECT_LOCAL='%s' is not XxYxZ with non-zero "
+                                 "extents -- the launch shape is left at its default\n", local);
+                } else {
+                    config.local_x = static_cast<uint32_t>(axis[0]);
+                    config.local_y = static_cast<uint32_t>(axis[1]);
+                    config.local_z = static_cast<uint32_t>(axis[2]);
+                }
+            }
             spirv = recompile_compute(words.data(), words.size(), nullptr, config);
         }
         stage_ok = !spirv.empty();
