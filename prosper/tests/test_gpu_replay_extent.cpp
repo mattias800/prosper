@@ -158,39 +158,39 @@ int main() {
         exact.items = {writer};
         exact.operations = {{SubmitOperationKind::Draw, 41, 100, true}};
 
-        const auto selected = replay_output_target_after_operation(exact, 0, 0x2010000000ull);
+        const auto selected = replay_output_target_after_operation(exact, prosper::tools::OperationIndex{0}, 0x2010000000ull);
         CHECK(selected.status == OutputTargetAfterStatus::Selected &&
-                  selected.target.operation_index == 0 && selected.target.draw_index == 41 &&
+                  selected.target.operation_index == prosper::tools::OperationIndex{0} && selected.target.draw_index == 41 &&
                   selected.target.slot == 0 && selected.target.guest_addr == 0x2010000000ull &&
                   selected.target.width == 1920 && selected.target.height == 1080 &&
                   selected.target.format == 37 && !selected.target.fixed_function_resolve,
               "exact selector retains operation/draw/slot/address/extent/format write proof");
 
-        CHECK(replay_output_target_after_operation(exact, 1, 0x2010000000ull).status ==
+        CHECK(replay_output_target_after_operation(exact, prosper::tools::OperationIndex{1}, 0x2010000000ull).status ==
                   OutputTargetAfterStatus::InvalidOperation,
               "exact selector distinguishes an invalid operation index");
         exact.operations[0].kind = SubmitOperationKind::Dispatch;
-        CHECK(replay_output_target_after_operation(exact, 0, 0x2010000000ull).status ==
+        CHECK(replay_output_target_after_operation(exact, prosper::tools::OperationIndex{0}, 0x2010000000ull).status ==
                   OutputTargetAfterStatus::NonDrawOperation,
               "exact selector distinguishes a non-draw operation");
         exact.operations[0].kind = SubmitOperationKind::Draw;
         exact.operations[0].realized = false;
-        CHECK(replay_output_target_after_operation(exact, 0, 0x2010000000ull).status ==
+        CHECK(replay_output_target_after_operation(exact, prosper::tools::OperationIndex{0}, 0x2010000000ull).status ==
                   OutputTargetAfterStatus::UnrealizedOperation,
               "exact selector distinguishes an unrealized draw operation");
         exact.operations[0].realized = true;
         exact.operations[0].source_index = 42;
-        CHECK(replay_output_target_after_operation(exact, 0, 0x2010000000ull).status ==
+        CHECK(replay_output_target_after_operation(exact, prosper::tools::OperationIndex{0}, 0x2010000000ull).status ==
                   OutputTargetAfterStatus::DrawUnavailable,
               "exact selector distinguishes missing realized draw state");
         exact.operations[0].source_index = 41;
         exact.items[0].ps.color_targets[0].write_mask = 0;
-        CHECK(replay_output_target_after_operation(exact, 0, 0x2010000000ull).status ==
+        CHECK(replay_output_target_after_operation(exact, prosper::tools::OperationIndex{0}, 0x2010000000ull).status ==
                   OutputTargetAfterStatus::NotWrittenByOperation,
               "a merely bound target with zero effective write mask is not an output");
         exact.items[0].ps.color_targets[0].write_mask = 0xf;
         exact.items[0].color_targets[0].width = 0;
-        CHECK(replay_output_target_after_operation(exact, 0, 0x2010000000ull).status ==
+        CHECK(replay_output_target_after_operation(exact, prosper::tools::OperationIndex{0}, 0x2010000000ull).status ==
                   OutputTargetAfterStatus::TargetIdentityUnavailable,
               "a written target with incomplete extent fails as unavailable identity");
     }
@@ -217,12 +217,12 @@ int main() {
         resolve.operations = {{SubmitOperationKind::Draw, 77, 600, true}};
 
         const auto destination =
-            replay_output_target_after_operation(resolve, 0, 0x2011800000ull);
+            replay_output_target_after_operation(resolve, prosper::tools::OperationIndex{0}, 0x2011800000ull);
         CHECK(destination.status == OutputTargetAfterStatus::Selected &&
                   destination.target.slot == 1 && destination.target.format == 97 &&
                   destination.target.fixed_function_resolve,
               "MODE=RESOLVE selects raw color1 destination despite zero shader write mask");
-        CHECK(replay_output_target_after_operation(resolve, 0, 0x2011000000ull).status ==
+        CHECK(replay_output_target_after_operation(resolve, prosper::tools::OperationIndex{0}, 0x2011000000ull).status ==
                   OutputTargetAfterStatus::NotWrittenByOperation,
               "MODE=RESOLVE never reports raw color0 source as an output");
     }
@@ -239,7 +239,7 @@ int main() {
         writer.ps.color_write_mask = 0xb;
         legacy.items = {writer};
         legacy.operations = {{SubmitOperationKind::Draw, 5, 10, true}};
-        const auto selected = replay_output_target_after_operation(legacy, 0, 0x12340000ull);
+        const auto selected = replay_output_target_after_operation(legacy, prosper::tools::OperationIndex{0}, 0x12340000ull);
         CHECK(selected.status == OutputTargetAfterStatus::Selected &&
                   selected.target.width == 320 && selected.target.height == 180 &&
                   selected.target.format == 37 && selected.target.slot == 0,
@@ -265,9 +265,9 @@ int main() {
         final.operations[0].source_index = 99;
 
         const auto predecessor = replay_bundle_output_target_after_operation(
-            earlier, 3, 4, 0, 0x2011800000ull);
+            earlier, 3, 4, prosper::tools::OperationIndex{0}, 0x2011800000ull);
         const auto selected_final = replay_bundle_output_target_after_operation(
-            final, 4, 4, 0, 0x2011800000ull);
+            final, 4, 4, prosper::tools::OperationIndex{0}, 0x2011800000ull);
         CHECK(!predecessor.applies_to_submit,
               "bundle exact selector leaves retained predecessor submit unbounded");
         CHECK(selected_final.applies_to_submit &&

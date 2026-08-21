@@ -172,7 +172,7 @@ bool plan_exact_output_target(
     prosper::gpu::replay_tool::OutputTargetAfterOperation& target,
     uint64_t bundle_submit = UINT64_MAX) {
     const auto selected = prosper::gpu::replay_tool::replay_output_target_after_operation(
-        replay, operation_index, guest_addr);
+        replay, prosper::tools::OperationIndex{operation_index}, guest_addr);
     using Status = prosper::gpu::replay_tool::OutputTargetAfterStatus;
     if (selected.status != Status::Selected) {
         switch (selected.status) {
@@ -227,7 +227,7 @@ bool plan_exact_output_target(
     std::fprintf(stderr,
                  "[gpureplay] armed exact output%s op=%zu draw=%llu slot=%u addr=%016llx "
                  "extent=%ux%u format=%u resolve=%s\n",
-                 submit_tag, target.operation_index,
+                 submit_tag, prosper::tools::raw(target.operation_index),
                  static_cast<unsigned long long>(target.draw_index),
                  target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
                  target.height, target.format, target.fixed_function_resolve ? "yes" : "no");
@@ -245,7 +245,7 @@ bool read_exact_output_target(
         std::fprintf(stderr,
                      "gpu_replay: exact output readback unavailable op=%zu draw=%llu slot=%u "
                      "addr=%016llx extent=%ux%u format=%u/%u\n",
-                     target.operation_index, static_cast<unsigned long long>(target.draw_index),
+                     prosper::tools::raw(target.operation_index), static_cast<unsigned long long>(target.draw_index),
                      target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
                      target.height, target.format,
                      static_cast<unsigned>(requested_backend_format));
@@ -258,7 +258,7 @@ bool read_exact_output_target(
         std::fprintf(stderr,
                      "gpu_replay: exact output readback identity mismatch op=%zu draw=%llu "
                      "slot=%u addr=%016llx requested=%ux%u/%u/%u actual=%ux%u/%u\n",
-                     target.operation_index, static_cast<unsigned long long>(target.draw_index),
+                     prosper::tools::raw(target.operation_index), static_cast<unsigned long long>(target.draw_index),
                      target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
                      target.height, target.format,
                      static_cast<unsigned>(requested_backend_format), snapshot.width,
@@ -272,7 +272,7 @@ bool read_exact_output_target(
         std::fprintf(stderr,
                      "gpu_replay: exact output conversion unavailable op=%zu addr=%016llx "
                      "expected=%llu actual=%zu\n",
-                     target.operation_index, static_cast<unsigned long long>(target.guest_addr),
+                     prosper::tools::raw(target.operation_index), static_cast<unsigned long long>(target.guest_addr),
                      static_cast<unsigned long long>(expected_bytes), pixels.size());
         return false;
     }
@@ -283,7 +283,7 @@ bool read_exact_output_target(
     std::fprintf(stderr,
                  "[gpureplay] exact output%s op=%zu draw=%llu slot=%u addr=%016llx "
                  "extent=%ux%u format=%u/%u bytes=%zu hash=%016llx\n",
-                 submit_tag, target.operation_index,
+                 submit_tag, prosper::tools::raw(target.operation_index),
                  static_cast<unsigned long long>(target.draw_index),
                  target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
                  target.height, target.format, static_cast<unsigned>(requested_backend_format),
@@ -1491,7 +1491,8 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
         const auto selected =
             prosper::gpu::replay_tool::replay_bundle_output_target_after_operation(
                 final_replay, final_submit_index, final_submit_index,
-                output_target_after_operation, output_target_after_addr);
+                prosper::tools::OperationIndex{output_target_after_operation},
+                output_target_after_addr);
         if (!selected.applies_to_submit) {
             std::fprintf(stderr,
                          "gpu_replay: exact output selector did not apply to final bundle submit\n");
@@ -1684,7 +1685,8 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
         const auto exact_for_submit = output_target_after_operation != SIZE_MAX
             ? prosper::gpu::replay_tool::replay_bundle_output_target_after_operation(
                   replay, i, bundle.submits.size() - 1,
-                  output_target_after_operation, output_target_after_addr)
+                  prosper::tools::OperationIndex{output_target_after_operation},
+                  output_target_after_addr)
             : prosper::gpu::replay_tool::BundleOutputTargetAfterSelection{};
         if (exact_for_submit.applies_to_submit) {
             if (exact_for_submit.selection.status !=
@@ -1694,7 +1696,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                              "preflight validation\n");
                 return 2;
             }
-            operation_limit = exact_for_submit.selection.target.operation_index + 1;
+            operation_limit = prosper::tools::raw(exact_for_submit.selection.target.operation_index) + 1;
         } else if (i + 1 < bundle.submits.size() && intermediate_target_width) {
             operation_limit = 0;
             for (size_t operation_index = 0; operation_index < replay.operations.size(); ++operation_index) {
@@ -3578,7 +3580,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const size_t operation_limit = exact_output_target
-        ? exact_output_target.operation_index + 1
+        ? prosper::tools::raw(exact_output_target.operation_index) + 1
         : through_operation >= 0
             ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
     const bool selected_draws_only = draw_selected && !draw_with_compute_prefix;
@@ -3770,7 +3772,7 @@ int main(int argc, char** argv) {
         std::snprintf(target_tag, sizeof target_tag,
                       " target=%016llx op=%zu draw=%llu slot=%u format=%u",
                       static_cast<unsigned long long>(exact_output_target.guest_addr),
-                      exact_output_target.operation_index,
+                      prosper::tools::raw(exact_output_target.operation_index),
                       static_cast<unsigned long long>(exact_output_target.draw_index),
                       exact_output_target.slot, exact_output_target.format);
     else if (output_extent.target_addr)
