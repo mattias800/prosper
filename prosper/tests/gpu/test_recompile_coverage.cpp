@@ -2808,8 +2808,10 @@ int main() {
     // detect_pcrel_tables the table never folded, so `s_getpc_b64` had nothing to justify it and
     // rejected, and each program's terminal reject was that getpc.
     //
-    // Every arm keeps the layout of the untyped control above byte-for-byte, so the s_getpc offset
-    // and the table's dword index are unchanged and the ONLY difference is the load instruction.
+    // The first three arms keep the layout of the untyped control above byte-for-byte, so the
+    // s_getpc offset and the table's dword index are unchanged; they differ from it in the load
+    // instruction and, where the opcode reads more than one component, in the V# word3 that has to
+    // carry an identity DST_SEL for it.
     const uint32_t pcrel_table_vs_typed_xyzw[] = {
         0xb0020010u,               // s_movk_i32 s2, 16 bytes
         0xbe8303ffu, 0x10005facu,  // s_mov_b32 s3, V# config (DST_SEL identity XYZW)
@@ -2887,6 +2889,33 @@ int main() {
     CHECK(recompile_vertex(pcrel_table_vs_typed_x_swizzled,
                            std::size(pcrel_table_vs_typed_x_swizzled), nullptr).empty(),
           "a non-identity DST_SEL is refused the typed embedded-table fold (#2859)");
+
+    // Entry soundness, which the typed case bounds by its OLDEST contributing fact rather than its
+    // newest (#2862 covers the untyped and scalar cases, which still use the newest). A branch
+    // target lands at pc7, AFTER the s_getpc_b64 at pc1 and before the load: a path entering there
+    // reaches the load having never computed the PC the fold's constants derive from, so the fold
+    // must be refused and the getpc must reject.
+    //
+    // With a newest-fact bound this program FOLDS -- `s_mov_b32 s3` at pc7 is the newest fact, the
+    // target is pc7, and `7 > 7` is false. That is the whole point of the arm, and reverting the
+    // aggregation is what shows it discriminates.
+    const uint32_t pcrel_table_vs_typed_branch_entry[] = {
+        0xb0020010u,               // pc0  s_movk_i32 s2, 16 bytes
+        0xbe801f00u,               // pc1  s_getpc_b64 s[0:1]   (next PC byte = 8)
+        0x800000ffu, 0x00000034u,  // pc2  s_add_u32 s0, 52, s0 (table byte = 60 -> dword 15)
+        0x82010180u,               // pc4  s_addc_u32 s1, 0, s1
+        0xbf820001u,               // pc5  s_branch -> pc7
+        0xbe850380u,               // pc6  s_mov_b32 s5, 0      (skipped by the branch)
+        0xbe8303ffu, 0x10005facu,  // pc7  s_mov_b32 s3, V# config  <-- BRANCH TARGET
+        0xe8b01000u, 0x80000004u,  // pc9  tbuffer_load_format_x v0, v4, s[0:3], 0 fmt:32_FLOAT offen
+        0xbf8c3f70u,               // pc11 s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x00000000u,  // pc12 exp pos0, v0, v0, v0, v0
+        0xbf810000u,               // pc14 s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,   // pc15 table
+    };
+    CHECK(recompile_vertex(pcrel_table_vs_typed_branch_entry,
+                           std::size(pcrel_table_vs_typed_branch_entry), nullptr).empty(),
+          "a branch entering after the s_getpc refuses the typed embedded-table fold (#2862)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

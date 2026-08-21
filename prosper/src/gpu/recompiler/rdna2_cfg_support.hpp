@@ -1808,10 +1808,23 @@ inline PcrelTables detect_pcrel_tables(
                 const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
                                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                 const uint64_t off = pcoff[sb];
-                uint32_t newest = 0;
-                for (int r : {sb, sb + 1, sb + 2, sb + 3}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
+                // Entry soundness. A fact established at pc F is invalid at the load if control can
+                // ENTER the stream at a branch target T with F < T <= load_pc, because on that path
+                // F never executed. Every contributing register carries that obligation, so the
+                // bound is the OLDEST fact, not the newest: a maximum protects only the last
+                // register written and silently admits a branch that entered after an earlier one.
+                // (The MUBUF and SMEM cases below still use a maximum and have the same hole —
+                // #2862. Deliberately not changed here: this is the typed path's own predicate, and
+                // widening the fix to the untyped ones needs its own evidence and its own arms.)
+                uint32_t oldest = UINT32_MAX;
                 bool entered = false;
-                for (uint32_t t : br_targets) if (t > newest && t <= in.pc) { entered = true; break; }
+                for (int r : {sb, sb + 1, sb + 2, sb + 3}) {
+                    auto it = fact_pc.find(r);
+                    if (it == fact_pc.end()) { entered = true; break; }   // no proven fact at all
+                    if (it->second < oldest) oldest = it->second;
+                }
+                if (!entered)
+                    for (uint32_t t : br_targets) if (t > oldest && t <= in.pc) { entered = true; break; }
                 if (entered) break;
                 if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
                     off / 4 + nrec / 4 > dwords) break;
