@@ -19,6 +19,39 @@ what you are looking at. Anything else is optional — write a paragraph when a 
 something, write one line when it is just another capture.
 
 ```markdown
+## 2026-08-22
+
+### Hi-Fi RUSH reaches its title screen on the first try
+
+<p align="center"><img src="assets/screenshots/hifi-rush-title.png" alt="Hi-Fi RUSH title screen — the yellow branding, shattered logo and Press Any Button prompt, rendered at 3840x2160"></p>
+
+A title added to the library this evening, booted for the first time a few hours later. `BOOT_COMPLETE`
+at **281 ms**, and the complete 4K title screen holds from t≈224 s to the end of the run — on a
+**default launch**, no throttle, no non-default switches, no pad input. `tools/screenshot`,
+45/45 samples, `guest=running status=ok`.
+
+With a pad route it goes further: through the first-boot language wizard and its settings pages,
+into a loading hold. Not gameplay, so this is rung 2.
+
+<p align="center"><img src="assets/screenshots/hifi-rush-rooftop-black-materials.png" alt="Hi-Fi RUSH Vandelay rooftop — correct geometry, depth and sky gradient, with every opaque surface shaded flat black"></p>
+
+The second picture is the interesting one, and it is a defect rather than a success. This is the
+Vandelay rooftop, and almost everything about it is right: the geometry is there, the depth sorting is
+right, the sky gradient is smooth, and the "WELCOME TO VANDELAY" billboard renders in full colour
+because it is emissive. Every *opaque* surface is a silhouette. So vertex processing and the
+transparent path both work and only opaque material shading fails — which is a much smaller problem
+than the picture first suggests. The prime suspect is 202 distinct `[dynvb] unknown V# format`
+signatures, mostly `0x0`.
+
+One more thing this title taught us, which cost the lane a 1168-second run: pressing Cross on the
+language page raises a *"Continue with these settings?"* dialog whose cursor starts on the **right-hand**
+option, so every Cross answers it negatively and returns to the same page. The run was completely
+healthy the whole time — 70 of 90 samples pixel-distinct — and looked exactly like a renderer wall.
+That is now the fourth title where input mapping has impersonated one. The committed route is
+`cross` → `left` → `cross`.
+
+Tracker [#2891](https://github.com/mattias800/prosper/issues/2891).
+
 ## 2026-08-21
 
 ### Beneath reaches gameplay
