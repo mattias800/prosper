@@ -676,6 +676,23 @@ instrument that separated the two runs above; the successful one went Loading ->
 the others Loading -> `SoloCoopMenu` -> stuck. Full derivation in
 [`ASTERIX_BABYLON_STATUS.md`](ASTERIX_BABYLON_STATUS.md); the route-reliability defect it exposed is #2743.
 
+**A cheaper self-check when the scene names do not pair: the `.resS` partition.** Asterix's check is
+the `World_X_Y` + `World_X_Y_Level` pairing, which only exists because that title names its scenes
+that way. *Beneath* (`PPSA27640`) does not, and a second check was still available for free from the
+dump's own file list: a `levelNN.resS` sidecar holds a scene's streamed resource data, so it attaches
+to heavy world scenes and not to loading screens. On that title 46 scene paths match 46 `levelNN`
+files, and **every one of the 12 `.resS` files above `level5` lands on a world scene while not one
+lands on a loading screen** — in a dump that is more than half loading screens. A mis-derived index
+breaks that partition rather than yielding a plausible wrong answer, which is the property that makes
+a check worth having. `sharedassetsN` gives a third reading on titles that pair it per scene (see
+[`BENDY_DARK_REVIVAL_STATUS.md`](BENDY_DARK_REVIVAL_STATUS.md)). Full derivation:
+[`BENEATH_STATUS.md`](BENEATH_STATUS.md).
+
+**Establish that the oracle discriminates before relying on it — the failures are not exotic.** It
+has now been used on four titles and been void on two: *Tales of Graces f* ships exactly one level
+file, so the index is a constant, and *Bendy and the Ink Machine*'s layout does not transfer to its
+own sequel. Counting the title's own `levelNN` files is a one-command precondition, not a formality.
+
 **For Unreal titles the equivalent is the IoStore package stream, and it is now tooled.** A large
 share of the titles still short of gameplay are Unreal — read `COMPATIBILITY.md` for the current
 split rather than a number restated here — and the Unity oracle covers none of them. The Unreal
