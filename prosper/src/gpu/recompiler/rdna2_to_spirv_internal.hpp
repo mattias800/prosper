@@ -97,9 +97,9 @@ inline void record_terminal_reject_reason(uint64_t program_address, const char* 
 // `PROSPER_DBG_PROGRAM=0x2005717e00[,0x...]` enables the same lines for the listed program
 // addresses only. Parsed once into a function-local static: this predicate sits on the reject path
 // of every recompile, and re-reading the environment per call is the cost #2214 removed elsewhere.
-// (The `PROSPER_DBG` latch is therefore also read once, where its two remaining neighbours in
-// `rdna2_emit_cfg.cpp` still call `getenv` per site. Only a mid-process `setenv` could tell the
-// difference, and nothing in prosper does that.)
+// (The `PROSPER_DBG` latch is therefore also read once, where the fifteen remaining per-site gates
+// in `rdna2_emit_cfg.cpp` still call `getenv` on every evaluation. Only a mid-process `setenv` could
+// tell the difference, and nothing in prosper does that.)
 //
 // Each comma-separated element goes through `parse_diagnostic_uint64` -- the same strict parser
 // every other PROSPER_* selector uses -- rather than a local `strtoull`. A hand-rolled loop accepts
