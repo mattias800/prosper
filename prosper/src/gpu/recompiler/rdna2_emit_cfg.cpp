@@ -3989,12 +3989,13 @@ bool emit_cfg_state_machine(
                     }
                 }
                 bool ok = true;
+                const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(state, in);
                 const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
                                               allow_smem, rt, /*allow_wave*/false);
                 if (handled && ok)
                     record_scalar_write(
                         state, in,
-                        allows_compute_scalar_vcc_bridge(b));
+                        allows_compute_scalar_vcc_bridge(b), saved_masks);
                 if (!handled || !ok) {
                     // NOT gated on PROSPER_DBG. log_recompile_diagnostic gates its own PRINTING
                     // on that variable and additionally RECORDS the reason for the unconditional
@@ -5788,12 +5789,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (dead_masks.count(in.pc)) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(rs, in)) return false; continue; }
             bool ok = true;
+            const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
             if (handled && ok)
                 record_scalar_write(
                     rs, in,
-                    allows_compute_scalar_vcc_bridge(b));
+                    allows_compute_scalar_vcc_bridge(b), saved_masks);
             // Shader I/O tap: snapshot this instruction's destination VGPR (+3) if it is the tapped PC.
             if (handled && ok && in.pc == b.tap_pc && in.dst.kind == OperandKind::VGPR) {
                 auto tv = [&](int r) { auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };

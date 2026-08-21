@@ -2709,13 +2709,14 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
         cov.total++;
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
+        const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
         const bool emitted = emit_alu(
             b, rs, in, ok, /*allow_exec_update*/true, &safe_branches,
             /*allow_smem*/true, /*rt*/nullptr, /*allow_wave*/true);
         if (emitted && ok)
             record_scalar_write(
                 rs, in,
-                allows_compute_scalar_vcc_bridge(b));
+                allows_compute_scalar_vcc_bridge(b), saved_masks);
         bool handled = cf_reconstructed(in) || (emitted && ok);
         // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
         // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass

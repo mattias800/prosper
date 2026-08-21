@@ -2750,6 +2750,57 @@ int main() {
               "a fully-supported kernel enumerates NO sites, and clears a dirty caller vector");
     }
 
+    // #2783 -- a saved B64 wave mask must not outlive the SGPR pair that held it.
+    //
+    // A compiler routinely saves a wave mask into an ordinary SGPR pair and later recycles that same
+    // pair for scalar data. R-Type Delta's sprite vertex shader (`shader/sprite_i_vv.ags`, live VS
+    // 0x2011c03100) does exactly this: its NGG fetch prologue writes `s_cselect_b64 s[0:1], exec, 0`
+    // at pc 38, and pc 303-306 then build the shader's PC-relative embedded-table address in the same
+    // s[0:1] with `s_getpc_b64` / `s_add_u32 s0, lit, s0` / `s_addc_u32 s1, 0, s1`.
+    //
+    // The base program is the "T12 vertex" shape already proven good in test_rdna2_to_spirv, so the
+    // ONLY difference between these two arms is the mask save. Both must recompile. Before the fix
+    // the second returned {} while the first still compiled, because the stale `sreg_bool` entry made
+    // `operand_bits` reject the data read of s0 as a live mask half -- which dropped every sprite
+    // draw in the title and left prosper republishing one retained frame from the title screen on.
+    const uint32_t pcrel_table_vs[] = {
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe801f00u,               // s_getpc_b64 s[0:1] (next PC byte = 16)
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0 (table byte = 56)
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0
+        0xe0381000u, 0x80000004u,  // buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x03020100u,  // exp pos0, v0, v1, v2, v3
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    CHECK(!recompile_vertex(pcrel_table_vs, std::size(pcrel_table_vs), nullptr).empty(),
+          "PC-relative embedded-table vertex shader recompiles (positive control)");
+
+    // Same program, preceded by the fetch-prologue mask save into the pair the table address then
+    // reuses. Prepending two dwords shifts s_getpc and the table equally, so the PC-relative offset
+    // is unchanged and the two arms differ only in the saved mask.
+    const uint32_t pcrel_table_vs_after_saved_mask[] = {
+        0xbf068004u,               // s_cmp_lg_u32 s4, 0   (SCC for the select)
+        0x8580807eu,               // s_cselect_b64 s[0:1], exec, 0  -- saved B64 mask in s[0:1]
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe801f00u,               // s_getpc_b64 s[0:1]   -- the pair is recycled as scalar data
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0 -- ordinary data read of that word
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0
+        0xe0381000u, 0x80000004u,  // buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x03020100u,  // exp pos0, v0, v1, v2, v3
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    CHECK(!recompile_vertex(pcrel_table_vs_after_saved_mask,
+                            std::size(pcrel_table_vs_after_saved_mask), nullptr).empty(),
+          "a scalar write ends a saved B64 mask lifetime: the recycled pair reads as data (#2783)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
