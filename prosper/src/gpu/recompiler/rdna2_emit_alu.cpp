@@ -121,6 +121,34 @@ inline bool sreg_srt_range_tag(const RegState& rs, int base, uint32_t words, uin
     return true;
 }
 
+// A DIRECT descriptor staged into `base` by copying it word-for-word out of entry-time user data
+// (#1773). Succeeds only for a FAITHFUL WHOLE-DESCRIPTOR move: every word `base + i` must alias
+// exactly `origin + i` for one origin. A partial, permuted or partly-recomputed copy is a descriptor
+// the shader assembled itself, which this must not resolve -- binding the wrong resource renders
+// silently wrong texels, which is strictly worse than declining the draw.
+//
+// The load-bearing condition is applied where the alias is ESTABLISHED, not here: the source must
+// still have been entry-time user data at the moment of the copy (`record_scalar_write`). It is
+// deliberately NOT re-checked at consumption, because a copy captures bits -- a later write to the
+// SOURCE register cannot change what the DESTINATION already holds. Re-checking it would reject the
+// exact shape #1773 documents: Earthion stages s[9:16] into s[20:27] and then immediately reuses
+// s[12:19] for the second descriptor, so five of the origin words are overwritten before the sample.
+//
+// Two invariants carry that instead, and both live elsewhere: a write to the DESTINATION expires
+// the alias (`record_scalar_write`), and every control-flow join meets the two edges' claims
+// (`merge_ud_alias`). Neither is visible here, which is why they are named here.
+inline bool sreg_range_ud_alias(const RegState& rs, int base, uint32_t words, int& origin) {
+    auto first = rs.sreg_ud_alias.find(base);
+    if (first == rs.sreg_ud_alias.end()) return false;
+    origin = first->second;
+    for (uint32_t word = 0; word < words; ++word) {
+        auto it = rs.sreg_ud_alias.find(base + static_cast<int>(word));
+        if (it == rs.sreg_ud_alias.end() ||
+            it->second != origin + static_cast<int>(word)) return false;
+    }
+    return true;
+}
+
 inline bool sopk_sets_full_flat_scratch_base(const Rdna2Inst& in) {
     if (in.fmt != Rdna2Format::SOPK || in.opcode != 0x13 ||
         in.dst.kind != OperandKind::SGPR)
@@ -6736,6 +6764,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     res = rt->by_srt_offset(srt_tag);
                 if (!res && !sreg_range_written(rs, in.src[1].value, 8))
                     res = rt->by_sgpr_base(in.src[1].value);
+                // The SRSRC range reads as written when the shader STAGED a direct descriptor into
+                // it with s_mov_b32, so the lookup above is skipped even though the bits are still
+                // the driver's. Resolve through the copy to where those words actually live (#1773).
+                if (int ud_origin = 0; !res && sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin))
+                    res = rt->by_sgpr_base(ud_origin);
             }
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
@@ -6781,12 +6814,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
                 const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
                 const ShaderResource* pp = rt->by_fetch_pc(in.pc);
-                fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s (%zu res)\n",
+                // Report the copy-alias step too. Without it a staged descriptor (#1773) and a
+                // genuinely absent one print the identical line, which is the output-vs-input
+                // confusion that cost #1590 several sessions -- name which provenance route failed.
+                int ud_origin = 0;
+                const bool has_ud_alias = sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin);
+                const ShaderResource* pa = has_ud_alias ? rt->by_sgpr_base(ud_origin) : nullptr;
+                fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s written=%d (%zu res)\n",
                         (unsigned long long)b.diagnostic.program_address,
                         in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
                         has_srt_tag ? srt_tag : 0u,
                         pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                        has_ud_alias ? "s" : "NONE ", has_ud_alias ? ud_origin : 0,
+                        pa ? (pa->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                        sreg_range_written(rs, in.src[1].value, 8) ? 1 : 0,
                         rt->resources.size());
             }
             if (!res) { ok = false; return true; }
