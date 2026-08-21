@@ -7189,7 +7189,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  (int)(in.mimg_dim == 5u && !b.is_compute),
                                  (unsigned long long)res->gpu_addr, res->width, res->height,
                                  res->depth, (int)res->format, res->tile_mode, in.mimg_dmask,
-                                 in.mimg_unorm, in.mimg_glc, res->layer_stride_bytes);
+                                 (unsigned)in.mimg_unorm, (unsigned)in.mimg_glc,
+                                 res->layer_stride_bytes);
                 ok = false;
                 return true;
             }

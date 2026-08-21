@@ -333,6 +333,35 @@ exactly what the 19-arm result above measured, and it is why the root-only rule 
 risk is therefore a shader whose mask prosper believes is dead and hardware does not; it fails loudly
 if it happens.
 
+## The PC-relative embedded-table fold had no TYPED consumer — **FIXED** (2026-08-21)
+
+`detect_pcrel_tables` (`rdna2_cfg_support.hpp`) folds a constant table the compiler placed inside the
+shader blob and addressed with an `s_getpc_b64`-built V#. It recognised the table's **untyped**
+consumer (`MUBUF` raw loads) and its **scalar** one (`SMEM` s_buffer loads) and not its **typed** one
+(`MTBUF`, `tbuffer_load_format_*`). With a typed consumer the table never folds, so `s_getpc_b64` has
+nothing to justify it (`rdna2_emit_alu.cpp` accepts the pair only when a table from this shader was
+proven) and the whole program rejects `mode=unresolved-operand` **at the getpc, not at the load**.
+
+*Sonic Frontiers*' three Cyber Space scene-width compute kernels hit this twice each. Two things about
+it generalise:
+
+* **The reject names the getpc, which is not where the gap is.** Nothing about
+  `be801f00 fmt=1 op=0x1f` says "your table fold does not know about typed loads"; the instruction that
+  carries the information is ten dwords further on. This is the same shape as #2481's rule — *a reject
+  pc names where a fact was consumed, not where it was lost* — reached from a different direction.
+* **A one-component 32-bit typed format converts nothing.** `rdna2_buffer_format` maps BUF_FMT 22 to
+  `Float32`/n=1, so `tbuffer_load_format_x` at that format returns the stored dword unchanged and the
+  existing constant-lookup fold was already exactly right for it. The typed case is admitted only when
+  the format stores 32 bits per component, its component count matches the opcode (a narrower format
+  default-fills the missing components rather than reading them), **and** the V#'s DST_SEL routes those
+  channels straight through — a FORMAT load applies DST_SEL and a raw load does not, and Frontiers' own
+  table descriptor carries `DST_SEL = (X, 0, 0, 0)`, so a four-component fetch through it would return
+  one stored dword and three constant zeroes.
+
+#2859, PR #2861. `tests/gpu/test_recompile_coverage.cpp` carries four arms, two of them negative
+(a converting format, and a non-identity DST_SEL), because without those the change is
+indistinguishable from "accept every MTBUF".
+
 ## Ruled out
 
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
