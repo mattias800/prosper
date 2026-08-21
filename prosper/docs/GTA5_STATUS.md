@@ -110,6 +110,42 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **A NAMED MECHANISM for the producer/consumer gap: eight programs reach the traversal table through
+  FOUR different span granularities, and prosper gives overlapping guest ranges independent host
+  buffers.** `PROSPER_COMPUTE_ADDRESS_WATCH=0x20f848417c` on a routed run, **22,327 hits**:
+
+  | program(s) | base | size |
+  | --- | --- | ---: |
+  | `0x413cea300` | `0x20f8480000` | 347,040 |
+  | `0x413d88400` | `0x20f8480100` | 132,032 |
+  | `0x413ce3400`, `0x413ce6000`, `0x413cee500`, `0x413e1c300` | `0x20f8482140` | 33,024 |
+  | `0x413dc3400`, `0x413dc6700` | `0x20f848417c` | **8,252** |
+
+  Six programs bind a span that *contains* the table; two bind the 8,252-byte table itself. The
+  33,024-byte span is four consecutive tables, so the whole ping-pong set lives inside one resource
+  from four programs' point of view and as separate resources from the traversal's.
+
+  **Why that is a hazard here, read from the source rather than assumed.** Each resource is
+  materialized into its own `VkBuffer`. The in-dispatch alias check refuses to share one unless
+  `gpu_addr` **and** `size` match exactly (plus several other fields), so an 8,252-byte table and a
+  33,024-byte span over the same bytes are two independent host copies. Persistent buffers are cached
+  on `ComputeBufferCacheKey{gpu_addr, host_data, bytes, materialization}`, and
+  `invalidate_cached_buffer_source` takes **that exact key** — there is no overlap-keyed
+  invalidation. So a write through the span's copy does not invalidate the table's cached copy, and a
+  read through the table's copy can see bytes that predate it.
+
+  That is exactly the shape the measurements demand: prosper's own writes are clean 43/43 (above),
+  the reading program did not write the cyclic table (`changed=0`, above), and yet the table it reads
+  is cyclic. A stale copy is a producer/consumer gap that needs no corrupting writer — which is also
+  why every attempt to name a corrupting *program* has failed.
+
+  **What is measured and what is not.** Measured: the eight programs, the four granularities, the
+  22,327 hits, the exact-match alias condition and the exact-key invalidation. **Not** measured: that
+  a lost update actually occurs on this route — no arm yet shows a specific write through one range
+  failing to appear through another. That is the next experiment, and it is cheap: watch one address
+  through both granularities across a dispatch pair and compare the bytes. Until then this is a
+  mechanism with strong circumstantial support, not a demonstrated defect. (2026-08-21.)
+
 - **PROSPER'S OWN WRITES ARE CLEAN: every table it actually writes comes out acyclic and fully
   terminating, 43 of 43.** This is the causal test done *within a single dispatch* — scanning the
   table after the dispatch that wrote it — so it is immune to the cross-dispatch attribution error
