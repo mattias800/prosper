@@ -65,6 +65,7 @@ Last updated: 2026-08-17
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Chapter 1 gameplay; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 | *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2864](https://github.com/mattias800/prosper/issues/2864) |
+| *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 
 ## At a glance
 
@@ -84,8 +85,8 @@ land here first.
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 24 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Not yet booted** — dump present, never run | 1 |
-| Total tracked | 40 |
+| **Not yet booted** — dump present, never run | 2 |
+| Total tracked | 41 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
