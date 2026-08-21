@@ -1,56 +1,88 @@
-# Screenshots — newest first
+# prosper — progress blog
 
-<!--
-    GENERATED FILE -- DO NOT EDIT BY HAND.
-    Produced by prosper/tools/docs/gen_screenshot_feed.py from git history.
-    Regenerate with:  python3 prosper/tools/docs/gen_screenshot_feed.py
-    CI regenerates this file and fails if it differs from the committed copy.
--->
+**Newest first.** Every screenshot checked into this repository, and the story around the ones worth
+a story. Read down from the top and stop when you reach something you have already seen.
 
-**Every screenshot checked into this repository, most recent first.** Read down from the top and stop when you reach one you have already seen.
+**This file is written by hand.** It used to be generated from git history, which meant its captions
+were commit subject lines — they said what the *change* was, never what the *picture* is, and there
+was nowhere to put "we finally reached gameplay in this one, look." That is the whole point of a
+blog, so the generator and its CI gate are gone.
 
-**141 images**, most recent **2026-08-21**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
+[`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and
+[`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table — that one *is* still generated
+from the tracker issues, and still gated, because it is a projection of state rather than a story.
 
-This file is generated from git history by [`prosper/tools/docs/gen_screenshot_feed.py`](prosper/tools/docs/gen_screenshot_feed.py) and is regenerated and diffed in CI, so it cannot drift from the tree. [`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table; this is only a reverse-chronological index of the images themselves.
+## How to add an entry
 
-> A screenshot here is evidence of what rendered on the day its commit landed. It is not
-> a claim about the title's current state — for that, read the tracker. An image is never
-> removed from this feed when a title moves on, because the point of a feed is that it is
-> a record of *when* things happened.
+Put it at the **top**, under a `## YYYY-MM-DD` heading. An entry needs an image and a sentence about
+what you are looking at. Anything else is optional — write a paragraph when a title finally does
+something, write one line when it is just another capture.
+
+```markdown
+## 2026-08-21
+
+### Beneath reaches gameplay
+
+<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="..."></p>
+
+The opening dive. The waypoint counts down as the route moves and the dialogue plays over it —
+this is the real scene, not a cutscene. Tracker [#1898](...).
+```
+
+> An entry is evidence of what rendered **on the day it was written**. It is not a claim about the
+> title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
+> because the point of a blog is that it records *when* things happened.
 
 ## 2026-08-21
 
-### rtype-delta-stage1-gameplay.png
+### Two more titles reach gameplay — and one reaches it in the dark
 
-<p align="center"><img src="assets/screenshots/rtype-delta-stage1-gameplay.png" alt="rtype delta stage1 gameplay"></p>
+**Beneath** (`PPSA27640`) plays. This is the opening dive aboard the science ship: the waypoint
+marker counts down as you move, and the characters talk over it. A cutscene would not have a live
+distance readout, which is how we know it is the real thing.
 
-scripts+docs(rtype-delta): an input route for PPSA26414 that reaches stage 1 — and the regression (#2783) that stops master drawing any of it (#2784)
+<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="Beneath — the opening dive, waypoint HUD reading 21m, dialogue subtitles over a dark seabed"></p>
 
-`6dd608bb` · [`assets/screenshots/rtype-delta-stage1-gameplay.png`](assets/screenshots/rtype-delta-stage1-gameplay.png)
+It is very dark, and that is the game rather than us — but it is worth an eye-check when this one
+comes up for manual verification. Getting here needed no renderer work at all; the title was one
+input route away. What it *did* need was `PROSPER_NULL_PAGE=1`, and the reason is a nice one: the
+game's stack unwinder walks one hop past the end of the frame-pointer chain **on purpose**, because
+it stops on a null return address rather than a null frame pointer. We enter the guest with `rbp`
+zeroed — which is correct — so that last read lands on address `0x8` and faults. The flag gives the
+guest back a low page that reads as zero, which is what the console gave it.
 
-### sonic-frontiers-cyberspace-hud.png
+### R-Type Delta, blank for nine days, draws stage 1 again
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-cyberspace-hud.png" alt="sonic frontiers cyberspace hud"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.png" alt="R-Type Delta stage 1: the R-9 and its Force device over a sunset cityscape with enemy formations and the BEAM and score HUD"></p>
 
-feat(sonic-frontiers): a route reaches Cyber Space gameplay, and the world behind the HUD is black for a measured reason (#2791)
+The R-9, its Force pod, enemy formations, and a city at sunset. This one is a good story. For nine
+days the title rendered its logo and its whole opening movie and then went blank forever — the guest
+was fine, reaching stage 1 and writing its save, while prosper published the same retained frame on
+every flip.
 
-`412b66c5` · [`assets/screenshots/sonic-frontiers-cyberspace-hud.png`](assets/screenshots/sonic-frontiers-cyberspace-hud.png)
+One shader did that. `sprite_i_vv.ags` is the title's **sprite vertex shader**, so it draws the
+menus, the HUD and the gameplay — everything except the logo and the movie, which is exactly the
+symptom. The recompiler had been refusing it since a change in August that saved a wave mask in a
+register pair and never ended that lifetime; when the shader later reused the same pair for an
+ordinary table address, the stale mask made it look like ballot bits and the read was refused.
 
-### beneath-gameplay.png
+Reaching it also needed a route, and the title screen taught us something: its prompt is the PS5
+**OPTIONS** glyph, not Cross. A Cross-only route sits there forever.
 
-<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="beneath gameplay"></p>
+### Sonic Frontiers reaches Cyber Space — and the world is black
 
-compat(beneath): PPSA27640 reaches gameplay — a Cross-only route, and the boot fault is the guest's own stack unwinder (#1898) (#2817)
+<p align="center"><img src="assets/screenshots/sonic-frontiers-cyberspace-hud.png" alt="Sonic Frontiers Cyber Space — stage clock at 00:55.89, ring counter, star medals and speedometer over an entirely black screen"></p>
 
-`9aef9f13` · [`assets/screenshots/beneath-gameplay.png`](assets/screenshots/beneath-gameplay.png)
+Not a pretty picture, and it is here because it is honest. That is a real running stage — the clock
+reads 55 seconds, the speedometer needle moves, the music plays — with a hundred streamed terrain
+sectors behind a world that never draws. Sixteen of the stage's thirty-two compute programs never
+execute.
 
-### rtype-delta-stage1-restored.png
-
-<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.png" alt="rtype delta stage1 restored"></p>
-
-fix(recompiler): a saved wave-mask alias must not outlive its SGPR pair — R-Type Delta's whole post-title render, blank for nine days (#2799)
-
-`e653f271` · [`assets/screenshots/rtype-delta-stage1-restored.png`](assets/screenshots/rtype-delta-stage1-restored.png)
+Three separate recompiler fixes have now unblocked programs on this title and changed **zero
+pixels**, so we have stopped assuming the next one will be different. It also prompted a rule
+change: reaching gameplay is no longer enough for rung 3, which now asks that the scene actually
+render. Frontiers and *Grand Theft Auto V* both sit at rung 2 because of it. Neither regressed —
+we just stopped counting a black screen as a win.
 
 ## 2026-08-20
 
