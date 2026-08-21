@@ -166,6 +166,31 @@ gdb names them with no symbol work — streams assets, and reaches a **4K presen
              — px_front=none px_vo=none px_last=none, offered 0 bytes
 ```
 
+The run ended through **the tool's own exit path**, which is itself the point:
+
+```text
+[shot] timeout after 701s with 78/120 saved -- game not rendering enough
+[shot] done: 78/120 screenshot(s); stop=timeout source-distinct=78 pixel-distinct=1
+       max-source-stale=0.0s max-pixel-stale=385.2s guest=running status=FAILED
+```
+
+`--timeout 700` fired; the outer 1500 s shell bound did not. Before the fix that was **structurally
+impossible** — the deadline is checked inside the sampling loop, which is only reached after
+`boot_program()` returns, so the deadlocked run had to be killed from outside and produced no summary
+line at all. Compare the two directly, because this is the difference between a measurement and a
+guess:
+
+| | arm A (deadlocked) | run C (fixed) |
+| --- | --- | --- |
+| stopped by | an outside kill; **no** `[shot]` line | **the tool's own `--timeout`**, with a summary |
+| `guest=` | never started | `running` — no fault |
+| `source-distinct` | — | **78** of 78 samples were new guest publications |
+| `pixel-distinct` | — | **1** — every one of those publications is the same black |
+
+`source-distinct=78` with `pixel-distinct=1` is the whole diagnosis in two numbers: the guest is
+publishing a genuinely new buffer every time, and every buffer is identical black. Nothing is stale
+or stuck; the content is simply never written.
+
 So the title is **rung 0**: it executes, but nothing renders. That is the frontier now.
 
 > **A reading recorded here 10 minutes earlier was wrong, and is kept because the correction is the
