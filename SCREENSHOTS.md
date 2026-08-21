@@ -9,7 +9,7 @@
 
 **Every screenshot checked into this repository, most recent first.** Read down from the top and stop when you reach one you have already seen.
 
-**138 images**, most recent **2026-08-21**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
+**140 images**, most recent **2026-08-21**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
 
 This file is generated from git history by [`prosper/tools/docs/gen_screenshot_feed.py`](prosper/tools/docs/gen_screenshot_feed.py) and is regenerated and diffed in CI, so it cannot drift from the tree. [`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table; this is only a reverse-chronological index of the images themselves.
 
@@ -19,6 +19,22 @@ This file is generated from git history by [`prosper/tools/docs/gen_screenshot_f
 > a record of *when* things happened.
 
 ## 2026-08-21
+
+### sonic-frontiers-cyberspace-hud.png
+
+<p align="center"><img src="assets/screenshots/sonic-frontiers-cyberspace-hud.png" alt="sonic frontiers cyberspace hud"></p>
+
+feat(sonic-frontiers): a route reaches Cyber Space gameplay, and the world behind the HUD is black for a measured reason (#2791)
+
+`412b66c5` · [`assets/screenshots/sonic-frontiers-cyberspace-hud.png`](assets/screenshots/sonic-frontiers-cyberspace-hud.png)
+
+### beneath-gameplay.png
+
+<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="beneath gameplay"></p>
+
+compat(beneath): PPSA27640 reaches gameplay — a Cross-only route, and the boot fault is the guest's own stack unwinder (#1898) (#2817)
+
+`9aef9f13` · [`assets/screenshots/beneath-gameplay.png`](assets/screenshots/beneath-gameplay.png)
 
 ### rtype-delta-stage1-restored.png
 
