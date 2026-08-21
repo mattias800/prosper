@@ -4784,6 +4784,29 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **The one JumpPatchTarget call per run that hands a non-Jump header (`0x3e718000`) is patching
+  somewhere inside a known DCB.** *VOID, not falsified — and the first attempt to kill it was wrong in
+  the opposite direction.* An instrumented run showed `patch_target_writable` answering through the
+  `guest_writable` OS probe rather than the ring registry, and that was published as "not a command
+  buffer, so all three candidates die". **It does not support that.** `remember_dcb_extent` has a
+  **single call site** (`hle_agc.cpp:581`, inside `set_regs_indirect`), the array is `thread_local`,
+  and it holds **four FIFO slots** evicted oldest-first — so a miss means only "not among ≤4 recently
+  registered extents on this thread that had a RegsIndirect packet built into them". A later run
+  settles how weak that is: the registry reads **0/4 slots used** at the moment of the refusal, so
+  `in_known_dcb` could not have returned true for *any* address. The discriminator was structurally
+  incapable of firing, which makes its negative void rather than merely weak.
+  **The dump's own window points the other way, and the framing is the evidence — not any single
+  recognisable header.** The eight dwords behind `cmd` are two consecutive, perfectly framed packets
+  that prosper itself emitted, whose lengths chain and land exactly on `cmd`:
+  `0xc0041068` = `PM4(kDwDispatch=6, IT_NOP, R_DISPATCH_DIRECT)` whose five payload dwords decode as a
+  coherent `748x1x1` dispatch with modifier `0x21`, followed by `0xc0001000` = `PM4(2, IT_NOP, 0)` with
+  payload `0x6875000d`, the marker emitted in `sceAgcCbSetShRegisterRangeDirect` (`hle_agc.cpp:1603`).
+  So `cmd` is a packet **boundary** in an AGC stream **prosper itself built**. The address argument was
+  misread too: across three runs the addresses share their low **16** bits (`7d34`) — the same offset
+  into a relocated allocation, not a heap object. (The first write of this entry claimed low 20 bits;
+  that holds for two of the three runs only.) **Candidate 1 (a consumed packet / recycled ring) is now
+  the leading reading, not a dead one.** #2715, #2856, #2857.
+
 - **`0x413dc6700` contains no guest barriers, so all eight emitted `OpControlBarrier` are emulation
   scaffolding.** *Falsified — and it was a grep artifact, not a measurement.* The program contains
   **two** `s_barrier` (SOPP `0x0a`, encoded `0xbf8a0000`), at **pc 116 and pc 129** — which are exactly

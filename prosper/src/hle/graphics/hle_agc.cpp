@@ -3208,13 +3208,108 @@ HLE(agc_patch_release_mem_data) {
 // is logged rather than stored — a slot invented for it here would be read by nothing.
 // CONFIDENCE: HIGH on the argument roles and the packet shape (both measured); MED on cache policy
 // being safely ignorable, which holds only while the decoder has no policy semantics.
+// #2715 forensics: say what the refused location actually is, on the cold refusal path.
+//
+// Exactly one call per run hands this handler a non-Jump header (0x3e718000, PM4 type 0),
+// bit-identically across runs. The candidates are a recycled ring, a pointer that is not a packet
+// start, and a second packet shape sharing this NID, and the header alone cannot separate them.
+//
+// READ THE REGISTRY MISS CORRECTLY -- this is the part that has already misled once. When
+// `in_known_dcb` says no, that is NOT "this is not a command buffer". `remember_dcb_extent` has a
+// single call site (`set_regs_indirect`), the array is `thread_local`, and it holds four FIFO slots
+// that evict oldest-first. So a miss means only "not among <=4 recently registered extents on this
+// thread that had a RegsIndirect packet built into them" -- a narrow negative that carries almost no
+// information about whether the bytes are a command stream. Occupancy is printed so the reader can
+// see how weak the negative is, rather than inferring strength it does not have.
+//
+// The back-scan is therefore run in BOTH branches, because it is the evidence that actually settles
+// the question: an AGC stream is self-identifying at the dword level (`PM4()` type-3 headers, and
+// prosper's own 2-dword NOP markers), so a type-3 header sitting just behind `cmd` says "command
+// buffer" far more reliably than the registry says "not one".
+//
+// Reads are bounded by what has already been PROVEN accessible: clamped to the ring when one supplies
+// bounds, and otherwise gated dword-by-dword on the same guest probe, stopping at the first refusal.
+// A forensic dump that itself faults would replace the question with a different one.
+inline void jump_patch_refusal_detail(const uint32_t* cmd, uint64_t policy, uint64_t target, uint64_t ndw) {
+    static std::atomic<int> budget{0};
+    if (budget.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+
+    const auto p = (uintptr_t)cmd;
+    const DcbExtent* ring = nullptr;
+    unsigned occupied = 0;
+    for (const auto& e : g_dcb_extents) {
+        if (e.bottom) ++occupied;
+        if (!ring && e.bottom && p >= e.bottom && p < e.top) ring = &e;
+    }
+
+    float as_float = 0.0f;
+    memcpy(&as_float, &cmd[0], sizeof(as_float));
+    fprintf(stderr,
+            "[agc] JumpPatchTarget REFUSED-DETAIL cmd=%p hdr=0x%08x type=%u (as f32 %.9g)\n"
+            "      writable-via=%s (registry %u/%u slots used, single call site, thread-local FIFO --\n"
+            "                       a MISS does NOT mean 'not a command buffer')\n"
+            "      args: policy=0x%llx target=0x%llx ndw=%llu -> target-in-registry=%s target-writable=%s\n",
+            (const void*)cmd, cmd[0], (unsigned)(cmd[0] >> 30), (double)as_float,
+            ring ? "DCB-ring-registry HIT" : "guest_writable OS probe (registry MISS)",
+            occupied, (unsigned)kDcbExtentSlots,
+            (unsigned long long)policy, (unsigned long long)target, (unsigned long long)ndw,
+            in_known_dcb((uintptr_t)target, 4) ? "YES" : "no",
+            gpu::guest_writable(target, 4) ? "YES" : "no");
+
+    // Walk back for the nearest type-3 header and ask whether its own length covers `cmd`. A hit that
+    // spans us means this pointer is mid-packet; a hit that stops exactly at `cmd` means `cmd` is a
+    // packet BOUNDARY in a live stream, which is the recycled-ring reading.
+    constexpr size_t kBack = 64;
+    auto read_dw = [&](ptrdiff_t off, uint32_t* out) -> bool {
+        const uintptr_t a = p + (uintptr_t)(off * (ptrdiff_t)sizeof(uint32_t));
+        if (ring) { if (a < ring->bottom || a + sizeof(uint32_t) > ring->top) return false; }
+        else if (!gpu::guest_writable((uint64_t)a, (uint32_t)sizeof(uint32_t))) return false;
+        memcpy(out, (const void*)a, sizeof(uint32_t));
+        return true;
+    };
+    if (ring) {
+        const auto* base = (const uint32_t*)ring->bottom;
+        const size_t ring_dw = (size_t)(ring->top - ring->bottom) / sizeof(uint32_t);
+        const size_t at = (size_t)(cmd - base);
+        fprintf(stderr, "      ring=[0x%llx,0x%llx) dw %zu of %zu (byte off 0x%zx)\n",
+                (unsigned long long)ring->bottom, (unsigned long long)ring->top,
+                at, ring_dw, at * sizeof(uint32_t));
+    }
+    bool found = false;
+    for (ptrdiff_t back = 1; back <= (ptrdiff_t)kBack; ++back) {
+        uint32_t w = 0;
+        if (!read_dw(-back, &w)) break;
+        if ((w >> 30) != 3u) continue;
+        const uint32_t len = ((w >> 16) & 0x3fffu) + 2u;   // PM4() encodes len-2
+        const uint32_t op  = (w >> 8) & 0xffu;
+        const uint32_t r   = (w >> 2) & (R_NUM - 1u);
+        const char* rel = ((ptrdiff_t)len == back) ? "ENDS EXACTLY AT cmd (cmd is a packet BOUNDARY)"
+                        : ((ptrdiff_t)len > back)  ? "SPANS cmd (cmd is MID-PACKET)"
+                                                   : "stops short of cmd";
+        fprintf(stderr, "      back-scan: type3 at cmd-%td hdr=0x%08x op=0x%x r=0x%x (%s) len=%u -- %s\n",
+                back, w, op, r, op == IT_NOP ? dcb_subop_name(r) : "non-NOP", len, rel);
+        found = true;
+        break;
+    }
+    if (!found)
+        fprintf(stderr, "      back-scan: no type-3 header found within %zu readable dwords behind cmd\n", kBack);
+
+    fprintf(stderr, "      window:");
+    for (ptrdiff_t i = -8; i < 12; i++) {
+        uint32_t w = 0;
+        if (!read_dw(i, &w)) { fprintf(stderr, " |x@%+td|", i); continue; }
+        fprintf(stderr, " %s%08x%s", i == 0 ? "[" : "", w, i == 0 ? "]" : "");
+    }
+    fprintf(stderr, "\n");
+}
+
 HLE(agc_jump_patch_target) {
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     // FOUR dwords, not kDwJump: this handler reads cmd[0] and writes cmd[1..3], and the span contract
     // above is the dwords each handler actually TOUCHES rather than the packet's nominal length.
     // cmd[4] is deliberately outside it -- predication belongs to sceAgcSetPacketPredication.
     if (!patch_target_writable(a0, 4u * sizeof(uint32_t), "JumpPatchTarget")) return 0;
-    if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) return 0;
+    if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) { jump_patch_refusal_detail(cmd, a1, a2, a3); return 0; }
     const uint32_t pre_lo = cmd[1], pre_hi = cmd[2], pre_ndw = cmd[3];
     cmd[1] = (uint32_t)(a2 & 0xffffffffu);
     cmd[2] = (uint32_t)(a2 >> 32u);
