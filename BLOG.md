@@ -70,14 +70,14 @@ So a module preloaded for one title had been silently wedging another, and the f
 only when something actually imports it.
 
 Which raised the obvious question a reviewer asked and I had not: *how many titles does that change?*
-I had checked two. The answer is a census — of 47 dumps here, 42 ship that PRX, 40 keep it, and two
+I had checked two. The answer is a census — across the tracked titles, 42 ship that PRX, 40 keep it, and two
 lose it: this title, and **Sonic Frontiers**, which nobody had looked at and which has no snapshot
 guard to notice. It appears to be harmless (import resolution is by NID, and not one of the 41,638
 NIDs that module exports is imported by anything in Frontiers' link graph) but "appears to be" is the
 honest phrasing, and a confirming boot of Frontiers belongs to the lane that owns it. A flag on a
 shared list is never a two-title question.
 
-Behind that wall the title is still at rung 0, and honestly so. On the real dump with the fix in, it
+Behind that wall the title is still at rung 0, and honestly so. Unmodified, with the fix in, it
 boots in 91 ms, streams its assets, and drives a 4K present loop at ~21 flips a second — while prosper
 composites exactly nothing. Every sample is a raw guest scanout: one distinct colour, zero non-black
 pixels, `published_frames=0`. Two runs on two different trees agree, so it is not an artifact. The

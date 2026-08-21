@@ -64,9 +64,9 @@ Last updated: 2026-08-17
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Chapter 1 gameplay; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
-| *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2864](https://github.com/mattias800/prosper/issues/2864) |
+| *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — nothing run against it yet | [#2864](https://github.com/mattias800/prosper/issues/2864) |
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
-| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2876](https://github.com/mattias800/prosper/issues/2876) |
+| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — nothing run against it yet | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 
 ## At a glance
 
@@ -76,17 +76,16 @@ ten of the twenty-four titles that reach gameplay are marked 🚧 rather than �
 three different states — two at different rungs, and one not yet run at all. Counting markers gives a
 different — and wrong — answer.
 
-**"Not yet booted" is a real category, not a rung.** A dump can be present and never measured, and
+**"Not yet booted" is a real category, not a rung.** A title can be tracked and never measured, and
 that is different from having been measured and found wanting. It is counted separately so an
-unmeasured title is never mistaken for a failing one — nine more dumps are arriving, and they will
-land here first.
+unmeasured title is never mistaken for a failing one; newly tracked titles start here.
 
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 24 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Not yet booted** — dump present, never run | 2 |
+| **Not yet booted** — tracked, no run attempted yet | 2 |
 | Total tracked | 42 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
