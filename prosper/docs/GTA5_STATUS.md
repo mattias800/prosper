@@ -152,9 +152,25 @@ conclusion; it sharpens what "essentially all black" looks like.
   own writes. The hazard above is strictly the **cross-program, cross-dispatch** one, where the spans
   differ and the persistent cache keys differ with them.
 
-  **What is measured and what is not.** Measured: the eight programs, the four granularities, the
-  22,327 hits, the exact-match alias condition, the exact-key invalidation, and the within-program
-  aliasing being correct. **Not** measured: that a lost update actually occurs on this route — no arm yet shows a specific write through one range
+  **REFUTED, same day, by the size gate — the persistent cache is NOT the vector.**
+  `persistent_compute_buffer_enabled()` ends `return enabled && bytes >= (1u << 20)`: the persistent
+  buffer cache applies only at **1 MiB and above**. Every span in the table above is far below it —
+  347,040 / 132,032 / 33,024 / **8,252** bytes — so **none of these resources is ever persistently
+  cached**, and the cross-dispatch staleness argument cannot operate on them. Each dispatch creates
+  its buffer, uploads from guest memory, and writes back.
+  The measured half of this entry stands (eight programs, four granularities, 22,327 hits, the
+  exact-match alias condition, the exact-key invalidation); the *inference* built on top of it does
+  not. Recorded rather than deleted because the reasoning was checkable in one line and I did not
+  check it before writing the entry.
+  **The consequence is a real narrowing, and it points the opposite way:** if every dispatch reads
+  these tables fresh from guest memory, then the cyclic graph the traversal consumes is genuinely
+  *in guest memory* — not an artifact of prosper's buffer management. Combined with "prosper's own
+  writes are clean 43/43" and "the reading dispatch did not write it (`changed=0`)", what remains is
+  a producer that is not the measured compute chain: the guest's own CPU-side construction over
+  inputs prosper supplied, or a GPU path outside these dispatches.
+
+  **What is measured and what is not.** Measured: everything listed above. **Not** measured: that a
+  lost update actually occurs on this route — no arm yet shows a specific write through one range
   failing to appear through another. That is the next experiment, and it is cheap: watch one address
   through both granularities across a dispatch pair and compare the bytes. Until then this is a
   mechanism with strong circumstantial support, not a demonstrated defect. (2026-08-21.)
