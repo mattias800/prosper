@@ -40,10 +40,10 @@
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
-// The --fps HUD is NOT part of the library view and must not be guarded by its macro: `Vk::overlay`
-// and every use site below are unconditional, so hiding the declaration behind
-// PROSPER_HAVE_LIBRARY_UI only compiles today because that macro happens to be defined
-// unconditionally wherever prosper-app is built. A latent break, not a working arrangement.
+// The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
+// every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
+// too. They briefly did not, which compiled only because CMake defines that macro unconditionally
+// for this target -- a latent break rather than a working arrangement.
 #include "gpu/present/present_frame_rate.hpp"   // distinct-guest-frame rate (NOT a present rate)
 #include "fps_overlay.hpp"               // --fps: the ImGui HUD drawn OVER a running title
 #include "fps_hud.hpp"                   // ...and what it says, kept pure and unit-tested
@@ -1712,14 +1712,14 @@ int main(int argc, char** argv) {
     bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
     windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
 
-#ifdef PROSPER_HAVE_LIBRARY_UI
-    // The library replaces the empty idle window. Only meaningful when this run has no game of its own
-    // and is not feeding a test pattern; a failure to bring it up is not fatal — the flat idle colour
-    // remains, so a driver that cannot host the UI costs the user a library, not the app.
-    prosper::frontend::LibraryUi libraryUi;
     // --fps. Brought up lazily, on the first frame that actually reaches the swapchain: at this
     // point the swapchain may not be final (the window can still be resized into fullscreen), and
     // the library view owns ImGui until a guest boots.
+    //
+    // Declared OUTSIDE the library-UI guard, because `Vk::overlay` and all five use sites are
+    // outside it. Putting it inside compiled only because CMake defines that macro unconditionally
+    // for this target, so the first person to make the library optional would get an undeclared type
+    // in `struct Vk`.
     prosper::frontend::FpsOverlay fpsOverlay;
     vk.overlay = &fpsOverlay;
     // The HUD reports a ROLLING rate, not a run average: a title that ran well for a minute and then
@@ -1728,6 +1728,11 @@ int main(int argc, char** argv) {
     prosper::gpu::PresentRateSnapshot fpsWindow = prosper::gpu::present_rate_snapshot();
     prosper::gpu::FrameRate fpsRate;
     std::vector<std::string> fpsLines;
+#ifdef PROSPER_HAVE_LIBRARY_UI
+    // The library replaces the empty idle window. Only meaningful when this run has no game of its own
+    // and is not feeding a test pattern; a failure to bring it up is not fatal — the flat idle colour
+    // remains, so a driver that cannot host the UI costs the user a library, not the app.
+    prosper::frontend::LibraryUi libraryUi;
     std::string libraryStatus;
     // True while a picker opened from the library's own button is outstanding: its answer is a games
     // DIRECTORY to remember, not a title to boot.
@@ -2524,9 +2529,11 @@ int main(int argc, char** argv) {
         std::_Exit(exitCode);
     }
 
-    // Before SDL_Quit and before the device wait below, for the same reason the library view is:
-    // this releases ImGui and Vulkan objects while the device and the window still exist. The
-    // destructor would do it too, but main does not always return here.
+    // Before SDL_Quit, like the library view: this releases ImGui and Vulkan objects while the
+    // device and the window still exist, and the destructor would do it too late. Note this runs
+    // BEFORE the vkDeviceWaitIdle below and must not depend on it -- FpsOverlay::shutdown() drains
+    // the device itself, exactly as LibraryUi::shutdown() does (library_ui.cpp:288), so the
+    // guarantee belongs to the object rather than to the order of these four lines.
     fpsOverlay.shutdown();
 #ifdef PROSPER_HAVE_LIBRARY_UI
     // Before SDL_Quit: ImGui's SDL3 backend frees cursors and closes gamepads on shutdown, and the

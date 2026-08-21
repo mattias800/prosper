@@ -157,7 +157,7 @@ the rate is worth quoting; well below means it was not.
 python3 - <<'EOF'
 import json
 s=[json.loads(l) for l in open('manifest.jsonl') if '"type":"sample"' in l]
-a,b = s[20], s[-1]                      # any two samples
+a, b = s[len(s) // 4], s[-1]            # any two samples; this pair skips the first quarter
 dt = b['elapsed_seconds']-a['elapsed_seconds']
 print('distinct  %.2f fps' % ((b['distinct_frames']-a['distinct_frames'])/dt))
 print('presented %.1f fps' % ((b['published_frames']-a['published_frames'])/dt))

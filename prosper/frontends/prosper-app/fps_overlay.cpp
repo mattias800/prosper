@@ -149,17 +149,19 @@ bool FpsOverlay::init(VkInstance instance, VkPhysicalDevice phys, VkDevice devic
     // Locked unconditionally rather than only when the queue is shared: init happens once, off the
     // hot path, and a lock whose necessity depends on a flag read elsewhere is the kind of
     // conditional correctness that stops being true when the flag moves.
+    bool uploaded = false;
     {
         std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
-        if (!upload_font_atlas()) {
-            std::fprintf(stderr, "[fps] font atlas upload failed; the counter is off\n");
-            ImGui_ImplVulkan_Shutdown();
-            shutdown();
-            return false;
-        }
+        uploaded = upload_font_atlas();
+    }
+    if (!uploaded) {
+        std::fprintf(stderr, "[fps] font atlas upload failed; the counter is off\n");
+        ImGui_ImplVulkan_Shutdown();
+        shutdown();
+        return false;
     }
     ready_ = true;
-    std::fprintf(stderr, "[fps] overlay on (%ux%u, %.0fx text scale)\n",
+    std::fprintf(stderr, "[fps] overlay on (%ux%u, %.2gx text scale)\n",
                  extent.width, extent.height, scale_);
     return true;
 }
@@ -271,8 +273,14 @@ bool FpsOverlay::recreate_swapchain(VkFormat format, const std::vector<VkImage>&
         ImGui::StyleColorsDark();
         ImGui::GetStyle().ScaleAllSizes(wanted);
         scale_ = wanted;
-        std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
-        if (!upload_font_atlas()) {
+        // The lock covers ONLY the upload. shutdown() now drains the device, and holding the present
+        // submit mutex across a vkDeviceWaitIdle would make the renderer wait on a wait.
+        bool uploaded = false;
+        {
+            std::lock_guard<std::mutex> lk(gpu::shared_present_submit_mutex());
+            uploaded = upload_font_atlas();
+        }
+        if (!uploaded) {
             std::fprintf(stderr, "[fps] font atlas rebuild failed after a resize; the counter is off\n");
             shutdown();
             return false;
@@ -282,10 +290,26 @@ bool FpsOverlay::recreate_swapchain(VkFormat format, const std::vector<VkImage>&
 }
 
 void FpsOverlay::shutdown() {
+    // DRAIN FIRST, and drain HERE rather than at any call site. Everything released below can still
+    // be referenced by the last present submit: `framebuffers_[i]`, `views_[i]`, `renderPass_` and
+    // ImGui's own pipeline all appear in the command buffer that `present_frame` submitted, and
+    // neither this function nor ImGui_ImplVulkan_Shutdown waits for it
+    // (VUID-vkDestroyFramebuffer-framebuffer-00892). LibraryUi::shutdown() opens the same way
+    // (library_ui.cpp:288) and that is the half of the precedent that makes it safe.
+    //
+    // Owning the wait here rather than relying on a caller ordering it is the point: shutdown() is
+    // also reached from init()'s failure branches and from recreate_swapchain()'s, and a rule that
+    // holds only at one call site is one edit away from not holding.
+    if (device_) vkDeviceWaitIdle(device_);
     if (context_) {
-        ScopedContext current(context_);
+        // Deliberately NOT ScopedContext: it would capture `previous_ == context_` when shutdown is
+        // called from inside one (init's and recreate_swapchain's failure paths), and restore a
+        // pointer this function has just deleted.
+        ImGuiContext* const previous = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext(context_);
         if (ready_) ImGui_ImplVulkan_Shutdown();
         ImGui::DestroyContext(context_);
+        ImGui::SetCurrentContext(previous == context_ ? nullptr : previous);
         context_ = nullptr;
     }
     ready_ = false;
