@@ -42,6 +42,9 @@
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
 #ifdef PROSPER_HAVE_LIBRARY_UI
 #include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
+#include "fps_overlay.hpp"               // --fps: the ImGui HUD drawn OVER a running title
+#include "fps_hud.hpp"                   // ...and what it says, kept pure and unit-tested
+#include "gpu/present/present_frame_rate.hpp"   // distinct-guest-frame rate (NOT a present rate)
 #endif
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "shared/live/live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
@@ -173,6 +176,11 @@ struct Vk {
     // the render queue, so present submits serialize through gpu::shared_present_submit_mutex().
     bool            gpu_present = false;
     bool            queue_shared = false;
+
+    // --fps. Null unless the counter was asked for AND came up. When it is live it REPLACES the
+    // present path's final TRANSFER_DST -> PRESENT_SRC barrier with its own render pass, so both
+    // present paths ask it first and fall back to the barrier when it declines.
+    prosper::frontend::FpsOverlay* overlay = nullptr;
 };
 
 uint32_t find_mem(VkPhysicalDevice p, uint32_t typeBits, VkMemoryPropertyFlags props) {
@@ -445,7 +453,8 @@ static bool write_frame_bmp(const std::string& path, const uint8_t* rgba, uint32
 // Present one guest RGBA frame (w*h, 4 bytes/pixel) to the window, scaling to the swapchain extent.
 using prosper::frontend::PresentAttempt;
 
-prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uint32_t w, uint32_t h) {
+prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uint32_t w, uint32_t h,
+                                                const std::vector<std::string>* overlayLines = nullptr) {
     if (!ensure_stage(vk, w, h)) return PresentAttempt::out_of_date;
     memcpy(vk.stageMapped, rgba, (size_t)w * h * 4);
 
@@ -498,8 +507,12 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     blit.dstOffsets[1] = {(int32_t)vk.scExtent.width, (int32_t)vk.scExtent.height, 1};
     vkCmdBlitImage(vk.cmd, vk.stageImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-    barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    // The overlay's render pass loads the blitted contents and leaves the image in PRESENT_SRC, so
+    // it stands in for the barrier below rather than adding to it. With --fps off, or if the HUD
+    // declined, this is byte-for-byte the path it always was.
+    if (!(overlayLines && vk.overlay && vk.overlay->record(vk.cmd, imgIndex, *overlayLines)))
+        barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     vkEndCommandBuffer(vk.cmd);
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -576,7 +589,8 @@ bool try_adopt_shared_present(Vk& vk, SDL_Window* win) {
 // now in flight and returns the acquire/present outcome.
 prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::frontend::GpuScanoutFrame& gf,
                                                     int& prevSlot, bool requestReadback,
-                                                    bool& readbackReady) {
+                                                    bool& readbackReady,
+                                                    const std::vector<std::string>* overlayLines = nullptr) {
     readbackReady = false;
     const VkResult previousWait = vkWaitForFences(
         vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);   // previous present's read complete
@@ -644,9 +658,12 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
                              VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostBarrier,
                              0, nullptr);
     }
-    barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    // Same substitution as the CPU path. Note the readback above copies gf.image -- the RENDERER's
+    // frame -- so an F9 grab or a scheduled screenshot never carries the HUD.
+    if (!(overlayLines && vk.overlay && vk.overlay->record(vk.cmd, imgIndex, *overlayLines)))
+        barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     vkEndCommandBuffer(vk.cmd);
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -1157,12 +1174,16 @@ int main(int argc, char** argv) {
     std::string setGamesDir;
     bool setGamesDirSeen = false;
     bool listGames = false;
+    bool showFps = false;   // --fps
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
     pick.bare_launch = (argc <= 1);
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
+        // --fps: draw the framerate over the running title. OFF by default -- a clean window is the
+        // right default, and a HUD that moved would change what a comparison screenshot shows.
+        else if (a == "--fps") showFps = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
         // --dump is LAST-WINS, and the positional form below applies only while no dump was given.
         // relaunch_with_dump() depends on that: it appends "--dump <new title>" to this run's own
@@ -1692,6 +1713,17 @@ int main(int argc, char** argv) {
     // and is not feeding a test pattern; a failure to bring it up is not fatal — the flat idle colour
     // remains, so a driver that cannot host the UI costs the user a library, not the app.
     prosper::frontend::LibraryUi libraryUi;
+    // --fps. Brought up lazily, on the first frame that actually reaches the swapchain: at this
+    // point the swapchain may not be final (the window can still be resized into fullscreen), and
+    // the library view owns ImGui until a guest boots.
+    prosper::frontend::FpsOverlay fpsOverlay;
+    vk.overlay = &fpsOverlay;
+    // The HUD reports a ROLLING rate, not a run average: a title that ran well for a minute and then
+    // collapsed must show the collapse. `fpsWindow` is re-based every kFpsWindowSeconds.
+    constexpr double kFpsWindowSeconds = 1.0;
+    prosper::gpu::PresentRateSnapshot fpsWindow = prosper::gpu::present_rate_snapshot();
+    prosper::gpu::FrameRate fpsRate;
+    std::vector<std::string> fpsLines;
     std::string libraryStatus;
     // True while a picker opened from the library's own button is outstanding: its answer is a games
     // DIRECTORY to remember, not a title to boot.
@@ -1790,7 +1822,8 @@ int main(int argc, char** argv) {
             // owns it, and two presenters acquiring the same images would fight.
             if (libraryUi.ready()) {
                 fprintf(stderr, "[app] library view closed; presenting the game.\n");
-                libraryUi.shutdown();
+                fpsOverlay.shutdown();
+    libraryUi.shutdown();
             }
 #endif
             return true;
@@ -2086,6 +2119,11 @@ int main(int argc, char** argv) {
                 libraryUi.shutdown();
             }
 #endif
+            // The framebuffers point at the destroyed swapchain's images. Rebuilt, or the HUD turns
+            // itself off -- never left pointing at freed images.
+            if (fpsOverlay.ready() &&
+                !fpsOverlay.recreate_swapchain(vk.scFormat, vk.scImages, vk.scExtent))
+                fprintf(stderr, "[app] the fps overlay lost its swapchain and is now off.\n");
         }
         const auto loopNow = std::chrono::steady_clock::now();
         if (timedDumpPending && loopNow >= nextTimedDump) {
@@ -2288,6 +2326,32 @@ int main(int argc, char** argv) {
             }
         }
 
+        // --fps: bring the HUD up on the first iteration that will actually present a game frame,
+        // and refresh the rolling rate at most once per window. Deferred to here rather than done at
+        // startup because the library view owns ImGui until a guest boots, and because the swapchain
+        // is not final until the window has settled.
+        if (showFps) {
+            if (!fpsOverlay.ready()) {
+                if (!fpsOverlay.init(vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue,
+                                     vk.scFormat, vk.scImages, vk.scExtent)) {
+                    fprintf(stderr, "[app] --fps could not start; continuing without the counter.\n");
+                    showFps = false;
+                }
+            }
+            const prosper::gpu::PresentRateSnapshot now = prosper::gpu::present_rate_snapshot();
+            if (prosper::frontend::fps_window_due(fpsWindow.now_seconds, now.now_seconds,
+                                                  kFpsWindowSeconds)) {
+                fpsRate = prosper::gpu::frame_rate_between(fpsWindow, now);
+                fpsWindow = now;
+                fpsLines = prosper::frontend::fps_hud_lines(
+                    fpsRate, gpu::present_frame_width(), gpu::present_frame_height(), now.distinct);
+            }
+        }
+        // Only a HUD that has something to say is passed down; an empty list leaves both present
+        // paths on their original barrier.
+        const std::vector<std::string>* fpsForPresent =
+            (showFps && fpsOverlay.ready() && !fpsLines.empty()) ? &fpsLines : nullptr;
+
         // Render completion and guest flips are separate clocks: the command stream can flip before
         // the renderer publishes its CPU frame. Key this loop to the completed-frame sequence so a
         // late renderer publication is not missed or marked handled while only the previous frame exists.
@@ -2302,7 +2366,7 @@ int main(int argc, char** argv) {
                 }
                 bool grabReady = false;
                 PresentAttempt attempt = present_frame_gpu(
-                    vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady);
+                    vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady, fpsForPresent);
                 if (grabReady)
                     flushGrabScreenshot(static_cast<const uint8_t*>(vk.stageMapped),
                                         gf.width, gf.height);
@@ -2342,7 +2406,8 @@ int main(int argc, char** argv) {
                         lastFrameSeq = cf.frame_seq;
                         continue;
                     }
-                    PresentAttempt a = present_frame(vk, cf.rgba->data(), cf.width, cf.height);
+                    PresentAttempt a = present_frame(vk, cf.rgba->data(), cf.width, cf.height,
+                                                     fpsForPresent);
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
                     else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
@@ -2370,7 +2435,7 @@ int main(int argc, char** argv) {
             uint32_t h = frame.height;
             if (w == 0 || h == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
             if (frame.rgba && frame.rgba->size() == (size_t)w * h * 4) {
-                PresentAttempt attempt = present_frame(vk, frame.rgba->data(), w, h);
+                PresentAttempt attempt = present_frame(vk, frame.rgba->data(), w, h, fpsForPresent);
                 if (attempt == PresentAttempt::out_of_date) {
                     // Out-of-date/suboptimal: share the resize/fullscreen recreation path next loop.
                     swapchainDirty = true;

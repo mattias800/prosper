@@ -199,6 +199,7 @@ tuning one; leave it unset for normal use.
   (`--set-games-dir ""`) clears the stored setting; a missing one is an error (exit 2).
 - `--list-games` — print the library as plain text and exit, with no window, no Vulkan and no guest.
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
+- `--fps` — draw the framerate over the running title. **Off by default.** See below.
 - `--present-mode fifo|mailbox|immediate` — choose swapchain latency behavior. FIFO is the default;
   mailbox is low-latency vsync, and immediate may tear. Unsupported optional modes fall back to FIFO.
 - `--record PATH` — record the final controller stream to a replayable `PROSPER_PAD_SCRIPT` route.
@@ -207,6 +208,41 @@ tuning one; leave it unset for normal use.
 - `--record-axis flip|pad-read` — timestamp recorded intervals by display flips (the backward-compatible
   default) or by successful guest input-state reads. Pad-read routes remain stable when presentation
   pauses while the title continues polling input.
+
+## `--fps`: two numbers, and the first one is the honest one
+
+`--fps` draws a small ImGui HUD in the top-left of the window while a title runs:
+
+```
+3.4 fps
+59.8 presented   3840x2160   612 frames
+```
+
+**The headline number counts DISTINCT guest frames. The second counts publications.** Those are not
+the same thing, and the difference is the whole reason the HUD says both. When a submit produces no
+usable present source the renderer re-publishes the frame it retained, and that re-serve travels
+through the ordinary publish path — so a title whose picture is completely frozen keeps publishing at
+the display's rate. A publication-counting counter reads **full speed for a frozen title**; that is
+instrument trap 90, and it is exactly the R-Type Delta regression #2783, which hid for nine days
+behind a healthy-looking present rate. When the two diverge far enough the HUD adds a third line
+saying so. `prosper/src/gpu/present/present_frame_rate.hpp` has the full argument.
+
+The rate is measured over a rolling one-second window, not over the whole run, so a title that ran
+well and then collapsed shows the collapse.
+
+Notes on what `--fps` does and does not affect:
+
+- **It is off by default**, and when it is off the present path is byte-for-byte what it always was.
+  When it is on, its render pass *replaces* the present path's final layout transition rather than
+  adding a second submit.
+- **It takes no input.** The overlay initialises ImGui's Vulkan backend only — no platform backend —
+  so it cannot capture keyboard or gamepad state away from the guest.
+- **Captures are unaffected.** F9 frame grabs and scheduled screenshots read the renderer's own
+  pixels, not the swapchain image the HUD draws into, so a capture taken with `--fps` on carries no
+  annotation. For a burned-in one, use `tools/screenshot --fps-overlay`, which says so in its
+  manifest.
+- If the HUD cannot be created (a driver that will not host it), the app says so once and keeps
+  running without it. A counter is never worth the frame under it.
 
 ## Notes
 

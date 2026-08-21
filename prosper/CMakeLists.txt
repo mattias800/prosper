@@ -846,6 +846,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_prosper_app_pad_overlay PRIVATE prosper_core)
   add_test(NAME prosper_app_pad_overlay COMMAND test_prosper_app_pad_overlay)
 
+  # WHAT the --fps counter says, kept out of the ImGui/Vulkan overlay that draws it. The order of the
+  # two rates is the load-bearing part: a HUD that led with the PRESENTED rate would read ~60 fps for
+  # a frozen title (#2783).
+  add_executable(test_prosper_app_fps_hud frontends/prosper-app/test_fps_hud.cpp
+                                          src/gpu/present/present_frame_rate.cpp)
+  target_include_directories(test_prosper_app_fps_hud PRIVATE src frontends/prosper-app)
+  add_test(NAME prosper_app_fps_hud COMMAND test_prosper_app_fps_hud)
+
   # Which key is which pad control (#2234). No SDL here: the frontend keeps the Key -> scancode
   # table and the mapping itself lives in a header, so this runs in the core suite on every host.
   add_executable(test_prosper_app_keyboard_pad_map frontends/prosper-app/test_keyboard_pad_map.cpp)
@@ -2602,7 +2610,8 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     endif()
 
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
-                               frontends/prosper-app/library_media.cpp)
+                               frontends/prosper-app/library_media.cpp
+                               frontends/prosper-app/fps_overlay.cpp)
     target_include_directories(prosper-app PRIVATE src third_party/stb)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
                                               prosper_performance_capture)
