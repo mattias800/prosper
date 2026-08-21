@@ -1585,6 +1585,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
   add_test(NAME gpu_capture_bundle_roundtrip COMMAND test_gpu_capture_bundle)
 
+  # Framerate must count DISTINCT guest frames, not publications: the renderer re-serves its retained
+  # frame through the ordinary publish path, so a present-counting fps reads full speed for a frozen
+  # title (#2783 / instrument trap 90). Pure -- no Vulkan, no dump.
+  add_executable(test_present_frame_rate tests/gpu/present/test_present_frame_rate.cpp)
+  target_link_libraries(test_present_frame_rate PRIVATE prosper_core)
+  add_test(NAME present_frame_rate COMMAND test_present_frame_rate)
+
   # Native-speed append-only submit/present timeline: portable framing, checksums, and truncated-tail
   # recovery are pure and must not depend on Vulkan or a game dump.
   add_executable(test_gpu_timeline tests/gpu/timeline/test_gpu_timeline.cpp)
