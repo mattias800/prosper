@@ -1,0 +1,15 @@
+# R-Type Delta: HD Boosted (PPSA26414) -- NEUTRAL CONTROL arm.
+#
+# This route deliberately delivers NO input inside any run window. It exists so the null arm of an
+# input A/B is matched to the input arm in every respect except the input itself: PROSPER_PAD_SCRIPT
+# makes the pad report CONNECTED for the whole run (hle_pad.cpp: apply_pad_script sets
+# s.connected = true), so a run with no route at all is NOT the right control -- the title would see
+# a different controller state, and any divergence could be the connection rather than the buttons.
+#
+# The single entry is anchored at t=9000 s, which no bounded run reaches, so the parser accepts a
+# non-empty route (0 entries would print the "no input will ever be delivered" warning and, more
+# importantly, would leave the pad disconnected).
+#
+# Anchors are SECONDS from the FIRST PAD POLL (prosper/src/input/pad.cpp: a bare number is seconds,
+# 'f' is flips, 'p' is pad reads).
+9000-9001:l3
