@@ -1836,6 +1836,19 @@ if(TARGET prosper_core)
         # and was caught only in review. #2840 will type the operation indices too, and gpu_replay.cpp
         # prints those with %zu at roughly sixteen more sites, so the class recurs the moment that
         # lands. Measured clean under -Wformat=2 before this gate was added.
+        #
+        # THIS GATE BINDS ON GCC ONLY, despite the GNU|Clang guard above. Clang deliberately looks
+        # through a scoped enum to its underlying type here and stays silent at -Wformat,
+        # -Werror=format, -Wformat=2 AND -Wall -Wextra; only -Wformat-pedantic makes it fire. The
+        # same positive control that errors under g++ exits 0 under clang++. It still protects every
+        # build this project actually performs -- both the Linux and the MinGW Windows legs are GCC,
+        # and the control was verified to fire on both -- but do not read the guard as Clang cover.
+        # -Wformat-pedantic on a Clang-only branch was measured clean on this TU if that is ever
+        # wanted; it is left out because no build here uses Clang and an unrecognized option is its
+        # own hazard. Deliberately NOT widened to -Wformat=2: GCC already diagnoses this class at
+        # plain -Wformat, so =2 adds only unrelated surface, and it does not even mean the same thing
+        # to the two compilers (GCC gives -Wformat-nonliteral where Clang gives
+        # -Wmissing-format-attribute, which GCC lacks entirely).
         target_compile_options(gpu_replay PRIVATE -Werror=switch -Werror=format)
       endif()
     else()
@@ -2058,6 +2071,19 @@ if(TARGET prosper_core)
         # and was caught only in review. #2840 will type the operation indices too, and gpu_replay.cpp
         # prints those with %zu at roughly sixteen more sites, so the class recurs the moment that
         # lands. Measured clean under -Wformat=2 before this gate was added.
+        #
+        # THIS GATE BINDS ON GCC ONLY, despite the GNU|Clang guard above. Clang deliberately looks
+        # through a scoped enum to its underlying type here and stays silent at -Wformat,
+        # -Werror=format, -Wformat=2 AND -Wall -Wextra; only -Wformat-pedantic makes it fire. The
+        # same positive control that errors under g++ exits 0 under clang++. It still protects every
+        # build this project actually performs -- both the Linux and the MinGW Windows legs are GCC,
+        # and the control was verified to fire on both -- but do not read the guard as Clang cover.
+        # -Wformat-pedantic on a Clang-only branch was measured clean on this TU if that is ever
+        # wanted; it is left out because no build here uses Clang and an unrecognized option is its
+        # own hazard. Deliberately NOT widened to -Wformat=2: GCC already diagnoses this class at
+        # plain -Wformat, so =2 adds only unrelated surface, and it does not even mean the same thing
+        # to the two compilers (GCC gives -Wformat-nonliteral where Clang gives
+        # -Wmissing-format-attribute, which GCC lacks entirely).
         target_compile_options(gpu_replay PRIVATE -Werror=switch -Werror=format)
       endif()
 
