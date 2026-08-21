@@ -2,6 +2,7 @@
 // (behavior-preserving); backed by whichever exec_image_<os> substrate the platform provides
 // (Linux/macOS: exec_image_linux.cpp; Windows: exec_image_win.cpp).
 #include "host/image/boot_program.hpp"
+#include "host/image/module_path_policy.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -252,6 +253,12 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
             slot++;
         }
     }
+    // The link list is complete here, so this is the chokepoint: every path above, fixed or
+    // discovered, is judged against the reject-by-default allowlist in module_path_policy.hpp
+    // before anything opens or parses it. See that header for why the policy is enforced rather
+    // than left as an emergent property of the discovery code, and why it is not switchable.
+    for (const auto& r : enforce_module_path_policy(d, in))
+        say("module REFUSED by path policy: %s -- %s\n", r.path.c_str(), r.reason.c_str());
     if (getenv("PROSPER_NO_PSN"))
         for (size_t i = in.size(); i-- > 0; )
             if (in[i].path.find("PSN.prx") != std::string::npos ||
