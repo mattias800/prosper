@@ -1828,7 +1828,15 @@ if(TARGET prosper_core)
       target_include_directories(gpu_replay PRIVATE src tests)
       target_link_libraries(gpu_replay PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(gpu_replay PRIVATE -Werror=switch)
+        # -Werror=format for the same reason as -Werror=switch above, and found the same way: by a
+        # defect this tool's own diagnostics hid. gpu_replay prints index values with %zu, and #2836
+        # gave three of those printf arguments a distinct type (ItemIndex) while the format stayed
+        # %zu. Varargs performs no conversion, so the type system has nothing to check, and this
+        # target compiled with neither -Wall nor -Wformat -- the mismatch was invisible in the build
+        # and was caught only in review. #2840 will type the operation indices too, and gpu_replay.cpp
+        # prints those with %zu at roughly sixteen more sites, so the class recurs the moment that
+        # lands. Measured clean under -Wformat=2 before this gate was added.
+        target_compile_options(gpu_replay PRIVATE -Werror=switch -Werror=format)
       endif()
     else()
       message(STATUS "Vulkan not found — Windows boot_trace built without the live renderer")
@@ -2042,7 +2050,15 @@ if(TARGET prosper_core)
       # prosper_live_renderer so the exhaustiveness contract holds at every mapping, not just the
       # ones inside frontends/shared/live/live_target_format.hpp.
       if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(gpu_replay PRIVATE -Werror=switch)
+        # -Werror=format for the same reason as -Werror=switch above, and found the same way: by a
+        # defect this tool's own diagnostics hid. gpu_replay prints index values with %zu, and #2836
+        # gave three of those printf arguments a distinct type (ItemIndex) while the format stayed
+        # %zu. Varargs performs no conversion, so the type system has nothing to check, and this
+        # target compiled with neither -Wall nor -Wformat -- the mismatch was invisible in the build
+        # and was caught only in review. #2840 will type the operation indices too, and gpu_replay.cpp
+        # prints those with %zu at roughly sixteen more sites, so the class recurs the moment that
+        # lands. Measured clean under -Wformat=2 before this gate was added.
+        target_compile_options(gpu_replay PRIVATE -Werror=switch -Werror=format)
       endif()
 
       # Seed flags are renderer-registration inputs. Exercise the real gpu_replay process so an
