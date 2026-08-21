@@ -125,14 +125,24 @@ conclusion; it sharpens what "essentially all black" looks like.
   somewhere. **1,793 of the dumps report `nz=2/2`** (non-empty payloads), so this is the resolved
   regime and not the empty-SRT startup window that has voided earlier readings here.
 
-  **Why this is the most promising lead on the table.** This program is the one whose
-  register→base assignment splits into *two orientations* (§ *What the descriptor shape
-  establishes*, 144 folds against 120). A low bit that alternates 50/50 on the slot the five V#s are
-  built from is exactly the shape of a **double-buffer parity selector**. If it is one and prosper
-  masks it away, prosper resolves both orientations to the same buffer — which would make it read the
-  buffer being written and write the one being read. That is a producer/consumer gap by construction,
-  and it would explain, with one mechanism, why one buffer is always cyclic while its partner never
-  is, why prosper's own writes are clean 43/43, and why no *program* could ever be found to blame.
+  **CORRECTED WITHIN THE HOUR — the tagged slot is NOT one of the five V# pointers.** This entry
+  first said the alternating bit sits on "the slot the five V#s are built from", and built a
+  double-buffer-parity argument on it. That is **wrong**. This program loads its five 64-bit pointers
+  at `+0x18/+0x20/+0x28/+0x30/+0x50` (§ *The first 88 folds see an EMPTY SRT*), i.e. dwords **6, 8,
+  10, 12 and 20**. The slot carrying the 50% tag is **dw0 — byte offset 0, not among them**; and the
+  only one of the five that the dump resolved, **dw12 (`+0x30`), is 0 of 88 odd**. Its pointer values
+  also sit in the `0x209c…` range, which is where the 120-byte bindings live, not the `0x20f848…`
+  traversal tables.
+
+  So the parity reading is **not supported by this measurement**: the slot that alternates is not a
+  V# source, and the V# source that was observed does not alternate. What survives is the bare fact
+  in the table — one SRT slot carries a low-bit flag on half its observations, and prosper drops that
+  bit — with **no established connection to the traversal buffers or to the two orientations**.
+
+  Recorded rather than deleted because it is the fourth mechanism this issue has seen proposed and
+  refuted in a day, and because I published the wrong version to the doc, the PR and the issue thread
+  before checking which dword offsets the five pointers actually occupy — a check that was two lines
+  further up this same document.
 
   **`packed_pointer` logs zero lines in this run**, so `rdna2_gta5_packed_pointer.cpp` — prosper's
   existing facility for exactly this class of GTA V pointer — is not engaged for this program.
