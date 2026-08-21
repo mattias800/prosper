@@ -1637,8 +1637,13 @@ struct PcrelTables {
 // and 75/76/77 (n=4); every other value either narrows, normalizes or packs. The component count
 // must MATCH the opcode's, because a typed load whose format is narrower than the opcode
 // default-fills the missing components (0,0,0,1) instead of reading them.
-// CONFIDENCE: HIGH — the identity is the format table's own definition. The live-evidence case is
-// BUF_FMT 22 (`32_FLOAT`, one component); the rest of the family is admitted by the same argument.
+// CONFIDENCE: HIGH, and the reason is a mitigation rather than the table's authority. The table it
+// reads (`agc_shader_layout.cpp:137`) labels itself "HIGH on the anchors, MED on the rest", and of
+// these twelve only 64/74/77 are anchors — the live case, BUF_FMT 22, is not. What makes HIGH
+// defensible is that for all twelve the NON-folded path is also a plain dword copy
+// (`rdna2_emit_alu.cpp`, `value = load_dword(kidx);  // raw 32-bit component`), so a wrong row here
+// would make the fold wrong in exactly the way the ordinary path is already wrong. The fold
+// introduces no divergence of its own.
 inline bool rdna2_buffer_format_is_raw_dwords(uint32_t format, uint32_t components) {
     switch (format) {
         case 20: case 21: case 22: return components == 1;

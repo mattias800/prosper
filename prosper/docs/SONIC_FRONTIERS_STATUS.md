@@ -280,7 +280,8 @@ reach the CFG dispatcher's body, and all three stop at:
 ```text
 [mimg-mip] program=0x2005714000 image_load_mip declined pc=33 shape=0 proven_zero_mip=0
            img_dim=5/1 samples=1 mips=12 mip_tail=0 compressed=0 array_in_gfx=0
-           addr=0x2026900000 2048x2048x1 fmt=1 tile=27 dmask=0x3 unorm=0 glc=0 layer_stride=0
+           addr=0x2026900000 2048x2048x1 dataformat=1 ncomp=2 tile=27 dmask=0x3 unorm=0 glc=0
+           layer_stride=0
 ```
 
 `IMAGE_LOAD_MIP` where the *resource* declares `2D_ARRAY` with a **12-level mip chain** while the
@@ -320,8 +321,21 @@ same family as R-Type Delta's #2783. **That half is now fixed** ([#2859](https:/
 the pre-pass recognised an untyped (`MUBUF`) and a scalar (`SMEM`) consumer but not a **typed**
 one, and Frontiers' consumer is `tbuffer_load_format_x v10, v10, s[0:3], 0 offen` at BUF_FMT 22
 (`32_FLOAT`) — a one-component 32-bit typed format, which performs no conversion at all, so the
-existing constant-lookup fold was already exactly right for it and only the `!is_format` guard stood
-in the way.
+existing constant-lookup fold was already exactly right for its *values*.
+
+The format was only half the proof, and the other half is the more interesting one because it is the
+one that would have been silently wrong. A FORMAT load also applies the descriptor's **DST_SEL**
+channel routing, which a raw `buffer_load_dword*` ignores — and Frontiers' own table descriptor
+carries word3 `0x10005004`, i.e. `DST_SEL = (X, 0, 0, 0)`. Its actual load writes only X and X is
+identity, so the live case is unaffected; a four-component typed fetch through that same descriptor
+would not have been. The typed fold therefore requires identity routing for the channels the opcode
+writes, as well as a conversion-free format. (Whether a typed fetch really does honour DST_SEL is
+`CONFIDENCE: MED` and prosper says it two different ways — see #2869 — but the obligation is
+fail-closed under either reading, so the guard is right regardless.)
+
+The declining `[mimg-mip]` line's sample above prints `dataformat=1 ncomp=2`: that `1` is prosper's
+own `DataFormat` ordinal (`Float32`), **not** the guest `IMG_FMT 64` named in the paragraph below it.
+The two numberings collide constantly and the field is labelled to keep them apart.
 
 ### The blocker list for these three programs is exactly two, and one of them is now closed
 

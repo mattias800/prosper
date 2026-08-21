@@ -2,6 +2,8 @@
 // requiring a complete vertex/fragment. Pure (no Vulkan), so it runs in CI. It also drives the
 // data-driven coverage report over the real game shaders (shader_histo).
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -2808,10 +2810,10 @@ int main() {
     // detect_pcrel_tables the table never folded, so `s_getpc_b64` had nothing to justify it and
     // rejected, and each program's terminal reject was that getpc.
     //
-    // The first three arms keep the layout of the untyped control above byte-for-byte, so the
-    // s_getpc offset and the table's dword index are unchanged; they differ from it in the load
-    // instruction and, where the opcode reads more than one component, in the V# word3 that has to
-    // carry an identity DST_SEL for it.
+    // Every arm keeps the untyped control's LAYOUT byte-for-byte — same s_getpc offset, same table
+    // dword index — so what differs is the load instruction and, where the opcode reads more than one
+    // component, the V# word3 that then has to carry an identity DST_SEL for it. (The branch-entry
+    // arm at the end is the exception: it needs a branch, so it has its own layout.)
     const uint32_t pcrel_table_vs_typed_xyzw[] = {
         0xb0020010u,               // s_movk_i32 s2, 16 bytes
         0xbe8303ffu, 0x10005facu,  // s_mov_b32 s3, V# config (DST_SEL identity XYZW)
@@ -2913,9 +2915,47 @@ int main() {
         0xbf810000u,               // pc14 s_endpgm
         0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,   // pc15 table
     };
-    CHECK(recompile_vertex(pcrel_table_vs_typed_branch_entry,
-                           std::size(pcrel_table_vs_typed_branch_entry), nullptr).empty(),
-          "a branch entering after the s_getpc refuses the typed embedded-table fold (#2862)");
+    // ASSERT THE DETECTOR, NOT THE COMPILE. Every arm above answers through `recompile_vertex`,
+    // which reports "did the whole program compile" -- and a program can fail to compile for reasons
+    // that have nothing to do with the fold. That is not hypothetical: the branch-entry arm was first
+    // written that way and PASSED under a mutation reverting the exact predicate it was meant to pin,
+    // because the forward branch makes that program unlowerable on its own. A recompile-empty check
+    // therefore cannot discriminate here at all.
+    //
+    // `detect_pcrel_tables` is pure, so ask it directly: it either recorded a table for that pc or it
+    // did not, and no unrelated rejection can fake either answer.
+    auto typed_pcrel_folds = [](const uint32_t* code, size_t dwords) {
+        std::vector<Rdna2Inst> instructions;
+        rdna2_walk(code, dwords, instructions);
+        return detect_pcrel_tables(instructions, code, dwords).mtbuf.size();
+    };
+    // The embedded table every arm addresses: four dwords at the blob's tail.
+    const std::vector<uint32_t> expected_table{0xbf800000u, 0xbf800000u, 0u, 0x3f800000u};
+    {
+        std::vector<Rdna2Inst> instructions;
+        rdna2_walk(pcrel_table_vs_typed_x, std::size(pcrel_table_vs_typed_x), instructions);
+        const auto folded = detect_pcrel_tables(instructions, pcrel_table_vs_typed_x,
+                                                std::size(pcrel_table_vs_typed_x)).mtbuf;
+        CHECK(folded.size() == 1 &&
+                  folded.begin()->first == 8u &&           // the MTBUF's own pc
+                  folded.begin()->second == expected_table,
+              "the typed fold records the blob's own four dwords, keyed by the load's pc (#2859)");
+    }
+    CHECK(typed_pcrel_folds(pcrel_table_vs_typed_xyzw,
+                            std::size(pcrel_table_vs_typed_xyzw)) == 1,
+          "detector: a 32-bit-per-component typed load is admitted (#2859)");
+    CHECK(typed_pcrel_folds(pcrel_table_vs_typed_converting,
+                            std::size(pcrel_table_vs_typed_converting)) == 0,
+          "detector: a CONVERTING typed format is refused (#2859)");
+    CHECK(typed_pcrel_folds(pcrel_table_vs_typed_x,
+                            std::size(pcrel_table_vs_typed_x)) == 1,
+          "detector: Sonic Frontiers' own tbuffer_load_format_x word is admitted (#2859)");
+    CHECK(typed_pcrel_folds(pcrel_table_vs_typed_x_swizzled,
+                            std::size(pcrel_table_vs_typed_x_swizzled)) == 0,
+          "detector: a non-identity DST_SEL is refused (#2859)");
+    CHECK(typed_pcrel_folds(pcrel_table_vs_typed_branch_entry,
+                            std::size(pcrel_table_vs_typed_branch_entry)) == 0,
+          "detector: a branch entering after the s_getpc is refused (#2862)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

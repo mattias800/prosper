@@ -6356,8 +6356,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // above when in-dword-provable; anything else that can't pack (packed_word, or an
                 // integer field that could straddle) rejects rather than mis-store.
                 if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
-                // MTBUF's instruction format owns the physical component count. A wider opcode still uses
-                // identity selection (for example XY00), so Z/W must not spill into adjacent memory.
+                // MTBUF's instruction format owns the physical component count. A wider opcode still
+                // reads only those components (for example XY00), so Z/W must not spill into adjacent
+                // memory. NOTE (#2869): "selection" here is the COMPONENT COUNT, not the descriptor's
+                // DST_SEL channel routing -- those are separate V# fields, and MTBUF overriding the
+                // format field says nothing about the selector one. `shader_resources.cpp:210` calls
+                // DST_SEL "a FORMAT-fetch control" and binds it on possibly-typed consumers; no format
+                // lowering here consults it at all. Do not read this line as settling that.
                 const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
                                            ? fmt_ncomp : n;
                 if (!packed) {
@@ -6396,9 +6401,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t old = vreg_old(b, rs, d);
                 uint32_t value;
                 // Format default-fill (#368): a requested component beyond the format's component
-                // count is not read from adjacent memory. MUBUF takes DST_SEL from the V# contract
-                // (0 for G/B/Z, 1 for A/W). MTBUF forces identity selection from its instruction
-                // format (X000/XY00/XYZ0/XYZW), so every absent component is zero.
+                // count is not read from adjacent memory. MUBUF takes the ABSENT-component default
+                // from the V# contract (0 for G/B/Z, 1 for A/W). MTBUF's instruction format names the
+                // present components directly (X000/XY00/XYZ0/XYZW), so every absent one is zero.
+                // NOTE (#2869): this is about which components EXIST, not about how the descriptor
+                // routes the ones that do -- DST_SEL is a separate field and no format lowering in
+                // this file reads it. Not a statement that a typed fetch ignores DST_SEL.
                 if (is_format && fmt_ncomp && k >= fmt_ncomp) {
                     uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
                     value = b.uconst(in.fmt != Rdna2Format::MTBUF && k == 3 ? one : 0u);
@@ -7179,7 +7187,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     std::fprintf(stderr,
                                  "[mimg-mip] program=0x%llx image_load_mip declined pc=%u shape=%d "
                                  "proven_zero_mip=%d img_dim=%u/%u samples=%u mips=%u mip_tail=%d "
-                                 "compressed=%d array_in_gfx=%d addr=0x%llx %ux%ux%u fmt=%d "
+                                 "compressed=%d array_in_gfx=%d addr=0x%llx %ux%ux%u "
+                                 "dataformat=%d ncomp=%u "
                                  "tile=%u dmask=0x%x unorm=%u glc=%u layer_stride=%u\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  (int)rdna2_mimg_zero_mip_shape(in),
@@ -7188,7 +7197,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  (int)res->in_mip_tail, (int)res->compression_enabled,
                                  (int)(in.mimg_dim == 5u && !b.is_compute),
                                  (unsigned long long)res->gpu_addr, res->width, res->height,
-                                 res->depth, (int)res->format, res->tile_mode, in.mimg_dmask,
+                                 res->depth, (int)res->format, res->num_components,
+                                 res->tile_mode, in.mimg_dmask,
                                  (unsigned)in.mimg_unorm, (unsigned)in.mimg_glc,
                                  res->layer_stride_bytes);
                 ok = false;

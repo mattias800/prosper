@@ -59,6 +59,15 @@ table is read back with an *untyped* load. Frontiers reads it with a typed one,
 it fetches are the bytes that are there. The fold was already correct for it; a guard spelled
 "untyped only" was the whole obstacle. That is what this PR fixes.
 
+Two things nearly went wrong on the way, and both are the same shape — a check that looked like a
+check. A typed fetch also honours the descriptor's channel routing, which the untyped one ignores,
+and this game's table descriptor routes three of its four channels to a constant zero; the first
+version of the fix only looked at the format, which would have been right here and silently wrong one
+instruction over. And the test written to pin the *second* correction passed under a mutation that
+deliberately broke the thing it was pinning — it was asserting "did the program compile", and that
+program does not compile for an unrelated reason, so it could never have failed. It asks the detector
+directly now.
+
 With both cleared, all three programs vanish from the skipped list — they recompile and they run:
 
 ```text
