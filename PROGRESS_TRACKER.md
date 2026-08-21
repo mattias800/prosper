@@ -102,7 +102,7 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | --- | --- |
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 2 |
-| 3 -- gameplay with real GPU draws | 8 |
+| 3 -- gameplay with the scene rendering | 8 |
 | 2 -- title screen | 13 |
 | 1 -- any real graphics | 1 |
 | 0 -- not started | 1 |
