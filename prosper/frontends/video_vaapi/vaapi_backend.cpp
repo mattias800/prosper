@@ -17,6 +17,7 @@ extern "C" {
 #include <map>
 #include <mutex>
 #include <vector>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -268,9 +269,15 @@ bool audio_consumer_is_starved(const Session& session) {
 bool enqueue_video(Session& session, VideoPacket packet, std::stop_token stop) {
     std::unique_lock<std::mutex> lock(session.mutex);
     bool starved = false;
-    // Polled rather than purely notified: every transition that matters does notify (next_audio
-    // does, answered or not), but one of the inputs is a CLOCK, and a wait whose predicate can
-    // become true with no event to announce it is a missed-wakeup waiting to happen.
+    // Polled rather than purely notified, and the honest reason is narrower than "a clock input can
+    // silently make the predicate true". It cannot: the clock only ever makes
+    // `audio_consumer_is_starved` go FALSE, because the window EXPIRES with time. Becoming true
+    // requires `audio_pull_at` to move or the audio queue to drain, and both of those notify.
+    //
+    // The poll is belt-and-braces for the one path that genuinely does not notify: a `jthread`
+    // destructor requesting stop. Keeping it is cheap; the earlier rationale was simply backwards,
+    // and a confidently-worded wrong reason in a comment is worse than none, because the next
+    // reader inherits it without checking. (Review of #2906.)
     while (!session.cv.wait_for(lock, kVideoWaitPoll, [&] {
         starved = false;   // the predicate runs many times; only the LAST verdict may act
         if (session.stopping || stop.stop_requested()) return true;

@@ -130,12 +130,12 @@ int main(int argc, char** argv) {
             // audio keeps arriving because a starved audio consumer releases the video wait.
             {
                 const int id = backend()->open(asset);
-                CHECK(id >= 0, "#2899: the clip opens for the audio-only consumer arm");
+                CHECK(id >= 0, "#2905: the clip opens for the audio-only consumer arm");
                 if (id >= 0) {
                     StreamInfo stream{};
                     const bool have = backend()->info(id, stream);
                     CHECK(have && stream.has_audio,
-                          "#2899: the test clip really has an audio stream (the arm is not vacuous)");
+                          "#2905: the test clip really has an audio stream (the arm is not vacuous)");
                     unsigned audio_frames = 0;
                     const auto deadline =
                         std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -144,8 +144,10 @@ int main(int argc, char** argv) {
                         if (backend()->next_audio(id, audio)) ++audio_frames;
                         else std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
-                    // The clip is one second of 48 kHz stereo AAC, i.e. roughly 47 packets of 1024
-                    // samples, and NOTHING here ever pulls a video frame.
+                    // The clip is one second of 48 kHz stereo AAC in an MPEG-4 Part 2 container --
+                    // exactly 45 packets of 1024 samples, counted with ffprobe rather than derived,
+                    // and NOTHING here ever pulls a video frame. (The video track is mpeg4, NOT
+                    // H.264; the H.264 asset is the separate h264_annexb_testpattern.264.)
                     //
                     // The threshold is MEASURED, not guessed, because the first one guessed did not
                     // discriminate: a parked worker still delivers everything it demuxed before the
@@ -155,7 +157,7 @@ int main(int argc, char** argv) {
                     // sides and well under the whole track, so it separates "the worker kept going"
                     // from "the worker parked" without asserting an exact decode order.
                     CHECK(audio_frames >= 35,
-                          "#2899: a consumer that pulls ONLY audio keeps receiving it "
+                          "#2905: a consumer that pulls ONLY audio keeps receiving it "
                           "(the video queue's backpressure does not stop the session)");
                     std::printf("  [info] #2899 audio-only arm collected %u audio frame(s), "
                                 "%llu video frame(s) recycled\n", audio_frames,
@@ -166,7 +168,7 @@ int main(int argc, char** argv) {
                     backend()->close(id);
                 }
                 const int consuming = backend()->open(asset);
-                CHECK(consuming >= 0, "#2899: the clip opens for the consuming control arm");
+                CHECK(consuming >= 0, "#2905: the clip opens for the consuming control arm");
                 if (consuming >= 0) {
                     const auto deadline =
                         std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -179,9 +181,9 @@ int main(int argc, char** argv) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                     CHECK(video_frames > 0 && audio_frames > 0,
-                          "#2899 control: a consumer that pulls both streams receives both");
+                          "#2905 control: a consumer that pulls both streams receives both");
                     CHECK(vaapi_video_frames_dropped(consuming) == 0,
-                          "#2899 control: a session whose video is consumed recycles NO frame");
+                          "#2905 control: a session whose video is consumed recycles NO frame");
                     backend()->close(consuming);
                 }
             }
