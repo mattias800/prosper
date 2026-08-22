@@ -148,16 +148,16 @@ of its manifest.
 | Little Nightmares III | `PPSA05143` | 2 | `12----` | - | - | none | [#2014](https://github.com/mattias800/prosper/issues/2014), [#2022](https://github.com/mattias800/prosper/issues/2022), [#2028](https://github.com/mattias800/prosper/issues/2028), [#1977](https://github.com/mattias800/prosper/issues/1977) | [#1893](https://github.com/mattias800/prosper/issues/1893) | [`LITTLE_NIGHTMARES_3_STATUS.md`](prosper/docs/LITTLE_NIGHTMARES_3_STATUS.md) |
 | Nikoderiko: The Magical World | `PPSA23760` | 2 | `12----` | - | - | none | [#1607](https://github.com/mattias800/prosper/issues/1607) | [#1885](https://github.com/mattias800/prosper/issues/1885) | [`NIKODERIKO_STATUS.md`](prosper/docs/NIKODERIKO_STATUS.md) |
 | Sonic Frontiers | `PPSA03831` | 2 | `12----` | - | - | none | [#2206](https://github.com/mattias800/prosper/issues/2206), [#657](https://github.com/mattias800/prosper/issues/657) | [#1891](https://github.com/mattias800/prosper/issues/1891) | [`SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) |
+| Sonic Origins | `PPSA05325` | 2 | `12----` | **4.7** fps · 47% active · 4K · default launch to the boot auto-save modal · tools/screenshot · 2026-08-22 | - | none | [#2919](https://github.com/mattias800/prosper/issues/2919), [#2920](https://github.com/mattias800/prosper/issues/2920), [#2267](https://github.com/mattias800/prosper/issues/2267), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) |
 | Sonic Racing: CrossWorlds | `PPSA08804` | 2 | `12----` | - | - | none | [#2361](https://github.com/mattias800/prosper/issues/2361), [#2362](https://github.com/mattias800/prosper/issues/2362), [#2363](https://github.com/mattias800/prosper/issues/2363), [#2309](https://github.com/mattias800/prosper/issues/2309), [#2303](https://github.com/mattias800/prosper/issues/2303) | [#1895](https://github.com/mattias800/prosper/issues/1895) | [`SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md) |
 | The Forgotten City | `PPSA03026` | 2 | `12----` | - | - | none | [#1961](https://github.com/mattias800/prosper/issues/1961), [#1945](https://github.com/mattias800/prosper/issues/1945), [#1226](https://github.com/mattias800/prosper/issues/1226) | [#1890](https://github.com/mattias800/prosper/issues/1890) | - |
 | The Oregon Trail | `PPSA19244` | 2 | `12----` | - | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#1606](https://github.com/mattias800/prosper/issues/1606), [#1641](https://github.com/mattias800/prosper/issues/1641), [#1634](https://github.com/mattias800/prosper/issues/1634) | [#1886](https://github.com/mattias800/prosper/issues/1886) | [`OREGON_TRAIL_STATUS.md`](prosper/docs/OREGON_TRAIL_STATUS.md) |
 | The Pathless | `PPSA01826` | 2 | `12----` | - | - | none | [#1570](https://github.com/mattias800/prosper/issues/1570), [#1213](https://github.com/mattias800/prosper/issues/1213) | [#1883](https://github.com/mattias800/prosper/issues/1883) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | The Plucky Squire | `PPSA15319` | 2 | `12----` | - | - | none | [#1390](https://github.com/mattias800/prosper/issues/1390) | [#1882](https://github.com/mattias800/prosper/issues/1882) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Beast of Reincarnation | `PPSA29343` | 1 | `1-----` | **9.2** fps · 56% active · 4K · GAME FREAK logo then the Digital Deluxe bonus dialog, with PROSPER_CB_EFC_NO_COLOR=1 · screenshot · 2026-08-22 | - | none | [#1588](https://github.com/mattias800/prosper/issues/1588), [#2911](https://github.com/mattias800/prosper/issues/2911), [#2915](https://github.com/mattias800/prosper/issues/2915) | [#2916](https://github.com/mattias800/prosper/issues/2916) | [`BEAST_OF_REINCARNATION_STATUS.md`](prosper/docs/BEAST_OF_REINCARNATION_STATUS.md) |
-| Sonic Origins | `PPSA05325` | 1 | `1-----` | - | - | none | [#2267](https://github.com/mattias800/prosper/issues/2267), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) |
 | ArcRunner | `PPSA21406` | 0 | `------` | - | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/ARCRUNNER_STATUS.md) |
 | BALAN WONDERWORLD | `PPSA02058` | 0 | `------` | none | - | none | - | [#2882](https://github.com/mattias800/prosper/issues/2882) | - |
-| Judgment | `PPSA02739` | 0 | `------` | none | - | none | - | [#2880](https://github.com/mattias800/prosper/issues/2880) | - |
+| Judgment | `PPSA02739` | 0 | `------` | none | - | none | [#2923](https://github.com/mattias800/prosper/issues/2923) | [#2880](https://github.com/mattias800/prosper/issues/2880) | [`YAKUZA_JUDGMENT_BRINGUP.md`](prosper/docs/YAKUZA_JUDGMENT_BRINGUP.md) |
 | Little Nightmares II | `PPSA02154` | 0 | `------` | none | - | none | - | [#2884](https://github.com/mattias800/prosper/issues/2884) | - |
 | Metaphor: ReFantazio | `PPSA20800` | 0 | `------` | none | - | none | - | [#2876](https://github.com/mattias800/prosper/issues/2876) | - |
 | PGA TOUR 2K25 | `PPSA17952` | 0 | `------` | none | - | none | [#2894](https://github.com/mattias800/prosper/issues/2894) | [#2895](https://github.com/mattias800/prosper/issues/2895) | [`PGA_TOUR_2K25_STATUS.md`](prosper/docs/PGA_TOUR_2K25_STATUS.md) |
@@ -168,7 +168,7 @@ of its manifest.
 | The First Berserker: Khazan | `PPSA20447` | 0 | `------` | **--** fps · 0% active · 4K · a flat white clear, the only frame it composites · tools/screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#1880](https://github.com/mattias800/prosper/issues/1880) | [#2909](https://github.com/mattias800/prosper/issues/2909) | [`KHAZAN_STATUS.md`](prosper/docs/KHAZAN_STATUS.md) |
 | The Lord of the Rings: Gollum | `PPSA06367` | 0 | `------` | **--** fps · 0% active · 1440p · one flat white composited clear before the boot dies at ~4 s · screenshot · 2026-08-22 | - | none | [#2898](https://github.com/mattias800/prosper/issues/2898) | [#2900](https://github.com/mattias800/prosper/issues/2900) | [`GOLLUM_STATUS.md`](prosper/docs/GOLLUM_STATUS.md) |
 | Unbound: Worlds Apart | `PPSA03274` | 0 | `------` | none | - | none | - | [#2886](https://github.com/mattias800/prosper/issues/2886) | - |
-| Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | - | [#2864](https://github.com/mattias800/prosper/issues/2864) | - |
+| Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | [#2922](https://github.com/mattias800/prosper/issues/2922) | [#2864](https://github.com/mattias800/prosper/issues/2864) | [`YAKUZA_JUDGMENT_BRINGUP.md`](prosper/docs/YAKUZA_JUDGMENT_BRINGUP.md) |
 
 ## Counts
 
@@ -177,8 +177,8 @@ of its manifest.
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 2 |
 | 3 -- gameplay with the scene rendering | 8 |
-| 2 -- title screen | 14 |
-| 1 -- any real graphics | 2 |
+| 2 -- title screen | 15 |
+| 1 -- any real graphics | 1 |
 | 0 -- not started | 14 |
 
 **4 of 54** trackers record a PS5 hardware-oracle comparison; the rest carry

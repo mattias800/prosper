@@ -371,6 +371,34 @@ so the assertion could never have failed. `detect_pcrel_tables` is pure, so the 
 and assert the recorded map. A recompile-outcome assertion cannot discriminate a change that only
 decides whether a table was recorded.
 
+## `s_mov_b32 exec_lo, -1` from an unnarrowed EXEC — **LANDED** (2026-08-22)
+
+The graphics wave size is not plumbed into the recompiler, so the vertex shell sets
+`b.allow_b32_masks = b.ngg_one_lane` — an exception for one byte-exact captured Astro Bot wrapper,
+not a property of any stage. Every Wave32 mask idiom therefore fails closed in a graphics stage, and
+that is correct in general: "write all-ones to the LOW EXEC dword" is the whole mask at Wave32 and
+half of it at Wave64, and reading one as the other re-enables the wrong lanes.
+
+**One case needs none of that.** `exec_narrowed == false` is prosper's invariant for "every lane is
+on". From that state the instruction rewrites the low dword with what it already held and leaves the
+high dword, if any, untouched — the postcondition equals the precondition at either width. It is
+therefore an exact no-op, derived rather than approximated, and it is now lowered as one in every
+stage (`rdna2_emit_alu.cpp`, immediately after the `allow_b32_masks` `s_mov_b32` block).
+
+Scope, and why it cannot regress a working title: every earlier arm returns first — Wave64 compute
+and fragment at the `(is_compute||is_fragment) && wave_size==64` gate, everything Wave32 at the
+`allow_b32_masks` gate — so the rule is reachable only in a graphics stage that rejects outright
+today. It can only turn a reject into an accept.
+
+The narrowed form (Wave32 reconvergence) and any non-all-ones value still reject, and
+`test_rdna2_spirv_struct` pins all three arms; both counter-arms are mutation-checked.
+
+Why it mattered: *Yakuza Kiwami* (`PPSA31334`) emits it at pc=3 in **19 of the 20** distinct
+programs a boot reaches, so the whole title's draw set was skipped for it. It now rejects one
+instruction later, at `bf8a0000` (`s_barrier`, pc=8) — the **generic NGG merged-stage prologue**,
+which is item 2 of the Recommendation list above and a frontier rather than a missing opcode. See
+`YAKUZA_JUDGMENT_BRINGUP.md`.
+
 ## Ruled out
 
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
@@ -379,6 +407,7 @@ without contradictory new evidence.
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
+| A vertex shader rejecting `s_mov_b32 exec_lo, -1` (`befe03c1`) is blocked on **plumbing the graphics wave size**, because the value's meaning depends on whether the wave is 32 or 64 lanes wide | **Falsified for the unnarrowed case, which is the one titles actually hit.** The dependence is real for a general value and for a restore from a NARROWED mask, and both still reject. It does not exist when every lane is already on: writing all-ones to the low dword then rewrites what that dword already held and leaves the high dword untouched, so the postcondition equals the precondition at 32 **and** 64 lanes. No wave width, no lane mapping, no peer lane. The prologue form was gating 19 of *Yakuza Kiwami*'s 20 programs and needed no wave-size contract at all. | #2872, `YAKUZA_JUDGMENT_BRINGUP.md` |
 | A `[recompile-reject] mode=unresolved-operand` on an instruction with **no descriptor operand** -- a plain `s_add_u32 s0, lit, s0` -- means the resource table is incomplete | **Falsified.** `unresolved-operand` says only that the lowering exists and *some* operand did not resolve. It is equally raised when a scalar source has no representable dword in the per-invocation model, including because a **stale saved-mask alias** still claims the register. #2783's reject was on an instruction whose only SGPR source was recycled scratch, and no descriptor was involved at any point. Read *which* operand failed -- the reject line prints every source's kind -- before assuming the descriptor. | #2783 |
 | GTA V's `unresolved-operand` rejects at **VCC reads** (`v_mov_b32 v1, vcc_lo`, `v_add_nc_u32 v0, vcc_lo, v0`) mean prosper's **VCC-as-scalar-scratch model is too narrow** — it admits VCC_LO scalar writes only through an enumerated packet list (`is_wave64_vcc_lo_scalar_cselect` (then named `is_gtav_…`), `is_wave64_vcc_lo_scalar_b32_candidate`, `b32_vcc_scalar_write`), and GTA V also writes VCC_LO with `s_lshl_b32`, `s_mulk_i32`, `s_add_i32`, `s_min_i32` and `v_readfirstlane_b32` | **Falsified — the reject is a symptom three instructions downstream of an unrelated cause.** Widening the write predicate to admit `s_lshl_b32`, extending it in the wave64 MUST dataflow, and adding a dual-domain admission all leave the terminal byte-identical, tested one at a time and then together. `operand_bits` was never the gap either: its `Special` case already reads `rs.sreg[106]` for 106..124. Instrumenting the dataflow gave the actual chain for `0x413d88400`: pc47 `s_mov_b32 s6, s14` makes s6 a MUST scalar word; pc337 **`s_bcnt1_i32_b64 s6, exec`** erases that fact, because `wave64_mask_reduction_source` deliberately returned −1 for architectural EXEC ("already resolved from architectural state by emit_alu"); pc351 `s_lshl_b32 vcc_lo, s6, 2` therefore has a non-scalar source, so VCC_LO's own scalar lifetime is dropped at the pc353 block boundary, and the failure finally surfaces at pc354 in a different register file. emit_alu *can* materialize the reduction, which is why the same packets compile fine inside one block — the coverage arm proving that had passed throughout. **A reject PC names where a fact was consumed, not where it was lost; instrument the MUST dataflow before widening any predicate at the reject site.** | #2481 |
 | A synthetic kernel reproducing that shape (EXEC popcount, a guard, a consume past the merge) is enough to regression-test it | **Falsified.** Three synthetic shapes were built, including one whose guarded block contains an unpredicated scalar write live at the merge specifically to defeat `safe_execz_branches`. All three compiled on **both** sides of the fix: the structured/linearizing routes claim them before the CFG dispatcher — whose block-entry filter is the defect — ever runs. The exact production kernel plus its exact routed resource table **does** discriminate, and that is what `test_exec_population_count` pins; whether some smaller synthetic could also discriminate was not established, so read this row as "three attempts failed" rather than as a proof of minimality. | #2481 |
