@@ -16,30 +16,70 @@ extern "C" {
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <iterator>
 #include <span>
 #include <vector>
 
 namespace prosper::ajm {
 namespace {
 
-class FfmpegMp3Decoder final : public StreamDecoder {
+// How a codec's byte stream is cut into packets.
+//
+//   Parser  every call's bytes are a slice of one continuous elementary stream and FFmpeg's parser
+//           finds the frame boundaries (MP3, and ADTS-framed AAC).
+//   Unit    every call's bytes are exactly one complete access unit, already de-framed by the
+//           guest's own container demuxer, with the codec configuration supplied out of band
+//           (raw AAC out of an MP4 `esds`). Running a parser over these finds no syncword and
+//           silently yields nothing, so the parser must be bypassed rather than merely tolerated.
+enum class Framing { Parser, Unit, Sniff };
+
+// Pack a two-byte MPEG-4 AudioSpecificConfig -- the bytes an MP4 `esds` box would have carried,
+// and the only thing that can configure a de-framed (raw) AAC elementary stream.
+//
+//   5 bits audioObjectType | 4 bits samplingFrequencyIndex | 4 bits channelConfiguration | 3 pad
+//
+// Every field comes from the caller, which for libSceAudiodec means it comes from the guest's own
+// parameter block. Nothing here is inferred. Returns empty for a combination MPEG-4 cannot express
+// in two bytes, because a wrong config decodes to noise rather than to an error and there is
+// nothing downstream that could catch it: object types 31+ use the escape encoding, index 15 means
+// the rate is spelled out explicitly, and channel configuration 0 means the layout is described by
+// a program config element inside the stream.
+inline std::vector<uint8_t> aac_audio_specific_config(uint32_t object_type, uint32_t freq_index,
+                                                      uint32_t channel_config) {
+    if (object_type == 0 || object_type > 30) return {};
+    if (freq_index > 14) return {};
+    if (channel_config == 0 || channel_config > 7) return {};
+    std::vector<uint8_t> asc(2);
+    asc[0] = static_cast<uint8_t>((object_type << 3) | (freq_index >> 1));
+    asc[1] = static_cast<uint8_t>(((freq_index & 1u) << 7) | (channel_config << 3));
+    return asc;
+}
+
+// An ADTS access unit begins with a 12-bit syncword; the four bits after it are layer (always 00
+// for ADTS) and the protection-absent flag, so 0xF6 masks off the one bit that legitimately varies.
+inline bool looks_like_adts(std::span<const uint8_t> data) {
+    return data.size() >= 2 && data[0] == 0xFF && (data[1] & 0xF6) == 0xF0;
+}
+
+class FfmpegStreamDecoder final : public StreamDecoder {
 public:
-    explicit FfmpegMp3Decoder(uint32_t max_channels): max_channels_(max_channels) {
-        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
+    FfmpegStreamDecoder(AVCodecID codec_id, uint32_t max_channels, Framing framing,
+                        std::vector<uint8_t> extradata)
+        : codec_id_(codec_id), max_channels_(max_channels), framing_(framing),
+          extradata_(std::move(extradata)) {
+        const AVCodec* codec = avcodec_find_decoder(codec_id_);
         if (!codec) return;
-        parser_ = av_parser_init(AV_CODEC_ID_MP3);
         context_ = avcodec_alloc_context3(codec);
         frame_ = av_frame_alloc();
         packet_ = av_packet_alloc();
-        if (!parser_ || !context_ || !frame_ || !packet_ ||
-            avcodec_open2(context_, codec, nullptr) < 0) {
-            release();
-            return;
-        }
+        if (!context_ || !frame_ || !packet_) { release(); return; }
+        // Sniff framing decides between Parser and Unit from the first access unit, so its codec
+        // open is deferred; the other two know their answer now and fail construction if it fails.
+        if (framing_ != Framing::Sniff && !open_codec(framing_)) { release(); return; }
         valid_ = true;
     }
 
-    ~FfmpegMp3Decoder() override { release(); }
+    ~FfmpegStreamDecoder() override { release(); }
 
     bool valid() const override { return valid_; }
 
@@ -71,12 +111,50 @@ public:
             return result;
         }
 
+        // A Sniff decoder has not opened its codec yet: the first access unit decides whether this
+        // is a self-framed (ADTS) elementary stream or de-framed units needing out-of-band config.
+        if (framing_ == Framing::Sniff) {
+            if (input.empty()) {          // nothing to decide on yet, and nothing to decode either
+                result.ok = true;
+                result.produced_bytes = static_cast<uint32_t>(written_samples * sizeof(int16_t));
+                return result;
+            }
+            const Framing resolved = looks_like_adts(input) ? Framing::Parser : Framing::Unit;
+            if (!open_codec(resolved)) return fail();
+            framing_ = resolved;
+        }
+
         // FFmpeg permits optimized parsers/decoders to read AV_INPUT_BUFFER_PADDING_SIZE bytes past
         // the packet. Guest buffers provide no such promise, so stage and zero-pad them here.
         if (input.size() > std::numeric_limits<size_t>::max() - AV_INPUT_BUFFER_PADDING_SIZE)
             return result;
         std::vector<uint8_t> padded(input.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
         if (!input.empty()) std::memcpy(padded.data(), input.data(), input.size());
+
+        // Unit framing: the span IS one access unit. Send it whole and report it fully consumed --
+        // there is no parser to tell us otherwise, and a partial consume would desynchronise the
+        // guest's own demuxer cursor.
+        if (framing_ == Framing::Unit) {
+            if (!input.empty()) {
+                av_packet_unref(packet_);
+                packet_->data = padded.data();
+                packet_->size = static_cast<int>(input.size());
+                int send = avcodec_send_packet(context_, packet_);
+                if (send == AVERROR(EAGAIN)) {
+                    if (!receive_frames(&decoded_frames)) return fail();
+                    send = avcodec_send_packet(context_, packet_);
+                }
+                if (send < 0 || !receive_frames(&decoded_frames)) return fail();
+                written_samples += drain(output.subspan(written_samples));
+            }
+            result.ok = true;
+            result.consumed_bytes = static_cast<uint32_t>(input.size());
+            result.produced_bytes = static_cast<uint32_t>(written_samples * sizeof(int16_t));
+            result.decoded_frames = decoded_frames;
+            result.channels = channels_;
+            result.sample_rate = sample_rate_;
+            return result;
+        }
 
         while (input_offset < input.size()) {
             uint8_t* packet_data = nullptr;
@@ -127,6 +205,29 @@ private:
         // against partially advanced state.
         invalidate();
         return {};
+    }
+
+    // Open the codec for a concrete framing. Parser framing allocates FFmpeg's parser; Unit framing
+    // installs the out-of-band extradata instead, which is the only thing that can configure a
+    // de-framed stream.
+    bool open_codec(Framing framing) {
+        const AVCodec* codec = avcodec_find_decoder(codec_id_);
+        if (!codec || !context_) return false;
+        if (framing == Framing::Parser) {
+            if (!parser_) parser_ = av_parser_init(codec_id_);
+            if (!parser_) return false;
+        } else if (!extradata_.empty()) {
+            // FFmpeg takes ownership of extradata and frees it with av_free, so it must come from
+            // FFmpeg's allocator and carry the padding its bitstream readers over-read into.
+            uint8_t* buffer = static_cast<uint8_t*>(
+                av_mallocz(extradata_.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!buffer) return false;
+            std::memcpy(buffer, extradata_.data(), extradata_.size());
+            av_freep(&context_->extradata);
+            context_->extradata = buffer;
+            context_->extradata_size = static_cast<int>(extradata_.size());
+        }
+        return avcodec_open2(context_, codec, nullptr) >= 0;
     }
 
     void release() {
@@ -216,6 +317,9 @@ private:
     }
 
     bool valid_ = false;
+    AVCodecID codec_id_ = AV_CODEC_ID_NONE;
+    Framing framing_ = Framing::Parser;
+    std::vector<uint8_t> extradata_;
     AVCodecParserContext* parser_ = nullptr;
     AVCodecContext* context_ = nullptr;
     AVFrame* frame_ = nullptr;
@@ -234,16 +338,45 @@ private:
 class FfmpegDecoderBackend final : public DecoderBackend {
 public:
     std::unique_ptr<StreamDecoder> create(Codec codec, uint64_t instance_flags) override {
-        if (codec != Codec::Mp3) return nullptr;
         // AJM packs the maximum output channel count in bits 0..6 and sample encoding in bits
         // 7..9. The seam emits signed-16 PCM today; reject S32/float instances rather than silently
         // handing them S16 bytes with a successful sideband.
         const uint32_t encoded_max_channels = static_cast<uint32_t>(instance_flags & 0x7fu);
-        const uint32_t max_channels = encoded_max_channels ? encoded_max_channels : 2u;
         const uint32_t sample_encoding = static_cast<uint32_t>((instance_flags >> 7u) & 0x7u);
-        if (max_channels > 8 || sample_encoding != 0) return nullptr;
-        auto decoder = std::make_unique<FfmpegMp3Decoder>(max_channels);
-        return decoder->valid() ? std::move(decoder) : nullptr;
+        if (sample_encoding != 0) return nullptr;
+        StreamConfig cfg{};
+        cfg.max_channels = encoded_max_channels;
+        return create_configured(codec, cfg);
+    }
+
+    std::unique_ptr<StreamDecoder> create_configured(Codec codec, const StreamConfig& cfg) override {
+        const uint32_t max_channels = cfg.max_channels ? cfg.max_channels : 2u;
+        if (max_channels > 8) return nullptr;
+
+        std::unique_ptr<FfmpegStreamDecoder> decoder;
+        switch (codec) {
+        case Codec::Mp3:
+            decoder = std::make_unique<FfmpegStreamDecoder>(AV_CODEC_ID_MP3, max_channels,
+                                                            Framing::Parser, std::vector<uint8_t>{});
+            break;
+        case Codec::Aac: {
+            // Raw AAC out of an MP4 needs the container's AudioSpecificConfig, which the caller's
+            // rate/channel hints reconstruct. Without them only self-framed (ADTS) input can be
+            // served, so leave the extradata empty and let the sniff resolve to Parser framing --
+            // a de-framed stream then fails visibly at its first access unit rather than decoding
+            // silence forever.
+            std::vector<uint8_t> asc;
+            if (cfg.aac_object_type)
+                asc = aac_audio_specific_config(cfg.aac_object_type, cfg.aac_sample_rate_index,
+                                                cfg.aac_channel_config);
+            decoder = std::make_unique<FfmpegStreamDecoder>(AV_CODEC_ID_AAC, max_channels,
+                                                            Framing::Sniff, std::move(asc));
+            break;
+        }
+        default:
+            return nullptr;   // ATRAC9 stays with the core's vendored LibAtrac9 implementation
+        }
+        return decoder && decoder->valid() ? std::move(decoder) : nullptr;
     }
 };
 
