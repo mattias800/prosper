@@ -12,7 +12,7 @@ no new run was made for that pass. The rest of the document is unchanged.
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | **rung 6** — native 1920×1080 opening gameplay with scripted movement, guarded by the reviewed `gris-gameplay` snapshot (tracker #1869) | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | **rung 1** — 3840x2160 SEGA logo, then decoded 4K movie frames; **no title screen observed**. The black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id). The "holds on white to the end" clause this row used to carry is **falsified on current master**: since #2571 (merged `687d2b70`) made `sceVideodec2Decode` decode by default, the pure-white frame at 80 s is passed *through* and the run continues (100-180 s: 14,871 / 8,978 / 13,351 / 9,294 / 9,372 distinct colours) — evidence in [#2267](https://github.com/mattias800/prosper/issues/2267)'s 2026-08-17 comment. That run did not look for a title screen, and prosper still authors nothing here: 68 of 68 guest scanouts report no present source and no renderer target, so only the flipped buffer's contents changed | Not re-measured since the boot advanced; the earlier silent-port figure no longer describes this state |
+| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | **rung 2** — the 3840x2160 title screen is reached and held, 2 of 2 routed runs on master `f856e7a8`. A **default launch** runs black -> a cyan loading element -> the 4K SEGA logo -> the decoded 4K intro -> the SONIC TEAM logo -> the third-party legal plate -> and then holds from t=200 s to the end of a 420 s run on the game's own **"This title supports auto save."** modal, whose only control is a `[X] Close` button. That hold is the whole of the former "no title screen observed" wall: it is a modal waiting for CROSS, not a renderer or HLE stall. One `cross` (`scripts/sonic/dismiss-boot-notice.pad`) closes it and the title screen comes up and stays up for the rest of the run, cycling Sonic, Tails and Knuckles through the emblem. Two defects remain on it: the **"SONIC ORIGINS" wordmark never draws** on the banner, and about a third of its frames still composite with `Cb == Cr` (#2919). The earlier rungs are unchanged: #1905 fixed the black startup loop, #2571 made the white frame non-terminal, #2901 fixed the movie chroma, and #2910 removed a `sceKernelSleep(1)` re-poll loop at `eboot+0x940380` that only a non-`0x809F0018` return can leave | Not re-measured since the boot advanced; the earlier silent-port figure no longer describes this state |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | rung 6 **on the revision it was reviewed at**, and **RED on current master** — the `cobra-gameplay` guard renders one uniformly black frame for the whole 199.6 s route ([#2899](https://github.com/mattias800/prosper/issues/2899)). Bisected to `ff72e77c` (#1974); see *The rung-6 guard is red on master* below. The reviewed evidence (native 1920×1080 tutorial combat, scripted progression) still describes the state before that commit | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% (measured 2026-07-25, not re-measured since the regression) |
 
 ## Visual evidence
@@ -33,6 +33,18 @@ On exact master `2562269711f89b59f7f3038eab1bb4dcf8468b52`, the direct native `s
 reached the controllable ink-ground scene around 130 seconds: the character moved and animated under
 the scripted input, then settled after the route returned to neutral. The retained 170-second run
 contained 85 source-distinct and 85 pixel-distinct unmodified 1920×1080 frontend frames.
+
+### Sonic Origins
+
+![Sonic Origins — the title screen](../../assets/screenshots/sonic-origins-title-screen.png)
+
+Route: `scripts/sonic/dismiss-boot-notice.pad`, sample 77 of 84 at t=385 s. Direct, unmodified
+`tools/screenshot` capture at native 3840x2160.
+
+![Sonic Origins — the boot auto-save notice](../../assets/screenshots/sonic-origins-autosave-notice.png)
+
+The wall in front of it, from a **default launch with no input**: sample 21 of 42 at t=210 s. The
+`[X] Close` button is the whole blocker.
 
 ### Space Adventure Cobra — The Awakening
 
@@ -67,6 +79,17 @@ PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-title-screen.pad \
 PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-first-gameplay.pad \
   prosper/build-linux/screenshot /path/PPSA09804-app0 \
   --seconds 2 --count 85 --timeout 210 --out "$HOME/prosper-artifacts/gris-gameplay-shots"
+
+# Sonic Origins: default launch -- reaches the boot auto-save modal and holds there
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+  prosper/build-linux/screenshot <DUMP_ROOT>/PPSA05325-app0 \
+  --seconds 10 --count 42 --timeout 520 --out "$HOME/prosper-artifacts/sonic-default"
+
+# Sonic Origins: one CROSS closes it -- reaches and holds the title screen
+PROSPER_PAD_SCRIPT=@prosper/scripts/sonic/dismiss-boot-notice.pad PROSPER_PAD_SCRIPT_LOG=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+  prosper/build-linux/screenshot <DUMP_ROOT>/PPSA05325-app0 \
+  --seconds 5 --count 84 --timeout 520 --out "$HOME/prosper-artifacts/sonic-title"
 
 PROSPER_SAVEDATA_DIR="$HOME/prosper-artifacts/cobra-savedata" \
 PROSPER_SAVE0="$HOME/prosper-artifacts/cobra-save0" \
@@ -178,6 +201,95 @@ Both arms are `tools/screenshot`, Linux/RADV, headless, scale 4, default route. 
 correct on its own and **the fix is not a choice between them** — it is whatever Cobra needs after its
 prepare succeeds, which is still open.
 
+### Sonic Origins reaches rung 2, and the wall was a modal (2026-08-22, master `f856e7a8`)
+
+Everything below is from three `tools/screenshot` runs on the same master and the same dump,
+headless Linux/RADV, native 3840x2160, `PROSPER_RENDER_SCALE=1`, `PROSPER_RENDER_EVERY=1`, no
+warm-up or sampling acceleration.
+
+**Arm A — default launch, no input.** 42 samples at 10 s.
+
+| | |
+| --- | --- |
+| result | `source-distinct=42  pixel-distinct=39  max-pixel-stale=10.0s  guest=running  status=ok` |
+| rate | **4.7 fps while producing frames, 47% of the 419.1 s run active** |
+| sequence | black (0-10 s) -> a cyan loading element on white (30-40 s) -> the **4K SEGA logo** (50-60 s) -> the decoded 4K intro, speed lines over grass (70-130 s) -> the **SONIC TEAM logo** (140-160 s) -> the **third-party legal plate**, Retro Engine / Headcannon Path Tracer / CRIWARE (170-190 s) -> the game's own **"This title supports auto save."** modal from 200 s **to the end** |
+
+The modal is the wall, and it is static: samples 20-41 are the same picture to within the animated
+background stripes — per-pixel mean delta **0.03 to 0.12 out of 255** across ten consecutive 10 s
+samples. It carries one control, a `[X] Close` button. So the run is healthy, the guest is running,
+39 of 42 samples are pixel-distinct, and the title is **waiting for CROSS**.
+
+This is the fourth title in this repository whose progression wall turned out to be input mapping —
+after *Asterix & Obelix: Babylon Mission* (skip was Triangle), *Tales of Graces f Remastered* (two
+OPTIONS-button gates whose Yes/No dialogs default to No) and *Hi-Fi RUSH* (a confirm dialog whose
+cursor starts on the right-hand option). The rule that would have found all four in minutes:
+**if the frames are still changing, it is not a wall.**
+
+**Arm B — `scripts/sonic/dismiss-boot-notice.pad`.** Same launch plus seconds-anchored CROSS pulses
+50 s apart; 84 samples at 5 s.
+
+| | |
+| --- | --- |
+| result | `source-distinct=84  pixel-distinct=72  guest=running  status=ok` |
+| rate | **4.3 fps while producing frames, 50% of the 419.8 s run active** |
+| outcome | the CROSS at t=250.168 s closes the modal; a white fade; the **title screen** from sample 56 (280 s) to sample 83 (420 s) — 28 consecutive samples, cycling Sonic, Tails and Knuckles through the emblem |
+
+**Arm C — same route, `PROSPER_FILELOG=1`.** 34 samples at 10 s. The CROSS at t=200.054 s lands on
+the modal this time and the title screen is up by sample 22 (230 s), so **2 of 2 routed runs reach
+it**; which pulse lands depends on where the modal's fade-in falls, not on whether the route works.
+
+Arm C also fires the progression oracle this document has cited as *never* firing. The frontend
+opens `raw/stage/title/stage_title.pac`, `raw/object/obj_stage_title.pac`,
+`raw/gedit/gedit_stage_title.pac`, `raw/ui/ui_mainmenu.pac` (id=69, 80,214,624 bytes) and
+`raw/ui/ui_mainmenu_pkg_texture_US.pac`, plus the DLC title objects from `dlc2` and `dlc4`. The
+entire miss list for the run is nine language-suffix probes (`*_en.pac`, each followed by a
+successful base-name resolve on the next call), three `dlc3`-prefixed retries that succeed on the
+base content root, and `ui_startup.pac`.
+
+**Why the boot got this far, stated as attribution rather than as proof.** Three fixes landed
+between the last measurement and this one; only the third has a mechanism this title's own
+disassembly pins:
+
+`eboot+0x93fde0` is the save handler's completion method — the function immediately after
+`eboot+0x93fdb0`, the prepare method from the #1905 chain. Its body is
+
+```text
+940350:  mov    rsi,rbx                     ; &event
+         vmovups ...                        ; zero 0x68 bytes of it
+         xor    edi,edi                     ; eventParam = NULL
+940380:  call   0xc49740                    ; -> GOT 0x1e68138 = j8xKtiFj0SY
+                                            ;    = sceSaveDataGetEventResult
+940385:  cmp    eax,0x809f0018
+94038a:  jne    0x940328                    ; ANY other value leaves the loop
+94038c:  mov    edi,0x1
+940391:  call   0xc49750                    ; -> GOT 0x1e68140 = -ZR+hG7aDHw
+                                            ;    = sceKernelSleep(1)
+940396:  jmp    0x940350                    ; ... and round again, forever
+```
+
+Both call targets were checked the way instrument trap 114 requires: the five bytes ending at the
+call site are an `e8` whose target is the `ff 25` PLT thunk for that NID, and the thunk's GOT slot is
+named by `self_dump --import-slots`. On exit the code indexes an `0x19`-entry jump table at
+`eboot+0x1b25658` over `eax - 0x809f0003`; `0x809F0008` is case 5, which lands on `eboot+0x940424`
+and sets the handler's result to `4` — a distinct, handled status, not the generic error arm at
+`eboot+0x940419`.
+
+prosper returned exactly `0x809F0018` until #2910. That is the "operation still in flight, keep
+waiting" code, so any boot that entered this loop slept one second per poll for the life of the
+process. #2910 returns `0x809F0008` for a drained queue instead.
+
+**Two defects remain on the title screen, and neither prevents reaching it.**
+
+1. **The "SONIC ORIGINS" wordmark never draws** on the banner, and no *press any button* prompt
+   appears. The banner, emblem, characters and painted background are all correct. Cause open.
+2. **About a third of the title-screen frames composite with `Cb == Cr`**, so they render magenta
+   and green. Measured over Arm B's title-screen window with the same metric #2731 used:
+   **10 of 28 samples at `corr(Cb, Cr) = +0.9972..+0.9998`**, against `-0.78` on the clean frames of
+   the same scene in the same run. The discriminator is controlled: **Arm A's 42 pre-title frames
+   are 0 of 42 collapsed** (`-1.0000` on the SEGA logo, `-0.72..-0.99` across the whole intro), so
+   this is not #2731 unfixed — it is the same signature surviving on one path.
+
 ## Ruled out
 
 One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
@@ -219,6 +331,9 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | Cobra hangs after the seek because it is waiting for `AVP_STOP`, which prosper's media clock can only fire from inside a guest-initiated `sceAvPlayerIsActive` call | **Falsified by construction.** An experimental prosper-owned timer thread was added that evaluates the same media clock and fires `AVP_STOP` with the calling thread's recorded guest TCB; it fired on time (`the 5077 ms source played out on the media clock -- nothing requested a video frame for 5156 ms`) and the title stayed at 1 pixel-distinct over 40 s. The arm is self-validating: the STOP is logged, so a silent no-op cannot pass as a negative. | #2899 |
 | Cobra stalls because `sceAvPlayerGetAudioData` answers 0 forever, so its audio-clocked pump never asks for video | **The starvation is REAL and is a separate defect; it is not why Cobra is black.** Measured on master with `tools/hle_calls --values`: 942 of 942 `s_avp_getaudiodata` calls return 0 while the decode worker sits in `enqueue_video` with `video_queue=6/6, audio_queue=0` (21 audio packets ever produced, 12 taken). Fixing that head-of-line block so audio keeps flowing changes nothing visible — the title still reports 1 pixel-distinct over 45 s, and still makes zero `GetVideoDataEx`/`IsActive` calls after `sceAvPlayerResume`. | #2899, and the fix in `frontends/video_vaapi/vaapi_backend.cpp` |
 | The paused post-seek delivery window (`seek_deliver`) is simply wrong and removing it is the fix | **Falsified: it is a straight trade, not a correction.** With it suppressed, *Asterix & Obelix: Babylon Mission* (`PPSA30490`) goes from 24 pixel-distinct to 1 — black — which is exactly the #1949 state that window exists to fix. See the two-way table above. | #2899, #1949 |
+| Sonic Origins reaches no title screen because of a renderer, decode, HLE or asset defect after the SEGA logo | **Falsified — it is one modal waiting for a button.** On master `f856e7a8` a default launch reaches the game's own **"This title supports auto save."** notice at t=200 s and holds it to the end of a 420 s run: ten consecutive 10 s samples, per-pixel mean delta **0.03..0.12 / 255** (only the animated background stripes move), `guest=running`, 42/42 source-distinct samples, 4.7 fps while producing. Its only control is a `[X] Close` button, i.e. CROSS. One `cross` window opens the title screen, 2 of 2 runs. Fourth title here whose wall was input mapping. | tracker #1871, this doc |
+| The 2026-08-06 finding that Sonic's post-logo state is *not* input-gated still bounds the current boot | **Superseded by depth, not falsified.** That measurement was taken at the *white-hold* depth on `7dc2a106`, and its evidence was an **APR path-set comparison** — a ~12,000-read input probe resolved the same 162 paths as an input-free arm and never requested `ui_mainmenu*`, `stage_title*` or any `.rsdk`. That was correct there and says nothing about a modal that only exists two fixes later (#2571, #2901, #2910). On the current boot the same oracle **fires**: a routed run opens `raw/stage/title/stage_title.pac`, `raw/object/obj_stage_title.pac`, `raw/gedit/gedit_stage_title.pac` and `raw/ui/ui_mainmenu.pac` (id=69, 80,214,624 bytes). **A negative input result is scoped to the state it was measured in**; re-run it when the state moves. | this doc, this PR |
+| The absent `raw/ui/rpl_texture/ui_title_nocopy.dds` is why the title screen's "SONIC ORIGINS" wordmark does not draw | **Not established, and the obvious link is already broken.** The wordmark really is missing, but that file is **never requested** on the current boot — `PROSPER_FILELOG=1` over a full routed run matches `nocopy` and `rpl_texture` **0 times** — and every asset the title stage does ask for resolves. The only misses in the whole run are language-suffix probes (`*_en.pac`) that fall back to the base name on the next call, plus `ui_startup.pac` (already falsified as a blocker). Cause open; filed as its own issue rather than assumed. | this doc, this PR |
 
 ## Sonic Origins dump audit
 
