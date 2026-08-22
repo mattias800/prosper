@@ -3610,9 +3610,9 @@ int main() {
     // The UNSIGNED sibling of the same shape, in the FRAGMENT stage, using Beast of
     // Reincarnation's (PPSA29343) own words: its scanout pixel shader opens with
     // `v_cvt_u32_f32_sdwa v2, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD`
-    // (7e040ef9 00061402) followed by the WORD_1 form (7e000ef9 00061503). Both rejected the
-    // whole shader before #2913, which dropped every draw into the title's 3840x2160 display
-    // buffers. llvm-mc gfx1030 round-trip verified.
+    // (7e040ef9 00061402) followed by the WORD_1 form (7e000ef9 00061503). Before PR #2917 both
+    // rejected the whole shader, which dropped every draw into the title's 3840x2160 display
+    // buffers. Tracker #2916; llvm-mc gfx1030 round-trip verified.
     const uint32_t fragment_cvt_u32_word_sdwa[] = {
         0x7e040ef9u, 0x00061402u,            // v_cvt_u32_f32_sdwa v2,v2 WORD_0/PRESERVE/DWORD
         0x7e000ef9u, 0x00061503u,            // v_cvt_u32_f32_sdwa v0,v3 WORD_1/PRESERVE/DWORD

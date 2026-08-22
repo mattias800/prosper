@@ -21,10 +21,20 @@ Unreal Engine 5. Three independent checks say UE5 here:
 3. **`uecommandline.txt` content** names `BeastOfReincarnation.uproject`, and the eboot's source
    paths include `/Runtime/AgcRHI/`, UE's PS5 RHI.
 
-Narrowing the **minor** version is weaker and is recorded as a hypothesis, not a finding:
-`Substrate`, `HeterogeneousVolumes` and `SparseVolumeTexture` are present (5.2/5.3-era) while
-`MegaLights`, `AnimNext`, `Chooser` and any Nanite-tessellation string are absent (5.4/5.5-era).
-That brackets it around **UE 5.3**. `CONFIDENCE: HIGH` for "UE5"; `CONFIDENCE: LOW` for "5.3".
+Narrowing the **minor** version is weaker and is recorded as a hypothesis, not a finding. Two
+independent directions agree, which is why it is worth stating at all:
+
+- **String presence/absence.** `Substrate`, `HeterogeneousVolumes` and `SparseVolumeTexture` are
+  present (5.2/5.3-era) while `MegaLights`, `AnimNext`, `Chooser` and any Nanite-tessellation
+  string are absent (5.4/5.5-era).
+- **The container version itself.** TOC version **6** is `EIoStoreTocVersion::OnDemandMetaData`,
+  which is UE 5.3-era — so the same byte that establishes "UE5, not UE4" also brackets the minor
+  version, from an axis that has nothing to do with which subsystems the game happens to link.
+  (Contributed by the reviewer of PR #2917.)
+
+That brackets it around **UE 5.3**. `CONFIDENCE: HIGH` for "UE5"; `CONFIDENCE: LOW` for "5.3" —
+two agreeing indirect signals are still two indirect signals, and no engine version string appears
+anywhere in the dump.
 
 `sce_sys/param.json` reports `sdkVersion 0x1100000000000000` (SDK **11.00**) and
 `requiredSystemSoftwareVersion 0x1260000000000000` (**12.60**). SDK 11 is below the SDK-13 gate on
@@ -76,10 +86,24 @@ Replicated: **2 of 2** unrouted lever runs reach the logo, and their t=35 s fram
 issue.** Across five runs: 0 faults in 2 default runs (240 s, 275 s), **2 faults in 3 lever runs** —
 a SIGSEGV inside `libvulkan_radeon.so` on `AgcSubmissionTh` with `rax=0`, identical instruction
 bytes and identical prosper frames both times ([#2915](https://github.com/mattias800/prosper/issues/2915)).
-Small numbers, so it is a correlation; but the plausible mechanism is the lever's own doing — it
-zeroes every colour write mask, and a draw reaching pipeline creation with no colour writes may hand
-the driver a null. Treat the lever as a measuring instrument with a known defect, not as a candidate
-fix. It does not weaken the A/B: the run that produced both screenshots completed 30 of 30 samples
+**Neither the cause nor even the association is established, and the first draft of this paragraph
+overstated both.** Two things cut against the obvious reading:
+
+- **The arms are not one variable at the GPU.** The lever arm sits at 9.2 fps / 56% active against
+  4.7 fps / 1% — roughly **12x** more real GPU work. "Correlates with the lever" and "correlates
+  with actually rendering" are not separated by five runs, and the second is at least as good an
+  explanation of a driver fault.
+- **Zeroed write masks are not a new state for this code.** `PROSPER_LEGACY_CB_DISABLE_MASK`
+  (#1724) performs the *identical* three assignments ten lines above, on a different mode
+  population. If all-zero masks alone produced a null at pipeline creation, the hazard would not be
+  specific to this lever — which is an argument from the code path being identical, not from a
+  clean run against that lever.
+
+A cheap discriminator, if it is worth one run: `PROSPER_LEGACY_CB_DISABLE_MASK=1` on this title,
+which zeroes masks on a different population and should crash too if the zeroing is the mechanism.
+
+So: treat the lever as a measuring instrument with a **suspected** defect, not as a candidate fix.
+None of this weakens the A/B — the run that produced both screenshots completed 30 of 30 samples
 `guest=running status=ok`, and a crash cannot synthesise a correctly composited 4K UI.
 
 The lever is declared in `prosper/src/gpu/state/render_state.cpp` and is **default off and not a
@@ -89,6 +113,12 @@ because a utility sequence's operation bits stay latched onto later ordinary dra
 suppresses colour on every draw that **decodes** as EFC, which is a superset of the draws that
 **are** one. What the arm establishes is that **the population of draws prosper decodes as EFC is
 what flattens this composite** — a localisation, not an identification.
+
+**That asymmetry is the argument that should stop anyone flipping the default, and it is stronger
+than the three practical reasons above.** A positive arm here can only ever localise a *population*
+of draws; identifying the *operation* is a different claim, and this lever is structurally unable to
+make it. So no amount of good-looking output from the positive arm justifies making it the default —
+the evidence it produces is the wrong shape for that decision, not merely insufficient in quantity.
 
 ### First contact: rung 0, a flat white 4K clear
 

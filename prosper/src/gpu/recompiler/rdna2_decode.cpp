@@ -367,6 +367,16 @@ void decode_operands(Rdna2Inst& i) {
                 // dst_sel:WORD_1 ...` (7e000ef9 00061503), both llvm-mc gfx1030 round-trip
                 // verified. Only the result's signedness differs; the destination-half insert and
                 // the preserved half are the same operation.
+                //
+                // NOT checked here, deliberately: `sd & 0xff000000` — the SRC1_* fields, which are
+                // meaningless for a one-source VOP1 SDWA word. The 0x38 arm below does refuse a
+                // non-zero value there and this arm does not, which is an inconsistency in the
+                // family. It is left alone rather than tightened because the gate is shared with
+                // the pre-existing signed 0x08 path, and narrowing THAT path's accepted set without
+                // the live encoding that motivated it would be an untested behaviour change to a
+                // shape that renders correctly today (Astro's world-map material). Both of this
+                // title's live words have those bits zero. Raised in review of PR #2917; a decision,
+                // not an oversight.
                 else if (((w >> 9) & 0xFFu) == 0x07u || ((w >> 9) & 0xFFu) == 0x08u) {
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u;

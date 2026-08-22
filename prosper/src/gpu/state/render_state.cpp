@@ -153,6 +153,17 @@ bool legacy_cb_disable_mask_enabled() {
 // And read #1706 before believing either arm: the decoded MODE is not per-draw-trustworthy,
 // because a utility sequence's operation bits stay latched onto later ordinary draws. This lever
 // therefore acts on every draw that DECODES as EFC, which is a superset of the draws that ARE one.
+// That is the reason a positive arm cannot justify flipping the default no matter how good the
+// frames look: it localises a POPULATION of draws, and identifying an OPERATION is a different
+// claim that this lever is structurally unable to make.
+//
+// KNOWN HAZARD, #2915: on PPSA29343 a SIGSEGV inside libvulkan_radeon.so on AgcSubmissionTh
+// appeared in 2 of 3 runs with this on and 0 of 2 with it off. Neither the cause nor even the
+// association is established — the lever arm also did roughly 12x more GPU work (56% vs 1% of the
+// run producing frames), so "correlates with the lever" and "correlates with actually rendering"
+// are not separated by those five runs; and PROSPER_LEGACY_CB_DISABLE_MASK ten lines above
+// performs the identical three assignments, so zeroed masks alone are not obviously the mechanism.
+// Recorded here because this is where a reader arrives by grepping the variable name.
 bool cb_eliminate_fast_clear_writes_no_color() {
     static const bool enabled = [] {
         const char* v = std::getenv("PROSPER_CB_EFC_NO_COLOR");
