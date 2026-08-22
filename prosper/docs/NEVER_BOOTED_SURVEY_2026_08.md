@@ -163,8 +163,8 @@ Only unregistered call worth noting beyond the shared set: `sceCoredumpRegisterC
 
 Boots in **224 ms** on the run described here (245 and 473 ms on two others). Renders a **4K logo
 sequence** that genuinely advances — **Bandai Namco Entertainment**, **Tarsier Studios**, **Unreal
-Engine** — through the first ~130 s of a 390 s run.
-6.9 fps while producing frames, 19% of the run active, guest alive at the end.
+Engine** — through the first ~130 s of a 390 s run. 6.9 fps while producing frames, 19% of the run
+active, guest alive at the end.
 
 **Then it goes white and stays white.** On a 13 s grid over 30 samples, the last frame carrying
 content is at **t=130 s**; every sample from **t=143 s to t=390 s** — 20 consecutive samples,
