@@ -3811,7 +3811,52 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
 static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
-static constexpr uint64_t SAVE_DATA_ERR_NO_EVENT = 0x809F0018ull;
+// 0x809F0018 is the "the operation is STILL IN FLIGHT, keep waiting" code. That meaning is
+// corroborated by four independent titles in the local dump set, each of which sleeps and re-polls
+// on it -- better evidence than exists for most constants in this file:
+//
+//   PPSA15552 Dead Cells      +0x173c9b0  call GetEventResult; cmp eax,0x809f0018; jne <exit>;
+//                                         mov edi,0x1f40; call sleep; jmp 0x173c9b0
+//   PPSA15552 Dead Cells      +0x173cda0  same idiom, second site
+//   PPSA28061 Earthion        +0x12f6d    cmp [rbp-0x7c],0x809f0018; jne; sleep(50 ms); jmp <repoll>
+//   PPSA03831 Sonic Frontiers +0x18a2285  cmp eax,0x809f0018; jne; sleep(1); jmp <repoll>
+//   PPSA05325 Sonic Origins   +0x940385   byte-identical (same SEGA save library)
+//
+// prosper has NOTHING in flight: every file operation here completes synchronously and the only
+// event ever queued is Umount2's. So answering 0x809F0018 was not an unestablished value -- it was
+// a well-established "still busy" returned in a state where nothing is busy, i.e. a permanent lie,
+// and a guaranteed infinite hang for any title that reaches one of those loops.
+//
+// A DRAINED queue is therefore reported with NOT_FOUND. PPSA20447 (The First Berserker: Khazan)
+// pins that value directly -- its game thread's drain loop leaves only on 0x809F0008:
+//
+//   eboot+0x796eb2c   jmp    0x796eb3d             ; loop ENTRY -- it polls first, sleeps after
+//   eboot+0x796eb38   call   0x1565790             ; FPlatformProcess::Sleep(float)
+//   eboot+0x796eb41.. vmovups/mov                  ; zero a 104-byte SceSaveDataEvent (96 + 8)
+//   eboot+0x796eb67   xor    edi,edi               ; eventParam = NULL
+//   eboot+0x796eb6f   call   0x8eaf3d0             ; sceSaveDataGetEventResult(NULL, &event)
+//   eboot+0x796eb7b   mov    r12d,eax              ; r12d IS the return value
+//   eboot+0x796eb88   cmp    r12d,0x809f0008       ; <-- the ONLY value that ends the wait
+//   eboot+0x796eb8f   jne    0x796eb30             ; anything else: sleep and poll again
+//   eboot+0x796eb91   movzx  eax,BYTE PTR [rip+..] ; a SECOND gate can still re-enter the loop
+//   eboot+0x796eb9a   jne    0x796eb30
+//
+// Earthion const-compares BOTH, in consecutive instructions -- 0x809F0018 -> sleep and re-poll,
+// then 0x809F0008 -> give up and return -- so the two codes are genuinely distinct in a shipping
+// title's bytes and this file must not merge their meanings, only their current value.
+//
+// SPELLED AS A LITERAL, not aliased to SAVE_DATA_ERR_NOT_FOUND on purpose: the drained-queue answer
+// HAPPENS to be NOT_FOUND today because prosper never has an operation in flight. An implementation
+// that gives sceSaveDataMount3 a real asynchronous path (which Earthion's wait needs -- see below)
+// must return SAVE_DATA_ERR_IN_FLIGHT while the operation runs, and should be able to do that
+// without unpicking an alias.
+// CONFIDENCE: HIGH on both values (five titles' own compare instructions).
+static constexpr uint64_t SAVE_DATA_ERR_IN_FLIGHT = 0x809F0018ull;   // "still running, keep waiting"
+static constexpr uint64_t SAVE_DATA_ERR_NO_EVENT  = 0x809F0008ull;   // drained: same value as NOT_FOUND
+static_assert(SAVE_DATA_ERR_NO_EVENT == SAVE_DATA_ERR_NOT_FOUND,
+              "a drained queue is reported with NOT_FOUND (PPSA20447 eboot+0x796eb88)");
+static_assert(SAVE_DATA_ERR_IN_FLIGHT != SAVE_DATA_ERR_NO_EVENT,
+              "the in-flight and drained codes are distinct in Earthion's bytes (eboot+0x12f6d/+0x12f82)");
 namespace { std::atomic<unsigned> g_savedata_umount_events{0}; }
 HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_term)    { return 0; }
@@ -4162,7 +4207,18 @@ HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); retur
 // generic success with an untouched event made Dead Cells consume a fabricated type-0 completion.
 // Event: { u32 type; s32 errorCode; s32 userId; u32 pad; titleId[16]; dirName[32]; reserved[40] },
 // 104 bytes. CONFIDENCE: HIGH on signature/error/type/size (Dead Cells zeroes exactly 104 bytes and
-// the identical PS4 NID/API defines that layout), MED on the PS5 tail field names.
+// the identical PS4 NID/API defines that layout). The dirName SLOT is now HIGH too, not MED:
+// PPSA28061 Earthion zeroes 0x68 bytes and then does memcmp(event + 0x20, <dirName>, 0x20) at
+// eboot+0x12f99, which pins dirName[32] at +0x20 in a 104-byte struct from a second title's bytes.
+//
+// KNOWN GAP -- prosper posts NO PER-OPERATION COMPLETION EVENT, and one title is already waiting for
+// one. The only event this ever queues comes from Umount2, and it is zero-filled: no titleId, no
+// dirName. Earthion's wait loop (eboot+0x12f30) polls until it gets an event whose dirName matches
+// the directory it is waiting on, and takes its match branch at +0x12fb4 only when that memcmp
+// succeeds -- which is STRUCTURALLY UNREACHABLE here. It survives only because it also has a
+// give-up branch on the drained code. Implementing async Mount3/Prepare/Commit means (a) returning
+// SAVE_DATA_ERR_IN_FLIGHT while the operation runs and (b) queueing a completion event that carries
+// the operation's dirName -- not just bumping a counter. Tracked on #2909 / #1880.
 HLE(s_savedata_get_event) {
     svc_log("sceSaveDataGetEventResult", a0,a1,a2,a3,a4,a5);
     if (!a1) return SAVE_DATA_ERR_PARAMETER;
@@ -4174,6 +4230,9 @@ HLE(s_savedata_get_event) {
             memset(event, 0, 104);
             *(uint32_t*)(event + 0) = 1;  // SCE_SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP
             *(int32_t*)(event + 8) = 1;  // initial user
+            // dirName (+0x20) is deliberately left zeroed: this event is not attributed to any one
+            // save directory, and inventing a name here would make Earthion's memcmp match the
+            // wrong operation. See the KNOWN GAP above.
             return 0;
         }
     }

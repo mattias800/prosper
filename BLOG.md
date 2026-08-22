@@ -170,6 +170,87 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-22
 
+### Khazan spent four seconds booting and then waited forever for one wrong hexadecimal digit
+
+No picture with this one either — *The First Berserker: Khazan* is a new 48 GB UE4 title and it
+composites nothing but a flat white 4K clear. The finding is what moved, and it turned out not to be
+about this title at all.
+
+The stall had an unusually clean shape. `tools/screenshot` reported **one distinct frame in 33
+publications over a 360-second run**, with `guest=running` throughout — so the process was alive and
+producing nothing. A `gdb` dump of the live boot showed **all 79 threads blocked in a syscall**:
+`RenderThread 0`, `RHIThread`, `FAPREventQueueL`, 42 `TaskGraphThread`s and 19 `PoolThread`s all
+parked on a condition variable, and the guest's main thread inside `sceKernelUsleep`. Nothing was
+spinning. Nothing was going to wake anything.
+
+With `PROSPER_SVCLOG=1` exactly one Sony call repeated during the stall — `sceSaveDataGetEventResult`,
+5,020 times in 90 seconds, and *nothing else from any thread*. That is a strong shape: when every
+other thread is idle, the only thing that can change the condition is the answer to that call. So the
+poll's own stack was scanned for guest return addresses, which gave a stable chain, and the first
+frame's function disassembled to the wait loop, verbatim:
+
+```text
+eboot+0x796eb30   vmovss xmm0,[rip+0x3aea72c]     ; the sleep interval
+eboot+0x796eb38   call   0x1565790                ; FPlatformProcess::Sleep(float)
+eboot+0x796eb67   xor    edi,edi                  ; eventParam = NULL
+eboot+0x796eb6f   call   0x8eaf3d0                ; sceSaveDataGetEventResult(NULL, &event)
+eboot+0x796eb88   cmp    r12d,0x809f0008          ; <-- the ONLY value that ends the wait
+eboot+0x796eb8f   jne    0x796eb30                ; anything else: sleep and poll again
+```
+
+prosper answered a drained event queue with `0x809F0018`. The game asks for `0x809F0008`. One digit,
+and the title's boot never happened.
+
+The digit turned out to be the least interesting part. `0x809F0018` is not a wrong number somebody
+made up — it is the code for **"the operation is still running, keep waiting"**, and four other
+titles in the library const-compare it and go back to sleep when they see it: Dead Cells at two
+separate sites, Earthion, Sonic Frontiers and Sonic Origins. So prosper was not returning something
+meaningless. It was returning a perfectly well-attested *"still busy"* in a state where nothing was
+busy — a permanent lie, and a guaranteed hang for any of those five titles that reached one of those
+loops. That is a much better reason for the change than "the constant was wrong", and it only showed
+up because someone went and disassembled the other four.
+
+What makes it worth an entry is the three hypotheses that got there first and were all wrong. The
+title ships Bink `.bk2` startup movies, so the obvious guess was the video-splash deadlock family —
+except a full file log shows **not one movie file is ever opened**. The save it was mounting did not
+exist, so the next guess was that the `NOT_FOUND` was the problem — except pre-creating the directory
+made the mount succeed and the title polled on exactly as before. Then the guess was that it wanted a
+*completion event* rather than a return code, so a probe fed it a synthetic event on every single
+poll, cycling the event type through all eight values over 140 seconds. It never blinked. The loop
+does not look at the event at all; it looks at the return value, and it accepts exactly one.
+
+The fix is not a guess either: `0x809F0008` is a constant prosper already had — it is what it calls
+`SAVE_DATA_ERR_NOT_FOUND` — so "the queue is empty" is now reported the way the guest's own `cmp`
+instruction says it is reported. `0x809F0018` had never been established by any title's bytes.
+
+Because this is a shared HLE constant and not a per-title workaround, the guarded rung-6 titles were
+run against it. *Dead Cells* — the title whose save-data event handling that code was originally
+written for — passes its gameplay guard unchanged: 44 frames, 44 qualifying, 21,045 colours in the
+richest, 44 of 44 structural matches.
+
+There was one more thing in the A/B, and it was not what the A/B was for. *Earthion* was run purely
+as a regression control. On master it made **2,400** of these calls across a 120-second run — line 45
+to line 63,046 of its log — and **never mounted a save at all**. With the fix it makes **five**, and
+then does the whole thing: mount, prepare, get-mount-info, commit, unmount. Identical frame counters
+either way.
+
+The first version of this entry said its save system had been dead and now worked. That is not what
+happens, and the correction is the interesting part. Earthion's loop compares against `0x809F0018`
+and sleeps, and then against `0x809F0008` and **gives up**. So the lifecycle appears because the
+title stopped waiting, not because prosper finally answered it. What it was actually waiting for is
+an event whose `dirName` field matches the directory it asked about — `memcmp(event + 0x20, …, 32)` —
+and the only event prosper can produce is a zero-filled one from `Umount2`. That branch cannot be
+reached today. Giving up is the honest answer when there really is no event, so the change is still
+strictly better; it just is not a save system coming back to life. The real finding is a gap nobody
+had written down: **prosper posts no per-operation completion event carrying a directory name.**
+
+And Khazan? It boots much further now — it mounts its profile, walks all thirty save slots — and then
+runs prosper's direct-memory pool dry and calls Unreal's own out-of-memory handler about six seconds
+in. Still rung 0. But it is a different wall, six seconds later, and it has a number:
+[#2908](https://github.com/mattias800/prosper/issues/2908).
+
+Tracker [#2909](https://github.com/mattias800/prosper/issues/2909).
+
 ### PGA TOUR 2K25 told us exactly what was wrong, in English, and it was not what it said
 
 No picture with this one — the title still does not render. The finding is what moved.
