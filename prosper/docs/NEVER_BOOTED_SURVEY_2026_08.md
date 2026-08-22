@@ -104,11 +104,14 @@ never answer 0 — but a ranking that ordered by call count would put them first
 - **No title is blocked on an unimplemented library that another surveyed title also blocks on.**
   Every rung-0 wall here is title-specific. The sharing is in the *symptoms* (rows 1-3), not in the
   missing surface.
-- **No cross-reference to [#2872](https://github.com/mattias800/prosper/issues/2872)** (the APR
-  gather/scatter read holding *Yakuza Kiwami* and *Judgment*). Metaphor calls one `libSceAmpr` NID —
-  `sceAmprCommandBufferGetNumCommands`, `gzndltBEzWc` — and BALAN calls
-  `sceAmprMeasureCommandSizeWriteAddressOnCompletion` (`C+IEj+BsAFM`); neither is #2872's
-  `sceAmprAprCommandBufferReadFileGatherScatter`, and neither title stops there.
+- **No cross-reference to [#2872](https://github.com/mattias800/prosper/issues/2872)**, the APR
+  gather/scatter read that held *Yakuza Kiwami* and *Judgment*. Two of the eight do call
+  `libSceAmpr` — Metaphor calls `sceAmprCommandBufferGetNumCommands` (`gzndltBEzWc`) and BALAN calls
+  `sceAmprMeasureCommandSizeWriteAddressOnCompletion` (`C+IEj+BsAFM`) — but **neither is #2872's
+  NID**, and neither title stops there.
+  (#2872 was **closed by #2924 on 2026-08-22**, while this survey was running. It is cited here as
+  the cross-reference the survey was asked to check, not as an open blocker; both titles it held
+  are now rung 0 for other reasons.)
 - **All eight are pre-SDK-13** (AGC register-defaults requests: 7, 9, 8, 8, 8, 9, 8, 12), so all
   eight are inside the [#2219](https://github.com/mattias800/prosper/issues/2219) post-submit
   completion-visibility cohort. **That is a shared property, not a shared diagnosis** — no title
