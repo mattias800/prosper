@@ -1,0 +1,174 @@
+# Stray (PPSA02101) -- past the brightness-calibration screen to the first map load.
+#
+# Anchors are SECONDS from the first pad poll (src/input/pad.cpp:207-210 -- a bare number is
+# seconds, 'f' is flips, 'p' is pad reads).
+#
+# VALIDATED on Linux with hardware Vulkan (RADV, AMD Radeon 8060S / STRIX_HALO) at 3840x2160,
+# headless `tools/screenshot` frontend, PROSPER_RENDER=1, PROSPER_GUEST_ARGS=-force-gfx-direct,
+# no render acceleration. Measured 2026-08-22 on master bb57d617.
+#
+# THIS IS THE ONE OF THE THREE THAT REALLY IS CROSS-ONLY.
+#
+# The first-boot screen is the brightness calibration -- three cat silhouettes, a 16-step slider,
+# and a prompt bar reading `/\ Defaults` and `X Accept`. Its own prompt names the button and the
+# button is correct: CROSS accepts, and nothing else is needed through the main menu behind it.
+# Recorded explicitly because the other two routes in this batch are NOT cross-only, and the
+# difference is not guessable from the prompt bar -- BALAN's names CROSS on a screen CROSS cannot
+# leave, and Unbound's title screen names CROSS while the screen after it names SQUARE.
+#
+# Positive control that the route drives the guest: with this route the `X Accept` glyph renders
+# in its pressed state, and the run leaves a screen a default run never leaves.
+#
+# PROGRESS ORACLE IS THE FILE LOG, NOT PIXELS (PROSPER_FILELOG=1) -- this title loses most of its
+# presents to the #2932 wrong composite. With its negative control:
+#
+#   default route, no input, 150 s  -> last asset is  /app0/hk_project/config/tags
+#                                      NO hk_project_mainstart, on 0 of the run's log lines
+#   this route, 415 s               -> /app0/hk_project_mainstart   t~36.5
+#
+# WHAT THIS ROUTE DOES NOT DO: it does not produce a rendered world. After the map load the frames
+# are LETTERBOXED -- black bars top and bottom, i.e. the game's own cinematic framing -- with the
+# picture between them a flat single-colour fill. The guest stays alive and keeps flipping. That
+# is #2932, not this route, which is why the title is still rung 2. Phase 3 is written for the
+# world that map load implies; it has not yet had one to move through.
+
+# --- phase 1: BlueTwelve logo, the calibration screen's X Accept, the main menu.
+3-3.5:cross
+6-6.5:cross
+9-9.5:cross
+12-12.5:cross
+15-15.5:cross
+18-18.5:cross
+21-21.5:cross
+24-24.5:cross
+27-27.5:cross
+30-30.5:cross
+33-33.5:cross
+36-36.5:cross
+39-39.5:cross
+42-42.5:cross
+45-45.5:cross
+48-48.5:cross
+51-51.5:cross
+54-54.5:cross
+57-57.5:cross
+60-60.5:cross
+63-63.5:cross
+66-66.5:cross
+69-69.5:cross
+72-72.5:cross
+75-75.5:cross
+78-78.5:cross
+81-81.5:cross
+84-84.5:cross
+87-87.5:cross
+90-90.5:cross
+
+# --- phase 2: the chapter load and its opening beats; CROSS keeps answering prompts
+#     while the stick starts walking as soon as there is anything to walk in.
+94-94.5:cross
+96-98:left-stick-up
+100-100.5:cross
+102-104:left-stick-up
+106-106.5:cross
+108-110:left-stick-up
+112-112.5:cross
+114-116:left-stick-up
+118-118.5:cross
+120-122:left-stick-up
+124-124.5:cross
+126-128:left-stick-up
+130-130.5:cross
+132-134:left-stick-up
+136-136.5:cross
+138-140:left-stick-up
+142-142.5:cross
+144-146:left-stick-up
+148-148.5:cross
+150-152:left-stick-up
+154-154.5:cross
+156-158:left-stick-up
+160-160.5:cross
+162-164:left-stick-up
+166-166.5:cross
+168-170:left-stick-up
+172-172.5:cross
+174-176:left-stick-up
+178-178.5:cross
+180-182:left-stick-up
+184-184.5:cross
+186-188:left-stick-up
+190-190.5:cross
+192-194:left-stick-up
+
+# --- phase 3: in-world -- walk forward, CROSS is the contextual jump and is harmless.
+196-200:left-stick-up
+200.5-201:cross
+202-206:left-stick-up
+206.5-207:cross
+208-212:left-stick-up
+212.5-213:cross
+214-218:left-stick-up
+218.5-219:cross
+220-224:left-stick-up
+224.5-225:cross
+226-230:left-stick-up
+230.5-231:cross
+232-236:left-stick-up
+236.5-237:cross
+238-242:left-stick-up
+242.5-243:cross
+244-248:left-stick-up
+248.5-249:cross
+250-254:left-stick-up
+254.5-255:cross
+256-260:left-stick-up
+260.5-261:cross
+262-266:left-stick-up
+266.5-267:cross
+268-272:left-stick-up
+272.5-273:cross
+274-278:left-stick-up
+278.5-279:cross
+280-284:left-stick-up
+284.5-285:cross
+286-290:left-stick-up
+290.5-291:cross
+292-296:left-stick-up
+296.5-297:cross
+298-302:left-stick-up
+302.5-303:cross
+304-308:left-stick-up
+308.5-309:cross
+310-314:left-stick-up
+314.5-315:cross
+316-320:left-stick-up
+320.5-321:cross
+322-326:left-stick-up
+326.5-327:cross
+328-332:left-stick-up
+332.5-333:cross
+334-338:left-stick-up
+338.5-339:cross
+340-344:left-stick-up
+344.5-345:cross
+346-350:left-stick-up
+350.5-351:cross
+352-356:left-stick-up
+356.5-357:cross
+358-362:left-stick-up
+362.5-363:cross
+364-368:left-stick-up
+368.5-369:cross
+370-374:left-stick-up
+374.5-375:cross
+376-380:left-stick-up
+380.5-381:cross
+382-386:left-stick-up
+386.5-387:cross
+388-392:left-stick-up
+392.5-393:cross
+394-398:left-stick-up
+398.5-399:cross
+400-404:left-stick-up
+404.5-405:cross

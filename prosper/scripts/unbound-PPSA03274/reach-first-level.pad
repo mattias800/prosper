@@ -1,0 +1,167 @@
+# Unbound: Worlds Apart (PPSA03274) -- past the title screen and the intro cinematic to the
+# first level's map load.
+#
+# Anchors are SECONDS from the first pad poll (src/input/pad.cpp:207-210 -- a bare number is
+# seconds, 'f' is flips, 'p' is pad reads).
+#
+# VALIDATED on Linux with hardware Vulkan (RADV, AMD Radeon 8060S / STRIX_HALO) at 3840x2160,
+# headless `tools/screenshot` frontend, PROSPER_RENDER=1, PROSPER_GUEST_ARGS=-force-gfx-direct,
+# no render acceleration. Measured 2026-08-22 on master bb57d617.
+#
+# THE TITLE SCREEN'S PROMPT AND THE CINEMATIC'S PROMPT NAME DIFFERENT BUTTONS.
+#
+# The 4K title screen draws a lone `X` glyph, and CROSS is right for it. What follows is not
+# another CROSS screen: the intro cinematic draws its own prompt, and it reads
+#
+#     "Press [] to skip"
+#
+# -- SQUARE. MEASURED: a cross-only ladder (110 presses, 330 s) reached the cinematic and then
+# sat on it for the remaining 180 s with that SQUARE prompt still on screen. Adding SQUARE at
+# t=78 skips it, and the first level loads 4 ms later.
+#
+# PROGRESS ORACLE IS THE FILE LOG, NOT PIXELS (PROSPER_FILELOG=1), because this title loses most
+# of its presents to the #2932 wrong composite and a pixel read of one sample is unreliable. The
+# oracle has a negative control, which is what makes it worth anything:
+#
+#   default route, no input, 120 s   -> last asset is  movies/screen_village_logo.mp4
+#                                       NO mainmenubg.mp4, NO intro_01.mp4, NO normalvillage
+#   this route, 330 s                -> movies/mainmenubg.mp4   t~3.5
+#                                       movies/intro_01.mp4     t~7.0
+#                                       /app0/normalvillage     t~78.0   <- the first level
+#
+# `normalvillage` is reproduced at t=78.01 on two independent runs, and it appears in the log
+# immediately after the SQUARE press, on the same line group as the guest's own
+# `sceAvPlayerSetTrickSpeed` call (NID av8Z++94rs0) -- i.e. the skip path. It is absent from
+# every default run measured.
+#
+# WHAT THIS ROUTE DOES NOT DO: it does not produce a rendered level. After the map load the guest
+# stays alive and the renderer keeps producing frames (flips 3146 -> 7812, rendered frames
+# 3258 -> 12811 over the following 250 s), but 175 of the 178 samples after the load are a flat
+# two-tone clear with exactly half the pixels non-black. That is the #2932 wrong composite, not
+# this route, and it is why the title is still rung 2. Phase 3 below is written for the world
+# that load implies; it has not yet had one to move through.
+
+# --- phase 1: logos, the title screen's lone X prompt, and the main menu. CROSS.
+3-3.5:cross
+6-6.5:cross
+9-9.5:cross
+12-12.5:cross
+15-15.5:cross
+18-18.5:cross
+21-21.5:cross
+24-24.5:cross
+27-27.5:cross
+30-30.5:cross
+33-33.5:cross
+36-36.5:cross
+39-39.5:cross
+42-42.5:cross
+45-45.5:cross
+48-48.5:cross
+51-51.5:cross
+54-54.5:cross
+57-57.5:cross
+60-60.5:cross
+63-63.5:cross
+66-66.5:cross
+69-69.5:cross
+72-72.5:cross
+75-75.5:cross
+
+# --- phase 2: the intro cinematic. SQUARE is its own skip prompt; the CROSS 2 s later
+#     answers whatever menu or dialog the skip lands on.
+78-78.5:square
+80-80.5:cross
+84-84.5:square
+86-86.5:cross
+90-90.5:square
+92-92.5:cross
+96-96.5:square
+98-98.5:cross
+102-102.5:square
+104-104.5:cross
+108-108.5:square
+110-110.5:cross
+114-114.5:square
+116-116.5:cross
+120-120.5:square
+122-122.5:cross
+126-126.5:square
+128-128.5:cross
+132-132.5:square
+134-134.5:cross
+138-138.5:square
+140-140.5:cross
+144-144.5:square
+146-146.5:cross
+150-150.5:square
+152-152.5:cross
+
+# --- phase 3: in-world -- walk right and jump, this being a 2D platformer. A sparse
+#     SQUARE covers a later cutscene without being dense enough to spam an ability.
+156-159:left-stick-right
+159.2-159.6:cross
+162-165:left-stick-right
+165.2-165.6:cross
+168-171:left-stick-right
+171.2-171.6:cross
+174-177:left-stick-right
+177.2-177.6:cross
+180-183:left-stick-right
+183.2-183.6:cross
+184.5-185:square
+186-189:left-stick-right
+189.2-189.6:cross
+192-195:left-stick-right
+195.2-195.6:cross
+198-201:left-stick-right
+201.2-201.6:cross
+204-207:left-stick-right
+207.2-207.6:cross
+210-213:left-stick-right
+213.2-213.6:cross
+214.5-215:square
+216-219:left-stick-right
+219.2-219.6:cross
+222-225:left-stick-right
+225.2-225.6:cross
+228-231:left-stick-right
+231.2-231.6:cross
+234-237:left-stick-right
+237.2-237.6:cross
+240-243:left-stick-right
+243.2-243.6:cross
+244.5-245:square
+246-249:left-stick-right
+249.2-249.6:cross
+252-255:left-stick-right
+255.2-255.6:cross
+258-261:left-stick-right
+261.2-261.6:cross
+264-267:left-stick-right
+267.2-267.6:cross
+270-273:left-stick-right
+273.2-273.6:cross
+274.5-275:square
+276-279:left-stick-right
+279.2-279.6:cross
+282-285:left-stick-right
+285.2-285.6:cross
+288-291:left-stick-right
+291.2-291.6:cross
+294-297:left-stick-right
+297.2-297.6:cross
+300-303:left-stick-right
+303.2-303.6:cross
+304.5-305:square
+306-309:left-stick-right
+309.2-309.6:cross
+312-315:left-stick-right
+315.2-315.6:cross
+318-321:left-stick-right
+321.2-321.6:cross
+324-327:left-stick-right
+327.2-327.6:cross
+330-333:left-stick-right
+333.2-333.6:cross
+334.5-335:square

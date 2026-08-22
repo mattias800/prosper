@@ -70,12 +70,12 @@ Last updated: 2026-08-22
 | *The First Berserker: Khazan* | `PPSA20447` | Unreal Engine 4 | 🔬 Rung 0 — boots, mounts and enumerates all thirty save slots, but composites only a flat white 4K clear; the guest then exhausts prosper's direct-memory pool and calls its own OOM handler ([#2908](https://github.com/mattias800/prosper/issues/2908)). The save-data event-drain code that parked its game thread forever is fixed | [#2909](https://github.com/mattias800/prosper/issues/2909) |
 | *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Rung 0 — the fastest boot tracked (161 ms) and zero frames: it dies ~7 s in with a SIGSEGV in its CRI Mana movie thread ([#2934](https://github.com/mattias800/prosper/issues/2934)) | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots and runs indefinitely without faulting, executes real GPU draws and presents 4K frames with zero recompiler rejections, but every frame is pure black ([#2923](https://github.com/mattias800/prosper/issues/2923)) | [#2880](https://github.com/mattias800/prosper/issues/2880) |
-| *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Rung 2 — the game's own 4K language-select menu renders in full, and waits for Cross; but only ~18% of frames carry it and the rest are a flat white 4K clear ([#2932](https://github.com/mattias800/prosper/issues/2932)) | [#2882](https://github.com/mattias800/prosper/issues/2882) |
-| *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Rung 2 — the BlueTwelve logo and the game's own 4K brightness-calibration screen, held for the rest of the run; its prompt reads `✕ Accept` and no input is sent | [#2883](https://github.com/mattias800/prosper/issues/2883) |
+| *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Rung 2 — a routed run answers the language menu's own *"Are you sure you want to change the game language to English?"* modal, which needs **Down** and not Cross, and reaches the title screen at t≈15 s, the main menu, and the opening story cutscene, which is a **decoded 4K H.264 movie** (two VA-API access-unit decoders open at t≈126 s, 3070 pictures) composited by prosper. No stage loads in 717 s, and the wrong composite still takes most frames ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/balan-PPSA02058/` | [#2882](https://github.com/mattias800/prosper/issues/2882) |
+| *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Rung 2 — a Cross-only route accepts the brightness-calibration screen its own `✕ Accept` prompt names, and reaches the first map load (`hk_project_mainstart`, t≈37 s, absent from every default run). The world then composites as a flat **letterboxed** clear, so no scene renders ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/stray-PPSA02101/` | [#2883](https://github.com/mattias800/prosper/issues/2883) |
 | *Little Nightmares II* | `PPSA02154` | Unreal Engine 4 | 🔬 Rung 1 — a 4K logo sequence (Bandai Namco → Tarsier → Unreal) renders for ~130 s, then the composite is a flat white 4K clear for the remaining 260 s of a 390 s run and no title screen is reached ([#2932](https://github.com/mattias800/prosper/issues/2932)); it also calls the unregistered `sceAgcDcbDrawIndirect` ([#2929](https://github.com/mattias800/prosper/issues/2929)) | [#2884](https://github.com/mattias800/prosper/issues/2884) |
 | *Spacebase Startopia* | `PPSA02846` | Unity 2020.3.1 / IL2CPP | 🔬 Rung 0 — boots in 447 ms, publishes 3 flips and one black 1080p frame, then stops submitting while its own threads and FMOD audio keep running ([#2933](https://github.com/mattias800/prosper/issues/2933)) | [#2887](https://github.com/mattias800/prosper/issues/2887) |
 | *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Rung 0 — every frame is a flat 4K clear, white then magenta. Two further defects on the same boot: a GPU hard recovery from a compute submit, in 2 of 3 runs and both naming the same program ([#2935](https://github.com/mattias800/prosper/issues/2935)), and the guest's own out-of-memory assert in the third ([#2908](https://github.com/mattias800/prosper/issues/2908), shared with *Khazan*) | [#2885](https://github.com/mattias800/prosper/issues/2885) |
-| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — the 4K title screen renders, with the wordmark and a Cross prompt, but on only ~9% of frames at a strict 5 s cadence; a near-black diagonal wedge otherwise ([#2932](https://github.com/mattias800/prosper/issues/2932)) | [#2886](https://github.com/mattias800/prosper/issues/2886) |
+| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — a routed run passes the title screen on Cross and skips the intro cinematic on **Square**, which is what that screen's own `Press ▢ to skip` prompt names, reaching the first level's map load (`normalvillage`, t≈78 s, absent from every default run). The level then composites as a flat two-tone clear ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/unbound-PPSA03274/` | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 
@@ -632,6 +632,16 @@ band ([#2932](https://github.com/mattias800/prosper/issues/2932)). The prompt is
 See [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and
 the [tracker](https://github.com/mattias800/prosper/issues/2886).
 
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic.png" alt="Unbound: Worlds Apart — the intro cinematic at 3840x2160: the cloaked blue-hooded character Soli standing beside a golden deer in a teal moonlit forest clearing, thatched huts and bunting behind them, purple mushrooms and grass in the foreground, and a prompt reading Press Square to skip"></p>
+
+A direct, unmodified `tools/screenshot` capture at 3840×2160, driven by
+[`prosper/scripts/unbound-PPSA03274/reach-first-level.pad`](prosper/scripts/unbound-PPSA03274/reach-first-level.pad).
+Cross clears the title screen, and the screen after it names a **different** button: its own prompt
+reads `Press ▢ to skip`. A cross-only ladder sat on this cinematic for 180 s; Square skips it and
+the first level's map load (`normalvillage`) follows at t ≈ 78 s, on two independent runs and never
+on a default one. The level itself composites as a flat two-tone clear, so the world does not yet
+render.
+
 ## BALAN WONDERWORLD — `PPSA02058`
 
 <p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.png" alt="BALAN WONDERWORLD — the language-select screen at 3840x2160: a Language Settings heading over a red and gold theatre interior, with 24 language buttons in three columns, English highlighted in cyan, and a prompt bar reading Change Language and Select Language"></p>
@@ -644,13 +654,33 @@ including CJK, Thai, Greek, Cyrillic and Arabic, and the prompt bar names the bu
 [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2882).
 
+<p align="center"><img src="assets/screenshots/balan-wonderworld-main-menu.png" alt="BALAN WONDERWORLD — the main menu at 3840x2160: a red and gold theatre interior with a lit proscenium and drawn curtains, a menu column on the right reading Language Settings, Settings, Credits and Copyright Information, and a 2021 Square Enix copyright line"></p>
+
+<p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.png" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
+
+Direct, unmodified `tools/screenshot` captures at 3840×2160, driven by
+[`prosper/scripts/balan-PPSA02058/reach-title-and-prologue.pad`](prosper/scripts/balan-PPSA02058/reach-title-and-prologue.pad).
+**The language screen is not waiting for Cross.** Pressing Cross raises its own modal — *"Are you
+sure you want to change the game language to English?"* — and 109 Cross presses over 330 s never
+leave the screen, loading no asset a default run does not. **Down** answers the modal; `/app0/title`
+then opens at t ≈ 15.5 s. Behind it the title screen and main menu render, and then the opening
+story cutscene, which is real GPU draws at 4K rather than a decoded movie — the boot logs no video
+decode of any kind. No stage asset loads in a 717 s run, so this is not yet gameplay.
+
 ## Stray — `PPSA02101`
 
 <p align="center"><img src="assets/screenshots/stray-brightness-calibration.png" alt="Stray — the brightness-calibration screen at 3840x2160: three grey cat-head silhouettes at increasing brightness on black, instruction text above them, a 16-step slider below, and Defaults and Accept prompts in the lower right"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
 The BlueTwelve Studio logo plays and the game's own brightness-calibration screen renders in full,
-then holds. Its prompt reads `✕ Accept`, and nothing on the default route presses it. See
+then holds. Its prompt reads `✕ Accept`, and on this default route nothing presses it.
+[`prosper/scripts/stray-PPSA02101/reach-first-map.pad`](prosper/scripts/stray-PPSA02101/reach-first-map.pad)
+does, and it is the one of these three titles whose on-screen glyph really is sufficient: Cross
+accepts the screen and carries the main menu behind it, and the first map load
+(`hk_project_mainstart`) follows at t ≈ 36.5 s — absent from every default run measured. There is
+no capture of what is behind it because there is nothing to show: the frames after the load are
+letterboxed with a flat single-colour fill between the bars, and a flat clear is not progression
+evidence. See
 [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2883).
 

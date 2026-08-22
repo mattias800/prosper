@@ -21,6 +21,17 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-22
 
+### BALAN's language menu was never waiting for Cross
+
+<p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.png" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
+
+Three titles sat on a screen whose own prompt named a button. Only one really was waiting for it.
+BALAN's language menu answers Cross with a modal — *change the language to English?* — that 109
+Cross presses never got past; **Down** does, and behind it are the title screen, the main menu, and
+this, the opening cutscene — 3070 decoded 4K pictures. Unbound wanted **Square**, the button its
+cinematic actually asks for. Trackers [#2882](https://github.com/mattias800/prosper/issues/2882), [#2883](https://github.com/mattias800/prosper/issues/2883),
+[#2886](https://github.com/mattias800/prosper/issues/2886).
+
 ### The eight titles nobody had ever run
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
