@@ -621,11 +621,26 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     what is new. It is **not** generated, so nothing backfills a missing entry and nothing goes red
     when one is skipped: the picture simply never surfaces, which is the whole failure this file
     exists to prevent.
-    Put the entry at the top under a `## YYYY-MM-DD` heading, with the image and a sentence about
-    **what you are looking at** — not what the change was. The commit subject already says what the
-    change was, and that is exactly what made the old generated feed useless. A paragraph when a
-    title finally does something ("we finally reached gameplay in X, look"), one line when it is just
-    another capture.
+    **It is a screenshot blog: image-heavy, text-light, always.** The rules used to live in
+    `BLOG.md`'s own header, which put authoring instructions in front of every reader who opened the
+    file to look at progress. They live here now.
+    - **Pictures: as many as you have.** Every screenshot the PR produced goes in the entry. An entry
+      covering eight titles shows eight titles, not one — that happened, and the other seven captures
+      sat in `assets/screenshots/` invisible to the only audience they existed for. A picture costs a
+      reader nothing to skip and everything to not have. Never economise here.
+    - **Words: one sentence saying what now works.** *"We now reach correct rendering of the Sonic
+      Frontiers title screen."* Then the screenshot. A second sentence only if the picture misleads
+      without one — a defect you want noticed, or a caveat about what is being seen. Say what you are
+      **looking at**, not what the change was; the commit subject already says what the change was,
+      and that is exactly what made the old generated feed useless.
+    - **One exception: a fix that moves several titles at once** earns a short plain-language
+      paragraph on the problem and the fix, because those are the ones a reader wants explained. Still
+      lead with the pictures. A single-title fix links its tracker instead.
+    - Everything else — measurements, bisects, censuses, mechanisms, reasoning — belongs in the
+      tracker, the PR or the status doc. Link, never transcribe. If an entry has a table, a code
+      block, or more than one or two numbers, it is a report wearing a blog entry's clothes. Six
+      entries filed in one day ran 330-946 words against the file's own median of about 60, and the
+      owner noticed before any check did.
     Write it even when the news is bad or the picture is ugly: *Sonic Frontiers*' black-world capture
     is in there precisely because the honest record is the point. And write it even when the rung did
     **not** move — a capture of a title that got further and still fell short is worth more than
