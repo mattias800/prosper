@@ -540,6 +540,41 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
+            // `s_mov_b32 exec_lo, -1` while EXEC is still the full unnarrowed wave mask, at ANY
+            // wave width and in any stage.
+            //
+            // Everything above needs to know the wave width, because "write all-ones to the low
+            // EXEC dword" means the whole mask in Wave32 and only half of it in Wave64 -- and the
+            // GRAPHICS wave size is not plumbed into the recompiler, so the vertex shell fails
+            // closed (rdna2_to_spirv.cpp: `b.allow_b32_masks = b.ngg_one_lane`, an exception for
+            // one byte-exact captured wrapper rather than a property of any stage).
+            //
+            // This case does not need it. `exec_narrowed == false` is prosper's invariant for "every
+            // lane is on" (the field's own definition, and what the s_wqm_b32 path below and the
+            // fragment export path in rdna2_to_spirv.cpp both already rely on). Setting the low
+            // dword to all-ones from that state leaves every lane on under EITHER width: in Wave32
+            // it rewrites the whole mask with what it already held, and in Wave64 it rewrites the
+            // low half with what it already held and does not touch the high half. So the exact
+            // lowering is a no-op, derived rather than approximated -- no lane mapping, no wave
+            // width, no peer lane.
+            //
+            // It is the compiler's standard program prologue, which is why it gates whole titles
+            // rather than odd shaders: Yakuza Kiwami (PPSA31334) emits `bfa00003` (s_branch) then
+            // `befe03c1` (this instruction) at pc=3 in 19 of the 20 distinct programs a boot
+            // reaches, and every draw was skipped for it.
+            //
+            // Deliberately NOT extended to the narrowed case. Restoring all-lanes from a NARROWED
+            // EXEC is the Wave32 reconvergence idiom, and reading it that way in a Wave64 program
+            // would silently re-enable the wrong lanes -- that one does need the wave size, and
+            // stays fail-closed. CONFIDENCE: HIGH.
+            if (in.opcode == kSop1OpcodeMovB32 && in.dst.value == 126 && !rs.exec_narrowed &&
+                in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+                rs.exec = b.btrue();
+                rs.exec_narrowed = false;
+                rs.sreg.erase(126);
+                rs.sreg_srt.erase(126);
+                return true;
+            }
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
                 sop1_opcode_is_emitted_saveexec_b32(in.opcode)) {
