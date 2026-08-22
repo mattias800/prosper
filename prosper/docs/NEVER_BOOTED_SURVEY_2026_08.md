@@ -71,7 +71,7 @@ not a *wall*.
 | # | Blocker | Titles held | Which |
 | --- | --- | --- | --- |
 | 1 | **The finished frame loses most presents to a wrong composite** — flat white 4K clear, or a near-black diagonal wedge ([#2932](https://github.com/mattias800/prosper/issues/2932)) | **3 of 8**, and 3 more already recorded | BALAN, Little Nightmares II, Unbound — plus *Beast of Reincarnation* ([#1588](https://github.com/mattias800/prosper/issues/1588)), *Gollum* ([#2898](https://github.com/mattias800/prosper/issues/2898)), *Khazan* ([#2908](https://github.com/mattias800/prosper/issues/2908)), all rung 0 on "a flat white clear" |
-| 2 | **The game's own screen waits for CROSS and nothing presses it** | **3 of 8** | BALAN (language select), Stray (`✕ Accept`), Unbound (title-screen prompt) |
+| 2 | **The game's own screen waits for CROSS and nothing presses it** — **SETTLED 2026-08-22**, and only one of the three was actually waiting for CROSS (see [below](#row-2-settled--what-was-behind-the-three-screens)) | **3 of 8** | BALAN (language select), Stray (`✕ Accept`), Unbound (title-screen prompt) |
 | 3 | **UE4's allocator asserts after the halving probe** ([#2908](https://github.com/mattias800/prosper/issues/2908)) | **2** | Sifu (new carrier), *Khazan* `PPSA20447` |
 | 4 | **`sceAgcDcbDrawIndirect` unregistered** ([#2929](https://github.com/mattias800/prosper/issues/2929)) | 0 confirmed; **2 confirmed callers**, NID in **49 of 54** dumps | Little Nightmares II, Sifu — and on the first of those, the composite's turn to permanent white brackets the call in both runs (`CONFIDENCE: LOW`) |
 | 5 | **HTTP entry points answer a false success** ([#2930](https://github.com/mattias800/prosper/issues/2930) v1, [#2894](https://github.com/mattias800/prosper/issues/2894) v2) | 0 here; **7 of 8** call one | all but Spacebase — v1 on six, v2 on Metaphor |
@@ -103,6 +103,37 @@ terms — a missing indirect draw deletes real content silently, and an id-retur
 never answer 0 — but a ranking that ordered by call count would put them first and be wrong.
 
 **Row 3 is the one that changed a shared blocker's shape.** See its section.
+
+### Row 2, settled — what was behind the three screens
+
+Routed 2026-08-22 on master `bb57d617`, one `.pad` route per title under `prosper/scripts/`, same
+frontend and conditions as the rest of this document. **All three advance, none reaches a rendered
+world, and the prompt bar was a reliable guide on exactly one of them.**
+
+| Title | What the route needed | Reaches | Rung |
+| --- | --- | --- | --- |
+| Stray | **CROSS only** — its `✕ Accept` prompt was the whole story | `/app0/hk_project_mainstart`, t≈36.5 s | 2 |
+| Unbound | CROSS for the title screen, then **SQUARE** — the next screen's own prompt reads `Press ▢ to skip` | `/app0/normalvillage`, t≈78.0 s | 2 |
+| BALAN | CROSS raises a modal (*"Are you sure you want to change the game language to English?"*); **DOWN** answers it | `/app0/title`, t≈15.5 s → title screen and main menu (engine-rendered), then the opening cutscene as a **decoded 4K H.264 movie** (decoders open t≈126 s, 3070 pictures) | 2 |
+
+Each claim carries a **negative control**: the map/asset named above appears on **no** default,
+no-input run of that title, and the progress oracle is the file log rather than pixels precisely
+because [#2932](https://github.com/mattias800/prosper/issues/2932) makes any single sample unreliable in both directions.
+
+**The falsification worth carrying forward is BALAN's.** Its prompt bar names CROSS, CROSS is
+accepted, and CROSS still never leaves the screen — 109 presses over 330 s loaded nothing a default
+run does not. A 10-arm probe (one 30 s window per candidate button, CROSS interleaved) put the
+breakout in the `down` window after `left` and `right` had both failed, and a re-run with CROSS+DOWN
+alone reproduced it at t = 15.5 s on two further runs. So *"the prompt names the button"* is not
+even a reliable **negative** — a screen can name a button that is genuinely accepted and still be
+gated on a second one.
+
+**What row 2 converts into.** For all three titles the blocker is now row 1: the map loads, the
+guest stays alive and the renderer keeps producing frames, and the composite is a flat clear —
+two-tone for Unbound, letterboxed for Stray, white for BALAN. Row 1 was already the largest cluster
+in this survey; settling row 2 moved three more titles behind it rather than past it. BALAN is the
+exception worth noting: its title screen, main menu and full 4K in-engine prologue **do** render,
+so the wrong composite is taking frames rather than all content.
 
 ### What the survey did NOT find
 
