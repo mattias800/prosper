@@ -143,7 +143,7 @@ teaching the decoder and the emitter the unsigned opcode, with an execution-diff
 asserts the **preserved** half — a lowering that ignored the destination select would overwrite all
 32 bits and still "recompile".
 
-### After the fix: the scanout draws land, the frame is still a clear
+### After the recompiler fix: the scanout draws land, the default frame is still a clear
 
 Same route, same duration, `PROSPER_DROPPED_DRAW_CENSUS=1`, current branch:
 
@@ -163,8 +163,9 @@ draw that now executes looks like when the surface it reads is empty. Frame rate
 (t=5 s at `frame_seq` 380 against 177 before), consistent with 400-odd fewer per-draw rejections
 per second.
 
-It is still a flat clear, so it is still **rung 0**. The fix removed one blocker and exposed the
-next; it did not produce a frame, and this document does not claim it did.
+On the **default** route it is still a flat clear, so the default route is still rung 0: this fix
+removed one blocker and exposed the next, and it did not produce a frame on its own. The frame comes
+from the second half, below.
 
 ### Still open
 
