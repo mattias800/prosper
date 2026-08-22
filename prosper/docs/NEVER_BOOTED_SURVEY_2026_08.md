@@ -265,6 +265,35 @@ separates Khazan and Sifu from Unbound is a **later, small** allocation failing 
 settled — Sifu dies on 16385 bytes while its own report says 13.6 GB is available. A pool resize
 that still failed that request would move the symptom without fixing it. Recorded on the issue.
 
+## One finding that is about the machine, not the titles
+
+Running `ctest` on the survey build turned up something the survey was not looking for and which is
+recorded here because it is true of the ground everything above stands on.
+
+**Five Vulkan-execution tests fail on RADV at `bffa40d4`, and every failing assertion is an indexed
+draw** — while CI is **green on the same SHA**, because `.github/workflows/ci.yml` runs the suite
+under Mesa **lavapipe** on a runner with no GPU. 296 of 301 pass. The discriminator is internal to
+one process:
+
+```text
+  [FAIL] indexed vertexOffset selects records 1..3 from a shared vertex pool
+  [ok]   non-indexed firstVertex selects records 1..3 from a shared vertex pool
+  [ok]   dropping the indices changes the picture (indices are really applied)
+```
+
+Same vertex pool, same shader, same target, same frame — the non-indexed arm is right and the
+indexed arm is not, and the index buffer demonstrably reaches the GPU.
+
+Filed as [#2937](https://github.com/mattias800/prosper/issues/2937), with the wedged-device and
+`-j4`-contention explanations ruled out there.
+
+**Whether this touches [#2932](https://github.com/mattias800/prosper/issues/2932) is not
+established.** `CONFIDENCE: LOW`, recorded as a lead and nothing more: three of the surveyed titles
+render a correct frame and then lose most of their presents to a wrong composite, and real engines
+draw almost everything indexed — but "indexed draws are wrong" and "the composite alternates" are
+different observables and no experiment has linked them. The reason to write it down is narrower and
+solid: anyone chasing #2932 on this box should know this is true of the machine underneath it.
+
 ## Ruled out
 
 One line per hypothesis this survey killed, so nobody re-derives it at full cost.
@@ -286,6 +315,8 @@ One line per hypothesis this survey killed, so nobody re-derives it at full cost
 - **Sifu's rejected compute programs are not what lost its device.** Five programs are skipped;
   the program named in `[compute] fatal Vulkan device loss` is not one of them — it recompiled and
   ran. #2935.
+- **A green CI is not evidence that prosper's Vulkan execution tests pass.** CI runs them on
+  lavapipe; five fail on RADV at the same SHA. #2937.
 - **`grep -rl` without `-a` is not usable for a dump census**, restated because this survey used it
   twice: `sceAgcDcbDrawIndirect`'s NID reads as absent from every dump without `-a` and is present
   in 49 of 54 with it. Both greps here were validated on a known positive first. Instrument trap 218.
