@@ -13,7 +13,7 @@ no new run was made for that pass. The rest of the document is unchanged.
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | **rung 6** — native 1920×1080 opening gameplay with scripted movement, guarded by the reviewed `gris-gameplay` snapshot (tracker #1869) | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
 | Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | **rung 1** — 3840x2160 SEGA logo, then decoded 4K movie frames; **no title screen observed**. The black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id). The "holds on white to the end" clause this row used to carry is **falsified on current master**: since #2571 (merged `687d2b70`) made `sceVideodec2Decode` decode by default, the pure-white frame at 80 s is passed *through* and the run continues (100-180 s: 14,871 / 8,978 / 13,351 / 9,294 / 9,372 distinct colours) — evidence in [#2267](https://github.com/mattias800/prosper/issues/2267)'s 2026-08-17 comment. That run did not look for a title screen, and prosper still authors nothing here: 68 of 68 guest scanouts report no present source and no renderer target, so only the flipped buffer's contents changed | Not re-measured since the boot advanced; the earlier silent-port figure no longer describes this state |
-| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | **rung 6** — native 1920×1080 tutorial combat with scripted progression, guarded by the reviewed `cobra-gameplay` snapshot (tracker #1870) | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
+| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | rung 6 **on the revision it was reviewed at**, and **RED on current master** — the `cobra-gameplay` guard renders one uniformly black frame for the whole 199.6 s route ([#2899](https://github.com/mattias800/prosper/issues/2899)). Bisected to `ff72e77c` (#1974); see *The rung-6 guard is red on master* below. The reviewed evidence (native 1920×1080 tutorial combat, scripted progression) still describes the state before that commit | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% (measured 2026-07-25, not re-measured since the regression) |
 
 ## Visual evidence
 
@@ -129,6 +129,55 @@ machine and at the same scale, GRIS runs at roughly 300 presents/s while **Cobra
 (median 9)**. Cobra renders correctly and passes its guard; it is simply very slow, and nothing in
 the automated suite would say so.
 
+## The rung-6 guard is red on master (#2899)
+
+`cobra-gameplay` produces **one distinct frame, uniformly black, for the whole 199.6 s route** on
+current master. The guest is not dead: it publishes 74,215 frames, keeps a live render thread
+submitting draws, and reports `guest=running status=ok`.
+
+**Bisected.** `git bisect` over the 908 commits between the guard's own commit `5f7d9b02`
+(2026-08-01, last known good — measured, 9 pixel-distinct in a 30 s probe) and `a6d1a34b`
+(2026-08-22) names one first-bad commit:
+
+> **`ff72e77c` — feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest
+> file-replacement reader (#1974)**, 2026-08-05.
+
+Ten probe steps, each a fresh build plus a 30 s `tools/screenshot` run at scale 4 with the guard's own
+environment; the discriminator is `pixel-distinct` (>1 = renders). `71584424` (its parent) reports 7,
+`ff72e77c` reports 1.
+
+**Localised inside that commit by a mutation arm.** The commit has two halves. Commenting out only
+the `sceAvPlayerJumpToTime` **registration** — restoring the dispatcher's pre-#1949 default of 0 —
+restores the title: **8 pixel-distinct of 25 samples, 9% active**, against 1 and 0% on master. The
+file-replacement-reader half is exonerated: with it live and the seek unregistered, the title renders,
+and the reader demonstrably works here (`open('/app0/Media/sharedassets0.resource') -> 32
+size=620929 bytes` — the embedded clip, not the 2.8 MB container).
+
+**Why the seek breaks it, from the guest's own code.** Unity's `PS5VideoMedia` prepares a clip by
+playing a little, pausing, seeking back, waiting for a frame, and resuming
+(`eboot+0x1540369..0x15406xx`; its own strings are `"timed-out after waiting for %.2f s (%d attempts)
+for a video frame to decode."`, `"failed to resume the AvPlayer while seeking."`, `"failed to get
+video frame while seeking."`). Before #1974 the NID was unregistered, the wait was never satisfied,
+that prepare **timed out**, and the title tore the player down, retried twice and moved on to
+gameplay — the state the guard was reviewed against. With the seek implemented the prepare
+**succeeds**, and Cobra then stops driving the player entirely: after `sceAvPlayerResume` it makes
+zero `sceAvPlayerGetVideoDataEx` and zero `sceAvPlayerIsActive` calls for the rest of the run, and
+renders black forever. So the seek did not introduce a rendering defect; it unlocked a state prosper
+cannot yet serve, and the previous "working" behaviour rested on a call that answered SCE_OK without
+doing anything.
+
+**The conflict is direct, one line wide, and measured in both directions.** The single lever is
+`p.seek_deliver` in `s_avp_jumptotime` — whether a PAUSED player publishes the post-seek frame:
+
+| `seek_deliver` | *Space Adventure Cobra* `PPSA17337` | *Asterix & Obelix: Babylon Mission* `PPSA30490` |
+| --- | --- | --- |
+| `true` (master, #1974/#1949) | 1 pixel-distinct — black | 24 pixel-distinct — renders |
+| `false` | 7 pixel-distinct — renders | 1 pixel-distinct — black |
+
+Both arms are `tools/screenshot`, Linux/RADV, headless, scale 4, default route. So neither value is
+correct on its own and **the fix is not a choice between them** — it is whatever Cobra needs after its
+prepare succeeds, which is still open.
+
 ## Ruled out
 
 One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
@@ -166,6 +215,10 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The rating-organisation id at `[eboot+0x350bf80]+0x1c` reading 0 is a value prosper should be supplying, and is why the startup scene is empty | **Not the blocker.** It still reads 0 on the fixed boot and the rating-texture jump table is still skipped, and the frontend advances past that step anyway — so it cannot be what held the state machine. Who owns `+0x1c` remains unestablished (a register-relative store is invisible to a RIP-relative scan), but it is no longer on the critical path and is not evidence of a missing platform query. | #1905, this doc, this PR |
 | Phase 2 is never requested because of something in the resource manager, the phase mask, or the loader | **Falsified — it is upstream of all of them.** Phase 2's requester `eboot+0x598310` is installed by `eboot+0x597b80`, which is installed by `eboot+0x5978f0` only after `[SaveManager+0x78]` (the outstanding-job count) reaches zero. It never did. Nothing in the resource manager was ever consulted. | #1905, this doc, this PR |
 | Sonic Origins' movies render magenta/green because of a decode, plane-order, range or BT.601-vs-709 error | **Falsified — the decode is right and the picture is one component short.** The collapse is `Cr == Cb` at every pixel (`corr(Cb, Cr)` `+0.9948`..`+0.9992` on post-white movie frames against `-0.63` on this title's own 4K SEGA logo in the same run), which only a broadcast of one value into both components produces; every listed alternative leaves grey grey and leaves chroma two-dimensional. The cause is in the renderer's plane recognition: this title stages its decoded `3840x2160` NV12 with both planes **GPU-tiled** (`SW_64KB_S`), and the chroma-plane classifier admitted linear surfaces only, so every movie frame took the legacy narrow coverage broadcast. Fixed in #2731 — the SONIC TEAM logo is blue again and the speed-line cinematic is blue over green grass. | #2731, `docs/RESOURCE_BINDING.md` § Ruled out |
+| The `cobra-gameplay` collapse is the 2026-08-21/22 loader work — `97b184ef`'s module-path policy, `a6d1a34b`'s Il2cpp module-param descriptor, or `tools/dump_hygiene.py` stripping `PPSA17337-app0` | **Falsified by the bisect.** The first bad commit is `ff72e77c` (2026-08-05), sixteen days earlier, and the arms either side of it were built and run against the dump in its already-stripped, already-relocated state. That also falsifies the dump hypotheses outright: `5f7d9b02` renders (9 pixel-distinct) using the *same* files that make master black, so nothing about the dump changed the answer. `PPSA17337-app0` ships no `libSce*` outside `sce_module/`, and no module refusal is logged on any run. | #2899, this doc |
+| Cobra hangs after the seek because it is waiting for `AVP_STOP`, which prosper's media clock can only fire from inside a guest-initiated `sceAvPlayerIsActive` call | **Falsified by construction.** An experimental prosper-owned timer thread was added that evaluates the same media clock and fires `AVP_STOP` with the calling thread's recorded guest TCB; it fired on time (`the 5077 ms source played out on the media clock -- nothing requested a video frame for 5156 ms`) and the title stayed at 1 pixel-distinct over 40 s. The arm is self-validating: the STOP is logged, so a silent no-op cannot pass as a negative. | #2899 |
+| Cobra stalls because `sceAvPlayerGetAudioData` answers 0 forever, so its audio-clocked pump never asks for video | **The starvation is REAL and is a separate defect; it is not why Cobra is black.** Measured on master with `tools/hle_calls --values`: 942 of 942 `s_avp_getaudiodata` calls return 0 while the decode worker sits in `enqueue_video` with `video_queue=6/6, audio_queue=0` (21 audio packets ever produced, 12 taken). Fixing that head-of-line block so audio keeps flowing changes nothing visible — the title still reports 1 pixel-distinct over 45 s, and still makes zero `GetVideoDataEx`/`IsActive` calls after `sceAvPlayerResume`. | #2899, and the fix in `frontends/video_vaapi/vaapi_backend.cpp` |
+| The paused post-seek delivery window (`seek_deliver`) is simply wrong and removing it is the fix | **Falsified: it is a straight trade, not a correction.** With it suppressed, *Asterix & Obelix: Babylon Mission* (`PPSA30490`) goes from 24 pixel-distinct to 1 — black — which is exactly the #1949 state that window exists to fix. See the two-way table above. | #2899, #1949 |
 
 ## Sonic Origins dump audit
 
