@@ -243,9 +243,18 @@ Arm C also fires the progression oracle this document has cited as *never* firin
 opens `raw/stage/title/stage_title.pac`, `raw/object/obj_stage_title.pac`,
 `raw/gedit/gedit_stage_title.pac`, `raw/ui/ui_mainmenu.pac` (id=69, 80,214,624 bytes) and
 `raw/ui/ui_mainmenu_pkg_texture_US.pac`, plus the DLC title objects from `dlc2` and `dlc4`. The
-entire miss list for the run is nine language-suffix probes (`*_en.pac`, each followed by a
-successful base-name resolve on the next call), three `dlc3`-prefixed retries that succeed on the
-base content root, and `ui_startup.pac`.
+entire miss list for the run is **twelve** entries: nine **language-overlay probes** (`*_en.*`), two
+`dlc3`-prefixed retries, and `ui_startup.pac`. Neither group is a failed load, and the two fail in
+opposite directions — worth stating, because getting it backwards makes the first group look like a
+fallback that never fired:
+
+- the `_en` probes come **after** the base name has already resolved, not before. E.g.
+  `raw/stage/title/stage_title.pac` resolves to `id=71 size=8948976` four times and *then*
+  `stage_title_en.pac` is probed and misses. The engine loads the asset, then asks whether a
+  localised overlay exists on top of it; this dump ships no `_en` overlays;
+- the two `dlc3` movie retries are genuine fallbacks, and they succeed:
+  `/app0/dlc3/movie/sonicteam_logo_4k.usm` misses, then `/app0/movie/sonicteam_logo_4k.usm` resolves
+  to `id=63 size=6476896` on the base content root.
 
 **Why the boot got this far, stated as attribution rather than as proof.** Three fixes landed
 between the last measurement and this one; only the third has a mechanism this title's own
@@ -333,7 +342,7 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The paused post-seek delivery window (`seek_deliver`) is simply wrong and removing it is the fix | **Falsified: it is a straight trade, not a correction.** With it suppressed, *Asterix & Obelix: Babylon Mission* (`PPSA30490`) goes from 24 pixel-distinct to 1 — black — which is exactly the #1949 state that window exists to fix. See the two-way table above. | #2899, #1949 |
 | Sonic Origins reaches no title screen because of a renderer, decode, HLE or asset defect after the SEGA logo | **Falsified — it is one modal waiting for a button.** On master `f856e7a8` a default launch reaches the game's own **"This title supports auto save."** notice at t=200 s and holds it to the end of a 420 s run: ten consecutive 10 s samples, per-pixel mean delta **0.03..0.12 / 255** (only the animated background stripes move), `guest=running`, 42/42 source-distinct samples, 4.7 fps while producing. Its only control is a `[X] Close` button, i.e. CROSS. One `cross` window opens the title screen, 2 of 2 runs. Fourth title here whose wall was input mapping. | tracker #1871, this doc |
 | The 2026-08-06 finding that Sonic's post-logo state is *not* input-gated still bounds the current boot | **Superseded by depth, not falsified.** That measurement was taken at the *white-hold* depth on `7dc2a106`, and its evidence was an **APR path-set comparison** — a ~12,000-read input probe resolved the same 162 paths as an input-free arm and never requested `ui_mainmenu*`, `stage_title*` or any `.rsdk`. That was correct there and says nothing about a modal that only exists two fixes later (#2571, #2901, #2910). On the current boot the same oracle **fires**: a routed run opens `raw/stage/title/stage_title.pac`, `raw/object/obj_stage_title.pac`, `raw/gedit/gedit_stage_title.pac` and `raw/ui/ui_mainmenu.pac` (id=69, 80,214,624 bytes). **A negative input result is scoped to the state it was measured in**; re-run it when the state moves. | this doc, this PR |
-| The absent `raw/ui/rpl_texture/ui_title_nocopy.dds` is why the title screen's "SONIC ORIGINS" wordmark does not draw | **Not established, and the obvious link is already broken.** The wordmark really is missing, but that file is **never requested** on the current boot — `PROSPER_FILELOG=1` over a full routed run matches `nocopy` and `rpl_texture` **0 times** — and every asset the title stage does ask for resolves. The only misses in the whole run are language-suffix probes (`*_en.pac`) that fall back to the base name on the next call, plus `ui_startup.pac` (already falsified as a blocker). Cause open; filed as its own issue rather than assumed. | this doc, this PR |
+| The absent `raw/ui/rpl_texture/ui_title_nocopy.dds` is why the title screen's "SONIC ORIGINS" wordmark does not draw | **Not established, and the obvious link is already broken.** The wordmark really is missing, but that file is **never requested** on the current boot — `PROSPER_FILELOG=1` over a full routed run matches `nocopy` and `rpl_texture` **0 times** — and every asset the title stage does ask for resolves. The whole run's miss list is twelve entries: nine language-**overlay** probes (`*_en.*`, each issued *after* its base name has already resolved — this dump ships no `_en` overlays), two `dlc3`-prefixed retries that then succeed on the base content root, and `ui_startup.pac` (already falsified as a blocker). Cause open; filed as its own issue rather than assumed. | this doc, this PR |
 
 ## Sonic Origins dump audit
 
