@@ -3630,19 +3630,73 @@ int main() {
     }
     printf("  [ok]   WORD-preserving v_cvt_u32_f32_sdwa emits valid SPIR-V\n");
 
-    const uint32_t wave32_vertex_exec[] = {
-        0xbefe03c1u,                         // s_mov_b32 exec_lo, -1
+    // `s_mov_b32 exec_lo, -1` FROM AN UNNARROWED EXEC is wave-size independent, and an ungated
+    // vertex shader must accept it.
+    //
+    // This assertion was the other way round until #2872's lane measured what it cost. The
+    // surrounding guard is right in general -- the graphics wave size is not plumbed, so "write
+    // all-ones to the LOW EXEC dword" means the whole mask in Wave32 and half of it in Wave64, and
+    // reading one as the other re-enables the wrong lanes. But that ambiguity does not exist when
+    // every lane is already on, which is what `exec_narrowed == false` means: the low dword is
+    // rewritten with what it already held, the high dword (if any) is untouched, and the
+    // postcondition equals the precondition at EITHER width. The lowering is derived, not
+    // approximated.
+    //
+    // It is the compiler's standard program prologue. Yakuza Kiwami (PPSA31334) emits it at pc=3 in
+    // 19 of the 20 distinct programs a boot reaches, so rejecting it skipped every draw in the
+    // title.
+    const uint32_t vertex_exec_lo_all_ones[] = {
+        0xbefe03c1u,                         // s_mov_b32 exec_lo, -1   (EXEC still unnarrowed)
         0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
         0xf80008cfu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto wave32_vertex_spv = recompile_vertex(
-        wave32_vertex_exec, std::size(wave32_vertex_exec));
-    if (!wave32_vertex_spv.empty()) {
-        printf("  [FAIL] ungated vertex shader accepted Wave32 EXEC_LO restore\n");
+    const auto vertex_exec_lo_all_ones_spv = recompile_vertex(
+        vertex_exec_lo_all_ones, std::size(vertex_exec_lo_all_ones));
+    if (vertex_exec_lo_all_ones_spv.empty() ||
+        !type_result_ids_are_nonzero(vertex_exec_lo_all_ones_spv, nullptr) ||
+        !phi_ids_are_nonzero(vertex_exec_lo_all_ones_spv)) {
+        printf("  [FAIL] ungated vertex shader rejected an unnarrowed EXEC_LO all-ones write\n");
         return 1;
     }
-    printf("  [ok]   unproven graphics Wave32 mask operations remain fail-visible\n");
+
+    // The two arms that keep the original guard's meaning, because the reasoning above buys exactly
+    // one case and nothing beside it.
+    //
+    // (a) A NON-all-ones value is wave-size dependent in both directions and must still reject.
+    //     This arm is cleanly discriminating: nothing else in the shader can reject it, so it fails
+    //     the moment the acceptance is broadened from "-1" to "any inline constant".
+    const uint32_t vertex_exec_lo_zero[] = {
+        0xbefe0380u,                         // s_mov_b32 exec_lo, 0
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf80008cfu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_vertex(vertex_exec_lo_zero, std::size(vertex_exec_lo_zero)).empty()) {
+        printf("  [FAIL] ungated vertex shader accepted a non-all-ones EXEC_LO write\n");
+        return 1;
+    }
+    // (b) All-ones from a NARROWED EXEC is the Wave32 reconvergence idiom and must still reject: at
+    //     Wave64 it would re-enable only the low half. `v_cmpx_eq_u32` narrows EXEC per lane first.
+    //     Note this arm's rejection is over-determined -- a vertex export under a narrowed EXEC
+    //     rejects on its own, since OpKill is fragment-only -- so it is not proof that the EXEC
+    //     write itself declined. It is still a real counter-arm: broadening the acceptance to the
+    //     narrowed case would clear exec_narrowed, which makes the export legal and the shader
+    //     compile, so this arm fires exactly when the rule widens.
+    const uint32_t vertex_exec_lo_restore_after_narrow[] = {
+        0x7DA80300u,                         // v_cmpx_eq_u32 v0, v1   (narrows EXEC)
+        0xbefe03c1u,                         // s_mov_b32 exec_lo, -1
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf80008cfu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_vertex(vertex_exec_lo_restore_after_narrow,
+                          std::size(vertex_exec_lo_restore_after_narrow)).empty()) {
+        printf("  [FAIL] ungated vertex shader accepted a narrowed-EXEC_LO restore\n");
+        return 1;
+    }
+    printf("  [ok]   unnarrowed EXEC_LO all-ones accepted; every wave-size-dependent form still "
+           "fail-visible\n");
 
     // A one-word Wave32 saved-mask alias ends when that physical SGPR is reused as scalar data.
     // v_cndmask must not prefer the old bool after either an SOPK or SOP2 writer; without a numeric
