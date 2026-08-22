@@ -17,6 +17,7 @@ extern "C" {
 #include <map>
 #include <mutex>
 #include <vector>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,16 @@ namespace {
 
 constexpr size_t kVideoQueueCapacity = 6;
 constexpr size_t kAudioQueueCapacity = 32;
+
+// A guest counts as an ACTIVE audio consumer for this long after its last next_audio() call. It has
+// to be a window rather than a flag because both of the states that matter -- "this title routes
+// audio elsewhere and will never pull" and "this player is paused, so prosper refuses every pull at
+// the HLE" -- look identical from here, and both must read as "no audio consumer". See
+// enqueue_video. Comfortably longer than any pump's inter-pull interval and far shorter than the
+// stall it exists to break.
+constexpr auto kAudioConsumerWindow = std::chrono::milliseconds(500);
+// How often the video wait re-checks that window while it is blocked.
+constexpr auto kVideoWaitPoll = std::chrono::milliseconds(50);
 
 bool env_enabled(const char* name) {
     const char* value = std::getenv(name);
@@ -136,6 +147,12 @@ struct Session {
     std::deque<AudioPacket> audio_queue;
     VideoPacket last_video;
     AudioPacket last_audio;
+    // When something last pulled AUDIO, and how many video frames the queue has recycled because it
+    // had to (#2899 -- see enqueue_video). Default-constructed to the clock epoch on purpose: until
+    // a pull actually happens there is no audio consumer, so a title that never touches the audio
+    // stream never loses a video frame to this.
+    std::chrono::steady_clock::time_point audio_pull_at{};
+    uint64_t video_frames_dropped = 0;
     // Guards ownership of `thread` itself, so a seek that is replacing the worker cannot race a
     // concurrent close that is tearing it down. Always taken BEFORE `mutex`, never the other way.
     std::mutex worker_mutex;
@@ -215,13 +232,66 @@ uint64_t frame_timestamp_us(const AVFrame* frame, AVRational time_base) {
     return value > 0 ? static_cast<uint64_t>(value) : 0;
 }
 
+// True while a guest is pulling audio from this session and has nothing left to pull. One
+// demux/decode worker feeds both queues, so this is the only state in which the video queue's
+// backpressure is actively harming the other stream.
+bool audio_consumer_is_starved(const Session& session) {
+    if (!session.stream_info.has_audio || !session.audio_queue.empty()) return false;
+    return std::chrono::steady_clock::now() - session.audio_pull_at < kAudioConsumerWindow;
+}
+
+// The video queue's backpressure is the ONLY thing pacing decode for a title that consumes frames:
+// the worker fills the queue and waits, so the movie advances at the rate the guest pulls it. That
+// property must stay -- #1973 records why making this unconditionally non-blocking is wrong, since
+// it turns a consuming title's 15 s cutscene into six frames.
+//
+// What it must NOT do is stop the SESSION. One demux/decode thread feeds both queues, and
+// enqueue_audio is deliberately non-blocking because the two streams have independent consumers --
+// but a video queue nobody drains stops audio just the same, because the worker never gets back to
+// the demuxer. For a guest that clocks playback on AUDIO that is a DEADLOCK, not a stall: Unity's
+// PS5VideoMedia pump pulls sceAvPlayerGetAudioData and only asks for a video frame once the audio
+// position advances, so no audio means no video pull, which means the video queue never drains,
+// which means no audio.
+//
+// Measured on Space Adventure Cobra (PPSA17337, #2899), in the state a successful
+// sceAvPlayerJumpToTime leaves the title in: video_queue=6/6, audio_queue=0, 21 audio packets ever
+// produced and 12 taken, and 942 of 942 sceAvPlayerGetAudioData calls answered 0 in one 200-tick
+// hle_calls window (943 of 944 in a second) -- with every guest thread live, the renderer still
+// submitting draws, and the title black for the whole 199.6 s route.
+//
+// So the wait also releases while the audio consumer is STARVED, and pays for it with the oldest
+// queued video frame. That is the smallest possible concession: it happens only when a guest that is
+// actively pulling audio has run out, it recycles one frame at a time rather than latching into a
+// free-running decode, and it keeps the SIX MOST RECENT frames, which is what the guest wants when
+// its clock does advance. A title that consumes video normally never reaches it (the queue has room),
+// and neither does a paused player or one that routes audio elsewhere (no audio consumer).
+// CONFIDENCE: HIGH (the deadlock and the state above are directly observed).
 bool enqueue_video(Session& session, VideoPacket packet, std::stop_token stop) {
     std::unique_lock<std::mutex> lock(session.mutex);
-    session.cv.wait(lock, [&] {
-        return session.stopping || stop.stop_requested() ||
-               session.video_queue.size() < kVideoQueueCapacity;
-    });
+    bool starved = false;
+    // Polled rather than purely notified, and the honest reason is narrower than "a clock input can
+    // silently make the predicate true". It cannot: the clock only ever makes
+    // `audio_consumer_is_starved` go FALSE, because the window EXPIRES with time. Becoming true
+    // requires `audio_pull_at` to move or the audio queue to drain, and both of those notify.
+    //
+    // The poll is belt-and-braces for the one path that genuinely does not notify: a `jthread`
+    // destructor requesting stop. Keeping it is cheap; the earlier rationale was simply backwards,
+    // and a confidently-worded wrong reason in a comment is worse than none, because the next
+    // reader inherits it without checking. (Review of #2906.)
+    while (!session.cv.wait_for(lock, kVideoWaitPoll, [&] {
+        starved = false;   // the predicate runs many times; only the LAST verdict may act
+        if (session.stopping || stop.stop_requested()) return true;
+        if (session.video_queue.size() < kVideoQueueCapacity) return true;
+        starved = audio_consumer_is_starved(session);
+        return starved;
+    })) {}
     if (session.stopping || stop.stop_requested()) return false;
+    if (starved) {
+        while (session.video_queue.size() >= kVideoQueueCapacity) {
+            session.video_queue.pop_front();
+            ++session.video_frames_dropped;
+        }
+    }
     if (!session.initialized) {
         session.stream_info.width = packet.width;
         session.stream_info.height = packet.height;
@@ -779,6 +849,11 @@ bool VaapiBackend::next_audio(int id, AudioFrame& out) {
     const auto session = impl_->get(id);
     if (!session) return false;
     std::lock_guard<std::mutex> lock(session->mutex);
+    // A request proves an audio consumer exists whether or not it can be answered, and the REFUSED
+    // one is the case that matters: it is the guest saying it has run dry, which is exactly what
+    // enqueue_video's wait needs to hear. Record and announce it before the empty check (#2899).
+    session->audio_pull_at = std::chrono::steady_clock::now();
+    session->cv.notify_all();
     if (session->audio_queue.empty()) return false;
     session->last_audio = std::move(session->audio_queue.front());
     session->audio_queue.pop_front();
@@ -854,6 +929,18 @@ void VaapiBackend::close(int id) {
 VaapiBackend& shared_vaapi_backend() {
     static VaapiBackend backend_instance;
     return backend_instance;
+}
+
+uint64_t VaapiBackend::video_frames_dropped_for_test(int id) {
+    const auto session = impl_->get(id);
+    if (!session) return 0;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->video_frames_dropped;
+}
+
+uint64_t vaapi_video_frames_dropped(int id) {
+    auto* installed = dynamic_cast<VaapiBackend*>(backend());
+    return installed ? installed->video_frames_dropped_for_test(id) : 0;
 }
 
 bool install_vaapi_backend() {

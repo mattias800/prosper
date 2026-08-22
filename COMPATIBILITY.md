@@ -30,7 +30,7 @@ Last updated: 2026-08-22
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ First playable room | [#1867](https://github.com/mattias800/prosper/issues/1867) |
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
-| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
+| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat **on the reviewed revision; black on current master** ([#2899](https://github.com/mattias800/prosper/issues/2899)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then a decoded 4K animated intro still running at 420 s; no title screen observed; movie chroma is collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay in the guest, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
@@ -176,6 +176,12 @@ The opening fall leads into native 1920×1080 gameplay with scripted input and a
 <p align="center"><img src="assets/screenshots/space-adventure-cobra.png" alt="Space Adventure Cobra — tutorial combat"></p>
 
 The route reaches the native 1920×1080 desert tutorial combat scene with audio. See the [tracker](https://github.com/mattias800/prosper/issues/1870).
+
+**Regressed on current master ([#2899](https://github.com/mattias800/prosper/issues/2899)).** The
+`cobra-gameplay` guard now renders one uniformly black frame for the whole 199.6 s route. Bisected to
+`ff72e77c` (#1974, `sceAvPlayerJumpToTime`): with the seek implemented, Unity's `PS5VideoMedia`
+prepare *succeeds* instead of timing out, and the title then stops driving the player. The two
+screenshots above are the reviewed pre-regression state, not a capture of master.
 
 ## Sonic Origins — `PPSA05325`
 
