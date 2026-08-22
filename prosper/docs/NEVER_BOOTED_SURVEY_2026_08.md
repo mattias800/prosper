@@ -40,7 +40,14 @@ positive before their result was believed (instrument trap 218).
 | `PPSA20800` | Metaphor: ReFantazio | Atlus GFD + CRIWARE | 12 | **0** | **Zero frames.** Dies ~7 s in: SIGSEGV in the `CRI Server Mana` movie thread on a non-canonical pointer ([#2934](https://github.com/mattias800/prosper/issues/2934)). |
 
 **Three of the eight reach rung 2, one reaches rung 1, four are rung 0.** Every one of them boots,
-links and runs guest code; the slowest boot in the set is 447 ms.
+links and runs guest code, and none takes as much as half a second to do it.
+
+**Boot time varies run to run on the same title, so the figures below are per-run, not per-title.**
+Measured across every run in this survey: `PPSA02058` 232/253/242 ms, `PPSA02101` 239 ms,
+`PPSA02154` 224/245/473 ms, `PPSA02846` 447 ms, `PPSA03001` 226/266 ms, `PPSA03130` 173/272 ms,
+`PPSA03274` 413 ms, `PPSA20800` 161 ms. The spread on Little Nightmares II is a factor of two, so
+quoting one number as "this title's boot time" would be a fiction — each section below names the
+figure from the run it describes.
 
 ### Two notes on how these rungs are assigned
 
@@ -154,8 +161,9 @@ Only unregistered call worth noting beyond the shared set: `sceCoredumpRegisterC
 
 ### `PPSA02154` — Little Nightmares II (Unreal Engine 4, `.pak`)
 
-Boots in **245 ms**. Renders a **4K logo sequence** that genuinely advances — **Bandai Namco
-Entertainment**, **Tarsier Studios**, **Unreal Engine** — through the first ~130 s of a 390 s run.
+Boots in **224 ms** on the run described here (245 and 473 ms on two others). Renders a **4K logo
+sequence** that genuinely advances — **Bandai Namco Entertainment**, **Tarsier Studios**, **Unreal
+Engine** — through the first ~130 s of a 390 s run.
 6.9 fps while producing frames, 19% of the run active, guest alive at the end.
 
 **Then it goes white and stays white.** On a 13 s grid over 30 samples, the last frame carrying
@@ -211,8 +219,9 @@ failure is upstream of the composite.
 
 ### `PPSA03001` — Sifu (Unreal Engine 4, `.pak`)
 
-Boots in **266 ms**. **Never renders content.** All 20 samples of a 140 s run are a flat 4K clear,
-one colour: RGB `(255,255,255)` to t≈35 s, then RGB `(255,0,255)` from t≈42 s onward. Rung 0.
+Boots in **266 ms** on the run described here (226 ms on another). **Never renders content.** All 20
+samples of a 140 s run are a flat 4K clear, one colour: RGB `(255,255,255)` to t≈35 s, then RGB
+`(255,0,255)` from t≈42 s onward. Rung 0.
 
 Three runs produced two different endings, and both are filed:
 
@@ -236,7 +245,8 @@ event, so neither is what holds the title at rung 0.
 ### `PPSA03130` — Sniper Ghost Warrior Contracts 2 (CryEngine)
 
 Independently reproduced at rung 0, matching [#2871](https://github.com/mattias800/prosper/issues/2871).
-Boots in **272 ms**, then drives a 4K present loop that publishes nothing:
+Boots in **272 ms** on the run described here (173 ms on a shorter one), then drives a 4K present
+loop that publishes nothing:
 `[rtt] PRESENT SOURCE EXTENT MISMATCH: no pass produced a 3840x2160 present source`, 64+
 occurrences, `present_count` 2231 over 244 s, all 24 samples `raw_scanout` and fully black.
 
