@@ -297,7 +297,27 @@ process. #2910 returns `0x809F0008` for a drained queue instead.
    **10 of 28 samples at `corr(Cb, Cr) = +0.9972..+0.9998`**, against `-0.78` on the clean frames of
    the same scene in the same run. The discriminator is controlled: **Arm A's 42 pre-title frames
    are 0 of 42 collapsed** (`-1.0000` on the SEGA logo, `-0.72..-0.99` across the whole intro), so
-   this is not #2731 unfixed — it is the same signature surviving on one path.
+   this is not #2731 unfixed.
+
+   **Arm D** names the mechanism without any new instrumentation. `PROSPER_AVPCHROMA_LOG=1` is
+   read-only — `classify_avplayer_chroma_plane` runs unconditionally at
+   `frontends/shared/live/live_renderer.cpp:2404` and the variable gates only the `fprintf` at
+   `:2411` — so it observes the default path. Over a full routed run (34/34,
+   `source-distinct=34 pixel-distinct=31 guest=running status=ok`, 4.3 fps while producing, 51% of
+   the 339.4 s run active) the verdicts are **7 `CHROMA matched-adjacent-luma-plane`**, **4
+   `coverage-broadcast no-sibling-luma-plane`** and 15 one-component context lines. The four
+   rejected planes (`206f420000`, `2068b60000`, `20380d0000`, `206da40000`) are **identical in every
+   field the predicate reads** to the seven accepted ones — `1920x1080`, `Unorm8`, 2 components,
+   `tile=9` (`SW_64KB_S`), `dim=5`, `depth=1`, `size=4147200`, `swz=4,5,0,1`, `row_bytes=3840`. The
+   only difference is `luma=0`: the sibling-luma search found nothing. Every accepted pair sits
+   exactly `0x870000` apart, the tiled size of a 3840x2160 one-byte-per-texel luma plane. So the
+   open question is **why the luma plane is absent from the resource table of the draw that samples
+   this chroma plane**, not what the predicate should be. #2919.
+
+   *Not concluded:* three addresses appear in the log both as a 3840x2160 one-component plane and as
+   a 1920x1080 two-component one, which looks like aliasing — but the log dedupes by plane identity
+   across the whole run, so a buffer recycled between the two roles at different times produces the
+   same output. It needs a per-frame view to separate.
 
 ## Ruled out
 
