@@ -31,7 +31,7 @@ Last updated: 2026-08-22
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat **on the reviewed revision; black on current master** ([#2899](https://github.com/mattias800/prosper/issues/2899)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
-| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then a decoded 4K animated intro still running at 420 s; no title screen observed; movie chroma is collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1871](https://github.com/mattias800/prosper/issues/1871) |
+| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🚧 4K title screen on a one-button route; a default launch stops at the game's own auto-save notice, which waits for Cross | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay in the guest, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
@@ -94,8 +94,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 13 |
-| **Below a title screen** — logo or splash only (rung 1) | 2 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
+| **Below a title screen** — logo or splash only (rung 1) | 1 |
 | **Boots, but no frame with content** (rung 0) | 6 |
 | **Not yet booted** — tracked, no run attempted yet | 7 |
 | Total tracked | 53 |
@@ -204,38 +204,50 @@ screenshots above are the reviewed pre-regression state, not a capture of master
 
 ## Sonic Origins — `PPSA05325`
 
+<p align="center"><img src="assets/screenshots/sonic-origins-title-screen.png" alt="Sonic Origins — title screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.png" alt="Sonic Origins — the boot auto-save notice, which waits for Cross"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.png" alt="Sonic Origins — the SONIC TEAM logo from the decoded intro"></p>
 <p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.png" alt="Sonic Origins — SEGA logo"></p>
-<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo.png" alt="Sonic Origins — SONIC TEAM logo from the decoded intro"></p>
 
-*The SONIC TEAM frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
-default launch with no input route, no render-scale or frame-skip acceleration, master `4c8b77c8`,
-native 3840×2160, sample 41 of a 420 s run at t=420.1 s.*
+*All four are direct, unmodified `tools/screenshot` captures — headless Linux/RADV, native 3840×2160,
+no render-scale or frame-skip acceleration, master `f856e7a8`. The SEGA logo, SONIC TEAM logo and
+auto-save notice are from a **default launch with no input** (42 samples at 10 s); the title screen is
+from the same launch driven by `prosper/scripts/sonic/dismiss-boot-notice.pad`, sample 77 of 84 at
+t=385 s.*
 
-The `scripts/sonic/reach-title-or-gameplay.pad` route reaches the game's SEGA logo, composited by the
-live renderer at 3840×2160; a default launch with no input reaches it too, and keeps going — which is
-why the second frame above is further along than the first. The title had previously produced nothing
-but black: its boot state machine waits for a save-data job that could never finish, because
-`sceSaveDataCreateTransactionResource` returned 0 when it must return the id of the transaction
-resource it creates. With a real id the boot advances,
-the frontend loads its menu resource set and opens its logo movie, and the SEGA logo renders.
+**The title screen is reached, and the wall in front of it was a dialog box.** A default launch runs
+black → a cyan loading element → the 4K SEGA logo → the decoded 4K intro → the SONIC TEAM logo → the
+third-party legal plate (Retro Engine / Headcannon / CRIWARE) → and then, at t≈200 s, the game's own
+**"This title supports auto save."** notice, whose only control is a `[X] Close` button. It holds
+there for the rest of a 420 s run: ten consecutive 10 s samples with a per-pixel mean delta of
+0.03–0.12 out of 255, the guest running and frames still being produced at 4.7/s. One `cross` closes
+it, and the title screen above comes up and stays up for the remaining 140 s of the run, cycling
+Sonic, Tails and Knuckles through the emblem. This is the fourth title here whose progression wall
+turned out to be input mapping rather than rendering.
 
-**No title screen is reached.** After the logo fades the composite goes to a flat white frame. That
-white state used to be terminal — one colour, static to the end of the run. It no longer is: since
-`sceVideodec2Decode` began decoding by default ([#2571](https://github.com/mattias800/prosper/pull/2571)),
-a default launch shows the pure-white frame and then continues into a decoded 4K animated intro. What
-follows the white is now measured rather than assumed: a 420 s default launch is **still inside that
-intro when the window ends**, and its last frame is the SONIC TEAM logo above. The white is **passed
-through, not eliminated**, and no title screen has been observed. prosper
-authors none of these frames either way: every guest scanout reports no present source and no
-renderer target, so every presented frame is raw guest memory published directly, and only its
-contents changed.
+Two open defects on that title screen, neither of which stops it being reached:
 
-The SONIC TEAM logo is **blue** in the game and renders purple here. That is the cross-title chroma
-collapse in [#2731](https://github.com/mattias800/prosper/issues/2731) — decoded video composites
-with its two chroma components equal — and it applies to every frame of this intro, not to the SEGA
-logo above it, which is not decoded video. See
-[`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md),
-[#2267](https://github.com/mattias800/prosper/issues/2267) for the measured run, and the
+- Its **"SONIC ORIGINS" wordmark never draws** on the banner, and no *press any button* prompt
+  appears. The banner, emblem, characters and background are all correct.
+- About **a third of its frames composite with their two chroma components equal**, so they render
+  magenta and green — 10 of 28 samples in the title-screen window, `corr(Cb, Cr) = +0.997` against
+  `−0.78` on the clean frames in the same run. This is the [#2731](https://github.com/mattias800/prosper/issues/2731)
+  signature surviving that issue's fix on one path: the same run's 42 pre-title frames are clean,
+  0 of 42.
+
+The title had previously produced nothing but black. Its boot state machine waits for a save-data job
+that could never finish, because `sceSaveDataCreateTransactionResource` returned 0 when it must return
+the id of the transaction resource it creates
+([#1905](https://github.com/mattias800/prosper/issues/1905)); with a real id the boot advances, the
+frontend loads its menu resource set and opens its logo movie, and the SEGA logo renders. What moved
+it from there to the title screen was two further fixes:
+[#2901](https://github.com/mattias800/prosper/pull/2901) (a decoded video's chroma plane is recognised
+by its geometry) and [#2910](https://github.com/mattias800/prosper/pull/2910)
+(`sceSaveDataGetEventResult` no longer answers a drained queue with the "still in flight" code — this
+title has a `sceKernelSleep(1)` re-poll loop at `eboot+0x940380` that nothing but a different return
+value can leave).
+
+See [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1871).
 
 ## Sonic Frontiers — `PPSA03831`

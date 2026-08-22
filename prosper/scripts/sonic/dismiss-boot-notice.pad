@@ -1,0 +1,32 @@
+# Sonic Origins (PPSA05325): close the boot auto-save notice, then let the frontend settle.
+#
+# Why this route exists, and why its anchors are SECONDS rather than flips or pad reads.
+#
+# Measured on master `f856e7a8` (2026-08-22), Linux/RADV, `tools/screenshot`, default launch with no
+# input, 42 samples at 10 s: the boot sequence is
+#     black -> a cyan loading element on white -> the 4K SEGA logo -> the decoded 4K intro (spinning
+#     ring, Sonic silhouette, SONIC TEAM logo) -> the third-party legal plate (Retro Engine /
+#     Headcannon Path Tracer / CRIWARE) -> the game's own "This title supports auto save." modal
+# and that modal is up from t=200 s to the end of the run, static to within the animated background
+# stripes (10 consecutive 10 s samples, per-pixel mean delta 0.03..0.12/255). Its only control is a
+# `[X] Close` button, i.e. CROSS. So the title's default-launch wall is a MODAL WAITING FOR A BUTTON,
+# not a renderer or HLE stall -- exactly the shape recorded for Asterix Babylon, Tales of Graces f
+# and Hi-Fi RUSH.
+#
+# Anchors: a bare number is seconds since the FIRST PAD POLL (see `src/input/pad.cpp:207` -- a
+# leading `f` selects display flips and `p` selects pad reads; no prefix means seconds). Seconds are
+# right here and flips are not: the wall is one modal that appears at a wall-clock point set by 4K
+# video decode, and this title's flip rate is not the quantity that moves it. `scripts/sonic/
+# long-input-probe.pad`'s header warns the opposite way for a reason -- it was written for a route
+# whose windows all had to land inside a short *count* budget.
+#
+# The pulses are 50 s apart on purpose. One press closes the modal; whatever follows needs to be
+# HELD long enough to be sampled before the next press advances past it. A dense pulse train would
+# walk through the notice, the title screen and the menu between two samples and prove nothing about
+# any of them.
+100-101:cross
+150-151:cross
+200-201:cross
+250-251:cross
+300-301:cross
+350-351:cross
