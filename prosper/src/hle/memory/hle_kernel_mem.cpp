@@ -47,6 +47,12 @@ uint64_t guest_memory_gpu_write_successes_for_test() {
     return g_guest_memory_gpu_write_successes.load(std::memory_order_relaxed);
 }
 
+// The APR read chain a command buffer carries (which file its …ReadFileGatherScatter segments read
+// from) belongs to the APR FILE layer, src/hle/fs/hle_file.cpp, which owns file ids and host paths.
+// This file owns the command-buffer object, so it is the one that has to tell that layer when a
+// buffer is rewound or destroyed.
+extern "C" void prosper_apr_chain_reset(uint64_t cb);
+
 // libSceAmpr command-buffer accounting is host-platform independent. UE4 batches commands until
 // `GetSize(cb) - GetCurrentOffset(cb)` can no longer hold the next packet, then submits that cb.
 // Keep the fixed capacity and appended-byte cursor together so constructor and reset operations
@@ -152,6 +158,13 @@ void ampr_cb_construct(uint64_t cb, uint64_t capacity, bool tracks_offset) {
 
 void ampr_cb_reset(uint64_t cb) {
     if (!cb) return;
+    // Rewinding a command buffer also closes the APR read chain recorded against it: the file a
+    // …ReadFileGatherScatter segment reads from is the one the plain ReadFile named, and that
+    // record dies with the commands it belonged to. The guest's own reader relies on exactly this
+    // ordering -- Yakuza Kiwami's dispatcher at eboot+0xdb5fb0 calls Reset immediately before the
+    // ReadFile that opens each chain (see the block beside prosper_apr_chain_reset in
+    // src/hle/fs/hle_file.cpp, which owns APR file identity).
+    prosper_apr_chain_reset(cb);
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
     if (it != g_ampr_cb_state.end()) it->second.offset = 0;
@@ -159,6 +172,7 @@ void ampr_cb_reset(uint64_t cb) {
 
 void ampr_cb_destroy_320(uint64_t cb) {
     if (!cb) return;
+    prosper_apr_chain_reset(cb);   // the chain cannot outlive the command buffer it is recorded on
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
     if (it != g_ampr_cb_state.end() && it->second.tracks_offset)
