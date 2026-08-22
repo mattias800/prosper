@@ -67,6 +67,7 @@ Last updated: 2026-08-22
 | *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots, allocates its whole game heap through libSceAmpr AMM, and dies loading its shader archives ([#2872](https://github.com/mattias800/prosper/issues/2872)); no frames yet | [#2864](https://github.com/mattias800/prosper/issues/2864) |
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 | *The Lord of the Rings: Gollum* | `PPSA06367` | Unreal Engine 4 | 🔬 Rung 0 — boots, links every module and composites a 2560x1440 frame, but the only frame is a flat white clear; the startup movie kills the process ~4 s in when `sceVideodec2GetPictureInfo` returns success without writing its picture-info struct ([#2898](https://github.com/mattias800/prosper/issues/2898)). Its AAC movie audio now decodes | [#2900](https://github.com/mattias800/prosper/issues/2900) |
+| *The First Berserker: Khazan* | `PPSA20447` | Unreal Engine 4 | 🔬 Rung 0 — boots, mounts and enumerates all thirty save slots, but composites only a flat white 4K clear; the guest then exhausts prosper's direct-memory pool and calls its own OOM handler ([#2908](https://github.com/mattias800/prosper/issues/2908)). The save-data event-drain code that parked its game thread forever is fixed | [#2909](https://github.com/mattias800/prosper/issues/2909) |
 | *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — nothing run against it yet | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — nothing run against it yet | [#2880](https://github.com/mattias800/prosper/issues/2880) |
 | *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2882](https://github.com/mattias800/prosper/issues/2882) |
@@ -94,9 +95,9 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 13 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Boots, but no frame with content** (rung 0) | 4 |
+| **Boots, but no frame with content** (rung 0) | 5 |
 | **Not yet booted** — tracked, no run attempted yet | 8 |
-| Total tracked | 51 |
+| Total tracked | 52 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -126,10 +127,11 @@ the engine recorded in the table:
 | Custom (Ancient), ASOBI, RAGE, Hedgehog Engine 2 — one each | 4 |
 
 **Unreal dominates this group, and it no longer accounts for all of it.** Nine of the 13 rung-2 rows
-are Unreal, against 16 Unreal rows in the table overall — the other seven are one at gameplay
-(*Dragon Quest VII Reimagined*, whose world renders), one at rung 0 (*The Lord of the Rings: Gollum*),
-and five not yet booted. So "every Unreal title stops at a title screen", which this section used to
-say, is no longer true in either direction: one has passed it and one has not reached it.
+are Unreal, against 17 Unreal rows in the table overall — the other eight are one at gameplay
+(*Dragon Quest VII Reimagined*, whose world renders), two at rung 0 (*The Lord of the Rings: Gollum*
+and *The First Berserker: Khazan*), and five not yet booted. So "every Unreal title stops at a title
+screen", which this section used to say, is no longer true in either direction: one has passed it and
+two have not reached it.
 
 The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
 Unity-family, and **no Unity title remains at rung 2 for want of a rendered world.** The rung-2 group

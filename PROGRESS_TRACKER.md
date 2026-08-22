@@ -153,6 +153,7 @@ of its manifest.
 | The Oregon Trail | `PPSA19244` | 2 | `12----` | - | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#1606](https://github.com/mattias800/prosper/issues/1606), [#1641](https://github.com/mattias800/prosper/issues/1641), [#1634](https://github.com/mattias800/prosper/issues/1634) | [#1886](https://github.com/mattias800/prosper/issues/1886) | [`OREGON_TRAIL_STATUS.md`](prosper/docs/OREGON_TRAIL_STATUS.md) |
 | The Pathless | `PPSA01826` | 2 | `12----` | - | - | none | [#1570](https://github.com/mattias800/prosper/issues/1570), [#1213](https://github.com/mattias800/prosper/issues/1213) | [#1883](https://github.com/mattias800/prosper/issues/1883) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | The Plucky Squire | `PPSA15319` | 2 | `12----` | - | - | none | [#1390](https://github.com/mattias800/prosper/issues/1390) | [#1882](https://github.com/mattias800/prosper/issues/1882) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
+| Beast of Reincarnation | `PPSA29343` | 1 | `1-----` | **9.2** fps · 56% active · 4K · GAME FREAK logo then the Digital Deluxe bonus dialog, with PROSPER_CB_EFC_NO_COLOR=1 · screenshot · 2026-08-22 | - | none | [#1588](https://github.com/mattias800/prosper/issues/1588), [#2911](https://github.com/mattias800/prosper/issues/2911), [#2915](https://github.com/mattias800/prosper/issues/2915) | [#2916](https://github.com/mattias800/prosper/issues/2916) | [`BEAST_OF_REINCARNATION_STATUS.md`](prosper/docs/BEAST_OF_REINCARNATION_STATUS.md) |
 | Sonic Origins | `PPSA05325` | 1 | `1-----` | - | - | none | [#2267](https://github.com/mattias800/prosper/issues/2267), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) |
 | ArcRunner | `PPSA21406` | 0 | `------` | - | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/ARCRUNNER_STATUS.md) |
 | BALAN WONDERWORLD | `PPSA02058` | 0 | `------` | none | - | none | - | [#2882](https://github.com/mattias800/prosper/issues/2882) | - |
@@ -164,7 +165,7 @@ of its manifest.
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | - | [#2867](https://github.com/mattias800/prosper/issues/2867) | - |
 | Spacebase Startopia | `PPSA02846` | 0 | `------` | none | - | none | - | [#2887](https://github.com/mattias800/prosper/issues/2887) | - |
 | Stray | `PPSA02101` | 0 | `------` | none | - | none | - | [#2883](https://github.com/mattias800/prosper/issues/2883) | - |
-| The First Berserker: Khazan | `PPSA20447` | 0 | `------` | **--** fps · 0% active · 4K · a flat white clear, the only frame it composites · tools/screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908) | [#2909](https://github.com/mattias800/prosper/issues/2909) | [`KHAZAN_STATUS.md`](prosper/docs/KHAZAN_STATUS.md) |
+| The First Berserker: Khazan | `PPSA20447` | 0 | `------` | **--** fps · 0% active · 4K · a flat white clear, the only frame it composites · tools/screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#1880](https://github.com/mattias800/prosper/issues/1880) | [#2909](https://github.com/mattias800/prosper/issues/2909) | [`KHAZAN_STATUS.md`](prosper/docs/KHAZAN_STATUS.md) |
 | The Lord of the Rings: Gollum | `PPSA06367` | 0 | `------` | **--** fps · 0% active · 1440p · one flat white composited clear before the boot dies at ~4 s · screenshot · 2026-08-22 | - | none | [#2898](https://github.com/mattias800/prosper/issues/2898) | [#2900](https://github.com/mattias800/prosper/issues/2900) | [`GOLLUM_STATUS.md`](prosper/docs/GOLLUM_STATUS.md) |
 | Unbound: Worlds Apart | `PPSA03274` | 0 | `------` | none | - | none | - | [#2886](https://github.com/mattias800/prosper/issues/2886) | - |
 | Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | - | [#2864](https://github.com/mattias800/prosper/issues/2864) | - |
@@ -177,9 +178,9 @@ of its manifest.
 | 4 -- manual visual verification | 2 |
 | 3 -- gameplay with the scene rendering | 8 |
 | 2 -- title screen | 14 |
-| 1 -- any real graphics | 1 |
+| 1 -- any real graphics | 2 |
 | 0 -- not started | 14 |
 
-**4 of 53** trackers record a PS5 hardware-oracle comparison; the rest carry
+**4 of 54** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.

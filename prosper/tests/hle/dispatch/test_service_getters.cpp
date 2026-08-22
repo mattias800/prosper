@@ -1271,9 +1271,20 @@ int main() {
         auto get_event = Hle::lookup("j8xKtiFj0SY");
         CHECK(umount && get_event, "SaveData unmount event lifecycle registered");
         if (umount && get_event) {
+            // A DRAINED queue answers NOT_FOUND (0x809F0008). This assertion used to require
+            // 0x809F0018 -- a REAL code in the WRONG SLOT, not an invented one: 0x809F0018 means
+            // "the operation is still in flight, keep waiting", and four titles sleep-and-repoll on
+            // it (Dead Cells +0x173c9b0 / +0x173cda0, Earthion +0x12f6d, Sonic Frontiers +0x18a2285,
+            // Sonic Origins +0x940385). Nothing in prosper is ever in flight, so returning it for a
+            // drained queue was a permanent "still busy" lie; PPSA20447's drain loop
+            // (`cmp r12d,0x809f0008` / `jne` at eboot+0x796eb88) then polled forever.
+            // Dead Cells -- the title these contracts were written for -- never reaches the
+            // empty-queue case on its guard route (4 unmounts against 3 GetEventResult calls,
+            // identical on both sides of the change), which is why the wrong slot survived here.
+            // tests/hle/service/test_savedata_event_drain.cpp carries the full derivation.
             uint8_t event[112]; memset(event, 0xAB, sizeof event);
-            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0018ull,
-                  "GetEventResult with no completion -> NO_EVENT");
+            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0008ull,
+                  "GetEventResult with no completion -> NOT_FOUND (the drained-queue code)");
             umount(0, 0, 0, 0, 0, 0);
             CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0,
                   "GetEventResult consumes the queued unmount completion");
@@ -1284,7 +1295,7 @@ int main() {
             CHECK(empty_tail, "GetEventResult zeroes the empty title, dir name, and reserved tail");
             CHECK(event[104] == 0xAB && event[111] == 0xAB,
                   "GetEventResult writes exactly the 104-byte event struct");
-            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0018ull,
+            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0008ull,
                   "GetEventResult completion is one-shot");
         }
 
