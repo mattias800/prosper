@@ -36,9 +36,16 @@
 #   t~15.5   /app0/title  -- the language modal has been answered
 #   t~22     title screen / main menu: the theatre, "Language Settings / Settings / Credits /
 #            Copyright Information", (c)2021 SQUARE ENIX
-#   t~140+   the opening story cutscene, rendered IN ENGINE at 4K -- Leo and Emma in the park.
-#            There is no movie decode on this boot (no videodec/AJM/CRIWARE decode lines), so
-#            these are real GPU draws of a real 3D scene, not a decoded video.
+#   t~125.6  two access-unit H.264 decoders open (VA-API), first picture 3840x2160 NV12; 3072
+#            access units and 3070 pictures follow. The opening story cutscene -- Leo and Emma in
+#            the park -- is a DECODED 4K MOVIE, and every rich frame in the run postdates this
+#            line. The title screen and main menu above it are engine-rendered; the cutscene is
+#            not. Reproduced on two independent runs.
+#
+#            Recorded this precisely because the first reading of it was WRONG: a grep for
+#            `[videodec2]` found nothing and was reported as "no movie decode on this boot". The
+#            tag is `[vdec2]`. Grep for the tag the code actually prints, and check a positive
+#            control before believing a clean zero.
 #
 # DOWN IS CONFINED TO PHASE 1 ON PURPOSE. On the main menu that follows, DOWN walks the cursor
 # down into Credits; the route has no button after t=37 that could commit such a selection.

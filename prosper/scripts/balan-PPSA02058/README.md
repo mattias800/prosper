@@ -36,6 +36,12 @@ is absent from every default run measured.
 | `open '/app0/…/game.locres'` | still on the language grid |
 | `open '/app0/title'` | the modal has been answered — the gate this route exists to open |
 
-The opening cutscene renders **in engine**: the boot logs no video decode of any kind (no
-`videodec`, AJM or CRIWARE decode lines), so the park scene is real GPU draws at 4K, not a
-decoded movie.
+The **title screen and main menu are engine-rendered** — they appear from t ≈ 22 s. The
+**opening cutscene is a decoded 4K H.264 movie**: at t ≈ 125.6 s two access-unit decoders open
+(VA-API), first picture `3840x2160 NV12`, and 3072 access units / 3070 pictures follow. Every rich
+frame in the run postdates that line. Reproduced on two independent runs.
+
+> An earlier revision of this file claimed the opposite — "rendered in engine, no video decode of
+> any kind" — on the strength of a grep for `[videodec2]` that found nothing. **The tag prosper
+> actually prints is `[vdec2]`.** The zero was the grep's, not the title's. Search for the tag the
+> code emits, and check a positive control before believing a clean zero.

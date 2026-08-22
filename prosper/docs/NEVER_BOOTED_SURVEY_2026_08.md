@@ -114,7 +114,7 @@ world, and the prompt bar was a reliable guide on exactly one of them.**
 | --- | --- | --- | --- |
 | Stray | **CROSS only** — its `✕ Accept` prompt was the whole story | `/app0/hk_project_mainstart`, t≈36.5 s | 2 |
 | Unbound | CROSS for the title screen, then **SQUARE** — the next screen's own prompt reads `Press ▢ to skip` | `/app0/normalvillage`, t≈78.0 s | 2 |
-| BALAN | CROSS raises a modal (*"Are you sure you want to change the game language to English?"*); **DOWN** answers it | `/app0/title`, t≈15.5 s → title screen, main menu, and the opening cutscene **rendered in engine at 4K** | 2 |
+| BALAN | CROSS raises a modal (*"Are you sure you want to change the game language to English?"*); **DOWN** answers it | `/app0/title`, t≈15.5 s → title screen and main menu (engine-rendered), then the opening cutscene as a **decoded 4K H.264 movie** (decoders open t≈126 s, 3070 pictures) | 2 |
 
 Each claim carries a **negative control**: the map/asset named above appears on **no** default,
 no-input run of that title, and the progress oracle is the file log rather than pixels precisely

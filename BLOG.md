@@ -28,7 +28,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 Three titles sat on a screen whose own prompt named a button. Only one really was waiting for it.
 BALAN's language menu answers Cross with a modal — *change the language to English?* — that 109
 Cross presses never got past; **Down** does, and behind it are the title screen, the main menu, and
-this, the opening cutscene drawn in engine at 4K. Unbound wanted **Square**, the button its
+this, the opening cutscene — 3070 decoded 4K pictures. Unbound wanted **Square**, the button its
 cinematic actually asks for. Trackers [#2882](https://github.com/mattias800/prosper/issues/2882), [#2883](https://github.com/mattias800/prosper/issues/2883),
 [#2886](https://github.com/mattias800/prosper/issues/2886).
 
