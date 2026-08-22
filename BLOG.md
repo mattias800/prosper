@@ -12,43 +12,8 @@ blog, so the generator and its CI gate are gone.
 [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table — that one *is* still generated
 from the tracker issues, and still gated, because it is a projection of state rather than a story.
 
-## How to add an entry
-
-**This is a screenshot blog. Image-heavy, text-light — always.**
-
-Put the entry at the **top**, under a `## YYYY-MM-DD` heading.
-
-**Pictures: as many as you have.** Every screenshot a PR produced belongs in its entry. An entry
-covering eight titles shows eight titles, not one. A picture costs the reader nothing to skip and
-everything to not have, and it is the only part of this file that shows what prosper actually does.
-Never economise here.
-
-**Words: one sentence saying what now works.** That is genuinely enough:
-
-> *We now reach correct rendering of the Sonic Frontiers title screen.*
-
-Then the screenshot. Add a second sentence only if the picture is misleading without it — a defect
-you want noticed, or a caveat about what the reader is seeing.
-
-**The one exception: a fix that moves several titles at once.** Those are worth a short paragraph
-explaining the problem and the fix, because they are the interesting ones and someone will want to
-know. Keep it to a paragraph, in plain language, and still lead with the pictures. A fix for one
-title does not get this — link its tracker instead.
-
-Everything else — measurements, bisects, censuses, mechanisms, reasoning — belongs in the tracker,
-the PR or the status doc. Link, never transcribe. Someone reads this file top to bottom to catch up,
-and a 900-word entry buries the four entries under it.
-
-```markdown
-## 2026-08-21
-
-### Beneath reaches gameplay
-
-<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="..."></p>
-
-The opening dive. The waypoint counts down as the route moves and the dialogue plays over it —
-this is the real scene, not a cutscene. Tracker [#1898](...).
-```
+<!-- How to add an entry: see CLAUDE.md, the BLOG.md bullet under PR verification.
+     Image-heavy, text-light. Pictures: as many as you have. Words: one sentence. -->
 
 > An entry is evidence of what rendered **on the day it was written**. It is not a claim about the
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
