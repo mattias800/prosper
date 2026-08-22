@@ -14,17 +14,30 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## How to add an entry
 
-Put it at the **top**, under a `## YYYY-MM-DD` heading. An entry needs an image and a sentence about
-what you are looking at. Anything else is optional — write a paragraph when a title finally does
-something, write one line when it is just another capture.
+**This is a screenshot blog. Image-heavy, text-light — always.**
 
-**Keep it short.** The median entry here is about 60 words, and that is the right size: a headline and
-a picture. Measurements, bisects, censuses and mechanisms belong in the issue, the PR or the status
-doc — link to them. This file is read top to bottom by someone catching up, and a 900-word entry
-buries the four entries under it.
+Put the entry at the **top**, under a `## YYYY-MM-DD` heading.
 
-A useful test: if your entry has a table, a code block, or more than one or two numbers, it is a
-report wearing a blog entry's clothes. "Beneath reaches gameplay", at 93 words, is the shape to copy.
+**Pictures: as many as you have.** Every screenshot a PR produced belongs in its entry. An entry
+covering eight titles shows eight titles, not one. A picture costs the reader nothing to skip and
+everything to not have, and it is the only part of this file that shows what prosper actually does.
+Never economise here.
+
+**Words: one sentence saying what now works.** That is genuinely enough:
+
+> *We now reach correct rendering of the Sonic Frontiers title screen.*
+
+Then the screenshot. Add a second sentence only if the picture is misleading without it — a defect
+you want noticed, or a caveat about what the reader is seeing.
+
+**The one exception: a fix that moves several titles at once.** Those are worth a short paragraph
+explaining the problem and the fix, because they are the interesting ones and someone will want to
+know. Keep it to a paragraph, in plain language, and still lead with the pictures. A fix for one
+title does not get this — link its tracker instead.
+
+Everything else — measurements, bisects, censuses, mechanisms, reasoning — belongs in the tracker,
+the PR or the status doc. Link, never transcribe. Someone reads this file top to bottom to catch up,
+and a 900-word entry buries the four entries under it.
 
 ```markdown
 ## 2026-08-21
@@ -46,6 +59,12 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 ### The eight titles nobody had ever run
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
+
+<p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.png" alt="BALAN WONDERWORLD — the language-select menu at 3840x2160, over the game's theatre artwork, with button glyphs along the bottom"></p>
+
+<p align="center"><img src="assets/screenshots/stray-brightness-calibration.png" alt="Stray — the 4K brightness-calibration screen, a dim reference image with a slider and the game's own Cross Accept prompt"></p>
+
+<p align="center"><img src="assets/screenshots/little-nightmares-2-tarsier-logo.png" alt="Little Nightmares II — the Tarsier Studios logo at 3840x2160, part of the boot logo sequence"></p>
 
 Eight tracked titles had never been booted. All eight now have: three reach a menu or title screen,
 one a logo sequence, four render nothing. *Unbound* is the best of them — that is its real title
