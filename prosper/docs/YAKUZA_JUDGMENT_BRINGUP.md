@@ -134,6 +134,13 @@ One line per already-falsified hypothesis. Extend it; do not re-derive these.
   archives' bytes provably never arrived — the gather/scatter half of every two-segment read was
   discarded by an unimplemented NID. The recompiler only became the frontier *after* the bytes
   arrived.
+- **"A refused gather/scatter segment leaves the completion record incomplete, so the guest reports
+  the failure through its own path."** Falsified in review of #2924: for the SDK wrapper shape
+  (`record == cb+0x20`, which is every observed callsite) the chain-opening `ReadFile` has already
+  written a success into that record, so a refused segment leaves the PREVIOUS segment's completion.
+  The failure travels in the return value only. The behaviour is unchanged and correct — invalidating
+  the status word would mean writing into a record layout nobody has established — but do not repeat
+  the claim.
 - **"`sceAmprAprCommandBufferReadFileGatherScatter` needs a new descriptor-list construct."** The
   issue text guessed the destination might be a descriptor list. Falsified 2026-08-22 from the SDK's
   own inline wrapper at `eboot+0xcc4a70`: it is the plain `ReadFile` wrapper with the file id removed
