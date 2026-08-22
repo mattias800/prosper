@@ -19,7 +19,75 @@ what you are looking at. Anything else is optional — write a paragraph when a 
 something, write one line when it is just another capture.
 
 ```markdown
+## 2026-08-21
+
+### Beneath reaches gameplay
+
+<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="..."></p>
+
+The opening dive. The waypoint counts down as the route moves and the dialogue plays over it —
+this is the real scene, not a cutscene. Tracker [#1898](...).
+```
+
+> An entry is evidence of what rendered **on the day it was written**. It is not a claim about the
+> title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
+> because the point of a blog is that it records *when* things happened.
+
 ## 2026-08-22
+
+### Sonic Origins reaches its title screen, and the wall was a dialog box
+
+<p align="center"><img src="assets/screenshots/sonic-origins-title-screen.png" alt="Sonic Origins — the title screen at 3840x2160: the classic winged gold ring emblem with blue stars, Sonic peering over a red-and-white striped banner, in front of the painted South Island seascape with cliffs, clouds and sunlit water"></p>
+
+*Sonic Origins* (`PPSA05325`) has been the most-investigated title in this repository that had
+nothing to show for it. Nine lanes went at its black startup frame; a dump audit, a Game-Intent
+experiment, a whole-frame GPU capture, a depth-alias fix and a present-path fix all came out of it.
+`#1905` eventually found the cause — one HLE call returning `0` where the guest needed a positive
+resource id — and the SEGA logo appeared. Then it stopped again, and for two more weeks the record
+read *"renders the 4K SEGA logo and then decoded 4K movie frames, with no title screen observed."*
+
+Tonight a plain launch on current master runs: black, a cyan loading element, the **SEGA logo**, the
+decoded 4K intro, the **SONIC TEAM** logo, the third-party legal plate — Retro Engine, Headcannon,
+CRIWARE — and then, at 200 seconds, this:
+
+<p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.png" alt="Sonic Origins — the game's own boot notice at 3840x2160: a white panel over the cyan and green striped menu background, a glowing gold ring icon, the text 'This title supports auto save. When this icon is shown, do not turn off the power. Save data may be corrupted.' and a Close button marked with the Cross glyph"></p>
+
+Ten consecutive samples, ten seconds apart, all of it. Per-pixel mean delta between them: **0.03 to
+0.12 out of 255** — the background stripes drift and nothing else moves. Every renderer diagnostic
+is clean, the guest is running, frames are being produced at 4.7/s. It is a **modal waiting for a
+button**, and the button is Cross, and it says so on the button.
+
+One `cross` in a route file, and the title screen above comes up and stays up for the rest of the
+run — 140 seconds, cycling Sonic, Tails and Knuckles through the emblem the way it does on hardware.
+That is the **fourth** title here where input mapping has impersonated a rendering wall, after
+*Asterix & Obelix: Babylon Mission* (skip was Triangle), *Tales of Graces f* (two OPTIONS-button
+gates with Yes/No dialogs defaulting to No) and *Hi-Fi RUSH* (a confirm dialog whose cursor starts on
+the right-hand option). The pattern is now familiar enough to be worth stating as a rule: **if the
+frames are still changing, it is not a wall.**
+
+What actually moved the title this far is less photogenic and probably more important. Two fixes
+landed in the last day. [#2901](https://github.com/mattias800/prosper/pull/2901) taught the renderer
+to recognise a decoded video's chroma plane by its geometry rather than by where the title happened
+to put it. [#2910](https://github.com/mattias800/prosper/pull/2910) stopped `sceSaveDataGetEventResult`
+answering a drained queue with `0x809F0018`, the "still in flight" code — and this title has, at
+`eboot+0x940380`, a loop that calls that function, compares against exactly `0x809F0018`, and on a
+match calls `sceKernelSleep(1)` and goes round again. Nothing else exits it. prosper was returning
+the one value that meant "keep waiting" in a state where nothing was waiting.
+
+Tracker [#1871](https://github.com/mattias800/prosper/issues/1871).
+
+### Sonic Origins' SONIC TEAM logo is blue
+
+<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.png" alt="Sonic Origins — the SONIC TEAM logo at 3840x2160: the blue Sonic head silhouette and blue SONIC TEAM wordmark on a near-white background"></p>
+
+The 2026-08-20 entry further down this page has the same frame in **purple**, and that was an
+honest record of what prosper drew that day: every movie in the title composited with its two chroma
+components collapsed onto one, so a gold ring rendered green and anything blue rendered magenta.
+[#2731](https://github.com/mattias800/prosper/issues/2731) is fixed, and this is the same logo from
+the same route on current master — a direct, unmodified `tools/screenshot` capture, default launch
+with no input, sample 14 of a 420 s run at t=150 s. The old entry stays where it is.
+
+Refs [#2904](https://github.com/mattias800/prosper/issues/2904).
 
 ### Beast of Reincarnation: the whole game was under a coat of white paint
 
@@ -153,20 +221,6 @@ That is now the fourth title where input mapping has impersonated one. The commi
 `cross` → `left` → `cross`.
 
 Tracker [#2891](https://github.com/mattias800/prosper/issues/2891).
-
-## 2026-08-21
-
-### Beneath reaches gameplay
-
-<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="..."></p>
-
-The opening dive. The waypoint counts down as the route moves and the dialogue plays over it —
-this is the real scene, not a cutscene. Tracker [#1898](...).
-```
-
-> An entry is evidence of what rendered **on the day it was written**. It is not a claim about the
-> title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
-> because the point of a blog is that it records *when* things happened.
 
 ## 2026-08-22
 
