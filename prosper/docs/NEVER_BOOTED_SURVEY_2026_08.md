@@ -32,7 +32,7 @@ positive before their result was believed (instrument trap 218).
 | --- | --- | --- | --- | --- | --- |
 | `PPSA02058` | BALAN WONDERWORLD | Unreal Engine 4 (`.pak`) | 7 | **2** | The game's own **4K language-select menu** renders, with full theatre art and button glyphs — but on only ~18% of frames; the rest are a flat white 4K clear ([#2932](https://github.com/mattias800/prosper/issues/2932)). The menu waits for CROSS. |
 | `PPSA02101` | Stray | Unreal Engine 4 (`.pak`) | 9 | **2** | BlueTwelve logo, then the game's **4K brightness-calibration screen**, held for the rest of the run. Its own prompt reads `✕ Accept` — the flow waits for CROSS. |
-| `PPSA02154` | Little Nightmares II | Unreal Engine 4 (`.pak`) | 8 | **1** | A **4K logo sequence** — Bandai Namco → Tarsier Studios → Unreal Engine — advancing over ~140 s. No title screen in a 380 s run. Interleaved with both wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932). Calls the unregistered `sceAgcDcbDrawIndirect` ([#2929](https://github.com/mattias800/prosper/issues/2929)). |
+| `PPSA02154` | Little Nightmares II | Unreal Engine 4 (`.pak`) | 8 | **1** | A **4K logo sequence** — Bandai Namco → Tarsier Studios → Unreal Engine — for the first ~130 s. Then the composite is a **flat white 4K clear for the remaining 260 s** of a 390 s run, and the last content frame is the last sample before the unregistered `sceAgcDcbDrawIndirect` call ([#2929](https://github.com/mattias800/prosper/issues/2929)). Also shows both wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932). |
 | `PPSA02846` | Spacebase Startopia | Unity 2020.3.12f1 / IL2CPP | 8 | **0** | Boots in 447 ms, publishes **3 flips and one black 1080p frame**, then never submits again. The guest stays alive and audible ([#2933](https://github.com/mattias800/prosper/issues/2933)). |
 | `PPSA03001` | Sifu | Unreal Engine 4 (`.pak`) | 8 | **0** | Flat white then flat magenta 4K clear, never any content. Two further defects on the same boot: the guest's own **out-of-memory assert** ([#2908](https://github.com/mattias800/prosper/issues/2908), 2 of 3 runs) and a **GPU hard recovery** ([#2935](https://github.com/mattias800/prosper/issues/2935), 1 of 3). |
 | `PPSA03130` | Sniper Ghost Warrior Contracts 2 | CryEngine | 9 | **0** | A 4K present loop at ~9 flips/s in which **no pass produces a present source** — 2231 flips, 0 published ([#2871](https://github.com/mattias800/prosper/issues/2871), independently reproduced). |
@@ -149,20 +149,43 @@ Only unregistered call worth noting beyond the shared set: `sceCoredumpRegisterC
 
 ### `PPSA02154` — Little Nightmares II (Unreal Engine 4, `.pak`)
 
-Boots in **245 ms**. Renders a **4K logo sequence** that genuinely advances — Bandai Namco at
-t≈28 s, Tarsier Studios at t≈70 s, Unreal Engine at t≈140 s — at 3.9 fps while active. A second run
-bounded at 380 s did not reach a title screen.
+Boots in **245 ms**. Renders a **4K logo sequence** that genuinely advances — **Bandai Namco
+Entertainment**, **Tarsier Studios**, **Unreal Engine** — through the first ~130 s of a 390 s run.
+6.9 fps while producing frames, 19% of the run active, guest alive at the end.
+
+**Then it goes white and stays white.** On a 13 s grid over 30 samples, the last frame carrying
+content is at **t=130 s**; every sample from **t=143 s to t=390 s** — 20 consecutive samples,
+260 seconds — is a flat white 4K clear (`distinct_rgb_colors == 1`, `nonblack_rgb_pixels ==
+8294400`). No title screen is reached.
+
+**And the transition brackets the `sceAgcDcbDrawIndirect` call.** In this run the single
+`[prosper] unimplemented: libSceAgc::1q1titRBL6o` line falls between the t=130 s sample (the last
+with content) and the t=143 s sample (the first of the 260 s of white). An earlier run on a 15 s
+grid put the first call at t≈100 s with the two following samples, at 105 s and 120 s, both white.
+
+**Two runs, the same ordering — and that is a correlation, not a cause.** `CONFIDENCE: LOW`. Two
+samples of an ordering is weak, the log line is emitted once per NID so it marks the *first* call
+rather than the interesting one, and #2932's flat white appears on this title well before t=130 s
+too. It is recorded because it is cheap to test properly and nobody would think to look: registering
+the NID ([#2929](https://github.com/mattias800/prosper/issues/2929)) and re-running this exact route
+answers it in one run.
 
 Shows **both** wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932):
 flat white 4K clears, and near-black frames carrying a diagonal smeared band in the upper-left. The
-wedge frames are pixel-for-pixel the same *kind* of picture as Unbound's, which is what put the two
-titles in one issue.
+wedge frames are the same kind of picture as *Unbound*'s, which is what put the two titles in one
+issue.
 
-**First live caller of `sceAgcDcbDrawIndirect`** ([#2929](https://github.com/mattias800/prosper/issues/2929)),
-at t≈100 s. `PROSPER_PROGRESS_UNIMPL=1` gives the rest of its unimplemented traffic as
+`PROSPER_PROGRESS_UNIMPL=1` gives the rest of its unimplemented traffic as
 `47 x pthread_setschedparam`, `3 x sceSaveDataSetParam`, and one each of `sceHttpInit`,
 `sceHttpCreateTemplate`, `sceNpWebApi2PushEventCreateHandle`, `sceVoiceQoSInit`,
 `sceNetResolverCreate`, `sceSaveDataSaveIcon`.
+
+> **A measurement of this title was wrong in an earlier draft of this document and is corrected
+> here.** It claimed "no title screen in a 380 s run" on the strength of a run configured
+> `--seconds 5 --count 24 --timeout 380`: the tool stops at `request-satisfied`, so 24 samples 5 s
+> apart end the run at **120 s** and the 380 s deadline was never approached. `--timeout` is an upper
+> bound, and `--seconds x --count` is what actually sets a run's length. The genuine 390 s run above
+> is what produced the flat-white finding, which the short run could not have seen.
 
 ### `PPSA02846` — Spacebase Startopia (Unity 2020.3.12f1 / IL2CPP)
 
