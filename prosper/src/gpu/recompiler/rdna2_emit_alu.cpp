@@ -2947,11 +2947,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
-            // v_cvt_i32_f32_sdwa converts the full source, then inserts the selected low/high
-            // result word while preserving the other destination word. The decoder accepts only
-            // this exact WORD + UNUSED_PRESERVE + DWORD-source subset.
-            if (in.opcode == 0x08 && in.sdwa_dst_sel != 6) {
-                const uint32_t result = b.cvt_f2i(a);
+            // v_cvt_i32_f32_sdwa / v_cvt_u32_f32_sdwa convert the full source, then insert the
+            // selected low/high result word while preserving the other destination word. The
+            // decoder accepts only this exact WORD + UNUSED_PRESERVE + DWORD-source subset. The
+            // two opcodes differ only in the signedness of the 32-bit conversion; the inserted
+            // half is its low 16 bits either way, so they share this lowering.
+            if ((in.opcode == 0x07 || in.opcode == 0x08) && in.sdwa_dst_sel != 6) {
+                const uint32_t result = in.opcode == 0x07 ? b.cvt_f2u(a) : b.cvt_f2i(a);
                 const uint32_t word = b.ibin(Op_BitwiseAnd, result, b.uconst(0xFFFFu));
                 d = in.sdwa_dst_sel == 5
                     ? b.ibin(Op_BitwiseOr,

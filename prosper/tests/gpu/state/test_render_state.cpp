@@ -799,6 +799,21 @@ int main() {
         CHECK(resolve_pipeline_state(dcc).color_write_mask == 0xFu,
               "DCC decompress keeps its helper-program handling outside state resolution");
 
+        // #1588's A/B lever must be OFF by default and must not touch the resolved state until it
+        // is asked to. Same reasoning as the #1724 hatch above: an agent who A/B's a lever that is
+        // silently already on, or silently cannot turn on, draws the wrong conclusion either way.
+        RenderState efc = absent;
+        efc.has_cb_color_control = true;
+        efc.cb_color_control =
+            P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        ResolvedPipelineState efc_ps = resolve_pipeline_state(efc);
+        CHECK(!cb_eliminate_fast_clear_writes_no_color(),
+              "the ELIMINATE_FAST_CLEAR colour-suppression lever is OFF unless explicitly requested");
+        CHECK(efc_ps.color_write_mask == 0xFu && efc_ps.color1_write_mask == 0xFu &&
+                  efc_ps.color_targets[0].write_mask == 0xFu,
+              "ELIMINATE_FAST_CLEAR still writes colour with the lever off (the #1588 gap is "
+              "reported, not silently changed)");
+
         // #1588 item 2: the unmodeled-mode report is COUNTABLE, not deduped per mode value. The old
         // assertion here checked `occurrence_count(..., "MODE=2 ") == 1` — i.e. the dedupe itself —
         // so a run in which one draw hit the path was indistinguishable from one in which hundreds

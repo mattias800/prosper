@@ -136,6 +136,42 @@ bool legacy_cb_disable_mask_enabled() {
     return enabled;
 }
 
+// PROSPER_CB_EFC_NO_COLOR=1 — diagnostic A/B lever for #1588, DEFAULT OFF, never a shipping mode.
+//
+// ELIMINATE_FAST_CLEAR is a colour-block metadata operation hardware performs INSTEAD of shading:
+// it expands a compressed fast-clear representation into explicit pixels. prosper does not model
+// compressed colour surfaces at all, so on this backend the expansion has nothing to do, while
+// running the pass as an ordinary colour draw writes the bound pixel shader's export over the
+// target. Whether that is what turns a title's composite into a flat clear is a QUESTION, not a
+// conclusion, and this lever exists so it can be answered in one run rather than argued.
+//
+// With it on, an EFC draw keeps its depth/stencil effects and writes no colour. That is a
+// behaviour change on a shared path in EVERY title (Plucky Squire alone reported 36,613 such draws
+// in one trace), which is exactly why it is opt-in: the measurement has to be separable from the
+// decision. Do NOT make it the default without a cross-title snapshot pass.
+//
+// And read #1706 before believing either arm: the decoded MODE is not per-draw-trustworthy,
+// because a utility sequence's operation bits stay latched onto later ordinary draws. This lever
+// therefore acts on every draw that DECODES as EFC, which is a superset of the draws that ARE one.
+// That is the reason a positive arm cannot justify flipping the default no matter how good the
+// frames look: it localises a POPULATION of draws, and identifying an OPERATION is a different
+// claim that this lever is structurally unable to make.
+//
+// KNOWN HAZARD, #2915: on PPSA29343 a SIGSEGV inside libvulkan_radeon.so on AgcSubmissionTh
+// appeared in 2 of 3 runs with this on and 0 of 2 with it off. Neither the cause nor even the
+// association is established — the lever arm also did roughly 12x more GPU work (56% vs 1% of the
+// run producing frames), so "correlates with the lever" and "correlates with actually rendering"
+// are not separated by those five runs; and PROSPER_LEGACY_CB_DISABLE_MASK ten lines above
+// performs the identical three assignments, so zeroed masks alone are not obviously the mechanism.
+// Recorded here because this is where a reader arrives by grepping the variable name.
+bool cb_eliminate_fast_clear_writes_no_color() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PROSPER_CB_EFC_NO_COLOR");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
     return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
 }
@@ -890,6 +926,14 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
             ps.cb_resolve = true;
         } else if (cb_mode_is_unmodeled_operation(cb_mode)) {
             report_unmodeled_cb_color_mode(cb_mode);
+            // #1588's A/B arm. Reported first, so the census counts the same population whichever
+            // way the lever is set and the two runs stay comparable.
+            if (cb_mode == P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR &&
+                cb_eliminate_fast_clear_writes_no_color()) {
+                ps.color_write_mask = 0;
+                ps.color1_write_mask = 0;
+                for (auto& target : ps.color_targets) target.write_mask = 0;
+            }
         }
     }
 
