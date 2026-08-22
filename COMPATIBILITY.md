@@ -66,6 +66,7 @@ Last updated: 2026-08-22
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 | *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots, allocates its whole game heap through libSceAmpr AMM, and dies loading its shader archives ([#2872](https://github.com/mattias800/prosper/issues/2872)); no frames yet | [#2864](https://github.com/mattias800/prosper/issues/2864) |
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
+| *The Lord of the Rings: Gollum* | `PPSA06367` | Unreal Engine 4 | 🔬 Rung 0 — boots, links every module and composites a 2560x1440 frame, but the only frame is a flat white clear; the startup movie kills the process ~4 s in when `sceVideodec2GetPictureInfo` returns success without writing its picture-info struct ([#2898](https://github.com/mattias800/prosper/issues/2898)). Its AAC movie audio now decodes | [#2900](https://github.com/mattias800/prosper/issues/2900) |
 | *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — nothing run against it yet | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — nothing run against it yet | [#2880](https://github.com/mattias800/prosper/issues/2880) |
 | *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2882](https://github.com/mattias800/prosper/issues/2882) |
@@ -94,14 +95,17 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 13 |
 | **Below a title screen** — logo or splash only (rung 1) | 2 |
-| **No frame yet** — booted and running, nothing but black or a flat clear (rung 0) | 3 |
+| **Boots, but no frame with content** (rung 0) | 4 |
 | **Not yet booted** — tracked, no run attempted yet | 8 |
-| Total tracked | 51 |
+| Total tracked | 52 |
 
-Re-derived row by row on 2026-08-22 when the *Beast of Reincarnation* row was added, because the
-previous figures summed to 48 against a stated total of 50 and had no rung-0 category at all while
-three rows said "Rung 0" in their own milestone text. The rung-0 row above is new; the other four
-numbers are the count of rows whose milestone text places them there, and they now sum to the total.
+Every figure above is re-derived from the rows each time this table is touched, and the buckets now
+sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
+render nothing were counted under whichever neighbouring bucket a previous editor reached for, and
+the sub-counts came to 48 against 49 rows. A missing category does not show up as a wrong number in
+one cell — it shows up as an arithmetic error nobody can localise, which is why the fix is a new row
+rather than an adjusted one. Rung 0 is now the third-largest bucket, so the gap it was hiding was not
+a rounding error.
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
@@ -114,18 +118,24 @@ title stuck at a menu — the text carries that, not the number.
 
 ### Where the titles accumulate
 
-The 14 titles below gameplay — a title screen or menu, or gameplay reached without a rendered world — by the engine recorded in the table:
+The 13 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
-| Unreal Engine — 8 × UE4, 1 × UE5, 1 unversioned | 10 |
+| Unreal Engine — 7 × UE4, 1 × UE5, 1 unversioned | 9 |
 | Custom (Ancient), ASOBI, RAGE, Hedgehog Engine 2 — one each | 4 |
 
-**Every Unreal title in the table is in this group.** Ten of the 39 rows are Unreal; all ten reach a
-title screen and none has reached gameplay. The distribution is the mirror image on the other side:
-19 of the 24 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows — and **no Unity title
-remains below gameplay.** The rung-2 group is ten Unreal titles plus *Earthion*, *Astro Bot*, and the
-two that reach the game loop without a world, *Grand Theft Auto V* and *Sonic Frontiers*.
+**Unreal dominates this group, and it no longer accounts for all of it.** Nine of the 13 rung-2 rows
+are Unreal, against 16 Unreal rows in the table overall — the other seven are one at gameplay
+(*Dragon Quest VII Reimagined*, whose world renders), one at rung 0 (*The Lord of the Rings: Gollum*),
+and five not yet booted. So "every Unreal title stops at a title screen", which this section used to
+say, is no longer true in either direction: one has passed it and one has not reached it.
+
+The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
+Unity-family, and **no Unity title remains at rung 2 for want of a rendered world.** The rung-2 group
+is nine Unreal titles plus *Earthion*, *Astro Bot*, and the two that reach the game loop without a
+world, *Grand Theft Auto V* and *Sonic Frontiers*.
 
 **This is an observation about where titles accumulate, not a claim that the ten Unreal titles share
 one root cause.** A common cause is an untested hypothesis, and the per-title records currently cut

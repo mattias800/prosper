@@ -72,6 +72,56 @@ The actual evidence is duller and better — `Nanite`, `Lumen`, `VirtualShadowMa
 `WorldPartition` in the executable's strings, and an IoStore container version of 6 where every UE4
 title in the library has 2 or 3.
 
+### Gollum's boot was killed by a divide by zero, and the divisor was a channel count nobody wrote
+
+No picture with this one — *The Lord of the Rings: Gollum* (`PPSA06367`) still renders nothing but a
+flat white clear. The finding is what moved, and it moved a wall that was four seconds from the
+start of every boot.
+
+The title booted further than you would guess. Every module links, all 32 Wwise plug-ins load, the
+AGC path comes up, real draws go out at 2560x1440, and the live renderer composites and presents.
+Then, at about four seconds, a worker thread called `ElectraPlayer::` — Unreal's media player,
+starting the intro movie — died on a **SIGFPE**. Not a segfault, a *divide error*:
+
+```text
+eboot+0xec15e1   mov  esi, DWORD PTR [r13+0x240]   ; channels
+eboot+0xec15f6   add  rsi,rsi                      ; 2 bytes per sample * channels
+eboot+0xec15f9   div  rsi                          ; ... and channels was 0
+```
+
+The function logs its own name three instructions earlier: `AudioAACConvertOutput`. So: the game had
+just decoded a chunk of AAC audio, wanted to know how many sample frames that was, divided the byte
+count by `2 × channels`, and the channel count was zero.
+
+It was zero because **prosper had never implemented `libSceAudiodec` at all** — not one of its nine
+entry points. Unregistered NIDs fall to a dispatcher default that returns `0`, and `0` is `SCE_OK`.
+So every call succeeded: the library initialised, a decoder was created, a decode ran. None of them
+wrote anything into the guest's structures, and the game had no way to tell. This is the exact
+failure mode that cost *Yakuza Kiwami* its boot a day earlier, in a different library.
+
+The fix was to actually implement it, and the interesting part was recovering the ABI, because there
+is no header for this. The game's own call sites give it up if you read them: the return of
+`sceAudiodecCreateDecoder` is tested with `jns`, so it is a handle-or-negative-error; the return of
+`sceAudiodecDecode` is tested with `jne`, so zero is success; the byte count the decoder reports back
+is *added* to the guest's own cursor at `eboot+0xec153b`, so it is a delta and not an absolute
+offset. Every offset in the four control structures came out of instructions like that.
+
+One field lied convincingly. The AAC parameter block has a 32-bit value at `+0x0c` that sits exactly
+where a sample rate belongs — and the first implementation read it as one, configured an FFmpeg
+decoder at "3 Hz", and failed on the first access unit. A log line printing the whole block is what
+corrected it: the field is `3`, the movie is 48 kHz, and **3 is the MPEG-4 sampling-frequency index
+for 48000**. The whole parameter block turned out to be an unpacked `AudioSpecificConfig` —
+`{objectType=2, samplingFrequencyIndex=3, channelConfiguration=2}` — which is exactly what a raw AAC
+stream out of an MP4 needs and cannot carry in-band. Rebuild those two bytes and the stream decodes:
+48000 Hz, stereo, 4096 bytes of PCM per access unit, which is precisely one AAC-LC frame.
+
+The wall moved about thirty milliseconds further into the movie, where the video half does the same
+thing: `sceVideodec2GetPictureInfo` returns success without writing its picture-info structure, and
+the guest dereferences a pointer that was never filled in ([#2898](https://github.com/mattias800/prosper/issues/2898)).
+That one is *not* fixed, deliberately — the structure is 120 bytes and this title only reveals eight
+fields of it, so filling in the rest would be inventing an ABI rather than recovering one. What the
+title did give us is the evidence an older issue asked for and never got. Tracker
+[#2900](https://github.com/mattias800/prosper/issues/2900).
 
 ### Hi-Fi RUSH reaches its title screen on the first try
 

@@ -148,4 +148,11 @@ AudioSink* audio_sink();
 // Close all ports and restore the default sink. Intended for tests.
 void audio_reset();
 
+// Fault-safe guest-memory copies (defined in hle_audio.cpp). Both return false rather than raising
+// when the guest range is not mapped, which is what lets an HLE entry point answer a bad pointer
+// with an error instead of killing the process. Declared here so the other audio HLE libraries in
+// this folder use the one implementation rather than each growing its own.
+bool audio_store_bytes(uint64_t dst, const void* src, std::size_t n);
+bool audio_read_bytes(uint64_t src, void* dst, std::size_t n);
+
 } // namespace prosper

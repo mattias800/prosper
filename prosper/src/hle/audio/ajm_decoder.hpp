@@ -41,10 +41,53 @@ public:
                                 std::span<int16_t> output) = 0;
 };
 
+// Out-of-band stream configuration, for callers that know more than AJM's instance flags can say.
+//
+// AJM packs only a channel bound and a sample encoding into `instance_flags`, which is everything
+// an AJM instance is told. libSceAudiodec is configured differently: its guest hands a codec
+// parameter block carrying the stream's sample rate and channel count, and a raw (MP4/`esds`) AAC
+// elementary stream CANNOT be decoded without them — the AudioSpecificConfig lives in the
+// container, not in the access units, so a decoder that only sees AUs has no framing to recover it
+// from. Passing them through this struct keeps that knowledge in the caller that actually has it.
+struct StreamConfig {
+    uint32_t max_channels = 0;  // 0 -> the backend's own default bound
+    uint32_t sample_rate = 0;   // 0 -> unknown; a hint, never a substitute for what decodes
+    uint32_t channels = 0;      // 0 -> unknown; ditto
+
+    // Raw MPEG-4 AudioSpecificConfig fields, for a caller that genuinely has them. libSceAudiodec's
+    // AAC parameter block IS an unpacked ASC -- measured live on PPSA06367, whose 48 kHz stereo
+    // AAC-LC stream arrives as `{objectType=2, samplingFrequencyIndex=3, channelConfiguration=2}`.
+    // Supplying them means the config is RECONSTRUCTED from the guest's own bytes rather than
+    // guessed from a rate, which is the difference between a derivation and an assumption.
+    uint32_t aac_object_type = 0;         // 0 -> not supplied
+    uint32_t aac_sample_rate_index = 0;   // only meaningful when aac_object_type != 0
+    uint32_t aac_channel_config = 0;      // ditto
+};
+
+// MPEG-4 AudioSpecificConfig sampling-frequency index table (ISO/IEC 14496-3, Table 1.18). Shared
+// because the HLE needs the rate in Hz to publish to its guest and the codec backend needs the
+// index to rebuild the config; two copies of a published constant table is one copy too many.
+inline constexpr int kAacSampleRates[] = {96000, 88200, 64000, 48000, 44100, 32000,
+                                          24000, 22050, 16000, 12000, 11025, 8000, 7350};
+
+// Hz for an ASC sampling-frequency index, or 0 for an index MPEG-4 does not define (15 means the
+// rate is written out explicitly in the config, which an unpacked parameter block cannot express).
+inline uint32_t aac_sample_rate_from_index(uint32_t index) {
+    if (index >= sizeof(kAacSampleRates) / sizeof(kAacSampleRates[0])) return 0;
+    return static_cast<uint32_t>(kAacSampleRates[index]);
+}
+
 class DecoderBackend {
 public:
     virtual ~DecoderBackend() = default;
     virtual std::unique_ptr<StreamDecoder> create(Codec codec, uint64_t instance_flags) = 0;
+
+    // Default: ignore the out-of-band configuration and fall back to the flags form. A backend
+    // written before this seam existed therefore keeps working unchanged, and simply cannot serve
+    // the codecs that need it (it returns nullptr for them exactly as it did before).
+    virtual std::unique_ptr<StreamDecoder> create_configured(Codec codec, const StreamConfig& cfg) {
+        return create(codec, static_cast<uint64_t>(cfg.max_channels & 0x7fu));
+    }
 };
 
 // Non-owning backend registration. Installation happens before the guest starts.
