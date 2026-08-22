@@ -68,14 +68,14 @@ Last updated: 2026-08-22
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 | *The Lord of the Rings: Gollum* | `PPSA06367` | Unreal Engine 4 | 🔬 Rung 0 — boots, links every module and composites a 2560x1440 frame, but the only frame is a flat white clear; the startup movie kills the process ~4 s in when `sceVideodec2GetPictureInfo` returns success without writing its picture-info struct ([#2898](https://github.com/mattias800/prosper/issues/2898)). Its AAC movie audio now decodes | [#2900](https://github.com/mattias800/prosper/issues/2900) |
 | *The First Berserker: Khazan* | `PPSA20447` | Unreal Engine 4 | 🔬 Rung 0 — boots, mounts and enumerates all thirty save slots, but composites only a flat white 4K clear; the guest then exhausts prosper's direct-memory pool and calls its own OOM handler ([#2908](https://github.com/mattias800/prosper/issues/2908)). The save-data event-drain code that parked its game thread forever is fixed | [#2909](https://github.com/mattias800/prosper/issues/2909) |
-| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — nothing run against it yet | [#2876](https://github.com/mattias800/prosper/issues/2876) |
+| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Rung 0 — the fastest boot tracked (161 ms) and zero frames: it dies ~7 s in with a SIGSEGV in its CRI Mana movie thread ([#2934](https://github.com/mattias800/prosper/issues/2934)) | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots and runs indefinitely without faulting, executes real GPU draws and presents 4K frames with zero recompiler rejections, but every frame is pure black ([#2923](https://github.com/mattias800/prosper/issues/2923)) | [#2880](https://github.com/mattias800/prosper/issues/2880) |
-| *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2882](https://github.com/mattias800/prosper/issues/2882) |
-| *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2883](https://github.com/mattias800/prosper/issues/2883) |
-| *Little Nightmares II* | `PPSA02154` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2884](https://github.com/mattias800/prosper/issues/2884) |
-| *Spacebase Startopia* | `PPSA02846` | Unity 2020.3.1 / IL2CPP | 🔬 Not yet booted — nothing run against it yet | [#2887](https://github.com/mattias800/prosper/issues/2887) |
-| *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2885](https://github.com/mattias800/prosper/issues/2885) |
-| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2886](https://github.com/mattias800/prosper/issues/2886) |
+| *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Rung 2 — the game's own 4K language-select menu renders in full, and waits for Cross; but only ~18% of frames carry it and the rest are a flat white 4K clear ([#2932](https://github.com/mattias800/prosper/issues/2932)) | [#2882](https://github.com/mattias800/prosper/issues/2882) |
+| *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Rung 2 — the BlueTwelve logo and the game's own 4K brightness-calibration screen, held for the rest of the run; its prompt reads `✕ Accept` and no input is sent | [#2883](https://github.com/mattias800/prosper/issues/2883) |
+| *Little Nightmares II* | `PPSA02154` | Unreal Engine 4 | 🔬 Rung 1 — a 4K logo sequence (Bandai Namco → Tarsier → Unreal) advances but reaches no title screen in 380 s; frames alternate with a flat white clear and a near-black diagonal wedge ([#2932](https://github.com/mattias800/prosper/issues/2932)), and it calls the unregistered `sceAgcDcbDrawIndirect` ([#2929](https://github.com/mattias800/prosper/issues/2929)) | [#2884](https://github.com/mattias800/prosper/issues/2884) |
+| *Spacebase Startopia* | `PPSA02846` | Unity 2020.3.1 / IL2CPP | 🔬 Rung 0 — boots in 447 ms, publishes 3 flips and one black 1080p frame, then stops submitting while its own threads and FMOD audio keep running ([#2933](https://github.com/mattias800/prosper/issues/2933)) | [#2887](https://github.com/mattias800/prosper/issues/2887) |
+| *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Rung 0 — every frame is a flat 4K clear, white then magenta. Two further defects on the same boot: the guest's own out-of-memory assert ([#2908](https://github.com/mattias800/prosper/issues/2908), shared with *Khazan*) and a GPU hard recovery from a compute submit ([#2935](https://github.com/mattias800/prosper/issues/2935)) | [#2885](https://github.com/mattias800/prosper/issues/2885) |
+| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — the 4K title screen renders, with the wordmark and a Cross prompt, but on only ~9% of frames at a strict 5 s cadence; a near-black diagonal wedge otherwise ([#2932](https://github.com/mattias800/prosper/issues/2932)) | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 
@@ -83,9 +83,9 @@ Last updated: 2026-08-22
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-twelve of the twenty-five titles that reach gameplay are marked 🚧 rather than ✅, and the 🔬 rows sit
-at four different states — three at different rungs, and seven not yet run at all. Counting markers
-gives a different — and wrong — answer.
+twelve of the twenty-five titles that reach gameplay are marked 🚧 rather than ✅, and the fifteen 🔬
+rows sit at three different rungs — four at rung 2, two at rung 1 and nine at rung 0 — with none
+unrun. Counting markers gives a different — and wrong — answer.
 
 **"Not yet booted" is a real category, not a rung.** A title can be tracked and never measured, and
 that is different from having been measured and found wanting. It is counted separately so an
@@ -94,10 +94,10 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
-| **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Boots, but no frame with content** (rung 0) | 6 |
-| **Not yet booted** — tracked, no run attempted yet | 7 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
+| **Below a title screen** — logo or splash only (rung 1) | 2 |
+| **Boots, but no frame with content** (rung 0) | 9 |
+| **Not yet booted** — tracked, no run attempted yet | 0 |
 | Total tracked | 53 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
@@ -107,6 +107,17 @@ the sub-counts came to 48 against 49 rows. A missing category does not show up a
 one cell — it shows up as an arithmetic error nobody can localise, which is why the fix is a new row
 rather than an adjusted one. Rung 0 is now the third-largest bucket, so the gap it was hiding was not
 a rounding error.
+
+**The "not yet booted" bucket emptied on 2026-08-22.** Seven of its eight titles were run by the
+never-booted survey
+([`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md)) —
+three landed at rung 2, one at rung 1 and three at rung 0 — and *Judgment* (`PPSA02739`) was booted
+the same day by a separate lane ([#2923](https://github.com/mattias800/prosper/issues/2923)).
+
+The row stays at 0 rather than being deleted, for the reason above: it is a **category, not a rung**,
+and the next title onboarded starts in it. The distribution is also the argument for having kept it
+separate — the unmeasured group turned out neither uniformly promising nor uniformly stuck, so
+folding it into rung 0 would have been wrong in both directions.
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
@@ -119,34 +130,38 @@ title stuck at a menu — the text carries that, not the number.
 
 ### Where the titles accumulate
 
-The 13 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+The 17 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
 the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
-| Unreal Engine — 7 × UE4, 1 × UE5, 1 unversioned | 9 |
-| Custom (Ancient), ASOBI, RAGE, Hedgehog Engine 2 — one each | 4 |
+| Unreal Engine — 10 × UE4, 1 × UE5, 1 unversioned | 12 |
+| Hedgehog Engine, Hedgehog Engine 2, RAGE, Custom (Ancient), ASOBI — one each | 5 |
 
-**Unreal dominates this group, and it no longer accounts for all of it.** Nine of the 13 rung-2 rows
-are Unreal, against 17 Unreal rows in the table overall — the other eight are one at gameplay
-(*Dragon Quest VII Reimagined*, whose world renders), two at rung 0 (*The Lord of the Rings: Gollum*
-and *The First Berserker: Khazan*), and five not yet booted. So "every Unreal title stops at a title
-screen", which this section used to say, is no longer true in either direction: one has passed it and
-two have not reached it.
+**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 17 rung-2
+rows are Unreal, against 18 Unreal rows in the table overall — the other six are one at gameplay
+(*Dragon Quest VII Reimagined*, whose world renders), two at rung 1 (*Little Nightmares II* and
+*Beast of Reincarnation*) and three at rung 0 (*The Lord of the Rings: Gollum*, *The First Berserker:
+Khazan* and *Sifu*). So "every Unreal title stops at a title screen", which this section used to say,
+is not true in either direction: one has passed it and five have not reached it.
 
 The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
 Unity-family, and **no Unity title remains at rung 2 for want of a rendered world.** The rung-2 group
-is nine Unreal titles plus *Earthion*, *Astro Bot*, and the two that reach the game loop without a
-world, *Grand Theft Auto V* and *Sonic Frontiers*.
+is twelve Unreal titles plus *Sonic Origins*, *Earthion*, *Astro Bot*, and the two that reach the
+game loop without a world, *Grand Theft Auto V* and *Sonic Frontiers*.
 
-**This is an observation about where titles accumulate, not a claim that the ten Unreal titles share
-one root cause.** A common cause is an untested hypothesis, and the per-title records currently cut
-against it: what bounds *Nikoderiko*, *ArcRunner*, *Crisis Core*, *Little Nightmares III* and
-*The Oregon Trail* is recorded separately for each in the sections below and in their tracker issues,
-and no cross-title experiment has been run. What the grouping does say is that the shared UE
-bring-up surface — [`prosper/docs/UE4_APR_IOSTORE_BRINGUP.md`](prosper/docs/UE4_APR_IOSTORE_BRINGUP.md)
-and [`prosper/docs/CROSS_ENGINE_UE4.md`](prosper/docs/CROSS_ENGINE_UE4.md) — carries the largest
-single block of titles waiting to reach gameplay.
+**This is an observation about where titles accumulate, not a claim that the twelve Unreal titles
+share one root cause** — and this is no longer merely an untested hypothesis in either direction.
+[#2747](https://github.com/mattias800/prosper/issues/2747) is a census over eight of them showing
+that four lose the *same* UE volumetric-fog compute pass to one recompiler gap and **none of them is
+stuck because of it**, and the never-booted survey found the same shape again: its eight titles share
+symptoms and share latent defects, and every rung-0 wall in it is title-specific. What bounds
+*Nikoderiko*, *ArcRunner*, *Crisis Core*, *Little Nightmares III* and *The Oregon Trail* is still
+recorded separately for each, in the sections below and in their tracker issues. What the grouping does say
+is that the shared UE bring-up surface —
+[`prosper/docs/UE4_APR_IOSTORE_BRINGUP.md`](prosper/docs/UE4_APR_IOSTORE_BRINGUP.md) and
+[`prosper/docs/CROSS_ENGINE_UE4.md`](prosper/docs/CROSS_ENGINE_UE4.md) — carries the largest single
+block of titles waiting to reach gameplay.
 
 ## Screenshots and short descriptions
 
@@ -605,6 +620,50 @@ This title needs `PROSPER_NULL_PAGE=1` to boot — the Unity player walks its fr
 hop past the terminal NULL frame pointer and reads the return-address slot at address `0x8`.
 See [`prosper/docs/BENEATH_STATUS.md`](prosper/docs/BENEATH_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1898).
+
+## Unbound: Worlds Apart — `PPSA03274`
+
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
+
+A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
+The title screen renders complete — wordmark, character, portal and prompt glyph — but on only about
+9% of frames, at a strict 5 s cadence; the rest are a near-black frame carrying a diagonal smeared
+band ([#2932](https://github.com/mattias800/prosper/issues/2932)). The prompt is waiting for Cross.
+See [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and
+the [tracker](https://github.com/mattias800/prosper/issues/2886).
+
+## BALAN WONDERWORLD — `PPSA02058`
+
+<p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.png" alt="BALAN WONDERWORLD — the language-select screen at 3840x2160: a Language Settings heading over a red and gold theatre interior, with 24 language buttons in three columns, English highlighted in cyan, and a prompt bar reading Change Language and Select Language"></p>
+
+A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
+This is the game's own first-boot language menu, not its title screen: all 24 labels render,
+including CJK, Thai, Greek, Cyrillic and Arabic, and the prompt bar names the buttons it wants. About
+82% of frames are a flat white 4K clear instead
+([#2932](https://github.com/mattias800/prosper/issues/2932)). See
+[`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/2882).
+
+## Stray — `PPSA02101`
+
+<p align="center"><img src="assets/screenshots/stray-brightness-calibration.png" alt="Stray — the brightness-calibration screen at 3840x2160: three grey cat-head silhouettes at increasing brightness on black, instruction text above them, a 16-step slider below, and Defaults and Accept prompts in the lower right"></p>
+
+A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
+The BlueTwelve Studio logo plays and the game's own brightness-calibration screen renders in full,
+then holds. Its prompt reads `✕ Accept`, and nothing on the default route presses it. See
+[`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/2883).
+
+## Little Nightmares II — `PPSA02154`
+
+<p align="center"><img src="assets/screenshots/little-nightmares-2-tarsier-logo.png" alt="Little Nightmares II — the Tarsier Studios logo at 3840x2160: a white condensed serif wordmark centred on a dark grey vignetted background"></p>
+
+A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
+The boot logo sequence advances — Bandai Namco, then Tarsier Studios, then Unreal Engine — but no
+title screen is reached in a 380 s run, and frames alternate with both wrong-composite signatures of
+[#2932](https://github.com/mattias800/prosper/issues/2932). See
+[`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/2884).
 
 ## Reproducible routes
 
