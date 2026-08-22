@@ -43,6 +43,16 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-22
 
+### The eight titles nobody had ever run
+
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
+
+Eight tracked titles had never been booted. All eight now have: three reach a menu or title screen,
+one a logo sequence, four render nothing. *Unbound* is the best of them — that is its real title
+screen, on 9% of frames. The point was the comparison, not the eight runs: what they share is
+symptoms, and every rung-0 wall is its own.
+[`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md).
+
 ### Sonic Origins reaches its title screen, and the wall was a dialog box
 
 <p align="center"><img src="assets/screenshots/sonic-origins-title-screen.png" alt="Sonic Origins — the title screen at 3840x2160: the classic winged gold ring emblem with blue stars, Sonic peering over a red-and-white striped banner, in front of the painted South Island seascape with cliffs, clouds and sunlit water"></p>
