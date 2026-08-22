@@ -117,6 +117,76 @@ int main(int argc, char** argv) {
                 backend()->close(id);
                 CHECK(!backend()->seek(id, 0), "seeking a closed session fails instead of lying");
             }
+            // #2899 -- AUDIO MUST NOT BE HOSTAGE TO THE VIDEO QUEUE.
+            //
+            // One demux/decode worker feeds both queues, so a video queue nobody drains used to stop
+            // audio as well: the worker parked in enqueue_video and never got back to the demuxer. A
+            // guest that clocks playback on audio (Unity's PS5VideoMedia pulls
+            // sceAvPlayerGetAudioData and only asks for a video frame once the audio position moves)
+            // therefore deadlocks -- no audio, so no video pull, so the video queue never drains.
+            //
+            // The arm below is that guest: it pulls ONLY audio. Without the fix it collects at most
+            // one video-queue-worth of interleaved audio before the worker parks forever; with it,
+            // audio keeps arriving because a starved audio consumer releases the video wait.
+            {
+                const int id = backend()->open(asset);
+                CHECK(id >= 0, "#2905: the clip opens for the audio-only consumer arm");
+                if (id >= 0) {
+                    StreamInfo stream{};
+                    const bool have = backend()->info(id, stream);
+                    CHECK(have && stream.has_audio,
+                          "#2905: the test clip really has an audio stream (the arm is not vacuous)");
+                    unsigned audio_frames = 0;
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                    while (std::chrono::steady_clock::now() < deadline && !backend()->eof(id)) {
+                        AudioFrame audio{};
+                        if (backend()->next_audio(id, audio)) ++audio_frames;
+                        else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    // The clip is one second of 48 kHz stereo AAC in an MPEG-4 Part 2 container --
+                    // exactly 45 packets of 1024 samples, counted with ffprobe rather than derived,
+                    // and NOTHING here ever pulls a video frame. (The video track is mpeg4, NOT
+                    // H.264; the H.264 asset is the separate h264_annexb_testpattern.264.)
+                    //
+                    // The threshold is MEASURED, not guessed, because the first one guessed did not
+                    // discriminate: a parked worker still delivers everything it demuxed before the
+                    // sixth video frame filled the queue, which for this asset is 26 packets, so a
+                    // ">= 20" arm passed with the fix reverted. Measured on this asset: 26 with the
+                    // pre-#2899 unbounded wait, 44 with it. 35 sits between them with margin on both
+                    // sides and well under the whole track, so it separates "the worker kept going"
+                    // from "the worker parked" without asserting an exact decode order.
+                    CHECK(audio_frames >= 35,
+                          "#2905: a consumer that pulls ONLY audio keeps receiving it "
+                          "(the video queue's backpressure does not stop the session)");
+                    std::printf("  [info] #2899 audio-only arm collected %u audio frame(s), "
+                                "%llu video frame(s) recycled\n", audio_frames,
+                                (unsigned long long)vaapi_video_frames_dropped(id));
+                    // The CONTROL that makes the number above mean something: a session whose video
+                    // IS consumed must never recycle a frame, so the two arms are separated by the
+                    // mechanism and not merely by how long each ran.
+                    backend()->close(id);
+                }
+                const int consuming = backend()->open(asset);
+                CHECK(consuming >= 0, "#2905: the clip opens for the consuming control arm");
+                if (consuming >= 0) {
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                    unsigned video_frames = 0, audio_frames = 0;
+                    while (std::chrono::steady_clock::now() < deadline && !backend()->eof(consuming)) {
+                        VideoFrame video{};
+                        AudioFrame audio{};
+                        if (backend()->next_video(consuming, video)) ++video_frames;
+                        if (backend()->next_audio(consuming, audio)) ++audio_frames;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    CHECK(video_frames > 0 && audio_frames > 0,
+                          "#2905 control: a consumer that pulls both streams receives both");
+                    CHECK(vaapi_video_frames_dropped(consuming) == 0,
+                          "#2905 control: a session whose video is consumed recycles NO frame");
+                    backend()->close(consuming);
+                }
+            }
             // #1955 — the same clip fed as BYTES rather than as a path. This is the route a title
             // that stores its media inside a container file must take, because only its own
             // sceAvPlayerInit file-replacement callbacks know where the media starts.

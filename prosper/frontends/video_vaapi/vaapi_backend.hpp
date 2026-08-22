@@ -28,6 +28,9 @@ public:
     bool seek(int id, uint64_t position_us) override;
     void close(int id) override;
 
+    // The implementation behind vaapi_video_frames_dropped below.
+    uint64_t video_frames_dropped_for_test(int id);
+
     // sceVideodec2's access-unit path (#2270). The guest submits one compressed access unit and
     // expects at most one picture back, which is libavcodec's send_packet/receive_frame contract --
     // so this is a second entry point onto the same decoder, not a second decoder.
@@ -50,5 +53,12 @@ private:
 
 bool install_vaapi_backend();
 void uninstall_vaapi_backend();
+
+// TEST SEAM (#2899): how many decoded video frames this open session recycled because a live audio
+// consumer was starved while the video queue was full. It is 0 for every session whose video IS
+// consumed -- which is what makes it a DISCRIMINATOR rather than an observation: the audio-only arm
+// and the consuming control arm are separated by this number, not only by how much each collected.
+// Returns 0 for an unknown id or when a different backend is installed.
+uint64_t vaapi_video_frames_dropped(int id);
 
 } // namespace prosper::video
