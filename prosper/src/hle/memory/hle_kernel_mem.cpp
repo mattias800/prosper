@@ -47,6 +47,12 @@ uint64_t guest_memory_gpu_write_successes_for_test() {
     return g_guest_memory_gpu_write_successes.load(std::memory_order_relaxed);
 }
 
+// The APR read chain a command buffer carries (which file its …ReadFileGatherScatter segments read
+// from) belongs to the APR FILE layer, src/hle/fs/hle_file.cpp, which owns file ids and host paths.
+// This file owns the command-buffer object, so it is the one that has to tell that layer when a
+// buffer is rewound or destroyed.
+extern "C" void prosper_apr_chain_reset(uint64_t cb);
+
 // libSceAmpr command-buffer accounting is host-platform independent. UE4 batches commands until
 // `GetSize(cb) - GetCurrentOffset(cb)` can no longer hold the next packet, then submits that cb.
 // Keep the fixed capacity and appended-byte cursor together so constructor and reset operations
@@ -138,6 +144,13 @@ namespace {
 
 void ampr_cb_construct(uint64_t cb, uint64_t capacity, bool tracks_offset) {
     if (!cb) return;
+    // Constructing over a command buffer rewinds it (`state.offset = 0` below), so it closes any
+    // APR read chain recorded against that address for exactly the reason ampr_cb_reset does: the
+    // chain names the file the commands in this buffer read from, and those commands are gone. It
+    // matters most here, because this is the path a RECYCLED guest VA arrives on — without it a new
+    // buffer at an old address inherits the old file, and the gather/scatter range guard only
+    // catches that when the newly named file happens to be smaller (review of #2924).
+    prosper_apr_chain_reset(cb);
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     if (g_ampr_cb_state.size() >= 4096 && !g_ampr_cb_state.count(cb))
         g_ampr_cb_state.erase(g_ampr_cb_state.begin());
@@ -152,6 +165,13 @@ void ampr_cb_construct(uint64_t cb, uint64_t capacity, bool tracks_offset) {
 
 void ampr_cb_reset(uint64_t cb) {
     if (!cb) return;
+    // Rewinding a command buffer also closes the APR read chain recorded against it: the file a
+    // …ReadFileGatherScatter segment reads from is the one the plain ReadFile named, and that
+    // record dies with the commands it belonged to. The guest's own reader relies on exactly this
+    // ordering -- Yakuza Kiwami's dispatcher at eboot+0xdb5fb0 calls Reset immediately before the
+    // ReadFile that opens each chain (see the block beside prosper_apr_chain_reset in
+    // src/hle/fs/hle_file.cpp, which owns APR file identity).
+    prosper_apr_chain_reset(cb);
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
     if (it != g_ampr_cb_state.end()) it->second.offset = 0;
@@ -159,6 +179,7 @@ void ampr_cb_reset(uint64_t cb) {
 
 void ampr_cb_destroy_320(uint64_t cb) {
     if (!cb) return;
+    prosper_apr_chain_reset(cb);   // the chain cannot outlive the command buffer it is recorded on
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
     if (it != g_ampr_cb_state.end() && it->second.tracks_offset)
@@ -1995,6 +2016,23 @@ HLE(k_ampr_x2) {
     ampr_cb_reset(a0);
     return 0;
 }
+// sceAmprAprCommandBufferResetGatherScatterState (YPxkUDhgoNI). The one libSceAmpr entry point
+// whose meaning the gather/scatter chain model is DERIVED from rather than inferred: its existence
+// beside the four read builders is what establishes that they carry no file id because the command
+// buffer holds one. So it does exactly that and nothing else -- close the chain open on this
+// buffer, leaving the buffer's own contents and cursor alone (unlike Reset, which rewinds both).
+//
+// Registered even though neither title that reaches the gather/scatter builder imports it: leaving
+// it on the dispatcher's return-0 default is the ONE way this design can serve bytes from the wrong
+// file without the range guard firing, because a title that closes a chain this way and opens no
+// new one would keep the stale one. A no-op here is not "nothing happened"; it is a stale chain.
+// (Review of #2924.) CONFIDENCE: HIGH on the effect, from the export's own name and the model the
+// guest's dispatcher at eboot+0xdb5fb0 demonstrates.
+HLE(k_ampr_reset_gather_scatter) {
+    ampr_arglog("YPxkUDhgoNI(AprResetGatherScatterState)", a0, a1, a2, a3, a4, a5);
+    prosper_apr_chain_reset(a0);
+    return 0;
+}
 // sceAmprCommandBufferGetSize (NID tZDDEo2tE5k, recovered by brute-forcing nid_hash over a
 // generated libSceAmpr corpus). Returns the command buffer's byte CAPACITY. Live contract
 // (issue #208 follow-up, guest append loop eboot+0x227e2c0, wrapper 0x59b5dd0): the IoStore
@@ -3194,6 +3232,8 @@ void register_kernel_mem_hle() {
     // teardown). Modeled as no-ops (arg capture under PROSPER_AMPRLOG); the read itself is
     // sceAmprAprCommandBufferReadFile in hle_file.cpp.
     Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_x1, "sceAmprCommandBufferReset");
+    Hle::register_fn("YPxkUDhgoNI", (HleFn)k_ampr_reset_gather_scatter,
+                     "sceAmprAprCommandBufferResetGatherScatterState");
     // ULvXMDz56po and tZDDEo2tE5k names recovered by brute-forcing nid_hash() over a generated
     // libSceAmpr corpus (sceAmprCommandBuffer<Verb>): ClearBuffer and GetSize.
     Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmprCommandBufferClearBuffer");
@@ -6344,6 +6384,12 @@ HLE(k_ampr_init) {
     return 0;
 }
 HLE(k_ampr_reset) { ampr_cb_reset(a0); return 0; }
+// Windows sibling of the POSIX handler; full contract documented there.
+HLE(k_ampr_reset_gather_scatter) {
+    ampr_arglog("YPxkUDhgoNI(AprResetGatherScatterState)", a0, a1, a2, a3, a4, a5);
+    prosper_apr_chain_reset(a0);
+    return 0;
+}
 // Two NIDs that the Windows arm answers with the shared `k_ampr_ok` (a bare `return 0`).
 // They get NAMED stubs purely so PROSPER_AMPRLOG can see them: a shared handler cannot carry
 // a per-NID tag, so routing both through k_ampr_ok made them invisible -- and these two are
@@ -6769,6 +6815,8 @@ void register_kernel_mem_hle() {
     Hle::register_fn("RPCAhx-aabE", (HleFn)k_ampr_get_buffer_base,
                      "sceAmprCommandBufferGetBufferBaseAddress");
     Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_reset, "sceAmprCommandBufferReset");
+    Hle::register_fn("YPxkUDhgoNI", (HleFn)k_ampr_reset_gather_scatter,
+                     "sceAmprAprCommandBufferResetGatherScatterState");
     Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_reset, "sceAmprCommandBufferClearBuffer");
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_destruct,

@@ -64,12 +64,12 @@ Last updated: 2026-08-22
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Chapter 1 gameplay; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
-| *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots, allocates its whole game heap through libSceAmpr AMM, and dies loading its shader archives ([#2872](https://github.com/mattias800/prosper/issues/2872)); no frames yet | [#2864](https://github.com/mattias800/prosper/issues/2864) |
+| *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots without faulting and loads every shader archive, scenario file and database table; the frame loop runs but every draw is skipped by the recompiler's NGG vertex prologue ([#2922](https://github.com/mattias800/prosper/issues/2922)), so all frames are black | [#2864](https://github.com/mattias800/prosper/issues/2864) |
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 | *The Lord of the Rings: Gollum* | `PPSA06367` | Unreal Engine 4 | 🔬 Rung 0 — boots, links every module and composites a 2560x1440 frame, but the only frame is a flat white clear; the startup movie kills the process ~4 s in when `sceVideodec2GetPictureInfo` returns success without writing its picture-info struct ([#2898](https://github.com/mattias800/prosper/issues/2898)). Its AAC movie audio now decodes | [#2900](https://github.com/mattias800/prosper/issues/2900) |
 | *The First Berserker: Khazan* | `PPSA20447` | Unreal Engine 4 | 🔬 Rung 0 — boots, mounts and enumerates all thirty save slots, but composites only a flat white 4K clear; the guest then exhausts prosper's direct-memory pool and calls its own OOM handler ([#2908](https://github.com/mattias800/prosper/issues/2908)). The save-data event-drain code that parked its game thread forever is fixed | [#2909](https://github.com/mattias800/prosper/issues/2909) |
 | *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — nothing run against it yet | [#2876](https://github.com/mattias800/prosper/issues/2876) |
-| *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — nothing run against it yet | [#2880](https://github.com/mattias800/prosper/issues/2880) |
+| *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots and runs indefinitely without faulting, executes real GPU draws and presents 4K frames with zero recompiler rejections, but every frame is pure black ([#2923](https://github.com/mattias800/prosper/issues/2923)) | [#2880](https://github.com/mattias800/prosper/issues/2880) |
 | *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2882](https://github.com/mattias800/prosper/issues/2882) |
 | *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2883](https://github.com/mattias800/prosper/issues/2883) |
 | *Little Nightmares II* | `PPSA02154` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2884](https://github.com/mattias800/prosper/issues/2884) |
@@ -84,7 +84,7 @@ Last updated: 2026-08-22
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
 twelve of the twenty-five titles that reach gameplay are marked 🚧 rather than ✅, and the 🔬 rows sit
-at four different states — three at different rungs, and eight not yet run at all. Counting markers
+at four different states — three at different rungs, and seven not yet run at all. Counting markers
 gives a different — and wrong — answer.
 
 **"Not yet booted" is a real category, not a rung.** A title can be tracked and never measured, and
@@ -96,8 +96,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Boots, but no frame with content** (rung 0) | 5 |
-| **Not yet booted** — tracked, no run attempted yet | 8 |
+| **Boots, but no frame with content** (rung 0) | 6 |
+| **Not yet booted** — tracked, no run attempted yet | 7 |
 | Total tracked | 53 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
