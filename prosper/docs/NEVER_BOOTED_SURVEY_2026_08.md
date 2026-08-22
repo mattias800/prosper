@@ -34,7 +34,7 @@ positive before their result was believed (instrument trap 218).
 | `PPSA02101` | Stray | Unreal Engine 4 (`.pak`) | 9 | **2** | BlueTwelve logo, then the game's **4K brightness-calibration screen**, held for the rest of the run. Its own prompt reads `✕ Accept` — the flow waits for CROSS. |
 | `PPSA02154` | Little Nightmares II | Unreal Engine 4 (`.pak`) | 8 | **1** | A **4K logo sequence** — Bandai Namco → Tarsier Studios → Unreal Engine — for the first ~130 s. Then the composite is a **flat white 4K clear for the remaining 260 s** of a 390 s run, and — in both runs, `CONFIDENCE: LOW` — the last content frame is the last sample before the unregistered `sceAgcDcbDrawIndirect` call ([#2929](https://github.com/mattias800/prosper/issues/2929)). Also shows both wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932). |
 | `PPSA02846` | Spacebase Startopia | Unity 2020.3.12f1 / IL2CPP | 8 | **0** | Boots in 447 ms, publishes **3 flips and one black 1080p frame**, then never submits again. The guest stays alive and audible ([#2933](https://github.com/mattias800/prosper/issues/2933)). |
-| `PPSA03001` | Sifu | Unreal Engine 4 (`.pak`) | 8 | **0** | Flat white then flat magenta 4K clear, never any content. Two further defects on the same boot: the guest's own **out-of-memory assert** ([#2908](https://github.com/mattias800/prosper/issues/2908), 2 of 3 runs) and a **GPU hard recovery** ([#2935](https://github.com/mattias800/prosper/issues/2935), 1 of 3). |
+| `PPSA03001` | Sifu | Unreal Engine 4 (`.pak`) | 8 | **0** | Flat white then flat magenta 4K clear, never any content. Two further defects on the same boot: a **GPU hard recovery** ([#2935](https://github.com/mattias800/prosper/issues/2935), 2 of 3 runs, both naming the same compute program) and the guest's own **out-of-memory assert** ([#2908](https://github.com/mattias800/prosper/issues/2908), 1 of 3). |
 | `PPSA03130` | Sniper Ghost Warrior Contracts 2 | CryEngine | 9 | **0** | A 4K present loop at ~9 flips/s in which **no pass produces a present source** — 2231 flips, 0 published ([#2871](https://github.com/mattias800/prosper/issues/2871), independently reproduced). |
 | `PPSA03274` | Unbound: Worlds Apart | Unreal Engine 4 (`.pak`) | 8 | **2** | The **4K title screen**, wordmark, character and Cross prompt — on ~9% of frames, at a strict 5 s cadence; a near-black diagonal wedge otherwise ([#2932](https://github.com/mattias800/prosper/issues/2932)). Waits for CROSS. |
 | `PPSA20800` | Metaphor: ReFantazio | Atlus GFD + CRIWARE | 12 | **0** | **Zero frames.** Dies ~7 s in: SIGSEGV in the `CRI Server Mana` movie thread on a non-canonical pointer ([#2934](https://github.com/mattias800/prosper/issues/2934)). |
@@ -216,13 +216,17 @@ one colour: RGB `(255,255,255)` to t≈35 s, then RGB `(255,0,255)` from t≈42 
 
 Three runs produced two different endings, and both are filed:
 
-- **2 of 3 runs: the guest's own out-of-memory assert**, at t≈45 s, in `FAsyncLoadingTh`. This is
+- **2 of 3 runs: a RADV hard recovery**, losing the Vulkan device from a compute submit and
+  disabling live compute process-wide ([#2935](https://github.com/mattias800/prosper/issues/2935)).
+  The *GTA V* shape ([#2481](https://github.com/mattias800/prosper/issues/2481)) on a second title.
+  **Both runs name the same compute program**, `0x3006260000`, at different submits and operation
+  ordinals (`submit=2214 order=583531`, and `submit=2482 order=585998`) — so on this title the
+  offending program address reproduced across runs. Re-derive it anyway rather than reusing the
+  literal: two runs is not a guarantee, and the charter's rule that addresses are run-local exists
+  because the exceptions are not announced.
+- **1 of 3 runs: the guest's own out-of-memory assert**, at t≈45 s, in `FAsyncLoadingTh`. This is
   [#2908](https://github.com/mattias800/prosper/issues/2908), previously a single-title issue on
-  *Khazan* — see the next section.
-- **1 of 3 runs: a RADV hard recovery** at t≈105 s, losing the Vulkan device from a compute submit
-  and disabling live compute process-wide
-  ([#2935](https://github.com/mattias800/prosper/issues/2935)). The *GTA V* shape
-  ([#2481](https://github.com/mattias800/prosper/issues/2481)) on a second title.
+  *The First Berserker: Khazan* — see the next section.
 
 Five compute programs are rejected before either ending — three `recompile-reject`, two
 `compute-cfg-reject … reason=wave64-ambiguous-mask-read`. **The program that lost the device is not
