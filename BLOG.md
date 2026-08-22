@@ -18,6 +18,14 @@ Put it at the **top**, under a `## YYYY-MM-DD` heading. An entry needs an image 
 what you are looking at. Anything else is optional — write a paragraph when a title finally does
 something, write one line when it is just another capture.
 
+**Keep it short.** The median entry here is about 60 words, and that is the right size: a headline and
+a picture. Measurements, bisects, censuses and mechanisms belong in the issue, the PR or the status
+doc — link to them. This file is read top to bottom by someone catching up, and a 900-word entry
+buries the four entries under it.
+
+A useful test: if your entry has a table, a code block, or more than one or two numbers, it is a
+report wearing a blog entry's clothes. "Beneath reaches gameplay", at 93 words, is the shape to copy.
+
 ```markdown
 ## 2026-08-21
 
@@ -39,43 +47,13 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 <p align="center"><img src="assets/screenshots/sonic-origins-title-screen.png" alt="Sonic Origins — the title screen at 3840x2160: the classic winged gold ring emblem with blue stars, Sonic peering over a red-and-white striped banner, in front of the painted South Island seascape with cliffs, clouds and sunlit water"></p>
 
-*Sonic Origins* (`PPSA05325`) has been the most-investigated title in this repository that had
-nothing to show for it. Nine lanes went at its black startup frame; a dump audit, a Game-Intent
-experiment, a whole-frame GPU capture, a depth-alias fix and a present-path fix all came out of it.
-`#1905` eventually found the cause — one HLE call returning `0` where the guest needed a positive
-resource id — and the SEGA logo appeared. Then it stopped again, and for two more weeks the record
-read *"renders the 4K SEGA logo and then decoded 4K movie frames, with no title screen observed."*
-
-Tonight a plain launch on current master runs: black, a cyan loading element, the **SEGA logo**, the
-decoded 4K intro, the **SONIC TEAM** logo, the third-party legal plate — Retro Engine, Headcannon,
-CRIWARE — and then, at 200 seconds, this:
-
 <p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.png" alt="Sonic Origins — the game's own boot notice at 3840x2160: a white panel over the cyan and green striped menu background, a glowing gold ring icon, the text 'This title supports auto save. When this icon is shown, do not turn off the power. Save data may be corrupted.' and a Close button marked with the Cross glyph"></p>
 
-Ten consecutive samples, ten seconds apart, all of it. Per-pixel mean delta between them: **0.03 to
-0.12 out of 255** — the background stripes drift and nothing else moves. Every renderer diagnostic
-is clean, the guest is running, frames are being produced at 4.7/s. It is a **modal waiting for a
-button**, and the button is Cross, and it says so on the button.
-
-One `cross` in a route file, and the title screen above comes up and stays up for the rest of the
-run — 140 seconds, cycling Sonic, Tails and Knuckles through the emblem the way it does on hardware.
-That is the **fourth** title here where input mapping has impersonated a rendering wall, after
-*Asterix & Obelix: Babylon Mission* (skip was Triangle), *Tales of Graces f* (two OPTIONS-button
-gates with Yes/No dialogs defaulting to No) and *Hi-Fi RUSH* (a confirm dialog whose cursor starts on
-the right-hand option). The pattern is now familiar enough to be worth stating as a rule: **if the
-frames are still changing, it is not a wall.**
-
-What actually moved the title this far is less photogenic and probably more important. Two fixes
-landed in the last day. [#2901](https://github.com/mattias800/prosper/pull/2901) taught the renderer
-to recognise a decoded video's chroma plane by its geometry rather than by where the title happened
-to put it. [#2910](https://github.com/mattias800/prosper/pull/2910) stopped `sceSaveDataGetEventResult`
-answering a drained queue with `0x809F0018`, the "still in flight" code — and this title has, at
-`eboot+0x940380`, a loop that calls that function, compares against exactly `0x809F0018`, and on a
-match calls `sceKernelSleep(1)` and goes round again. Nothing else exits it. prosper was returning
-the one value that meant "keep waiting" in a state where nothing was waiting.
-
-Tracker [#1871](https://github.com/mattias800/prosper/issues/1871).
-
+The most-investigated title in this repository, and the last wall was a modal waiting for CROSS.
+Nine lanes went at its black startup frame. What finally moved it was tonight's save-data fix — the
+guest loops on `cmp eax,0x809f0018` and sleeps, and prosper returned exactly that. Rung 1 to rung 2.
+The banner is empty because the wordmark never draws
+([#2920](https://github.com/mattias800/prosper/issues/2920)).
 ### Sonic Origins' SONIC TEAM logo is blue
 
 <p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.png" alt="Sonic Origins — the SONIC TEAM logo at 3840x2160: the blue Sonic head silhouette and blue SONIC TEAM wordmark on a near-white background"></p>
@@ -93,263 +71,43 @@ Refs [#2904](https://github.com/mattias800/prosper/issues/2904).
 
 <p align="center"><img src="assets/screenshots/beast-of-reincarnation-deluxe-bonus-dialog.png" alt="Beast of Reincarnation — the game's own Digital Deluxe bonus dialog: an item list with Big Dipper, Black Shiba Skin, Special Hat, Amber and crop seedlings, a scrollbar, an orange note and an OK button, rendered at 3840x2160"></p>
 
-Game Freak's first PS5 title, added to the library tonight. On a default launch it presents a
-**flat white 4K frame** and holds it for four minutes — and every renderer diagnostic says the
-emulator is fine, because it is: the guest runs, the frame counter climbs past twelve thousand,
-and prosper renders hundreds of real draw batches a second. Nothing was wrong with the picture.
-There simply was no picture, and then prosper painted over the place where it should have been.
-
-Two things were doing that. The first was one missing instruction form. The pixel shader that
-writes both of the title's 3840x2160 scanout buffers opens with
-`v_cvt_u32_f32_sdwa v2, v2 dst_sel:WORD_0` — convert a float to an integer and drop the result into
-the *low half* of a register, leaving the high half alone, which is how a shader packs two numbers
-into one. prosper already understood exactly that instruction in its **signed** form and had never
-been shown the unsigned one, so the shader was rejected and **404 draws per run into the visible
-framebuffer were discarded**. Four lines fixed it. The census of dropped draws into the scanout
-went from 404 to zero.
-
-That was not enough on its own, because of the second thing, which is more interesting. The frame
-went from white to... a different flat colour. This title issues over **eight thousand**
-`ELIMINATE_FAST_CLEAR` passes per boot — a hardware operation that expands a compressed
-"this whole surface is one colour" record into real pixels, *instead of* running a pixel shader.
-prosper does not model compressed colour surfaces at all, so it has nothing to expand; it runs
-those passes as ordinary draws, which paint the surface. That gap has been on file as
-[#1588](https://github.com/mattias800/prosper/issues/1588) for a while with no title that made it
-matter. Here it was the entire visible output.
-
 <p align="center"><img src="assets/screenshots/beast-of-reincarnation-game-freak-logo.png" alt="Beast of Reincarnation — the GAME FREAK developer logo in white on black, rendered at 3840x2160"></p>
 
-Add a default-off switch that stops those passes writing colour, and the game is just *there*
-underneath: the GAME FREAK logo, then the Digital Deluxe bonus dialog above — item list, scrollbar,
-that orange footnote, a properly styled OK button, 6,452 distinct colours. It had been rendering
-all along.
-
-So: **rung 1, honestly** — that switch is not a fix and is not on by default, the same passes
-happen in every other title (one *Plucky Squire* trace has 36,613 of them), and the switch itself
-now looks like it may crash the driver
-([#2915](https://github.com/mattias800/prosper/issues/2915)). No title screen yet either. But the
-measurement is now on #1588 instead of the argument, and two other titles that also end on a pure
-white frame — *Astro Bot* and *Sonic Racing: CrossWorlds* — are suddenly one run each away from
-knowing whether they have the same problem.
-
-One thing worth writing down for whoever gets this title next. Its command-line file is
-`uecommandline.txt`, without the `4` that every UE4 title in the library carries, and that looked
-like the one real clue going in — the first UE5 title in the corpus. It is not: *Sonic Racing:
-CrossWorlds* ships the same file name, and `COMPATIBILITY.md` already calls it Unreal Engine 5.
-The actual evidence is duller and better — `Nanite`, `Lumen`, `VirtualShadowMap` and
-`WorldPartition` in the executable's strings, and an IoStore container version of 6 where every UE4
-title in the library has 2 or 3.
-
+Game Freak's first PS5 title, and the corpus's second confirmed UE5. A default launch shows a flat
+white 4K frame for four minutes, while the guest runs happily and prosper renders hundreds of draw
+batches a second. Two causes: a missing SDWA instruction form dropping 404 draws a run, and 8,192
+fast-clear-eliminate draws painted as ordinary colour
+([#1588](https://github.com/mattias800/prosper/issues/1588)). Under a default-off lever, this is
+underneath.
 ### Gollum's boot was killed by a divide by zero, and the divisor was a channel count nobody wrote
 
-No picture with this one — *The Lord of the Rings: Gollum* (`PPSA06367`) still renders nothing but a
-flat white clear. The finding is what moved, and it moved a wall that was four seconds from the
-start of every boot.
-
-The title booted further than you would guess. Every module links, all 32 Wwise plug-ins load, the
-AGC path comes up, real draws go out at 2560x1440, and the live renderer composites and presents.
-Then, at about four seconds, a worker thread called `ElectraPlayer::` — Unreal's media player,
-starting the intro movie — died on a **SIGFPE**. Not a segfault, a *divide error*:
-
-```text
-eboot+0xec15e1   mov  esi, DWORD PTR [r13+0x240]   ; channels
-eboot+0xec15f6   add  rsi,rsi                      ; 2 bytes per sample * channels
-eboot+0xec15f9   div  rsi                          ; ... and channels was 0
-```
-
-The function logs its own name three instructions earlier: `AudioAACConvertOutput`. So: the game had
-just decoded a chunk of AAC audio, wanted to know how many sample frames that was, divided the byte
-count by `2 × channels`, and the channel count was zero.
-
-It was zero because **prosper had never implemented `libSceAudiodec` at all** — not one of its nine
-entry points. Unregistered NIDs fall to a dispatcher default that returns `0`, and `0` is `SCE_OK`.
-So every call succeeded: the library initialised, a decoder was created, a decode ran. None of them
-wrote anything into the guest's structures, and the game had no way to tell. This is the exact
-failure mode that cost *Yakuza Kiwami* its boot a day earlier, in a different library.
-
-The fix was to actually implement it, and the interesting part was recovering the ABI, because there
-is no header for this. The game's own call sites give it up if you read them: the return of
-`sceAudiodecCreateDecoder` is tested with `jns`, so it is a handle-or-negative-error; the return of
-`sceAudiodecDecode` is tested with `jne`, so zero is success; the byte count the decoder reports back
-is *added* to the guest's own cursor at `eboot+0xec153b`, so it is a delta and not an absolute
-offset. Every offset in the four control structures came out of instructions like that.
-
-One field lied convincingly. The AAC parameter block has a 32-bit value at `+0x0c` that sits exactly
-where a sample rate belongs — and the first implementation read it as one, configured an FFmpeg
-decoder at "3 Hz", and failed on the first access unit. A log line printing the whole block is what
-corrected it: the field is `3`, the movie is 48 kHz, and **3 is the MPEG-4 sampling-frequency index
-for 48000**. The whole parameter block turned out to be an unpacked `AudioSpecificConfig` —
-`{objectType=2, samplingFrequencyIndex=3, channelConfiguration=2}` — which is exactly what a raw AAC
-stream out of an MP4 needs and cannot carry in-band. Rebuild those two bytes and the stream decodes:
-48000 Hz, stereo, 4096 bytes of PCM per access unit, which is precisely one AAC-LC frame.
-
-The wall moved about thirty milliseconds further into the movie, where the video half does the same
-thing: `sceVideodec2GetPictureInfo` returns success without writing its picture-info structure, and
-the guest dereferences a pointer that was never filled in ([#2898](https://github.com/mattias800/prosper/issues/2898)).
-That one is *not* fixed, deliberately — the structure is 120 bytes and this title only reveals eight
-fields of it, so filling in the rest would be inventing an ABI rather than recovering one. What the
-title did give us is the evidence an older issue asked for and never got. Tracker
-[#2900](https://github.com/mattias800/prosper/issues/2900).
-
+`libSceAudiodec` was entirely unimplemented, so its nine entry points fell to the dispatcher's
+`return 0` — which is `SCE_OK`. Unreal's Electra player believed it had an AAC decoder, ran a decode
+that wrote nothing, and divided by the channel count nothing had written. Now implemented against the
+real ABI, recovered from the title's own call sites. Still rung 0; next blocker
+[#2898](https://github.com/mattias800/prosper/issues/2898).
 ### Hi-Fi RUSH reaches its title screen on the first try
 
 <p align="center"><img src="assets/screenshots/hifi-rush-title.png" alt="Hi-Fi RUSH title screen — the yellow branding, shattered logo and Press Any Button prompt, rendered at 3840x2160"></p>
 
-A title added to the library this evening, booted for the first time a few hours later. `BOOT_COMPLETE`
-at **281 ms**, and the complete 4K title screen holds from t≈224 s to the end of the run — on a
-**default launch**, no throttle, no non-default switches, no pad input. `tools/screenshot`,
-45/45 samples, `guest=running status=ok`.
-
-With a pad route it goes further: through the first-boot language wizard and its settings pages,
-into a loading hold. Not gameplay, so this is rung 2.
-
 <p align="center"><img src="assets/screenshots/hifi-rush-rooftop-black-materials.png" alt="Hi-Fi RUSH Vandelay rooftop — correct geometry, depth and sky gradient, with every opaque surface shaded flat black"></p>
 
-The second picture is the interesting one, and it is a defect rather than a success. This is the
-Vandelay rooftop, and almost everything about it is right: the geometry is there, the depth sorting is
-right, the sky gradient is smooth, and the "WELCOME TO VANDELAY" billboard renders in full colour
-because it is emissive. Every *opaque* surface is a silhouette. So vertex processing and the
-transparent path both work and only opaque material shading fails — which is a much smaller problem
-than the picture first suggests. The prime suspect is 202 distinct `[dynvb] unknown V# format`
-signatures, mostly `0x0`.
-
-One more thing this title taught us, which cost the lane a 1168-second run: pressing Cross on the
-language page raises a *"Continue with these settings?"* dialog whose cursor starts on the **right-hand**
-option, so every Cross answers it negatively and returns to the same page. The run was completely
-healthy the whole time — 70 of 90 samples pixel-distinct — and looked exactly like a renderer wall.
-That is now the fourth title where input mapping has impersonated one. The committed route is
-`cross` → `left` → `cross`.
-
-Tracker [#2891](https://github.com/mattias800/prosper/issues/2891).
-
-## 2026-08-22
-
+Added to the library in the evening, at its title screen a few hours later — 281 ms to
+`BOOT_COMPLETE`, default launch, no throttle, no pad. The second picture is the Vandelay rooftop,
+where geometry, depth and the sky gradient are all correct and every opaque surface is a silhouette,
+which narrows the defect nicely.
 ### Khazan spent four seconds booting and then waited forever for one wrong hexadecimal digit
 
-No picture with this one either — *The First Berserker: Khazan* is a new 48 GB UE4 title and it
-composites nothing but a flat white 4K clear. The finding is what moved, and it turned out not to be
-about this title at all.
-
-The stall had an unusually clean shape. `tools/screenshot` reported **one distinct frame in 33
-publications over a 360-second run**, with `guest=running` throughout — so the process was alive and
-producing nothing. A `gdb` dump of the live boot showed **all 79 threads blocked in a syscall**:
-`RenderThread 0`, `RHIThread`, `FAPREventQueueL`, 42 `TaskGraphThread`s and 19 `PoolThread`s all
-parked on a condition variable, and the guest's main thread inside `sceKernelUsleep`. Nothing was
-spinning. Nothing was going to wake anything.
-
-With `PROSPER_SVCLOG=1` exactly one Sony call repeated during the stall — `sceSaveDataGetEventResult`,
-5,020 times in 90 seconds, and *nothing else from any thread*. That is a strong shape: when every
-other thread is idle, the only thing that can change the condition is the answer to that call. So the
-poll's own stack was scanned for guest return addresses, which gave a stable chain, and the first
-frame's function disassembled to the wait loop, verbatim:
-
-```text
-eboot+0x796eb30   vmovss xmm0,[rip+0x3aea72c]     ; the sleep interval
-eboot+0x796eb38   call   0x1565790                ; FPlatformProcess::Sleep(float)
-eboot+0x796eb67   xor    edi,edi                  ; eventParam = NULL
-eboot+0x796eb6f   call   0x8eaf3d0                ; sceSaveDataGetEventResult(NULL, &event)
-eboot+0x796eb88   cmp    r12d,0x809f0008          ; <-- the ONLY value that ends the wait
-eboot+0x796eb8f   jne    0x796eb30                ; anything else: sleep and poll again
-```
-
-prosper answered a drained event queue with `0x809F0018`. The game asks for `0x809F0008`. One digit,
-and the title's boot never happened.
-
-The digit turned out to be the least interesting part. `0x809F0018` is not a wrong number somebody
-made up — it is the code for **"the operation is still running, keep waiting"**, and four other
-titles in the library const-compare it and go back to sleep when they see it: Dead Cells at two
-separate sites, Earthion, Sonic Frontiers and Sonic Origins. So prosper was not returning something
-meaningless. It was returning a perfectly well-attested *"still busy"* in a state where nothing was
-busy — a permanent lie, and a guaranteed hang for any of those five titles that reached one of those
-loops. That is a much better reason for the change than "the constant was wrong", and it only showed
-up because someone went and disassembled the other four.
-
-What makes it worth an entry is the three hypotheses that got there first and were all wrong. The
-title ships Bink `.bk2` startup movies, so the obvious guess was the video-splash deadlock family —
-except a full file log shows **not one movie file is ever opened**. The save it was mounting did not
-exist, so the next guess was that the `NOT_FOUND` was the problem — except pre-creating the directory
-made the mount succeed and the title polled on exactly as before. Then the guess was that it wanted a
-*completion event* rather than a return code, so a probe fed it a synthetic event on every single
-poll, cycling the event type through all eight values over 140 seconds. It never blinked. The loop
-does not look at the event at all; it looks at the return value, and it accepts exactly one.
-
-The fix is not a guess either: `0x809F0008` is a constant prosper already had — it is what it calls
-`SAVE_DATA_ERR_NOT_FOUND` — so "the queue is empty" is now reported the way the guest's own `cmp`
-instruction says it is reported. `0x809F0018` had never been established by any title's bytes.
-
-Because this is a shared HLE constant and not a per-title workaround, the guarded rung-6 titles were
-run against it. *Dead Cells* — the title whose save-data event handling that code was originally
-written for — passes its gameplay guard unchanged: 44 frames, 44 qualifying, 21,045 colours in the
-richest, 44 of 44 structural matches.
-
-There was one more thing in the A/B, and it was not what the A/B was for. *Earthion* was run purely
-as a regression control. On master it made **2,400** of these calls across a 120-second run — line 45
-to line 63,046 of its log — and **never mounted a save at all**. With the fix it makes **five**, and
-then does the whole thing: mount, prepare, get-mount-info, commit, unmount. Identical frame counters
-either way.
-
-The first version of this entry said its save system had been dead and now worked. That is not what
-happens, and the correction is the interesting part. Earthion's loop compares against `0x809F0018`
-and sleeps, and then against `0x809F0008` and **gives up**. So the lifecycle appears because the
-title stopped waiting, not because prosper finally answered it. What it was actually waiting for is
-an event whose `dirName` field matches the directory it asked about — `memcmp(event + 0x20, …, 32)` —
-and the only event prosper can produce is a zero-filled one from `Umount2`. That branch cannot be
-reached today. Giving up is the honest answer when there really is no event, so the change is still
-strictly better; it just is not a save system coming back to life. The real finding is a gap nobody
-had written down: **prosper posts no per-operation completion event carrying a directory name.**
-
-And Khazan? It boots much further now — it mounts its profile, walks all thirty save slots — and then
-runs prosper's direct-memory pool dry and calls Unreal's own out-of-memory handler about six seconds
-in. Still rung 0. But it is a different wall, six seconds later, and it has a number:
-[#2908](https://github.com/mattias800/prosper/issues/2908).
-
-Tracker [#2909](https://github.com/mattias800/prosper/issues/2909).
-
+All 79 threads parked in a syscall, `sceSaveDataGetEventResult` polled 5,020 times in 90 seconds.
+The guest's wait loop accepts exactly one value; prosper answered the code meaning *"still in
+flight"*, returned when nothing was in flight. Run as a control, *Earthion* turned out to have had
+its whole save-data subsystem dead for the same reason.
 ### PGA TOUR 2K25 told us exactly what was wrong, in English, and it was not what it said
 
-No picture with this one — the title still does not render. The finding is what moved.
-
-A new Unity 6 / IL2CPP title, 35 GB, and it died 1.2 seconds into every boot. What made it unusual
-is that it *announced* the crash first:
-
-```
-ERROR...
- PSN is an old version that cannot be used by the current player runtime.
- Please update the PSN native module and any associated managed assemblies to the latest versions
-```
-
-That message is a lie in the most useful possible way. Nothing is old, and no module is missing.
-The string is not in the dump anywhere as plain text — it lives compressed inside the Unity data —
-so it had to be chased through the disassembly of `Il2cppUserAssemblies.prx` instead, which is where
-it turned into an exact mechanism. The game holds two globals: an argument count and a pointer to a
-"plugin args" struct. It checks the count has a bit above the low nibble, then checks the struct
-says `size == 0x10` and `version == 0x200`. Both globals were zero, so it took the mismatch branch —
-and the mismatch branch's own third `printf`, the one that would have politely told us which version
-it found, reads that version straight off the NULL pointer. The error handler is the crash.
-
-`tools/re/xref.py` found exactly one writer of the pointer, and it was a two-instruction function
-that stores `rdi` and `rsi` and returns: the module's `module_start(size_t argc, const void *argp)`.
-prosper was starting the module with `(0, NULL)`.
-
-The good part is what was already in the tree. prosper has had that exact descriptor —
-`{size = 0x10, version = 0x200, callback = 0}` — since the PSN.prx work, sitting in
-`exec_image_linux.cpp` under a comment reading *"the descriptor Sony's PSN/SaveData plugin
-module_start validates"*. Same two constants. The Unity PSN package simply does not always ship as
-its own `PSN.prx`: with IL2CPP its native half can be linked straight into the user-assemblies
-module, and then the handshake belongs to *that* module's `module_start`. It only ever needed to be
-told about one more module.
-
-With that fixed the title runs six times longer, streams its assets through Ampr, brings up the
-compute backend and submits over a thousand draws — and then dies again, on a thread called
-`Background Job.`, in a loop scanning for `:` and CRLF. An HTTP header parser, walking a NULL
-buffer, because `sceHttp2SendRequest` returned `0` for a request that was never sent, `0` is
-`SCE_OK`, and `sceHttp2GetAllResponseHeaders` then reported success without writing anything to its
-out-parameters. Rung 0 still, but every metre of that is now named:
-[#2894](https://github.com/mattias800/prosper/issues/2894), tracker
-[#2895](https://github.com/mattias800/prosper/issues/2895).
-
-## 2026-08-21
-
+*"PSN is an old version that cannot be used by the current player runtime"* — and nothing was old,
+and no module was missing. Unity's PSN native half links into the user-assemblies module, prosper
+started it with a null parameter block, and the mismatch branch's own error message read the version
+off that null pointer. The error handler was the crash.
 ### Yakuza Kiwami allocates its entire game heap through a Sony API nobody had implemented
 
 No picture with this one — the title still does not render. The finding is what moved.

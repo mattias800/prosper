@@ -157,7 +157,7 @@ of its manifest.
 | Beast of Reincarnation | `PPSA29343` | 1 | `1-----` | **9.2** fps · 56% active · 4K · GAME FREAK logo then the Digital Deluxe bonus dialog, with PROSPER_CB_EFC_NO_COLOR=1 · screenshot · 2026-08-22 | - | none | [#1588](https://github.com/mattias800/prosper/issues/1588), [#2911](https://github.com/mattias800/prosper/issues/2911), [#2915](https://github.com/mattias800/prosper/issues/2915) | [#2916](https://github.com/mattias800/prosper/issues/2916) | [`BEAST_OF_REINCARNATION_STATUS.md`](prosper/docs/BEAST_OF_REINCARNATION_STATUS.md) |
 | ArcRunner | `PPSA21406` | 0 | `------` | - | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/ARCRUNNER_STATUS.md) |
 | BALAN WONDERWORLD | `PPSA02058` | 0 | `------` | none | - | none | - | [#2882](https://github.com/mattias800/prosper/issues/2882) | - |
-| Judgment | `PPSA02739` | 0 | `------` | none | - | none | - | [#2880](https://github.com/mattias800/prosper/issues/2880) | - |
+| Judgment | `PPSA02739` | 0 | `------` | none | - | none | [#2923](https://github.com/mattias800/prosper/issues/2923) | [#2880](https://github.com/mattias800/prosper/issues/2880) | [`YAKUZA_JUDGMENT_BRINGUP.md`](prosper/docs/YAKUZA_JUDGMENT_BRINGUP.md) |
 | Little Nightmares II | `PPSA02154` | 0 | `------` | none | - | none | - | [#2884](https://github.com/mattias800/prosper/issues/2884) | - |
 | Metaphor: ReFantazio | `PPSA20800` | 0 | `------` | none | - | none | - | [#2876](https://github.com/mattias800/prosper/issues/2876) | - |
 | PGA TOUR 2K25 | `PPSA17952` | 0 | `------` | none | - | none | [#2894](https://github.com/mattias800/prosper/issues/2894) | [#2895](https://github.com/mattias800/prosper/issues/2895) | [`PGA_TOUR_2K25_STATUS.md`](prosper/docs/PGA_TOUR_2K25_STATUS.md) |
@@ -168,7 +168,7 @@ of its manifest.
 | The First Berserker: Khazan | `PPSA20447` | 0 | `------` | **--** fps · 0% active · 4K · a flat white clear, the only frame it composites · tools/screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#1880](https://github.com/mattias800/prosper/issues/1880) | [#2909](https://github.com/mattias800/prosper/issues/2909) | [`KHAZAN_STATUS.md`](prosper/docs/KHAZAN_STATUS.md) |
 | The Lord of the Rings: Gollum | `PPSA06367` | 0 | `------` | **--** fps · 0% active · 1440p · one flat white composited clear before the boot dies at ~4 s · screenshot · 2026-08-22 | - | none | [#2898](https://github.com/mattias800/prosper/issues/2898) | [#2900](https://github.com/mattias800/prosper/issues/2900) | [`GOLLUM_STATUS.md`](prosper/docs/GOLLUM_STATUS.md) |
 | Unbound: Worlds Apart | `PPSA03274` | 0 | `------` | none | - | none | - | [#2886](https://github.com/mattias800/prosper/issues/2886) | - |
-| Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | - | [#2864](https://github.com/mattias800/prosper/issues/2864) | - |
+| Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | [#2922](https://github.com/mattias800/prosper/issues/2922) | [#2864](https://github.com/mattias800/prosper/issues/2864) | [`YAKUZA_JUDGMENT_BRINGUP.md`](prosper/docs/YAKUZA_JUDGMENT_BRINGUP.md) |
 
 ## Counts
 
