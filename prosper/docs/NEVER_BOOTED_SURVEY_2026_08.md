@@ -32,15 +32,22 @@ positive before their result was believed (instrument trap 218).
 | --- | --- | --- | --- | --- | --- |
 | `PPSA02058` | BALAN WONDERWORLD | Unreal Engine 4 (`.pak`) | 7 | **2** | The game's own **4K language-select menu** renders, with full theatre art and button glyphs — but on only ~18% of frames; the rest are a flat white 4K clear ([#2932](https://github.com/mattias800/prosper/issues/2932)). The menu waits for CROSS. |
 | `PPSA02101` | Stray | Unreal Engine 4 (`.pak`) | 9 | **2** | BlueTwelve logo, then the game's **4K brightness-calibration screen**, held for the rest of the run. Its own prompt reads `✕ Accept` — the flow waits for CROSS. |
-| `PPSA02154` | Little Nightmares II | Unreal Engine 4 (`.pak`) | 8 | **1** | A **4K logo sequence** — Bandai Namco → Tarsier Studios → Unreal Engine — advancing over ~140 s. No title screen in a 380 s run. Interleaved with both wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932). Calls the unregistered `sceAgcDcbDrawIndirect` ([#2929](https://github.com/mattias800/prosper/issues/2929)). |
+| `PPSA02154` | Little Nightmares II | Unreal Engine 4 (`.pak`) | 8 | **1** | A **4K logo sequence** — Bandai Namco → Tarsier Studios → Unreal Engine — for the first ~130 s. Then the composite is a **flat white 4K clear for the remaining 260 s** of a 390 s run, and — in both runs, `CONFIDENCE: LOW` — the last content frame is the last sample before the unregistered `sceAgcDcbDrawIndirect` call ([#2929](https://github.com/mattias800/prosper/issues/2929)). Also shows both wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932). |
 | `PPSA02846` | Spacebase Startopia | Unity 2020.3.12f1 / IL2CPP | 8 | **0** | Boots in 447 ms, publishes **3 flips and one black 1080p frame**, then never submits again. The guest stays alive and audible ([#2933](https://github.com/mattias800/prosper/issues/2933)). |
-| `PPSA03001` | Sifu | Unreal Engine 4 (`.pak`) | 8 | **0** | Flat white then flat magenta 4K clear, never any content. Two further defects on the same boot: the guest's own **out-of-memory assert** ([#2908](https://github.com/mattias800/prosper/issues/2908), 2 of 3 runs) and a **GPU hard recovery** ([#2935](https://github.com/mattias800/prosper/issues/2935), 1 of 3). |
+| `PPSA03001` | Sifu | Unreal Engine 4 (`.pak`) | 8 | **0** | Flat white then flat magenta 4K clear, never any content. Two further defects on the same boot: a **GPU hard recovery** ([#2935](https://github.com/mattias800/prosper/issues/2935), 2 of 3 runs, both naming the same compute program) and the guest's own **out-of-memory assert** ([#2908](https://github.com/mattias800/prosper/issues/2908), 1 of 3). |
 | `PPSA03130` | Sniper Ghost Warrior Contracts 2 | CryEngine | 9 | **0** | A 4K present loop at ~9 flips/s in which **no pass produces a present source** — 2231 flips, 0 published ([#2871](https://github.com/mattias800/prosper/issues/2871), independently reproduced). |
 | `PPSA03274` | Unbound: Worlds Apart | Unreal Engine 4 (`.pak`) | 8 | **2** | The **4K title screen**, wordmark, character and Cross prompt — on ~9% of frames, at a strict 5 s cadence; a near-black diagonal wedge otherwise ([#2932](https://github.com/mattias800/prosper/issues/2932)). Waits for CROSS. |
 | `PPSA20800` | Metaphor: ReFantazio | Atlus GFD + CRIWARE | 12 | **0** | **Zero frames.** Dies ~7 s in: SIGSEGV in the `CRI Server Mana` movie thread on a non-canonical pointer ([#2934](https://github.com/mattias800/prosper/issues/2934)). |
 
 **Three of the eight reach rung 2, one reaches rung 1, four are rung 0.** Every one of them boots,
-links and runs guest code; the slowest boot in the set is 447 ms.
+links and runs guest code, and none takes as much as half a second to do it.
+
+**Boot time varies run to run on the same title, so the figures below are per-run, not per-title.**
+Measured across every run in this survey: `PPSA02058` 232/253/242 ms, `PPSA02101` 239 ms,
+`PPSA02154` 224/245/473 ms, `PPSA02846` 447 ms, `PPSA03001` 226/266 ms, `PPSA03130` 173/272 ms,
+`PPSA03274` 413 ms, `PPSA20800` 161 ms. The spread on Little Nightmares II is a factor of two, so
+quoting one number as "this title's boot time" would be a fiction — each section below names the
+figure from the run it describes.
 
 ### Two notes on how these rungs are assigned
 
@@ -66,7 +73,7 @@ not a *wall*.
 | 1 | **The finished frame loses most presents to a wrong composite** — flat white 4K clear, or a near-black diagonal wedge ([#2932](https://github.com/mattias800/prosper/issues/2932)) | **3 of 8**, and 3 more already recorded | BALAN, Little Nightmares II, Unbound — plus *Beast of Reincarnation* ([#1588](https://github.com/mattias800/prosper/issues/1588)), *Gollum* ([#2898](https://github.com/mattias800/prosper/issues/2898)), *Khazan* ([#2908](https://github.com/mattias800/prosper/issues/2908)), all rung 0 on "a flat white clear" |
 | 2 | **The game's own screen waits for CROSS and nothing presses it** | **3 of 8** | BALAN (language select), Stray (`✕ Accept`), Unbound (title-screen prompt) |
 | 3 | **UE4's allocator asserts after the halving probe** ([#2908](https://github.com/mattias800/prosper/issues/2908)) | **2** | Sifu (new carrier), *Khazan* `PPSA20447` |
-| 4 | **`sceAgcDcbDrawIndirect` unregistered** ([#2929](https://github.com/mattias800/prosper/issues/2929)) | 0 confirmed; **2 confirmed callers**, NID in **49 of 54** dumps | Little Nightmares II, Sifu |
+| 4 | **`sceAgcDcbDrawIndirect` unregistered** ([#2929](https://github.com/mattias800/prosper/issues/2929)) | 0 confirmed; **2 confirmed callers**, NID in **49 of 54** dumps | Little Nightmares II, Sifu — and on the first of those, the composite's turn to permanent white brackets the call in both runs (`CONFIDENCE: LOW`) |
 | 5 | **HTTP entry points answer a false success** ([#2930](https://github.com/mattias800/prosper/issues/2930) v1, [#2894](https://github.com/mattias800/prosper/issues/2894) v2) | 0 here; **7 of 8** call one | all but Spacebase — v1 on six, v2 on Metaphor |
 | 6 | **A GPU hard recovery from a compute submit** ([#2935](https://github.com/mattias800/prosper/issues/2935)) | 1 | Sifu — the *GTA V* pattern ([#2481](https://github.com/mattias800/prosper/issues/2481)) on a second title |
 | 7 | **No pass produces a present source** ([#2871](https://github.com/mattias800/prosper/issues/2871)) | 1 | Sniper Ghost Warrior Contracts 2 |
@@ -89,7 +96,9 @@ waiting" from "the title is stuck" without any code.
 
 **Rows 4 and 5 are large and hold nothing, and that is the finding.** `sceAgcDcbDrawIndirect` is a
 one-line registration gap whose NID sits in 49 of 54 dumps; the HTTP false success is called by
-seven of these eight. Neither is why any surveyed title stops. They are worth fixing on their own
+seven of these eight. Neither is *established* as why any surveyed title stops — though row 4 has one
+`CONFIDENCE: LOW` correlation against it on *Little Nightmares II*, which registering the NID would
+settle in a single re-run. They are worth fixing on their own
 terms — a missing indirect draw deletes real content silently, and an id-returning contract must
 never answer 0 — but a ranking that ordered by call count would put them first and be wrong.
 
@@ -102,11 +111,14 @@ never answer 0 — but a ranking that ordered by call count would put them first
 - **No title is blocked on an unimplemented library that another surveyed title also blocks on.**
   Every rung-0 wall here is title-specific. The sharing is in the *symptoms* (rows 1-3), not in the
   missing surface.
-- **No cross-reference to [#2872](https://github.com/mattias800/prosper/issues/2872)** (the APR
-  gather/scatter read holding *Yakuza Kiwami* and *Judgment*). Metaphor calls one `libSceAmpr` NID —
-  `sceAmprCommandBufferGetNumCommands`, `gzndltBEzWc` — and BALAN calls
-  `sceAmprMeasureCommandSizeWriteAddressOnCompletion` (`C+IEj+BsAFM`); neither is #2872's
-  `sceAmprAprCommandBufferReadFileGatherScatter`, and neither title stops there.
+- **No cross-reference to [#2872](https://github.com/mattias800/prosper/issues/2872)**, the APR
+  gather/scatter read that held *Yakuza Kiwami* and *Judgment*. Two of the eight do call
+  `libSceAmpr` — Metaphor calls `sceAmprCommandBufferGetNumCommands` (`gzndltBEzWc`) and BALAN calls
+  `sceAmprMeasureCommandSizeWriteAddressOnCompletion` (`C+IEj+BsAFM`) — but **neither is #2872's
+  NID**, and neither title stops there.
+  (#2872 was **closed by #2924 on 2026-08-22**, while this survey was running. It is cited here as
+  the cross-reference the survey was asked to check, not as an open blocker; both titles it held
+  are now rung 0 for other reasons.)
 - **All eight are pre-SDK-13** (AGC register-defaults requests: 7, 9, 8, 8, 8, 9, 8, 12), so all
   eight are inside the [#2219](https://github.com/mattias800/prosper/issues/2219) post-submit
   completion-visibility cohort. **That is a shared property, not a shared diagnosis** — no title
@@ -149,20 +161,44 @@ Only unregistered call worth noting beyond the shared set: `sceCoredumpRegisterC
 
 ### `PPSA02154` — Little Nightmares II (Unreal Engine 4, `.pak`)
 
-Boots in **245 ms**. Renders a **4K logo sequence** that genuinely advances — Bandai Namco at
-t≈28 s, Tarsier Studios at t≈70 s, Unreal Engine at t≈140 s — at 3.9 fps while active. A second run
-bounded at 380 s did not reach a title screen.
+Boots in **224 ms** on the run described here (245 and 473 ms on two others). Renders a **4K logo
+sequence** that genuinely advances — **Bandai Namco Entertainment**, **Tarsier Studios**, **Unreal
+Engine** — through the first ~130 s of a 390 s run. 6.9 fps while producing frames, 19% of the run
+active, guest alive at the end.
+
+**Then it goes white and stays white.** On a 13 s grid over 30 samples, the last frame carrying
+content is at **t=130 s**; every sample from **t=143 s to t=390 s** — 20 consecutive samples,
+260 seconds — is a flat white 4K clear (`distinct_rgb_colors == 1`, `nonblack_rgb_pixels ==
+8294400`). No title screen is reached.
+
+**And the transition brackets the `sceAgcDcbDrawIndirect` call.** In this run the single
+`[prosper] unimplemented: libSceAgc::1q1titRBL6o` line falls between the t=130 s sample (the last
+with content) and the t=143 s sample (the first of the 260 s of white). An earlier run on a 15 s
+grid put the first call at t≈100 s with the two following samples, at 105 s and 120 s, both white.
+
+**Two runs, the same ordering — and that is a correlation, not a cause.** `CONFIDENCE: LOW`. Two
+samples of an ordering is weak, the log line is emitted once per NID so it marks the *first* call
+rather than the interesting one, and #2932's flat white appears on this title well before t=130 s
+too. It is recorded because it is cheap to test properly and nobody would think to look: registering
+the NID ([#2929](https://github.com/mattias800/prosper/issues/2929)) and re-running this exact route
+answers it in one run.
 
 Shows **both** wrong-frame signatures of [#2932](https://github.com/mattias800/prosper/issues/2932):
 flat white 4K clears, and near-black frames carrying a diagonal smeared band in the upper-left. The
-wedge frames are pixel-for-pixel the same *kind* of picture as Unbound's, which is what put the two
-titles in one issue.
+wedge frames are the same kind of picture as *Unbound*'s, which is what put the two titles in one
+issue.
 
-**First live caller of `sceAgcDcbDrawIndirect`** ([#2929](https://github.com/mattias800/prosper/issues/2929)),
-at t≈100 s. `PROSPER_PROGRESS_UNIMPL=1` gives the rest of its unimplemented traffic as
+`PROSPER_PROGRESS_UNIMPL=1` gives the rest of its unimplemented traffic as
 `47 x pthread_setschedparam`, `3 x sceSaveDataSetParam`, and one each of `sceHttpInit`,
 `sceHttpCreateTemplate`, `sceNpWebApi2PushEventCreateHandle`, `sceVoiceQoSInit`,
 `sceNetResolverCreate`, `sceSaveDataSaveIcon`.
+
+> **A measurement of this title was wrong in an earlier draft of this document and is corrected
+> here.** It claimed "no title screen in a 380 s run" on the strength of a run configured
+> `--seconds 5 --count 24 --timeout 380`: the tool stops at `request-satisfied`, so 24 samples 5 s
+> apart end the run at **120 s** and the 380 s deadline was never approached. `--timeout` is an upper
+> bound, and `--seconds x --count` is what actually sets a run's length. The genuine 390 s run above
+> is what produced the flat-white finding, which the short run could not have seen.
 
 ### `PPSA02846` — Spacebase Startopia (Unity 2020.3.12f1 / IL2CPP)
 
@@ -183,18 +219,23 @@ failure is upstream of the composite.
 
 ### `PPSA03001` — Sifu (Unreal Engine 4, `.pak`)
 
-Boots in **266 ms**. **Never renders content.** All 20 samples of a 140 s run are a flat 4K clear,
-one colour: RGB `(255,255,255)` to t≈35 s, then RGB `(255,0,255)` from t≈42 s onward. Rung 0.
+Boots in **266 ms** on the run described here (226 ms on another). **Never renders content.** All 20
+samples of a 140 s run are a flat 4K clear, one colour: RGB `(255,255,255)` to t≈35 s, then RGB
+`(255,0,255)` from t≈42 s onward. Rung 0.
 
 Three runs produced two different endings, and both are filed:
 
-- **2 of 3 runs: the guest's own out-of-memory assert**, at t≈45 s, in `FAsyncLoadingTh`. This is
+- **2 of 3 runs: a RADV hard recovery**, losing the Vulkan device from a compute submit and
+  disabling live compute process-wide ([#2935](https://github.com/mattias800/prosper/issues/2935)).
+  The *GTA V* shape ([#2481](https://github.com/mattias800/prosper/issues/2481)) on a second title.
+  **Both runs name the same compute program**, `0x3006260000`, at different submits and operation
+  ordinals (`submit=2214 order=583531`, and `submit=2482 order=585998`) — so on this title the
+  offending program address reproduced across runs. Re-derive it anyway rather than reusing the
+  literal: two runs is not a guarantee, and the charter's rule that addresses are run-local exists
+  because the exceptions are not announced.
+- **1 of 3 runs: the guest's own out-of-memory assert**, at t≈45 s, in `FAsyncLoadingTh`. This is
   [#2908](https://github.com/mattias800/prosper/issues/2908), previously a single-title issue on
-  *Khazan* — see the next section.
-- **1 of 3 runs: a RADV hard recovery** at t≈105 s, losing the Vulkan device from a compute submit
-  and disabling live compute process-wide
-  ([#2935](https://github.com/mattias800/prosper/issues/2935)). The *GTA V* shape
-  ([#2481](https://github.com/mattias800/prosper/issues/2481)) on a second title.
+  *The First Berserker: Khazan* — see the next section.
 
 Five compute programs are rejected before either ending — three `recompile-reject`, two
 `compute-cfg-reject … reason=wave64-ambiguous-mask-read`. **The program that lost the device is not
@@ -204,7 +245,8 @@ event, so neither is what holds the title at rung 0.
 ### `PPSA03130` — Sniper Ghost Warrior Contracts 2 (CryEngine)
 
 Independently reproduced at rung 0, matching [#2871](https://github.com/mattias800/prosper/issues/2871).
-Boots in **272 ms**, then drives a 4K present loop that publishes nothing:
+Boots in **272 ms** on the run described here (173 ms on a shorter one), then drives a 4K present
+loop that publishes nothing:
 `[rtt] PRESENT SOURCE EXTENT MISMATCH: no pass produced a 3840x2160 present source`, 64+
 occurrences, `present_count` 2231 over 244 s, all 24 samples `raw_scanout` and fully black.
 
