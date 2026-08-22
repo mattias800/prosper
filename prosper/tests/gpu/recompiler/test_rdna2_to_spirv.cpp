@@ -9646,6 +9646,96 @@ int main() {
     CHECK(gotS1.size()==N && badS1==0, "v_cvt_u32_f32 saturates (NaN/neg -> 0, >=2^32 -> UINT_MAX)");
     CHECK(gotS2.size()==N && badS2==0, "v_cvt_i32_f32 saturates (NaN -> 0, clamps to INT_MIN/INT_MAX)");
 
+    // Kernels S3/S4: the WORD-DESTINATION SDWA form of v_cvt_u32_f32 (#2916 / PR #2917). The signed sibling
+    // v_cvt_i32_f32 already had this shape; the unsigned one did not, and the decoder's
+    // opcode-keyed admission list is what separated them, so `v_cvt_u32_f32_sdwa v2, v2
+    // dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD` rejected the whole shader. That
+    // is Beast of Reincarnation's (PPSA29343) scanout pixel shader: with it rejected, every draw
+    // into the title's two 3840x2160 display buffers was dropped and the presented frame stayed
+    // at its white clear.
+    //
+    // The operation: convert the FULL dword source, then write the low 16 bits of the 32-bit
+    // result into the selected destination word and PRESERVE the other one. Asserting the
+    // preserved half is what separates this from the plain form -- a lowering that ignored the
+    // destination select would overwrite all 32 bits and still "recompile".
+    // (llvm-mc gfx1030 round-trip: 7e020eff/3f800000, 7e020ef9/00061400, 7e020ef9/00061500.)
+    const uint32_t codeS3[] = {                    // WORD_0: preserve [31:16]
+        0x7E0202FFu, 0x3F800000u,                  // v_mov_b32 v1, 0x3f800000
+        0x7E020EF9u, 0x00061400u,                  // v_cvt_u32_f32_sdwa v1, v0 WORD_0/PRESERVE/DWORD
+        0xBF810000u,
+    };
+    const uint32_t codeS4[] = {                    // WORD_1: preserve [15:0]
+        0x7E0202FFu, 0x0000ABCDu,                  // v_mov_b32 v1, 0x0000abcd
+        0x7E020EF9u, 0x00061500u,                  // v_cvt_u32_f32_sdwa v1, v0 WORD_1/PRESERVE/DWORD
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvS3 = recompile_valu(codeS3, sizeof(codeS3)/sizeof(codeS3[0]), 1, 1);
+    std::vector<uint32_t> spvS4 = recompile_valu(codeS4, sizeof(codeS4)/sizeof(codeS4[0]), 1, 1);
+    CHECK(!spvS3.empty(), "recompiled kernel S3 (v_cvt_u32_f32_sdwa WORD_0/PRESERVE) -> SPIR-V");
+    CHECK(!spvS4.empty(), "recompiled kernel S4 (v_cvt_u32_f32_sdwa WORD_1/PRESERVE) -> SPIR-V");
+    // TWO constraints on this input set, and the second one is the whole point of the arm.
+    //
+    // (a) Every input is >= 128, so the WORD_1 result keeps a nonzero exponent field and the
+    //     compared dword stays a normal float. The saturating edge cases (NaN, negative, >= 2^32)
+    //     are covered by S1/S2 above, which compare the FULL 32-bit result.
+    //
+    // (b) At least one input must DIVERGE between the unsigned and the signed convert *in its low
+    //     16 bits*, or this arm cannot see the axis it exists to test. The first version of it
+    //     could not: every element was non-negative and the only out-of-int32 one saturated to
+    //     UINT_MAX under cvt_f2u and INT_MAX under cvt_f2i, whose low halves are both 0xFFFF -- so
+    //     writing b.cvt_f2i() in the new branch, which is exactly the copy-from-the-signed-sibling
+    //     mistake this change invites, left the arm green. 3.0e9f fixes that: it is exactly
+    //     representable as a float (3,000,000,000 = 5,859,375 * 2^9, 23 significant bits), it is
+    //     >= 2^31 so the converts diverge, and its unsigned low half is 0x5e00 -- nonzero, so
+    //     constraint (a) still holds. Under the signed lowering it would be 0xffff.
+    //
+    // Constraint (b) is ASSERTED below rather than left to this comment, because an input array is
+    // exactly the kind of thing a later edit prunes for tidiness without knowing what it carried.
+    const float sdwaIn[] = { 300.7f, 65535.9f, 70000.0f, 1000.0f, 128.0f, 4096.0f, 999.5f, 1e10f,
+                             3.0e9f };
+    const uint32_t NSDWA = sizeof(sdwaIn)/sizeof(sdwaIn[0]);
+    uint32_t sdwa_signedness_discriminating = 0;
+    for (uint32_t k = 0; k < NSDWA; k++)
+        if ((sat_u32(sdwaIn[k]) & 0xFFFFu) !=
+            (static_cast<uint32_t>(sat_i32(sdwaIn[k])) & 0xFFFFu))
+            sdwa_signedness_discriminating++;
+    printf("  kernelS3/S4 inputs that discriminate u32 from i32 in the written half: %u of %u\n",
+           sdwa_signedness_discriminating, NSDWA);
+    CHECK(sdwa_signedness_discriminating > 0,
+          "the S3/S4 input set can tell v_cvt_u32_f32 from v_cvt_i32_f32 at all");
+    std::vector<float> inW(N);
+    std::vector<uint32_t> expS3(N), expS4(N);
+    for (uint32_t i = 0; i < N; i++) {
+        const float a = sdwaIn[i % NSDWA];
+        inW[i] = a;
+        const uint32_t half = sat_u32(a) & 0xFFFFu;
+        expS3[i] = 0x3F800000u | half;             // low word replaced, high word preserved
+        expS4[i] = (half << 16) | 0x0000ABCDu;     // high word replaced, low word preserved
+    }
+    std::vector<float> gotS3 = prosper::test::run_compute(spvS3, inW, N, N);
+    std::vector<float> gotS4 = prosper::test::run_compute(spvS4, inW, N, N);
+    // Report the FIRST MISMATCHING sample, not sample 0. Only 1 of the 9 inputs discriminates
+    // signedness, so on a signedness regression sample 0 still agrees -- printing it beside
+    // "mismatches=14" shows a reader two identical hex values next to a nonzero failure count,
+    // which reads as a broken test rather than a caught defect. (Same shape as instrument trap 219:
+    // a diagnostic whose own fields contradict each other.) Falls back to sample 0 when all agree,
+    // which is the informative one then.
+    uint32_t badS3 = 0, badS4 = 0, firstS3 = 0, firstS4 = 0;
+    for (uint32_t i = 0; i < N && gotS3.size() == N; i++)
+        if (bits_of(gotS3[i]) != expS3[i]) { if (!badS3) firstS3 = i; badS3++; }
+    for (uint32_t i = 0; i < N && gotS4.size() == N; i++)
+        if (bits_of(gotS4[i]) != expS4[i]) { if (!badS4) firstS4 = i; badS4++; }
+    printf("  kernelS3(u32 sdwa WORD_0) mismatches=%u (sample %u in=%g got 0x%08x expect 0x%08x)\n",
+           badS3, firstS3, (double)inW[firstS3],
+           gotS3.size()==N?bits_of(gotS3[firstS3]):0u, expS3[firstS3]);
+    printf("  kernelS4(u32 sdwa WORD_1) mismatches=%u (sample %u in=%g got 0x%08x expect 0x%08x)\n",
+           badS4, firstS4, (double)inW[firstS4],
+           gotS4.size()==N?bits_of(gotS4[firstS4]):0u, expS4[firstS4]);
+    CHECK(gotS3.size()==N && badS3==0,
+          "v_cvt_u32_f32_sdwa WORD_0 writes D[15:0] and preserves D[31:16]");
+    CHECK(gotS4.size()==N && badS4==0,
+          "v_cvt_u32_f32_sdwa WORD_1 writes D[31:16] and preserves D[15:0]");
+
     // Kernels X1..X3: SPECIAL operands read as ALU DATA (#134). VCC/EXEC live as per-lane bools in
     // the per-invocation model (their 32-bit wave-mask value doesn't exist) and M0 isn't modeled —
     // such reads previously computed with a silent 0; they must now REJECT. SGPR_NULL (field 125)

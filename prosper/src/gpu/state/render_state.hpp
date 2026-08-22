@@ -406,6 +406,17 @@ uint64_t unmodeled_cb_color_mode_count(uint32_t mode);
 // without a revert. Read once into a static; not a supported rendering mode.
 bool legacy_cb_disable_mask_enabled();
 
+// #1588 diagnostic-only: true when PROSPER_CB_EFC_NO_COLOR=1 makes an ELIMINATE_FAST_CLEAR draw
+// write no colour, so "is the unmodeled EFC pass what flattens this title's composite?" can be
+// answered by an A/B instead of an argument. DEFAULT OFF and not a supported rendering mode.
+//
+// Read the #1706 caveat above before believing either arm: prosper's decoded MODE is not
+// per-draw-trustworthy, because a utility sequence's operation bits stay latched onto later
+// ordinary draws. So this lever suppresses colour on every draw that DECODES as EFC, which is a
+// superset of the draws that ARE EFC — a positive result localises the population, it does not
+// identify the operation.
+bool cb_eliminate_fast_clear_writes_no_color();
+
 // Apply the renderer's reduced-resolution scale to both viewport and scissor state. Scissor outer
 // bounds round outward so resolution scaling never discards a guest-covered sample.
 void scale_resolved_render_area(ResolvedPipelineState& ps, float scale_x, float scale_y);

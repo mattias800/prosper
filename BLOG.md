@@ -21,6 +21,57 @@ something, write one line when it is just another capture.
 ```markdown
 ## 2026-08-22
 
+### Beast of Reincarnation: the whole game was under a coat of white paint
+
+<p align="center"><img src="assets/screenshots/beast-of-reincarnation-deluxe-bonus-dialog.png" alt="Beast of Reincarnation — the game's own Digital Deluxe bonus dialog: an item list with Big Dipper, Black Shiba Skin, Special Hat, Amber and crop seedlings, a scrollbar, an orange note and an OK button, rendered at 3840x2160"></p>
+
+Game Freak's first PS5 title, added to the library tonight. On a default launch it presents a
+**flat white 4K frame** and holds it for four minutes — and every renderer diagnostic says the
+emulator is fine, because it is: the guest runs, the frame counter climbs past twelve thousand,
+and prosper renders hundreds of real draw batches a second. Nothing was wrong with the picture.
+There simply was no picture, and then prosper painted over the place where it should have been.
+
+Two things were doing that. The first was one missing instruction form. The pixel shader that
+writes both of the title's 3840x2160 scanout buffers opens with
+`v_cvt_u32_f32_sdwa v2, v2 dst_sel:WORD_0` — convert a float to an integer and drop the result into
+the *low half* of a register, leaving the high half alone, which is how a shader packs two numbers
+into one. prosper already understood exactly that instruction in its **signed** form and had never
+been shown the unsigned one, so the shader was rejected and **404 draws per run into the visible
+framebuffer were discarded**. Four lines fixed it. The census of dropped draws into the scanout
+went from 404 to zero.
+
+That was not enough on its own, because of the second thing, which is more interesting. The frame
+went from white to... a different flat colour. This title issues over **eight thousand**
+`ELIMINATE_FAST_CLEAR` passes per boot — a hardware operation that expands a compressed
+"this whole surface is one colour" record into real pixels, *instead of* running a pixel shader.
+prosper does not model compressed colour surfaces at all, so it has nothing to expand; it runs
+those passes as ordinary draws, which paint the surface. That gap has been on file as
+[#1588](https://github.com/mattias800/prosper/issues/1588) for a while with no title that made it
+matter. Here it was the entire visible output.
+
+<p align="center"><img src="assets/screenshots/beast-of-reincarnation-game-freak-logo.png" alt="Beast of Reincarnation — the GAME FREAK developer logo in white on black, rendered at 3840x2160"></p>
+
+Add a default-off switch that stops those passes writing colour, and the game is just *there*
+underneath: the GAME FREAK logo, then the Digital Deluxe bonus dialog above — item list, scrollbar,
+that orange footnote, a properly styled OK button, 6,452 distinct colours. It had been rendering
+all along.
+
+So: **rung 1, honestly** — that switch is not a fix and is not on by default, the same passes
+happen in every other title (one *Plucky Squire* trace has 36,613 of them), and the switch itself
+now looks like it may crash the driver
+([#2915](https://github.com/mattias800/prosper/issues/2915)). No title screen yet either. But the
+measurement is now on #1588 instead of the argument, and two other titles that also end on a pure
+white frame — *Astro Bot* and *Sonic Racing: CrossWorlds* — are suddenly one run each away from
+knowing whether they have the same problem.
+
+One thing worth writing down for whoever gets this title next. Its command-line file is
+`uecommandline.txt`, without the `4` that every UE4 title in the library carries, and that looked
+like the one real clue going in — the first UE5 title in the corpus. It is not: *Sonic Racing:
+CrossWorlds* ships the same file name, and `COMPATIBILITY.md` already calls it Unreal Engine 5.
+The actual evidence is duller and better — `Nanite`, `Lumen`, `VirtualShadowMap` and
+`WorldPartition` in the executable's strings, and an IoStore container version of 6 where every UE4
+title in the library has 2 or 3.
+
 ### Gollum's boot was killed by a divide by zero, and the divisor was a channel count nobody wrote
 
 No picture with this one — *The Lord of the Rings: Gollum* (`PPSA06367`) still renders nothing but a
