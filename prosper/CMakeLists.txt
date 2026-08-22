@@ -1151,6 +1151,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_txres PRIVATE prosper_core)
   add_test(NAME savedata_tx_resource_ids COMMAND test_savedata_txres)
 
+  add_executable(test_savedata_event_drain tests/hle/service/test_savedata_event_drain.cpp)
+  target_link_libraries(test_savedata_event_drain PRIVATE prosper_core)
+  add_test(NAME savedata_event_drain_code COMMAND test_savedata_event_drain)
+
   add_executable(test_translate_sandbox tests/hle/test_translate_sandbox.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_translate_sandbox PRIVATE tests)
