@@ -2105,6 +2105,79 @@ int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
         if (f.size == size) { if (n++ == 0 && out_path) *out_path = f.path; }
     return n;
 }
+
+// --- APR gather/scatter chain state -------------------------------------------------------------
+// libSceAmpr exposes FOUR read builders against one APR command buffer:
+//
+//   mQ16-QdKv7k  sceAmprAprCommandBufferReadFile               (cb, fileId, dst, len, offset)
+//   mZSbNJVJpV8  sceAmprAprCommandBufferReadFileGather
+//   Jg-AgkdJHkk  sceAmprAprCommandBufferReadFileScatter
+//   BVmR1H8l+XI  sceAmprAprCommandBufferReadFileGatherScatter  (cb,         dst, len, offset)
+//
+// and one explicit teardown, `YPxkUDhgoNI sceAmprAprCommandBufferResetGatherScatterState`. That
+// last export is the primary-source proof that the gather/scatter variants are STATEFUL on the
+// command buffer: they carry no file id because the chain the plain ReadFile opened already holds
+// it. (Export list from the PS5 3.20 firmware library database, which gives names and NIDs only —
+// every layout below is re-derived from the guest.)
+//
+// So: `ReadFile` OPENS a chain on a command buffer and names the file; each `…GatherScatter`
+// APPENDS one (fileOffset -> dst, len) segment to the chain that is currently open on that same
+// command buffer; `sceAmprCommandBufferReset` (which the guest calls immediately before every
+// chain-opening ReadFile) closes it.
+//
+// Yakuza Kiwami's own read dispatcher at eboot+0xdb5fb0 is that contract written out. Its two arms
+// are argument-for-argument identical apart from the file id, and which one runs is a single latch
+// bit on the APR file object:
+//
+//     eax = [aprf+0x148]; test eax,0x400; jne <gather-scatter arm>
+//     or  [aprf+0x148],0x400          ; first read for this file: OPEN the chain
+//     call sceAmprCommandBufferReset(cb)
+//     call sceAmprAprCommandBufferReadFile(cb, [aprf+0x04], dst, min(len, size-off), off)
+//     [aprf+0x1c]  = bytes            ; ASSIGN
+//   <gather-scatter arm>
+//     call sceAmprAprCommandBufferReadFileGatherScatter(cb, dst, min(len, size-off), off)
+//     [aprf+0x1c] += bytes            ; ACCUMULATE
+//
+// prosper serves every APR read EAGERLY at record time, so the chain never has to be replayed —
+// the only thing it must carry across calls is the file the segments read from.
+//
+// A refused chain lookup is a LOUD failure (the read reports the same error an unresolvable file id
+// reports) rather than a silent success. That matters more here than usual: a gather/scatter
+// segment whose file could not be established would otherwise hand the guest an unwritten buffer
+// that is indistinguishable from a successful read of zeros.
+namespace {
+struct AprChain { uint32_t file_id; uint64_t fsize; std::string host; };
+PROSPER_HEAP_MUTEX(g_apr_chain_mx);          // #707: heap-backed on macOS, like the registry mutex
+std::map<uint64_t, AprChain> g_apr_chains;   // APR command-buffer VA -> the read chain open on it
+constexpr size_t kAprChainMax = 4096;        // titles seen so far construct two command buffers
+}
+// Record the chain a plain ReadFile just opened on `cb`.
+static void apr_chain_open(uint64_t cb, uint32_t id, uint64_t fsize, const std::string& host) {
+    if (!cb) return;
+    std::lock_guard lk(g_apr_chain_mx);
+    // Bounded like the Ampr command-buffer state map. Unlike that one (#2878) an evicted entry here
+    // cannot produce a wrong answer -- the next gather/scatter segment on the victim refuses and
+    // says so -- so an arbitrary victim is safe, and no title comes near the bound anyway.
+    if (g_apr_chains.size() >= kAprChainMax && !g_apr_chains.count(cb))
+        g_apr_chains.erase(g_apr_chains.begin());
+    g_apr_chains[cb] = AprChain{ id, fsize, host };
+}
+// Look up the chain open on `cb`. False when there is none.
+static bool apr_chain_current(uint64_t cb, AprChain* out) {
+    if (!cb) return false;
+    std::lock_guard lk(g_apr_chain_mx);
+    auto it = g_apr_chains.find(cb);
+    if (it == g_apr_chains.end()) return false;
+    *out = it->second;
+    return true;
+}
+// sceAmprCommandBufferReset / ClearBuffer / the APR command-buffer destructor close the chain.
+// Called from the Ampr command-buffer layer (hle_kernel_mem.cpp), which owns those entry points.
+extern "C" void prosper_apr_chain_reset(uint64_t cb) {
+    if (!cb) return;
+    std::lock_guard lk(g_apr_chain_mx);
+    g_apr_chains.erase(cb);
+}
 // "Which guest code asked for the file that is not there?" — the question every missing-asset
 // bring-up investigation reaches, and the one a path alone cannot answer. A resolve MISS names the
 // path; it does not name the engine call site, so the next step (does the caller fall back to an
@@ -2521,6 +2594,132 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
 }
 #endif
 
+#ifdef _WIN32
+// Windows sibling of the POSIX apr_write_guest_dst above; ONE name for "put these bytes in the
+// guest's own destination" on both hosts. This used to be a lambda inside the ReadFile handler, so
+// the gather/scatter builder could not reach it -- and the two builders differing in how they write
+// a destination is precisely the divergence the shared core below exists to make impossible.
+// #2139: APR is a DMA-style producer, so it must be able to write a destination page even when the
+// renderer/compute caches currently hold it write-protected for dirty tracking. Notifying first both
+// restores write access and dirties every overlapping cache registration, exactly as on POSIX.
+static bool apr_write_guest_dst(uint64_t dst, void* src, uint64_t bytes) {
+    if (!bytes) return true;
+    host::guest_write_watch_notify_host_write(dst, bytes);
+    if (!windows_prepare_guest_write(dst, bytes)) return false;
+    memcpy((void*)(uintptr_t)dst, src, (size_t)bytes);
+    return true;
+}
+#endif
+
+// --- The APR read itself, shared by every read builder -------------------------------------------
+// `sceAmprAprCommandBufferReadFile` and `sceAmprAprCommandBufferReadFileGatherScatter` differ only
+// in how the FILE is named (an explicit id vs. the chain open on the command buffer). Everything
+// after that -- clamp to EOF, stage the bytes, DMA them into the guest's destination, complete the
+// command buffer's record, account for the encoded command -- is one contract, so it is one
+// function. A gather/scatter segment that behaved even slightly differently from the plain read of
+// the same range would be a bug the guest could only report as corrupt data.
+struct AprReadOutcome {
+    bool ok = false;          // every requested byte (after the EOF clamp) was delivered
+    bool in_dst = false;      // ...into the guest's own destination, rather than staging
+    uint64_t offset = 0;      // clamped
+    uint64_t size = 0;        // clamped
+    uint64_t published = 0;   // what the completion record's data pointer was set to
+    int64_t  got = 0;         // bytes the host read actually returned; `ok` is (got == size)
+};
+// `cb` is the APR command buffer (a0 of either builder), `record` its completion-record out-pointer
+// (a2, always &cb[0x20] in the SDK's own inline wrappers), `dst`/`requested`/`offset` the read.
+static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::string& host,
+                                       uint64_t dst, uint64_t requested, uint64_t offset,
+                                       uint64_t fsize) {
+    AprReadOutcome out;
+    if (offset > fsize) {
+        if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) -- clamped\n",
+                               (unsigned long long)offset, (unsigned long long)fsize);
+        offset = fsize;
+    }
+    uint64_t size = requested;
+    if (size > fsize - offset) size = fsize - offset;
+    out.offset = offset;
+    out.size = size;
+#ifndef _WIN32
+    // Fill a library-owned page-aligned buffer (models the Ampr engine's own DMA pages; one per
+    // read, never freed -- the engine only ever reads through the published pointer).
+    uint64_t rounded = (size + 0xfff) & ~0xfffull; if (!rounded) rounded = 0x1000;
+    void* slot = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (slot == MAP_FAILED) return out;
+    ssize_t got = 0;
+    if (size) {
+        int fd = apr_cached_fd(host);
+        if (fd < 0) { munmap(slot, rounded); return out; }
+        got = ::pread(fd, slot, (size_t)size, (off_t)offset);
+    }
+    out.got = (int64_t)got;
+    out.ok = ((uint64_t)got == size);
+#else
+    // Read through a host staging buffer so an invalid guest range cannot make the CRT abort the
+    // whole read before EOF.
+    void* slot = ::malloc(size ? (size_t)size : 16);
+    if (!slot) return out;
+    size_t got = 0;
+    if (size) {
+        FILE* f = ::fopen(host.c_str(), "rb");
+        if (!f) { ::free(slot); return out; }
+        if (_fseeki64(f, (__int64)offset, SEEK_SET) == 0)
+            got = ::fread(slot, 1, (size_t)size, f);
+        ::fclose(f);
+    }
+    out.got = (int64_t)got;
+    out.ok = ((uint64_t)got == size);
+#endif
+    // `dst` is the caller's DESTINATION buffer -- on real hardware the DMA engine fills it and the
+    // completion record's data pointer equals it. Some callsites consume the data through the
+    // record pointer and some read their own dst buffer directly, so write BOTH: copy into dst
+    // fault-safely and publish record[0] = dst, falling back to the prosper-owned staging buffer
+    // only if dst is absent or unmapped.
+    out.in_dst = out.ok && dst > 0xffff && apr_write_guest_dst(dst, slot, size);
+    // Set BEFORE the record write, not inside it: this is also what the caller's log line prints,
+    // and gating it on `ok && record` made a failed read (or a read with no record out-pointer)
+    // report `dst=0x0(staging)` where the old code printed the real staging address (review of
+    // #2924). The record write below publishes the same value.
+    out.published = out.in_dst ? dst : (uint64_t)(uintptr_t)slot;
+    if (out.ok && record) {
+        // Complete the record through the caller-supplied out-pointer: [0] data pointer,
+        // [+8] status (0 = success; on failure holds {err, CB offset} that the guest's fatal
+        // prints), [+0x10] bytes transferred.
+        *(uint64_t*)(uintptr_t)(record + 0x00) = out.published;
+        *(uint64_t*)(uintptr_t)(record + 0x08) = 0;
+        // The bytes-transferred qword at record+0x10 completes a 3-qword record (Evergate reads
+        // it). The other shape is record == cb+0x20, where record+0x10 == cb+0x30 is a LIVE pointer
+        // the guest still uses. That shape is NOT a Terminator 2D quirk despite the evidence coming
+        // from there: it is what the SDK's own inline wrappers produce (`lea rdx,[rdi+0x20]`), so on
+        // Yakuza Kiwami it holds for EVERY read of BOTH builders and this qword is never written.
+        // Terminator 2D (Unity IL2CPP, PPSA25872) is simply where the consequence was captured. A live capture proved that writing read id=7's size (9612 = 0x258c) there led the
+        // guest to free 0x258c and later fault while popping that corrupted allocator freelist
+        // (eboot+0x7c4a39). Skip only that proven shape: the size and meaning of other request
+        // layouts are unknown, so mere address overlap is not evidence that a caller-supplied
+        // output slot is invalid. CONFIDENCE: HIGH for the exact Terminator shape (live A/B
+        // advances to the frame loop).
+        if (record != cb + 0x20)
+            *(uint64_t*)(uintptr_t)(record + 0x10) = size;
+    }
+#ifndef _WIN32
+    // failure: record stays incomplete -> the guest reports it; success-into-dst: staging is no
+    // longer referenced by anything and can go back.
+    if (!out.ok || out.in_dst) munmap(slot, rounded);
+#else
+    if (!out.ok || out.in_dst) ::free(slot);
+#endif
+    // Account for the encoded read record in the command buffer's GetCurrentOffset state. The
+    // firmware's own sceAmprMeasureCommandSizeReadFile answers 20 bytes, or 24 when the file offset
+    // needs its high 32 bits; neither title that exercises the gather/scatter builder imports
+    // sceAmprMeasureCommandSizeReadFileGatherScatter, so its encoded size is unmeasured and the
+    // plain read's is used for both. CONFIDENCE: HIGH for ReadFile, LOW for the gather/scatter
+    // variant -- it feeds GetCurrentOffset only, and prosper serves every read eagerly, so a wrong
+    // count cannot lose data.
+    if (out.ok) prosper_ampr_advance(cb, (offset >> 32) ? 24 : 20);
+    return out;
+}
+
 #ifndef _WIN32
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
                                         uint64_t a3, uint64_t a4, uint64_t a5,
@@ -2726,13 +2925,6 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 #endif
         }
     }
-    uint64_t size = requested_size;
-    if (offset > fsize) {
-        if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) -- clamped\n",
-                               (unsigned long long)offset, (unsigned long long)fsize);
-        offset = fsize;
-    }
-    if (size > fsize - offset) size = fsize - offset;
 #ifndef _WIN32
     // Fault-safe guest-memory read (unmapped guest VA -> false, never SIGSEGV in the HLE).
     auto safe_read = [](uint64_t va, void* out, size_t n) -> bool {
@@ -2792,110 +2984,128 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
                     (unsigned long long)hd[2], (unsigned long long)hd[3], hops, hit);
         }
     }
-    // The read: fill a library-owned page-aligned buffer (models the Ampr engine's own DMA pages;
-    // one per read, never freed — the engine only ever reads through the published pointer) and
-    // COMPLETE the record: +0x20 = data pointer, +0x28 = 0 (success). The completion check is at
-    // eboot 0x22738a5 (mov 0x30(%rbx)/0x34(%rbx), rbx = req-8).
-    uint64_t rounded = (size + 0xfff) & ~0xfffull; if (!rounded) rounded = 0x1000;
-    void* slot = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (slot == MAP_FAILED) return 0x80020016ull;
-    ssize_t got = 0;
-    if (size) {
-        int fd = apr_cached_fd(host);
-        if (fd < 0) { munmap(slot, rounded); return 0x80020016ull; }
-        got = ::pread(fd, slot, (size_t)size, (off_t)offset);
-    }
-    bool ok = ((uint64_t)got == size);
-    // a4 is the caller's DESTINATION buffer (the `dst` argument of
-    // sceAmprAprCommandBufferReadFile) — on real hardware the DMA engine fills it and the
-    // completion record's data pointer equals it. The utoc callsite consumes data via the record
-    // pointer, but the pak-footer callsite reads its own dst buffer directly (with only the
-    // record published to a side buffer, the correct footer bytes were provably never seen: no
-    // index read followed and PreInit failed). Copy into dst fault-safely (process_vm_writev
-    // refuses unmapped ranges instead of SIGSEGVing in the HLE) and publish record[0] = dst;
-    // fall back to the prosper-owned buffer only if dst is absent/unmapped.
-    // CONFIDENCE: MED-HIGH (dst role from the recovered real prototype + both callsites' behavior).
-    bool in_dst = ok && a4 > 0xffff && apr_write_guest_dst(a4, slot, size);
-    if (ok && a2) {
-        // Complete the record through the caller-supplied out-pointer (a2 = &record.data; the
-        // stack offsets differ per callsite, a2 is the stable handle): [0] data pointer,
-        // [+8] status (0 = success; on failure holds {err, CB offset} that the fatal prints),
-        // [+0x10] bytes transferred.
-        *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
-        *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
-        // The bytes-transferred qword at a2+0x10 completes a 3-qword record (Evergate reads it).
-        // Terminator 2D (Unity IL2CPP, PPSA25872) instead passes the exact observed alternate shape
-        // a2 = req+0x20, where a2+0x10 == req+0x30 is a LIVE pointer the guest still uses. A live
-        // capture proved that writing read id=7's size (9612 = 0x258c) there led the guest to free
-        // 0x258c and later fault while popping that corrupted allocator freelist (eboot+0x7c4a39).
-        // Skip only that proven shape: the size and meaning of other request layouts are unknown,
-        // so mere address overlap is not evidence that a caller-supplied output slot is invalid.
-        // CONFIDENCE: HIGH for the exact Terminator shape (live A/B advances to the frame loop).
-        if (a2 != a0 + 0x20)
-            *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
-    }
-    if (!ok || in_dst) {
-        munmap(slot, rounded);   // failure: record stays -> guest reports it; success-into-dst: staging no longer needed
-    }
-    if (ok) prosper_ampr_advance(a0, (offset >> 32) ? 24 : 20);
+    // The read, the DMA into the guest's destination and the record completion are the shared
+    // contract every APR read builder implements: apr_execute_read (above).
+    AprReadOutcome r = apr_execute_read(a0, a2, host, /*dst=*/a4, requested_size, offset, fsize);
     if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) "
                    "off=0x%llx size=%llu got=%lld %s method=%s requested=%llu\n",
                    (unsigned long long)id, host.c_str(),
-                   in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
-                   in_dst ? "guest" : "staging",
-                   (unsigned long long)offset, (unsigned long long)size, (long long)got,
-                   ok ? "OK" : "SHORT", resolution_method,
+                   (unsigned long long)(r.in_dst ? a4 : r.published),
+                   r.in_dst ? "guest" : "staging",
+                   (unsigned long long)r.offset, (unsigned long long)r.size,
+                   (long long)r.got, r.ok ? "OK" : "SHORT", resolution_method,
                    (unsigned long long)requested_size);
-    return ok ? 0 : 0x80020016ull;
+    // A completed read OPENS this command buffer's gather/scatter chain: every later
+    // …ReadFileGatherScatter segment on the same buffer reads from this file until a
+    // sceAmprCommandBufferReset closes it.
+    if (r.ok) apr_chain_open(a0, (uint32_t)id, fsize, host);
+    return r.ok ? 0 : 0x80020016ull;
 #else
     (void)dest;
-    // Windows host: same record-completion + DMA-destination model over stdio. Read through a host
-    // staging buffer so an invalid guest range cannot make the CRT abort the whole read before EOF.
-    void* slot = ::malloc(size ? (size_t)size : 16);
-    if (!slot) return 0x80020016ull;
-    size_t got = 0;
-    if (size) {
-        FILE* f = ::fopen(host.c_str(), "rb"); if (!f) { ::free(slot); return 0x80020016ull; }
-        if (_fseeki64(f, (__int64)offset, SEEK_SET) == 0)
-            got = ::fread(slot, 1, (size_t)size, f);
-        ::fclose(f);
-    }
-    if ((uint64_t)got != size) { ::free(slot); return 0x80020016ull; }
-    auto write_guest_dst = [](uint64_t dst, const void* src, uint64_t bytes) -> bool {
-        // #2139: APR is a DMA-style producer, so it must be able to write a destination page even
-        // when the renderer/compute caches currently hold it write-protected for dirty tracking —
-        // the POSIX path has always notified first, and this one never did. Two consequences on
-        // Windows: windows_prepare_guest_write REFUSES a watch-protected page (it only checks
-        // writability, it does not restore it), so the read silently published its host staging
-        // pointer instead of the guest's own buffer; and overlapping cache registrations were never
-        // marked dirty, so the renderer could keep serving stale bytes for a range APR had just
-        // rewritten. Notifying first both restores write access and dirties every overlapping
-        // registration, exactly as on POSIX.
-        host::guest_write_watch_notify_host_write(dst, bytes);
-        if (!windows_prepare_guest_write(dst, bytes)) return false;
-        memcpy((void*)(uintptr_t)dst, src, (size_t)bytes);
-        return true;
-    };
-    const bool in_dst = a4 > 0xffff && write_guest_dst(a4, slot, size);
-    if (a2) {
-        *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
-        *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
-        // Match the exact Terminator alternate record shape described in the Linux path above.
-        if (a2 != a0 + 0x20)
-            *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
-    }
-    if (in_dst) ::free(slot);
-    prosper_ampr_advance(a0, (offset >> 32) ? 24 : 20);
+    // Windows host: the same shared core. The record-completion and DMA-destination model is not
+    // per-platform, and it used to be written out twice here.
+    AprReadOutcome r = apr_execute_read(a0, a2, host, /*dst=*/a4, requested_size, offset, fsize);
     if (filelog()) fprintf(stderr,
-        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu "
-        "got=%llu OK method=%s requested=%llu\n",
+        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%lld "
+        "%s method=%s requested=%llu\n",
         (unsigned long long)id, host.c_str(),
-        in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
-        in_dst ? "guest" : "staging", (unsigned long long)offset,
-        (unsigned long long)size, (unsigned long long)got, resolution_method,
+        (unsigned long long)(r.in_dst ? a4 : r.published),
+        r.in_dst ? "guest" : "staging", (unsigned long long)r.offset,
+        (unsigned long long)r.size, (long long)r.got, r.ok ? "OK" : "SHORT", resolution_method,
         (unsigned long long)requested_size);
-    return 0;
+    if (r.ok) apr_chain_open(a0, (uint32_t)id, fsize, host);
+    return r.ok ? 0 : 0x80020016ull;
 #endif
+}
+
+// libSceAmpr BVmR1H8l+XI — sceAmprAprCommandBufferReadFileGatherScatter.
+//
+// ABI, re-derived from the guest (the 3.20 firmware database gives the name and NID only). The
+// SDK's own inline wrapper at eboot+0xcc4a70 in Yakuza Kiwami fixes the low-level order, and it is
+// the plain ReadFile wrapper at eboot+0xcc4a40 with the file id removed and every later argument
+// shifted down one register:
+//
+//   public   GatherScatter(rdi=cb, rsi=dst, rdx=len, rcx=offset)
+//   cc4a70:  mov r9,rcx / mov r8,rdx / mov rcx,rsi        ; offset -> a5, len -> a4, dst -> a3
+//            lea rsi,[rdi+0x18] / lea rdx,[rdi+0x20]      ; the same cursor pair the plain read gets
+//            jmp <BVmR1H8l+XI>
+//   low      (a0=cb, a1=&cb[0x18], a2=&cb[0x20], a3=dst, a4=len, a5=fileOffset)
+//
+// Note `mov rcx,rsi` is 64-bit where the plain read's is `mov ecx,esi`: a3 here is a pointer, not
+// the 32-bit file id. There is no seventh (stack) argument — the plain read's file offset moved
+// into a5 — so this needs none of the plain read's entry-shim machinery.
+//
+// WHICH FILE: the one the chain open on this command buffer names (apr_chain_open / the block
+// beside prosper_apr_chain_reset above). No id is passed because the library already has it; that
+// is what the sibling export sceAmprAprCommandBufferResetGatherScatterState exists to clear, and
+// what the guest's own dispatcher at eboot+0xdb5fb0 assumes when it calls
+// sceAmprCommandBufferReset + ReadFile for the first read of a file and this for every later one.
+//
+// REFUSAL is deliberate and loud in three cases, because the alternative to refusing is handing the
+// guest an unwritten buffer that it cannot tell apart from a successful read of zeros:
+//   * no chain open on this command buffer — we cannot name the file;
+//   * offset past the chain file's EOF;
+//   * offset+len past it — the guest clamps every request to `min(len, size - offset)` against its
+//     OWN size (which came from prosper's resolve), so a range that overruns is evidence the chain
+//     lookup found the wrong file, not evidence of a short read.
+// Each returns the same error the plain read returns for an unresolvable id, and does NOT touch the
+// completion record.
+//
+// Be precise about what that buys, because the obvious phrasing overstates it: it is NOT "the record
+// stays incomplete so the guest sees a failure". For the SDK wrapper shape (record == cb+0x20, which
+// is every observed callsite) the chain-opening plain ReadFile has ALREADY written a success there,
+// so a refused segment leaves a record reading as the PREVIOUS segment's completion — the failure
+// travels only in this call's return value. Invalidating the status word instead would mean writing
+// into a record layout we have not established, which is the exact mistake the Terminator 2D note in
+// apr_execute_read records. So: refuse, return the error, log loudly, and leave the record alone.
+// (Review of #2924.)
+// CONFIDENCE: HIGH on the argument layout (the guest's two arms are argument-for-argument identical
+// apart from the id) and on the chain being command-buffer state (the firmware's own
+// …ResetGatherScatterState export). MED on chain lifetime: Reset is the only closer observed.
+HLE(f_apr_read_gather_scatter) {
+    (void)a1;
+    const uint64_t cb = a0, record = a2, dst = a3, requested = a4, offset = a5;
+    // Bounded: a title that issues gather/scatter with no chain would otherwise emit one line per
+    // segment for the life of the process, and a diagnostic that drowns the log is one nobody reads.
+    // The count is reported so a truncated tail is visible rather than plausible.
+    static std::atomic<uint64_t> refusals{0};
+    constexpr uint64_t kRefusalLogLimit = 32;
+    const auto log_refusal = [&](const char* what) {
+        const uint64_t n = refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > kRefusalLogLimit) return;
+        fprintf(stderr, "[apr] gather-scatter REFUSED (#%llu%s): %s\n", (unsigned long long)n,
+                n == kRefusalLogLimit ? ", further refusals silent" : "", what);
+    };
+    AprChain chain{};
+    if (!apr_chain_current(cb, &chain)) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "no read chain open on cb=0x%llx "
+                 "(dst=0x%llx len=%llu off=0x%llx) -- the file cannot be named, so the "
+                 "segment is reported as failed rather than served empty",
+                 (unsigned long long)cb, (unsigned long long)dst,
+                 (unsigned long long)requested, (unsigned long long)offset);
+        log_refusal(msg);
+        return 0x80020016ull;
+    }
+    if (offset > chain.fsize || requested > chain.fsize - offset) {
+        char msg[512];
+        snprintf(msg, sizeof msg, "[0x%llx,+%llu) is outside %s (%llu bytes) "
+                 "-- the chain open on cb=0x%llx names the wrong file",
+                 (unsigned long long)offset, (unsigned long long)requested,
+                 chain.host.c_str(), (unsigned long long)chain.fsize, (unsigned long long)cb);
+        log_refusal(msg);
+        return 0x80020016ull;
+    }
+    AprReadOutcome r = apr_execute_read(cb, record, chain.host, dst, requested, offset, chain.fsize);
+    if (filelog())
+        fprintf(stderr, "[apr] gather-scatter id=%u %s -> dst=0x%llx(%s) off=0x%llx size=%llu "
+                        "got=%lld %s\n",
+                chain.file_id, chain.host.c_str(),
+                (unsigned long long)(r.in_dst ? dst : r.published),
+                r.in_dst ? "guest" : "staging",
+                (unsigned long long)r.offset, (unsigned long long)r.size,
+                (long long)r.got, r.ok ? "OK" : "SHORT");
+    return r.ok ? 0 : 0x80020016ull;
 }
 
 // libSceAmpr vWU-odnS+fU — sceAmprMeasureCommandSizeReadFile. The exact firmware contract returns
@@ -2951,10 +3161,11 @@ HLE(f_apr_measure_read_file) {
                 got = ::fread(staging, 1, (size_t)a2, file);
             ::fclose(file);
         }
-        if (got == (size_t)a2 && windows_prepare_guest_write(a1, a2)) {
-            memcpy((void*)(uintptr_t)a1, staging, (size_t)a2);
-            copied = true;
-        }
+        // Route through the same helper the POSIX arm above uses. This block open-coded
+        // windows_prepare_guest_write + memcpy and so never notified the guest write watch --
+        // #2139's defect, surviving in a third place because the helper it needed was a lambda
+        // inside another function until this change lifted it to file scope (review of #2924).
+        copied = got == (size_t)a2 && apr_write_guest_dst(a1, staging, a2);
         ::free(staging);
     }
 #endif
@@ -3036,6 +3247,11 @@ void register_file_hle() {
 #else
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
 #endif
+    // The gather/scatter read builder appends a segment to the chain the plain ReadFile opened on
+    // the same command buffer (contract documented on the handler). Uniform on both hosts: unlike
+    // the plain read it takes no stack argument, so it needs no entry shim.
+    Hle::register_fn("BVmR1H8l+XI", (HleFn)f_apr_read_gather_scatter,
+                     "sceAmprAprCommandBufferReadFileGatherScatter");
     Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_measure_read_file,
                      "sceAmprMeasureCommandSizeReadFile");
     #undef R
