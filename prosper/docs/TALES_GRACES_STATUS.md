@@ -104,9 +104,14 @@ So the success condition, stated before the run that satisfied it: *a matched
 
 ## Known defects on this title
 
-- [#2731](https://github.com/mattias800/prosper/issues/2731) — decoded movie frames composite with
-  their chroma components collapsed (`Cr == Cb`). Cross-title; the title screen and the prologue in
-  the same run are unaffected.
+- ~~[#2731](https://github.com/mattias800/prosper/issues/2731) — decoded movie frames composite with
+  their chroma components collapsed (`Cr == Cb`).~~ **Fixed.** This title stages the decoded NV12 in
+  two allocations of its own, `0x111000` bytes apart, and the renderer's chroma-plane test required
+  the luma plane to END at the chroma plane's address — so every movie frame took the legacy narrow
+  coverage broadcast, which repeats the first byte into every channel. Measured on the default route
+  with `tools/screenshot`: `corr(Cb, Cr)` over the ten opening-movie samples of a 120 s run went from
+  `+0.9992..+1.0000` to `-0.95..+0.53`, and the sky is blue again. See `docs/RESOURCE_BINDING.md`
+  § Ruled out.
 - [#1688](https://github.com/mattias800/prosper/issues/1688) — `sceVideodec2` has no real AVC
   decoder for the later movie path.
 - [#1673](https://github.com/mattias800/prosper/issues/1673) — APR completion delivery; measured

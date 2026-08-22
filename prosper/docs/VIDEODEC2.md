@@ -141,7 +141,7 @@ documenting it — and drops a 3.1 MB per-frame copy on the way.
 
 | variable | effect |
 | --- | --- |
-| `PROSPER_VDEC2_CONTRACT` | print what the guest configures and submits (capped at 12 decodes) |
+| `PROSPER_VDEC2_CONTRACT` | print what the guest configures and submits, including the guest frame buffer's ADDRESS (capped at 12 decodes) |
 | `PROSPER_VDEC2_DUMP_DIR` | write `au.bin` + `pic.nv12` for the reference comparison above |
 | `PROSPER_VDEC2_DUMP_FRAMES` | cap for both dump files (default 16) |
 | `PROSPER_VDEC2_NO_DECODE` | restore the pre-#2270 no-picture behaviour, for the A/B |
@@ -201,6 +201,12 @@ that its rendering works.
   *hashes*, which differ across arms **by construction** when the subject is a playing video, and a
   guaranteed difference was about to be reported as signal.
 
+  #2731 adds the sharpest arm yet, and it is a *negative* one: both `PPSA19991` and `PPSA05325`
+  composited their movies with **collapsed chroma** (`corr(Cb, Cr) = +0.999`), the cast was fixed
+  entirely in the renderer's plane classification, and `format` was 0 on both sides of that fix.
+  So the field did not cause the one colour defect it was the leading suspect for. Do not spend a
+  session sweeping it on a chroma symptom; start from `PROSPER_AVPCHROMA_LOG=1`.
+
   Two more titles now composite a byte-verified picture with `format = 0`. Taken together that is
   evidence these guests tolerate 0 and **not** evidence that no guest reads the field — one title's
   null does not generalise, and a value that happens to mean something specific could still change
@@ -218,6 +224,19 @@ that its rendering works.
 
 ## Ruled out
 
+- **"A movie compositing with its two chroma components collapsed (`Cr == Cb`) is a Videodec2 output
+  problem — the unestablished `VdecOutput::format` misdescribing the chroma layout, or the delivered
+  NV12 bytes."** Falsified on both halves. The bytes were already verified byte-identical to an
+  independent `ffmpeg` decode (#2571), and `format` stayed 0 across the fix while
+  *Tales of Graces f Remastered* and *Sonic Origins* both went from `corr(Cb, Cr) = +0.999` to the
+  uncorrelated range. The defect was **downstream of delivery and outside this library entirely**:
+  the live renderer did not recognise the guest's own NV12 chroma plane, so it took the narrow
+  coverage broadcast, which repeats the first byte into every channel. Note *how far* the two are
+  apart — on `PPSA19991` the guest copies the decoded frame out of its decode ring (`0x2098…`) into
+  two textures of its own (`0x2078…`) before anything samples it, so no property of the buffer this
+  library writes could have been the cause. `[vdec2]` now prints the exact NV12 layout it wrote and
+  where, once per run, so that gap is visible in one boot instead of being inferred. #2731,
+  `docs/RESOURCE_BINDING.md` § Ruled out.
 - **"Closing the backend decoder is an acceptable way to express `sceVideodec2Reset`, because
   forgetting more than a reset needs to is a safe direction to err."** Falsified by measurement
   against this build's libavcodec: a **fresh** `AVCodecContext` — exactly what close-and-reopen
