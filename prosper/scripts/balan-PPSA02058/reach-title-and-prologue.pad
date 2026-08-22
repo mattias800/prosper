@@ -1,0 +1,185 @@
+# BALAN WONDERWORLD (PPSA02058) -- past the first-boot language menu to the title screen,
+# the main menu and the opening story cutscene.
+#
+# Anchors are SECONDS from the first pad poll (src/input/pad.cpp:207-210 -- a bare number is
+# seconds, 'f' is flips, 'p' is pad reads).
+#
+# VALIDATED on Linux with hardware Vulkan (RADV, AMD Radeon 8060S / STRIX_HALO) at 3840x2160,
+# headless `tools/screenshot` frontend, PROSPER_RENDER=1, PROSPER_GUEST_ARGS=-force-gfx-direct,
+# no render acceleration. Measured 2026-08-22 on master bb57d617.
+#
+# WHY THIS ROUTE IS NOT CROSS-ONLY -- this is the whole point of the file.
+#
+# The first-boot screen is "Language Settings": a 24-entry grid with English preselected and a
+# prompt bar reading `O X /\ [] Change Language` and `(L) Select Language`. Every glyph on that
+# bar says CROSS is accepted, and it is -- CROSS raises the screen's confirmation modal:
+#
+#     "Are you sure you want to change the game language to English?"
+#
+# and that modal is where a cross-only route dies. MEASURED: 109 CROSS presses over a 330 s run
+# left the title on the language screen with no new asset load of any kind; the run's last file
+# open was still `game.locres`, exactly as on a default no-input run. The modal is answered by
+# DOWN and then CROSS.
+#
+# A 10-arm probe attributed it: one 30 s window per candidate button, CROSS interleaved
+# throughout, `left` and `right` windows first. `left` did not leave the screen, `right` did not
+# leave the screen, `down` did -- `/app0/title` opened 9.5 s into the `down` window. Re-run with
+# CROSS+DOWN alone from t=3 and nothing else, `/app0/title` opens at t=15.5 s. That is the
+# isolating arm: the breakout is DOWN, not an accumulation of CROSS presses.
+#
+# PROGRESS ORACLE IS THE FILE LOG, NOT PIXELS (PROSPER_FILELOG=1). This title interleaves its
+# good frames with the #2932 wrong composite -- a flat white 4K clear -- so a pixel-only read of
+# any single sample is unreliable in both directions. `open '/app0/title'` is unambiguous, it is
+# absent from every default run measured, and it is the gate this route exists to open.
+#
+#   t~12     language menu is up (default runs render it from t=12)
+#   t~15.5   /app0/title  -- the language modal has been answered
+#   t~22     title screen / main menu: the theatre, "Language Settings / Settings / Credits /
+#            Copyright Information", (c)2021 SQUARE ENIX
+#   t~140+   the opening story cutscene, rendered IN ENGINE at 4K -- Leo and Emma in the park.
+#            There is no movie decode on this boot (no videodec/AJM/CRIWARE decode lines), so
+#            these are real GPU draws of a real 3D scene, not a decoded video.
+#
+# DOWN IS CONFINED TO PHASE 1 ON PURPOSE. On the main menu that follows, DOWN walks the cursor
+# down into Credits; the route has no button after t=37 that could commit such a selection.
+
+# --- phase 1: the language grid and its confirmation modal. CROSS raises, DOWN answers,
+#     CROSS commits. Eight cycles so a slow boot is still covered.
+3-3.5:cross
+4.5-5:down
+7-7.5:cross
+8.5-9:down
+11-11.5:cross
+12.5-13:down
+15-15.5:cross
+16.5-17:down
+19-19.5:cross
+20.5-21:down
+23-23.5:cross
+24.5-25:down
+27-27.5:cross
+28.5-29:down
+31-31.5:cross
+32.5-33:down
+35-35.5:cross
+36.5-37:down
+
+# --- phase 2: title screen, main menu and the opening cutscene. CROSS only.
+38-38.5:cross
+41-41.5:cross
+44-44.5:cross
+47-47.5:cross
+50-50.5:cross
+53-53.5:cross
+56-56.5:cross
+59-59.5:cross
+62-62.5:cross
+65-65.5:cross
+68-68.5:cross
+71-71.5:cross
+74-74.5:cross
+77-77.5:cross
+80-80.5:cross
+83-83.5:cross
+86-86.5:cross
+89-89.5:cross
+92-92.5:cross
+95-95.5:cross
+98-98.5:cross
+101-101.5:cross
+104-104.5:cross
+107-107.5:cross
+110-110.5:cross
+113-113.5:cross
+116-116.5:cross
+119-119.5:cross
+122-122.5:cross
+125-125.5:cross
+128-128.5:cross
+131-131.5:cross
+134-134.5:cross
+137-137.5:cross
+140-140.5:cross
+143-143.5:cross
+146-146.5:cross
+149-149.5:cross
+152-152.5:cross
+155-155.5:cross
+158-158.5:cross
+161-161.5:cross
+164-164.5:cross
+167-167.5:cross
+170-170.5:cross
+173-173.5:cross
+176-176.5:cross
+179-179.5:cross
+182-182.5:cross
+185-185.5:cross
+188-188.5:cross
+191-191.5:cross
+194-194.5:cross
+197-197.5:cross
+200-200.5:cross
+
+# --- phase 3: keep advancing story prompts and walk, so a capture shows motion
+#     rather than one static frame. No DOWN, and nothing that can leave a stage.
+203-206:left-stick-right
+206.5-207:cross
+209-212:left-stick-right
+212.5-213:cross
+215-218:left-stick-right
+218.5-219:cross
+221-224:left-stick-right
+224.5-225:cross
+227-230:left-stick-right
+230.5-231:cross
+233-236:left-stick-right
+236.5-237:cross
+239-242:left-stick-right
+242.5-243:cross
+245-248:left-stick-right
+248.5-249:cross
+251-254:left-stick-right
+254.5-255:cross
+257-260:left-stick-right
+260.5-261:cross
+263-266:left-stick-right
+266.5-267:cross
+269-272:left-stick-right
+272.5-273:cross
+275-278:left-stick-right
+278.5-279:cross
+281-284:left-stick-right
+284.5-285:cross
+287-290:left-stick-right
+290.5-291:cross
+293-296:left-stick-right
+296.5-297:cross
+299-302:left-stick-right
+302.5-303:cross
+305-308:left-stick-right
+308.5-309:cross
+311-314:left-stick-right
+314.5-315:cross
+317-320:left-stick-right
+320.5-321:cross
+323-326:left-stick-right
+326.5-327:cross
+329-332:left-stick-right
+332.5-333:cross
+335-338:left-stick-right
+338.5-339:cross
+341-344:left-stick-right
+344.5-345:cross
+347-350:left-stick-right
+350.5-351:cross
+353-356:left-stick-right
+356.5-357:cross
+359-362:left-stick-right
+362.5-363:cross
+365-368:left-stick-right
+368.5-369:cross
+371-374:left-stick-right
+374.5-375:cross
+377-380:left-stick-right
+380.5-381:cross
