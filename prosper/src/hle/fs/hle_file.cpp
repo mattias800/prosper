@@ -2178,10 +2178,6 @@ extern "C" void prosper_apr_chain_reset(uint64_t cb) {
     std::lock_guard lk(g_apr_chain_mx);
     g_apr_chains.erase(cb);
 }
-void prosper_apr_chain_reset_for_test() {
-    std::lock_guard lk(g_apr_chain_mx);
-    g_apr_chains.clear();
-}
 // "Which guest code asked for the file that is not there?" — the question every missing-asset
 // bring-up investigation reaches, and the one a path alone cannot answer. A resolve MISS names the
 // path; it does not name the engine call site, so the next step (does the caller fall back to an
@@ -2628,6 +2624,7 @@ struct AprReadOutcome {
     uint64_t offset = 0;      // clamped
     uint64_t size = 0;        // clamped
     uint64_t published = 0;   // what the completion record's data pointer was set to
+    int64_t  got = 0;         // bytes the host read actually returned; `ok` is (got == size)
 };
 // `cb` is the APR command buffer (a0 of either builder), `record` its completion-record out-pointer
 // (a2, always &cb[0x20] in the SDK's own inline wrappers), `dst`/`requested`/`offset` the read.
@@ -2656,6 +2653,7 @@ static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::
         if (fd < 0) { munmap(slot, rounded); return out; }
         got = ::pread(fd, slot, (size_t)size, (off_t)offset);
     }
+    out.got = (int64_t)got;
     out.ok = ((uint64_t)got == size);
 #else
     // Read through a host staging buffer so an invalid guest range cannot make the CRT abort the
@@ -2670,6 +2668,7 @@ static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::
             got = ::fread(slot, 1, (size_t)size, f);
         ::fclose(f);
     }
+    out.got = (int64_t)got;
     out.ok = ((uint64_t)got == size);
 #endif
     // `dst` is the caller's DESTINATION buffer -- on real hardware the DMA engine fills it and the
@@ -2678,17 +2677,23 @@ static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::
     // fault-safely and publish record[0] = dst, falling back to the prosper-owned staging buffer
     // only if dst is absent or unmapped.
     out.in_dst = out.ok && dst > 0xffff && apr_write_guest_dst(dst, slot, size);
+    // Set BEFORE the record write, not inside it: this is also what the caller's log line prints,
+    // and gating it on `ok && record` made a failed read (or a read with no record out-pointer)
+    // report `dst=0x0(staging)` where the old code printed the real staging address (review of
+    // #2924). The record write below publishes the same value.
+    out.published = out.in_dst ? dst : (uint64_t)(uintptr_t)slot;
     if (out.ok && record) {
         // Complete the record through the caller-supplied out-pointer: [0] data pointer,
         // [+8] status (0 = success; on failure holds {err, CB offset} that the guest's fatal
         // prints), [+0x10] bytes transferred.
-        out.published = out.in_dst ? dst : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(record + 0x00) = out.published;
         *(uint64_t*)(uintptr_t)(record + 0x08) = 0;
         // The bytes-transferred qword at record+0x10 completes a 3-qword record (Evergate reads
-        // it). Terminator 2D (Unity IL2CPP, PPSA25872) instead passes the exact observed alternate
-        // shape record == cb+0x20, where record+0x10 == cb+0x30 is a LIVE pointer the guest still
-        // uses. A live capture proved that writing read id=7's size (9612 = 0x258c) there led the
+        // it). The other shape is record == cb+0x20, where record+0x10 == cb+0x30 is a LIVE pointer
+        // the guest still uses. That shape is NOT a Terminator 2D quirk despite the evidence coming
+        // from there: it is what the SDK's own inline wrappers produce (`lea rdx,[rdi+0x20]`), so on
+        // Yakuza Kiwami it holds for EVERY read of BOTH builders and this qword is never written.
+        // Terminator 2D (Unity IL2CPP, PPSA25872) is simply where the consequence was captured. A live capture proved that writing read id=7's size (9612 = 0x258c) there led the
         // guest to free 0x258c and later fault while popping that corrupted allocator freelist
         // (eboot+0x7c4a39). Skip only that proven shape: the size and meaning of other request
         // layouts are unknown, so mere address overlap is not evidence that a caller-supplied
@@ -2983,12 +2988,12 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // contract every APR read builder implements: apr_execute_read (above).
     AprReadOutcome r = apr_execute_read(a0, a2, host, /*dst=*/a4, requested_size, offset, fsize);
     if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) "
-                   "off=0x%llx size=%llu %s method=%s requested=%llu\n",
+                   "off=0x%llx size=%llu got=%lld %s method=%s requested=%llu\n",
                    (unsigned long long)id, host.c_str(),
                    (unsigned long long)(r.in_dst ? a4 : r.published),
                    r.in_dst ? "guest" : "staging",
                    (unsigned long long)r.offset, (unsigned long long)r.size,
-                   r.ok ? "OK" : "SHORT", resolution_method,
+                   (long long)r.got, r.ok ? "OK" : "SHORT", resolution_method,
                    (unsigned long long)requested_size);
     // A completed read OPENS this command buffer's gather/scatter chain: every later
     // …ReadFileGatherScatter segment on the same buffer reads from this file until a
@@ -3001,12 +3006,12 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // per-platform, and it used to be written out twice here.
     AprReadOutcome r = apr_execute_read(a0, a2, host, /*dst=*/a4, requested_size, offset, fsize);
     if (filelog()) fprintf(stderr,
-        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu "
+        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%lld "
         "%s method=%s requested=%llu\n",
         (unsigned long long)id, host.c_str(),
         (unsigned long long)(r.in_dst ? a4 : r.published),
         r.in_dst ? "guest" : "staging", (unsigned long long)r.offset,
-        (unsigned long long)r.size, r.ok ? "OK" : "SHORT", resolution_method,
+        (unsigned long long)r.size, (long long)r.got, r.ok ? "OK" : "SHORT", resolution_method,
         (unsigned long long)requested_size);
     if (r.ok) apr_chain_open(a0, (uint32_t)id, fsize, host);
     return r.ok ? 0 : 0x80020016ull;
@@ -3043,38 +3048,63 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 //   * offset+len past it — the guest clamps every request to `min(len, size - offset)` against its
 //     OWN size (which came from prosper's resolve), so a range that overruns is evidence the chain
 //     lookup found the wrong file, not evidence of a short read.
-// Each returns the same error the plain read returns for an unresolvable id, leaving the completion
-// record incomplete so the guest reports the failure through its own path.
+// Each returns the same error the plain read returns for an unresolvable id, and does NOT touch the
+// completion record.
+//
+// Be precise about what that buys, because the obvious phrasing overstates it: it is NOT "the record
+// stays incomplete so the guest sees a failure". For the SDK wrapper shape (record == cb+0x20, which
+// is every observed callsite) the chain-opening plain ReadFile has ALREADY written a success there,
+// so a refused segment leaves a record reading as the PREVIOUS segment's completion — the failure
+// travels only in this call's return value. Invalidating the status word instead would mean writing
+// into a record layout we have not established, which is the exact mistake the Terminator 2D note in
+// apr_execute_read records. So: refuse, return the error, log loudly, and leave the record alone.
+// (Review of #2924.)
 // CONFIDENCE: HIGH on the argument layout (the guest's two arms are argument-for-argument identical
 // apart from the id) and on the chain being command-buffer state (the firmware's own
 // …ResetGatherScatterState export). MED on chain lifetime: Reset is the only closer observed.
 HLE(f_apr_read_gather_scatter) {
     (void)a1;
     const uint64_t cb = a0, record = a2, dst = a3, requested = a4, offset = a5;
+    // Bounded: a title that issues gather/scatter with no chain would otherwise emit one line per
+    // segment for the life of the process, and a diagnostic that drowns the log is one nobody reads.
+    // The count is reported so a truncated tail is visible rather than plausible.
+    static std::atomic<uint64_t> refusals{0};
+    constexpr uint64_t kRefusalLogLimit = 32;
+    const auto log_refusal = [&](const char* what) {
+        const uint64_t n = refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > kRefusalLogLimit) return;
+        fprintf(stderr, "[apr] gather-scatter REFUSED (#%llu%s): %s\n", (unsigned long long)n,
+                n == kRefusalLogLimit ? ", further refusals silent" : "", what);
+    };
     AprChain chain{};
     if (!apr_chain_current(cb, &chain)) {
-        fprintf(stderr, "[apr] gather-scatter REFUSED: no read chain open on cb=0x%llx "
-                        "(dst=0x%llx len=%llu off=0x%llx) -- the file cannot be named, so the "
-                        "segment is reported as failed rather than served empty\n",
-                (unsigned long long)cb, (unsigned long long)dst,
-                (unsigned long long)requested, (unsigned long long)offset);
+        char msg[256];
+        snprintf(msg, sizeof msg, "no read chain open on cb=0x%llx "
+                 "(dst=0x%llx len=%llu off=0x%llx) -- the file cannot be named, so the "
+                 "segment is reported as failed rather than served empty",
+                 (unsigned long long)cb, (unsigned long long)dst,
+                 (unsigned long long)requested, (unsigned long long)offset);
+        log_refusal(msg);
         return 0x80020016ull;
     }
     if (offset > chain.fsize || requested > chain.fsize - offset) {
-        fprintf(stderr, "[apr] gather-scatter REFUSED: [0x%llx,+%llu) is outside %s (%llu bytes) "
-                        "-- the chain open on cb=0x%llx names the wrong file\n",
-                (unsigned long long)offset, (unsigned long long)requested,
-                chain.host.c_str(), (unsigned long long)chain.fsize, (unsigned long long)cb);
+        char msg[512];
+        snprintf(msg, sizeof msg, "[0x%llx,+%llu) is outside %s (%llu bytes) "
+                 "-- the chain open on cb=0x%llx names the wrong file",
+                 (unsigned long long)offset, (unsigned long long)requested,
+                 chain.host.c_str(), (unsigned long long)chain.fsize, (unsigned long long)cb);
+        log_refusal(msg);
         return 0x80020016ull;
     }
     AprReadOutcome r = apr_execute_read(cb, record, chain.host, dst, requested, offset, chain.fsize);
     if (filelog())
-        fprintf(stderr, "[apr] gather-scatter id=%u %s -> dst=0x%llx(%s) off=0x%llx size=%llu %s\n",
+        fprintf(stderr, "[apr] gather-scatter id=%u %s -> dst=0x%llx(%s) off=0x%llx size=%llu "
+                        "got=%lld %s\n",
                 chain.file_id, chain.host.c_str(),
                 (unsigned long long)(r.in_dst ? dst : r.published),
                 r.in_dst ? "guest" : "staging",
                 (unsigned long long)r.offset, (unsigned long long)r.size,
-                r.ok ? "OK" : "SHORT");
+                (long long)r.got, r.ok ? "OK" : "SHORT");
     return r.ok ? 0 : 0x80020016ull;
 }
 
@@ -3131,10 +3161,11 @@ HLE(f_apr_measure_read_file) {
                 got = ::fread(staging, 1, (size_t)a2, file);
             ::fclose(file);
         }
-        if (got == (size_t)a2 && windows_prepare_guest_write(a1, a2)) {
-            memcpy((void*)(uintptr_t)a1, staging, (size_t)a2);
-            copied = true;
-        }
+        // Route through the same helper the POSIX arm above uses. This block open-coded
+        // windows_prepare_guest_write + memcpy and so never notified the guest write watch --
+        // #2139's defect, surviving in a third place because the helper it needed was a lambda
+        // inside another function until this change lifted it to file scope (review of #2924).
+        copied = got == (size_t)a2 && apr_write_guest_dst(a1, staging, a2);
         ::free(staging);
     }
 #endif
