@@ -3607,6 +3607,29 @@ int main() {
     }
     printf("  [ok]   WORD-preserving v_cvt_i32_f32_sdwa emits valid SPIR-V\n");
 
+    // The UNSIGNED sibling of the same shape, in the FRAGMENT stage, using Beast of
+    // Reincarnation's (PPSA29343) own words: its scanout pixel shader opens with
+    // `v_cvt_u32_f32_sdwa v2, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD`
+    // (7e040ef9 00061402) followed by the WORD_1 form (7e000ef9 00061503). Both rejected the
+    // whole shader before #2913, which dropped every draw into the title's 3840x2160 display
+    // buffers. llvm-mc gfx1030 round-trip verified.
+    const uint32_t fragment_cvt_u32_word_sdwa[] = {
+        0x7e040ef9u, 0x00061402u,            // v_cvt_u32_f32_sdwa v2,v2 WORD_0/PRESERVE/DWORD
+        0x7e000ef9u, 0x00061503u,            // v_cvt_u32_f32_sdwa v0,v3 WORD_1/PRESERVE/DWORD
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto fragment_cvt_u32_word_sdwa_spv = recompile_fragment(
+        fragment_cvt_u32_word_sdwa, std::size(fragment_cvt_u32_word_sdwa));
+    if (fragment_cvt_u32_word_sdwa_spv.empty() ||
+        !type_result_ids_are_nonzero(fragment_cvt_u32_word_sdwa_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cvt_u32_word_sdwa_spv)) {
+        printf("  [FAIL] WORD-preserving v_cvt_u32_f32_sdwa did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   WORD-preserving v_cvt_u32_f32_sdwa emits valid SPIR-V\n");
+
     const uint32_t wave32_vertex_exec[] = {
         0xbefe03c1u,                         // s_mov_b32 exec_lo, -1
         0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,

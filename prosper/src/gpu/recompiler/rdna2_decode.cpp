@@ -357,10 +357,17 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
-                // v_cvt_i32_f32_sdwa may write only one destination word while preserving the
-                // other. Astro's world-map material uses WORD_0 + UNUSED_PRESERVE from a full
-                // DWORD f32 source before packing two integer results into one VGPR.
-                else if (((w >> 9) & 0xFFu) == 0x08u) {
+                // v_cvt_i32_f32_sdwa / v_cvt_u32_f32_sdwa may write only one destination word while
+                // preserving the other. Astro's world-map material uses WORD_0 + UNUSED_PRESERVE
+                // from a full DWORD f32 source before packing two integer results into one VGPR.
+                // The UNSIGNED sibling (0x07) is the identical shape and appears in the same idiom:
+                // Beast of Reincarnation's scanout pixel shader opens with
+                // `v_cvt_u32_f32_sdwa v2, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+                // src0_sel:DWORD` (7e040ef9 00061402) and `v_cvt_u32_f32_sdwa v0, v3
+                // dst_sel:WORD_1 ...` (7e000ef9 00061503), both llvm-mc gfx1030 round-trip
+                // verified. Only the result's signedness differs; the destination-half insert and
+                // the preserved half are the same operation.
+                else if (((w >> 9) & 0xFFu) == 0x07u || ((w >> 9) & 0xFFu) == 0x08u) {
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u;
                     if ((dsel == 4u || dsel == 5u) && dun == 2u && s0sel == 6u &&

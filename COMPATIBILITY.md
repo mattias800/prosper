@@ -75,14 +75,15 @@ Last updated: 2026-08-22
 | *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2885](https://github.com/mattias800/prosper/issues/2885) |
 | *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
+| *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 
 ## At a glance
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-ten of the twenty-four titles that reach gameplay are marked 🚧 rather than ✅, and the 🔬 rows sit at
-three different states — two at different rungs, and one not yet run at all. Counting markers gives a
-different — and wrong — answer.
+twelve of the twenty-five titles that reach gameplay are marked 🚧 rather than ✅, and the 🔬 rows sit
+at four different states — three at different rungs, and eight not yet run at all. Counting markers
+gives a different — and wrong — answer.
 
 **"Not yet booted" is a real category, not a rung.** A title can be tracked and never measured, and
 that is different from having been measured and found wanting. It is counted separately so an
@@ -90,11 +91,17 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 24 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
-| **Below a title screen** — logo or splash only (rung 1) | 1 |
-| **Not yet booted** — tracked, no run attempted yet | 9 |
-| Total tracked | 50 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 13 |
+| **Below a title screen** — logo or splash only (rung 1) | 2 |
+| **No frame yet** — booted and running, nothing but black or a flat clear (rung 0) | 3 |
+| **Not yet booted** — tracked, no run attempted yet | 8 |
+| Total tracked | 51 |
+
+Re-derived row by row on 2026-08-22 when the *Beast of Reincarnation* row was added, because the
+previous figures summed to 48 against a stated total of 50 and had no rung-0 category at all while
+three rows said "Rung 0" in their own milestone text. The rung-0 row above is new; the other four
+numbers are the count of rows whose milestone text places them there, and they now sum to the total.
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
