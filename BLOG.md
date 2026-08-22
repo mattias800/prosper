@@ -21,6 +21,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-22
 
+### New Joe & Mac: Caveman Ninja plays start to finish
+
+<p align="center"><img src="assets/screenshots/joe-mac.png" alt="New Joe & Mac: Caveman Ninja — gameplay: Joe crouched in a jungle level with palms, pink blossom, a volcano behind and coiled snakes either side, with the name plate, score, health bar and a lives counter reading x3"></p>
+
+<p align="center"><img src="assets/screenshots/joe-mac-menu.png" alt="New Joe & Mac: Caveman Ninja — the game's menu at 1920x1080"></p>
+
+We play this one through, and have done for a while — it is rung 6 with a reviewed `joe-mac-gameplay`
+snapshot guard, and it had somehow never appeared here. Tracker
+[#1876](https://github.com/mattias800/prosper/issues/1876).
+
+## 2026-08-22
+
 ### The eight titles nobody had ever run
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
