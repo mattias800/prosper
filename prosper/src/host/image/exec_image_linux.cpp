@@ -39,6 +39,8 @@
 #include <map>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <thread>
 
 // Darwin mcontext/perf compatibility (PROSPER_GREGS / PROSPER_REG_ERR / PROSPER_SI_FD, the
 // HW_BREAKPOINT_*/F_SETSIG constants, and mach headers) lives in posix_shim.hpp — shared with the
@@ -3307,6 +3309,108 @@ void install_trap_handler() {
         struct sigaction ta{}; ta.sa_sigaction = fault_handler; ta.sa_flags = SA_SIGINFO;
         sigemptyset(&ta.sa_mask); sigaction(SIGTRAP, &ta, nullptr);
         arm_hwwatch(addr);
+    }
+    // PROSPER_POLLWATCH="0xADDR[,0xADDR...]" (diagnostic, default off) — sample up to 6 guest
+    // 64-bit slots from a host thread every millisecond and print every value CHANGE with the
+    // elapsed time. This answers a question no watchpoint here can answer cheaply: WHEN a slot
+    // changed, and whether it was ever correct.
+    //
+    // Why a poller and not the mprotect page-watch: that one is exact and process-wide, but it
+    // takes a SIGSEGV plus a single-step SIGTRAP per write to the whole 4 KiB page, so on a hot
+    // heap page it costs roughly two orders of magnitude. Measured on PPSA20800: armed on the
+    // page holding the CRI server's list, a boot that faults at ~7 s had not reached the fault
+    // after 240 s. The poller costs one read per slot per millisecond and changes no protection,
+    // so it cannot perturb what it is measuring — at the price of missing changes shorter than
+    // its interval, and of naming no writer. Use it to BOUND the event in time, then point an
+    // exact instrument at that window.
+    //
+    // Readability is probed on the poller's OWN pipe pair, not the shared g_probe_pipe. That
+    // sharing would be a real defect rather than untidiness: probe_readable's safety argument is
+    // explicitly single-user ("we drain what we wrote immediately so the pipe can never fill"),
+    // the fds are O_NONBLOCK, and a 1 kHz poller interleaving with the SIGSEGV dumper, HWBP,
+    // DUMPAT or bp_il2cpp_cname could leave the pipe holding another thread's bytes — after which
+    // a raw_write returns EAGAIN and probe_readable answers FALSE FOR A READABLE ADDRESS. That is
+    // a silent false negative in the fault dumper, in exactly the run where it matters. Raised in
+    // review of #2954.
+    //
+    // Two residual limits, both accepted because this is a default-off diagnostic. (a) TOCTOU: the
+    // guest can unmap between the probe and the load, and this host thread installs no
+    // sigaltstack, so such a fault surfaces as a WORKER-THREAD FAULT on a thread that has nothing
+    // to do with the guest — instrument, not subject. (b) The thread is detached and exits only
+    // after 4096 logged changes, so it can be inside fprintf while exit() tears stdio down.
+    // Point it at slots you expect to change a bounded number of times.
+    //
+    // The block-scope statics plus a capture-less lambda are safe because install_trap_handler()
+    // runs exactly once per process; that is load-bearing, not incidental.
+    if (const char* pw = getenv("PROSPER_POLLWATCH")) {
+        static uint64_t addrs[6]; static int n = 0;
+        static int poll_pipe[2] = {-1, -1};
+        const char* s2 = pw;
+        while (*s2 && n < 6) {
+            addrs[n++] = strtoull(s2, nullptr, 0);
+            const char* comma = strchr(s2, ','); if (!comma) break; s2 = comma + 1;
+        }
+        // pipe2 is Linux-only; Darwin needs pipe + fcntl. Same split as make_probe_pipe() above,
+        // and the reason it is spelled out again rather than shared is that this pair must NOT be
+        // the shared one (see the paragraph above). Caught by CI: the first revision called pipe2
+        // unconditionally and broke the macOS build outright, in a file whose name says Linux but
+        // which Darwin also compiles.
+        bool poll_pipe_ok = false;
+#ifdef __linux__
+        poll_pipe_ok = n > 0 && pipe2(poll_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+#else
+        if (n > 0 && pipe(poll_pipe) == 0) {
+            poll_pipe_ok = true;
+            for (int fd : poll_pipe)
+                if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 || fcntl(fd, F_SETFL, O_NONBLOCK) != 0)
+                    poll_pipe_ok = false;
+            // A successful pipe() whose fcntl then failed leaves two live descriptors behind, and
+            // `poll_pipe` still holding them while `poll_pipe_ok` says the pair is unusable.
+            // ensure_probe_pipe() resets to -1 on its failure path; this must too.
+            if (!poll_pipe_ok) {
+                close(poll_pipe[0]); close(poll_pipe[1]);
+                poll_pipe[0] = poll_pipe[1] = -1;
+            }
+        }
+#endif
+        // An instrument that declines to run must SAY SO. Going quiet with PROSPER_POLLWATCH set
+        // makes "the pipe could not be created" indistinguishable from "the slot never changed",
+        // which is the failure this project keeps recording as an instrument trap: the reassuring
+        // reading is the one you get for free. Raised in review.
+        if (n > 0 && !poll_pipe_ok)
+            fprintf(stderr, "[pollwatch] NOT ARMED: could not create the poller's pipe (errno=%d) "
+                            "-- no slot is being sampled\n", errno);
+        if (poll_pipe_ok) {
+            fprintf(stderr, "[pollwatch] watching %d slot(s), 1 ms interval\n", n);
+            std::thread([] {
+                static uint64_t last[6]; static bool seen[6];
+                // Private twin of probe_readable(): a pipe write imports the source pages, so an
+                // unmapped address returns EFAULT instead of faulting the poller.
+                auto readable = [](uint64_t a) {
+                    if (a < 0x1000) return false;
+                    long w = raw_write(poll_pipe[1], (const void*)a, 8);
+                    if (w > 0) { char b[8]; syscall(SYS_read, poll_pipe[0], b, (size_t)w); }
+                    return w == 8;
+                };
+                const auto t0 = std::chrono::steady_clock::now();
+                int changes = 0;
+                while (changes < 4096) {
+                    for (int i = 0; i < n; i++) {
+                        if (!readable(addrs[i])) continue;
+                        const uint64_t v = *(const volatile uint64_t*)addrs[i];
+                        if (seen[i] && v == last[i]) continue;
+                        const double ms = std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - t0).count();
+                        fprintf(stderr, "[pollwatch] +%.1fms 0x%llx: 0x%llx -> 0x%llx\n", ms,
+                                (unsigned long long)addrs[i],
+                                (unsigned long long)(seen[i] ? last[i] : 0),
+                                (unsigned long long)v);
+                        last[i] = v; seen[i] = true; changes++;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }).detach();
+        }
     }
     // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — absolute guest addresses to hex-dump at fault time.
     if (const char* da = getenv("PROSPER_DUMPAT")) {

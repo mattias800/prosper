@@ -880,7 +880,11 @@ int main() {
         auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
         auto release = prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
         constexpr uint64_t direct_len = 0x10000;
-        constexpr uint64_t direct_end = 0x10000000ull + 16ull * 1024 * 1024 * 1024;
+        // The advertised budget, NOT a hand-copy of `kDmemBase + kDmemTotal`. Only the size is a
+        // guest-visible fact; where the pool sits inside it is prosper's business and has moved
+        // (#2934). dmem_take clamps the window anyway, so this was harmless -- it is corrected
+        // because it is the same base-coupling class the fix exists to remove.
+        constexpr uint64_t direct_end = 16ull * 1024 * 1024 * 1024;
         uint64_t physical = 0, first_view = 0, second_view = 0;
         const bool mapped = alloc && map && unmap && release &&
             alloc(0, direct_end, direct_len, direct_len, 0,

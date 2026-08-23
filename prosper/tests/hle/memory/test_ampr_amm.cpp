@@ -120,10 +120,11 @@ int main() {
     // virgin direct-memory pool — which is how both of them were void in the first version of this
     // test, and is worth stating because the failure is invisible rather than wrong:
     //
-    //   * the ALIGNMENT arm. The pool's first-fit gap starts at kDmemBase = 0x10000000, which is
-    //     already 2 MiB aligned, so honouring a 2 MiB alignment and silently falling back to the
-    //     16 KiB granule produce the SAME offset. Fix: hold a 16 KiB allocation so the next gap
-    //     starts at 0x10004000, where the two answers differ.
+    //   * the ALIGNMENT arm. The pool's first-fit gap starts at kDmemBase, and a fresh pool's
+    //     first free offset is 16 KiB aligned by construction, so on any base that is ALSO 2 MiB
+    //     aligned, honouring a 2 MiB alignment and silently falling back to the 16 KiB granule
+    //     produce the SAME offset. Fix: hold a 16 KiB allocation so the next free offset is
+    //     kDmemBase + 0x4000, which cannot be 2 MiB aligned, and where the two answers differ.
     //   * the ZEROING arm further down. prosper's pool is one process-wide memfd that retains bytes
     //     across release and reuse; in a fresh test process nothing has ever written it, so it reads
     //     back zero through sparseness whether or not the allocator punches the range. Fix: dirty
@@ -150,8 +151,13 @@ int main() {
     uint64_t pin = 0;
     CHECK(alloc_dmem(0, 16ull << 30, 0x4000, 0x4000, 0, (uint64_t)&pin) == 0,
           "a 16 KiB direct-memory block can be pinned to unalign the pool's first free gap");
-    CHECK((pin & (0x200000ull - 1)) == 0 && pin != 0,
-          "...and it starts at the pool base, so the gap after it is NOT 2 MiB aligned");
+    // The property this precondition needs is about the GAP, not about `pin` itself: whatever the
+    // pool base is, a 16 KiB block held at the base must leave the next free offset off a 2 MiB
+    // boundary, or the alignment arm below cannot discriminate. Asserting `pin`'s own 2 MiB
+    // alignment stated that only for a base that happened to be 2 MiB aligned, and broke when
+    // kDmemBase moved to 0x4000 (#2934) while the property it was standing in for still held.
+    CHECK(pin != 0 && ((pin + 0x4000ull) & (0x200000ull - 1)) != 0,
+          "...and the next free offset after it is NOT 2 MiB aligned");
 
     // (2) Dirty the physical range the AMM pool is about to be carved from, then release it. This
     // is what makes the zero-read arm below a statement about the allocator rather than about an
@@ -189,9 +195,14 @@ int main() {
           "GiveDirectMemory claims a physical pool");
     CHECK(phys != kPoison && phys != 0,
           "GiveDirectMemory WRITES the physical offset out-parameter");
-    // Now discriminating, thanks to the pin above: the first fit is somewhere in [0x10004000, …),
-    // so an honoured 2 MiB alignment lands on 0x10200000 and a 16 KiB fallback does not. Reading
-    // a3/a4 the other way round rejects a3 = 1 as an alignment and reddens exactly here.
+    // Now discriminating, thanks to the pin above: the first free offset is kDmemBase + 0x4000, so
+    // an honoured 2 MiB alignment rounds up past it and a 16 KiB fallback does not. (Not "never"
+    // 2 MiB aligned -- a base congruent to -0x4000 mod 0x200000 would be, e.g. 0x1FC000. It does
+    // not matter, because the CHECK below TESTS that property instead of assuming it, so such a
+    // base reddens loudly rather than silently voiding this arm. Precision noted in review.) Stated in terms of the base rather than in absolute offsets, because the
+    // absolute ones went stale the moment kDmemBase moved (#2934) and a comment that describes the
+    // world it replaced is believed instead of checked. Reading a3/a4 the other way round rejects
+    // a3 = 1 as an alignment and reddens exactly here.
     CHECK(phys > pin && (phys & (0x200000ull - 1)) == 0,
           "the physical offset honours the 2 MiB alignment the guest asked for in a3");
     CHECK(phys >= dirty && phys + 0x40000ull <= dirty + kDirtyLen,

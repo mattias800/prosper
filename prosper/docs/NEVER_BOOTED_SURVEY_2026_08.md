@@ -317,6 +317,16 @@ pointer. Rung 0. Detail in [#2934](https://github.com/mattias800/prosper/issues/
 
 Its tracker predicted CRIWARE would be the surface that mattered here, and it was, on the first run.
 
+> **Resolved 2026-08-23, and CRIWARE was the victim rather than the cause.** The non-canonical
+> pointer was one of thousands: prosper's direct-memory pool started at physical offset
+> `0x10000000` while advertising a 16 GiB budget, so the last 256 MiB of the pool lay outside any
+> search window ending at the advertised size. This title partitions that budget to the byte, took
+> an ENOMEM on its final 4 MiB request, built a GFS resource reader over a null buffer, and its
+> own read-with-endian-swap helper then byte-reversed `(uint32)-1` bytes — ~4 GiB of live heap —
+> in place. `kDmemBase` is now `0x4000`. The title reaches asset loading, audio, save data and 63
+> published frames; see `METAPHOR_STATUS.md`. Row 9 of the ranking above is closed, and the
+> ranking is otherwise left as it was measured.
+
 Four unregistered NIDs are called before the fault, none established as the cause:
 `sceHttp2CreateTemplate` (this is [#2894](https://github.com/mattias800/prosper/issues/2894)),
 `sceAmprCommandBufferGetNumCommands`, `sce::Json::InitParameter2`'s constructor plus two of its

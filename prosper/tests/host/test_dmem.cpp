@@ -32,7 +32,7 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 // Pool bounds mirror hle_kernel_mem.cpp (kDmemBase / kDmemTotal).
-static constexpr uint64_t kBase  = 0x10000000ull;
+static constexpr uint64_t kBase  = 0x10000ull;
 static constexpr uint64_t kTotal = 16ull * 1024 * 1024 * 1024;
 static constexpr uint64_t kEnd   = kBase + kTotal;
 using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
@@ -462,7 +462,14 @@ int main() {
     // access violations, and a second VA must still alias the same physical bytes.
     constexpr uint64_t sparse_len = 0x02000000;
     constexpr uint64_t sparse_align = 0x00200000;
-    constexpr uint64_t sparse_window = kBase + 0x10000000;
+    // ALIGNED UP, and base-independent on purpose. dmem_take's align_up_multiple aligns the
+    // ABSOLUTE offset, so a window whose start is not itself `sparse_align`-aligned loses up to
+    // `sparse_align - 1` bytes to round-up and can no longer hold a request exactly `sparse_len`
+    // long. `kBase + 0x10000000` happened to be 2 MiB aligned at kBase = 0x10000000 and silently
+    // stopped being so when the base moved (#2954) -- a Windows-only failure that no Linux ctest
+    // run can see. Aligning here states the property the window actually needs.
+    constexpr uint64_t sparse_window =
+        (kBase + 0x10000000 + sparse_align - 1) & ~(sparse_align - 1);
     uint64_t sparse_phys = 0, sparse_va1 = 0, sparse_va2 = 0;
     CHECK(alloc(sparse_window, sparse_window + sparse_len, sparse_len, sparse_align, 0,
                 (uint64_t)(uintptr_t)&sparse_phys) == 0 && sparse_phys == sparse_window,
@@ -994,6 +1001,28 @@ int main() {
     CHECK(r == 0, "available(fresh) returns success");
     CHECK(phys == kBase, "available(fresh) phys == pool base");
     CHECK(size == kTotal, "available(fresh) size == whole pool");
+
+    // #2934: every offset the pool can hand out must lie inside the space
+    // sceKernelGetDirectMemorySize() defines, because that is the space a guest's
+    // [searchStart, searchEnd) window is expressed in -- and searchEnd is routinely the advertised
+    // size itself. The arm above deliberately queries [0, kEnd), a window whose end is
+    // kBase + kTotal and which therefore no guest can express; this one asks the question a guest
+    // actually asks, and it is what PINS kDmemBase.
+    //
+    // The bound is an ABSOLUTE 1 MiB, deliberately NOT expressed in terms of kBase: a threshold
+    // that adapts to the base passes at every base, which is exactly the non-discriminating shape
+    // the same fix had to correct in test_ampr_amm. Stated absolutely it asserts a real contract --
+    // *at most 1 MiB of the advertised budget may be unreachable* -- and it fails for any larger
+    // base. At the historical 0x10000000 the largest block inside [0, kTotal) is kTotal - 256 MiB,
+    // and the guest that noticed partitioned the budget to the byte and lost its last allocation.
+    // Read-only: dmem_largest_free walks the gaps and mutates nothing, so the pool is still virgin
+    // for the arms below.
+    constexpr uint64_t kMaxUnreachable = 0x100000;   // 1 MiB
+    uint64_t gphys = 0xdead, gsize = 0xdead;
+    CHECK(avail(0, kTotal, 0x4000, (uint64_t)(uintptr_t)&gphys,
+                (uint64_t)(uintptr_t)&gsize, 0) == 0 &&
+              gphys < kMaxUnreachable && gsize >= kTotal - kMaxUnreachable,
+          "all but 1 MiB of the advertised budget is reachable from [0, GetDirectMemorySize())");
 
     // Null out-pointers -> EINVAL, and it must NOT be the old success-with-garbage.
     CHECK((uint32_t)avail(0, kEnd, 0x4000, 0, (uint64_t)(uintptr_t)&size, 0) == 0x80020016u,

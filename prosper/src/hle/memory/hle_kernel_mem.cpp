@@ -53,6 +53,38 @@ uint64_t guest_memory_gpu_write_successes_for_test() {
 // buffer is rewound or destroyed.
 extern "C" void prosper_apr_chain_reset(uint64_t cb);
 
+// PROSPER_PAGEWATCH=0xADDR — diagnostic (default off), Linux only. Arms the host mprotect write-watch
+// (exec_image_linux.cpp's prosper_arm_label_watch_force) on the page holding ADDR the moment a guest
+// mapping covers it, then logs every write into [ADDR-0x18, ADDR+0x20) with the writer's rip, tid and
+// a guest return-address scan.
+//
+// The watch itself already existed; what did not was an arm site independent of the AGC fence builder,
+// which is the only caller today (hle_agc.cpp) and which several titles never reach at all — a run on
+// PPSA20800 records zero `ReleaseMem` calls, so PROSPER_WATCH_ABS is unarmable there and its silence
+// reads exactly like "no writer". Mapping is the right trigger because it is the earliest moment the
+// page provably exists, and every guest VA in this file funnels through track().
+//
+// Prefer this over the perf_event PROSPER_HWWATCH_ABS whenever the writer's THREAD is unknown: debug
+// registers are per-thread state and that instrument arms the main guest thread only, so its zero says
+// nothing about a worker (instrument trap 168). This one is process-wide because the protection lives
+// in the page table.
+#if defined(__linux__)
+extern "C" void prosper_arm_label_watch_force(uint64_t addr) __attribute__((weak));
+namespace {
+void pagewatch_maybe_arm(uint64_t base, uint64_t size) {
+    static const uint64_t want = [] {
+        const char* e = getenv("PROSPER_PAGEWATCH");
+        return e ? strtoull(e, nullptr, 0) : 0ull;
+    }();
+    if (!want || !prosper_arm_label_watch_force) return;
+    if (!size || want < base || want - base >= size) return;
+    prosper_arm_label_watch_force(want);   // idempotent: a second call is ignored once armed
+}
+}   // namespace
+#else
+namespace { inline void pagewatch_maybe_arm(uint64_t, uint64_t) {} }
+#endif
+
 // libSceAmpr command-buffer accounting is host-platform independent. UE4 batches commands until
 // `GetSize(cb) - GetCurrentOffset(cb)` can no longer hold the next packet, then submits that cb.
 // Keep the fixed capacity and appended-byte cursor together so constructor and reset operations
@@ -846,7 +878,46 @@ namespace {
     // GetDirectMemorySize and allocates chunks in a loop until ENOMEM ends it. A never-failing
     // allocator handed out offsets past the pool, the guest's 512GB-arena block bitmap indexed
     // out of range, and user_malloc_init crashed on the bitmap read.
-    constexpr uint64_t kDmemBase  = 0x10000000;
+    // Where the pool's PHYSICAL OFFSETS start. This must stay inside the offset space
+    // sceKernelGetDirectMemorySize() advertises — [0, kDmemTotal) — because that is the space a
+    // guest's [searchStart, searchEnd) window is expressed in, and searchEnd is routinely the
+    // advertised size itself. A base of B puts the pool's last B bytes at offsets >= kDmemTotal,
+    // where NO window ending at the advertised size can reach them, so the guest silently loses
+    // the tail of a budget prosper told it it had.
+    //
+    // This was 0x10000000 (256 MiB) and cost Metaphor: ReFantazio its boot (#2934). That title
+    // partitions the advertised budget to the byte — 0x400000000 - 0x180000000 (main) - 0x400000
+    // - 0xC00000 = 0x27F000000 for its Ampr AMM pool — and its last 4 MiB request, made in
+    // [0, 0x400000000), then found the only free gap sitting at [0x40F400000, 0x410000000),
+    // entirely above its window. It took the ENOMEM, built a GFS resource reader over a null
+    // buffer, and its own read-with-endian-swap helper then byte-swapped `(uint32)-1` bytes in
+    // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/METAPHOR_STATUS.md.
+    //
+    // Three constraints fix the value, and only the first is about the guest:
+    //
+    //  1. It must be SMALL, for the reason above.
+    //  2. It must be a multiple of the **Windows allocation granularity (64 KiB)**, and that is a
+    //     hard requirement rather than tidiness. The POSIX arm uses `phys` directly as the memfd
+    //     offset, but the Windows arm maps a `kDmemTotal`-sized section at `rel = phys - kDmemBase`
+    //     (see `map_section_view`, and the same subtraction in the unmap and remap paths). Only a
+    //     64 KiB-aligned base keeps `rel` congruent to `phys` mod 64 KiB, and `map_section_view`'s
+    //     `MapViewOfFileEx` fallback depends on that congruence twice: the hinted path refuses a
+    //     hint that is not `delta`-congruent, and the zero-hint path returns `view + delta`, which
+    //     a `requested_align >= 0x10000` then rejects. A base of 0x4000 makes `delta` permanently
+    //     0xC000 for every 64 KiB-aligned allocation and breaks both. The placeholder path
+    //     (`MapViewOfFile3`) is page-granular and unaffected, so this only bites where the modern
+    //     APIs are absent or a placeholder cannot be acquired — which is exactly the kind of
+    //     narrow, platform-specific regression a Linux-only test run cannot see. Found in review
+    //     of #2954.
+    //  3. It must be NON-ZERO, so a successful allocation never returns physical offset 0. That
+    //     third one is conservatism rather than a derived requirement — nothing in this file needs
+    //     it (`have_phys` is a bool, not `phys != 0`; the `phys_out > 0xffff` guard elsewhere
+    //     validates the OUT POINTER, not the offset) — but a zero physical offset is the kind of
+    //     value downstream code reads as "absent", and one granule is not worth the audit.
+    //
+    // 64 KiB satisfies all three, and costs 48 KiB more unreachable tail than the smallest value
+    // that satisfies (1) and (3) alone — against the 256 MiB this replaces, nothing.
+    constexpr uint64_t kDmemBase  = 0x10000;
     // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
     // reports the GAME budget (aperture minus OS reservation), not the raw 16 GiB aperture; UE
     // sizes allocator pools from this value (#1213 investigation). PROSPER_DMEM_BUDGET_MB
@@ -1025,6 +1096,7 @@ namespace {
         if (committed && !(query_flags & kVirtualQueryDirect))
             host::guest_write_watch_notify_direct_mapping_added(
                 base, size, base, guest_prot);
+        if (committed) pagewatch_maybe_arm(base, size);   // PROSPER_PAGEWATCH diagnostic, default off
     }
     // Trim/split tracked mappings overlapping [base, base+len). munmap/BatchMap-UNMAP must remove
     // their tracking (this never happened before — g_maps only ever grew): stale "committed"
@@ -3721,7 +3793,46 @@ namespace {
         mappings.insert(insertion, mapping);
     }
     bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end);
-    constexpr uint64_t kDmemBase  = 0x10000000;
+    // Where the pool's PHYSICAL OFFSETS start. This must stay inside the offset space
+    // sceKernelGetDirectMemorySize() advertises — [0, kDmemTotal) — because that is the space a
+    // guest's [searchStart, searchEnd) window is expressed in, and searchEnd is routinely the
+    // advertised size itself. A base of B puts the pool's last B bytes at offsets >= kDmemTotal,
+    // where NO window ending at the advertised size can reach them, so the guest silently loses
+    // the tail of a budget prosper told it it had.
+    //
+    // This was 0x10000000 (256 MiB) and cost Metaphor: ReFantazio its boot (#2934). That title
+    // partitions the advertised budget to the byte — 0x400000000 - 0x180000000 (main) - 0x400000
+    // - 0xC00000 = 0x27F000000 for its Ampr AMM pool — and its last 4 MiB request, made in
+    // [0, 0x400000000), then found the only free gap sitting at [0x40F400000, 0x410000000),
+    // entirely above its window. It took the ENOMEM, built a GFS resource reader over a null
+    // buffer, and its own read-with-endian-swap helper then byte-swapped `(uint32)-1` bytes in
+    // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/METAPHOR_STATUS.md.
+    //
+    // Three constraints fix the value, and only the first is about the guest:
+    //
+    //  1. It must be SMALL, for the reason above.
+    //  2. It must be a multiple of the **Windows allocation granularity (64 KiB)**, and that is a
+    //     hard requirement rather than tidiness. The POSIX arm uses `phys` directly as the memfd
+    //     offset, but the Windows arm maps a `kDmemTotal`-sized section at `rel = phys - kDmemBase`
+    //     (see `map_section_view`, and the same subtraction in the unmap and remap paths). Only a
+    //     64 KiB-aligned base keeps `rel` congruent to `phys` mod 64 KiB, and `map_section_view`'s
+    //     `MapViewOfFileEx` fallback depends on that congruence twice: the hinted path refuses a
+    //     hint that is not `delta`-congruent, and the zero-hint path returns `view + delta`, which
+    //     a `requested_align >= 0x10000` then rejects. A base of 0x4000 makes `delta` permanently
+    //     0xC000 for every 64 KiB-aligned allocation and breaks both. The placeholder path
+    //     (`MapViewOfFile3`) is page-granular and unaffected, so this only bites where the modern
+    //     APIs are absent or a placeholder cannot be acquired — which is exactly the kind of
+    //     narrow, platform-specific regression a Linux-only test run cannot see. Found in review
+    //     of #2954.
+    //  3. It must be NON-ZERO, so a successful allocation never returns physical offset 0. That
+    //     third one is conservatism rather than a derived requirement — nothing in this file needs
+    //     it (`have_phys` is a bool, not `phys != 0`; the `phys_out > 0xffff` guard elsewhere
+    //     validates the OUT POINTER, not the offset) — but a zero physical offset is the kind of
+    //     value downstream code reads as "absent", and one granule is not worth the audit.
+    //
+    // 64 KiB satisfies all three, and costs 48 KiB more unreachable tail than the smallest value
+    // that satisfies (1) and (3) alone — against the 256 MiB this replaces, nothing.
+    constexpr uint64_t kDmemBase  = 0x10000;
     // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
     // reports the GAME budget (aperture minus OS reservation), not the raw 16 GiB aperture; UE
     // sizes allocator pools from this value (#1213 investigation). PROSPER_DMEM_BUDGET_MB
