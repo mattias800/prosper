@@ -823,8 +823,13 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   0`) made each pass's writes available to nothing, and `vkCmdCopyImageToBuffer` read attachments
   whose `finalLayout` transition had just been performed by `vkCmdEndRenderPass` with no dependency
   at all. Synchronization validation named it exactly — 10 × `SYNC-HAZARD-READ-AFTER-WRITE`,
-  0 after the fix. Interleaved A/B on the bundle, 30 replays per arm: **18 distinct output hashes
-  with the dependencies and 17 without.** Land it on its own merits; it is not this bug. #2945.
+  0 after the fix, and 10 again with `PROSPER_NO_RENDERPASS_EXTERNAL_DEPS=1` on the same binary.
+  **Its effect on the nondeterminism is UNDECIDED, not zero.** Interleaved A/B on the bundle,
+  30 replays per arm on the merged (`ALL_COMMANDS`) masks, gave 1 distinct hash in *both* arms --
+  the whole measurement landed in one of the quiet windows trap 223 describes, so it discriminates
+  nothing. The earlier "18 distinct against 17" figure was taken on the narrow masks that broke
+  three guarded titles and is withdrawn. Land the dependencies on their own merits; the bundle A/B
+  owes a re-run in a window where the baseline is unstable. #2945.
 - **The layer's verbatim words for the over-limit vertex interface, recorded once so nothing has to
   re-derive the arithmetic.** Everything else that cites this cites this row:
 
@@ -846,8 +851,10 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   vertex emitter fanned one `EXP PARAM0` out to 32 locations — 128 components plus gl_Position's 4,
   against a `maxVertexOutputComponents` of 128 (`VUID-RuntimeSpirv-Location-06272`, the only
   validation error in the whole replay). Bounding the fan-out to the attributes the fragment program
-  reads removes the error; the draw still vanishes at the same rate (interleaved, 30 per arm: 23 bad
-  fixed / 20 bad mutated). #2945.
+  reads removes the error; the draw still vanishes at the same rate. Interleaved, 30 per arm, twice:
+  23 bad fixed / 20 bad mutated before the masks were widened, 15 / 12 after. Both arms fail about
+  half the time either way, so on this the answer is a genuine negative rather than an undecided
+  one. #2945.
 - **Not the host-visible upload path, in any of its forms.** Interleaved arms on the one-draw
   reproduction, 12-30 runs each, all indistinguishable from the default:
   `PROSPER_NO_BACKEND_BUFFER_ARENA`, `PROSPER_NO_BACKEND_BUFFER_POOL`, `PROSPER_NO_MEMORY_POOL`,
@@ -878,7 +885,11 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   slice and of the index buffer read back through the GPU in the same command buffer
   (`PROSPER_BUFFER_ECHO`, including a deliberately mutated `w = 2.0` that the memory carried while
   the shader read 0), the descriptor allocation result, set handles and per-binding
-  buffer/offset/range, and the compiled RDNA2 ISA (`RADV_DEBUG=shaders`, byte-identical). **Do not
+  buffer/offset/range, and the compiled RDNA2 ISA (`RADV_DEBUG=shaders`, byte-identical). Re-taken
+  after the probe was corrected — the copies moved out of the render pass, `TRANSFER_SRC` added
+  under the switch, and `gpu_replay`'s geometry-probe rebuild given the same dead-varying bound the
+  live path applies — and unchanged: 6 of 12 replays vanish, and every one of the 12 reads the
+  correct `3f800000 3f800000 00000000 3f800000` and indices `0 4 5` off the device. **Do not
   re-derive any of that; start from what the control cannot see.** #2945.
 - **Declaring an explicit external subpass dependency REPLACES the implicit one, so any mask narrower
   than the default silently removes visibility — and neither validation nor ctest can see it.** The
