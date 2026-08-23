@@ -32,10 +32,12 @@ Sifu 32,192 times, so Sifu was losing nearly two gigabytes of the pool to alloca
 existed. That is now fixed.
 
 The other half is the more useful finding, and it is a negative one: with the leak gone, both titles
-still assert — and at that moment prosper still has 230 MiB free and has not refused the guest a
-single thing. So the memory pool was never what stopped them, the thousands of refused mappings were
-all for memory the guest already had, and whatever is really going on is inside Unreal's own
-allocator. Details in [#2908](https://github.com/mattias800/prosper/issues/2908).
+still assert — and at that moment prosper's pool still has a 230 MiB block free and has failed no
+allocation the guest asked for. So the pool was never what stopped them, and whatever is really
+going on is inside Unreal's own allocator. Those thousands of refused mappings are not a loss
+either: prosper refuses them precisely because the guest already has memory there, and refusing is
+what stops us overwriting it. Details in
+[#2908](https://github.com/mattias800/prosper/issues/2908).
 
 ## 2026-08-22
 

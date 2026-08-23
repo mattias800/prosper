@@ -11,26 +11,50 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
-- **A refused Ampr map is a lost page commit — false, and the disproof is structural rather than
-  statistical.** `sceAmprCommandBufferSetBuffer`'s map flavor logs `ampr push-map … -> FAILED` when
-  the host declines to place the mapping, and on the two UE4 titles that assert with UE's own
-  out-of-memory report those lines arrive in bulk immediately beforehand — thousands on *Khazan*
-  `PPSA20447`, tens of thousands on *Sifu* `PPSA03001`. That is a compelling place to conclude the
-  guest's allocator could not commit. It could. `map_phys_at` returns null in only two situations:
-  the address/length is not page-aligned — and a 64-byte "map" was never a page commit — or
-  `range_is_free_reservation` declined, which at `hle_kernel_mem.cpp:1183` means the range contains a
-  **committed** mapping or an untracked gap. A refusal therefore means the guest **already holds**
-  that memory and prosper refused to `MAP_FIXED` over it: the same #88 / #107 clobber the flavor
-  discriminator exists to prevent. These calls are the BUFFER flavor arriving in an argument shape
-  `a3 == a1` does not recognise (`a3 == 0`, `a5 == a0`), and leaving their memory untouched is the
-  correct outcome. Refusing is protective, not lossy.
-  **One correction worth carrying, because this was a wrong `## Ruled out` row for a day:** the entry
-  first rested on a measured "100% of refusals report `target ALREADY MAPPED`", produced by a
-  `mincore` probe of **one page** against ranges that are mostly `0x4000` — four host pages — while
-  `MAP_FIXED_NOREPLACE` fails if *any* page in the range is mapped. A quarter of each range was
-  examined and the result was asserted for all of it, in the direction the author wanted. Caught in
-  review of [#2947](https://github.com/mattias800/prosper/pull/2947); the probe now covers the whole
-  range and its numbers corroborate the argument above rather than standing in for it.
+- **A refused Ampr map is a lost page commit — false, by case analysis over the refusal's own code
+  path.** `sceAmprCommandBufferSetBuffer`'s map flavor logs `ampr push-map … -> FAILED` when the host
+  declines to place the mapping, and on the two UE4 titles that assert with UE's own out-of-memory
+  report those lines arrive in bulk immediately beforehand — thousands on *Khazan* `PPSA20447`, tens
+  of thousands on *Sifu* `PPSA03001`. That is a compelling place to conclude the allocator could not
+  commit. It could.
+
+  `map_phys_at(fixed=true)` returns null only when `range_is_free_reservation` declined **and**
+  `prosper_mmap_noreplace` then failed. That second step is the load-bearing one and the first
+  version of this entry omitted it: the declined reservation alone proves nothing, because the code
+  goes on to *try* the mapping and succeeds whenever the host range is free. It is
+  `MAP_FIXED_NOREPLACE` failing (`host/platform/posix_shim.hpp:318`) that proves a host VMA exists —
+  `EEXIST` — or that the address/length is not page-aligned, `EINVAL`, which no page commit ever is.
+  (`map_at` contributes two further nulls, an unavailable memfd and a failed `MAP_FIXED` over one of
+  prosper's own free reservations; neither arises on this path.)
+
+  A refusal therefore leaves the range in one of exactly three states, and **none loses the guest
+  memory**. `prosper_reserved_range_state` (`hle/memory/hle_kernel_mem.cpp:2906`) answers **2 =
+  committed** — the guest already holds it; **1 = tracked but uncommitted** — the lazy-commit fault
+  arm backs it on first touch (`host/image/exec_image_linux.cpp:2150`); or **0 = untracked** —
+  nothing rescues it, because the unified-memory GPU-VA fallback spans only `GPU_VA_LO`..`GPU_VA_HI`
+  = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit near **139 GiB**. In that last
+  case a genuinely lost commit would be a **fatal** SIGSEGV, and neither title takes one. These calls
+  are the BUFFER flavor arriving in an argument shape `a3 == a1` does not recognise (`a3 == 0`,
+  `a5 == a0`); leaving their memory untouched is correct, and is the #88 / #107 clobber the
+  discriminator exists to prevent.
+
+  **Two corrections are recorded here rather than smoothed away, because this was a wrong
+  `## Ruled out` row twice.** It first rested on a measured "100% report `target ALREADY MAPPED`",
+  produced by a `mincore` probe of **one page** against four-page ranges — a quarter of each range
+  examined, the result asserted for all of it, in the author's favour. Its replacement claimed a
+  structural argument that skipped the `prosper_mmap_noreplace` step and was not exhaustive over the
+  null paths. Both were caught in review of
+  [#2947](https://github.com/mattias800/prosper/pull/2947). One residual hole in the general case is
+  worth knowing: on a host with the default `vm.max_map_count` of 65530, a title making 30,000+
+  mappings could take `ENOMEM` from the limit rather than from an existing VMA, and only a probe
+  distinguishes that. It is not reachable on the box these runs were made on, where
+  `vm.max_map_count` is **2,147,483,642**.
+
+  The widened probe corroborates the case analysis, and this time the instrument measures what the
+  claim says: whole-range `mincore` over every refused range gives Khazan **4,646 / 4,646** and Sifu
+  **31,716 / 31,716** — 36,362 refusals, not one containing an unmapped page. Reporting VA and
+  length alignment separately also surfaced a shape the single flag hid: 14 Khazan and 5 Sifu
+  refusals carry a page-aligned VA with an unaligned *length*.
   [#2908](https://github.com/mattias800/prosper/issues/2908).
 
 - **The refusal was not free, though, and that half was a real defect.** Each refused map had already

@@ -2388,9 +2388,16 @@ HLE(k_ampr_push_map) {
                 const long v = sysconf(_SC_PAGESIZE);
                 return v > 0 ? (uint64_t)v : 4096ull;
             }();
-            const bool aligned = (a1 % page) == 0 && (a2 % page) == 0;
+            const bool va_aligned  = (a1 % page) == 0;
+            const bool len_aligned = (a2 % page) == 0;
             // Diagnostic-only, and this path runs tens of thousands of times per boot: do no
             // syscalls unless the log that consumes them is on.
+            //
+            // kProbePages sizes `vec` and the stride together. They must stay equal: every span
+            // below is a whole number of pages (start/end/at are all page-aligned), so the entry
+            // count is exactly span/page <= kProbePages. Raising the stride without raising the
+            // array would have mincore write past `vec` — silent stack corruption in a diagnostic.
+            constexpr uint64_t kProbePages = 64;
             bool fully_mapped = false;
             if (memlog()) {
                 const uint64_t start = a1 & ~(page - 1);
@@ -2401,18 +2408,24 @@ HLE(k_ampr_push_map) {
                 if (a2 <= UINT64_MAX - a1 && (a1 + a2) <= UINT64_MAX - (page - 1))
                     end = (a1 + a2 + page - 1) & ~(page - 1);
                 fully_mapped = end > start;
-                unsigned char vec[64];
-                for (uint64_t at = start; at < end && fully_mapped; at += page * 64) {
-                    const uint64_t span = (end - at < page * 64) ? end - at : page * 64;
+                unsigned char vec[kProbePages];
+                for (uint64_t at = start; at < end && fully_mapped; at += page * kProbePages) {
+                    const uint64_t chunk = page * kProbePages;
+                    const uint64_t span  = (end - at < chunk) ? end - at : chunk;
                     if (prosper_mincore((void*)(uintptr_t)at, (size_t)span, vec) != 0)
                         fully_mapped = false;
                 }
             }
-            MLOG("ampr push-map va=0x%llx len=0x%llx -> FAILED (%s; target %s)\n",
+            // Report what was OBSERVED, not what it implies. mincore sees a VMA; it does not see
+            // who owns it, and the earlier wording ("nothing was lost here") was a conclusion that
+            // got transcribed out of this log line into two `## Ruled out` sections as though it
+            // were a measurement. The inference belongs in the docs, where it can be argued.
+            MLOG("ampr push-map va=0x%llx len=0x%llx -> FAILED (va %s, len %s; %s)\n",
                  (unsigned long long)a1, (unsigned long long)a2,
-                 aligned ? "page-aligned" : "NOT page-aligned -- never a page commit",
-                 fully_mapped ? "every page ALREADY MAPPED -- nothing was lost here"
-                              : "contains at least one unmapped page");
+                 va_aligned  ? "page-aligned" : "UNALIGNED",
+                 len_aligned ? "page-aligned" : "UNALIGNED",
+                 fully_mapped ? "every page of the range has a VMA"
+                              : "at least one page of the range has no VMA");
         }
     }
     return 0;
