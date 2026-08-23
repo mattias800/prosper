@@ -95,10 +95,24 @@ advertised direct-memory budget loses its last `kDmemBase` bytes.
 Three blockers, in the order they bite.
 
 1. **SIGFPE in the guest's primary thread at `eboot+0x10019f6`**, about 5 s in — `div r14d` with
-   `r14d == 0`, immediately after an allocate-and-`memset` pair at `eboot+0x10019d1`/`+0x10019dc`.
+   `r14d == 0`. The enclosing function is `eboot+0x1001970`, and RTTI names it: it is slot 3 of
+   **`fw::font::Font_PS5`**'s vtable (typeinfo `N2fw4font8Font_PS5E` at `0x237078f`), the routine
+   that expands an 8-bit glyph coverage bitmap into a white RGBA8 texture. `r14d` is
+   **bytes-per-pixel**, resolved through two lookup tables from the FORMAT field of the target
+   image's Gen5 T# — `(dword[image+0x64] >> 20) & 0x1ff` — and every stage of that resolution
+   defaults to **0** on an unrecognised value. The healthy answer is 4. The `div` runs *before*
+   both zero-dimension guards, so a zero glyph width or height is not what kills it.
+   **The lead:** the four `libSceFont` entry points this path calls —
+   `sceFontSelectRendererFt` (`Xx974EW-QFY`), `sceFontRenderSurfaceSetScissor` (`vRxf4d0ulPs`),
+   `sceFontGetCharGlyphMetrics` (`L97d+3OgMlE`) and `sceFontRenderCharGlyphImage` (`3G4zhgKuxE8`)
+   — are all **unregistered** and all answer 0, and they are the last four
+   `[prosper] unimplemented:` lines before the fault. `sceFontRenderSurfaceInit` and
+   `sceFontCreateRendererWithEdition` on the same path *are* registered
+   (`src/hle/util/hle_font.cpp:332`, `:311`), so this is a partial library rather than an absent
+   one. Full derivation, the T# layout and the one-run experiment that would settle it are on
+   [#2951](https://github.com/mattias800/prosper/issues/2951).
    Once it dies, `tools/screenshot` reports `guest=faulted` and every sample after that moment is
    stale (`max-pixel-stale=115.0s`), so the run's 24 identical PNGs are one frame served 24 times.
-   Tracked as [#2951](https://github.com/mattias800/prosper/issues/2951).
 2. **The 63 frames it does publish are black** — 6,093 of 6,137 sampled pixels pure black, the rest
    near-black (`0x161314`, `0x150e05`). 5 distinct of 63 published. Whether this is the composite
    defect of [#2932](https://github.com/mattias800/prosper/issues/2932) or a title-specific absence
