@@ -791,6 +791,86 @@ title shows the identical skipped dispatch,
 `[compute] program 0x3007980000 image 0x306c0f0000 1920x1080x1 ... DCC metadata extent is
 unsupported -> dispatch skipped (#590)`, so #590 costs a real 1920x1080 storage-image dispatch every
 frame on this title but does not separate a white frame from a good one.
+### Renderer determinism (#2945 / #2932 / #2937)
+
+The observable is one frozen `.prgbundle` replayed offline by `gpu_replay` producing a different
+picture from run to run. Everything below was measured on master `99d5f738`, Linux / AMD Radeon
+8060S (RADV STRIX_HALO), Mesa 26.1.4.
+
+- **READ THIS ROW FIRST: the failure rate drifts machine-wide over minutes, so a NON-INTERLEAVED A/B
+  here is void, not negative.** The identical command (`gpu_replay s3537.prgcap --draw 42
+  --recompile-raw`) measured 0/20 failures in one ten-minute window and 12/12 in the next, with no
+  change to the binary, the environment or the machine's process list. Every apparent lever in this
+  investigation that was measured by running arm A then arm B evaporated when the arms were
+  interleaved run-by-run: `PROSPER_SERIAL_DRAW_REALIZE` looked like 19/20-vs-10/20 and is 10/10
+  distinct on both arms interleaved; `RADV_DEBUG=zerovram`, `nodcc` and
+  `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES` each looked like 4-distinct-of-10 against a 10-of-10
+  baseline and are indistinguishable interleaved — two of them produced *byte-identical* hash
+  sequences, which is what exposed them. **Interleave the arms, quote n, and prefer a modal fraction
+  to a distinct count.** #2945.
+- **`gpu_replay --warmup-repeats N` is not an idempotent oracle.** It calls `execute_frame` N times
+  without re-restoring the RTT seeds (`gpu_replay.cpp`), so each repeat renders on top of the
+  previous one's persistent targets and the hashes drift by construction. Ten distinct hashes over
+  ten repeats says nothing. Use separate processes. #2945.
+- **`PROSPER_RTT_NOSEED=1` destroys the discriminator on a composite draw and reads as a fix.**
+  Without the seed the target starts cleared, so "the draw rendered black over half the frame" and
+  "the draw rendered nothing" both hash to the all-zero image — 25 of 25 replays identical, which
+  looks like determinism restored. Measured with `PROSPER_GEOM_PROBE` instead, the same lever is
+  *worse* than the default (9 of 20 degenerate against 3 of 20). #2945.
+- **The renderer's nondeterminism is NOT the missing external subpass dependencies, though those
+  were real and are now fixed.** Every render pass was created with `dependencyCount = 0`, so
+  Vulkan's default outgoing external dependency (`dstStageMask = BOTTOM_OF_PIPE`, `dstAccessMask =
+  0`) made each pass's writes available to nothing, and `vkCmdCopyImageToBuffer` read attachments
+  whose `finalLayout` transition had just been performed by `vkCmdEndRenderPass` with no dependency
+  at all. Synchronization validation named it exactly — 10 × `SYNC-HAZARD-READ-AFTER-WRITE`,
+  0 after the fix. Interleaved A/B on the bundle, 30 replays per arm: **18 distinct output hashes
+  with the dependencies and 17 without.** Land it on its own merits; it is not this bug. #2945.
+- **Nor is the over-limit vertex output interface, though that was real too.** `SPI_PS_INPUT_CNTL_0..31`
+  are sticky context registers and `extract_render_state` marked a slot valid when the register was
+  merely present, so a pixel shader with one interpolant reported `valid_mask=0xffffffff` and the
+  vertex emitter fanned one `EXP PARAM0` out to 32 locations — 128 components plus gl_Position's 4,
+  against a `maxVertexOutputComponents` of 128 (`VUID-RuntimeSpirv-Location-06272`, the only
+  validation error in the whole replay). Bounding the fan-out to the attributes the fragment program
+  reads removes the error; the draw still vanishes at the same rate (interleaved, 30 per arm: 23 bad
+  fixed / 20 bad mutated). #2945.
+- **Not the host-visible upload path, in any of its forms.** Interleaved arms on the one-draw
+  reproduction, 12-30 runs each, all indistinguishable from the default:
+  `PROSPER_NO_BACKEND_BUFFER_ARENA`, `PROSPER_NO_BACKEND_BUFFER_POOL`, `PROSPER_NO_MEMORY_POOL`,
+  `PROSPER_NO_INDEX_ARENA` (individually and together), `PROSPER_NO_BACKEND_PIPELINE_CACHE`,
+  `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE`, `PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS`,
+  `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES`, `PROSPER_NO_BACKEND_BATCH_SUBMITS`,
+  `PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS`, `PROSPER_NO_SHARED_VULKAN_DEVICE`,
+  `PROSPER_NO_SHADER_CACHE`, `PROSPER_NO_DEPTH`, `PROSPER_SERIAL_DRAW_REALIZE`,
+  `PROSPER_DRAW_REALIZE_THREADS=1`. #2945.
+- **Not the driver, on every lever that was tried, and not address-space layout.**
+  `RADV_DEBUG=zerovram | nongg | llvm | syncshaders | nodcc | nofastclears` all measure the same as
+  the default when interleaved, and `setarch -R` (ASLR off) still produced both outcomes — 8 good, 6
+  bad, 1 good over 15 runs, flipping at the same point in time as the ASLR-on arm beside it. #2945.
+- **Not an explicit host-write visibility barrier, and not descriptor-pool address recycling.** A
+  `HOST_WRITE -> MEMORY_READ` barrier at the top of every pass command buffer (redundant per spec,
+  added as an A/B) measured 2 bad of 15 against the default's 4 of 15; leaking every per-pass
+  `VkDescriptorPool` so no descriptor VA is ever reused measured 3 of 15 against 4 of 15. Both
+  levers were removed again. #2945.
+- **The one-draw reproduction, and what is PROVABLY IDENTICAL between the two outcomes.** The
+  divergence localizes to a single operation: prefixes of *BALAN WONDERWORLD*'s submit 3537 through
+  operation 55 replay to one hash over 8 runs, and adding operation 56 — draw 42, an indexed
+  three-index composite triangle into the guest scanout — makes it nondeterministic.
+  `gpu_replay s3537.prgcap --draw 42` renders that draw alone in ~3 s with a binary outcome, and
+  `PROSPER_GEOM_PROBE=42` shows the failing runs emit clip position **(-1, 1, 0, 0) for all three
+  vertices** — every storage-buffer load in the vertex shader returning 0, so the primitive is
+  discarded with `after_clip=0`. Between a good and a bad run these are identical: the host-side
+  source words (`PROSPER_BUFLOG`, md5-identical over 10 runs), the GPU-side contents of every bound
+  slice and of the index buffer read back through the GPU in the same command buffer
+  (`PROSPER_BUFFER_ECHO`, including a deliberately mutated `w = 2.0` that the memory carried while
+  the shader read 0), the descriptor allocation result, set handles and per-binding
+  buffer/offset/range, and the compiled RDNA2 ISA (`RADV_DEBUG=shaders`, byte-identical). **Do not
+  re-derive any of that; start from what the control cannot see.** #2945.
+- **The standalone control is clean, so the defect is prosper's.** `tools/vkprobe` drives the same
+  dumped modules through a bare Vulkan pipeline with no prosper code in the process: 3,000 indexed
+  draws in one run, coverage constant, zero disagreements with the non-indexed arm beside it. One
+  earlier 300-iteration run of the same binary reported 80 disagreements and did not reproduce in
+  3x200 and 1x3000 immediately afterwards — recorded because it is unexplained, not because it is
+  evidence. #2945 / #2937.
 
 
 ## Recommended implementation order
