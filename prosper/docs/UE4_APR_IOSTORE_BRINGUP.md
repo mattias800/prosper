@@ -27,16 +27,35 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   (`map_at` contributes two further nulls, an unavailable memfd and a failed `MAP_FIXED` over one of
   prosper's own free reservations; neither arises on this path.)
 
-  A refusal therefore leaves the range in one of exactly three states, and **none loses the guest
-  memory**. `prosper_reserved_range_state` (`hle/memory/hle_kernel_mem.cpp:2906`) answers **2 =
-  committed** — the guest already holds it; **1 = tracked but uncommitted** — the lazy-commit fault
-  arm backs it on first touch (`host/image/exec_image_linux.cpp:2150`); or **0 = untracked** —
-  nothing rescues it, because the unified-memory GPU-VA fallback spans only `GPU_VA_LO`..`GPU_VA_HI`
-  = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit near **139 GiB**. In that last
-  case a genuinely lost commit would be a **fatal** SIGSEGV, and neither title takes one. These calls
-  are the BUFFER flavor arriving in an argument shape `a3 == a1` does not recognise (`a3 == 0`,
-  `a5 == a0`); leaving their memory untouched is correct, and is the #88 / #107 clobber the
-  discriminator exists to prevent.
+  A refusal therefore leaves every page of the range in one of the states
+  `prosper_reserved_range_state` reports (`hle/memory/hle_kernel_mem.cpp:2921` — it answers about a
+  single **address**, not a range). On POSIX that is **0 / 1 / 2 / 4**; the full contract is
+  0/1/2/3/4, with **3** Windows-only and **4** POSIX-only, enumerated at `:2906-2910`. An earlier
+  version of this entry said "exactly three states", which the comment two lines above its own
+  citation contradicts. **None of them loses the guest memory:**
+
+  - **2 = committed** — the guest already holds it.
+  - **1 = reserved, uncommitted** — the lazy-commit fault arm backs it on first touch
+    (`host/image/exec_image_linux.cpp:2150`, gated on exactly `== 1` and on `addr >= 0x1000000000`).
+    Observed, not merely inferred: a Sifu census run logs
+    `[lazy-commit] #1 mapped page=0x20e1520000` — 131 GiB, the same range as the Ampr VAs.
+  - **4 = reserved but declining lazy commit** — disposes exactly as 0 does, and cannot arise for
+    these VAs: the AMM window is searched upward from `kAmmWindowSearch` = 1 TiB
+    (`hle_kernel_mem.cpp:2537`), far above them.
+  - **0 = untracked** — nothing rescues it, because the unified-memory GPU-VA fallback spans only
+    `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit near
+    **139 GiB**. A genuinely lost commit would therefore be a **fatal** SIGSEGV at that address.
+
+  **Neither title takes such a fault, and the fault each does take is the discriminator** — both die
+  at `SIGSEGV addr=(nil)` on UE's own `int $0x45 ; nop ; ud2` trap, while both rescue arms are
+  floored far above zero, so a null fault cannot be a lost Ampr commit. Grepping both census runs
+  finds no fault at any address in the Ampr range. Note too that state 0 is the hypothetical branch:
+  the census below finds every refused page already carries a VMA, so on the measured population the
+  argument runs through states 1 and 2 and the state-0 arm never engages. These calls are the BUFFER
+  flavor arriving in an argument shape `a3 == a1` does not recognise (`a3 == 0`, `a5 == a0`); leaving
+  their memory untouched is correct, and is the #88 / #107 clobber the discriminator exists to
+  prevent.
+
 
   **Two corrections are recorded here rather than smoothed away, because this was a wrong
   `## Ruled out` row twice.** It first rested on a measured "100% report `target ALREADY MAPPED`",

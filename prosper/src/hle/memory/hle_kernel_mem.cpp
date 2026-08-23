@@ -2304,18 +2304,21 @@ HLE(k_ampr_push_map) {
         bool have_phys = dmem_take(a2, 0x10000, 0x0c, phys);
         void* p = have_phys ? map_phys_at(a1, a2, PROT_READ | PROT_WRITE, phys)
                             : map_at(a1, a2, PROT_READ | PROT_WRITE);
-        // A refused mapping must give the physical pages BACK (#2908). map_phys_at answers null
-        // whenever the no-clobber discipline declines the target — an unaligned va, or a va that is
-        // already live guest memory — and that refusal is the CORRECT outcome for the flavors that
-        // reach here with an existing buffer. What was not correct is keeping the pool offset
-        // dmem_take just consumed: nothing references it, nothing can ever release it, and the
-        // dmem_take alignment above rounds every such carcass up to a full 64 KiB stride however
-        // small the request was. On PPSA20447 (Khazan) that is 4,294-4,574 refusals of
-        // 0x40/0x4000/0x10000 requests in one 6 s boot (the count varies run to run) = 268-286 MiB
-        // of the pool retired for nothing, against the 300 MiB scratch block that is the only
-        // headroom left after UE4's halving probe. PPSA03001 (Sifu) does it 31,839-32,192 times,
-        // which is 1.9-2.0 GiB. Fixing this does NOT get either title past its out-of-memory
-        // assert — see #2908 for what does not follow from it — but the pool damage was real.
+        // A refused mapping must give the physical pages BACK (#2908). map_phys_at answers null when
+        // the no-clobber discipline declines the target, and that refusal is the CORRECT outcome for
+        // the flavors that reach here carrying a buffer the guest already owns. WHY it is correct is
+        // argued in docs/KHAZAN_STATUS.md and docs/UE4_APR_IOSTORE_BRINGUP.md, deliberately not
+        // here: two review rounds were spent on wrong one-line versions of that argument, and a
+        // comment is the worst place to keep a claim that needs a case analysis to be true.
+        //
+        // What was not correct is keeping the pool offset dmem_take just consumed: nothing
+        // references it, nothing can ever release it, and the dmem_take alignment above rounds every
+        // such carcass up to a full 64 KiB stride however small the request was. Counts vary run to
+        // run and the ones worth quoting are whole-run censuses rather than a remembered range: one
+        // measured 6 s boot gives 4,646 refusals on PPSA20447 (Khazan) and 31,716 on PPSA03001
+        // (Sifu), i.e. ~286 MiB and ~1.94 GiB of pool retired for nothing — against the 300 MiB
+        // scratch block that is Khazan's only headroom after UE4's halving probe. Fixing this does
+        // NOT get either title past its out-of-memory assert; see #2908 for what does not follow.
         if (have_phys && !p) {
             dmem_release(phys, a2);
             have_phys = false;
@@ -2372,10 +2375,9 @@ HLE(k_ampr_push_map) {
             // "FAILED" reads as a lost page commit, and on the two titles that assert with UE4's
             // own out-of-memory report it was read that way — thousands of these on Khazan and tens
             // of thousands on Sifu sit right before the assert, which is a compelling place to be
-            // wrong about. map_phys_at answers null in exactly two situations, and neither loses
-            // the guest anything: MAP_FIXED_NOREPLACE refuses to clobber a range that is already
-            // mapped (the guest has that memory and can write it), or the address/length is not
-            // page-aligned, which no page commit ever is.
+            // wrong about. Whether it IS wrong is settled in the status docs by a case analysis
+            // over what a refusal leaves behind — not here, and not by this log line, which reports
+            // an observation and must keep doing only that.
             //
             // The probe covers the WHOLE range, and that is the point rather than a detail.
             // MAP_FIXED_NOREPLACE fails if ANY page in [a1, a1+a2) is mapped, so a one-page probe

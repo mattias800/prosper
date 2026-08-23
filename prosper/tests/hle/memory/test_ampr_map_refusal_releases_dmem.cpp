@@ -2,16 +2,18 @@
 //
 // The handler claims a physical range from the pool and then asks the host to place it at the
 // guest's VA. That placement is REFUSED whenever the no-clobber discipline (#137 / #88 / #107)
-// declines the target — an unaligned VA, or a VA that is already live guest memory — and the
-// refusal is the correct answer: those calls carry an ALREADY-EXISTING buffer, and real hardware
-// does not touch its memory. What was wrong is what happened to the pool offset afterwards. It was
+// declines the target, and the refusal is the correct answer — why it is correct takes a case
+// analysis and lives in docs/KHAZAN_STATUS.md's `## Ruled out`, not in a comment here; two review
+// rounds went on one-line versions of it that were wrong. What was wrong in the CODE is what
+// happened to the pool offset afterwards. It was
 // simply dropped: nothing referenced it, nothing could ever release it, and because the claim is
 // made at 64 KiB alignment every carcass retired a full 64 KiB stride however small the request.
 //
-// The cost is not theoretical. On *The First Berserker: Khazan* (PPSA20447) a 6 s boot produces
-// 4,294-4,574 refusals — the count varies run to run — which is 268-286 MiB of pool gone, against
-// the 300 MiB scratch block that is the only headroom left after UE4's halving probe has claimed
-// the rest. *Sifu* (PPSA03001) produces 31,839-32,192 of them, i.e. 1.9-2.0 GiB.
+// The cost is not theoretical. Counts vary run to run, so the figures worth quoting are whole-run
+// censuses rather than a remembered range: one measured 6 s boot gives *The First Berserker:
+// Khazan* (PPSA20447) 4,646 refusals — ~286 MiB of pool gone, against the 300 MiB scratch block
+// that is its only headroom after UE4's halving probe — and *Sifu* (PPSA03001) 31,716, i.e.
+// ~1.94 GiB.
 //
 // What this leak is NOT is the reason either of those titles asserts, and the distinction is
 // recorded here because the obvious story — "the pool runs dry, so the engine heap cannot commit" —
