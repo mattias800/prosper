@@ -58,7 +58,9 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   states the refused pages are in. `mincore` reports whether a **VMA exists**;
   `prosper_reserved_range_state` reports whether **prosper tracks the range**, and states 1 and 2
   both require tracking (`hle_kernel_mem.cpp:2928`, `:2931` return 0 for anything absent from
-  `g_maps`). Untracked-but-mapped is exactly the population that yields an `EEXIST` refusal. That
+  `g_maps`). Untracked-but-mapped is *part* of the population that yields an `EEXIST` refusal — the rest is
+  tracked-and-committed, since `range_is_free_reservation` declines those too — and a VMA census
+  cannot tell the two apart. That
   was the same instrument-measures-X-claim-is-about-Y error recorded below, committed again in the
   sentence written to fix it. The case analysis is complete over all four states, which is why it
   never needed to know which one applies. These calls are the BUFFER
