@@ -4867,18 +4867,31 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     static const bool no_renderpass_external_deps =
         getenv("PROSPER_NO_RENDERPASS_EXTERNAL_DEPS") != nullptr;
     constexpr VkAccessFlags kAllAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    // ALL_COMMANDS on the EXTERNAL side, ALL_GRAPHICS on the SUBPASS side, and the asymmetry is
+    // required rather than stylistic. VUID-VkRenderPassCreateInfo-pDependencies-00837 and -00838:
+    // when a dependency's src/dstSubpass is NOT VK_SUBPASS_EXTERNAL, that side's stage mask may
+    // contain only stages the subpass's bind point supports, and ALL_COMMANDS includes compute and
+    // host. The first version of this change used ALL_COMMANDS on both sides of both dependencies
+    // and was rejected 923 times across 15 tests by CI's validation scan -- which is the only gate
+    // in the tree that would have caught it: syncval on the replay path was clean, all 303 local
+    // ctest cases passed, and the guards were already failing for #2950's reasons.
+    //
+    // Nothing is lost by the narrowing. Subpass 0 is a graphics subpass, so ALL_GRAPHICS covers
+    // every stage that can execute inside it; the dependency remains a superset of the implicit
+    // defaults in the only sense that matters, which is that nothing the pass actually does escapes
+    // the ordering.
     std::array<VkSubpassDependency, 2> deps{};
     deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass = 0;
-    deps[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    deps[0].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;   // EXTERNAL side
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;   // subpass side
     deps[0].srcAccessMask = kAllAccess;
     deps[0].dstAccessMask = kAllAccess;
     deps[0].dependencyFlags = 0;
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    deps[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;   // subpass side
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;   // EXTERNAL side
     deps[1].srcAccessMask = kAllAccess;
     deps[1].dstAccessMask = kAllAccess;
     deps[1].dependencyFlags = 0;

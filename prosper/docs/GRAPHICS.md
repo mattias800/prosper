@@ -952,6 +952,13 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   they can only add ordering.** The tempting edit is to narrow them for performance; a narrowing that
   remains a superset of the implicit defaults is legitimate, one that does not is a silent
   visibility hole.
+  **And the masks are asymmetric by requirement, not by taste.** `ALL_COMMANDS` is legal only on the
+  `VK_SUBPASS_EXTERNAL` side of each dependency; on the subpass side, VUID-00837/-00838 allow only
+  stages the bind point supports, so it must be `ALL_GRAPHICS`. Getting that wrong is rejected 923
+  times across 15 tests — but **only by `tools/vkval/vk_validation_scan.py`, which is a CI job and
+  is not part of a local `ctest` run.** Synchronization validation on the replay path was clean,
+  303 local ctest cases passed, and the snapshot guards were already red for #2950's reasons, so
+  nothing local saw it. If you touch these dependencies, run that scan.
   **This row rests on the Vulkan contract, NOT on a measurement, and the measurement that looked
   like one is withdrawn.** The narrow masks were first written up as having "collapsed three rung-6
   guards", because `messenger-scene`, `dead-cells-gameplay` and `gris-gameplay` all failed at
