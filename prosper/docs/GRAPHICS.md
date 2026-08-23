@@ -752,6 +752,47 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   10/12 and 5/12 for `descriptor_array_render` on the same afternoon. Only the 0/30 pair is a stable
   discriminator. #2937.
 
+## The renderer is not deterministic on frozen input (2026-08-23) — #2945
+
+The cheapest reproduction of #2932 and #2937 does not need a guest, a route, or a screenshot grid.
+**One `.prgbundle`, replayed offline, produces a different picture from run to run.**
+
+```bash
+# Capture any frame of an affected title (no keyboard needed; ~40 s, ~80 MB).
+SDL_VIDEODRIVER=offscreen PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_CAPTURE_DIR=<work> PROSPER_GRAB_BUNDLE_AFTER_MS=21000 \
+    timeout 55 ./prosper-app <DUMP_ROOT>/PPSA02058-app0
+
+# Replay it. The per-submit hash on the [gpureplay] lines is the metric.
+./gpu_replay --bundle <work>/frame_grab_*.prgbundle <work>/out.bmp
+```
+
+Measured on one *BALAN WONDERWORLD* (`PPSA02058`) bundle, master `08c23efd`, Linux / AMD Radeon 8060S
+(RADV STRIX_HALO), **15 replays of the same file with the same binary**:
+
+| submit | operations | distinct output hashes over 15 replays |
+| --- | --- | --- |
+| 3537 (the scene) | 118 | **5** — `5c54906d637de17f` x7, `d6feaabf815c3096` x5, and `5a0e2fd6393fbfb5`, `ad8fd75518fd10b9`, `126927e49922ef95` once each |
+| 3540 (the tail) | 11 | 1 — `a5e7b61cbf984383`, stable |
+
+Same bytes in, five pictures out. The instability is inside the large scene submit and the eleven-op
+tail is stable, so it is not the capture, not the seeds, and not the publish path.
+
+**Why this matters more than the duty cycle.** Every other handle on #2932 costs a boot and a
+sampling grid, and every one of them measures the grid as much as the defect. This costs ~40 s, has
+no guest in it, and gives a falsifiable scalar. Bisect against the hash, not against a screenshot.
+
+**It also explains the shape of both issues** (tracked as #2945). #2932's alternation between the real frame and a flat
+clear, and #2937's Vulkan-execution failures that move when you add an `fprintf` or a query, are the
+same observation at two scales: the renderer's output is a function of timing as well as of input.
+
+Known and *not* the discriminator: the same bundle-replay log on a **content** frame of the same
+title shows the identical skipped dispatch,
+`[compute] program 0x3007980000 image 0x306c0f0000 1920x1080x1 ... DCC metadata extent is
+unsupported -> dispatch skipped (#590)`, so #590 costs a real 1920x1080 storage-image dispatch every
+frame on this title but does not separate a white frame from a good one.
+
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct
