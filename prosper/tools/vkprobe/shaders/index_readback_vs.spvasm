@@ -1,0 +1,82 @@
+; index_readback_vs.spvasm -- "what did the vertex shader actually SEE?" (#2945)
+;
+; Coverage alone cannot separate the three ways an indexed draw can come back empty:
+;   (a) the vertex shader never ran at all,
+;   (b) it ran, but every invocation was handed vertex index 0 -- the index fetch returned zeros,
+;       which collapses the triangle exactly as (c) does,
+;   (c) it ran with the right indices and something after it discarded the primitive.
+; A degenerate triangle looks identical in all three cases, so this module reports the answer out
+; of band. `vertexPipelineStoresAndAtomics` is already required by prosper's own vertex modules and
+; is enabled by vkprobe, so a vertex shader may store: each invocation writes `gl_VertexIndex + 1`
+; into `records[16 + gl_VertexIndex]`. vkprobe fills those dwords with a sentinel before every
+; render (`--readback-dwords 16:3`) and prints them after, so:
+;
+;   sentinel, sentinel, sentinel   -> (a) no vertex invocation ran
+;   1, sentinel, sentinel          -> (b) all three invocations saw vertex index 0
+;   1, 2, 3                        -> (c) the indices arrived correctly; the loss is downstream
+;
+; `+ 1` rather than the raw index so that "wrote zero" and "was never written" stay distinguishable.
+; The clip position is derived from gl_VertexIndex with OpSelect, matching `no_ssbo_vs` exactly, so
+; a working draw covers the same 496 pixels and the coverage number stays comparable across the
+; whole family in this folder.
+;
+; NOTE the storage buffer here is deliberately NOT `NonWritable` -- it cannot be, since the shader
+; writes it. That makes this module the one arm in the folder whose descriptor decoration matches
+; prosper's generated modules, which are also writable-by-declaration.
+;
+; Assemble with:  spirv-as --target-env vulkan1.1 index_readback_vs.spvasm -o index_readback_vs.spv
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %vertex_index %per_vertex
+               OpDecorate %vertex_index BuiltIn VertexIndex
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpDecorate %PerVertex Block
+               OpDecorate %_runtimearr_uint ArrayStride 4
+               OpMemberDecorate %Records 0 Offset 0
+               OpDecorate %Records Block
+               OpDecorate %records DescriptorSet 0
+               OpDecorate %records Binding 3
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+    %v4float = OpTypeVector %float 4
+%_ptr_Input_int = OpTypePointer Input %int
+%vertex_index = OpVariable %_ptr_Input_int Input
+  %PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %PerVertex
+ %per_vertex = OpVariable %_ptr_Output_PerVertex Output
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+    %Records = OpTypeStruct %_runtimearr_uint
+%_ptr_StorageBuffer_Records = OpTypePointer StorageBuffer %Records
+    %records = OpVariable %_ptr_StorageBuffer_Records StorageBuffer
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+    %uint_16 = OpConstant %uint 16
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %float_n1 = OpConstant %float -1
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+    %vid_int = OpLoad %int %vertex_index
+   %vid_uint = OpBitcast %uint %vid_int
+   %slot     = OpIAdd %uint %uint_16 %vid_uint
+   %slot_ptr = OpAccessChain %_ptr_StorageBuffer_uint %records %uint_0 %slot
+   %marker   = OpIAdd %uint %vid_uint %uint_1
+               OpStore %slot_ptr %marker
+      %is_v0 = OpIEqual %bool %vid_int %int_0
+      %is_v1 = OpIEqual %bool %vid_int %int_1
+          %x = OpSelect %float %is_v0 %float_n1 %float_0
+      %y_v1x = OpSelect %float %is_v1 %float_1 %float_0
+          %y = OpSelect %float %is_v0 %float_n1 %y_v1x
+   %clip_pos = OpCompositeConstruct %v4float %x %y %float_0 %float_1
+    %out_ptr = OpAccessChain %_ptr_Output_v4float %per_vertex %uint_0
+               OpStore %out_ptr %clip_pos
+               OpReturn
+               OpFunctionEnd

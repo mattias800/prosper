@@ -63,6 +63,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <map>
 #include <set>
@@ -73,6 +74,12 @@ namespace {
 
 struct Options {
     std::string vs_path, fs_path, records_path;
+    // A SECOND module pair, rendered in the SAME process and interleaved render-by-render with the
+    // first. #2945's failure rate drifts machine-wide over minutes -- 0/20 in one ten-minute window
+    // and 12/12 in the next, with nothing changed -- so an A/B measured as "run arm A, then run arm
+    // B" is void here rather than negative. Two pipelines alive at once, alternating within each
+    // iteration, is the only shape of this comparison that survives that drift.
+    std::string vs_b_path, fs_b_path;
     std::vector<uint32_t> indices{0, 1, 2};
     uint32_t iterations = 300;
     uint32_t width = 64, height = 64;
@@ -84,7 +91,20 @@ struct Options {
     // DEVICE_LOCAL memory through a transfer, which is what a real application does, and turns that
     // into a single-variable A/B on one binary.
     bool device_local_indices = false;
+    // Dwords of the record buffer to reset to a sentinel before every render and read back after
+    // it. A vertex shader that STORES what it saw (see shaders/index_readback_vs.spvasm) turns
+    // "the draw came back empty" -- which is the same picture whether the shader never ran, ran
+    // with all-zero indices, or ran correctly and lost the primitive later -- into three
+    // distinguishable answers.
+    uint32_t readback_first = 0, readback_count = 0;
+    // 16- or 32-bit indices. The defect being characterised is specific to indexed draws, and the
+    // index type is one of the few remaining free variables in the draw itself.
+    uint32_t index_bits = 32;
 };
+
+// A sentinel that is not a plausible vertex index, a plausible marker, or zero, so "never written"
+// stays distinguishable from "written with zero".
+constexpr uint32_t kReadbackSentinel = 0xdeadbeefu;
 
 [[noreturn]] void fail_setup(const char* what) {
     std::fprintf(stderr, "vkprobe: setup failed: %s\n", what);
@@ -291,7 +311,8 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --vs FILE --fs FILE [--iterations N] [--records FILE]\n"
                  "          [--indices i,j,k] [--extent WxH] [--device N] [--verbose]\n"
-                 "          [--device-local-indices]\n", argv0);
+                 "          [--device-local-indices] [--vs-b FILE --fs-b FILE]\n"
+                 "          [--readback-dwords FIRST:COUNT] [--index-bits 16|32]\n", argv0);
 }
 
 }  // namespace
@@ -307,6 +328,23 @@ int main(int argc, char** argv) {
         };
         if (argument == "--vs") options.vs_path = next("--vs");
         else if (argument == "--fs") options.fs_path = next("--fs");
+        else if (argument == "--vs-b") options.vs_b_path = next("--vs-b");
+        else if (argument == "--fs-b") options.fs_b_path = next("--fs-b");
+        else if (argument == "--index-bits") {
+            options.index_bits = strict_u32(next("--index-bits"), "--index-bits");
+            if (options.index_bits != 16 && options.index_bits != 32)
+                fail_setup("--index-bits accepts 16 or 32 (nothing has been measured)");
+        } else if (argument == "--readback-dwords") {
+            // FIRST:COUNT, and a malformed value disables the run rather than quietly measuring a
+            // different region -- the same convention as strict_u32 above.
+            const char* text = next("--readback-dwords");
+            const char* colon = std::strchr(text, ':');
+            if (!colon) fail_setup("--readback-dwords expects FIRST:COUNT");
+            options.readback_first = strict_u32(std::string(text, colon).c_str(),
+                                                "--readback-dwords FIRST");
+            options.readback_count = strict_u32(colon + 1, "--readback-dwords COUNT");
+            if (!options.readback_count) fail_setup("--readback-dwords COUNT 0 reads nothing");
+        }
         else if (argument == "--records") options.records_path = next("--records");
         else if (argument == "--iterations")
             options.iterations = strict_u32(next("--iterations"), "--iterations");
@@ -327,6 +365,8 @@ int main(int argc, char** argv) {
         else { usage(argv[0]); return 2; }
     }
     if (options.vs_path.empty() || options.fs_path.empty()) { usage(argv[0]); return 2; }
+    if (options.vs_b_path.empty() != options.fs_b_path.empty())
+        fail_setup("--vs-b and --fs-b go together (nothing has been measured)");
     if (!options.iterations) fail_setup("--iterations 0 measures nothing");
     if (options.indices.size() < 3) fail_setup("--indices needs at least three values");
 
@@ -334,6 +374,14 @@ int main(int argc, char** argv) {
     const std::vector<uint32_t> fs = read_spirv(options.fs_path);
     if (vs.empty()) fail_setup("cannot read the vertex module (missing, truncated, or not SPIR-V)");
     if (fs.empty()) fail_setup("cannot read the fragment module (missing, truncated, or not SPIR-V)");
+    const bool paired = !options.vs_b_path.empty();
+    std::vector<uint32_t> vs_b, fs_b;
+    if (paired) {
+        vs_b = read_spirv(options.vs_b_path);
+        fs_b = read_spirv(options.fs_b_path);
+        if (vs_b.empty()) fail_setup("cannot read --vs-b");
+        if (fs_b.empty()) fail_setup("cannot read --fs-b");
+    }
     std::vector<uint8_t> records =
         options.records_path.empty() ? default_records() : read_bytes(options.records_path);
     if (records.empty()) fail_setup("cannot read --records");
@@ -406,7 +454,11 @@ int main(int argc, char** argv) {
                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memcpy(record_buffer.mapped, records.data(), records.size());
 
-    const VkDeviceSize index_bytes = options.indices.size() * 4;
+    if (options.readback_count &&
+        (uint64_t(options.readback_first) + options.readback_count) * 4 > records.size())
+        fail_setup("--readback-dwords runs past the end of the record buffer (nothing measured)");
+    const VkDeviceSize index_stride = options.index_bits / 8;
+    const VkDeviceSize index_bytes = options.indices.size() * index_stride;
     uint32_t index_memory_type = UINT32_MAX;
     // N21: TRANSFER_SRC only in the staged arm. An added usage bit can narrow
     // memoryRequirements.memoryTypeBits, so putting it on the default path would mean the
@@ -415,7 +467,16 @@ int main(int argc, char** argv) {
         phys, device, index_bytes,
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
             (options.device_local_indices ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : 0u));
-    std::memcpy(index_staging.mapped, options.indices.data(), index_bytes);
+    if (options.index_bits == 32) {
+        std::memcpy(index_staging.mapped, options.indices.data(), index_bytes);
+    } else {
+        auto* narrow = static_cast<uint16_t*>(index_staging.mapped);
+        for (size_t i = 0; i < options.indices.size(); ++i) {
+            if (options.indices[i] > 0xffffu)
+                fail_setup("--indices holds a value 16-bit indices cannot carry");
+            narrow[i] = static_cast<uint16_t>(options.indices[i]);
+        }
+    }
     // Device-local index buffer, filled by a transfer, when asked for. Everything after this point
     // binds `index_buffer`, which is either the host-coherent staging allocation itself or a
     // DEVICE_LOCAL copy of it.
@@ -460,8 +521,10 @@ int main(int argc, char** argv) {
     // is a 132-component vertex interface, so this is not hypothetical -- feeding vkprobe a module
     // dumped before that bound was applied would produce exactly the confident, meaningless answer
     // this tool exists not to give.
-    {
-        const std::set<uint32_t> vertex_out = output_locations(vs);
+    const std::vector<uint32_t>* vertex_modules[2] = {&vs, &vs_b};
+    for (const std::vector<uint32_t>* module : vertex_modules) {
+        if (module->empty()) continue;
+        const std::set<uint32_t> vertex_out = output_locations(*module);
         const uint32_t highest = vertex_out.empty() ? 0u : (*vertex_out.rbegin() + 1u);
         const uint32_t components = highest * 4u + 4u;   // + gl_Position, as the layer counts it
         if (!vertex_out.empty() && components > properties.limits.maxVertexOutputComponents) {
@@ -472,9 +535,18 @@ int main(int argc, char** argv) {
             fail_setup("over-budget vertex interface (nothing has been measured)");
         }
     }
+    // One descriptor set layout serves BOTH pipelines, so it is the UNION of what all the supplied
+    // modules declare. A pipeline may legally carry a binding its shader never reads, and a shared
+    // layout is what makes the paired comparison a comparison of the MODULES rather than of two
+    // differently-shaped pipelines. It does mean a paired run is not bit-identical in setup to the
+    // same module run alone -- run both ways when that could matter.
     std::set<uint32_t> bindings;
     collect_storage_bindings(vs, "vertex", bindings);
     collect_storage_bindings(fs, "fragment", bindings);
+    if (paired) {
+        collect_storage_bindings(vs_b, "vertex (b)", bindings);
+        collect_storage_bindings(fs_b, "fragment (b)", bindings);
+    }
     if (bindings.empty()) fail_setup("neither module declares a set-0 storage-buffer binding");
     std::vector<VkDescriptorSetLayoutBinding> layout_bindings;
     for (uint32_t binding : bindings)
@@ -535,6 +607,8 @@ int main(int argc, char** argv) {
         return module;
     };
     VkShaderModule vs_module = make_module(vs), fs_module = make_module(fs);
+    VkShaderModule vs_b_module = VK_NULL_HANDLE, fs_b_module = VK_NULL_HANDLE;
+    if (paired) { vs_b_module = make_module(vs_b); fs_b_module = make_module(fs_b); }
 
     VkAttachmentDescription attachment{};
     attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -623,6 +697,17 @@ int main(int argc, char** argv) {
     if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) !=
         VK_SUCCESS)
         fail_setup("vkCreateGraphicsPipelines (an invalid shader interface fails here)");
+    VkPipeline pipeline_b = VK_NULL_HANDLE;
+    if (paired) {
+        VkPipelineShaderStageCreateInfo stages_b[2] = {stages[0], stages[1]};
+        stages_b[0].module = vs_b_module;
+        stages_b[1].module = fs_b_module;
+        VkGraphicsPipelineCreateInfo info_b = pipeline_info;
+        info_b.pStages = stages_b;
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info_b, nullptr, &pipeline_b) !=
+            VK_SUCCESS)
+            fail_setup("vkCreateGraphicsPipelines (--vs-b/--fs-b)");
+    }
 
     VkCommandPoolCreateInfo command_pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     command_pool_info.queueFamilyIndex = family;
@@ -633,7 +718,20 @@ int main(int argc, char** argv) {
 
     // One render of the triangle, indexed or not, into a fresh image. Returns the covered-pixel
     // count (pixels that differ from the blue clear).
-    auto render = [&](bool indexed) -> uint64_t {
+    // What one render reports back: how many pixels differ from the clear, and -- when
+    // --readback-dwords is on -- the sentinel window the vertex shader may have written.
+    struct RenderResult {
+        uint64_t covered = 0;
+        std::vector<uint32_t> words;
+    };
+    auto render = [&](VkPipeline use_pipeline, bool indexed) -> RenderResult {
+        // Reset the readback window BEFORE recording, so it is a host write ordered ahead of the
+        // submit by the implicit host-write domain operation vkQueueSubmit performs.
+        if (options.readback_count) {
+            auto* dwords = static_cast<uint32_t*>(record_buffer.mapped);
+            for (uint32_t i = 0; i < options.readback_count; ++i)
+                dwords[options.readback_first + i] = kReadbackSentinel;
+        }
         VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         image_info.imageType = VK_IMAGE_TYPE_2D;
         image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -699,11 +797,13 @@ int main(int argc, char** argv) {
         pass_begin.clearValueCount = 1;
         pass_begin.pClearValues = &clear;
         vkCmdBeginRenderPass(command, &pass_begin, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, use_pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
                                 &descriptor_set, 0, nullptr);
         if (indexed) {
-            vkCmdBindIndexBuffer(command, index_binding, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindIndexBuffer(command, index_binding, 0,
+                                 options.index_bits == 16 ? VK_INDEX_TYPE_UINT16
+                                                          : VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(command, static_cast<uint32_t>(options.indices.size()), 1, 0, 0, 0);
         } else {
             vkCmdDraw(command, static_cast<uint32_t>(options.indices.size()), 1, 0, 0);
@@ -715,10 +815,16 @@ int main(int argc, char** argv) {
         vkCmdCopyImageToBuffer(command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                readback.buffer, 1, &copy);
         VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        // SHADER_WRITE as well as TRANSFER_WRITE: with --readback-dwords the vertex shader itself
+        // writes the record buffer, and making that available to the host is a separate operation
+        // from waiting the fence. Ordering is not availability -- the distinction #2944 is about.
+        host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                             0, 1, &host_read, 0, nullptr, 0, nullptr);
+        vkCmdPipelineBarrier(command,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read, 0, nullptr, 0, nullptr);
         if (vkEndCommandBuffer(command) != VK_SUCCESS) fail_setup("vkEndCommandBuffer");
 
         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -735,11 +841,16 @@ int main(int argc, char** argv) {
         if (vkWaitForFences(device, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) != VK_SUCCESS)
             fail_setup("vkWaitForFences did not complete (hang or device loss); nothing measured");
 
-        uint64_t covered = 0;
+        RenderResult result;
         const uint8_t* pixels = static_cast<const uint8_t*>(readback.mapped);
         for (uint64_t i = 0; i < uint64_t(options.width) * options.height; ++i) {
             const uint8_t* pixel = pixels + i * 4;
-            if (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 255) ++covered;
+            if (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 255) ++result.covered;
+        }
+        if (options.readback_count) {
+            const auto* dwords = static_cast<const uint32_t*>(record_buffer.mapped);
+            result.words.assign(dwords + options.readback_first,
+                                dwords + options.readback_first + options.readback_count);
         }
 
         vkDestroyFence(device, fence, nullptr);
@@ -748,7 +859,7 @@ int main(int argc, char** argv) {
         vkDestroyImageView(device, view, nullptr);
         vkDestroyImage(device, image, nullptr);
         vkFreeMemory(device, image_memory, nullptr);
-        return covered;
+        return result;
     };
 
     // ORDER IS ALTERNATED, and that is not tidiness. Running non-indexed then indexed every time
@@ -802,51 +913,135 @@ int main(int argc, char** argv) {
         std::printf("[vkprobe] index memory: HOST_VISIBLE|HOST_COHERENT, bound directly\n");
     }
 
-    uint32_t plain_empty = 0, indexed_empty = 0, mismatched = 0;
-    uint32_t first_empty = 0, second_empty = 0;
-    uint64_t plain_min = UINT64_MAX, plain_max = 0, indexed_min = UINT64_MAX, indexed_max = 0;
+    // One module pair's tally. Two of these exist in a paired run.
+    struct Tally {
+        const char* label = "";
+        uint32_t plain_empty = 0, indexed_empty = 0, mismatched = 0;
+        uint64_t plain_min = UINT64_MAX, plain_max = 0;
+        uint64_t indexed_min = UINT64_MAX, indexed_max = 0;
+        std::map<std::string, uint32_t> plain_words, indexed_words;
+    };
+    auto describe_words = [](const std::vector<uint32_t>& words) {
+        std::string text;
+        for (size_t i = 0; i < words.size(); ++i) {
+            char buffer[16];
+            if (words[i] == kReadbackSentinel) std::snprintf(buffer, sizeof buffer, "--");
+            else std::snprintf(buffer, sizeof buffer, "%u", words[i]);
+            if (i) text += ",";
+            text += buffer;
+        }
+        return text;
+    };
+    auto record = [&](Tally& tally, const RenderResult& plain, const RenderResult& indexed) {
+        if (!plain.covered) ++tally.plain_empty;
+        if (!indexed.covered) ++tally.indexed_empty;
+        if (plain.covered != indexed.covered) ++tally.mismatched;
+        tally.plain_min = std::min(tally.plain_min, plain.covered);
+        tally.plain_max = std::max(tally.plain_max, plain.covered);
+        tally.indexed_min = std::min(tally.indexed_min, indexed.covered);
+        tally.indexed_max = std::max(tally.indexed_max, indexed.covered);
+        if (options.readback_count) {
+            ++tally.plain_words[describe_words(plain.words)];
+            ++tally.indexed_words[describe_words(indexed.words)];
+        }
+    };
+
+    Tally tally_a, tally_b;
+    tally_a.label = "a";
+    tally_b.label = "b";
+    uint32_t position_empty[4] = {0, 0, 0, 0};
+    const uint32_t positions = paired ? 4u : 2u;
     for (uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
         const bool indexed_first = (iteration & 1u) != 0;
-        const uint64_t first = render(indexed_first);
-        const uint64_t second = render(!indexed_first);
-        const uint64_t plain = indexed_first ? second : first;
-        const uint64_t indexed = indexed_first ? first : second;
-        if (!plain) ++plain_empty;
-        if (!indexed) ++indexed_empty;
-        if (!first) ++first_empty;
-        if (!second) ++second_empty;
-        if (plain != indexed) ++mismatched;
-        plain_min = plain < plain_min ? plain : plain_min;
-        plain_max = plain > plain_max ? plain : plain_max;
-        indexed_min = indexed < indexed_min ? indexed : indexed_min;
-        indexed_max = indexed > indexed_max ? indexed : indexed_max;
+        if (!paired) {
+            const RenderResult first = render(pipeline, indexed_first);
+            const RenderResult second = render(pipeline, !indexed_first);
+            record(tally_a, indexed_first ? second : first, indexed_first ? first : second);
+            if (!first.covered) ++position_empty[0];
+            if (!second.covered) ++position_empty[1];
+            if (options.verbose)
+                std::printf("[vkprobe] iteration=%u %s plain=%llu indexed=%llu\n", iteration,
+                            indexed_first ? "indexed-first" : "plain-first",
+                            (unsigned long long)(indexed_first ? second : first).covered,
+                            (unsigned long long)(indexed_first ? first : second).covered);
+            continue;
+        }
+        // ABBA within the iteration, with the leading MODULE alternating on top of the leading ARM.
+        // The modules are the thing under comparison, so they must not sit at fixed submission
+        // positions: over four iterations each module occupies each of the four slots equally, and
+        // the by-position line below is what shows whether position moved instead of module.
+        const bool b_first = (iteration & 2u) != 0;
+        VkPipeline lead = b_first ? pipeline_b : pipeline;
+        VkPipeline trail = b_first ? pipeline : pipeline_b;
+        const RenderResult r0 = render(lead, indexed_first);
+        const RenderResult r1 = render(trail, indexed_first);
+        const RenderResult r2 = render(trail, !indexed_first);
+        const RenderResult r3 = render(lead, !indexed_first);
+        const RenderResult& lead_plain = indexed_first ? r3 : r0;
+        const RenderResult& lead_indexed = indexed_first ? r0 : r3;
+        const RenderResult& trail_plain = indexed_first ? r2 : r1;
+        const RenderResult& trail_indexed = indexed_first ? r1 : r2;
+        record(b_first ? tally_b : tally_a, lead_plain, lead_indexed);
+        record(b_first ? tally_a : tally_b, trail_plain, trail_indexed);
+        const RenderResult* slots[4] = {&r0, &r1, &r2, &r3};
+        for (uint32_t slot = 0; slot < 4; ++slot)
+            if (!slots[slot]->covered) ++position_empty[slot];
         if (options.verbose)
-            std::printf("[vkprobe] iteration=%u %s plain=%llu indexed=%llu\n", iteration,
+            std::printf("[vkprobe] iteration=%u %s %s a-plain=%llu a-indexed=%llu b-plain=%llu "
+                        "b-indexed=%llu\n", iteration, b_first ? "b-first" : "a-first",
                         indexed_first ? "indexed-first" : "plain-first",
-                        (unsigned long long)plain, (unsigned long long)indexed);
+                        (unsigned long long)(b_first ? trail_plain : lead_plain).covered,
+                        (unsigned long long)(b_first ? trail_indexed : lead_indexed).covered,
+                        (unsigned long long)(b_first ? lead_plain : trail_plain).covered,
+                        (unsigned long long)(b_first ? lead_indexed : trail_indexed).covered);
     }
 
-    std::printf("[vkprobe] non-indexed: covered [%llu..%llu], EMPTY on %u of %u\n",
-                (unsigned long long)plain_min, (unsigned long long)plain_max,
-                plain_empty, options.iterations);
-    std::printf("[vkprobe] indexed:     covered [%llu..%llu], EMPTY on %u of %u\n",
-                (unsigned long long)indexed_min, (unsigned long long)indexed_max,
-                indexed_empty, options.iterations);
-    std::printf("[vkprobe] the two arms disagreed on %u of %u iterations\n",
-                mismatched, options.iterations);
-    // The same failures split by POSITION rather than by draw kind. Three readings, not two: arm
-    // counts lopsided and position counts comparable means the defect follows the draw kind;
-    // position lopsided and arm comparable means it follows submission order and the arm
+    auto report = [&](const Tally& tally, const char* prefix) {
+        std::printf("[vkprobe] %snon-indexed: covered [%llu..%llu], EMPTY on %u of %u\n", prefix,
+                    (unsigned long long)tally.plain_min, (unsigned long long)tally.plain_max,
+                    tally.plain_empty, options.iterations);
+        std::printf("[vkprobe] %sindexed:     covered [%llu..%llu], EMPTY on %u of %u\n", prefix,
+                    (unsigned long long)tally.indexed_min, (unsigned long long)tally.indexed_max,
+                    tally.indexed_empty, options.iterations);
+        std::printf("[vkprobe] %sthe two arms disagreed on %u of %u iterations\n", prefix,
+                    tally.mismatched, options.iterations);
+        if (!options.readback_count) return;
+        // "--" is the sentinel, i.e. a dword no vertex invocation wrote. Read the patterns, not
+        // just the coverage: they separate "the shader never ran" from "it ran on index 0 three
+        // times" from "it ran correctly and the primitive was lost afterwards".
+        for (const auto& [pattern, count] : tally.plain_words)
+            std::printf("[vkprobe] %snon-indexed vertex-index readback [%s] x%u\n", prefix,
+                        pattern.c_str(), count);
+        for (const auto& [pattern, count] : tally.indexed_words)
+            std::printf("[vkprobe] %sindexed     vertex-index readback [%s] x%u\n", prefix,
+                        pattern.c_str(), count);
+    };
+    if (paired) {
+        std::printf("[vkprobe] a = %s + %s\n", options.vs_path.c_str(), options.fs_path.c_str());
+        std::printf("[vkprobe] b = %s + %s\n", options.vs_b_path.c_str(), options.fs_b_path.c_str());
+        report(tally_a, "a: ");
+        report(tally_b, "b: ");
+    } else {
+        report(tally_a, "");
+    }
+    // The same failures split by POSITION rather than by draw kind or module. Three readings, not
+    // two: arm counts lopsided and position counts comparable means the defect follows the draw
+    // kind; position lopsided and arm comparable means it follows submission order and the arm
     // attribution is an artefact; BOTH lopsided is neither, and is what a period-4 effect looks
     // like through this strict-parity alternation -- the alternation kills period 2, not period 4.
-    std::printf("[vkprobe] by submission position: first EMPTY on %u, second EMPTY on %u "
-                "(order alternates each iteration)\n", first_empty, second_empty);
+    std::printf("[vkprobe] by submission position (order alternates each iteration):");
+    for (uint32_t slot = 0; slot < positions; ++slot)
+        std::printf(" #%u EMPTY on %u", slot, position_empty[slot]);
+    std::printf("\n");
 
     vkDestroyPipeline(device, pipeline, nullptr);
+    if (pipeline_b) vkDestroyPipeline(device, pipeline_b, nullptr);
     vkDestroyCommandPool(device, command_pool, nullptr);
     vkDestroyRenderPass(device, render_pass, nullptr);
     vkDestroyShaderModule(device, vs_module, nullptr);
     vkDestroyShaderModule(device, fs_module, nullptr);
+    if (vs_b_module) vkDestroyShaderModule(device, vs_b_module, nullptr);
+    if (fs_b_module) vkDestroyShaderModule(device, fs_b_module, nullptr);
     vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
     vkDestroyDescriptorPool(device, pool, nullptr);
     vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
@@ -861,5 +1056,8 @@ int main(int argc, char** argv) {
     }
     vkDestroyDevice(device, nullptr);
     vkDestroyInstance(instance, nullptr);
-    return (plain_empty || indexed_empty) ? 1 : 0;
+    return (tally_a.plain_empty || tally_a.indexed_empty || tally_b.plain_empty ||
+            tally_b.indexed_empty)
+               ? 1
+               : 0;
 }
