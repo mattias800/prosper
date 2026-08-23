@@ -419,6 +419,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   earlier route's decline is invisible without the verbose stream. Take the addresses from the
   `[compute-census]` per-program lines; they are run-local, so re-derive them per run (#2790).
 - **`imgdump/`** — decode/dump a guest texture to an image for inspection.
+- **`gpu_busy.sh`** — answers "is a peer lane mid-run on the shared GPU?" with pgrep-convention
+  exit codes (0 busy / 1 free / 2 tool error), counting the five consumer names including
+  `screenshot_snap`. Replaces the inline `pgrep -x a b c` spelling that was a usage error
+  masquerading as a clean box (trap 222, #2948).
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,
   are gitignored, and must never be committed. The tool exits non-zero on output-hash mismatch.

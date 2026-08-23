@@ -946,7 +946,9 @@ tr '\0' '\n' < /proc/<pid>/environ | grep PROSPER_   # and whose run?
 **`pgrep -x` takes exactly ONE pattern.** `pgrep -x prosper-app screenshot boot_trace` is a usage error: it exits 2
 having looked at nothing, and the two ways it is usually written both read as a clean box — with stderr suppressed it
 prints nothing, and `... || echo "GPU free"` prints *"GPU free"* **because** the command failed. Use one ERE argument
-(`pgrep -x 'prosper-app|screenshot|boot_trace|screenshot_snap'`) or the per-name loop below. Trap 222.
+(`pgrep -x 'prosper-app|screenshot|boot_trace|screenshot_snap'`), the per-name loop below, or
+**`tools/gpu_busy.sh`, which wraps exactly this census with an exit code that means what it says**
+(0 consumers running / 1 free / 2 tool error — a broken tool never answers "free"). Trap 222.
 
 Before terminating anything, confirm the exact PID **and** that its `cwd`/`environ` identify it as yours. Never
 kill from a pattern count. Note `comm` is truncated to 15 characters by the kernel, so a longer binary name needs
