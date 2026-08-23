@@ -1,5 +1,8 @@
-// libSceHttp URI helpers. Network requests remain offline, but parsing is local and deterministic:
-// returning success without filling this structure makes callers dereference stale pointer fields.
+// libSceHttp URI helpers plus the library/template id lifecycle. Network requests remain
+// offline, but parsing is local and deterministic, and id-returning entry points hand out
+// real tracked ids: returning success without filling this structure makes callers dereference
+// stale pointer fields, and answering 0 for an id hands the guest a valid-looking handle that
+// was never allocated (#2930).
 #include "hle/net/hle_http.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
@@ -7,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -169,10 +173,62 @@ HLE(h_http_uri_parse) { // (out, src_uri, pool, required_size, pool_size)
     return 0;
 }
 
+// --- Library/template id lifecycle (#2930) ----------------------------------------------
+// sceHttpInit and sceHttpCreateTemplate return IDS, and an id-returning contract must never
+// answer 0: the dispatcher's unregistered default is a valid-looking context/template id that
+// six of eight surveyed titles carry into later calls. Offline there is no network behind these
+// objects, but the ids are real - allocated here, tracked, deletable.
+//
+// Deliberately not invented until a live caller supplies evidence (id positivity itself is
+// CONFIDENCE: HIGH from the published contract): repeated Init hands out a further independent
+// context, CreateTemplate accepts whatever context it is given, and DeleteTemplate answers
+// SCE_OK for any argument - the dispatcher default it replaces was also 0, so registering the
+// explicit no-op removes census noise without fabricating an SDK error encoding. PS5 3.20
+// libSceHttp exports no sceHttpTerminate: contexts live for the process.
+
+struct HttpLibCtx   { bool in_use = false; };
+struct HttpTemplate { bool in_use = false; };
+constexpr int kMaxHttpLibs      = 4;
+constexpr int kMaxHttpTemplates = 16;
+
+std::mutex g_http_mx;  // guards both tables below
+HttpLibCtx   g_http_libs[kMaxHttpLibs];
+HttpTemplate g_http_templates[kMaxHttpTemplates];
+
+HLE(h_http_init) { // sceHttpInit() -> library context id (>0)
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    for (int i = 0; i < kMaxHttpLibs; i++) {
+        if (g_http_libs[i].in_use) continue;
+        g_http_libs[i].in_use = true;
+        return (uint64_t)(i + 1);
+    }
+    return (uint64_t)(int64_t)-1;  // table exhausted: negative, never an id-shaped answer
+}
+
+HLE(h_http_create_template) { // sceHttpCreateTemplate(libCtxId, ...) -> template id (>0)
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    for (int i = 0; i < kMaxHttpTemplates; i++) {
+        if (g_http_templates[i].in_use) continue;
+        g_http_templates[i].in_use = true;
+        return (uint64_t)(i + 1);
+    }
+    return (uint64_t)(int64_t)-1;
+}
+
+HLE(h_http_delete_template) { // sceHttpDeleteTemplate(templateId) -> SCE_OK offline
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    if (int id = (int32_t)a0; id >= 1 && id <= kMaxHttpTemplates)
+        g_http_templates[id - 1].in_use = false;
+    return 0;
+}
 } // namespace
 
 void register_http_hle() {
     Hle::register_fn("IWalAn-guFs", (HleFn)h_http_uri_parse, "sceHttpUriParse");
+    // Id lifecycle (#2930): an id-returning contract must never answer the dispatcher's 0.
+    Hle::register_fn("A9cVMUtEp4Y", (HleFn)h_http_init, "sceHttpInit");
+    Hle::register_fn("0gYjPTR-6cY", (HleFn)h_http_create_template, "sceHttpCreateTemplate");
+    Hle::register_fn("4I8vEpuEhZ8", (HleFn)h_http_delete_template, "sceHttpDeleteTemplate");
 }
 
 } // namespace prosper
