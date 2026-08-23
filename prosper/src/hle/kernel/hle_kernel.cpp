@@ -4906,7 +4906,8 @@ void register_kernel_hle() {
     R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)
     R("scePthreadGetaffinity", k_attr_getaffinity);      R("scePthreadSetaffinity", k_attr_noop);
     R("scePthreadGetschedparam", k_getschedparam);  R("pthread_getschedparam", k_getschedparam);
-    R("scePthreadSetschedparam", k_log_setschedparam);  R("scePthreadSetprio", k_log_setprio);
+    R("scePthreadSetschedparam", k_log_setschedparam);  R("pthread_setschedparam", k_log_setschedparam);  // #2914
+    R("scePthreadSetprio", k_log_setprio);
     R("scePthreadGetprio", k_getprio);
     R("scePthreadGetname", k_pthread_getname);   // bare ON PURPOSE — see the block above the body
     R("scePthreadRename", k_sce_pthread_rename);

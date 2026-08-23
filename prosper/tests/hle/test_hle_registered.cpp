@@ -33,6 +33,8 @@ int main() {
         "scePthreadCreate", "scePthreadMutexLock", "scePthreadCondWait", "pthread_equal",
         "sceKernelInstallExceptionHandler", "sceKernelRaiseException",
         "sceKernelIsStack", "scePthreadGetschedparam",
+        // POSIX spellings must answer identically to the sce ones (#2914)
+        "pthread_getschedparam", "pthread_setschedparam",
         // time / event queues
         "sceKernelClockGettime", "sceKernelUsleep", "sceKernelCreateEqueue", "sceKernelWaitEqueue",
         "getpid",
