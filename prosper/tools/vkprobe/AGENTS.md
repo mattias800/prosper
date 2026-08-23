@@ -49,8 +49,10 @@ believed after a few hundred iterations needed tens of runs before its first pos
 Then on validity, which is the one worth remembering. The rebuild — like, almost certainly, the
 original — created its device without `vertexPipelineStoresAndAtomics`, so **every pipeline it built
 from a prosper vertex module was invalid** (`VUID-RuntimeSpirv-NonWritable-06341`), and with no
-layers loaded it reported coverage for them anyway. Every reading before that fix is void, in both
-directions, including #2937's 1,500-draw result that redirected that whole investigation.
+layers loaded it reported coverage for them anyway. Every reading **this program** took before that
+fix is void, in both directions. #2937's 1,500-draw result came from a different, earlier program
+that was deleted before this one existed, so whether it shared the gap is inference — likely, but
+not checkable.
 
 The lesson the folder exists to carry: **a control is only a control once it is valid, and a program
 that loads no validation layers cannot tell you that it is.** Read the README's "Reading a result"

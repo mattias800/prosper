@@ -82,9 +82,12 @@ before that bound was applied is refused with those exact numbers).
 of binding a host-coherent allocation directly, which is what a real application does. It exists
 because the two arms differ in more than indexedness — only the indexed one binds an index buffer at
 all — so a failure attributed to "indexed draws" could be an attribution to host-coherent index
-memory. Measured interleaved, 25 runs x 150 iterations per arm: **0 failures in both arms**, i.e. a
-quiet window that discriminates nothing. The lever is here so the next person can run it while the
-machine is failing.
+memory. **Result: the DEVICE_LOCAL arm fails too** — 2 of 10 iterations in a failing window, with
+the selected memory type's flags printed as `0x1`, so host-coherent index memory is not necessary
+for the defect. A 20-run-per-arm interleaved A/B did not separate the rates (1 failing run against
+0, which is underpowered at this base rate). The probe prints the memory type it actually selected
+and refuses if the device has no DEVICE_LOCAL type that is not also HOST_VISIBLE — without that,
+this arm silently measures nothing on an APU while printing a confident label.
 
 **Run it under the validation layers when the answer matters** — and note that the plain form below
 enables CORE validation only, so "zero findings" from it says nothing about synchronization. Add a

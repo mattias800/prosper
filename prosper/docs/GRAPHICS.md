@@ -971,13 +971,24 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   A gap that size still suggests something on prosper's side raises the rate, but it is one
   comparison across different workloads and it is not strong evidence. The remaining suspects are prosper's generated SPIR-V (which the control executes),
   prosper's host-side usage as an amplifier, and the driver/hardware.
-  **The index-memory lead is open, not falsified.** The arms differ in more than indexedness: only
-  the indexed one binds an index buffer, and vkprobe's was `HOST_VISIBLE|HOST_COHERENT`. Since the
-  characterised mechanism is loads returning zero, an index fetch reading zeros gives `0,0,0`, a
-  degenerate triangle and zero coverage — the tool's entire observable. `--device-local-indices`
-  stages the same bytes into DEVICE_LOCAL and makes it a single-variable A/B. Measured interleaved,
-  25 runs x 150 iterations per arm: **0 failures in BOTH arms** — the window was quiet, so it
-  discriminates nothing. Run it again when the machine is failing. #2945.
+  **The index-memory lead: falsified as a NECESSARY condition, undecided as a rate factor.** The
+  arms differ in more than indexedness — only the indexed one binds an index buffer, and vkprobe's
+  was `HOST_VISIBLE|HOST_COHERENT`. Since the characterised mechanism is loads returning zero, an
+  index fetch reading zeros gives `0,0,0`, a degenerate triangle and zero coverage: the tool's
+  entire observable. `--device-local-indices` stages the same bytes into DEVICE_LOCAL through a
+  transfer and makes it a single-variable A/B. Caught in a failing window, **the DEVICE_LOCAL arm
+  failed 2 of 10 iterations**, with the selected memory type's property flags printed as `0x1` —
+  DEVICE_LOCAL and demonstrably not HOST_VISIBLE — so the failure does not require host-coherent
+  index memory. A 20-run-per-arm interleaved A/B immediately afterwards gave 1 failing run against
+  0, which does not separate the rates: at this base rate a quiet 20-run arm is likely either way,
+  and roughly 48 runs per arm are needed before that null means anything. One positive outranks that
+  null for the necessity question.
+  **The probe now reports the memory type it actually got, and that guard is the point.**
+  `memory_type` matches a SUPERSET, so asking for DEVICE_LOCAL on an APU, on lavapipe, or on any
+  device that orders a ReBAR heap first returns memory that is also HOST_VISIBLE — the arm would
+  have printed "DEVICE_LOCAL (staged)" and changed nothing about where the indices live. It now
+  excludes HOST_VISIBLE, exits 2 if no such type exists, and prints the selected type's flags.
+  An experiment that fails silently behind a loud label is the subject of the row below. #2945.
   **The transferable lesson is about the instrument, not the bug: a control is only a control once
   it is VALID, and a program that loads no validation layers cannot tell you that it is.** Two
   investigations were steered by this one for weeks. `vkprobe` now enables the feature, exits 2 if

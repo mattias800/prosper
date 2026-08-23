@@ -197,12 +197,23 @@ void collect_storage_bindings(const std::vector<uint32_t>& spirv, const char* st
     }
 }
 
-uint32_t memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags wanted) {
+uint32_t memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags wanted,
+                     VkMemoryPropertyFlags forbidden = 0) {
     VkPhysicalDeviceMemoryProperties properties{};
     vkGetPhysicalDeviceMemoryProperties(phys, &properties);
-    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
-        if ((bits & (1u << i)) &&
-            (properties.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
+    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+        if (!(bits & (1u << i))) continue;
+        const VkMemoryPropertyFlags flags = properties.memoryTypes[i].propertyFlags;
+        if ((flags & wanted) != wanted) continue;
+        // `forbidden` exists because this is a SUPERSET match. Asking for DEVICE_LOCAL on an APU,
+        // on lavapipe, or on any device that orders a ReBAR heap first hands back memory that is
+        // also HOST_VISIBLE -- so `--device-local-indices` would print "DEVICE_LOCAL (staged)" and
+        // change nothing about where the indices live. An experiment that fails silently behind a
+        // loud label is worse than no experiment; the caller passes HOST_VISIBLE here and gets
+        // UINT32_MAX rather than a false positive.
+        if (flags & forbidden) continue;
+        return i;
+    }
     return UINT32_MAX;
 }
 
@@ -396,9 +407,14 @@ int main(int argc, char** argv) {
     std::memcpy(record_buffer.mapped, records.data(), records.size());
 
     const VkDeviceSize index_bytes = options.indices.size() * 4;
+    uint32_t index_memory_type = UINT32_MAX;
+    // N21: TRANSFER_SRC only in the staged arm. An added usage bit can narrow
+    // memoryRequirements.memoryTypeBits, so putting it on the default path would mean the
+    // host-index arm of an A/B is not the configuration every earlier number was measured on.
     Buffer index_staging = make_host_buffer(
         phys, device, index_bytes,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            (options.device_local_indices ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : 0u));
     std::memcpy(index_staging.mapped, options.indices.data(), index_bytes);
     // Device-local index buffer, filled by a transfer, when asked for. Everything after this point
     // binds `index_buffer`, which is either the host-coherent staging allocation itself or a
@@ -415,14 +431,18 @@ int main(int argc, char** argv) {
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocate.allocationSize = requirements.size;
         allocate.memoryTypeIndex = memory_type(phys, requirements.memoryTypeBits,
-                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
         if (allocate.memoryTypeIndex == UINT32_MAX)
-            fail_setup("no DEVICE_LOCAL memory type for indices");
+            fail_setup("this device exposes no DEVICE_LOCAL memory type that is not also "
+                       "HOST_VISIBLE, so --device-local-indices could not change where the indices "
+                       "live (nothing has been measured)");
         if (vkAllocateMemory(device, &allocate, nullptr, &index_device.memory) != VK_SUCCESS)
             fail_setup("vkAllocateMemory (device-local indices)");
         if (vkBindBufferMemory(device, index_device.buffer, index_device.memory, 0) != VK_SUCCESS)
             fail_setup("vkBindBufferMemory (device-local indices)");
         index_device.size = index_bytes;
+        index_memory_type = allocate.memoryTypeIndex;
     }
     const VkBuffer index_binding =
         options.device_local_indices ? index_device.buffer : index_staging.buffer;
@@ -771,8 +791,16 @@ int main(int argc, char** argv) {
         vkDestroyFence(device, fence, nullptr);
         vkFreeCommandBuffers(device, command_pool, 1, &upload);
     }
-    std::printf("[vkprobe] index memory: %s\n",
-                options.device_local_indices ? "DEVICE_LOCAL (staged)" : "HOST_VISIBLE|HOST_COHERENT");
+    if (options.device_local_indices) {
+        VkPhysicalDeviceMemoryProperties memory_properties{};
+        vkGetPhysicalDeviceMemoryProperties(phys, &memory_properties);
+        std::printf("[vkprobe] index memory: DEVICE_LOCAL (staged), memory type %u, property "
+                    "flags 0x%x -- not HOST_VISIBLE, checked\n",
+                    index_memory_type,
+                    memory_properties.memoryTypes[index_memory_type].propertyFlags);
+    } else {
+        std::printf("[vkprobe] index memory: HOST_VISIBLE|HOST_COHERENT, bound directly\n");
+    }
 
     uint32_t plain_empty = 0, indexed_empty = 0, mismatched = 0;
     uint32_t first_empty = 0, second_empty = 0;
