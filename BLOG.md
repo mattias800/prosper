@@ -19,6 +19,26 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-23
+
+### Two Unreal titles were being quietly charged 2 GiB for memory they never got
+
+No picture with this one — neither title renders yet. *Sifu* and *The First Berserker: Khazan* both
+die a few seconds into boot with Unreal's own out-of-memory report, and the suspicion was that
+prosper's direct-memory pool really had run dry. Half of that turned out to be true in a way nobody
+had spotted: every time the guest asked us to place a buffer somewhere we had to refuse, we took the
+physical memory for it anyway and then forgot we had it. Khazan does that 4,646 times per boot and
+Sifu 31,716 times, so Sifu was losing nearly two gigabytes of the pool to allocations that never
+existed. That is now fixed.
+
+The other half is the more useful finding, and it is a negative one: with the leak gone, both titles
+still assert — and at that moment prosper's pool still has a 230 MiB block free and has failed no
+allocation the guest asked for. So the pool was never what stopped them, and whatever is really
+going on is inside Unreal's own allocator. Those thousands of refused mappings are not a loss
+either: prosper refuses them precisely because the guest already has memory there, and refusing is
+what stops us overwriting it. Details in
+[#2908](https://github.com/mattias800/prosper/issues/2908).
+
 ## 2026-08-22
 
 ### New Joe & Mac: Caveman Ninja plays start to finish

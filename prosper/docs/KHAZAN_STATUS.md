@@ -160,7 +160,7 @@ parameter error.
 `Prepare`/`GetMountInfo`/`Commit`/`Umount2`, does a `DirNameSearch`, then walks all thirty save slots
 (`SaveGame0Slot` … `SaveGame29Slot`, 113 `sceSaveDataMount3` calls in total). It then hits blocker 2.
 
-## Blocker 2 — the guest exhausts prosper's direct-memory pool and calls its own OOM handler (OPEN)
+## Blocker 2 — the guest calls its own OOM handler at ~6 s (OPEN; the direct-memory reading below is superseded)
 
 At ~6 s the guest prints its own out-of-memory report and asserts:
 
@@ -198,27 +198,70 @@ then releases its 300 MiB scratch block (`release_dmem [0x10010000,0x22c10000)`)
 allocations are served **out of that hole**: `0x1000c000`, `0x10218000`, `0x115a0000`, `0x13580000`,
 `0x15be0000`, `0x15e00000`. When the hole runs out, `ENOMEM`.
 
-Two things follow, and the second is the open question:
+**Read against the 2026-08-23 re-measurement below, this section describes the pool arithmetic
+correctly and the *diagnosis* wrongly.** The allocation ledger above is accurate. What does not
+follow from it — and what the rest of this document used to assert — is that the pool running out is
+what makes the title assert. It is not. See *Blocker 2, re-measured*.
 
 - **prosper's allocator is behaving correctly.** The reuse is legitimate, not overlapping — see
   `## Ruled out`.
 - **The six later allocations are graphics allocations, not engine-heap ones.** Their `map_dmem`
   targets are `0x9fc0000000` and `0xa000000000`, which the guest's own boot banner names
-  `Frame Buffer va range 9fc0000000 - a000000000`. So the shape is: the engine heap consumes the
-  whole advertised direct-memory budget, and the renderer's later allocations have only a released
-  300 MiB scratch block to live in.
+  `Frame Buffer va range 9fc0000000 - a000000000`.
 
 The guest's own report — **13.4 GiB available, 2.3 GiB used** — is its *own* accounting of the heap
 it reserved, and is not in contradiction with prosper's pool being empty. That earlier reading was
 wrong and is recorded in `## Ruled out` so it is not re-derived.
 
-**The mechanism is not established.** What would make a real PS5 survive this — a game budget smaller
-than the physical aperture, a different allocation type for framebuffer memory, or something else
-entirely — has not been determined, and no hypothesis is recorded. The 3,873
-`ampr push-map … -> FAILED` lines immediately before the OOM are the same family as the
-already-solved #88 / #107 / #161 Ampr work (`UE4_APR_IOSTORE_BRINGUP.md`) and are the obvious next
-thing to look at; whether they are a cause or a symptom of the exhaustion is also **not
-established**.
+## Blocker 2, re-measured — the pool was never the wall (2026-08-23)
+
+One real defect was found underneath this section and fixed (#2908); it is **not** what holds the
+title, and saying so plainly is the point of this rewrite.
+
+**The defect that was real: a refused Ampr map retired direct memory it never used.**
+`sceAmprCommandBufferSetBuffer`'s map flavor claimed a physical range from the pool and then asked
+the host to place it at the guest's VA. When that placement was refused the pool offset was simply
+dropped — nothing referenced it, nothing could release it, and because the claim is made at 64 KiB
+alignment every carcass retired a full 64 KiB stride however small the request. Khazan produces
+**4,646 refusals in a 6 s boot** (4,041 fully page-aligned, 591 unaligned, 14 with an unaligned
+length), so **290 MiB** of pool
+went with them, against the 300 MiB scratch block that is the only headroom left after the halving
+probe. *Sifu* (`PPSA03001`) produces **31,716** of them, i.e. **1.94 GiB**. Fixed in
+`src/hle/memory/hle_kernel_mem.cpp`, pinned by `tests/hle/memory/test_ampr_map_refusal_releases_dmem.cpp`.
+
+**The fix works and does not rescue the title.** With it, the post-release allocations stop being
+scattered across the leak's fragments and become contiguous — `0x1000c000`, `0x10218000`,
+`0x10220000`, `0x12200000`, `0x141e0000` against the leaking run's `…`, `0x11a70000`, `0x13a50000`,
+`0x16340000` — and the guest gets **one more allocation than it used to** (`0x200000` at
+`0x14400000`, which never happened before). It then prints the same `PS5 Out of Memory` at the same
+point.
+
+**And that is the finding: when the guest asserts, prosper's pool is not exhausted and no prosper
+call has failed.** Measured on the fixed build, `PROSPER_MEMLOG=1`, `tools/screenshot`, default
+route, Linux/RADV:
+
+| | Khazan `PPSA20447` | Sifu `PPSA03001` |
+| --- | --- | --- |
+| largest free direct-memory block at the assert | **230.1 MiB** | **234.2 MiB** |
+| `alloc_main_dmem` failures after the probe settles | **0** | **0** |
+| any other failing prosper call in the whole run | **none** | **none** |
+| `sceKernelBatchMap` page commits, all successful | 15,509 | 30,000+ |
+
+Every `ENOMEM (pool exhausted)` in either run — 19 of them on Khazan — belongs to the halving probe
+itself and is by design: the guest asks for the whole advertised budget and halves until a request
+fits. *Unbound: Worlds Apart* takes 19 of the same answers and renders its title screen. **So the
+issue body's "the first failure is `alloc_main_dmem … -> ENOMEM (pool exhausted)`" names a
+by-design event, not the defect.**
+
+**What the guest is actually doing is failing inside its own allocator with memory available on both
+sides of the boundary.** Sifu says so explicitly — `Ran out of memory allocating 16385 bytes with
+alignment 0`, `LowLevelFatalError [Line: 197]` — while its own report says 13.6 GB free and prosper
+has 234 MiB free and is refusing nothing. Khazan reaches the same
+`FGenericPlatformMemory::OnOutOfMemory` path (the `Allocator Stats for Binned3 are not in this
+build` line is `FMallocBinned3::DumpAllocatorStats`) without flushing the size line before the crash
+handler takes over. The next step is the guest's own disassembly at that call site, not another
+memory-layer experiment: every memory-layer question this document could ask has now been answered
+in the negative. Tracked separately as the reframed blocker.
 
 ## Ruled out
 
@@ -237,6 +280,11 @@ Each row is an executed experiment, not an opinion.
 | The allocator hands out **overlapping physical ranges** once the pool is full — allocations 17-22 start at `0x1000c000`, back at the bottom, inside the 300 MiB block allocation 2 still appeared to hold | `release_dmem [0x10010000,0x22c10000)` is logged at run-log line 49, *before* the first of those at line 52, and its bounds are exactly allocation 2's. The reuse is correct. Recorded because the size list alone reads as a serious corruption bug and the disproof is one line that is easy not to look for — read the physical addresses **and** the releases, never the sizes alone. |
 | The guest's `13.4 GiB available / 2.3 GiB used` report **contradicts** prosper's exhausted pool, so prosper is losing memory it handed out | It is not a contradiction. Those are UE's figures for the heap it reserved from prosper, sub-allocated 2.3 GiB of, and still considers 13.4 GiB free inside. Both statements are true at once. |
 | This title is in the pre-SDK-13 post-submit-visibility family (#2219) | It reports **SDK version 13**, so that contract is already armed for it. |
+| Blocker 2 is prosper's **direct-memory pool running out** | Falsified 2026-08-23 on the #2908 build. At the moment the guest asserts, the largest free block in the pool is **230.1 MiB** (Khazan) / **234.2 MiB** (Sifu), there are **zero** post-probe `alloc_main_dmem` failures, and **no prosper call of any kind fails in the entire run**. The 19 `ENOMEM (pool exhausted)` answers are the halving probe's own, by design, and *Unbound: Worlds Apart* takes the same 19 and renders its title screen. #2908. |
+| The **`ampr push-map … -> FAILED`** lines are lost page commits — the guest's allocator cannot commit, so it declares OOM | Falsified 2026-08-23 by case analysis over the refusal's own code path; no probe is involved and none is needed. `map_phys_at(fixed=true)` returns null only when `range_is_free_reservation` declined **and** `prosper_mmap_noreplace` then failed (`src/host/platform/posix_shim.hpp:318` — `MAP_FIXED_NOREPLACE`, so `EEXIST` means a host VMA already covers part of the range and `EINVAL` means the address or length is not page-aligned, which no page commit ever is); `map_at` adds two further nulls that cannot arise here — an unavailable memfd, and a failed `MAP_FIXED` over one of prosper's own free reservations. So for every page of a refused range, `prosper_reserved_range_state` (`src/hle/memory/hle_kernel_mem.cpp:2921`, and note it answers about **one address**, not a range) returns one of **0 / 1 / 2 / 4** on POSIX — the full contract is 0/1/2/3/4 with **3** Windows-only and **4** POSIX-only, enumerated at `:2906-2910`; the earlier "exactly three states" here was wrong and the comment two lines above the line it cited says so. **None of the four loses the guest memory.** **2 = committed**: the guest already holds it. **1 = reserved, uncommitted**: the lazy-commit fault arm backs it on first touch (`src/host/image/exec_image_linux.cpp:2150`, gated on exactly `== 1` and on `addr >= 0x1000000000`), and the arm is live in this address region rather than merely gated for it: a Sifu census run logs `[lazy-commit] #1 mapped page=0x20e1520000` — 131.5 GiB. That page is **not** one of the refused VAs, so it evidences the mechanism working up here, not the disposal of any particular refusal. **4 = reserved but declining lazy commit** disposes exactly as 0 does, and cannot arise here anyway: the AMM window is searched upward from `kAmmWindowSearch` = 1 TiB (`:2537`), far above these VAs. **0 = untracked**: nothing rescues it — the unified-memory fallback spans only `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit at **129.5-156.5 GiB** — so a genuinely lost commit would be a **fatal** SIGSEGV at that address. **Neither title takes one, and the fault each does take is the discriminator — by its ADDRESS, which is the part that carries it.** A lost commit at one of these VAs would fault *at* that VA, somewhere in 129.5-156.5 GiB. Both titles instead die at `SIGSEGV addr=(nil)`, on UE's own `int $0x45 ; nop ; ud2` trap, and a grep of both census runs finds no fault at any address in the Ampr range at all. (Both rescue arms also being floored far above zero is consistent with that but is not what settles it.) One thing the census below does **not** license, and an earlier version of this row claimed it did: it cannot say which of the four states the refused pages are in. `mincore` reports whether a **VMA exists**; `prosper_reserved_range_state` reports whether **prosper tracks the range**, and states 1 and 2 both require tracking (`hle_kernel_mem.cpp:2928`, `:2931` return 0 for anything absent from `g_maps`). Untracked-but-mapped is *part* of the population that produces an `EEXIST` refusal — the rest is tracked-and-committed, which `range_is_free_reservation` also declines — and a VMA census cannot separate them, so "the argument runs through states 1 and 2" was an inference from the wrong instrument — the same instrument-measures-X-claim-is-about-Y error this row already records once. The case analysis is complete over all four states, which is why it does not need to know. Refusing is protective: it is the #88 / #107 clobber the flavor discriminator exists to prevent. **Correction, and it matters more than the conclusion:** this row first rested on a measured "100% of refusals target memory the guest ALREADY HAS MAPPED", from a `mincore` probe of **one page** against ranges that are mostly `0x4000` — four host pages — while `MAP_FIXED_NOREPLACE` fails if *any* page is mapped. A quarter of each range was examined and the result asserted for all of it, in the direction the author wanted. Its replacement then claimed a structural argument that skipped the `prosper_mmap_noreplace` step and was not exhaustive over the null paths. Both were caught in review of #2947; the case analysis above is the third attempt and the first that closes. **The widened probe corroborates it, and this time the instrument measured what the claim says.** Every page of every refused range, whole-range `mincore`: Khazan **4,646 / 4,646**, Sifu **31,716 / 31,716** — 36,362 refusals, none containing an unmapped page. Splitting the alignment report also showed something the old line could not: 14 Khazan and 5 Sifu refusals have a page-aligned VA with an UNALIGNED length, a shape the single "page-aligned" flag hid entirely. #2908 / #2947. |
+| Fixing the Ampr pool leak gets the title past the assert | It does not, and this is the difference between *a* cause and *the* cause. The fix demonstrably works — allocations go from fragmented to contiguous and the guest gets one more allocation than before — and the assert lands at the same point. #2908, and #2747 is the standing reminder. |
+| The `LogDataTable … Fatal` line just before the memory report is the assert | It is UE's log-category **verbosity listing** (`%-40s %-12s`, empty message body), and it lands ~27,000 log lines before the crash in both runs. Restated here because it looks exactly like a fatal assert when grepped for. |
+| `libScePsml::3WVD91e12ZQ` / `+2KpvixvL6E`, reached immediately before the OOM, are implicated | Not shared with the other carrier: **Sifu calls `libScePsml` zero times** and asserts identically. Their position in Khazan's log is proximity, not evidence. |
 
 ## Evidence
 

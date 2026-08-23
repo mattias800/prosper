@@ -2304,6 +2304,34 @@ HLE(k_ampr_push_map) {
         bool have_phys = dmem_take(a2, 0x10000, 0x0c, phys);
         void* p = have_phys ? map_phys_at(a1, a2, PROT_READ | PROT_WRITE, phys)
                             : map_at(a1, a2, PROT_READ | PROT_WRITE);
+        // A refused mapping must give the physical pages BACK (#2908). map_phys_at answers null when
+        // the no-clobber discipline declines the target, and that refusal is the CORRECT outcome for
+        // the flavors that reach here carrying a buffer the guest already owns. WHY it is correct is
+        // argued in docs/KHAZAN_STATUS.md and docs/UE4_APR_IOSTORE_BRINGUP.md, deliberately not
+        // here: two review rounds were spent on wrong one-line versions of that argument, and a
+        // comment is the worst place to keep a claim that needs a case analysis to be true.
+        //
+        // What was not correct is keeping the pool offset dmem_take just consumed: nothing
+        // references it, nothing can ever release it, and the dmem_take alignment above rounds every
+        // such carcass up to a full 64 KiB stride however small the request was. Counts vary run to
+        // run and the ones worth quoting are whole-run censuses rather than a remembered range: one
+        // measured 6 s boot gives 4,646 refusals on PPSA20447 (Khazan) and 31,716 on PPSA03001
+        // (Sifu), i.e. ~290 MiB and ~1.94 GiB of pool retired for nothing — against the 300 MiB
+        // scratch block that is Khazan's only headroom after UE4's halving probe. Fixing this does
+        // NOT get either title past its out-of-memory assert; see #2908 for what does not follow.
+        if (have_phys && !p) {
+            dmem_release(phys, a2);
+            have_phys = false;
+            phys = 0;
+        }
+        // Fresh direct memory reads back ZERO on hardware, and the pool's memfd RETAINS bytes across
+        // release and reuse (see dmem_zero). Every other fresh-allocation path in this file punches;
+        // this one did not, and it is NOT merely a latent gap that the release above introduces.
+        // dmem_take is first-fit over the pool's free gaps, and guests genuinely release: Khazan
+        // hands back a 300 MiB scratch block mid-boot and the allocations after it are served out of
+        // that hole, so an Ampr map flavor could already land on an offset a previous tenant wrote.
+        // The release above widens the window; it did not open it. Raised in review of this change.
+        if (have_phys) dmem_zero(phys, a2);
         if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-map",
                      have_phys ? kVirtualQueryDirect : 0, have_phys ? phys : 0,
                      have_phys ? 0x0c : 0);
@@ -2339,9 +2367,67 @@ HLE(k_ampr_push_map) {
                  (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)phys,
                  (unsigned long long)mirror, p ? "ok" : "FAIL",
                  mirror_live ? "skip" : (q ? "ok" : "FAIL"));
+        } else if (p) {
+            MLOG("ampr push-map va=0x%llx len=0x%llx -> ok\n",
+                 (unsigned long long)a1, (unsigned long long)a2);
         } else {
-            MLOG("ampr push-map va=0x%llx len=0x%llx -> %s\n",
-                 (unsigned long long)a1, (unsigned long long)a2, p ? "ok" : "FAILED");
+            // WHY the host refused, recorded rather than left to be re-derived (#2908). A bare
+            // "FAILED" reads as a lost page commit, and on the two titles that assert with UE4's
+            // own out-of-memory report it was read that way — thousands of these on Khazan and tens
+            // of thousands on Sifu sit right before the assert, which is a compelling place to be
+            // wrong about. Whether it IS wrong is settled in the status docs by a case analysis
+            // over what a refusal leaves behind — not here, and not by this log line, which reports
+            // an observation and must keep doing only that.
+            //
+            // The probe covers the WHOLE range, and that is the point rather than a detail.
+            // MAP_FIXED_NOREPLACE fails if ANY page in [a1, a1+a2) is mapped, so a one-page probe
+            // would answer a strictly weaker question than the one the refusal asks — and the
+            // dominant shape here is 0x4000, four host pages, so three quarters of each range would
+            // go unexamined while the log claimed to have classified it. mincore returns -1/ENOMEM
+            // on the first hole, which is exactly the property being tested. Raised in review of
+            // this change; the earlier one-page form is why "100% already mapped" needed re-deriving.
+            static const uint64_t page = [] {
+                const long v = sysconf(_SC_PAGESIZE);
+                return v > 0 ? (uint64_t)v : 4096ull;
+            }();
+            const bool va_aligned  = (a1 % page) == 0;
+            const bool len_aligned = (a2 % page) == 0;
+            // Diagnostic-only, and this path runs tens of thousands of times per boot: do no
+            // syscalls unless the log that consumes them is on.
+            //
+            // kProbePages sizes `vec` and the stride together. They must stay equal: every span
+            // below is a whole number of pages (start/end/at are all page-aligned), so the entry
+            // count is exactly span/page <= kProbePages. Raising the stride without raising the
+            // array would have mincore write past `vec` — silent stack corruption in a diagnostic.
+            constexpr uint64_t kProbePages = 64;
+            bool fully_mapped = false;
+            if (memlog()) {
+                const uint64_t start = a1 & ~(page - 1);
+                // Round the end up to a page, refusing anything that would wrap rather than
+                // wrapping quietly: a2 is guest-supplied and this is the only arithmetic here that
+                // can overflow.
+                uint64_t end = start;
+                if (a2 <= UINT64_MAX - a1 && (a1 + a2) <= UINT64_MAX - (page - 1))
+                    end = (a1 + a2 + page - 1) & ~(page - 1);
+                fully_mapped = end > start;
+                unsigned char vec[kProbePages];
+                for (uint64_t at = start; at < end && fully_mapped; at += page * kProbePages) {
+                    const uint64_t chunk = page * kProbePages;
+                    const uint64_t span  = (end - at < chunk) ? end - at : chunk;
+                    if (prosper_mincore((void*)(uintptr_t)at, (size_t)span, vec) != 0)
+                        fully_mapped = false;
+                }
+            }
+            // Report what was OBSERVED, not what it implies. mincore sees a VMA; it does not see
+            // who owns it, and the earlier wording ("nothing was lost here") was a conclusion that
+            // got transcribed out of this log line into two `## Ruled out` sections as though it
+            // were a measurement. The inference belongs in the docs, where it can be argued.
+            MLOG("ampr push-map va=0x%llx len=0x%llx -> FAILED (va %s, len %s; %s)\n",
+                 (unsigned long long)a1, (unsigned long long)a2,
+                 va_aligned  ? "page-aligned" : "UNALIGNED",
+                 len_aligned ? "page-aligned" : "UNALIGNED",
+                 fully_mapped ? "every page of the range has a VMA"
+                              : "at least one page of the range has no VMA");
         }
     }
     return 0;

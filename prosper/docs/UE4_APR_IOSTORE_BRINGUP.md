@@ -11,6 +11,91 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
+- **A refused Ampr map is a lost page commit — false, by case analysis over the refusal's own code
+  path.** `sceAmprCommandBufferSetBuffer`'s map flavor logs `ampr push-map … -> FAILED` when the host
+  declines to place the mapping, and on the two UE4 titles that assert with UE's own out-of-memory
+  report those lines arrive in bulk immediately beforehand — thousands on *Khazan* `PPSA20447`, tens
+  of thousands on *Sifu* `PPSA03001`. That is a compelling place to conclude the allocator could not
+  commit. It could.
+
+  `map_phys_at(fixed=true)` returns null only when `range_is_free_reservation` declined **and**
+  `prosper_mmap_noreplace` then failed. That second step is the load-bearing one and the first
+  version of this entry omitted it: the declined reservation alone proves nothing, because the code
+  goes on to *try* the mapping and succeeds whenever the host range is free. It is
+  `MAP_FIXED_NOREPLACE` failing (`host/platform/posix_shim.hpp:318`) that proves a host VMA exists —
+  `EEXIST` — or that the address/length is not page-aligned, `EINVAL`, which no page commit ever is.
+  (`map_at` contributes two further nulls, an unavailable memfd and a failed `MAP_FIXED` over one of
+  prosper's own free reservations; neither arises on this path.)
+
+  A refusal therefore leaves every page of the range in one of the states
+  `prosper_reserved_range_state` reports (`hle/memory/hle_kernel_mem.cpp:2921` — it answers about a
+  single **address**, not a range). On POSIX that is **0 / 1 / 2 / 4**; the full contract is
+  0/1/2/3/4, with **3** Windows-only and **4** POSIX-only, enumerated at `:2906-2910`. An earlier
+  version of this entry said "exactly three states", which the comment two lines above its own
+  citation contradicts. **None of them loses the guest memory:**
+
+  - **2 = committed** — the guest already holds it.
+  - **1 = reserved, uncommitted** — the lazy-commit fault arm backs it on first touch
+    (`host/image/exec_image_linux.cpp:2150`, gated on exactly `== 1` and on `addr >= 0x1000000000`).
+    The arm is live in this address region rather than merely gated for it: a Sifu census run logs
+    `[lazy-commit] #1 mapped page=0x20e1520000` — 131.5 GiB. That page is **not** one of the refused
+    VAs, so it evidences the mechanism working up here, not the disposal of any given refusal.
+  - **4 = reserved but declining lazy commit** — disposes exactly as 0 does, and cannot arise for
+    these VAs: the AMM window is searched upward from `kAmmWindowSearch` = 1 TiB
+    (`hle_kernel_mem.cpp:2537`), far above them.
+  - **0 = untracked** — nothing rescues it, because the unified-memory GPU-VA fallback spans only
+    `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit at
+    **129.5-156.5 GiB**. A genuinely lost commit would therefore be a **fatal** SIGSEGV at that
+    address.
+
+  **Neither title takes such a fault, and the fault each does take is the discriminator — by its
+  ADDRESS, which is the part that carries it.** A lost commit at one of these VAs would fault *at*
+  that VA, in 129.5-156.5 GiB. Both titles instead die at `SIGSEGV addr=(nil)` on UE's own
+  `int $0x45 ; nop ; ud2` trap, and grepping both census runs finds no fault at any address in the
+  Ampr range at all. (Both rescue arms being floored far above zero is consistent with that, but is
+  not what settles it.) One thing the census below does **not**
+  license, and an earlier version of this entry claimed it did: it cannot say which of the four
+  states the refused pages are in. `mincore` reports whether a **VMA exists**;
+  `prosper_reserved_range_state` reports whether **prosper tracks the range**, and states 1 and 2
+  both require tracking (`hle_kernel_mem.cpp:2928`, `:2931` return 0 for anything absent from
+  `g_maps`). Untracked-but-mapped is *part* of the population that yields an `EEXIST` refusal — the rest is
+  tracked-and-committed, since `range_is_free_reservation` declines those too — and a VMA census
+  cannot tell the two apart. That
+  was the same instrument-measures-X-claim-is-about-Y error recorded below, committed again in the
+  sentence written to fix it. The case analysis is complete over all four states, which is why it
+  never needed to know which one applies. These calls are the BUFFER
+  flavor arriving in an argument shape `a3 == a1` does not recognise (`a3 == 0`, `a5 == a0`); leaving
+  their memory untouched is correct, and is the #88 / #107 clobber the discriminator exists to
+  prevent.
+
+
+  **Two corrections are recorded here rather than smoothed away, because this was a wrong
+  `## Ruled out` row twice.** It first rested on a measured "100% report `target ALREADY MAPPED`",
+  produced by a `mincore` probe of **one page** against four-page ranges — a quarter of each range
+  examined, the result asserted for all of it, in the author's favour. Its replacement claimed a
+  structural argument that skipped the `prosper_mmap_noreplace` step and was not exhaustive over the
+  null paths. Both were caught in review of
+  [#2947](https://github.com/mattias800/prosper/pull/2947). One residual hole in the general case is
+  worth knowing: on a host with the default `vm.max_map_count` of 65530, a title making 30,000+
+  mappings could take `ENOMEM` from the limit rather than from an existing VMA, and only a probe
+  distinguishes that. It is not reachable on the box these runs were made on, where
+  `vm.max_map_count` is **2,147,483,642**.
+
+  The widened probe corroborates the case analysis, and this time the instrument measures what the
+  claim says: whole-range `mincore` over every refused range gives Khazan **4,646 / 4,646** and Sifu
+  **31,716 / 31,716** — 36,362 refusals, not one containing an unmapped page. Reporting VA and
+  length alignment separately also surfaced a shape the single flag hid: 14 Khazan and 5 Sifu
+  refusals carry a page-aligned VA with an unaligned *length*.
+  [#2908](https://github.com/mattias800/prosper/issues/2908).
+
+- **The refusal was not free, though, and that half was a real defect.** Each refused map had already
+  claimed a physical range from the direct-memory pool, and the claim was dropped rather than
+  released: nothing referenced it, nothing could ever free it, and because the claim is made at
+  64 KiB alignment every carcass retired a full 64 KiB stride however small the request. 290 MiB per
+  Khazan boot, **1.94 GiB** per Sifu boot. Fixed in `hle_kernel_mem.cpp`; a refused map now returns
+  its pages, and the map-flavor success path zeroes them because a released offset can now be
+  recycled. `tests/hle/memory/test_ampr_map_refusal_releases_dmem.cpp`.
+
 - **The shared-equeue completion coalescing is what blocks Tales of Graces f's opening movie —
   false, and the tempting inference to avoid is "the bug is real, therefore it is THIS title's
   blocker".** The drop itself *is* real and is fixed by
