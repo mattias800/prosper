@@ -733,6 +733,12 @@ void register_font_hle() {
     R("vRxf4d0ulPs", (HleFn)font_surface_set_scissor, "sceFontRenderSurfaceSetScissor");
     R("L97d+3OgMlE", (HleFn)font_get_metrics, "sceFontGetCharGlyphMetrics");
     R("3G4zhgKuxE8", (HleFn)font_render_char_glyph_image, "sceFontRenderCharGlyphImage");
+    // STILL A STUB, and deliberately so -- #2957. This reports success and renders nothing, which
+    // is the same defect shape as #2951 immediately above it. It is not fixed here because the
+    // evidence that made the non-Horizontal variant implementable (argument positions, both
+    // out-parameter sizes, the pen convention) came from Metaphor's disassembly, and Metaphor does
+    // not import this one. Astro Bot is the only importer; deriving it needs Astro's own eboot.
+    // Do not guess the extra parameter the name implies -- it would be a wrong-slot write.
     R("kAenWy1Zw5o", (HleFn)font_ok, "sceFontRenderCharGlyphImageHorizontal");
     R("oaJ1BpN2FQk", (HleFn)font_text_source_init, "sceFontTextSourceInit");
     R("eCRMCSk96NU", (HleFn)font_text_default, "sceFontTextSourceSetDefaultFont");
