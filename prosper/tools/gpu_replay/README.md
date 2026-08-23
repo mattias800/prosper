@@ -489,6 +489,18 @@ chain), and `PROSPER_BUFLOG=1` prints each buffer binding's upload provenance (s
 identity/first floats, capped) — ground truth for "which bytes did the shader actually see" (the #1287
 palette-UV audit).
 
+`PROSPER_BUFLOG=1` answers the HOST half of that question. `PROSPER_BUFFER_ECHO=1` answers the
+**device** half, and the difference is the whole point of it: after recording the draw and before
+`vkCmdEndRenderPass`, the backend copies the first 64 bytes of every bound storage slice — and of
+every bound index buffer — back through the GPU into a host-visible buffer poisoned with `0xCD`, in
+the same command buffer, and prints them after the fence. So a `[buffer-echo]` line is what the
+shader's descriptors actually resolve to, not what the CPU believed it uploaded. It also prints one
+`[desc-echo]` line per draw with `vkAllocateDescriptorSets`' result, the set handles, and every
+binding's buffer/offset/range. Written for #2945, where `PROSPER_BUFLOG` and `--dump-resource` both
+reported byte-identical inputs across runs that rendered and runs whose vertices collapsed, and this
+was the instrument that moved the suspect off the upload path. Opt-in, bounded to 16 slices, and
+inert by default.
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
 `--inspect-only`, as it is for the probes above. Capture v19 adds
 `--dump-realized-shader DRAW:vs|vs-main|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized

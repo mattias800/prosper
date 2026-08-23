@@ -6682,7 +6682,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             allocate_info.descriptorPool = shared_descriptor_pool;
             allocate_info.descriptorSetCount = v.n_sets;
             allocate_info.pSetLayouts = dsls.data();
-            vkAllocateDescriptorSets(dev, &allocate_info, v.dsets.data());
+            const VkResult descriptor_alloc = vkAllocateDescriptorSets(dev, &allocate_info,
+                                                                       v.dsets.data());
+            // Read once, not per draw: getenv takes a process-wide lock on Windows and this is the
+            // per-draw resource loop (#2214).
+            static const bool descriptor_echo = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+            if (descriptor_echo) {
+                std::fprintf(stderr, "[desc-echo] draw=%zu alloc=%d sets=%u", di,
+                             (int)descriptor_alloc, v.n_sets);
+                for (uint32_t s = 0; s < v.n_sets; ++s)
+                    std::fprintf(stderr, " set%u=%p", s, (void*)v.dsets[s]);
+                for (size_t i = 0; i < R.size(); i++)
+                    std::fprintf(stderr, " [b%u type=%d cnt=%u buf=%p off=%llu range=%llu]",
+                                 R[i].binding, (int)wr[i].descriptorType, wr[i].descriptorCount,
+                                 wr[i].pBufferInfo ? (void*)wr[i].pBufferInfo->buffer : nullptr,
+                                 wr[i].pBufferInfo
+                                     ? (unsigned long long)wr[i].pBufferInfo->offset : 0ull,
+                                 wr[i].pBufferInfo
+                                     ? (unsigned long long)wr[i].pBufferInfo->range : 0ull);
+                std::fprintf(stderr, "\n");
+            }
             for (size_t i = 0; i < R.size(); i++)
                 wr[i].dstSet = v.dsets[R[i].set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(wr.size()), wr.data(), 0, nullptr);
@@ -7612,6 +7631,70 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdEndQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di));
         }
     }
+    // PROSPER_BUFFER_ECHO=1 (#2945) -- ground truth for "what did the GPU see in this draw's
+    // storage buffers". Every other instrument reads the HOST side: PROSPER_BUFLOG prints the source
+    // words, --dump-resource prints the capture's bytes, and both were byte-identical across runs
+    // that rendered and runs whose vertices collapsed. This copies the bound slices back THROUGH THE
+    // GPU, in the same command buffer as the draw, so the values printed are the ones the shader's
+    // descriptors resolve to. Opt-in and bounded: first 16 slices, 64 bytes each.
+    static const bool buffer_echo = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    VkBuffer echo_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory echo_memory = VK_NULL_HANDLE;
+    void* echo_mapped = nullptr;
+    size_t echo_count = 0;
+    std::vector<size_t> echo_index_slice;
+    constexpr VkDeviceSize kEchoStride = 64;
+    constexpr size_t kEchoMax = 16;
+    if (buffer_echo && !shared_buffers.empty()) {
+        VkBufferCreateInfo eci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        eci.size = kEchoStride * kEchoMax;
+        eci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkMemoryRequirements er{};
+        if (vkCreateBuffer(dev, &eci, nullptr, &echo_buffer) == VK_SUCCESS) {
+            vkGetBufferMemoryRequirements(dev, echo_buffer, &er);
+            VkMemoryAllocateInfo eai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            eai.allocationSize = er.size;
+            eai.memoryTypeIndex = render_memory_type(
+                ctx.phys, er.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (eai.memoryTypeIndex != UINT32_MAX &&
+                vkAllocateMemory(dev, &eai, nullptr, &echo_memory) == VK_SUCCESS &&
+                vkBindBufferMemory(dev, echo_buffer, echo_memory, 0) == VK_SUCCESS &&
+                vkMapMemory(dev, echo_memory, 0, VK_WHOLE_SIZE, 0, &echo_mapped) == VK_SUCCESS) {
+                std::memset(echo_mapped, 0xCD, static_cast<size_t>(kEchoStride * kEchoMax));
+                echo_count = std::min(kEchoMax, shared_buffers.size());
+                for (size_t i = 0; i < echo_count; ++i) {
+                    VkBufferCopy copy{};
+                    copy.srcOffset = shared_buffers[i].offset;
+                    copy.dstOffset = kEchoStride * i;
+                    copy.size = std::min<VkDeviceSize>(kEchoStride, shared_buffers[i].range);
+                    if (!copy.size) continue;
+                    vkCmdCopyBuffer(cmd, shared_buffers[i].buffer, echo_buffer, 1, &copy);
+                }
+                // ...and the INDEX buffers, which live outside `shared_buffers`. A draw whose
+                // gl_VertexIndex is out of range makes every vertex-buffer load return 0 under
+                // robustness, which is indistinguishable at the pixel from "the vertex data is
+                // wrong" -- so the index bytes have to be read back from the GPU too.
+                for (size_t d = 0; d < dv.size() && echo_count < kEchoMax; ++d) {
+                    if (!dv[d].ibuf || !dv[d].icount) continue;
+                    VkBufferCopy copy{};
+                    copy.srcOffset = dv[d].ioffset;
+                    copy.dstOffset = kEchoStride * echo_count;
+                    copy.size = std::min<VkDeviceSize>(kEchoStride,
+                                                       VkDeviceSize(dv[d].icount) * 4);
+                    echo_index_slice.push_back(echo_count);
+                    ++echo_count;
+                    vkCmdCopyBuffer(cmd, dv[d].ibuf, echo_buffer, 1, &copy);
+                }
+                VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read,
+                                     0, nullptr, 0, nullptr);
+            }
+        }
+    }
     vkCmdEndRenderPass(cmd);
     backend_pass_timing_end(cmd);   // #2333
     // Fence waits used to provide the device-memory dependency between every target call. Batched
@@ -7945,6 +8028,31 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
+    if (echo_mapped && flush_now) {
+        const uint8_t* bytes = static_cast<const uint8_t*>(echo_mapped);
+        for (size_t i = 0; i < echo_count; ++i) {
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(bytes + kEchoStride * i);
+            const bool is_index =
+                std::find(echo_index_slice.begin(), echo_index_slice.end(), i) !=
+                echo_index_slice.end();
+            if (is_index) {
+                std::fprintf(stderr,
+                             "[buffer-echo] INDEX slice=%zu gpu-read=%u %u %u %u %u %u\n",
+                             i, words[0], words[1], words[2], words[3], words[4], words[5]);
+                continue;
+            }
+            std::fprintf(stderr,
+                         "[buffer-echo] slice=%zu buf=%p off=%llu range=%llu gpu-read="
+                         "%08x %08x %08x %08x\n",
+                         i, (void*)shared_buffers[i].buffer,
+                         (unsigned long long)shared_buffers[i].offset,
+                         (unsigned long long)shared_buffers[i].range,
+                         words[0], words[1], words[2], words[3]);
+        }
+    }
+    if (echo_mapped) vkUnmapMemory(dev, echo_memory);
+    if (echo_memory) vkFreeMemory(dev, echo_memory, nullptr);
+    if (echo_buffer) vkDestroyBuffer(dev, echo_buffer, nullptr);
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
         (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);
