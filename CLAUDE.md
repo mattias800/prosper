@@ -350,6 +350,14 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   `real_shader_render` assert against *The Messenger's* own bytes. CMake derives the dump's title id
   and names both ids in the skip. So a bring-up agent's first `ctest` on a new title is green with a
   smaller executed set — read the skip count, not just the exit code. `docs/VERIFICATION.md` § CI.
+  - **Editor/LSP (clangd):** CMake exports `compile_commands.json` into the build dir
+    (`CMAKE_EXPORT_COMPILE_COMMANDS ON`), and a symlink at the repo root points clangd at it —
+    create both with one configure (`cmake -S prosper -B prosper/build-linux`) plus
+    `ln -sf prosper/build-linux/compile_commands.json compile_commands.json`. The database
+    regenerates on every configure/rebuild, so there is no separate upkeep; but EACH WORKTREE is
+    its own source tree and needs its own configure or its files resolve no includes. Verify any
+    setup with `clangd --check=<file> --compile-commands-dir=.` (exit 0 = parsed; tweak-internal
+    `ExtractFunction ==> FAIL` lines are clangd noise, not diagnostics).
 - **Write run artifacts and build temporaries to the real disk, never `/tmp`.** On the Linux box `/tmp`
   is a **RAM-backed tmpfs sized at 50% of RAM, with a per-user quota shared by every concurrent agent**.
   A single `.prgcap` is 200 MB–2.7 GB, a 4K `.bmp` is 24 MB, and a `PROSPER_GFXLOG`/`PROSPER_DBG` run log
