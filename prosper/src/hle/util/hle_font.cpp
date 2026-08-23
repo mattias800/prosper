@@ -275,15 +275,25 @@ void blit_glyph(const RenderSurface* surf, const uint8_t* glyph, int gw, int gh,
     const int pitch = surf->width_bytes;
     if (!dst || pitch <= 0 || surf->width <= 0 || surf->height <= 0) return;
 
-    // Clip box: the surface, intersected with its scissor. `font_surface_init` seeds the scissor
-    // to the whole surface, so an untouched scissor clips to nothing extra.
+    // Clip box: the surface, intersected with its scissor. `font_surface_init` seeds the scissor to
+    // the whole surface, so an untouched one clips nothing extra, and an EMPTY one clips
+    // everything -- it is honoured unconditionally rather than being read as "no scissor".
+    //
+    // That matters because the two failure directions are not symmetric: treating an empty scissor
+    // as absent draws MORE of the guest's buffer than it asked for, over glyph cells it may be
+    // holding. Treating an absent one as empty only loses a glyph. And the choice needs no
+    // interpretation of the field, because {0,0,0,0} is empty under BOTH readings of the trailing
+    // pair -- extents or a second corner.
+    //
+    // CONFIDENCE: MED on that pair being {w, h} rather than {x1, y1}. It matches the seeding
+    // `font_surface_init` has always done, so prosper is at least self-consistent, and the only
+    // guest call in the corpus cannot tell them apart: Metaphor asks for (0, 0, 0x400, 0x400) on a
+    // 0x400x0x400 surface (eboot+0x100156c), which is the whole surface either way.
     int64_t cx0 = 0, cy0 = 0, cx1 = surf->width, cy1 = surf->height;
     const int64_t sx0 = (int64_t)surf->scissor[0], sy0 = (int64_t)surf->scissor[1];
     const int64_t sw = (int64_t)surf->scissor[2], sh = (int64_t)surf->scissor[3];
-    if (sw > 0 && sh > 0) {
-        cx0 = std::max(cx0, sx0); cy0 = std::max(cy0, sy0);
-        cx1 = std::min(cx1, sx0 + sw); cy1 = std::min(cy1, sy0 + sh);
-    }
+    cx0 = std::max(cx0, sx0); cy0 = std::max(cy0, sy0);
+    cx1 = std::min(cx1, sx0 + sw); cy1 = std::min(cy1, sy0 + sh);
     // A row must also fit the declared pitch -- a title is free to give a pitch narrower than the
     // width it also declared, and the pitch is what indexes memory.
     cx1 = std::min<int64_t>(cx1, pitch);

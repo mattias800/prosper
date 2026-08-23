@@ -285,6 +285,32 @@ int main() {
     CHECK(covered2 == 0, "a scissor away from the glyph clips every pixel");
     CHECK(rw2 == 0, "a fully clipped glyph reports zero drawn width, not poison");
 
+    // --- an EMPTY scissor clips everything; it is not read as "no scissor" -------------------
+    // {0,0,0,0} is empty under both readings of the trailing pair (extents or a second corner), so
+    // this arm does not depend on resolving that ambiguity. The failure it guards is the
+    // asymmetric one: treating empty as absent would draw over the whole of the guest's buffer.
+    std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
+    CHECK(set_scissor(P(surface), 0, 0, 0, 0, 0) == 0, "SetScissor accepts an empty rectangle");
+    uint8_t result_empty[0x40];
+    std::memset(result_empty, kPoison, sizeof(result_empty));
+    render_f(face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result_empty);
+    size_t covered_empty = 0;
+    for (uint8_t b : surf_bytes) if (b) ++covered_empty;
+    int32_t rw_empty; std::memcpy(&rw_empty, result_empty + 0x38, 4);
+    CHECK(covered_empty == 0, "an empty scissor draws nothing at all");
+    CHECK(rw_empty == 0, "an empty scissor reports zero drawn width, not poison");
+
+    // ...and restoring the scissor to the whole surface draws again, which is what proves the two
+    // arms above measured the scissor rather than something that had simply stopped working.
+    std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
+    set_scissor(P(surface), 0, 0, kDim, kDim, 0);
+    uint8_t result_back[0x40];
+    std::memset(result_back, kPoison, sizeof(result_back));
+    render_f(face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result_back);
+    size_t covered_back = 0;
+    for (uint8_t b : surf_bytes) if (b) ++covered_back;
+    CHECK(covered_back > 500, "restoring a full scissor draws the glyph again");
+
     // --- a null surface must not be answered with success over an unwritten result -----------
     uint8_t result3[0x40];
     std::memset(result3, kPoison, sizeof(result3));
