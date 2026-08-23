@@ -1,0 +1,25 @@
+# Metaphor: ReFantazio (PPSA20800) -- EXPLORATORY, not a milestone route.
+#
+# What it establishes, measured 2026-08-23 with tools/screenshot at 3840x2160
+# (--seconds 10 --count 12, guest=running status=ok, 12/12 samples, 7 pixel-distinct):
+#
+#   ~12 s  language-selection screen (this is what a DEFAULT launch reaches and holds)
+#   ~30 s  a SYSTEM screen -- the title's brush-stroke art, a "SYSTEM" heading and a Cross prompt
+#   ~60 s  back to the loading mascot, and it stays there for the rest of the run
+#
+# So the pad does advance the title, and it does NOT reach a title screen. Recorded so the next
+# lane starts from "it stalls in a loading state after SYSTEM" rather than re-deriving that the
+# language screen needs input at all. Do not read this file as a milestone route: nothing here is
+# a checkpoint, and the timings are wall-clock on one machine.
+20-21:cross
+25-26:cross
+30-31:cross
+36-37:cross
+42-43:cross
+48-49:cross
+55-56:cross
+62-63:cross
+70-71:cross
+80-81:cross
+90-91:cross
+100-101:cross
