@@ -4814,9 +4814,74 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = color_count; sub.pColorAttachments = ar.data();
     if (use_ds) sub.pDepthStencilAttachment = &dar;
+    // #2945 -- EXPLICIT external subpass dependencies. Without these the render pass gets Vulkan's
+    // DEFAULT external dependencies, and the outgoing default is
+    //   srcStageMask=ALL_COMMANDS, srcAccessMask=<all writes>,
+    //   dstStageMask=BOTTOM_OF_PIPE, dstAccessMask=0
+    // i.e. it makes this pass's writes AVAILABLE and makes them visible to NOTHING. Every
+    // attachment above whose finalLayout is TRANSFER_SRC_OPTIMAL is then read by
+    // vkCmdCopyImageToBuffer a few commands later with no dependency at all -- and the final layout
+    // transition itself is a write of the whole image, which on RADV can be a DCC decompress. The
+    // copy racing that decompress reads part-compressed texels, so the SAME capture replayed twice
+    // produced different pixels: 20 offline `gpu_replay --bundle` runs of one frozen .prgbundle gave
+    // 11 distinct output hashes with identical output_bytes. Synchronization validation names it
+    // exactly: `SYNC-HAZARD-READ-AFTER-WRITE ... vkCmdCopyImageToBuffer reads VkImage <...>, which
+    // was previously written during an image layout transition initiated by vkCmdEndRenderPass`.
+    //
+    // The barrier the readback path DOES emit (`transition_color_to_readback`) is guarded on
+    // `persistent`, so it covers only the persistent-target route; a transient target's copy has
+    // never been ordered against the pass that filled it. Fixing it here rather than beside the copy
+    // covers every consumer of the pass's output in one place -- the transient readback, the
+    // persistent sample, and the depth/stencil plane copy -- and is the dependency Vulkan expects an
+    // application to declare.
+    //
+    // The incoming dependency is the mirror: attachments that LOAD (initialLayout
+    // COLOR_ATTACHMENT_OPTIMAL / DEPTH_STENCIL_ATTACHMENT_OPTIMAL) must be ordered after whatever
+    // wrote them, which may have been an earlier pass, a transfer upload or a compute writeback.
+    //
+    // PROSPER_NO_RENDERPASS_EXTERNAL_DEPS=1 restores the defaulted behaviour, so the A/B for this
+    // change is single-variable on ONE binary. Same reason PROSPER_NO_INDEX_ARENA and the
+    // PROSPER_NO_BACKEND_* family exist. It is a bisection lever, not a tunable: leaving it set
+    // reinstates the race.
+    static const bool no_renderpass_external_deps =
+        getenv("PROSPER_NO_RENDERPASS_EXTERNAL_DEPS") != nullptr;
+    constexpr VkPipelineStageFlags kAttachmentWriteStages =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    constexpr VkAccessFlags kAttachmentWriteAccess =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    std::array<VkSubpassDependency, 2> deps{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = kAttachmentWriteStages | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    deps[0].dstStageMask = kAttachmentWriteStages;
+    deps[0].srcAccessMask = kAttachmentWriteAccess | VK_ACCESS_TRANSFER_WRITE_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT;
+    deps[0].dstAccessMask = kAttachmentWriteAccess | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    deps[0].dependencyFlags = 0;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = kAttachmentWriteStages;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                           kAttachmentWriteStages;
+    deps[1].srcAccessMask = kAttachmentWriteAccess;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    deps[1].dependencyFlags = 0;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpci.attachmentCount = color_count + (use_ds ? 1u : 0u); rpci.pAttachments = att.data();
     rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    if (!no_renderpass_external_deps) {
+        rpci.dependencyCount = static_cast<uint32_t>(deps.size());
+        rpci.pDependencies = deps.data();
+    }
     VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
     std::array<VkImageView, prosper::gpu::kColorTargetCount + 1> fbviews{};
     fbviews[0] = view;
