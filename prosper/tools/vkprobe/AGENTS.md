@@ -15,8 +15,14 @@ it *avoids* prosper's **host-side Vulkan usage** — descriptor wiring, synchron
 lifetime, pass configuration — rather than reproducing it. So a failure here shows that usage is not
 NECESSARY for the defect; it never shows it is exonerated, and the difference matters because the
 same run also suggests something on prosper's side is amplifying. It does **not** clear the
-recompiler, because the SPIR-V under test is the recompiler's own output, and it does **not** clear
-the driver, because on a valid pipeline it reproduces #2945 itself.
+driver, because on a valid pipeline it reproduces #2945 itself.
+
+**It no longer leaves the recompiler in the suspect set either, and that is what `shaders/` is
+for.** Running prosper's own modules could never separate "the driver is wrong" from "the SPIR-V
+prosper emits is wrong", because both are present in every run. `shaders/` holds hand-written
+modules that do the same storage-buffer loads through the same descriptor shape, and `--vs-b/--fs-b`
+runs one of them beside a prosper module **in the same process**. That pair is the instrument that
+settled #2945 — read `shaders/AGENTS.md`.
 
 ## What belongs here
 
@@ -28,8 +34,12 @@ editing code.
 
 ## Boundary against its siblings
 
+- `shaders/` holds the SPIR-V prosper did **not** generate — the arm that takes the recompiler out
+  of the suspect set. Modules dumped from a capture do not belong there.
 - `tools/gpu_replay/` replays a capture **through prosper's backend**. That is the subject, not the
-  control.
+  control. `correlate_with_replay.sh` here runs the two alternately so their windows can be compared
+  round by round; it starts `gpu_replay` as a child process, which is not the linkage this folder
+  forbids.
 - `tools/spv_validate/` asks whether a module is *valid*; `vkprobe` asks whether it *renders*.
 - `tests/gpu/**` are assertions about prosper's behaviour and are compiled against it.
 

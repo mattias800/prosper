@@ -1696,6 +1696,31 @@ if(TARGET prosper_core)
   add_test(NAME spv_validate
            COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 
+  # tools/vkprobe/shaders (#2945): the HAND-WRITTEN SPIR-V controls -- the arm that separated
+  # "prosper's generated SPIR-V is malformed" from "the driver is wrong", by performing the same
+  # storage-buffer loads from a module prosper did not emit. Their entire value is being valid by
+  # construction, and this folder's recorded history is a control that reported confident numbers
+  # from an INVALID pipeline for weeks because nothing checked it. So the check is a test, not a
+  # README line: every .spvasm must assemble, land on SPIR-V 1.3, and pass spirv-val.
+  #
+  # Skipped, loudly, when the assembler is absent -- a validation gate that passes because its
+  # validator is missing is exactly the #1711 failure spv_validate above exists to prevent, and a
+  # silent skip is how instrument trap 126 reads a smaller suite as a green one.
+  find_program(SPIRV_AS_EXECUTABLE NAMES spirv-as)
+  find_program(SPIRV_VAL_EXECUTABLE NAMES spirv-val)
+  if(Python3_Interpreter_FOUND AND SPIRV_AS_EXECUTABLE AND SPIRV_VAL_EXECUTABLE)
+    add_test(NAME vkprobe_hand_written_controls
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/vkprobe/shaders/check_controls.py"
+                     "${SPIRV_AS_EXECUTABLE}" "${SPIRV_VAL_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/vkprobe/shaders"
+                     "${CMAKE_CURRENT_BINARY_DIR}")
+  else()
+    message(STATUS "vkprobe_hand_written_controls NOT registered: "
+                   "python3=${Python3_Interpreter_FOUND} spirv-as=${SPIRV_AS_EXECUTABLE} "
+                   "spirv-val=${SPIRV_VAL_EXECUTABLE}")
+  endif()
+
   # #2945: a recompiled VS must not declare more output components than the device can carry, and
   # the bound is what the FS actually reads. Carries its own mutation arm. Registered OUTSIDE the
   # Vulkan_FOUND block on purpose -- it inspects SPIR-V words and needs no device, so gating it on

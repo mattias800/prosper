@@ -1,0 +1,22 @@
+; minimal_green_fs.spvasm -- the fragment half of the hand-written control (#2945).
+; Writes opaque green, which is what prosper's dumped fragment module for the same draw writes, so
+; vkprobe's "differs from the blue clear" coverage predicate reads the two identically.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %colour
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %colour Location 0
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+     %colour = OpVariable %_ptr_Output_v4float Output
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+      %green = OpConstantComposite %v4float %float_0 %float_1 %float_0 %float_1
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+               OpStore %colour %green
+               OpReturn
+               OpFunctionEnd

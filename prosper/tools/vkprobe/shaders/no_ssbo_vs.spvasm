@@ -1,0 +1,67 @@
+; no_ssbo_vs.spvasm -- the DISCRIMINATOR arm for #2945: same draw, same descriptor layout, and the
+; vertex position does NOT come from memory.
+;
+; `minimal_ssbo_vs` and prosper's own module both compute gl_Position from storage-buffer loads, so
+; when their indexed draw comes back empty the observable cannot say WHICH fetch returned zero --
+; the storage-buffer load, or the index fetch that chose the vertex. This module removes the first
+; possibility: it declares the same set-0 binding-3 storage buffer (so the pipeline layout and the
+; descriptor writes are unchanged) but never reads it, and derives the three clip positions from
+; gl_VertexIndex with OpSelect.
+;
+; The constants reproduce, exactly, the geometry the sibling module reads out of vkprobe's default
+; records at an 8-byte stride -- (-1,-1), (0,1), (0,0) -- so a working draw covers the same 496
+; pixels of a 64x64 target and the arms are directly comparable.
+;
+;   this module's indexed draw comes back EMPTY too -> the defect is not storage-buffer loads;
+;                                                       it is the indexed draw path itself
+;   this module never comes back empty             -> the defect needs a storage-buffer load
+;
+; Assemble with:  spirv-as --target-env vulkan1.1 no_ssbo_vs.spvasm -o no_ssbo_vs.spv
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %vertex_index %per_vertex
+               OpDecorate %vertex_index BuiltIn VertexIndex
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpDecorate %PerVertex Block
+               OpDecorate %_runtimearr_uint ArrayStride 4
+               OpMemberDecorate %Records 0 Offset 0
+               OpDecorate %Records Block
+               OpDecorate %records DescriptorSet 0
+               OpDecorate %records Binding 3
+               OpDecorate %records NonWritable
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+    %v4float = OpTypeVector %float 4
+%_ptr_Input_int = OpTypePointer Input %int
+%vertex_index = OpVariable %_ptr_Input_int Input
+  %PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %PerVertex
+ %per_vertex = OpVariable %_ptr_Output_PerVertex Output
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+    %Records = OpTypeStruct %_runtimearr_uint
+%_ptr_StorageBuffer_Records = OpTypePointer StorageBuffer %Records
+    %records = OpVariable %_ptr_StorageBuffer_Records StorageBuffer
+     %uint_0 = OpConstant %uint 0
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %float_n1 = OpConstant %float -1
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+    %vid_int = OpLoad %int %vertex_index
+      %is_v0 = OpIEqual %bool %vid_int %int_0
+      %is_v1 = OpIEqual %bool %vid_int %int_1
+          %x = OpSelect %float %is_v0 %float_n1 %float_0
+      %y_v1x = OpSelect %float %is_v1 %float_1 %float_0
+          %y = OpSelect %float %is_v0 %float_n1 %y_v1x
+   %clip_pos = OpCompositeConstruct %v4float %x %y %float_0 %float_1
+    %out_ptr = OpAccessChain %_ptr_Output_v4float %per_vertex %uint_0
+               OpStore %out_ptr %clip_pos
+               OpReturn
+               OpFunctionEnd

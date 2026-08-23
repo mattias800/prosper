@@ -5,8 +5,28 @@ the process**, and report whether the draw rasterizes.
 
 ```
 vkprobe --vs vs.spv --fs fs.spv [--iterations 300] [--records FILE] [--indices 0,1,2]
-        [--extent 64x64] [--device N] [--verbose]
+        [--extent 64x64] [--device N] [--verbose] [--device-local-indices]
+        [--vs-b vs2.spv --fs-b fs2.spv] [--readback-dwords FIRST:COUNT] [--index-bits 16|32]
 ```
+
+**`--vs-b`/`--fs-b` render a SECOND module pair in the same process, interleaved render-by-render
+with the first, and report the two separately.** Use it for any comparison between two modules. The
+failure rate here drifts machine-wide over minutes — the identical command measured 0/20 in one
+ten-minute window and 12/12 in the next with nothing changed — so "run module A for a while, then
+module B" is void rather than negative, and two pipelines alive in one process is the only shape of
+the comparison that survives that. Both pipelines share one descriptor set layout, the union of what
+all the supplied modules declare, which is what makes it a comparison of the modules; it also means
+a paired run is not bit-identical in setup to either module run alone, so run both ways when that
+could matter.
+
+**`--readback-dwords FIRST:COUNT` turns an empty draw into three distinguishable answers.** Coverage
+alone cannot say whether an empty indexed draw means the vertex shader never ran, ran with all-zero
+indices, or ran correctly and lost the primitive afterwards — a degenerate triangle looks the same
+in all three. Those dwords of the record buffer are reset to `0xdeadbeef` before every render and
+read back after it, so a vertex shader that stores what it saw (`shaders/index_readback_vs.spvasm`)
+reports out of band. The tool prints the patterns per arm with `--` for a dword nothing wrote. A
+module that does not write leaves `[--,--,--]`, which is the readback path's own positive control:
+if it ever printed something else for a non-writing module it would be reporting stale bytes.
 
 Each iteration renders twice into two fresh targets — once with `vkCmdDraw`, once with
 `vkCmdBindIndexBuffer` + `vkCmdDrawIndexed` — and counts pixels that differ from the blue clear.
@@ -97,6 +117,31 @@ enables CORE validation only, so "zero findings" from it says nothing about sync
 VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation vkprobe --vs vs.spv --fs fs.spv --iterations 200
 ```
 
+## The verdict it reached, and the arm that made it possible (2026-08-23)
+
+Everything below this heading was written before the question was settled; keep it, because the ways
+this tool has been wrong are the reason to trust the answer. The answer itself:
+
+**#2945 is the driver or the hardware, not prosper's generated SPIR-V.** The module in
+`shaders/minimal_ssbo_vs.spvasm` performs the same storage-buffer loads through the same descriptor
+shape as prosper's dumped vertex module and was hand-written from the specification; run beside that
+module **in the same process** with `--vs-b`, it fails at the same rate. `shaders/no_ssbo_vs.spvasm`,
+which never reads the storage buffer at all, fails too — so the failure does not even require a
+storage-buffer load. All of them render correctly, on both arms, on **lavapipe**, from the same
+binary and the same files. Every module involved is `spirv-val` clean.
+
+Two things that follow for anyone using this tool:
+
+- **Reach for `--vs-b` with a `shaders/` module first.** Running a dumped module alone can never
+  separate "the driver is wrong" from "prosper emitted bad SPIR-V", because both are in every run.
+  A paired run separates them in one command.
+- **Concurrent GPU work from another process is what opens the failing window.** The "drift over
+  minutes" this README and `GRAPHICS.md` describe is not weather: three heavy `gpu_replay` full-submit
+  replays flipped a quiet machine into failing within one round and it recovered within ~15 s of
+  them stopping, and a second `vkprobe` used purely as a load reproduces it more weakly. So run the
+  control against a *quiet* GPU when you want a negative, and put a load beside it when you want the
+  defect. `pgrep -x 'prosper-app|screenshot|boot_trace'` will not see another agent's `gpu_replay`.
+
 **This probe has itself reproduced the #2945 class on a VALID pipeline, and that is its most
 important result so far.** On the corrected build, running
 `vkprobe --vs vs.spv --fs vs.spv.frag --iterations N` against #2937's module dump with default
@@ -111,3 +156,33 @@ reading a negative, and quote the number of RUNS as well as iterations — the f
 in shape, not per-iteration. Both failures happened to be the first execution after a relink; the
 obvious mechanism, a cold Mesa shader cache, is falsified (`MESA_SHADER_CACHE_DISABLE=true`, 0 of
 8x150 either way), so that correlation is unexplained at n=2.
+
+**And the strongest form of that warning, measured 2026-08-23: a run on an IDLE GPU is void, not
+negative.** The "per-process, drifts over minutes" shape above is concurrent GPU work by another
+process. On a quiet machine this family measures 0 failing runs of 48 per arm; three heavy
+`gpu_replay` full-submit replays flipped it to failing within one round of a 3-second detector loop,
+and it recovered within ~15 s of them stopping. Under sustained load the paired campaign measured 52
+failing runs of 400 for prosper's dumped module against 54 of 400 for the hand-written control, and
+142 of 400 for `no_ssbo_vs`. **So put load on the GPU before believing a null** — and note that
+`pgrep -x 'prosper-app|screenshot|boot_trace'` does not see another agent's `gpu_replay`, `vkprobe`
+or ctest, which is precisely the load that matters.
+
+### The rate table, so nobody re-derives it
+
+All 2026-08-23, Linux / AMD Radeon 8060S (RADV STRIX_HALO `0x1586`), Mesa 26.1.6 host, kernel 7.1.5.
+Paired runs are one process, interleaved render-by-render, 20 iterations per run.
+
+| arm | condition | failing RUNS | empty indexed iterations |
+| --- | --- | --- | --- |
+| prosper's dumped VS | sustained GPU load | 52 of 400 | 220 of 8,000 |
+| `minimal_ssbo_vs` (hand-written) | sustained GPU load, paired with the above | 54 of 400 | 228 of 8,000 |
+| `no_ssbo_vs` (hand-written) | sustained GPU load | 142 of 400 | 675 of 8,000 |
+| `index_readback_vs` (hand-written) | sustained GPU load, paired with the above | 138 of 400 | 669 of 8,000 |
+| all four, NON-indexed arm | sustained GPU load | — | **0 of 32,000** |
+| all four | idle GPU | 0 of 48 each | 0 |
+| prosper's VS, `minimal_ssbo_vs`, `no_ssbo_vs` | **lavapipe**, during a window RADV was failing 20/20 | 0 of 1 each | 0 of 20 each |
+
+The vertex-index readback over 7,320 indexed iterations under load: `[1,2,3]` 6,707, `[--,--,--]`
+377 (no vertex invocation ran), `[1,--,--]` 236 (all three invocations handed index 0); `[1,--,3]`
+and `[1,2,--]` — one index lost, the rest correct — also occur. The non-indexed arm was `[1,2,3]`
+on 7,320 of 7,320.
