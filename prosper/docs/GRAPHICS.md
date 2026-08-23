@@ -802,6 +802,42 @@ unsupported -> dispatch skipped (#590)`, so #590 costs a real 1920x1080 storage-
 frame on this title but does not separate a white frame from a good one.
 ### Renderer determinism (#2945 / #2932 / #2937)
 
+**START HERE — the reproduction, end to end, three seconds a sample.** Everything else in this
+section is what the reproduction was used to rule out. Do not re-derive it from a boot.
+
+```bash
+# ONCE: pull the scene submit out of the bundle attached to #2945 (~650 MB, ~40 s).
+gpu_replay --bundle frame_grab_PPSA02058_*.prgbundle --bundle-extract-submit 3537 s3537.prgcap
+
+# THE REPRODUCTION: one indexed draw, ~3 s, BINARY outcome.
+gpu_replay s3537.prgcap --draw 42
+#   hash=9068fcf09de07383   the half-screen composite triangle rendered   (correct)
+#   hash=a5e7b61cbf984383   the scanout is untouched: the draw drew nothing
+
+# WHAT FAILS, directly observed rather than inferred:
+PROSPER_GEOM_PROBE=42 gpu_replay s3537.prgcap --draw 42 --recompile-raw
+#   [geom-probe] verts-written=3 finite=3 on-screen=0 clipped=3 (offscreen=3 w<=0=3 nan/inf=0)
+#   [geom-probe]   clip-bbox x[-1,-1] y[1,1] z[0,0] w[0,0] -> DEGENERATE
+#   i.e. every storage-buffer load in the vertex shader returned 0, so all three vertices
+#   collapse to one clip point with w=0 and the clipper discards the primitive.
+
+# WHAT IS PROVABLY IDENTICAL between a good and a bad run -- do not re-check these:
+PROSPER_BUFLOG=1        gpu_replay s3537.prgcap --draw 42   # host-side source words
+PROSPER_BUFFER_ECHO=1   gpu_replay s3537.prgcap --draw 42   # DEVICE-side slices + index buffer,
+                                                            # and the descriptor set/offset/range
+RADV_DEBUG=shaders      gpu_replay s3537.prgcap --draw 42   # the compiled ISA
+```
+
+Draw 42 was found by prefix bisect: `--through-operation N` over 8 replays each is 1 distinct hash
+through operation 55 and 3 of 8 at 56, and operation 56 is that draw. Draws 0, 1, 7, 9, 11, 31, 32
+and 41 replay deterministically 8 of 8 while 42, 43, 60 and 90 do not — the affected ones are all in
+the same six-attachment 4K scanout pass, which is the sharpest untested lead in this section.
+
+**And the same class reproduces with no prosper code in the process** —
+`tools/vkprobe --vs vs.spv --fs vs.spv.frag --iterations 200`. Read that tool's README before
+quoting anything from it, including a clean run.
+
+
 The observable is one frozen `.prgbundle` replayed offline by `gpu_replay` producing a different
 picture from run to run. Everything below was measured on master `99d5f738`, Linux / AMD Radeon
 8060S (RADV STRIX_HALO), Mesa 26.1.4.
