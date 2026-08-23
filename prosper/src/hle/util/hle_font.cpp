@@ -192,9 +192,15 @@ FontFace* face(void* handle) {
 // consumes this block right up to its last byte. Nothing live sits inside the range this file
 // memsets.
 //
-// FIVE fields are read back, at eboot+0x1001412..0x100143f. (This comment said "four" until
-// review re-disassembled the range and found +0x30; the count is spelled out here because the
-// wrong one told the next reader there was nothing to look at.)
+// SIX fields are read back, across FOUR read instructions, at eboot+0x1001412..0x100143f:
+//   1001412  mov    rax,[rbp-0x28]   -> +0x38 and +0x3c
+//   100141a  mov    eax,[rbp-0x50]   -> +0x10
+//   1001420  vmovsd xmm0,[rbp-0x38]  -> +0x28 and +0x2c
+//   1001432  vmovss xmm1,[rbp-0x30]  -> +0x30
+// The instruction listing is here because the count kept coming out wrong: this comment first said
+// "four", review corrected it to "five" by incrementing that number, and re-review found that
+// neither counts anything in the range. Two reads are qwords covering two fields each. The number
+// mattered because the wrong one told the next reader there was nothing to look at at +0x30.
 //   +0x10 -> the glyph cache entry's row STRIDE. It has to be the surface's pitch: the engine
 //            later blits with `src + col + stride*row` straight out of the surface buffer
 //            (eboot+0x1001a5b..0x1001a63), so any other value walks the wrong rows.
@@ -305,8 +311,14 @@ void blit_glyph(const RenderSurface* surf, const uint8_t* glyph, int gw, int gh,
     // exactly that (`sceFontRenderSurfaceInit(..., pixel_size=1, ...)` at eboot+0x100152a, and the
     // live probe agrees), and nothing else in the corpus reaches here -- but a wider surface would
     // otherwise get 8-bit coverage smeared across it with no diagnostic, which is a silent skip
-    // where the charter asks for a loud one. It stays in bounds either way; the complaint is that
-    // it would look handled.
+    // where the charter asks for a loud one.
+    //
+    // Refusing is fail-visible IN THE GAME as well as on stderr, which is the real justification
+    // and is better than "it stays in bounds": reporting a zero drawn size makes this title
+    // substitute U+005F. Its wrapper re-reads `result+0x38`/`+0x3c` at eboot+0x100168f/0x100169c
+    // and, if either is zero, re-renders `_` (eboot+0x10016a9, `mov esi,0x5f`) -- exempting only
+    // U+0020 and U+3000, which is also why the whitespace `return 0` below is correct rather than
+    // lossy. So an unsupported surface format shows up as a line of underscores, not as nothing.
     if (surf->pixel_size != 1) {
         static bool warned = false;
         if (!warned) {
@@ -463,6 +475,10 @@ int32_t font_close(void* handle) {
     if (!handle) return 0;
     auto* f = face(handle);
     if (!f) return static_cast<int32_t>(0x80540002u);
+    // Scrub the magic before freeing so a double close is caught by the check above deterministically
+    // rather than by luck. It usually would be anyway -- glibc's tcache overwrites the first 16 bytes
+    // of a freed chunk -- but "usually, on this allocator" is not a property to rely on.
+    f->magic = 0;
     delete f;
     return 0;
 }
@@ -595,7 +611,9 @@ int32_t font_surface_set_scissor(RenderSurface* surface, int32_t x, int32_t y,
     // Clamping a negative origin to 0 has to take the same amount off the extent, or the rectangle
     // slides instead of being cropped: (-10, 0, 20, 20) is x in [-10,10), and clamping the origin
     // alone would turn it into [0,20) -- twice the requested area, half of it never asked for.
-    // Same fail-open asymmetry as the empty-scissor case in blit_glyph.
+    // Same fail-open asymmetry as the empty-scissor case in blit_glyph -- and it inherits that
+    // function's `CONFIDENCE: MED` on the trailing pair being {w, h}: under {x1, y1} this
+    // over-clips, which is the safe direction and consistent with `font_surface_init`'s seeding.
     auto crop = [](int origin, int extent, uint32_t* out_origin, uint32_t* out_extent) {
         int64_t o = origin, e = std::max(extent, 0);
         if (o < 0) { e = std::max<int64_t>(0, e + o); o = 0; }
