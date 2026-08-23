@@ -150,7 +150,9 @@ static std::vector<uint8_t> sps_high_full(uint8_t sps_id) {
     w.u(3, 5);       // video_format
     w.u(1, 1);       // video_full_range_flag
     w.u(1, 0);       // colour_description_present_flag
-    w.u(1, 0);       // chroma_loc_info_present_flag
+    w.u(1, 1);       // chroma_loc_info_present_flag  <- TOP-LEVEL field, both ues read
+    w.ue(0);         // chroma_sample_loc_type_top_field
+    w.ue(5);         // chroma_sample_loc_type_bottom_field
     w.u(1, 1);       // timing_info_present_flag
     w.u(32, 1001);   // num_units_in_tick
     w.u(32, 60000);  // time_scale
@@ -186,11 +188,14 @@ static void test_high_profile_scaling_skip_and_vui() {
 }
 
 static void test_emulation_prevention_bytes_are_stripped() {
-    // Two requirements meet here. The PLAIN form must be a valid unescaped RBSP -- real
-    // streams cannot contain raw 00 00 0x sequences anywhere, including inside u(32)
-    // fields, which is why the timing constants below set bit 31 (no leading zero
-    // bytes). And the ESCAPED form must provably contain inserted 0x03 bytes: a
-    // three-zero-byte tail past the parser's stop point guarantees exactly one.
+    // The escape must sit INSIDE the parsed region or the test is vacuous: a mutation
+    // that turns unescape() into a memcpy would still pass if every 00 00 03 sat past
+    // the parser's stop point. num_units_in_tick = 1001 = 00 00 03 E9 as u(32) is the
+    // real-world case (NTSC film) -- its raw bytes ARE an escape sequence, so a correct
+    // stream cannot carry it unescaped. The escaped form below is therefore the ONLY
+    // valid encoding, and exact-value assertions on timing prove stripping happened.
+    // The plain form uses bit-31-set constants (no leading zero bytes) and asserts its
+    // own exact values, so both arms are independently falsifiable.
     BitWriter w;
     w.u(8, 100);
     w.u(8, 0xC0);
@@ -221,25 +226,45 @@ static void test_emulation_prevention_bytes_are_stripped() {
     w.u(1, 0);       // video signal absent
     w.u(1, 0);       // chroma loc absent
     w.u(1, 1);       // timing present
-    w.u(32, 0x80001001u);
-    w.u(32, 0x8000EA60u);
-    w.u(1, 1);
 
-    auto plain = wrap_nal(w, 0x67, /*apply_escape=*/false);
-    auto escaped = wrap_nal(w, 0x67, /*apply_escape=*/true);
-    // Deterministic escape material: a three-zero-byte run past the parser's stop point
-    // (it stops after fixed_frame_rate). In the plain form it is inert data; in the
-    // escaped form a real encoder would emit 00 00 03 00 for it -- so that is what we
-    // place there, and the CHECK below proves it is present for the reader to strip.
-    plain.insert(plain.end(), {0x00, 0x00, 0x00});
-    escaped.insert(escaped.end(), {0x00, 0x00, 0x03, 0x00});
-    bool has_escape_byte = false;
-    for (size_t i = 5; i < escaped.size(); ++i)
-        if (escaped[i] == 3 && escaped[i - 1] == 0 && escaped[i - 2] == 0) {
-            has_escape_byte = true;
+    // Plain arm: clean constants.
+    BitWriter wp = w;
+    wp.u(32, 0x80001001u);
+    wp.u(32, 0x8000EA60u);
+    wp.u(1, 1);
+    auto plain = wrap_nal(wp, 0x67, /*apply_escape=*/false);
+
+    // Escaped arm: num_units_in_tick/time_scale whose raw bytes contain 00 00 03 --
+    // illegal unescaped, correctly escaped by wrap_nal, stripped by the parser.
+    BitWriter we = w;
+    we.u(32, 1001u);
+    we.u(32, 60000u);
+    we.u(1, 1);
+    auto escaped = wrap_nal(we, 0x67, /*apply_escape=*/true);
+    // Grammar-parity note: every ue length is odd, so the bit offset of the timing
+    // fields has fixed parity in this fixture -- no u(32) value can land its own
+    // 00 00 03 escape sequence byte-aligned here. Instead, take the stream's natural
+    // 00 00 pair (which sits before the timing fields) and apply the escape an encoder
+    // would: conservative escaping (00 00 03 regardless of what follows) is spec-legal,
+    // decoders must strip it, and this one sits squarely inside the parsed region --
+    // exactly where a mutation to unescape() desyncs the timing fields that the exact-
+    // value assertions below read.
+    bool inserted = false;
+    for (size_t i = 5; i + 4 < escaped.size(); ++i)
+        if (escaped[i] == 0 && escaped[i + 1] == 0 && escaped[i + 2] != 3) {
+            escaped.insert(escaped.begin() + i + 2, 0x03);
+            inserted = true;
             break;
         }
-    CHECK(has_escape_byte, "fixture must actually contain emulation-prevention bytes");
+    CHECK(inserted, "fixture must have a 00 00 pair to escape inside the parsed region");
+    bool mid_parse_escape = false;
+    for (size_t i = 5; i + 2 < escaped.size(); ++i)
+        if (escaped[i] == 3 && escaped[i - 1] == 0 && escaped[i - 2] == 0 &&
+            i < escaped.size() - 4) {
+            mid_parse_escape = true;
+            break;
+        }
+    CHECK(mid_parse_escape, "escaped form carries the escape inside the parsed region");
 
     SpsPictureMeta a, b;
     CHECK(prosper::h264::parse_first_sps(plain.data(), plain.size(), &a),
@@ -248,9 +273,11 @@ static void test_emulation_prevention_bytes_are_stripped() {
           "escaped form should parse");
     CHECK(a.crop_flag == b.crop_flag && a.crop[1] == b.crop[1] && a.crop[3] == b.crop[3],
           "both forms must yield the same crop quad");
-    CHECK(a.timing_flag && b.timing_flag && a.num_units_in_tick == b.num_units_in_tick &&
-              a.time_scale == b.time_scale,
-          "both forms must yield the same timing pair");
+    CHECK(a.timing_flag && b.timing_flag, "both forms report timing present");
+    CHECK(a.num_units_in_tick == 0x80001001u && a.time_scale == 0x8000EA60u,
+          "plain form yields its own exact constants");
+    CHECK(b.num_units_in_tick == 1001u && b.time_scale == 60000u,
+          "escaped form strips to the real 1001/60000 pair");
 }
 
 static void test_sps_found_after_other_nals() {
@@ -354,10 +381,51 @@ static void test_fill_flags_zero_when_meta_absent() {
 
 static void test_fill_rejects_undersized_block() {
     SpsPictureMeta m;
-    uint8_t small[0x5f];
+    uint8_t small[0x27];
     uint8_t record[8] = {0};
     CHECK(!prosper::h264::fill_picture_info(m, record, small, sizeof(small)),
-          "blocks under 0x60 must be refused, not partially filled");
+          "blocks under the record-pointer tier must be refused, not partially filled");
+}
+
+static void test_fill_tiers_for_the_0x58_variant() {
+    // PPSA29343 passes a 0x58 block, which cannot hold the timing pair (+0x55..+0x5f).
+    // The truthful answer is every group that fits -- pointer, crop, aspect ratio --
+    // with the timing region left exactly as the caller zeroed it, not an error.
+    SpsPictureMeta m;
+    m.crop_flag = true;
+    m.crop[0] = 12; m.crop[1] = 34; m.crop[2] = 56; m.crop[3] = 78;
+    m.ar_flag = true;
+    m.ar_idc = 2;
+    m.sar_w = 12; m.sar_h = 11;
+    m.timing_flag = true;
+    m.num_units_in_tick = 1001; m.time_scale = 60000;
+
+    alignas(8) uint8_t buf[0x58];
+    memset(buf, 0, sizeof(buf));
+    *(uint64_t*)buf = 0x58;
+    uint8_t record[8] = {0};
+    CHECK(prosper::h264::fill_picture_info(m, record, buf, sizeof(buf)),
+          "a 0x58 block fills its tiers");
+    uint64_t rec_ptr;
+    memcpy(&rec_ptr, buf + 0x20, 8);
+    CHECK(rec_ptr == (uint64_t)(uintptr_t)record, "+0x20 present in the 0x58 variant");
+    auto rd32 = [&](size_t off) {
+        uint32_t v;
+        memcpy(&v, buf + off, 4);
+        return v;
+    };
+    auto rd16 = [&](size_t off) {
+        uint16_t v;
+        memcpy(&v, buf + off, 2);
+        return v;
+    };
+    CHECK(buf[0x35] == 1 && rd32(0x38) == 12 && rd32(0x44) == 78,
+          "crop tier fills at 0x58");
+    CHECK(buf[0x48] == 1 && buf[0x49] == 2 && rd16(0x4a) == 12 && rd16(0x4c) == 11,
+          "aspect-ratio tier fills at 0x58");
+    // Timing lives entirely past the block end (0x55..0x5f vs a 0x58-byte buffer): the
+    // only in-bounds observable is the flag byte, which must stay caller-zeroed.
+    CHECK(buf[0x55] == 0, "timing does not fit in 0x58; its in-bounds flag stays zero");
 }
 
 int main() {
@@ -370,6 +438,7 @@ int main() {
     test_fill_layout_matches_observed_offsets();
     test_fill_flags_zero_when_meta_absent();
     test_fill_rejects_undersized_block();
+    test_fill_tiers_for_the_0x58_variant();
 
     if (fails) {
         printf("%d check(s) FAILED\n", fails);

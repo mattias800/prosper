@@ -235,11 +235,12 @@ bool parse_first_sps(const uint8_t* au, size_t n, SpsPictureMeta* out) {
         }
         // chroma_loc_info_present_flag is a TOP-LEVEL VUI field -- it does not sit
         // inside video_signal_type. Nesting it there desynced every stream that omits
-        // video signal info and carried timing instead.
+        // video signal info and carried timing instead. When present it carries TWO
+        // ue fields (top-field then bottom-field sample loc types, E.1.1).
         {
             uint32_t chroma_loc;
             if (!br.u(1, &chroma_loc)) return false;
-            if (chroma_loc && !br.ue(&f)) return false;
+            if (chroma_loc && (!br.ue(&f) || !br.ue(&f))) return false;
         }
         uint32_t timing;
         if (!br.u(1, &timing)) return false;
@@ -261,9 +262,12 @@ bool parse_first_sps(const uint8_t* au, size_t n, SpsPictureMeta* out) {
 
 bool fill_picture_info(const SpsPictureMeta& meta, void* record, void* pic_info,
                        size_t size) {
-    // 0x5c..0x5f is the highest observed read (time_scale), so anything smaller cannot
-    // hold the fields the guest will fetch.
-    if (size < 0x60) return false;
+    // Tiered by the caller's declared size (see the header): the record pointer needs
+    // 0x28 bytes, crop ends at 0x48, aspect ratio at 0x4e, timing at 0x60. The 0x58
+    // variant Beast passes cannot hold timing -- refusing the whole block there would
+    // hand a title that TESTS return values an error where "everything but timing" is
+    // the truthful answer.
+    if (size < 0x28) return false;
     auto* p = (uint8_t*)pic_info;
     auto w32 = [&](size_t off, uint32_t v) {
         p[off] = (uint8_t)v;
@@ -279,23 +283,29 @@ bool fill_picture_info(const SpsPictureMeta& meta, void* record, void* pic_info,
     uint64_t rec = (uint64_t)(uintptr_t)record;
     for (int i = 0; i < 8; ++i) p[0x20 + i] = (uint8_t)(rec >> (8 * i));
 
-    p[0x35] = meta.crop_flag ? 1 : 0;
-    if (meta.crop_flag) {
-        w32(0x38, meta.crop[0]);
-        w32(0x3c, meta.crop[1]);
-        w32(0x40, meta.crop[2]);
-        w32(0x44, meta.crop[3]);
+    if (size >= 0x48) {
+        p[0x35] = meta.crop_flag ? 1 : 0;
+        if (meta.crop_flag) {
+            w32(0x38, meta.crop[0]);
+            w32(0x3c, meta.crop[1]);
+            w32(0x40, meta.crop[2]);
+            w32(0x44, meta.crop[3]);
+        }
     }
-    p[0x48] = meta.ar_flag ? 1 : 0;
-    if (meta.ar_flag) {
-        p[0x49] = meta.ar_idc;
-        w16(0x4a, meta.sar_w);
-        w16(0x4c, meta.sar_h);
+    if (size >= 0x4e) {
+        p[0x48] = meta.ar_flag ? 1 : 0;
+        if (meta.ar_flag) {
+            p[0x49] = meta.ar_idc;
+            w16(0x4a, meta.sar_w);
+            w16(0x4c, meta.sar_h);
+        }
     }
-    p[0x55] = meta.timing_flag ? 1 : 0;
-    if (meta.timing_flag) {
-        w32(0x58, meta.num_units_in_tick);
-        w32(0x5c, meta.time_scale);
+    if (size >= 0x60) {
+        p[0x55] = meta.timing_flag ? 1 : 0;
+        if (meta.timing_flag) {
+            w32(0x58, meta.num_units_in_tick);
+            w32(0x5c, meta.time_scale);
+        }
     }
     return true;
 }

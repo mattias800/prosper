@@ -54,11 +54,16 @@ void resolve_sar(uint8_t idc, uint32_t ext_w, uint32_t ext_h, uint32_t* w, uint3
 // it alive with the decoder). Offsets above +0x5f are unobserved and left untouched --
 // this function never writes a byte the guest has not been seen reading.
 //
+// FILLING IS TIERED by the caller's declared size, because the corpus contains a 0x58
+// variant (PPSA29343) that cannot hold the timing pair: every group is written only when
+// it fits completely -- the record pointer needs 0x28 bytes, crop ends at 0x48, aspect
+// ratio at 0x4e, timing at 0x60. A block smaller than the first tier is refused.
+//
 // CONFIDENCE: HIGH that these offsets are read at these instructions; MED on the
 // left/right/top/bottom ORDER within the crop quad (the guest only sums the pairs) and
 // on the SPS/VUI naming itself, which is an inference from the access pattern.
-// Returns false when `size` cannot hold the observed fields (< 0x60), in which case the
-// caller must not write anything.
+// Returns false when even the record-pointer tier does not fit (< 0x28), in which case
+// the caller must not write anything.
 bool fill_picture_info(const SpsPictureMeta& meta, void* record, void* pic_info,
                        size_t size);
 

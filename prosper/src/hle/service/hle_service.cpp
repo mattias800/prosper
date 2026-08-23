@@ -1103,12 +1103,16 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     auto* pic = PW(a1);
     if (!pic) return VDEC_ERR_ARG;
     // Self-sizing convention: the caller's first field declares the block's length.
+    // Observed variants: 0xb8 and 0x78 and 0x58 (PPSA29343's three sites). The fill is
+    // tiered (see h264_sps.hpp), so anything from 0x28 up gets every group that fits;
+    // below that the guest could not read even the +0x20 pointer back.
     const uint64_t declared = *(const uint64_t*)pic;
-    if (declared < 0x60 || declared > 0x1000) {
+    if (declared < 0x28 || declared > 0x1000) {
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 4)
-            fprintf(stderr, "[vdec] %s: pictureInfo size 0x%llx is outside every observed "
-                            "variant (0x58/0x78/0xb8, #2898) -- rejected\n",
+            fprintf(stderr, "[vdec] %s: pictureInfo size 0x%llx cannot hold the observed "
+                            "field set (smallest tier 0x28; observed variants "
+                            "0x58/0x78/0xb8, #2898) -- rejected\n",
                     which, (unsigned long long)declared);
         return VDEC_ERR_STRUCT;
     }
@@ -1124,7 +1128,16 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     // arrays could key on. PROSPER_VDEC2_PICINFO_ECHO_FRAME=1 tests that reading.
     static const bool echo_frame = [] {
         const char* v = getenv("PROSPER_VDEC2_PICINFO_ECHO_FRAME");
-        return v && *v == '1';
+        if (v && *v == '1') {
+            fprintf(stderr, "[vdec] %s: PROSPER_VDEC2_PICINFO_ECHO_FRAME armed -- +0x20 "
+                            "will echo outputInfo->frame. DIAGNOSTIC ONLY: measured on "
+                            "PPSA06367 this faults at image+0x105ed54 (the guest derefs "
+                            "*record as a pointer to the payload), which is the evidence "
+                            "that falsified the frame-echo reading (#2967)\n",
+                    "sceVideodec2GetPictureInfo");
+            return true;
+        }
+        return false;
     }();
     {
         std::lock_guard<std::mutex> lk(g_vdec_mx);
@@ -1157,14 +1170,8 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
             fprintf(stderr, "[vdec] %s: no SPS parsed for frame=0x%llx; filling flags as absent "
                             "(#2898)\n", which, (unsigned long long)out->frame);
     }
-    if (!prosper::h264::fill_picture_info(meta, record, pic, (size_t)declared)) {
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) < 4)
-            fprintf(stderr, "[vdec] %s: pictureInfo size 0x%llu too small for the observed "
-                            "field set (>=0x60) -- rejected\n",
-                    which, (unsigned long long)declared);
-        return VDEC_ERR_STRUCT;
-    }
+    if (!prosper::h264::fill_picture_info(meta, record, pic, (size_t)declared))
+        return VDEC_ERR_STRUCT;  // unreachable: the guard above admits only tiers the fill handles
     return 0;
 }
 HLE(s_videodec2_picture_info) {
