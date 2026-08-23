@@ -3324,26 +3324,49 @@ void install_trap_handler() {
     // its interval, and of naming no writer. Use it to BOUND the event in time, then point an
     // exact instrument at that window.
     //
-    // Reads go through the same probe_readable() pipe trick the fault dumper uses, so an address
-    // that is not mapped yet is skipped rather than crashing the poller — the slot may legitimately
-    // appear late in boot.
+    // Readability is probed on the poller's OWN pipe pair, not the shared g_probe_pipe. That
+    // sharing would be a real defect rather than untidiness: probe_readable's safety argument is
+    // explicitly single-user ("we drain what we wrote immediately so the pipe can never fill"),
+    // the fds are O_NONBLOCK, and a 1 kHz poller interleaving with the SIGSEGV dumper, HWBP,
+    // DUMPAT or bp_il2cpp_cname could leave the pipe holding another thread's bytes — after which
+    // a raw_write returns EAGAIN and probe_readable answers FALSE FOR A READABLE ADDRESS. That is
+    // a silent false negative in the fault dumper, in exactly the run where it matters. Raised in
+    // review of #2954.
+    //
+    // Two residual limits, both accepted because this is a default-off diagnostic. (a) TOCTOU: the
+    // guest can unmap between the probe and the load, and this host thread installs no
+    // sigaltstack, so such a fault surfaces as a WORKER-THREAD FAULT on a thread that has nothing
+    // to do with the guest — instrument, not subject. (b) The thread is detached and exits only
+    // after 4096 logged changes, so it can be inside fprintf while exit() tears stdio down.
+    // Point it at slots you expect to change a bounded number of times.
+    //
+    // The block-scope statics plus a capture-less lambda are safe because install_trap_handler()
+    // runs exactly once per process; that is load-bearing, not incidental.
     if (const char* pw = getenv("PROSPER_POLLWATCH")) {
         static uint64_t addrs[6]; static int n = 0;
+        static int poll_pipe[2] = {-1, -1};
         const char* s2 = pw;
         while (*s2 && n < 6) {
             addrs[n++] = strtoull(s2, nullptr, 0);
             const char* comma = strchr(s2, ','); if (!comma) break; s2 = comma + 1;
         }
-        ensure_probe_pipe();
-        if (n > 0) {
+        if (n > 0 && pipe2(poll_pipe, O_CLOEXEC | O_NONBLOCK) == 0) {
             fprintf(stderr, "[pollwatch] watching %d slot(s), 1 ms interval\n", n);
             std::thread([] {
                 static uint64_t last[6]; static bool seen[6];
+                // Private twin of probe_readable(): a pipe write imports the source pages, so an
+                // unmapped address returns EFAULT instead of faulting the poller.
+                auto readable = [](uint64_t a) {
+                    if (a < 0x1000) return false;
+                    long w = raw_write(poll_pipe[1], (const void*)a, 8);
+                    if (w > 0) { char b[8]; syscall(SYS_read, poll_pipe[0], b, (size_t)w); }
+                    return w == 8;
+                };
                 const auto t0 = std::chrono::steady_clock::now();
                 int changes = 0;
                 while (changes < 4096) {
                     for (int i = 0; i < n; i++) {
-                        if (!probe_readable(addrs[i])) continue;
+                        if (!readable(addrs[i])) continue;
                         const uint64_t v = *(const volatile uint64_t*)addrs[i];
                         if (seen[i] && v == last[i]) continue;
                         const double ms = std::chrono::duration<double, std::milli>(

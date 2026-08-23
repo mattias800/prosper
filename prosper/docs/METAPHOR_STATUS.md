@@ -82,9 +82,12 @@ reported. There is no environment lever that helps: shifting `PROSPER_DMEM_BUDGE
 the advertised size and the pool, so the same `kDmemBase` bytes fall off the end whatever the
 budget is.
 
-**Fix:** `kDmemBase` is now `0x4000` — one 16 KiB granule, retained only so a successful allocation
-never returns physical offset 0. The pool now lives inside the offset space the guest is told it
-has. With it, the 4 MiB request succeeds at `phys=0x3ff600000`, the resource loads, and the
+**Fix:** `kDmemBase` is now `0x10000` — 64 KiB. Small enough that the unreachable tail is
+negligible, non-zero so a successful allocation never returns physical offset 0, and a multiple of
+the Windows allocation granularity, which review established is load-bearing: the Windows arm maps
+its section at `phys - kDmemBase`, and `map_section_view`'s `MapViewOfFileEx` fallback depends on
+that offset staying congruent to `phys` mod 64 KiB. The pool now lives inside the offset space the
+guest is told it has. With it, the 4 MiB request succeeds at `phys=0x3ff600000`, the resource loads, and the
 `swap32(-1)` never happens.
 
 This is a cross-title defect that happened to be fatal here: any guest that partitions the whole
@@ -150,9 +153,13 @@ One line per hypothesis this work killed, so nobody re-derives it at full cost.
   `PROSPER_RENDER` unset reproduces the corruption byte-for-byte — same addresses, same reversed
   values, same `CRI Server Mana` fault. A GPU write-back with a channel-order swap would have been
   an exact fit for an 8-in-32 reversal, and it is not the mechanism. #2934.
-- **prosper did not write the reversed bytes at all.** `grep -rn 'bswap\|byteswap\|__builtin_bswap\|htonl\|htobe32\|be32toh\|std::byteswap' prosper/src`
-  returns **zero** matches; there is no byte-swapping code anywhere in the emulator. The writer was
-  always going to be guest code, which is what `PROSPER_HWWATCH_ABS` then confirmed. #2934.
+- **prosper did not write the reversed bytes at all.** `grep -rn 'bswap\|byteswap\|__builtin_bswap\|htonl\|htobe32\|be32toh\|std::byteswap'`
+  returns **zero** matches over the whole `prosper` tree — and the wider scope is the point, because
+  `prosper/src` alone would not have established it: the live renderer is in
+  `tests/fixtures/render_runner.h`, outside `src/`. (Widened during review; the only hits anywhere
+  are vendored SDL3 headers under a build directory.) There is no byte-swapping code in the
+  emulator, so the writer was always going to be guest code — which is what `PROSPER_HWWATCH_ABS`
+  then confirmed. #2934.
 - **The four unregistered NIDs called before the fault are not the cause.** `sceHttp2CreateTemplate`
   (`+wCt7fCijgk`), `sceAmprCommandBufferGetNumCommands` (`gzndltBEzWc`),
   `sce::Json::InitParameter2`'s constructor (`GvGvswb0v34`) and `sceRtcGetDayOfWeek`

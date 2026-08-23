@@ -893,11 +893,31 @@ namespace {
     // buffer, and its own read-with-endian-swap helper then byte-swapped `(uint32)-1` bytes in
     // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/METAPHOR_STATUS.md.
     //
-    // One granule is still withheld so a successful allocation never RETURNS physical offset 0.
-    // That is conservatism, not a derived requirement: nothing in this file needs it (`have_phys`
-    // is a bool, not `phys != 0`), but a zero physical offset is the kind of value downstream code
-    // reads as "absent", and 16 KiB is not worth the audit.
-    constexpr uint64_t kDmemBase  = 0x4000;
+    // Three constraints fix the value, and only the first is about the guest:
+    //
+    //  1. It must be SMALL, for the reason above.
+    //  2. It must be a multiple of the **Windows allocation granularity (64 KiB)**, and that is a
+    //     hard requirement rather than tidiness. The POSIX arm uses `phys` directly as the memfd
+    //     offset, but the Windows arm maps a `kDmemTotal`-sized section at `rel = phys - kDmemBase`
+    //     (see `map_section_view`, and the same subtraction in the unmap and remap paths). Only a
+    //     64 KiB-aligned base keeps `rel` congruent to `phys` mod 64 KiB, and `map_section_view`'s
+    //     `MapViewOfFileEx` fallback depends on that congruence twice: the hinted path refuses a
+    //     hint that is not `delta`-congruent, and the zero-hint path returns `view + delta`, which
+    //     a `requested_align >= 0x10000` then rejects. A base of 0x4000 makes `delta` permanently
+    //     0xC000 for every 64 KiB-aligned allocation and breaks both. The placeholder path
+    //     (`MapViewOfFile3`) is page-granular and unaffected, so this only bites where the modern
+    //     APIs are absent or a placeholder cannot be acquired — which is exactly the kind of
+    //     narrow, platform-specific regression a Linux-only test run cannot see. Found in review
+    //     of #2954.
+    //  3. It must be NON-ZERO, so a successful allocation never returns physical offset 0. That
+    //     third one is conservatism rather than a derived requirement — nothing in this file needs
+    //     it (`have_phys` is a bool, not `phys != 0`; the `phys_out > 0xffff` guard elsewhere
+    //     validates the OUT POINTER, not the offset) — but a zero physical offset is the kind of
+    //     value downstream code reads as "absent", and one granule is not worth the audit.
+    //
+    // 64 KiB satisfies all three, and costs 48 KiB more unreachable tail than the smallest value
+    // that satisfies (1) and (3) alone — against the 256 MiB this replaces, nothing.
+    constexpr uint64_t kDmemBase  = 0x10000;
     // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
     // reports the GAME budget (aperture minus OS reservation), not the raw 16 GiB aperture; UE
     // sizes allocator pools from this value (#1213 investigation). PROSPER_DMEM_BUDGET_MB
@@ -3788,11 +3808,31 @@ namespace {
     // buffer, and its own read-with-endian-swap helper then byte-swapped `(uint32)-1` bytes in
     // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/METAPHOR_STATUS.md.
     //
-    // One granule is still withheld so a successful allocation never RETURNS physical offset 0.
-    // That is conservatism, not a derived requirement: nothing in this file needs it (`have_phys`
-    // is a bool, not `phys != 0`), but a zero physical offset is the kind of value downstream code
-    // reads as "absent", and 16 KiB is not worth the audit.
-    constexpr uint64_t kDmemBase  = 0x4000;
+    // Three constraints fix the value, and only the first is about the guest:
+    //
+    //  1. It must be SMALL, for the reason above.
+    //  2. It must be a multiple of the **Windows allocation granularity (64 KiB)**, and that is a
+    //     hard requirement rather than tidiness. The POSIX arm uses `phys` directly as the memfd
+    //     offset, but the Windows arm maps a `kDmemTotal`-sized section at `rel = phys - kDmemBase`
+    //     (see `map_section_view`, and the same subtraction in the unmap and remap paths). Only a
+    //     64 KiB-aligned base keeps `rel` congruent to `phys` mod 64 KiB, and `map_section_view`'s
+    //     `MapViewOfFileEx` fallback depends on that congruence twice: the hinted path refuses a
+    //     hint that is not `delta`-congruent, and the zero-hint path returns `view + delta`, which
+    //     a `requested_align >= 0x10000` then rejects. A base of 0x4000 makes `delta` permanently
+    //     0xC000 for every 64 KiB-aligned allocation and breaks both. The placeholder path
+    //     (`MapViewOfFile3`) is page-granular and unaffected, so this only bites where the modern
+    //     APIs are absent or a placeholder cannot be acquired — which is exactly the kind of
+    //     narrow, platform-specific regression a Linux-only test run cannot see. Found in review
+    //     of #2954.
+    //  3. It must be NON-ZERO, so a successful allocation never returns physical offset 0. That
+    //     third one is conservatism rather than a derived requirement — nothing in this file needs
+    //     it (`have_phys` is a bool, not `phys != 0`; the `phys_out > 0xffff` guard elsewhere
+    //     validates the OUT POINTER, not the offset) — but a zero physical offset is the kind of
+    //     value downstream code reads as "absent", and one granule is not worth the audit.
+    //
+    // 64 KiB satisfies all three, and costs 48 KiB more unreachable tail than the smallest value
+    // that satisfies (1) and (3) alone — against the 256 MiB this replaces, nothing.
+    constexpr uint64_t kDmemBase  = 0x10000;
     // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
     // reports the GAME budget (aperture minus OS reservation), not the raw 16 GiB aperture; UE
     // sizes allocator pools from this value (#1213 investigation). PROSPER_DMEM_BUDGET_MB

@@ -195,9 +195,12 @@ int main() {
           "GiveDirectMemory claims a physical pool");
     CHECK(phys != kPoison && phys != 0,
           "GiveDirectMemory WRITES the physical offset out-parameter");
-    // Now discriminating, thanks to the pin above: the first fit is somewhere in [0x10004000, …),
-    // so an honoured 2 MiB alignment lands on 0x10200000 and a 16 KiB fallback does not. Reading
-    // a3/a4 the other way round rejects a3 = 1 as an alignment and reddens exactly here.
+    // Now discriminating, thanks to the pin above: the first free offset is kDmemBase + 0x4000,
+    // which is never 2 MiB aligned, so an honoured 2 MiB alignment rounds up past it and a 16 KiB
+    // fallback does not. Stated in terms of the base rather than in absolute offsets, because the
+    // absolute ones went stale the moment kDmemBase moved (#2934) and a comment that describes the
+    // world it replaced is believed instead of checked. Reading a3/a4 the other way round rejects
+    // a3 = 1 as an alignment and reddens exactly here.
     CHECK(phys > pin && (phys & (0x200000ull - 1)) == 0,
           "the physical offset honours the 2 MiB alignment the guest asked for in a3");
     CHECK(phys >= dirty && phys + 0x40000ull <= dirty + kDirtyLen,
