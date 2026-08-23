@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-23
 
+### Metaphor: ReFantazio was byte-reversing four gigabytes of its own heap
+
+No picture — the frames it now produces are still black. We had been telling the game about memory
+it could not actually reach, and it handled the resulting refusal by asking its endian converter to
+byte-swap "however many bytes I just read", which was the error code. It now loads its assets,
+opens its audio and publishes frames before dying of something else
+([#2934](https://github.com/mattias800/prosper/issues/2934),
+[#2951](https://github.com/mattias800/prosper/issues/2951)).
+
 ### Two Unreal titles were being quietly charged 2 GiB for memory they never got
 
 No picture with this one — neither title renders yet. *Sifu* and *The First Berserker: Khazan* both

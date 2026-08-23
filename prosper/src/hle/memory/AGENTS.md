@@ -54,3 +54,26 @@ platform arms and they are **not** dense — 3 refines "committed" and belongs t
 4 refines "reserved" — so read its table before adding a value. This is the thing a newcomer gets wrong here, and it was found in
 review rather than by testing, because every symptom of getting it wrong looks like a bug somewhere
 else.
+
+**The pool's physical offsets have to fit inside the size prosper advertises.** `kDmemBase` is where
+the direct-memory pool starts and `kDmemTotal` is both its length and what
+`sceKernelGetDirectMemorySize()` returns — but a guest's `[searchStart, searchEnd)` window is
+expressed in the offset space that *advertised size* defines, and `searchEnd` is routinely the
+advertised size itself. So a base of B places the pool's last B bytes at offsets the guest is
+structurally unable to name, and a guest that partitions the whole budget loses its tail with a
+correct-looking ENOMEM. That is not hypothetical: at B = 0x10000000 it cost *Metaphor: ReFantazio*
+its boot, and it cost it in a place nobody would look — the guest handled the ENOMEM by building a
+resource reader over a null buffer and then byte-reversing 4 GiB of its own heap (#2934,
+`docs/METAPHOR_STATUS.md`). B is now **64 KiB** — small enough that the unreachable tail is
+negligible, non-zero so a successful allocation never returns physical offset 0, and a multiple of
+the **Windows allocation granularity**, which is not optional: the Windows arm maps its section at
+`phys - kDmemBase`, and `map_section_view`'s `MapViewOfFileEx` fallback depends on that offset
+staying congruent to `phys` mod 64 KiB.
+
+**Raising `kDmemTotal` does not buy the tail back** — `sceKernelGetDirectMemorySize()` returns
+`kDmemTotal` verbatim while the pool is `[kDmemBase, kDmemBase + kDmemTotal)`, so raising it moves
+the advertisement and the pool together and leaves exactly the same B bytes out of reach. (An
+earlier version of this paragraph said the opposite; the `PROSPER_DMEM_BUDGET_MB` row in
+`docs/METAPHOR_STATUS.md`'s `## Ruled out` is the measurement that kills it.) The only ways to
+change the reachable amount are to move B or to **decouple** the two — advertise
+`kDmemBase + kDmemTotal`, or size the pool at `kDmemTotal + kDmemBase`.
