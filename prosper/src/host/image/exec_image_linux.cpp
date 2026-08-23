@@ -3364,8 +3364,22 @@ void install_trap_handler() {
             for (int fd : poll_pipe)
                 if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 || fcntl(fd, F_SETFL, O_NONBLOCK) != 0)
                     poll_pipe_ok = false;
+            // A successful pipe() whose fcntl then failed leaves two live descriptors behind, and
+            // `poll_pipe` still holding them while `poll_pipe_ok` says the pair is unusable.
+            // ensure_probe_pipe() resets to -1 on its failure path; this must too.
+            if (!poll_pipe_ok) {
+                close(poll_pipe[0]); close(poll_pipe[1]);
+                poll_pipe[0] = poll_pipe[1] = -1;
+            }
         }
 #endif
+        // An instrument that declines to run must SAY SO. Going quiet with PROSPER_POLLWATCH set
+        // makes "the pipe could not be created" indistinguishable from "the slot never changed",
+        // which is the failure this project keeps recording as an instrument trap: the reassuring
+        // reading is the one you get for free. Raised in review.
+        if (n > 0 && !poll_pipe_ok)
+            fprintf(stderr, "[pollwatch] NOT ARMED: could not create the poller's pipe (errno=%d) "
+                            "-- no slot is being sampled\n", errno);
         if (poll_pipe_ok) {
             fprintf(stderr, "[pollwatch] watching %d slot(s), 1 ms interval\n", n);
             std::thread([] {
