@@ -12,7 +12,9 @@
 ;   * bitcast to float for x and y; z = 0, w = 1; OpStore into gl_Position
 ; Everything prosper's module carries beyond that -- the second (unused) binding, the `Aliased`
 ; decorations, the absent `NonWritable`, the unused gl_InstanceIndex load -- is deliberately absent
-; here and is varied one factor at a time by the sibling modules in this folder.
+; here, and NO sibling varies these factors one at a time: the siblings vary the storage-buffer LOAD
+; (`no_ssbo_vs`) and what is reported (`index_readback_vs`), nothing else. Treat everything beyond
+; the loads as unvaried by this family.
 ;
 ; Assemble with:  spirv-as --target-env vulkan1.1 minimal_ssbo_vs.spvasm -o minimal_ssbo_vs.spv
 ; (vulkan1.1 so the header says SPIR-V 1.3, matching the modules prosper emits.)

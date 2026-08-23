@@ -7,7 +7,10 @@
 # with the same machine-wide rhythm -- which is exactly the situation in which two separate
 # measurement sessions cannot be compared. Interleaving them inside one loop turns "they both fail
 # sometimes" into a per-round paired observation: if the control is bad on the rounds the subject is
-# bad and good on the rounds it is good, they share a cause, and the control's verdict transfers.
+# bad and good on the rounds it is good, they go bad in the same WINDOWS -- which transfers the
+# control's verdict to those windows and no further. It does not by itself establish a shared
+# MECHANISM: a common environmental driver (GPU load from another process) produces exactly this
+# association without any shared defect.
 #
 # It lives beside vkprobe rather than in tools/gpu_replay because the QUESTION is the control's.
 # Note the boundary this folder's AGENTS.md draws is about linkage: this script starts gpu_replay as
