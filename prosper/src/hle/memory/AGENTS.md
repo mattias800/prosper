@@ -54,3 +54,16 @@ platform arms and they are **not** dense — 3 refines "committed" and belongs t
 4 refines "reserved" — so read its table before adding a value. This is the thing a newcomer gets wrong here, and it was found in
 review rather than by testing, because every symptom of getting it wrong looks like a bug somewhere
 else.
+
+**The pool's physical offsets have to fit inside the size prosper advertises.** `kDmemBase` is where
+the direct-memory pool starts and `kDmemTotal` is both its length and what
+`sceKernelGetDirectMemorySize()` returns — but a guest's `[searchStart, searchEnd)` window is
+expressed in the offset space that *advertised size* defines, and `searchEnd` is routinely the
+advertised size itself. So a base of B places the pool's last B bytes at offsets the guest is
+structurally unable to name, and a guest that partitions the whole budget loses its tail with a
+correct-looking ENOMEM. That is not hypothetical: at B = 0x10000000 it cost *Metaphor: ReFantazio*
+its boot, and it cost it in a place nobody would look — the guest handled the ENOMEM by building a
+resource reader over a null buffer and then byte-reversing 4 GiB of its own heap (#2934,
+`docs/METAPHOR_STATUS.md`). B is now one 16 KiB granule, held back only so a successful allocation
+never returns physical offset 0. If you ever need to raise it, raise `kDmemTotal`'s *advertisement*
+with it or you are shrinking the reachable pool without saying so.
