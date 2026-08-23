@@ -58,3 +58,6 @@ __pycache__/
 
 # Local per-game launch scripts (prosper/scripts/play/) — convenience only, not project state.
 prosper/scripts/play/
+
+# Machine-local agent instructions (pointed at by CLAUDE.md) — per-computer, never committed.
+/LOCAL.md
