@@ -217,6 +217,40 @@ rather than decoration:**
    flagged module twice, once where its exports collide and once where a single export NID differs; a
    guard that skipped every flagged module would pass the first arm exactly as well as a correct one.
 
+## The PROGRESS_TRACKER.md staleness gate, and the two ways it goes red on YOUR PR
+
+`PROGRESS_TRACKER.md` is **generated** from the `tracker:game` issues, and CI re-reads those issues
+live on every PR and fails if the committed file no longer matches
+(`tools/docs/gen_progress_tracker.py --check`). The gate is deliberately unconditional — it does not
+check only when the diff touches the file — because "the file drifted and nobody noticed" is the
+whole thing it exists to prevent. Documented here because the gate's own rationale lives in a CI
+workflow comment, which is not where anyone looks when it fails.
+
+The repair is always the same and always the author's, whoever the author is:
+
+```bash
+python3 prosper/tools/docs/gen_progress_tracker.py     # regenerate
+git add PROGRESS_TRACKER.md && git commit              # and commit it
+```
+
+**Two triggers, and only one of them involves a person.**
+
+1. **A tracker was edited mid-flight.** Someone ticked a rung or changed an FPS record while your PR
+   was open. This is the one the CI comment names.
+2. **A PR merged that CLOSED an issue this file cites as a blocker** — and this one is automatic, so
+   looking for an edit finds nothing. The generator drops a blocker from a title's row once that
+   issue closes, so a PR whose body says `Fixes #NN` makes master stale **the instant it merges**.
+   Nobody touches a tracker; the author who caused it has already merged and moved on; the next
+   unrelated PR eats the red.
+
+Trigger 2 measured on 2026-08-23 rather than reasoned: #2956 merged at 07:41:59Z, its `Fixes #2951`
+closed that issue at **07:42:00Z**, and the `Docs` job on an unrelated documentation PR failed at
+07:48 against a file neither PR had touched since. One second between a green merge and a file that
+was wrong.
+
+So if your PR closes an issue cited as a blocker here, expect to regenerate **after** the merge —
+or accept that you have handed the bill to whoever opens the next PR.
+
 ## Sentinels: assert on the bits, not the decoded value
 
 A test that fills a buffer with a poison byte and then checks the *decoded* field cannot always tell
