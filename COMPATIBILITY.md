@@ -68,7 +68,7 @@ Last updated: 2026-08-23
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 | *The Lord of the Rings: Gollum* | `PPSA06367` | Unreal Engine 4 | 🔬 Rung 0 — boots, links every module and composites a 2560x1440 frame, but the only frame is a flat white clear; the startup movie kills the process ~4 s in when `sceVideodec2GetPictureInfo` returns success without writing its picture-info struct ([#2898](https://github.com/mattias800/prosper/issues/2898)). Its AAC movie audio now decodes | [#2900](https://github.com/mattias800/prosper/issues/2900) |
 | *The First Berserker: Khazan* | `PPSA20447` | Unreal Engine 4 | 🔬 Rung 0 — boots, mounts and enumerates all thirty save slots, but composites only a flat white 4K clear; the guest then exhausts prosper's direct-memory pool and calls its own OOM handler ([#2908](https://github.com/mattias800/prosper/issues/2908)). The save-data event-drain code that parked its game thread forever is fixed | [#2909](https://github.com/mattias800/prosper/issues/2909) |
-| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Rung 0 — loads its GFD assets and publishes 63 frames at 34.8 fps, all of them black ([#2952](https://github.com/mattias800/prosper/issues/2952)); the primary thread then dies of a SIGFPE ~5 s in ([#2951](https://github.com/mattias800/prosper/issues/2951)). The CRI Mana crash that produced zero frames is fixed ([#2934](https://github.com/mattias800/prosper/issues/2934)) | [#2876](https://github.com/mattias800/prosper/issues/2876) |
+| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Loading mascot and the language-selection screen, twelve languages drawn legibly in Latin, Cyrillic, Japanese, Chinese and Korean; the background art behind the menu does not draw ([#2952](https://github.com/mattias800/prosper/issues/2952)). The SIGFPE that killed every boot at five seconds is fixed ([#2951](https://github.com/mattias800/prosper/issues/2951)), as is the CRI Mana crash before it ([#2934](https://github.com/mattias800/prosper/issues/2934)) | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots and runs indefinitely without faulting, executes real GPU draws and presents 4K frames with zero recompiler rejections, but every frame is pure black ([#2923](https://github.com/mattias800/prosper/issues/2923)) | [#2880](https://github.com/mattias800/prosper/issues/2880) |
 | *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Rung 2 — a routed run answers the language menu's own *"Are you sure you want to change the game language to English?"* modal, which needs **Down** and not Cross, and reaches the title screen at t≈15 s, the main menu, and the opening story cutscene, which is a **decoded 4K H.264 movie** (two VA-API access-unit decoders open at t≈126 s, 3070 pictures) composited by prosper. No stage loads in 717 s, and the wrong composite still takes most frames ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/balan-PPSA02058/` | [#2882](https://github.com/mattias800/prosper/issues/2882) |
 | *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Rung 2 — a Cross-only route accepts the brightness-calibration screen its own `✕ Accept` prompt names, and reaches the first map load (`hk_project_mainstart`, t≈37 s, absent from every default run). The world then composites as a flat **letterboxed** clear, so no scene renders ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/stray-PPSA02101/` | [#2883](https://github.com/mattias800/prosper/issues/2883) |
@@ -84,7 +84,7 @@ Last updated: 2026-08-23
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
 twelve of the twenty-five titles that reach gameplay are marked 🚧 rather than ✅, and the fifteen 🔬
-rows sit at three different rungs — four at rung 2, two at rung 1 and nine at rung 0 — with none
+rows sit at three different rungs — four at rung 2, three at rung 1 and eight at rung 0 — with none
 unrun. Counting markers gives a different — and wrong — answer.
 
 **"Not yet booted" is a real category, not a rung.** A title can be tracked and never measured, and
@@ -95,8 +95,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
-| **Below a title screen** — logo or splash only (rung 1) | 2 |
-| **Boots, but no frame with content** (rung 0) | 9 |
+| **Below a title screen** — logo or splash only (rung 1) | 3 |
+| **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
 | Total tracked | 53 |
 
@@ -524,6 +524,20 @@ The route [`prosper/scripts/talesgraces/reach-gameplay.pad`](prosper/scripts/tal
 <p align="center"><img src="assets/screenshots/astro-bot-worldmap-background.png" alt="Astro Bot — world-map backdrop"></p>
 
 The opening sequence and ASTRO BOT title card render at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1809) for current visual and performance work.
+
+## Metaphor: ReFantazio — `PPSA20800`
+
+<p align="center"><img src="assets/screenshots/metaphor-language-select.png" alt="Metaphor: ReFantazio — the language-selection screen, twelve languages in white serif type with English highlighted by a blue brush-stroke"></p>
+<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.png" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book"></p>
+
+A default 3840×2160 launch reaches the loading mascot and then the language-selection screen, and
+holds it: 12 of 12 samples distinct over 60 s with the guest still running. Every glyph above is
+rasterized from the title's own TrueType file, which it hands prosper through
+`sceFontOpenFontMemory` — Latin, Cyrillic, Japanese, Traditional and Simplified Chinese and Korean.
+The **background art behind the menu does not draw** ([#2952](https://github.com/mattias800/prosper/issues/2952)).
+Until 2026-08-23 the title died of a divide-by-zero five seconds into every boot
+([#2951](https://github.com/mattias800/prosper/issues/2951)). See the
+[tracker](https://github.com/mattias800/prosper/issues/2876).
 
 ## The Forgotten City — `PPSA03026`
 

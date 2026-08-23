@@ -161,7 +161,7 @@ Two ABI facts worth keeping, both derived rather than assumed:
   self-consistent whatever Sony's absolute convention is, because prosper supplies both the metrics
   and the baseline the caller subtracts.
 
-**Windows carries a known, named gap here** ([#2985](https://github.com/mattias800/prosper/issues/2985)):
+**Windows carries a known, named gap here** ([#2955](https://github.com/mattias800/prosper/issues/2955)):
 the import-stub trampoline converts SysV to the MS ABI by remapping integer registers **only**, so
 a handler declared with the guest's float arguments in place would read the two pointers after them
 out of the wrong slots and write through garbage. The Windows arm therefore takes the five integer
@@ -230,6 +230,25 @@ from outside and its silence is not evidence.
 ## Ruled out
 
 One line per hypothesis this work killed, so nobody re-derives it at full cost.
+
+- **A zero glyph width or height is not what caused the SIGFPE, and neither is a null texture.**
+  The `div` at `eboot+0x10019f6` runs *before* both of the routine's zero-dimension guards, and a
+  null image would have faulted on `mov rdi,[r14+8]` rather than on the divide. Probing the fault
+  directly (`PROSPER_HWBP=0x10019f6 PROSPER_HWBP_R14=0`) showed the image and its surface both
+  present, with an all-zero T#. The divisor was bytes-per-pixel, not a dimension. #2951.
+- **The unregistered NIDs were not "leads only", and the earlier `CONFIDENCE: LOW` on them was too
+  low.** #2951's body listed `sceHttp2CreateTemplate`, `sceAmprCommandBufferGetNumCommands`,
+  `sce::Json::InitParameter2` and `sceRtcGetDayOfWeek` as the candidates and marked the four
+  `libSceFont` entry points a low-confidence lead. The four Json/Rtc/Http2/Ampr calls are still
+  unregistered on the fixed run and are still not the cause; the font four were, and the chain from
+  them to the divide is now measured end to end. Recorded because the two lists were both in the
+  same issue and the wrong one was ranked higher. #2951.
+- **prosper did not have to invent a single font metric to fix this.** The tempting shortcut — pick
+  a plausible glyph advance so the divide survives — was never necessary, because the title supplies
+  its own TrueType file through `sceFontOpenFontMemory` (`eboot+0x1001274`, 180,424 bytes, sfnt 1.0,
+  17 tables). Check the *open* call before concluding a font API cannot be answered honestly: the
+  branch it does not take, `sceFontOpenFontSet` at `eboot+0x1001253`, is the one prosper genuinely
+  cannot serve. #2951.
 
 - **prosper's live Vulkan renderer is not what byte-reversed the heap.** A matched A/B with
   `PROSPER_RENDER` unset reproduces the corruption byte-for-byte — same addresses, same reversed

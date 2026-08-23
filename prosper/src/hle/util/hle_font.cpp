@@ -602,6 +602,8 @@ int32_t render_glyph(void* handle, uint32_t code, RenderSurface* surface,
 #if defined(_WIN32)
 // Windows: the import-stub trampoline converts the guest's SysV call to the MS ABI by remapping
 // INTEGER registers only (exec_image_win.cpp emit_sysv_to_ms_prologue) -- it never touches xmm.
+// That is #2955, a general defect of the trampoline rather than of this library; delete this #if
+// when it is fixed.
 // A declaration carrying `float x, float y` in their guest positions would therefore read the two
 // pointer arguments after them out of the wrong slots and write through whatever happened to be
 // in guest r9 and the guest stack. That is an arbitrary memory write, not a wrong glyph, so the
