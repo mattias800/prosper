@@ -92,7 +92,7 @@ advertised direct-memory budget loses its last `kDmemBase` bytes.
 
 ## Where it stops now
 
-Two blockers, in the order they bite.
+Three blockers, in the order they bite.
 
 1. **SIGFPE in the guest's primary thread at `eboot+0x10019f6`**, about 5 s in — `div r14d` with
    `r14d == 0`, immediately after an allocate-and-`memset` pair at `eboot+0x10019d1`/`+0x10019dc`.
@@ -104,12 +104,13 @@ Two blockers, in the order they bite.
    defect of [#2932](https://github.com/mattias800/prosper/issues/2932) or a title-specific absence
    is **not established**: the guest dies before enough frames exist to characterise it. Tracked as
    [#2952](https://github.com/mattias800/prosper/issues/2952).
-
-Also seen once, and not reproduced: a **host-side** null dereference in prosper's own renderer on
-thread `job_render_0` — `mov r8,[rax+0x98]` with `rax = 0` inside the persistent-texture cache
-lookup at `tests/fixtures/render_runner.h:6169`. One `boot_trace` run of five faulted there; the
-`tools/screenshot` run on the same build did not.
-[#2953](https://github.com/mattias800/prosper/issues/2953).
+3. **A host-side null dereference in prosper's own renderer, on the guest job thread
+   `job_render_0`** — inside a `std::unordered_map` lookup in `render_draw_pass_rgba`
+   (`tests/fixtures/render_runner.h:6169`, whose `persistent_texture_images` is an unsynchronised
+   function-local static). **Deterministic under `boot_trace`: 5 of 5 runs**, at two distinct
+   instructions that both resolve to libstdc++'s `_M_equals`. **0 of 2 under `tools/screenshot`**,
+   which is why the rung evidence above exists at all. Name the frontend in any claim about this
+   one (instrument trap 127). [#2953](https://github.com/mattias800/prosper/issues/2953).
 
 ## Reproduction route
 
