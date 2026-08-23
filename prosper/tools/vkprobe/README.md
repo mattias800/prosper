@@ -8,9 +8,12 @@ vkprobe --vs vs.spv --fs fs.spv [--iterations 300] [--records FILE] [--indices 0
         [--extent 64x64] [--device N] [--verbose]
 ```
 
-Each iteration renders the same triangle twice into two fresh targets — once with `vkCmdDraw`, once
-with `vkCmdBindIndexBuffer` + `vkCmdDrawIndexed` over indices naming the same vertices — and counts
-pixels that differ from the blue clear. The two arms are the point: an indexed arm that fails beside
+Each iteration renders twice into two fresh targets — once with `vkCmdDraw`, once with
+`vkCmdBindIndexBuffer` + `vkCmdDrawIndexed` — and counts pixels that differ from the blue clear.
+The non-indexed arm draws `--indices`-many vertices starting at 0, so **the two arms are directly
+comparable only when the indices are the identity sequence** (the default `0,1,2`); pass a capture's
+real indices when you want the indexed arm to reproduce a specific draw, and read the arms
+separately rather than comparing them. The two arms are the point: an indexed arm that fails beside
 a passing non-indexed arm is #2937's signature; either arm failing alone is a device or shader
 problem rather than an indexing one.
 

@@ -4821,23 +4821,28 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // i.e. it makes this pass's writes AVAILABLE and makes them visible to NOTHING. Every
     // attachment above whose finalLayout is TRANSFER_SRC_OPTIMAL is then read by
     // vkCmdCopyImageToBuffer a few commands later with no dependency at all -- and the final layout
-    // transition itself is a write of the whole image, which on RADV can be a DCC decompress. The
-    // copy racing that decompress reads part-compressed texels, so the SAME capture replayed twice
-    // produced different pixels: 20 offline `gpu_replay --bundle` runs of one frozen .prgbundle gave
-    // 11 distinct output hashes with identical output_bytes. Synchronization validation names it
-    // exactly: `SYNC-HAZARD-READ-AFTER-WRITE ... vkCmdCopyImageToBuffer reads VkImage <...>, which
-    // was previously written during an image layout transition initiated by vkCmdEndRenderPass`.
+    // transition itself is a write of the whole image, which on RADV can be a DCC decompress.
+    // Synchronization validation names it exactly: `SYNC-HAZARD-READ-AFTER-WRITE ...
+    // vkCmdCopyImageToBuffer reads VkImage <...>, which was previously written during an image
+    // layout transition initiated by vkCmdEndRenderPass` -- 10 of them on one offline replay.
     //
     // The barrier the readback path DOES emit (`transition_color_to_readback`) is guarded on
     // `persistent`, so it covers only the persistent-target route; a transient target's copy has
-    // never been ordered against the pass that filled it. Fixing it here rather than beside the copy
-    // covers every consumer of the pass's output in one place -- the transient readback, the
-    // persistent sample, and the depth/stencil plane copy -- and is the dependency Vulkan expects an
-    // application to declare.
+    // never been ordered against the pass that filled it. Declaring the dependency here rather than
+    // beside the copy covers every consumer of the pass's output in one place.
     //
-    // The incoming dependency is the mirror: attachments that LOAD (initialLayout
-    // COLOR_ATTACHMENT_OPTIMAL / DEPTH_STENCIL_ATTACHMENT_OPTIMAL) must be ordered after whatever
-    // wrote them, which may have been an earlier pass, a transfer upload or a compute writeback.
+    // THESE MASKS ARE DELIBERATELY ALL_COMMANDS / MEMORY_READ|MEMORY_WRITE, and narrowing them is a
+    // REGRESSION, not an optimisation. Declaring an explicit external dependency REPLACES the
+    // implicit one, and the implicit INCOMING default is
+    //   srcStageMask=TOP_OF_PIPE, dstStageMask=ALL_COMMANDS, srcAccessMask=0,
+    //   dstAccessMask=<all reads and writes>
+    // -- so a pass that samples a texture a transfer just uploaded, or reads a buffer a compute
+    // dispatch just wrote, is relying on that blanket visibility. The first version of this change
+    // set dstAccessMask to the ATTACHMENT accesses only, which silently removed visibility for every
+    // SHADER_READ in the pass; it collapsed The Messenger, Dead Cells and GRIS to near-white
+    // garbage on their snapshot guards while leaving the syncval hazard fixed, so nothing but the
+    // guards caught it. Both dependencies must stay a SUPERSET of the implicit defaults: they may
+    // only add ordering, never remove it.
     //
     // PROSPER_NO_RENDERPASS_EXTERNAL_DEPS=1 restores the defaulted behaviour, so the A/B for this
     // change is single-variable on ONE binary. Same reason PROSPER_NO_INDEX_ARENA and the
@@ -4845,35 +4850,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // reinstates the race.
     static const bool no_renderpass_external_deps =
         getenv("PROSPER_NO_RENDERPASS_EXTERNAL_DEPS") != nullptr;
-    constexpr VkPipelineStageFlags kAttachmentWriteStages =
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    constexpr VkAccessFlags kAttachmentWriteAccess =
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    constexpr VkAccessFlags kAllAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     std::array<VkSubpassDependency, 2> deps{};
     deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass = 0;
-    deps[0].srcStageMask = kAttachmentWriteStages | VK_PIPELINE_STAGE_TRANSFER_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    deps[0].dstStageMask = kAttachmentWriteStages;
-    deps[0].srcAccessMask = kAttachmentWriteAccess | VK_ACCESS_TRANSFER_WRITE_BIT |
-                            VK_ACCESS_SHADER_WRITE_BIT;
-    deps[0].dstAccessMask = kAttachmentWriteAccess | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[0].srcAccessMask = kAllAccess;
+    deps[0].dstAccessMask = kAllAccess;
     deps[0].dependencyFlags = 0;
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask = kAttachmentWriteStages;
-    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                           kAttachmentWriteStages;
-    deps[1].srcAccessMask = kAttachmentWriteAccess;
-    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
-                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[1].srcAccessMask = kAllAccess;
+    deps[1].dstAccessMask = kAllAccess;
     deps[1].dependencyFlags = 0;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpci.attachmentCount = color_count + (use_ds ? 1u : 0u); rpci.pAttachments = att.data();
@@ -7631,18 +7622,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdEndQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di));
         }
     }
+    vkCmdEndRenderPass(cmd);
     // PROSPER_BUFFER_ECHO=1 (#2945) -- ground truth for "what did the GPU see in this draw's
     // storage buffers". Every other instrument reads the HOST side: PROSPER_BUFLOG prints the source
     // words, --dump-resource prints the capture's bytes, and both were byte-identical across runs
     // that rendered and runs whose vertices collapsed. This copies the bound slices back THROUGH THE
-    // GPU, in the same command buffer as the draw, so the values printed are the ones the shader's
-    // descriptors resolve to. Opt-in and bounded: first 16 slices, 64 bytes each.
+    // GPU, in the same command buffer as the draw and immediately after the render pass ends, so
+    // the values printed are the ones the shader's descriptors resolved to. It has to be after
+    // vkCmdEndRenderPass: vkCmdCopyBuffer is a transfer command and is not permitted inside a
+    // render pass instance. Opt-in and bounded: first 16 slices, 64 bytes each.
     static const bool buffer_echo = getenv("PROSPER_BUFFER_ECHO") != nullptr;
     VkBuffer echo_buffer = VK_NULL_HANDLE;
     VkDeviceMemory echo_memory = VK_NULL_HANDLE;
     void* echo_mapped = nullptr;
     size_t echo_count = 0;
     std::vector<size_t> echo_index_slice;
+    bool echo_ready = false;
     constexpr VkDeviceSize kEchoStride = 64;
     constexpr size_t kEchoMax = 16;
     if (buffer_echo && !shared_buffers.empty()) {
@@ -7662,40 +7657,42 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 vkBindBufferMemory(dev, echo_buffer, echo_memory, 0) == VK_SUCCESS &&
                 vkMapMemory(dev, echo_memory, 0, VK_WHOLE_SIZE, 0, &echo_mapped) == VK_SUCCESS) {
                 std::memset(echo_mapped, 0xCD, static_cast<size_t>(kEchoStride * kEchoMax));
-                echo_count = std::min(kEchoMax, shared_buffers.size());
-                for (size_t i = 0; i < echo_count; ++i) {
-                    VkBufferCopy copy{};
-                    copy.srcOffset = shared_buffers[i].offset;
-                    copy.dstOffset = kEchoStride * i;
-                    copy.size = std::min<VkDeviceSize>(kEchoStride, shared_buffers[i].range);
-                    if (!copy.size) continue;
-                    vkCmdCopyBuffer(cmd, shared_buffers[i].buffer, echo_buffer, 1, &copy);
-                }
-                // ...and the INDEX buffers, which live outside `shared_buffers`. A draw whose
-                // gl_VertexIndex is out of range makes every vertex-buffer load return 0 under
-                // robustness, which is indistinguishable at the pixel from "the vertex data is
-                // wrong" -- so the index bytes have to be read back from the GPU too.
-                for (size_t d = 0; d < dv.size() && echo_count < kEchoMax; ++d) {
-                    if (!dv[d].ibuf || !dv[d].icount) continue;
-                    VkBufferCopy copy{};
-                    copy.srcOffset = dv[d].ioffset;
-                    copy.dstOffset = kEchoStride * echo_count;
-                    copy.size = std::min<VkDeviceSize>(kEchoStride,
-                                                       VkDeviceSize(dv[d].icount) * 4);
-                    echo_index_slice.push_back(echo_count);
-                    ++echo_count;
-                    vkCmdCopyBuffer(cmd, dv[d].ibuf, echo_buffer, 1, &copy);
-                }
-                VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read,
-                                     0, nullptr, 0, nullptr);
+                echo_ready = true;
             }
         }
     }
-    vkCmdEndRenderPass(cmd);
+    if (echo_ready) {
+        echo_count = std::min(kEchoMax, shared_buffers.size());
+        for (size_t i = 0; i < echo_count; ++i) {
+            VkBufferCopy copy{};
+            copy.srcOffset = shared_buffers[i].offset;
+            copy.dstOffset = kEchoStride * i;
+            copy.size = std::min<VkDeviceSize>(kEchoStride, shared_buffers[i].range);
+            if (!copy.size) continue;
+            vkCmdCopyBuffer(cmd, shared_buffers[i].buffer, echo_buffer, 1, &copy);
+        }
+        // ...and the INDEX buffers, which live outside `shared_buffers`. A draw whose
+        // gl_VertexIndex is out of range makes every vertex-buffer load return 0 under
+        // robustness, which is indistinguishable at the pixel from "the vertex data is
+        // wrong" -- so the index bytes have to be read back from the GPU too.
+        for (size_t d = 0; d < dv.size() && echo_count < kEchoMax; ++d) {
+            if (!dv[d].ibuf || !dv[d].icount) continue;
+            VkBufferCopy copy{};
+            copy.srcOffset = dv[d].ioffset;
+            copy.dstOffset = kEchoStride * echo_count;
+            copy.size = std::min<VkDeviceSize>(kEchoStride,
+                                               VkDeviceSize(dv[d].icount) * 4);
+            echo_index_slice.push_back(echo_count);
+            ++echo_count;
+            vkCmdCopyBuffer(cmd, dv[d].ibuf, echo_buffer, 1, &copy);
+        }
+        VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read,
+                             0, nullptr, 0, nullptr);
+    }
     backend_pass_timing_end(cmd);   // #2333
     // Fence waits used to provide the device-memory dependency between every target call. Batched
     // command buffers deliberately remove those intermediate waits, and command-buffer/submission

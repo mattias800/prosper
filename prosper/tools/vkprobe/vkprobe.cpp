@@ -19,9 +19,10 @@
 //
 // WHAT IT MEASURES
 //
-// Each iteration renders the same triangle twice into two fresh targets — once with vkCmdDraw and
-// once with vkCmdBindIndexBuffer + vkCmdDrawIndexed over indices that name the same vertices — then
-// counts pixels that differ from the clear colour. A run reports, per draw kind, how many iterations
+// Each iteration renders twice into two fresh targets — once with vkCmdDraw over vertices 0..N-1 and
+// once with vkCmdBindIndexBuffer + vkCmdDrawIndexed over the supplied indices — then counts pixels
+// that differ from the clear colour. The arms are directly comparable only when those indices are
+// the identity sequence (the default); with a capture's real indices, read each arm on its own. A run reports, per draw kind, how many iterations
 // produced ZERO covered pixels. The two arms are the point: an indexed arm that fails while the
 // non-indexed arm beside it passes is the #2937 signature, and either arm failing on its own is a
 // device or shader problem rather than an indexing one.
