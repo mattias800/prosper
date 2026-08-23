@@ -13,6 +13,7 @@
 #include "hle/input/ime_input.hpp"
 #include "hle/service/platform_ui.hpp"
 #include "hle/video/video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
+#include "hle/video/h264_sps.hpp"        // SPS/VUI extraction for GetPictureInfo (#2898)
 #include "gpu/texture/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
 #include "host/platform/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
 #include "host/image/boot_program.hpp"  // guest_module_name: is a callback target guest code?
@@ -313,6 +314,43 @@ std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
 // turns the fail-visible path into a flood, which is how fail-visible paths get muted (#2571 N3).
 struct VdecAu { int id = -1; bool opened = false; bool announced = false; unsigned no_picture_run = 0; };
 std::unordered_map<uint64_t, VdecAu> g_vdec_au;
+
+// Per-decoded-picture metadata for sceVideodec2GetPictureInfo (#2898).
+//
+// GetPictureInfo takes NO decoder handle -- its arguments are (outputInfo*, pictureInfo*,
+// 0, 0) at every observed call site (PPSA06367 x2, PPSA29343 x3) -- so the only way to
+// know which picture to describe is the one thing that identifies it: outputInfo->frame,
+// the pointer Decode wrote into the caller's output struct. Keying on it means a title
+// that recycles frame buffers collapses those pictures onto one metadata entry; SPS/VUI
+// values rarely change within a stream, so the practical cost is negligible and it is
+// recorded rather than hidden (CONFIDENCE: MED on cross-picture identity, HIGH on the
+// offsets themselves).
+//
+// `record` is a small prosper-owned block handed to the guest through pictureInfo+0x20.
+// Guest evidence about its SHAPE (#2898, refined by live boot once the pointer was no
+// longer null -- the fault moved from "deref of the null pointer field" to "walk of the
+// block behind it", which is what named the extra indirection):
+//
+//   P = *(void**)record;                    // +0x00 is a POINTER to the payload block
+//   string_assign(s, (char*)P + 0x08);      // C-string at payload+0x08
+//   if (payload[+0x30]) use qword payload[+0x28] else built-in default text;
+//
+//   (PPSA29343 never dereferences; it compares `record` values for identity across its
+//   per-decoder arrays, which any stable per-picture address satisfies.)
+//
+// Our block therefore points its first qword at its own +0x08, where the payload lives:
+// an EMPTY string and flag = 0, which takes the guest's default-text path -- nothing is
+// fabricated. Records are allocated once per distinct frame buffer and deliberately
+// NEVER freed while the process lives -- freeing them would turn Beast's stored keys
+// (and any reference the guest kept) dangling, which is worse than a bounded few hundred
+// bytes.
+struct VdecPicMeta {
+    bool has_meta = false;
+    prosper::h264::SpsPictureMeta meta;
+    void* record = nullptr;
+};
+constexpr size_t kVdecInfoRecordSize = 0x48;  // 8-byte self-pointer + 0x40 payload
+std::unordered_map<uint64_t, VdecPicMeta> g_vdec_picmeta;
 
 // A rejected decoder config is a hard stop for a title's movie playback, and the guest only prints the
 // bare SCE code — 0x811d0200 covers TWO different conditions here, so "err=0x811d0200" alone cannot tell
@@ -829,6 +867,38 @@ HLE(s_videodec2_decode) {
                 out->width = pic.width; out->height = pic.height;
                 out->pitch = pic.y_stride; out->pitch_bytes = pic.y_stride;
                 out->frame = frame->data; out->frame_size = frame->data_size;
+                // #2898: remember this picture's SPS/VUI metadata so GetPictureInfo can
+                // answer from the real stream. The access-unit bytes are exactly what the
+                // guest handed us this call -- no extra I/O, no guessing.
+                {
+                    prosper::h264::SpsPictureMeta m;
+                    bool have = prosper::h264::parse_first_sps(
+                        (const uint8_t*)PW(input->data), (size_t)input->data_size, &m);
+                    std::lock_guard<std::mutex> lk(g_vdec_mx);
+                    VdecPicMeta& e = g_vdec_picmeta[frame->data];
+                    if (!e.record) {
+                        e.record = calloc(1, kVdecInfoRecordSize);
+                        if (e.record) {
+                            // *(void**)record = &record[8]: the payload block. calloc
+                            // zeroes it, so the C-string at payload+0x08 is empty and
+                            // the flag byte at payload+0x30 is 0 (guest default path).
+                            *(void**)e.record = (uint8_t*)e.record + 8;
+                        }
+                    }
+                    e.has_meta = have;
+                    if (have) e.meta = m;
+                    static std::atomic<bool> said{false};
+                    if (!said.exchange(true))
+                        fprintf(stderr,
+                                "[vdec2] picture meta captured for GetPictureInfo (#2898): "
+                                "record=%p sps=%s crop=%u[%u,%u,%u,%u] ar=%u(idc=%u sar=%ux%u) "
+                                "timing=%u(%u/%u)\n",
+                                e.record,
+                                have ? "parsed" : "absent-in-AU", m.crop_flag ? 1u : 0u,
+                                m.crop[0], m.crop[1], m.crop[2], m.crop[3],
+                                m.ar_flag ? 1u : 0u, m.ar_idc, m.sar_w, m.sar_h,
+                                m.timing_flag ? 1u : 0u, m.num_units_in_tick, m.time_scale);
+                }
                 // The one field still unestablished (#2270). Left 0 rather than filled with a
                 // plausible constant, because a wrong value here is a correctly-decoded picture
                 // the guest misreads, which is silent. PROSPER_VDEC2_FORMAT exists so the first
@@ -977,13 +1047,23 @@ HLE(s_videodec2_reset) {
 // sceVideodec2GetPictureInfo / ...GetAvcPictureInfo. `which` names the entry point so a size mismatch
 // identifies itself (#1658).
 //
-// Both currently validate against VdecOutput. That is an ASSUMPTION for the AVC form: the two exist as
-// separate exports, which is normally because the AVC one carries codec-specific picture metadata in a
-// larger structure. prosper has no title evidence for that layout — the firmware database gives names
-// and NIDs, never bodies — so inventing a second struct would be fabricating an ABI. Instead the
-// mismatch path reports the size the guest actually passed, which IS the evidence needed: the first
-// title to call it prints `sizeof` its own struct, and the layout can then be derived rather than guessed.
-// CONFIDENCE: LOW that a shared layout is correct; HIGH that guessing one would be worse.
+// #2898, now implemented for the generic form. Guest evidence (PPSA06367 x2, PPSA29343 x3 --
+// all five sites disassembled):
+//   * the caller pre-zeroes its picture-info block and sets its FIRST field to the block
+//     size -- 0x78 (Gollum both sites), 0xb8 and 0x58 (Beast) -- the same self-sizing
+//     convention every other struct in this library uses. The size is the variant
+//     discriminator, so it is honoured rather than matched against one constant.
+//   * on return the guest reads +0x20 (a pointer), +0x35/+0x38..+0x44 (crop flag +
+//     quad), +0x48/+0x49/+0x4a/+0x4c (aspect flag/idc/SAR pair), +0x55/+0x58/+0x5c
+//     (timing flag/num_units_in_tick/time_scale). That set IS H.264 SPS/VUI, and every
+//     value comes from the stream we actually decoded (see h264_sps.cpp).
+//   * +0x20 points at a decoder-side record; Gollum reads an inline C-string at +0x08 of
+//     it and a flag byte at +0x30, Beast only compares it for identity. Our record is a
+//     zeroed block with an empty string: flag 0 takes the guest's own default path.
+//
+// The AVC form (kjrLbcyhEiw) keeps the old behaviour: no title has ever been observed
+// calling it, so its layout remains unestablished, and inventing one would be fabricating
+// an ABI. The mismatch path still reports the size the caller declared.
 static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, uint64_t a2,
                                   uint64_t a3) {
     // Report the FIRST call to each entry point unconditionally, with the later arguments.
@@ -997,21 +1077,95 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     bool first = false;
     { std::lock_guard<std::mutex> lk(mx); first = (seen[which]++ == 0); }
     if (first)
-        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 -- the "
-                        "AVC layout is unestablished; these arguments are the evidence)\n",
+        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx\n",
                 which, (unsigned long long)a0, (unsigned long long)a1,
                 (unsigned long long)a2, (unsigned long long)a3);
-    auto* out = (const VdecOutput*)PW(a0); if (!out) return VDEC_ERR_ARG;
-    if (out->size == sizeof(*out)) return 0;
-    static std::mutex bad_mx;
-    static std::unordered_map<const char*, int> bad;
-    bool report = false;
-    { std::lock_guard<std::mutex> lk(bad_mx); report = (bad[which]++ < 4); }
-    if (report)
-        fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx -- rejected. If this "
-                        "is the AVC form, that size IS its layout evidence (#1658).\n",
-                which, (unsigned long long)out->size, sizeof(*out));
-    return VDEC_ERR_STRUCT;
+    auto* out = (const VdecOutput*)PW(a0);
+    if (!out) return VDEC_ERR_ARG;
+    if (out->size != sizeof(*out)) {
+        static std::mutex bad_mx;
+        static std::unordered_map<const char*, int> bad;
+        bool report = false;
+        { std::lock_guard<std::mutex> lk(bad_mx); report = (bad[which]++ < 4); }
+        if (report)
+            fprintf(stderr, "[vdec] %s: outputInfo size 0x%llx != VdecOutput 0x%zx -- rejected. If this "
+                            "is the AVC form, that size IS its layout evidence (#1658).\n",
+                    which, (unsigned long long)out->size, sizeof(*out));
+        return VDEC_ERR_STRUCT;
+    }
+
+    // The AVC form stops here: no title has ever been observed calling it, its layout is
+    // unestablished, and inventing one would be fabricating an ABI. It accepts the same
+    // OutputInfo and stays permissive about everything else.
+    if (strcmp(which, "sceVideodec2GetPictureInfo") != 0) return 0;
+
+    // Generic form (#2898): fill the caller's picture-info from real SPS/VUI metadata.
+    auto* pic = PW(a1);
+    if (!pic) return VDEC_ERR_ARG;
+    // Self-sizing convention: the caller's first field declares the block's length.
+    const uint64_t declared = *(const uint64_t*)pic;
+    if (declared < 0x60 || declared > 0x1000) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 4)
+            fprintf(stderr, "[vdec] %s: pictureInfo size 0x%llx is outside every observed "
+                            "variant (0x58/0x78/0xb8, #2898) -- rejected\n",
+                    which, (unsigned long long)declared);
+        return VDEC_ERR_STRUCT;
+    }
+
+    prosper::h264::SpsPictureMeta meta;
+    void* record = nullptr;
+    bool have = false;
+    // #2898 diagnosis: the guest FREES the block behind pictureInfo+0x20 through its own
+    // allocator (measured: prosper's calloc'd record came back as "FMallocBinned3
+    // Attempt to free an unrecognized block", same address printed). So whatever lives
+    // there must be memory the GUEST allocated. The strongest candidate is the decoded
+    // frame buffer itself -- out->frame -- which the guest owns and Beast's identity
+    // arrays could key on. PROSPER_VDEC2_PICINFO_ECHO_FRAME=1 tests that reading.
+    static const bool echo_frame = [] {
+        const char* v = getenv("PROSPER_VDEC2_PICINFO_ECHO_FRAME");
+        return v && *v == '1';
+    }();
+    {
+        std::lock_guard<std::mutex> lk(g_vdec_mx);
+        auto it = g_vdec_picmeta.find(out->frame);
+        if (it != g_vdec_picmeta.end()) {
+            have = it->second.has_meta;
+            meta = it->second.meta;
+            record = echo_frame ? (void*)(uintptr_t)out->frame : it->second.record;
+        }
+    }
+    if (!record) {
+        // Never decoded through this outputInfo: there is no picture to describe. An
+        // error here is honest, and both observed callers cope -- Gollum ignores the
+        // return but only calls after a successful Decode, Beast tests the return and
+        // takes its error path (its three sites all do `test eax,eax`).
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 4)
+            fprintf(stderr, "[vdec] %s: no decoded picture behind frame=0x%llx yet -- "
+                            "returning VDEC_ERR_PIPE (#2898)\n",
+                    which, (unsigned long long)out->frame);
+        return VDEC_ERR_PIPE;
+    }
+    if (!have) {
+        // A picture exists but its AU carried no parseable SPS (parameter sets can arrive
+        // out-of-band or in a later unit). Still publish the record pointer -- identity
+        // is what Beast needs and Gollum dereferences -- with all optional flags zero,
+        // which is the truthful answer "this stream declares none of those".
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 2)
+            fprintf(stderr, "[vdec] %s: no SPS parsed for frame=0x%llx; filling flags as absent "
+                            "(#2898)\n", which, (unsigned long long)out->frame);
+    }
+    if (!prosper::h264::fill_picture_info(meta, record, pic, (size_t)declared)) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 4)
+            fprintf(stderr, "[vdec] %s: pictureInfo size 0x%llu too small for the observed "
+                            "field set (>=0x60) -- rejected\n",
+                    which, (unsigned long long)declared);
+        return VDEC_ERR_STRUCT;
+    }
+    return 0;
 }
 HLE(s_videodec2_picture_info) {
     return vdec_picture_info("sceVideodec2GetPictureInfo", a0, a1, a2, a3);

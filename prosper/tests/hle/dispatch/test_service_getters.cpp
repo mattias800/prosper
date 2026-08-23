@@ -311,14 +311,25 @@ int main() {
                       "#1658: kjrLbcyhEiw is registered as sceVideodec2GetAvcPictureInfo");
                 CHECK(std::string(Hle::name_of("NtXRa3dRzU0")) == "sceVideodec2GetPictureInfo",
                       "#1658: NtXRa3dRzU0 keeps the generic name");
-                // Both accept the known 56-byte output ABI today. The AVC layout is NOT established
-                // from title evidence, so this pins current behaviour rather than a guessed struct.
+                // #2898: the generic form no longer answers an empty success. A null
+                // pictureInfo pointer is an argument error; a real buffer naming a frame
+                // nothing decoded reports VDEC_ERR_PIPE. The false success is exactly
+                // what the fix removed.
                 alignas(8) uint8_t pinfo[56]{}; *(uint64_t*)pinfo = 56;
-                CHECK(picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0 &&
-                      avc_picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0,
-                      "#1658: both picture-info forms accept the 56-byte VdecOutput ABI");
-                // A mismatched size must be REJECTED, not silently accepted — that rejection is what
-                // captures an AVC-specific layout the first time a title passes one.
+                CHECK(picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0x811d0102ull,
+                      "#2898/#1658: a null pictureInfo pointer is rejected as an argument error");
+                // A caller-sized pictureInfo block (Gollum passes 0x78) naming an undecoded
+                // frame reports VDEC_ERR_PIPE.
+                alignas(8) uint8_t picbuf[0x78]{}; *(uint64_t*)picbuf = 0x78;
+                CHECK(picture_info((uint64_t)(uintptr_t)pinfo, (uint64_t)(uintptr_t)picbuf, 0, 0, 0, 0) ==
+                          0x811d0201ull,
+                      "#2898/#1658: an undecoded frame reports VDEC_ERR_PIPE, not success");
+                // The AVC layout is NOT established from title evidence, so this pins current
+                // behaviour rather than a guessed struct: permissive about everything but a
+                // mismatched OutputInfo size, whose rejection is what captures an AVC-specific
+                // layout the first time a title passes one.
+                CHECK(avc_picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0,
+                      "#1658/#2898: the unestablished AVC form stays permissive");
                 alignas(8) uint8_t pinfo_bad[64]{}; *(uint64_t*)pinfo_bad = 64;
                 CHECK(avc_picture_info((uint64_t)(uintptr_t)pinfo_bad, 0, 0, 0, 0, 0) == 0x811d0101ull,
                       "#1658: an unexpected AVC struct size is rejected, not assumed compatible");

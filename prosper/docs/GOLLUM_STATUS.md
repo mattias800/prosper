@@ -23,9 +23,14 @@ A default launch gets a long way in a short time and then stops hard:
 The run bound is not the limit; the crash is. Every arm so far has ended the same way at the same
 point.
 
-## The blocker: `sceVideodec2GetPictureInfo` writes nothing, and the guest dereferences it
+## The blocker: `sceVideodec2GetPictureInfo` — FIXED as far as the false-success defect; one ownership question remains
 
-**Named, located, and not fixable without an ABI that has not been recovered.**
+**2026-08-23: the structure is now filled from the title's own bitstream.** `sceVideodec2GetPictureInfo`
+(`NtXRa3dRzU0`) writes the SPS/VUI-derived field set (crop flag + quad, aspect-ratio idc +
+SAR, timing pair) parsed from the access unit the guest itself submitted at Decode time,
+plus a per-picture record pointer at +0x20. The original SIGSEGV at `eboot+0xec6394`
+(deref of the never-written +0x20) is gone and Electra proceeds through its whole
+picture-info consumer. What remains is below.
 
 `sceVideodec2GetPictureInfo` (`NtXRa3dRzU0`) is registered, and its handler
 (`src/hle/service/hle_service.cpp`, `vdec_picture_info`) validates `a0->size` and returns `0`
@@ -136,13 +141,33 @@ forming a new one.
 | "The guest's own decode-error path can be used as a fallback." | **False.** Returning an error from `sceAudiodecDecode` (an earlier arm, when the AAC config was still wrong) sent the guest down a path that null-dereferenced at `eboot+0xec6394` — the same address the video blocker reaches. This title's media error paths are not survivable; the calls have to actually succeed. |
 | "VA-API decodes this title's H.264." | **False, and it is not the blocker.** `No support for codec h264 profile 77` — the stream is Main profile and the host VA-API driver declines it, so prosper falls back to software decode (`#2270`). The fallback *works*: `au#1 bytes=508 send=0 recv=0 \| pictures=1`. The crash is downstream of a successful decode. |
 
+## The remaining frontier: who owns the +0x20 record?
+
+With the structure filled, Electra now walks the record at +0x20 (`P = *(void**)record`,
+C-string at `P+0x08`, ownership flag at `P+0x30`) — and then **frees the record through
+its own allocator**: prosper's calloc'd block came back as
+`FMallocBinned3 Attempt to free an unrecognized block <the same address>`, fatal. So the
+real decoder hands back a block the GUEST ALLOCATOR owns (or a value whose free path is
+guarded). Two readings were measured and both falsified:
+
+- A zeroed prosper-owned block with an empty string: guest walks it fine but the post-consumer
+  free fatals (above).
+- Echoing `out->frame` (the decoded NV12 buffer): the guest derefs `*record` as a pointer to
+  the payload, reads the frame data as a pointer, and faults at `image+0x105ed54`
+  (`PROSPER_VDEC2_PICINFO_ECHO_FRAME=1` boot). The field really is a pointer TO a payload,
+  not itself payload.
+
+The decisive question: where does Electra allocate (or register) that block so the real
+decoder can hand it back owned? Candidates: an echo of something passed in via
+`VdecInput`/`CreateDecoder` (Beast's identity arrays suggest a registered token), or an
+allocation from a shared pool MB3 recognizes. Beast (`PPSA29343`) live-traced at its three
+call sites would settle what the arrays at `this+0x150/0x170/0x178` hold.
+
 ## What would move this to rung 1
 
-The movie is the only thing standing between this title and its first real frame, and the movie is
-one unwritten structure. In order of expected value:
-
-1. **Recover the picture-info layout** (above). A second Electra title calling the same entry point
-   is the cheapest cross-check available.
-2. Failing that, establish whether Unreal's Electra has a configuration under which `PPSA06367`
+1. **Settle the +0x20 ownership contract** (above) so Electra's post-picture free succeeds.
+2. Then whatever the movie pipeline wants next — every crash since the fix has moved
+   further into Electra's own logic, which is exactly the shape of progress.
+3. Failing that, establish whether Unreal's Electra has a configuration under which `PPSA06367`
    skips its startup movies through an ordinary guest path rather than a forced one. Nothing here
    is currently known about that, and a forced skip would not be acceptance evidence anyway.
