@@ -695,6 +695,104 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   forced arm never exercised the GPU-side cost of *keeping* an attachment, which is argued from the
   extent-keyed target cache rather than measured. #2114 / #2127.
 
+- **The wrong composite of #2932 is not a present-source SELECTION error, and not the extent
+  contract — the pass prosper publishes is the guest's own scanout pass, and that pass renders the
+  flat white itself.** Both entries above send a "the frame exists and the screen is wrong"
+  investigation at the publish gate; on *BALAN WONDERWORLD* (`PPSA02058`) the publish gate is
+  innocent. Measured 2026-08-23, `tools/screenshot`, default route, no pad input,
+  `PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct`, Linux/RADV: every wrong sample is
+  `source=composited`, 3840x2160, `distinct_rgb_colors == 1`, `nonblack_rgb_pixels == 8294400`, so
+  the renderer composited it and the publisher accepted it at exactly `w*h*4`.
+  `PROSPER_PASS_LOG` over a 20 s window then names the producer: **1,255 passes target a registered
+  VideoOut buffer (`vo=1`), and 403 of them read back `px_nonblack=8235719` — the exact
+  `nonblack_rgb_pixels` the manifest records for every content sample of the same run — while 832
+  read back 8,294,400.** Same pass, same target, two outcomes. It is not buffer parity either: the
+  two flipped buffers carry both outcomes in near-equal proportion (`0x9fc0000000` 417 white / 202
+  content, `0x9fc2000000` 415 / 201). So the question is what that one scanout pass samples on the
+  frames it comes out white, not which candidate the renderer chose. #2932.
+- **The screenshot duty cycle UNDERSTATES how often the renderer gets it right, so do not use it as
+  the fix metric.** On the same BALAN run the renderer produced the real menu on **403 of 1,255**
+  scanout passes (32%) while a 1 s sample grid caught it on 5 of 40 (12.5%); a separate 110-sample
+  grid on the same title caught 15 of 110 (13.6%). A sparse grid over a fast, irregular alternation
+  is a sample of the grid as much as of the title — instrument trap 211's family. Count producing
+  passes, and only then check that the samples follow. #2932.
+- **prosper never makes a readback AVAILABLE to the host, and fixing that does not fix #2932 or
+  #2937.** Waiting a fence orders execution; it does not perform the availability operation that
+  moves a transfer write into the host domain, and no readback in `tests/fixtures/render_runner.h`
+  emits `VK_ACCESS_TRANSFER_WRITE_BIT -> VK_ACCESS_HOST_READ_BIT` at `TRANSFER -> HOST`
+  (`VK_ACCESS_HOST_READ_BIT` appears nowhere in the render path). That is a real spec gap and is
+  filed on its own terms, but it is **not** either defect's cause: adding the barrier at all four
+  readback sites left BALAN unchanged in a matched A/B — identical `--seconds 1 --count 110` arms,
+  only the lever differing, **15 of 110 content frames with the barrier against 17 of 110
+  without** — and moved no Vulkan-execution test out of the noise band described below. #2932 /
+  #2937.
+- **#2937's five RADV failures are not a RADV defect: a standalone Vulkan program driving prosper's
+  own SPIR-V renders both draw kinds correctly.** A ~150-line program with no prosper code, using
+  the vertex+fragment modules dumped from `test_indexed_render` itself and the same pipeline shape
+  (no vertex input state, TRIANGLE_LIST, dynamic scissor, one `STORAGE_BUFFER` at binding 3,
+  host-visible index and vertex buffers), renders the non-indexed and the identity-indexed draw
+  identically on the same device and driver: **1,500 indexed draws over five 300-iteration runs, 0
+  failures.** The same SPIR-V through the renderer backend rasterizes nothing. So the defect is in
+  what prosper does around the draw, not in the shader, the driver or the hardware. #2937.
+- **And it is not in prosper's caches, pools or arenas, nor in RADV's shader path.** Every one of
+  these left `test_indexed_render` at exactly 4 failures: `PROSPER_NO_INDEX_ARENA`,
+  `PROSPER_NO_BACKEND_BUFFER_ARENA`, `PROSPER_NO_BACKEND_BUFFER_POOL`, `PROSPER_NO_MEMORY_POOL`,
+  `PROSPER_NO_BACKEND_PIPELINE_CACHE`, `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE`,
+  `PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS`, `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES`,
+  `PROSPER_RTT_NOSEED`, `PROSPER_NO_DEPTH`, `PROSPER_NO_STENCIL`, `PROSPER_NO_SHARED_VULKAN_DEVICE`,
+  and `RADV_DEBUG=nongg` / `llvm` / `syncshaders` / `nooutoforder` / `zerovram` /
+  `nodcc,nohiz,nofastclears`. The index data is correct where it is bound, checked by instrumenting
+  `vkCmdBindIndexBuffer` to print the buffer handle, the offset and the first indices read back from
+  the mapped slice. #2937.
+- **Do not read #2937's failure list as a set of deterministic failures — three of the five are
+  flaky, and one of those passes most of the time.** Measured 30 runs each of the same binary at
+  master (`08c23efd`), Linux/RADV: `descriptor_array_render` **23/30 pass**, `multidraw_render`
+  **3/30**, `indexed_render` **0/30**, `gpu_execute` **0/30**. An A/B on the first two needs far more
+  than a dozen samples per arm to say anything — twelve-run arms of one unchanged binary produced
+  10/12 and 5/12 for `descriptor_array_render` on the same afternoon. Only the 0/30 pair is a stable
+  discriminator. #2937.
+
+## The renderer is not deterministic on frozen input (2026-08-23) — #2945
+
+The cheapest reproduction of #2932 and #2937 does not need a guest, a route, or a screenshot grid.
+**One `.prgbundle`, replayed offline, produces a different picture from run to run.**
+
+```bash
+# Capture any frame of an affected title (no keyboard needed; ~40 s, ~80 MB).
+SDL_VIDEODRIVER=offscreen PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_CAPTURE_DIR=<work> PROSPER_GRAB_BUNDLE_AFTER_MS=21000 \
+    timeout 55 ./prosper-app <DUMP_ROOT>/PPSA02058-app0
+
+# Replay it. The per-submit hash on the [gpureplay] lines is the metric.
+./gpu_replay --bundle <work>/frame_grab_*.prgbundle <work>/out.bmp
+```
+
+Measured on one *BALAN WONDERWORLD* (`PPSA02058`) bundle, master `08c23efd`, Linux / AMD Radeon 8060S
+(RADV STRIX_HALO), **15 replays of the same file with the same binary**:
+
+| submit | operations | distinct output hashes over 15 replays |
+| --- | --- | --- |
+| 3537 (the scene) | 118 | **5** — `5c54906d637de17f` x7, `d6feaabf815c3096` x5, and `5a0e2fd6393fbfb5`, `ad8fd75518fd10b9`, `126927e49922ef95` once each |
+| 3540 (the tail) | 11 | 1 — `a5e7b61cbf984383`, stable |
+
+Same bytes in, five pictures out. The instability is inside the large scene submit and the eleven-op
+tail is stable, so it is not the capture, not the seeds, and not the publish path.
+
+**Why this matters more than the duty cycle.** Every other handle on #2932 costs a boot and a
+sampling grid, and every one of them measures the grid as much as the defect. This costs ~40 s, has
+no guest in it, and gives a falsifiable scalar. Bisect against the hash, not against a screenshot.
+
+**It also explains the shape of both issues** (tracked as #2945). #2932's alternation between the real frame and a flat
+clear, and #2937's Vulkan-execution failures that move when you add an `fprintf` or a query, are the
+same observation at two scales: the renderer's output is a function of timing as well as of input.
+
+Known and *not* the discriminator: the same bundle-replay log on a **content** frame of the same
+title shows the identical skipped dispatch,
+`[compute] program 0x3007980000 image 0x306c0f0000 1920x1080x1 ... DCC metadata extent is
+unsupported -> dispatch skipped (#590)`, so #590 costs a real 1920x1080 storage-image dispatch every
+frame on this title but does not separate a white frame from a good one.
+
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct
