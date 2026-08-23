@@ -2182,6 +2182,13 @@ if(TARGET prosper_core)
       endif()
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
+      # vkprobe (#2945/#2937): the CONTROL for "is this prosper or is this the driver". Drives a
+      # dumped SPIR-V pair through a bare Vulkan pipeline with no prosper code in the process, so a
+      # draw that renders here and not through the backend rules out the recompiler, the SPIR-V, ACO
+      # and the hardware in one run. Deliberately links nothing from prosper.
+      add_executable(vkprobe tools/vkprobe/vkprobe.cpp)
+      target_link_libraries(vkprobe PRIVATE Vulkan::Vulkan)
+
       # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
       # data remains gitignored, renders it through the same live backend, and checks the captured hash.
       add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
