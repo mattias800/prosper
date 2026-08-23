@@ -923,22 +923,39 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   through `STORAGE_BUFFER` descriptors, which Vulkan requires to be `NonWritable` in the vertex
   stage unless that feature is enabled (`VUID-RuntimeSpirv-NonWritable-06341`). Every pipeline it
   built was therefore invalid, and because it loads no validation layers it reported coverage
-  numbers regardless. That voids its 3,000-clean-iteration result, it voids the two failures that
-  were later used to withdraw that result, and it voids #2937's original 1,500-draw measurement —
-  the one that turned "RADV is broken" into "prosper is broken" and redirected that whole
-  investigation.
-  **With the feature enabled and the pipeline validating clean, the control still fails.** 3 of 5
-  iterations empty in one run *under the validation layers with zero findings*, and 38 of 200 in
-  another without them — 2 failing runs of 26 — with the non-indexed arm beside them constant at 496
-  throughout. So a bare Vulkan program, a spec-valid pipeline and no prosper code reproduce exactly
-  the #2945/#2937 signature.
-  **What that does and does not license.** It clears prosper's HOST-side Vulkan usage — descriptor
-  wiring, synchronisation, resource lifetime, pass configuration — which is the entire suspect space
-  the row above spent a session narrowing. It does NOT clear prosper's generated SPIR-V, which is
-  what the control executes. So the remaining suspects are **the recompiler's output and the
-  driver/hardware**, and the rates still differ by orders of magnitude (prosper's one-draw
-  reproduction fails ~50% in a bad window, the control needs tens of runs), so prosper is very
-  likely amplifying rather than solely causing.
+  numbers regardless. That voids its 3,000-clean-iteration result and the two failures later used to
+  withdraw it. **It also casts the same doubt over #2937's original 1,500-draw measurement — the one
+  that turned "RADV is broken" into "prosper is broken" — but that is INFERENCE, not fact:** that
+  program was deleted during cleanup and cannot be inspected, and the inference rests only on the
+  rebuild sharing its shape and on a hand-written control having no reason to enable the feature.
+  Cheap to check if anyone recovers it; expensive to assume either way.
+  **With the feature enabled and the pipeline validating clean, the control still fails.** Measured
+  as `vkprobe --vs vs.spv --fs vs.spv.frag --iterations N` on the #2937 module dump (default
+  records, default indices `0,1,2`; the fully-covered figure is 496 pixels of a 64x64 target, not
+  the whole target, because that dump's record stride differs from the tool's default): 3 of 5
+  iterations empty in one run *under the validation layers with zero core-validation findings*, 38
+  of 200 in another, and 13 of 150 in a third — **3 failing runs of about 63**. `--iterations` is
+  the sample count; the failure is per-PROCESS in shape, so quote runs.
+  **The arm attribution survives the obvious confound.** The first version always submitted
+  non-indexed then indexed, which made "the indexed draw failed" indistinguishable from "the second
+  submit failed". The tool now alternates the order every iteration and reports both breakdowns:
+  across every run measured, **the non-indexed arm has never come back empty — not once in ~9,000
+  iterations** — while the indexed arm does, and in the one failing run under alternation the
+  failures split 9 first / 4 second. So the failure follows the draw KIND, not submission order.
+  **What that does and does not license, stated exactly, because the obvious phrasing is wrong.**
+  The control does not reproduce prosper's host-side Vulkan usage — it *avoids* it; the pass,
+  descriptors and synchronisation are vkprobe's own. So the correct conclusion is that **prosper's
+  host-side usage is not NECESSARY for the failure**, which is weaker than "cleared" and is the
+  claim the evidence supports. It may still be sufficient on its own, and it may still be what
+  raises the rate. The tempting sentence — "this clears descriptors, sync and lifetimes" — is the
+  one to avoid: it contradicts the amplification reading in the same breath, since an amplifier has
+  to live somewhere, and the shared SPIR-V and the shared driver are common to both sides.
+  What the row above narrowed is therefore not wasted but re-scoped: those twenty levers are all
+  *unnecessary* conditions too.
+  **Rates differ by orders of magnitude** — prosper's one-draw reproduction fails ~50% in a bad
+  window, the control fails in 3 runs of ~63 — so something on prosper's side is very likely
+  amplifying. The remaining suspects are prosper's generated SPIR-V (which the control executes),
+  prosper's host-side usage as an amplifier, and the driver/hardware.
   **The transferable lesson is about the instrument, not the bug: a control is only a control once
   it is VALID, and a program that loads no validation layers cannot tell you that it is.** Two
   investigations were steered by this one for weeks. `vkprobe` now enables the feature, exits 2 if

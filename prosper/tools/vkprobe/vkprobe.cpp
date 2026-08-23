@@ -31,7 +31,8 @@
 // once with vkCmdBindIndexBuffer + vkCmdDrawIndexed over the supplied indices — then counts pixels
 // that differ from the clear colour. The arms are directly comparable only when those indices are
 // the identity sequence (the default); with a capture's real indices, read each arm on its own.
-// A run reports, per draw kind, how many iterations produced ZERO covered pixels. The two arms are the point: an indexed arm that fails while the
+// A run reports, per draw kind, how many iterations produced ZERO covered pixels, and the same
+// failures split by submission position beside it.
 // non-indexed arm beside it passes is the #2937 signature, and either arm failing on its own is a
 // device or shader problem rather than an indexing one.
 //
@@ -104,15 +105,6 @@ std::vector<uint8_t> read_bytes(const std::string& path) {
     return data;
 }
 
-// Storage-buffer bindings the module declares, and a REFUSAL for anything this tool cannot model.
-//
-// The refusal half matters more than the reflection half. vkprobe builds one descriptor set layout
-// with every binding typed STORAGE_BUFFER, so a module that declares a sampled image, or a set other
-// than 0, would get a pipeline layout inconsistent with its own shaders
-// (VUID-VkGraphicsPipelineCreateInfo-layout-00756). No validation layers are loaded here by default,
-// so nothing would say so: the tool would run, print a coverage number, and that number would be
-// undefined. A control that answers confidently on inputs it cannot model is worse than no control,
-// so those inputs exit 2 instead.
 // Output-interface Locations a module decorates, for the budget refusal below.
 std::set<uint32_t> output_locations(const std::vector<uint32_t>& spirv) {
     constexpr uint32_t kOpDecorate = 71, kOpVariable = 59;
@@ -134,6 +126,15 @@ std::set<uint32_t> output_locations(const std::vector<uint32_t>& spirv) {
     return result;
 }
 
+// Storage-buffer bindings the module declares, and a REFUSAL for anything this tool cannot model.
+//
+// The refusal half matters more than the reflection half. vkprobe builds one descriptor set layout
+// with every binding typed STORAGE_BUFFER, so a module that declares a sampled image, or a set other
+// than 0, would get a pipeline layout inconsistent with its own shaders
+// (VUID-VkGraphicsPipelineCreateInfo-layout-00756). No validation layers are loaded here by default,
+// so nothing would say so: the tool would run, print a coverage number, and that number would be
+// undefined. A control that answers confidently on inputs it cannot model is worse than no control,
+// so those inputs exit 2 instead.
 void collect_storage_bindings(const std::vector<uint32_t>& spirv, const char* stage,
                               std::set<uint32_t>& out) {
     constexpr uint32_t kOpDecorate = 71, kOpVariable = 59;
@@ -287,7 +288,8 @@ int main(int argc, char** argv) {
         if (argument == "--vs") options.vs_path = next("--vs");
         else if (argument == "--fs") options.fs_path = next("--fs");
         else if (argument == "--records") options.records_path = next("--records");
-        else if (argument == "--iterations") options.iterations = strict_u32(next("--iterations"), "--iterations");
+        else if (argument == "--iterations")
+            options.iterations = strict_u32(next("--iterations"), "--iterations");
         else if (argument == "--device") options.device_index = strict_u32(next("--device"), "--device");
         else if (argument == "--extent") {
             if (!parse_extent(next("--extent"), options.width, options.height)) { usage(argv[0]); return 2; }
@@ -596,7 +598,8 @@ int main(int argc, char** argv) {
         VkDeviceMemory image_memory = VK_NULL_HANDLE;
         if (vkAllocateMemory(device, &allocate, nullptr, &image_memory) != VK_SUCCESS)
             fail_setup("vkAllocateMemory (image)");
-        vkBindImageMemory(device, image, image_memory, 0);
+        if (vkBindImageMemory(device, image, image_memory, 0) != VK_SUCCESS)
+            fail_setup("vkBindImageMemory (image)");
         VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_info.image = image;
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -622,10 +625,12 @@ int main(int argc, char** argv) {
         command_allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         command_allocate.commandBufferCount = 1;
         VkCommandBuffer command = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(device, &command_allocate, &command);
+        if (vkAllocateCommandBuffers(device, &command_allocate, &command) != VK_SUCCESS)
+            fail_setup("vkAllocateCommandBuffers");
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(command, &begin);
+        if (vkBeginCommandBuffer(command, &begin) != VK_SUCCESS)
+            fail_setup("vkBeginCommandBuffer");
         VkClearValue clear{};
         clear.color = {{0.0f, 0.0f, 1.0f, 1.0f}};
         VkRenderPassBeginInfo pass_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -655,11 +660,12 @@ int main(int argc, char** argv) {
         host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                              0, 1, &host_read, 0, nullptr, 0, nullptr);
-        vkEndCommandBuffer(command);
+        if (vkEndCommandBuffer(command) != VK_SUCCESS) fail_setup("vkEndCommandBuffer");
 
         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence = VK_NULL_HANDLE;
-        vkCreateFence(device, &fence_info, nullptr, &fence);
+        if (vkCreateFence(device, &fence_info, nullptr, &fence) != VK_SUCCESS)
+            fail_setup("vkCreateFence");
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
@@ -686,20 +692,32 @@ int main(int argc, char** argv) {
         return covered;
     };
 
+    // ORDER IS ALTERNATED, and that is not tidiness. Running non-indexed then indexed every time
+    // confounds the arm with its POSITION: "the indexed draw came back empty" is then exactly as
+    // well supported as "the second submit came back empty", and this tool's whole purpose is to
+    // attribute a failure to the draw KIND. Swapping the order on odd iterations separates them, and
+    // both breakdowns are reported so a reader can see which one moved.
     uint32_t plain_empty = 0, indexed_empty = 0, mismatched = 0;
+    uint32_t first_empty = 0, second_empty = 0;
     uint64_t plain_min = UINT64_MAX, plain_max = 0, indexed_min = UINT64_MAX, indexed_max = 0;
     for (uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
-        const uint64_t plain = render(false);
-        const uint64_t indexed = render(true);
+        const bool indexed_first = (iteration & 1u) != 0;
+        const uint64_t first = render(indexed_first);
+        const uint64_t second = render(!indexed_first);
+        const uint64_t plain = indexed_first ? second : first;
+        const uint64_t indexed = indexed_first ? first : second;
         if (!plain) ++plain_empty;
         if (!indexed) ++indexed_empty;
+        if (!first) ++first_empty;
+        if (!second) ++second_empty;
         if (plain != indexed) ++mismatched;
         plain_min = plain < plain_min ? plain : plain_min;
         plain_max = plain > plain_max ? plain : plain_max;
         indexed_min = indexed < indexed_min ? indexed : indexed_min;
         indexed_max = indexed > indexed_max ? indexed : indexed_max;
         if (options.verbose)
-            std::printf("[vkprobe] iteration=%u plain=%llu indexed=%llu\n", iteration,
+            std::printf("[vkprobe] iteration=%u %s plain=%llu indexed=%llu\n", iteration,
+                        indexed_first ? "indexed-first" : "plain-first",
                         (unsigned long long)plain, (unsigned long long)indexed);
     }
 
@@ -711,6 +729,11 @@ int main(int argc, char** argv) {
                 indexed_empty, options.iterations);
     std::printf("[vkprobe] the two arms disagreed on %u of %u iterations\n",
                 mismatched, options.iterations);
+    // The same failures split by POSITION rather than by draw kind. If these two are comparable
+    // while the arm counts above are lopsided, the defect follows the draw kind; if it is these that
+    // are lopsided, it follows submission order and the arm attribution is an artefact.
+    std::printf("[vkprobe] by submission position: first EMPTY on %u, second EMPTY on %u "
+                "(order alternates each iteration)\n", first_empty, second_empty);
 
     vkDestroyPipeline(device, pipeline, nullptr);
     vkDestroyCommandPool(device, command_pool, nullptr);

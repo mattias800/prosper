@@ -46,10 +46,10 @@ geometry will be arbitrary — which is still a valid *determinism* test, but no
 
 | observation | what it means |
 | --- | --- |
-| both arms cover the same pixel count on every iteration | **nothing, on its own.** This tool has produced ~7,500 such iterations and then failed; see below. It is a negative only across tens of RUNS, and even then it clears prosper's HOST-side Vulkan usage, not the SPIR-V it is executing |
+| both arms cover the same pixel count on every iteration | **nothing, on its own.** This tool has produced thousands of such iterations and then failed; see below. It is a negative only across tens of RUNS, and even then it shows prosper's host-side Vulkan usage is not NECESSARY for a failure — never that it is exonerated |
 | the indexed arm is empty while the non-indexed arm is not | the index path itself; compare against #2937 |
 | coverage varies between iterations | the driver or hardware is not deterministic on this input — take it to the driver, and re-run at high `--iterations` before believing it |
-| the indexed arm is empty on some iterations while the non-indexed arm is constant | the #2945 defect, reproduced with no prosper code in the process. Measured 2 of 26 runs on a valid pipeline, once at 38 of 200 iterations |
+| the indexed arm is empty on some iterations while the non-indexed arm is constant | the #2945 signature, reproduced with no prosper code in the process. Measured 3 of ~63 runs on a valid pipeline. The order of the two arms alternates every iteration and the by-position line is printed beside the by-arm line **so this attribution is checkable** — if the position counts are lopsided and the arm counts are not, it is submission order, not indexing |
 | exit 2 | the probe never ran; nothing has been measured — a hung wait, an unsupported input pair, or a malformed argument all land here rather than reading as a failing draw |
 
 The coverage predicate counts pixels that differ from the **blue clear**, ignoring alpha. A fragment
@@ -77,16 +77,20 @@ and a vertex module whose output interface exceeds the device's `maxVertexOutput
 refused by name (this is #2945's own subject — a 132-against-128 interface — and a module dumped
 before that bound was applied is refused with those exact numbers).
 
-**Run it under the validation layers when the answer matters:**
+**Run it under the validation layers when the answer matters** — and note that the plain form below
+enables CORE validation only, so "zero findings" from it says nothing about synchronization. Add a
+`vk_layer_settings.txt` with `khronos_validation.validate_sync = true` if that is the question:
 
 ```bash
 VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation vkprobe --vs vs.spv --fs fs.spv --iterations 200
 ```
 
 **This probe has itself reproduced the #2945 class on a VALID pipeline, and that is its most
-important result so far.** On the corrected build: 3 of 5 iterations empty in one run under the validation
-layers with **zero validation findings**, and 38 of 200 in another without them — 2 failing runs of
-26 — while the non-indexed arm beside them stayed constant at 496 throughout. So the run-level rate
+important result so far.** On the corrected build, running
+`vkprobe --vs vs.spv --fs vs.spv.frag --iterations N` against #2937's module dump with default
+records and default indices: 3 of 5 iterations empty in one run under the validation layers with
+**zero core-validation findings**, 38 of 200 in another, 13 of 150 in a third — **3 failing runs of
+about 63** — while the non-indexed arm beside them stayed constant at 496 throughout. So the run-level rate
 is low, the control is **not** a clean negative, and "prosper's Vulkan usage is the defect" does not
 follow from a quiet afternoon with this tool.
 

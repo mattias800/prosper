@@ -11,10 +11,12 @@ share the suspect.
 `vkprobe` is the arm that does not. It links **no prosper code**, creates its own instance, device
 and queue, and executes the *same SPIR-V modules prosper produced* through a bare pipeline. What
 that separates is narrower than it first appears, and getting it wrong has cost this project twice:
-it isolates prosper's **host-side Vulkan usage** — descriptor wiring, synchronisation, resource
-lifetime, pass configuration — from everything else. It does **not** clear the recompiler, because
-the SPIR-V under test is the recompiler's own output, and it does **not** clear the driver, because
-on a valid pipeline it reproduces #2945 itself.
+it *avoids* prosper's **host-side Vulkan usage** — descriptor wiring, synchronisation, resource
+lifetime, pass configuration — rather than reproducing it. So a failure here shows that usage is not
+NECESSARY for the defect; it never shows it is exonerated, and the difference matters because the
+same run also suggests something on prosper's side is amplifying. It does **not** clear the
+recompiler, because the SPIR-V under test is the recompiler's own output, and it does **not** clear
+the driver, because on a valid pipeline it reproduces #2945 itself.
 
 ## What belongs here
 
