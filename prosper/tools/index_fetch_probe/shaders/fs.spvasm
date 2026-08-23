@@ -1,0 +1,54 @@
+; fs.spvasm — fragment shader for the indexed-fetch probe (#2961).
+;
+; For each point fragment: ssbo[payload] = ordinal, where payload is what the fixed-function
+; fetcher returned for that vertex and ordinal is the gl_VertexIndex the driver supplied.
+; On a correct implementation with an identity vertex buffer the two are equal, so every
+; written slot reads back as its own index; a slot whose value differs from its index is the
+; divergence. Out-of-range payloads (should not exist) are discarded.
+;
+; Assemble:  spirv-as --target-env vulkan1.0 shaders/fs.spvasm -o fs.spv
+
+               OpCapability Shader
+               OpExtension "SPV_KHR_storage_buffer_storage_class"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %fs_main "fs_main" %v_ordinal %v_payload
+               OpExecutionMode %fs_main OriginUpperLeft
+               OpDecorate %v_ordinal Location 0
+               OpDecorate %v_ordinal Flat
+               OpDecorate %v_payload Flat
+               OpDecorate %runtime ArrayStride 4
+               OpMemberDecorate %ssbo_type 0 Offset 0
+               OpDecorate %ssbo_type Block
+               OpDecorate %results DescriptorSet 0
+               OpDecorate %results Binding 0
+       %void = OpTypeVoid
+        %fnt = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+%ptr_in_uint = OpTypePointer Input %uint
+%ptr_fn_uint = OpTypePointer Function %uint
+   %runtime  = OpTypeRuntimeArray %uint
+  %ssbo_type = OpTypeStruct %runtime
+%ptr_ssbo    = OpTypePointer StorageBuffer %ssbo_type
+    %results = OpVariable %ptr_ssbo StorageBuffer
+%ptr_wr_uint = OpTypePointer StorageBuffer %uint
+  %v_ordinal = OpVariable %ptr_in_uint Input
+ %v_payload  = OpVariable %ptr_in_uint Input
+        %c_u0   = OpConstant %uint 0
+      %c_limit  = OpConstant %uint 256
+
+     %fs_main = OpFunction %void None %fnt
+       %entry = OpLabel
+        %ord   = OpLoad %uint %v_ordinal
+     %payload  = OpLoad %uint %v_payload
+        ; discard out-of-range fetches instead of corrupting memory
+      %in_range = OpULessThan %bool %payload %c_limit
+               OpSelectionMerge %merge None
+               OpBranchConditional %in_range %write %merge
+       %write = OpLabel
+       %addr  = OpAccessChain %ptr_wr_uint %results %c_u0 %payload
+               OpStore %addr %ord
+               OpBranch %merge
+      %merge  = OpLabel
+               OpReturn
+               OpFunctionEnd

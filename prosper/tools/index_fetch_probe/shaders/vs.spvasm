@@ -1,0 +1,71 @@
+; vs.spvasm — vertex shader for the indexed-fetch probe (#2961).
+;
+; Records, for every invoked vertex, the pair (ordinal, payload):
+;   ordinal = gl_VertexIndex          (what the driver handed the shader)
+;   payload = vertex attribute 0      (what the fixed-function fetcher returned)
+;
+; The vertex buffer holds identity data (payload == source position), so on a correct
+; implementation ordinal == payload for every index in the list, and the fragment stage
+; stores ssbo[payload] = ordinal — a slot whose stored value differs from its index is a
+; divergence between what was fetched and what was sequenced.
+;
+; Assemble:  spirv-as --target-env vulkan1.0 shaders/vs.spvasm -o vs.spv
+
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %vs_main "vs_main" %gl_VertexIndex %attr %gl_Position %gl_PointSize %v_ordinal %v_payload
+               OpDecorate %gl_VertexIndex BuiltIn VertexIndex
+               OpDecorate %gl_Position BuiltIn Position
+               OpDecorate %gl_PointSize BuiltIn PointSize
+               OpDecorate %v_ordinal Location 0
+               OpDecorate %v_ordinal Flat
+               OpDecorate %v_payload Location 1
+               OpDecorate %v_payload Flat
+       %void = OpTypeVoid
+        %fnt = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+     %fvec4  = OpTypeVector %float 4
+%ptr_in_int  = OpTypePointer Input %int
+%ptr_in_uint = OpTypePointer Input %uint
+%ptr_out_uint = OpTypePointer Output %uint
+%ptr_out_f4  = OpTypePointer Output %fvec4
+%ptr_out_fl  = OpTypePointer Output %float
+%gl_VertexIndex = OpVariable %ptr_in_int Input
+         %attr = OpVariable %ptr_in_uint Input
+    %gl_Position = OpVariable %ptr_out_f4 Output
+    %gl_PointSize = OpVariable %ptr_out_fl Output
+      %v_ordinal = OpVariable %ptr_out_uint Output
+     %v_payload = OpVariable %ptr_out_uint Output
+        %c_u32 = OpConstant %uint 32
+        %c_fhalf = OpConstant %float 0.5
+        %c_k    = OpConstant %float 0.0625
+        %c_f1   = OpConstant %float 1
+        %c_f0   = OpConstant %float 0
+
+     %vs_main = OpFunction %void None %fnt
+       %entry = OpLabel
+        %ord_i = OpLoad %int %gl_VertexIndex
+        %ord   = OpBitcast %uint %ord_i
+      %payload = OpLoad %uint %attr
+               OpStore %v_ordinal %ord
+               OpStore %v_payload %payload
+        ; grid position: column = ord mod 32, row = (ord / 32) mod 32 -> one pixel-centre point each
+        %col    = OpUMod %uint %ord %c_u32
+        %row_t  = OpUDiv %uint %ord %c_u32
+        %row    = OpUMod %uint %row_t %c_u32
+     %col_f0    = OpConvertUToF %float %col
+     %row_f0    = OpConvertUToF %float %row
+     %col_c     = OpFAdd %float %col_f0 %c_fhalf
+     %row_c     = OpFAdd %float %row_f0 %c_fhalf
+        ; ndc = centre / 32 * 2 - 1
+     %mul_x     = OpFMul %float %col_c %c_k
+     %x_ndc     = OpFSub %float %mul_x %c_f1
+     %mul_y     = OpFMul %float %row_c %c_k
+     %y_ndc     = OpFSub %float %mul_y %c_f1
+        %pos    = OpCompositeConstruct %fvec4 %x_ndc %y_ndc %c_f0 %c_f1
+               OpStore %gl_Position %pos
+               OpStore %gl_PointSize %c_f1
+               OpReturn
+               OpFunctionEnd
