@@ -2304,6 +2304,30 @@ HLE(k_ampr_push_map) {
         bool have_phys = dmem_take(a2, 0x10000, 0x0c, phys);
         void* p = have_phys ? map_phys_at(a1, a2, PROT_READ | PROT_WRITE, phys)
                             : map_at(a1, a2, PROT_READ | PROT_WRITE);
+        // A refused mapping must give the physical pages BACK (#2908). map_phys_at answers null
+        // whenever the no-clobber discipline declines the target — an unaligned va, or a va that is
+        // already live guest memory — and that refusal is the CORRECT outcome for the flavors that
+        // reach here with an existing buffer. What was not correct is keeping the pool offset
+        // dmem_take just consumed: nothing references it, nothing can ever release it, and the
+        // dmem_take alignment above rounds every such carcass up to a full 64 KiB stride however
+        // small the request was. On PPSA20447 (Khazan) that is 4,294-4,574 refusals of
+        // 0x40/0x4000/0x10000 requests in one 6 s boot (the count varies run to run) = 268-286 MiB
+        // of the pool retired for nothing, against the 300 MiB scratch block that is the only
+        // headroom left after UE4's halving probe. PPSA03001 (Sifu) does it 31,839-32,192 times,
+        // which is 1.9-2.0 GiB. Fixing this does NOT get either title past its out-of-memory
+        // assert — see #2908 for what does not follow from it — but the pool damage was real.
+        if (have_phys && !p) {
+            dmem_release(phys, a2);
+            have_phys = false;
+            phys = 0;
+        }
+        // Fresh direct memory reads back ZERO on hardware, and the pool's memfd RETAINS bytes across
+        // release and reuse (see dmem_zero). Before the release above, an Ampr map-flavor offset was
+        // never freed and so never recycled, which is the only reason this path got away without
+        // punching. Now that a refusal returns the offset, the next taker of it — including this
+        // very handler, whose map flavor documents "the guest expects FRESH ZEROED pages" — must not
+        // inherit the previous tenant's bytes.
+        if (have_phys) dmem_zero(phys, a2);
         if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-map",
                      have_phys ? kVirtualQueryDirect : 0, have_phys ? phys : 0,
                      have_phys ? 0x0c : 0);
@@ -2339,9 +2363,34 @@ HLE(k_ampr_push_map) {
                  (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)phys,
                  (unsigned long long)mirror, p ? "ok" : "FAIL",
                  mirror_live ? "skip" : (q ? "ok" : "FAIL"));
+        } else if (p) {
+            MLOG("ampr push-map va=0x%llx len=0x%llx -> ok\n",
+                 (unsigned long long)a1, (unsigned long long)a2);
         } else {
-            MLOG("ampr push-map va=0x%llx len=0x%llx -> %s\n",
-                 (unsigned long long)a1, (unsigned long long)a2, p ? "ok" : "FAILED");
+            // WHY the host refused, recorded rather than left to be re-derived (#2908). A bare
+            // "FAILED" reads as a lost page commit, and on the two titles that assert with UE4's
+            // own out-of-memory report it was read that way — thousands of these on Khazan and tens
+            // of thousands on Sifu sit right before the assert, which is a compelling place to be
+            // wrong about. Measured with this line, 100% of them on both titles report ALREADY
+            // MAPPED, so none of them is a lost commit.
+            // map_phys_at answers null in exactly two situations, and neither is a lost commit:
+            // MAP_FIXED_NOREPLACE refuses to clobber a range that is ALREADY MAPPED (the guest has
+            // that memory and can write it), or the address/length is not page-aligned, which no
+            // page commit ever is. Printing the discriminator makes the distinction measurable in
+            // any run instead of inferable from the mmap flags.
+            static const uint64_t page = [] {
+                const long v = sysconf(_SC_PAGESIZE);
+                return v > 0 ? (uint64_t)v : 4096ull;
+            }();
+            const bool aligned = (a1 % page) == 0 && (a2 % page) == 0;
+            unsigned char vec = 0;
+            const bool resident =
+                prosper_mincore((void*)(uintptr_t)(a1 & ~(page - 1)), 1, &vec) == 0;
+            MLOG("ampr push-map va=0x%llx len=0x%llx -> FAILED (%s; target %s)\n",
+                 (unsigned long long)a1, (unsigned long long)a2,
+                 aligned ? "page-aligned" : "NOT page-aligned -- never a page commit",
+                 resident ? "ALREADY MAPPED -- the guest already has this memory"
+                          : "unmapped");
         }
     }
     return 0;

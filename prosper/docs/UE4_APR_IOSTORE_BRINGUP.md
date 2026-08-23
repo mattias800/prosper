@@ -11,6 +11,28 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
+- **A refused Ampr map is a lost page commit — false, on every one of 36,766 measured refusals.**
+  `sceAmprCommandBufferSetBuffer`'s map flavor logs `ampr push-map … -> FAILED` when the host
+  declines to place the mapping, and on the two UE4 titles that assert with UE's own out-of-memory
+  report those lines arrive in bulk immediately beforehand — 4,574 on *Khazan* `PPSA20447`, 32,192 on
+  *Sifu* `PPSA03001`. That is a compelling place to conclude the guest's allocator could not commit.
+  It did not: `map_phys_at` answers null in exactly two situations, neither of which loses the guest
+  anything. `MAP_FIXED_NOREPLACE` refuses to clobber a range that is **already mapped** — the guest
+  has that memory and can write it — or the address/length is not page-aligned, and a 64-byte "map"
+  was never a page commit. The handler now prints which, and the census is unanimous: **100% of the
+  refusals on both titles report `target ALREADY MAPPED`** (4,006 + 568 unaligned; 31,857 + 335).
+  These calls are the BUFFER flavor arriving in an argument shape the `a3 == a1` discriminator does
+  not recognise (`a3 == 0`, `a5 == a0`), and refusing to touch their memory is the correct outcome —
+  it is the same #88 / #107 clobber the discriminator exists to prevent. [#2908](https://github.com/mattias800/prosper/issues/2908).
+
+- **The refusal was not free, though, and that half was a real defect.** Each refused map had already
+  claimed a physical range from the direct-memory pool, and the claim was dropped rather than
+  released: nothing referenced it, nothing could ever free it, and because the claim is made at
+  64 KiB alignment every carcass retired a full 64 KiB stride however small the request. 286 MiB per
+  Khazan boot, **1.96 GiB** per Sifu boot. Fixed in `hle_kernel_mem.cpp`; a refused map now returns
+  its pages, and the map-flavor success path zeroes them because a released offset can now be
+  recycled. `tests/hle/memory/test_ampr_map_refusal_releases_dmem.cpp`.
+
 - **The shared-equeue completion coalescing is what blocks Tales of Graces f's opening movie —
   false, and the tempting inference to avoid is "the bug is real, therefore it is THIS title's
   blocker".** The drop itself *is* real and is fixed by
