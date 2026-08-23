@@ -21,6 +21,31 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-23
 
+### Metaphor: ReFantazio can read its own font now, and the first thing it wanted to say was hello in twelve languages
+
+<p align="center"><img src="assets/screenshots/metaphor-language-select.png" alt="Metaphor: ReFantazio — the language-selection screen: twelve languages listed in white serif type over black, English highlighted with a blue brush-stroke, the list reading English, Deutsch, Español (España), Español (Latinoamérica), Français, Italiano, Português, Русский, 日本語, 中文(繁體), 中文(简体), 한국어"></p>
+
+<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.png" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book, drawn in blue and red over black in the lower right corner"></p>
+
+Sony's font library has a call that draws one letter and then tells you how big the letter it drew
+was; prosper had never implemented it, so it politely reported success and left the answer blank.
+The game read the blank — whatever the last function to use that piece of stack had left behind,
+which happened to be 285,196,807 — decided its letters were two hundred and eighty-five million
+pixels wide, ordered a texture that size, got one that was never really built, and divided by its
+zero pixel format. Five seconds into every boot, forty minutes of tracing away from the font code.
+
+The fix is not a better number, because there is no honest number to invent: it is a real
+rasterizer. The game hands us its own 180 KB font file when it starts, so prosper now reads that
+file and draws the actual outlines out of it — which is why the Cyrillic, Japanese, Chinese and
+Korean above are all correct. Nothing here is a guess; it is the game's own typeface
+([#2951](https://github.com/mattias800/prosper/issues/2951)).
+
+The same change made two facts measurable that had only been suspicions. *Sonic Frontiers* and
+*Sonic Origins* both name this font library in their binaries, so it looked like a plausible cause
+for Sonic Origins' missing wordmark — but neither title imports a single function from it, and
+counting is what settled that rather than argument. And Astro Bot, which imports fifty-four of
+them, was quietly missing one all along.
+
 ### Metaphor: ReFantazio was byte-reversing four gigabytes of its own heap
 
 No picture — the frames it now produces are still black. We had been telling the game about memory
