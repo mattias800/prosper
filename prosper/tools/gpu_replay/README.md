@@ -503,6 +503,13 @@ reported byte-identical inputs across runs that rendered and runs whose vertices
 was the instrument that moved the suspect off the upload path. Opt-in, bounded to 16 slices, and
 inert by default.
 
+A capsule does **not** round-trip the dead-varying bound (#2945). `consumed_mask` /
+`consumed_known` are derived from the fragment program rather than serialized, so a stored capture
+loads with them unset. `--recompile-raw` and the `PROSPER_GEOM_PROBE` rebuild both re-derive them
+before recompiling; a plain replay of stored SPIR-V uses the modules exactly as captured, which is
+the point of a plain replay. If you are comparing a replay's vertex interface against the live
+renderer's, use one of the two that re-derive.
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
 `--inspect-only`, as it is for the probes above. Capture v19 adds
 `--dump-realized-shader DRAW:vs|vs-main|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized

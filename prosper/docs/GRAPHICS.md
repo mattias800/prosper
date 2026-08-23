@@ -899,19 +899,41 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   dstAccessMask=0`. The first attempt at the fix above set the incoming `dstAccessMask` to the
   ATTACHMENT accesses only, which dropped visibility for every `SHADER_READ` in the pass — every
   texture a transfer had just uploaded and every buffer a compute dispatch had just written.
-  Synchronization validation stayed clean (removing a visibility operation the application never
-  declared is not a hazard the layer can see) and all 302 ctest cases passed; what caught it was
-  three rung-6 snapshot guards collapsing to near-white garbage at `structural matches 0`
-  (`messenger-scene`, `dead-cells-gameplay`, `gris-gameplay`). **Keep both dependencies a superset of
-  the defaults — `ALL_COMMANDS` / `MEMORY_READ|MEMORY_WRITE` — so they can only add ordering.** The
-  tempting edit to that code is to narrow the masks for performance, and nothing but a guard run
-  would stop it. #2945.
-- **The standalone control is clean, so the defect is prosper's.** `tools/vkprobe` drives the same
-  dumped modules through a bare Vulkan pipeline with no prosper code in the process: 3,000 indexed
-  draws in one run, coverage constant, zero disagreements with the non-indexed arm beside it. One
-  earlier 300-iteration run of the same binary reported 80 disagreements and did not reproduce in
-  3x200 and 1x3000 immediately afterwards — recorded because it is unexplained, not because it is
-  evidence. #2945 / #2937.
+  Synchronization validation stays clean either way — removing a visibility operation the application
+  never declared is not a hazard the layer can see — and all 302 ctest cases pass on both. **Keep
+  both dependencies a superset of the defaults — `ALL_COMMANDS` / `MEMORY_READ|MEMORY_WRITE` — so
+  they can only add ordering.** The tempting edit is to narrow them for performance; a narrowing that
+  remains a superset of the implicit defaults is legitimate, one that does not is a silent
+  visibility hole.
+  **This row rests on the Vulkan contract, NOT on a measurement, and the measurement that looked
+  like one is withdrawn.** The narrow masks were first written up as having "collapsed three rung-6
+  guards", because `messenger-scene`, `dead-cells-gameplay` and `gris-gameplay` all failed at
+  `structural matches 0` on that build. That run had no control. #2950 then established that those
+  three fail identically on plain `origin/master` and on a 2026-08-02 build, so the narrow-mask run
+  could not distinguish "the masks broke it" from "already broken", and no snapshot guard on that
+  machine is a usable renderer oracle until #2950 resolves. The reason to keep the masks wide is
+  that a non-superset dependency removes visibility the pass relies on — which is true from the
+  spec, and was true before anything was measured. #2945 / #2950.
+- **The standalone control is NOT clean, and the earlier claim that it was is withdrawn.**
+  `tools/vkprobe` drives the same dumped modules through a bare Vulkan pipeline with no prosper code
+  in the process. It was first reported here as 3,000 indexed draws with constant coverage and zero
+  failures, which was read as "the defect is prosper's, not RADV's". **It has since failed twice**:
+  one 300-iteration run with 80 arm disagreements and indexed coverage ranging 496-2731, and one
+  200-iteration run with **76 of 200 indexed draws covering ZERO pixels** while the non-indexed arm
+  beside it stayed constant at 496 — the same signature, with no prosper code anywhere in the
+  process. Against that, roughly 7,500 clean iterations over ~45 runs, so the run-level rate is low
+  but not zero.
+  **What this does and does not license.** It kills "the defect is prosper's": a process containing
+  no prosper code reproduces the class. It does NOT establish the converse, because the rates differ
+  by orders of magnitude — prosper's one-draw reproduction fails about half the time in a bad
+  window, the control needs tens of runs — so prosper is very likely amplifying something rather
+  than solely causing it. Treat the suspect as *at or below the driver*, and treat any prosper-side
+  A/B as measuring an amplifier.
+  **One correlation, deliberately not stated as a cause:** both failing runs were the FIRST execution
+  after the binary was relinked. The obvious mechanism, a cold Mesa shader cache, is falsified —
+  `MESA_SHADER_CACHE_DISABLE=true` measured 0 failures over 8x150 iterations interleaved against 0
+  over the same warm count. n=2 on the correlation; it is written down because it is the only
+  structure anyone has, not because it is evidence. #2945 / #2937 / #2950.
 
 
 ## Recommended implementation order

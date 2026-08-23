@@ -60,7 +60,15 @@ set, or a binding that is not a `StorageBuffer` variable, exits 2 with a message
 than building a pipeline layout inconsistent with the shaders — with no validation layers loaded,
 nothing else would report that, and the coverage number would be undefined.
 
-Re-run before believing an unstable result. During #2945 one 300-iteration run reported 80
-disagreements between the arms and was not reproduced by 3×200 and 1×3000 iterations immediately
-afterwards on the same binary — the same slow, machine-wide drift that made every A/B in that
-investigation worthless unless the arms were interleaved.
+**This probe has itself reproduced the #2945 class, twice, and that is its most important result
+so far.** One 300-iteration run reported 80 arm disagreements with indexed coverage ranging
+496-2731; one 200-iteration run had 76 of 200 indexed draws cover ZERO pixels while the non-indexed
+arm beside it stayed at 496. Against roughly 7,500 clean iterations over ~45 runs. So the run-level
+rate is low, the control is **not** a clean negative, and "prosper's Vulkan usage is the defect" does
+not follow from a quiet afternoon with this tool.
+
+Practical consequence: **a clean run here proves nothing on its own.** Budget tens of runs before
+reading a negative, and quote the number of RUNS as well as iterations — the failure is per-process
+in shape, not per-iteration. Both failures happened to be the first execution after a relink; the
+obvious mechanism, a cold Mesa shader cache, is falsified (`MESA_SHADER_CACHE_DISABLE=true`, 0 of
+8x150 either way), so that correlation is unexplained at n=2.

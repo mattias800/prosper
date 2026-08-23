@@ -36,3 +36,9 @@ prosper's own modules render with zero failures on the same device where the bac
 nothing — which is what turned "RADV is broken" into "prosper is broken". It was then **deleted
 during cleanup**, and #2945 had to rebuild it from the issue comment. That is why it lives in the
 tree now: a control that has to be re-derived every time is a control nobody runs.
+
+**And the rebuilt version then falsified that conclusion.** Run enough times, it reproduces the
+class itself — twice so far, once with 76 of 200 indexed draws covering nothing. A control whose
+negative result was believed after a few hundred iterations turned out to need tens of runs before
+its first positive. Read the README's "Reading a result" section before quoting a clean run from
+this tool; that is the whole reason it says what it says.

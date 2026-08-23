@@ -27,9 +27,9 @@
 // non-indexed arm beside it passes is the #2937 signature, and either arm failing on its own is a
 // device or shader problem rather than an indexing one.
 //
-// The descriptor interface is read out of the vertex module rather than hardcoded: every
+// The descriptor interface is read out of BOTH modules rather than hardcoded: every
 // `OpDecorate <id> DescriptorSet 0` + `Binding N` becomes one STORAGE_BUFFER binding, all pointing at
-// the same host-visible vertex-record buffer. That is what prosper's recompiled vertex shaders want
+// the same host-visible vertex-record buffer, and anything the tool cannot model is refused. That is what prosper's recompiled vertex shaders want
 // (they fetch through V#-derived storage buffers), and it keeps the tool usable for any dumped pair
 // without editing it.
 //
@@ -121,6 +121,19 @@ void collect_storage_bindings(const std::vector<uint32_t>& spirv, const char* st
         }
         if (opcode == kOpVariable && count >= 4) storage_class_of[spirv[word + 2]] = spirv[word + 3];
         word += count;
+    }
+    // A PushConstant block is not a descriptor and so carries no Binding decoration -- it would slip
+    // past the loop below and out of the pipeline layout entirely, which is
+    // VUID-VkGraphicsPipelineCreateInfo-layout-00756 all over again. prosper's recompiler does emit
+    // them, so refuse rather than build a layout that does not describe the shader.
+    constexpr uint32_t kStorageClassPushConstant = 9;
+    for (const auto& [id, storage_class] : storage_class_of) {
+        (void)id;
+        if (storage_class != kStorageClassPushConstant) continue;
+        std::fprintf(stderr,
+                     "vkprobe: the %s module declares a push-constant block; this probe builds a "
+                     "pipeline layout with no push-constant range\n", stage);
+        fail_setup("unsupported push constants (nothing has been measured)");
     }
     for (const auto& [id, binding] : binding_of) {
         const auto set = set_of.find(id);

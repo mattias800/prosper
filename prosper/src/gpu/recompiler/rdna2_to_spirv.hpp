@@ -330,17 +330,24 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 
 // Every logical PS input a fragment program can read, as a mask of SPI_PS_INPUT_CNTL slots (#2945).
 //
-// A STRICT SUPERSET of FragmentInterpolationLayout::attribute_mask, and the margin is the point.
-// Both are built from the same VINTRP attribute numbers, but `attribute_mask` comes from a
-// `rdna2_walk`, which stops at the first `is_end` and at the first Unknown encoding; this function
-// steps past both and covers the whole `rdna2_recompile_code_span`. `test_vertex_output_budget`
-// pins the containment.
+// A SUPERSET of FragmentInterpolationLayout::attribute_mask, and EQUAL to it for an ordinary
+// program. Both are built from the same VINTRP attribute numbers; `attribute_mask` comes from a
+// `rdna2_walk`, which stops at the first `is_end` and at the first Unknown encoding, and this
+// function walks `rdna2_recompile_code_span` without stopping at either. For a program whose span
+// is just its body those are the same instructions, so the masks match --
+// `test_vertex_output_budget` pins the containment, not a margin it does not have.
 //
-// Why the margin has to exist rather than be argued: the fragment emitter today declares inputs
-// only at the VINTRP attribute numbers of that same truncated prefix, so an equal mask would also
-// be *correct* today -- and would silently stop being correct the moment the fragment path grows a
-// tail extension of the kind `recompile_valu` and `recompile_compute` already have. Then the
-// fragment stage would declare a Location the vertex stage no longer exports.
+// The margin appears exactly where it is needed. `rdna2_recompile_code_span` is extended by
+// `extend_terminating_if_else` and by the pcrel table/dispatch detectors, and this walk follows the
+// extension while a plain `rdna2_walk` stops short of it. The hazard that makes an equal mask
+// unsafe is the fragment path gaining that same tail extension -- which `recompile_valu` and
+// `recompile_compute` already have and `recompile_fragment_impl` does not -- and in that case the
+// span grows and so does this mask.
+//
+// Do not upgrade this comment to "strict". An earlier revision claimed a superset it did not have
+// (it routed through `rdna2_walk`, which made the masks equal by construction) and the claim
+// survived review once; the conclusion was right and the reason was not, which is the failure mode
+// this file's callers can least afford.
 //
 // The bias is one-directional on purpose: over-reporting costs a dead varying, under-reporting is
 // the regression this analysis must never cause.

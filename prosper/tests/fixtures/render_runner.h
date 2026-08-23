@@ -4851,11 +4851,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     //   dstAccessMask=<all reads and writes>
     // -- so a pass that samples a texture a transfer just uploaded, or reads a buffer a compute
     // dispatch just wrote, is relying on that blanket visibility. The first version of this change
-    // set dstAccessMask to the ATTACHMENT accesses only, which silently removed visibility for every
-    // SHADER_READ in the pass; it collapsed The Messenger, Dead Cells and GRIS to near-white
-    // garbage on their snapshot guards while leaving the syncval hazard fixed, so nothing but the
-    // guards caught it. Both dependencies must stay a SUPERSET of the implicit defaults: they may
-    // only add ordering, never remove it.
+    // set dstAccessMask to the ATTACHMENT accesses only, which silently removes visibility for every
+    // SHADER_READ in the pass. Both dependencies must stay a SUPERSET of the implicit defaults: they
+    // may only add ordering, never remove it.
+    //
+    // That requirement is the Vulkan contract, not an empirical result. Three rung-6 snapshot guards
+    // did fail on the narrow build, and this comment used to cite them -- but they fail identically
+    // on plain master (#2950), so that run had no control and proved nothing about these masks.
+    // Do not re-derive the rule from a guard run on this machine; derive it from the defaults above.
     //
     // PROSPER_NO_RENDERPASS_EXTERNAL_DEPS=1 restores the defaulted behaviour, so the A/B for this
     // change is single-variable on ONE binary. Same reason PROSPER_NO_INDEX_ARENA and the

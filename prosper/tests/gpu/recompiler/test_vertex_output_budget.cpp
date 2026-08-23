@@ -109,6 +109,19 @@ int main() {
     CHECK((declared & ~consumed) == 0,
           "the consumed mask CONTAINS every attribute the interpolation layout declares");
 
+    // Containment is satisfied by EQUALITY, and equality is the normal case -- say so here rather
+    // than let a reader infer a margin from the assertion. `fragment_consumed_attribute_mask` walks
+    // `rdna2_recompile_code_span`, and for an ordinary program that span IS the prefix
+    // `fragment_interpolation_layout`'s own `rdna2_walk` stops at, so the two masks come out equal.
+    //
+    // Where the margin exists is the case that matters: the span is extended by
+    // `extend_terminating_if_else` and by the pcrel table/dispatch detectors, and this function does
+    // not stop at `is_end` inside it. So if the fragment path ever gains the tail extension
+    // `recompile_valu` and `recompile_compute` already have -- the hazard that makes an equal mask
+    // unsafe -- the span grows and this walk follows it, while a plain `rdna2_walk` would not.
+    // The line below is the property that holds unconditionally; the margin above is conditional,
+    // and neither is stronger than it is.
+
     PixelInputMapping bounded = sticky_all_slots_param0();
     apply_fragment_consumption(bounded, ps, ps_dwords);
     // apply_fragment_consumption is a no-op under PROSPER_NO_DEAD_VARYING_ELIM, which would make

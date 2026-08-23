@@ -1832,6 +1832,16 @@ ShaderAnalysisCacheStats shader_analysis_cache_stats() {
     return stats;
 }
 
+// Keyed on the shader-analysis identity, so it is cleared with that cache rather than outliving it.
+struct ConsumedAttributeMaskCache {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, uint32_t> masks;
+};
+ConsumedAttributeMaskCache& consumed_attribute_mask_cache() {
+    static ConsumedAttributeMaskCache cache;
+    return cache;
+}
+
 void clear_shader_analysis_cache() {
     {
         auto& cache = shader_analysis_cache();
@@ -1839,6 +1849,13 @@ void clear_shader_analysis_cache() {
         cache.entries.clear();
         cache.stats = {};
         cache.use_counter = 0;
+    }
+    {
+        // #2945: the consumed-attribute memo is keyed on an analysis identity, so it must die with
+        // the analysis cache. Leaving it would answer from an identity nothing can produce again.
+        auto& cache = consumed_attribute_mask_cache();
+        std::lock_guard lock(cache.mutex);
+        cache.masks.clear();
     }
     {
         auto& cache = interpolation_cache();
@@ -1889,8 +1906,9 @@ uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dw
     if (!analysis) return fragment_consumed_attribute_mask(code, dwords);
     // Keyed on the immutable analysis identity, not on the address: a same-address shader mutation
     // receives a new identity, which is the property the interpolation cache next door relies on.
-    static std::mutex mutex;
-    static std::unordered_map<uint64_t, uint32_t> masks;
+    auto& state = consumed_attribute_mask_cache();
+    auto& mutex = state.mutex;
+    auto& masks = state.masks;
     {
         std::lock_guard lock(mutex);
         const auto found = masks.find(analysis->identity);
