@@ -164,7 +164,15 @@ static int run_list(VkCommandBuffer cmd, VkPipeline pipeline,
     for (uint32_t slot = 0; slot < SLOT_COUNT && off < report_cap; ++slot) {
         if (g_ssbo_map[slot] == SENTINEL) continue;
         ++seen;
-        if (g_ssbo_map[slot] != slot) ok = 0;
+        /* The slot must be one the index list actually named AND hold its own
+         * value. Checking only self-consistency would pass ordinal-only
+         * execution (an implementation ignoring the index buffer writes
+         * {0:n, 1:n, ...} for identity data), which is exactly what this tool
+         * exists to catch (#2961). */
+        int indexed = 0;
+        for (uint32_t j = 0; j < count; ++j)
+            if (indices[j] == slot) { indexed = 1; break; }
+        if (!indexed || g_ssbo_map[slot] != slot) ok = 0;
         off += (size_t)snprintf(report + off, report_cap - off, "%s%u:%u",
                                 seen > 1 ? ", " : "", slot,
                                 g_ssbo_map[slot]);
@@ -200,6 +208,11 @@ int main(void)
     for (uint32_t i = 0; i < nq; ++i)
         if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { g_queue_family = i; break; }
 
+    VkPhysicalDeviceFeatures features;
+    vkGetPhysicalDeviceFeatures(g_pd, &features);
+    require(features.fragmentStoresAndAtomics,
+            "device lacks fragmentStoresAndAtomics (the FS stores to an SSBO)");
+
     float prio = 1.f;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = g_queue_family;
@@ -208,6 +221,7 @@ int main(void)
     VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
+    di.pEnabledFeatures = &features;
     r = vkCreateDevice(g_pd, &di, NULL, &g_dev);
     if (r) die("vkCreateDevice", r);
     vkGetDeviceQueue(g_dev, g_queue_family, 0, &g_queue);

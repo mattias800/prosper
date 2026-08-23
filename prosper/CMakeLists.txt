@@ -52,9 +52,9 @@ endif()
 # self_dump: SELF/ELF inspector and NID import extractor (M0).
 add_executable(self_dump tools/self_dump/self_dump.cpp)
 
-# index_fetch_probe: bare-Vulkan reproducer for #2961 (RADV/STRIX_HALO indexed draws reading
-# sequential ordinals instead of fetched indices). Standalone on purpose — no prosper code, so
-# it cannot inherit vkprobe's harness. Vulkan headers + loader only; skipped where unavailable.
+# index_fetch_probe: bare-Vulkan oracle for indexed-draw index fetch (#2961). The #2961 hypothesis
+# (RADV/STRIX_HALO reading sequential ordinals) was falsified with this tool; it stays so any
+# future suspicion costs one command. Standalone on purpose — no prosper code, so it cannot
 if(NOT TARGET Vulkan::Vulkan)
   find_package(Vulkan QUIET)
 endif()

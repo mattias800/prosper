@@ -1,11 +1,13 @@
 # AGENTS.md — prosper/tools/index_fetch_probe
 
-Standalone bare-Vulkan reproducer for **#2961**: on RADV/STRIX_HALO, indexed
-draws hand the vertex shader the sequential vertex ordinal instead of the
-fetched index-buffer value (deterministic, no GPU load needed). Deliberately
-shares **no code** with vkprobe — the point of the tool is to answer whether
-the divergence lives in the driver or in vkprobe's harness, so importing
-vkprobe's pipeline setup would defeat the experiment.
+Independent bare-Vulkan oracle for **#2961**: does an indexed draw hand the
+vertex shader the fetched index-buffer value (correct) or the sequential
+vertex ordinal (the falsified #2961 hypothesis — the signal came from
+vkprobe's fixed readback window, not from the driver)? The probe exists so
+that any future suspicion costs one command instead of a re-derivation. It
+shares **no code** with vkprobe — the point of the experiment is answering
+whether a divergence lives in the driver or in vkprobe's harness, so
+importing vkprobe's pipeline setup would defeat it.
 
 - `probe.c` — the whole program. Vulkan 1.0, no extensions, no layers, one
   64×64 offscreen render pass. A POINTS draw records `(gl_VertexIndex,
