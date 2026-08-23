@@ -3350,7 +3350,23 @@ void install_trap_handler() {
             addrs[n++] = strtoull(s2, nullptr, 0);
             const char* comma = strchr(s2, ','); if (!comma) break; s2 = comma + 1;
         }
-        if (n > 0 && pipe2(poll_pipe, O_CLOEXEC | O_NONBLOCK) == 0) {
+        // pipe2 is Linux-only; Darwin needs pipe + fcntl. Same split as make_probe_pipe() above,
+        // and the reason it is spelled out again rather than shared is that this pair must NOT be
+        // the shared one (see the paragraph above). Caught by CI: the first revision called pipe2
+        // unconditionally and broke the macOS build outright, in a file whose name says Linux but
+        // which Darwin also compiles.
+        bool poll_pipe_ok = false;
+#ifdef __linux__
+        poll_pipe_ok = n > 0 && pipe2(poll_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+#else
+        if (n > 0 && pipe(poll_pipe) == 0) {
+            poll_pipe_ok = true;
+            for (int fd : poll_pipe)
+                if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 || fcntl(fd, F_SETFL, O_NONBLOCK) != 0)
+                    poll_pipe_ok = false;
+        }
+#endif
+        if (poll_pipe_ok) {
             fprintf(stderr, "[pollwatch] watching %d slot(s), 1 ms interval\n", n);
             std::thread([] {
                 static uint64_t last[6]; static bool seen[6];
