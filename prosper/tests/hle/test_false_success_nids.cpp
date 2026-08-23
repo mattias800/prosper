@@ -240,6 +240,50 @@ void test_savedata_transferring_mount() {
     }
 }
 
+// libSceHttp answers every entry point except the URI parser with the dispatcher default 0
+// (#2930). For the two entry points every caller starts with, that 0 IS a valid-looking id:
+// sceHttpInit's contract returns a positive library context, sceHttpCreateTemplate a positive
+// template id bound to it. Six of eight surveyed titles call both.
+constexpr const char* kHttpInit            = "A9cVMUtEp4Y";
+constexpr const char* kHttpCreateTemplate  = "0gYjPTR-6cY";
+constexpr const char* kHttpDeleteTemplate  = "4I8vEpuEhZ8";
+
+void test_http_ids() {
+    printf("-- libSceHttp::sceHttpInit / sceHttpCreateTemplate --\n");
+    HleFn init_fn = Hle::lookup(kHttpInit);
+    // Kills: leaving the NID unregistered -- the dispatcher default 0 is the whole bug.
+    CHECK(init_fn != nullptr, "sceHttpInit is registered");
+    if (!init_fn) return;
+    uint64_t ctx = init_fn(0, 0, 0, 0, 0, 0);
+    CHECK(ctx != 0, "sceHttpInit returns a non-zero library context id");
+    // Kills: answering with a negative error instead of an id -- guest sites carry the value
+    // into later calls, so any id-shaped answer must have the sign bit clear.
+    CHECK((int64_t)ctx > 0, "sceHttpInit returns a POSITIVE id, not an error");
+
+    HleFn create_fn = Hle::lookup(kHttpCreateTemplate);
+    CHECK(create_fn != nullptr, "sceHttpCreateTemplate is registered");
+    if (!create_fn) return;
+    uint64_t tmpl = create_fn(ctx, 0, 0, 0, 0, 0);
+    CHECK(tmpl != 0, "sceHttpCreateTemplate returns a non-zero template id");
+    CHECK((int64_t)tmpl > 0, "sceHttpCreateTemplate returns a POSITIVE id, not an error");
+
+    HleFn del_fn = Hle::lookup(kHttpDeleteTemplate);
+    CHECK(del_fn != nullptr, "sceHttpDeleteTemplate is registered");
+    if (!del_fn) return;
+    // Kills three mutations at once: a delete whose body is just `return 0` (never clearing its
+    // slot), a table that never frees, and an exhaustion path answering an id-shaped value. Fill
+    // the table to exhaustion, free ONE live id, and the allocator must hand out a positive id
+    // again.
+    uint64_t probe = tmpl;
+    while ((int64_t)probe > 0)
+        probe = create_fn(ctx, 0, 0, 0, 0, 0);
+    CHECK((int64_t)probe < 0, "an exhausted template table answers NEGATIVE, not a fake id");
+    // Kills: a delete that reports failure (or a crash) on a live id.
+    CHECK(del_fn(tmpl, 0, 0, 0, 0, 0) == 0, "sceHttpDeleteTemplate answers SCE_OK for a live id");
+    probe = create_fn(ctx, 0, 0, 0, 0, 0);
+    CHECK((int64_t)probe > 0, "a freed slot is handed out again (delete actually cleared its slot)");
+}
+
 } // namespace
 
 int main() {
@@ -248,6 +292,7 @@ int main() {
     test_random();
     test_nptrophy2_info_queries();
     test_savedata_transferring_mount();
+    test_http_ids();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
