@@ -191,6 +191,44 @@ FragmentInterpolationLayout fragment_interpolation_layout(
     return layout;
 }
 
+uint32_t fragment_consumed_attribute_mask(const uint32_t* code, size_t dwords) {
+    if (!code || !dwords) return 0;
+    // Decoded instruction by instruction rather than through `rdna2_walk`, and this is the whole
+    // point of the function. `rdna2_walk` stops at the first `is_end` AND at the first Unknown
+    // encoding (rdna2_decode.cpp), which is exactly the prefix `fragment_interpolation_layout`
+    // already sees -- so routing through it would make this mask EQUAL to `attribute_mask`, not a
+    // superset, and the margin the caller's safety argument depends on would be zero. Stepping past
+    // both terminators is what buys the margin.
+    //
+    // The bias is deliberate and one-directional. Decoding past a terminator can decode data as
+    // instructions, so a spurious VINTRP hit is possible; that costs one dead output varying.
+    // MISSING an attribute would hand the fragment stage an input the vertex stage no longer
+    // exports, which is the regression this analysis must never cause. Over-report, never under.
+    const size_t span = rdna2_recompile_code_span(code, dwords);
+    uint32_t mask = 0;
+    for (size_t pc = 0; pc < span;) {
+        const Rdna2Inst instruction = rdna2_decode_one(code + pc, span - pc);
+        if (instruction.fmt == Rdna2Format::VINTRP && instruction.vintrp_attr < 32)
+            mask |= 1u << instruction.vintrp_attr;
+        if (!instruction.len_dwords) break;   // safety: never advance 0
+        pc += instruction.len_dwords;
+    }
+    return mask;
+}
+
+bool dead_varying_elimination_enabled() {
+    static const bool disabled = getenv("PROSPER_NO_DEAD_VARYING_ELIM") != nullptr;
+    return !disabled;
+}
+
+void apply_fragment_consumption(PixelInputMapping& mapping,
+                                const uint32_t* fragment_code, size_t dwords) {
+    if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)
+        return;
+    mapping.consumed_mask = fragment_consumed_attribute_mask(fragment_code, dwords);
+    mapping.consumed_known = true;
+}
+
 std::vector<uint32_t> recompile_interpolation_geometry(
         const FragmentInterpolationLayout& layout, bool capture_position) {
     SpirvCompute builder;
@@ -3940,11 +3978,17 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                 z = b.sel(state.exec, z, zero); w = b.sel(state.exec, w, zero);
             }
             const uint32_t gx = x, gy = y, gz = z, gw = w;
-            if (!pixel_inputs || source >= 32 || !(pixel_inputs->valid_mask & (1u << source)))
-                b.export_param(source, gx, gy, gz, gw);       // absent control retains identity wiring
+            // #2945: skip a slot the fragment program never reads. See PixelInputMapping::consumes
+            // -- SPI_PS_INPUT_CNTL is sticky, so `valid_mask` alone fans one export out to 32
+            // locations and overruns maxVertexOutputComponents.
+            if (!pixel_inputs || source >= 32 || !(pixel_inputs->valid_mask & (1u << source))) {
+                if (!pixel_inputs || pixel_inputs->consumes(source))
+                    b.export_param(source, gx, gy, gz, gw);   // absent control retains identity wiring
+            }
             if (pixel_inputs) {
                 for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
                     if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
+                    if (!pixel_inputs->consumes(ps_input)) continue;
                     const uint32_t raw_offset = pixel_inputs->controls[ps_input] & 0x3Fu;
                     const uint32_t offset = (passthrough_mask & (1u << ps_input))
                         ? (raw_offset & 0x1fu) : raw_offset;
@@ -3993,11 +4037,14 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                 const int32_t dword = passthrough->params[source][component];
                 value[component] = dword >= 0 ? record_load(dword) : b.uconst(0u);
             }
-            if (!pixel_inputs || !(pixel_inputs->valid_mask & (1u << source)))
-                b.export_param(source, value[0], value[1], value[2], value[3]);
+            if (!pixel_inputs || !(pixel_inputs->valid_mask & (1u << source))) {
+                if (!pixel_inputs || pixel_inputs->consumes(source))   // #2945
+                    b.export_param(source, value[0], value[1], value[2], value[3]);
+            }
             if (pixel_inputs) {
                 for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
                     if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
+                    if (!pixel_inputs->consumes(ps_input)) continue;    // #2945
                     if ((pixel_inputs->controls[ps_input] & 0x3fu) == source)
                         b.export_param(ps_input, value[0], value[1], value[2], value[3]);
                 }
@@ -4020,6 +4067,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     if (pixel_inputs) {
         for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
             if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
+            if (!pixel_inputs->consumes(ps_input)) continue;            // #2945
             const uint32_t control = pixel_inputs->controls[ps_input];
             if ((passthrough_mask & (1u << ps_input)) ||
                 (control & 0x3Fu) != 0x20u) continue;

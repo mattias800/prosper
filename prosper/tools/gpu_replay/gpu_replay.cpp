@@ -2605,6 +2605,13 @@ int main(int argc, char** argv) {
         if (tap_env_raw) clear_environment("PROSPER_FS_TAP");
         size_t vs_swapped = 0, fs_swapped = 0, vs_kept = 0, fs_kept = 0;
         for (auto& it : replay.items) {
+            // #2945: the same dead-varying bound the live path applies, or this mode recompiles a
+            // vertex interface the live renderer would never build.
+            if (it.has_pixel_inputs && it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& fs_raw = replay.raw_shader_versions[it.fs_raw_shader_index];
+                prosper::gpu::apply_fragment_consumption(
+                    it.pixel_inputs, fs_raw.words.data(), fs_raw.words.size());
+            }
             const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
             const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
             std::vector<uint32_t> vs, fs, gs;
@@ -2706,6 +2713,17 @@ int main(int argc, char** argv) {
             const long long operation_label =
                 operation_index == prosper::tools::kNoOperationIndex
                     ? -1 : static_cast<long long>(prosper::tools::raw(operation_index));
+            // #2945: stamp the dead-varying bound before ANY rebuild below reads the mapping. A
+            // capsule does not serialize `consumed_mask`/`consumed_known` (they are derived from
+            // the fragment program), so a loaded item arrives with the bound unset and this probe
+            // would otherwise rebuild the 32-location fan-out the live renderer no longer emits --
+            // and this is the instrument whose output is quoted as evidence about the vertex
+            // stage, so it must not be measuring a pipeline the renderer would never build.
+            if (it.has_pixel_inputs && it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& fs_raw = replay.raw_shader_versions[it.fs_raw_shader_index];
+                prosper::gpu::apply_fragment_consumption(
+                    it.pixel_inputs, fs_raw.words.data(), fs_raw.words.size());
+            }
             const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
             const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
             std::vector<uint32_t> rebuilt_geometry;

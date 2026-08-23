@@ -750,6 +750,8 @@ struct ShaderCompileKeyHash {
         if (key.has_pixel_inputs) {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
             hash = hash_mix(hash, key.pixel_inputs.passthrough_mask);
+            hash = hash_mix(hash, key.pixel_inputs.consumed_mask);   // #2945
+            hash = hash_mix(hash, key.pixel_inputs.consumed_known);
             for (uint32_t control : key.pixel_inputs.controls)
                 hash = hash_mix(hash, control);
         }
@@ -1830,6 +1832,19 @@ ShaderAnalysisCacheStats shader_analysis_cache_stats() {
     return stats;
 }
 
+// Keyed on the shader-analysis identity, so it is cleared with that cache rather than outliving it.
+// Internal linkage: it is a private detail of this translation unit, like the caches around it.
+namespace {
+struct ConsumedAttributeMaskCache {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, uint32_t> masks;
+};
+ConsumedAttributeMaskCache& consumed_attribute_mask_cache() {
+    static ConsumedAttributeMaskCache cache;
+    return cache;
+}
+}  // namespace
+
 void clear_shader_analysis_cache() {
     {
         auto& cache = shader_analysis_cache();
@@ -1837,6 +1852,13 @@ void clear_shader_analysis_cache() {
         cache.entries.clear();
         cache.stats = {};
         cache.use_counter = 0;
+    }
+    {
+        // #2945: the consumed-attribute memo is keyed on an analysis identity, so it must die with
+        // the analysis cache. Leaving it would answer from an identity nothing can produce again.
+        auto& cache = consumed_attribute_mask_cache();
+        std::lock_guard lock(cache.mutex);
+        cache.masks.clear();
     }
     {
         auto& cache = interpolation_cache();
@@ -1879,6 +1901,30 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     }
     cache.entries.emplace(std::move(key), CachedInterpolationLayout{layout, ++cache.use_counter});
     return layout;
+}
+
+uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords) {
+    static const bool no_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
+    const auto analysis = no_cache ? nullptr : analyze_shader_code_cached(code, dwords);
+    if (!analysis) return fragment_consumed_attribute_mask(code, dwords);
+    // Keyed on the immutable analysis identity, not on the address: a same-address shader mutation
+    // receives a new identity, which is the property the interpolation cache next door relies on.
+    auto& state = consumed_attribute_mask_cache();
+    auto& mutex = state.mutex;
+    auto& masks = state.masks;
+    {
+        std::lock_guard lock(mutex);
+        const auto found = masks.find(analysis->identity);
+        if (found != masks.end()) return found->second;
+    }
+    const uint32_t mask = fragment_consumed_attribute_mask(code, dwords);
+    std::lock_guard lock(mutex);
+    // Cleared wholesale rather than aged; the entries are four bytes each and the bound exists only
+    // so a pathological run cannot grow it without limit.
+    constexpr size_t max_entries = 4096;
+    if (masks.size() >= max_entries) masks.clear();
+    masks.emplace(analysis->identity, mask);
+    return mask;
 }
 
 SharedShaderWords recompile_graphics_shader_cached_shared(
