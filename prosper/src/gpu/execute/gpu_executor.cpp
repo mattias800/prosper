@@ -1833,6 +1833,8 @@ ShaderAnalysisCacheStats shader_analysis_cache_stats() {
 }
 
 // Keyed on the shader-analysis identity, so it is cleared with that cache rather than outliving it.
+// Internal linkage: it is a private detail of this translation unit, like the caches around it.
+namespace {
 struct ConsumedAttributeMaskCache {
     std::mutex mutex;
     std::unordered_map<uint64_t, uint32_t> masks;
@@ -1841,6 +1843,7 @@ ConsumedAttributeMaskCache& consumed_attribute_mask_cache() {
     static ConsumedAttributeMaskCache cache;
     return cache;
 }
+}  // namespace
 
 void clear_shader_analysis_cache() {
     {

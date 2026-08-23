@@ -46,9 +46,10 @@ geometry will be arbitrary — which is still a valid *determinism* test, but no
 
 | observation | what it means |
 | --- | --- |
-| both arms cover the same pixel count on every iteration | the modules, ACO and the device are fine; a defect seen through prosper is prosper's |
+| both arms cover the same pixel count on every iteration | **nothing, on its own.** This tool has produced ~7,500 such iterations and then failed; see below. It is a negative only across tens of RUNS, and even then it clears prosper's HOST-side Vulkan usage, not the SPIR-V it is executing |
 | the indexed arm is empty while the non-indexed arm is not | the index path itself; compare against #2937 |
 | coverage varies between iterations | the driver or hardware is not deterministic on this input — take it to the driver, and re-run at high `--iterations` before believing it |
+| the indexed arm is empty on some iterations while the non-indexed arm is constant | the #2945 defect, reproduced with no prosper code in the process. Measured 2 of 26 runs on a valid pipeline, once at 38 of 200 iterations |
 | exit 2 | the probe never ran; nothing has been measured — a hung wait, an unsupported input pair, or a malformed argument all land here rather than reading as a failing draw |
 
 The coverage predicate counts pixels that differ from the **blue clear**, ignoring alpha. A fragment
@@ -60,12 +61,34 @@ set, or a binding that is not a `StorageBuffer` variable, exits 2 with a message
 than building a pipeline layout inconsistent with the shaders — with no validation layers loaded,
 nothing else would report that, and the coverage number would be undefined.
 
-**This probe has itself reproduced the #2945 class, twice, and that is its most important result
-so far.** One 300-iteration run reported 80 arm disagreements with indexed coverage ranging
-496-2731; one 200-iteration run had 76 of 200 indexed draws cover ZERO pixels while the non-indexed
-arm beside it stayed at 496. Against roughly 7,500 clean iterations over ~45 runs. So the run-level
-rate is low, the control is **not** a clean negative, and "prosper's Vulkan usage is the defect" does
-not follow from a quiet afternoon with this tool.
+### Before any of that: the pipeline has to be VALID
+
+The single most important thing this tool has established is about itself. Its first version created
+its device **without `vertexPipelineStoresAndAtomics`**, and prosper's recompiled vertex shaders
+fetch through `STORAGE_BUFFER` descriptors — which Vulkan requires to be `NonWritable` in the vertex
+stage unless that feature is on (`VUID-RuntimeSpirv-NonWritable-06341`). So every pipeline it built
+from a prosper vertex module was **invalid**, and because it loads no layers it printed coverage
+numbers for them anyway. Every reading taken before that was fixed is void — the clean ones and the
+failures alike, including the 1,500-draw result on #2937 that turned "RADV is broken" into "prosper
+is broken".
+
+Two guards now exist so it cannot happen again: the feature is enabled and its absence is `exit 2`,
+and a vertex module whose output interface exceeds the device's `maxVertexOutputComponents` is
+refused by name (this is #2945's own subject — a 132-against-128 interface — and a module dumped
+before that bound was applied is refused with those exact numbers).
+
+**Run it under the validation layers when the answer matters:**
+
+```bash
+VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation vkprobe --vs vs.spv --fs fs.spv --iterations 200
+```
+
+**This probe has itself reproduced the #2945 class on a VALID pipeline, and that is its most
+important result so far.** On the corrected build: 3 of 5 iterations empty in one run under the validation
+layers with **zero validation findings**, and 38 of 200 in another without them — 2 failing runs of
+26 — while the non-indexed arm beside them stayed constant at 496 throughout. So the run-level rate
+is low, the control is **not** a clean negative, and "prosper's Vulkan usage is the defect" does not
+follow from a quiet afternoon with this tool.
 
 Practical consequence: **a clean run here proves nothing on its own.** Budget tens of runs before
 reading a negative, and quote the number of RUNS as well as iterations — the failure is per-process

@@ -6,32 +6,40 @@
 // When a draw stops producing pixels, "is this prosper or is this the driver?" is the first question
 // and the most expensive one to answer, because every other instrument in this repository runs
 // inside prosper. This tool is the control: it links no prosper header, allocates its own device,
-// and executes the SAME shader modules prosper produced. If the picture is right here and wrong
-// through the backend, the defect is in what prosper does AROUND the draw — descriptor wiring,
-// synchronisation, resource lifetime — and the recompiler, the SPIR-V, ACO and the hardware are all
-// ruled out in one run.
+// and executes the SAME shader modules prosper produced. A draw that renders here and not through
+// the backend points at what prosper does AROUND the draw -- descriptor wiring, synchronisation,
+// resource lifetime. It does NOT clear the recompiler: the SPIR-V under test is prosper's own
+// output, so this separates prosper's HOST-side Vulkan usage from everything else, and no more.
 //
-// It was first written for #2937 (five Vulkan-execution tests failing on RADV, every failing
-// assertion an indexed draw) and established there that 1,500 indexed draws of prosper's own modules
-// render correctly standalone while the same modules through the backend rasterize nothing. That
-// program was then deleted during cleanup and had to be rebuilt from the issue comment, which is why
-// it now lives in the tree: the next person inherits the control instead of re-deriving it.
+// It also does not clear the driver, and #2945 is why that sentence is here. Run with a VALID
+// pipeline this program reproduces the defect it was built to exonerate the driver from: indexed
+// draws intermittently rasterizing nothing while the non-indexed arm beside them stays constant, in
+// a process containing no prosper code. **A clean run proves nothing on its own** -- see the
+// README's "Reading a result".
+//
+// It was first written for #2937 and reported 1,500 clean indexed draws, which is what turned "RADV
+// is broken" into "prosper is broken". That program was deleted during cleanup and rebuilt here from
+// the issue comment -- and the rebuild found the reason to distrust the original number: a device
+// created without vertexPipelineStoresAndAtomics makes every pipeline built from a prosper vertex
+// module INVALID, and with no layers loaded the program reports coverage for it regardless. See the
+// device-creation comment below. The tool lives in the tree so the next person inherits the control
+// AND the ways it has already been wrong.
 //
 // WHAT IT MEASURES
 //
 // Each iteration renders twice into two fresh targets — once with vkCmdDraw over vertices 0..N-1 and
 // once with vkCmdBindIndexBuffer + vkCmdDrawIndexed over the supplied indices — then counts pixels
 // that differ from the clear colour. The arms are directly comparable only when those indices are
-// the identity sequence (the default); with a capture's real indices, read each arm on its own. A run reports, per draw kind, how many iterations
-// produced ZERO covered pixels. The two arms are the point: an indexed arm that fails while the
+// the identity sequence (the default); with a capture's real indices, read each arm on its own.
+// A run reports, per draw kind, how many iterations produced ZERO covered pixels. The two arms are the point: an indexed arm that fails while the
 // non-indexed arm beside it passes is the #2937 signature, and either arm failing on its own is a
 // device or shader problem rather than an indexing one.
 //
 // The descriptor interface is read out of BOTH modules rather than hardcoded: every
 // `OpDecorate <id> DescriptorSet 0` + `Binding N` becomes one STORAGE_BUFFER binding, all pointing at
-// the same host-visible vertex-record buffer, and anything the tool cannot model is refused. That is what prosper's recompiled vertex shaders want
-// (they fetch through V#-derived storage buffers), and it keeps the tool usable for any dumped pair
-// without editing it.
+// the same host-visible vertex-record buffer, and anything the tool cannot model is refused. That
+// is what prosper's recompiled vertex shaders want (they fetch through V#-derived storage buffers),
+// and it keeps the tool usable for any dumped pair without editing it.
 //
 // USAGE
 //
@@ -105,6 +113,27 @@ std::vector<uint8_t> read_bytes(const std::string& path) {
 // so nothing would say so: the tool would run, print a coverage number, and that number would be
 // undefined. A control that answers confidently on inputs it cannot model is worse than no control,
 // so those inputs exit 2 instead.
+// Output-interface Locations a module decorates, for the budget refusal below.
+std::set<uint32_t> output_locations(const std::vector<uint32_t>& spirv) {
+    constexpr uint32_t kOpDecorate = 71, kOpVariable = 59;
+    constexpr uint32_t kDecLocation = 30, kStorageClassOutput = 3;
+    std::map<uint32_t, uint32_t> location_of;
+    std::set<uint32_t> outputs, result;
+    for (size_t word = 5; word < spirv.size();) {
+        const uint32_t count = spirv[word] >> 16;
+        const uint32_t opcode = spirv[word] & 0xffffu;
+        if (count == 0 || word + count > spirv.size()) break;
+        if (opcode == kOpDecorate && count >= 4 && spirv[word + 2] == kDecLocation)
+            location_of[spirv[word + 1]] = spirv[word + 3];
+        if (opcode == kOpVariable && count >= 4 && spirv[word + 3] == kStorageClassOutput)
+            outputs.insert(spirv[word + 2]);
+        word += count;
+    }
+    for (const auto& [id, location] : location_of)
+        if (outputs.count(id)) result.insert(location);
+    return result;
+}
+
 void collect_storage_bindings(const std::vector<uint32_t>& spirv, const char* stage,
                               std::set<uint32_t>& out) {
     constexpr uint32_t kOpDecorate = 71, kOpVariable = 59;
@@ -318,9 +347,25 @@ int main(int argc, char** argv) {
     queue_info.queueFamilyIndex = family;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    // vertexPipelineStoresAndAtomics, and this line is the difference between a control and a lie.
+    // prosper's recompiled VERTEX shaders fetch through STORAGE_BUFFER descriptors, and Vulkan
+    // requires every storage buffer in the vertex stage to be decorated NonWritable UNLESS this
+    // feature is enabled (VUID-RuntimeSpirv-NonWritable-06341). prosper's own renderer enables it
+    // (render_runner.h). The first version of this program did not, so every pipeline it ever built
+    // from a prosper vertex module was INVALID -- and it reported coverage numbers anyway, because
+    // it loads no validation layers. Both its clean runs and its failures were void, and one of each
+    // had already been quoted as evidence about the driver.
+    VkPhysicalDeviceFeatures supported_features{};
+    vkGetPhysicalDeviceFeatures(phys, &supported_features);
+    if (!supported_features.vertexPipelineStoresAndAtomics)
+        fail_setup("the device does not support vertexPipelineStoresAndAtomics, which prosper's "
+                   "vertex modules require (nothing has been measured)");
+    VkPhysicalDeviceFeatures enabled_features{};
+    enabled_features.vertexPipelineStoresAndAtomics = VK_TRUE;
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    device_info.pEnabledFeatures = &enabled_features;
     VkDevice device = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &device_info, nullptr, &device) != VK_SUCCESS)
         fail_setup("vkCreateDevice");
@@ -347,6 +392,25 @@ int main(int argc, char** argv) {
     Buffer readback = make_host_buffer(phys, device, readback_bytes,
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
+    // Refuse a vertex interface the device cannot carry, for the same reason the descriptor
+    // refusals exist: an over-budget interface is an INVALID pipeline
+    // (VUID-RuntimeSpirv-Location-06272), the driver's behaviour is then undefined, and with no
+    // layers loaded this program would print a coverage number for it anyway. #2945's whole subject
+    // is a 132-component vertex interface, so this is not hypothetical -- feeding vkprobe a module
+    // dumped before that bound was applied would produce exactly the confident, meaningless answer
+    // this tool exists not to give.
+    {
+        const std::set<uint32_t> vertex_out = output_locations(vs);
+        const uint32_t highest = vertex_out.empty() ? 0u : (*vertex_out.rbegin() + 1u);
+        const uint32_t components = highest * 4u + 4u;   // + gl_Position, as the layer counts it
+        if (!vertex_out.empty() && components > properties.limits.maxVertexOutputComponents) {
+            std::fprintf(stderr,
+                         "vkprobe: the vertex module declares %u output locations = %u components "
+                         "with gl_Position, over this device's maxVertexOutputComponents of %u\n",
+                         highest, components, properties.limits.maxVertexOutputComponents);
+            fail_setup("over-budget vertex interface (nothing has been measured)");
+        }
+    }
     std::set<uint32_t> bindings;
     collect_storage_bindings(vs, "vertex", bindings);
     collect_storage_bindings(fs, "fragment", bindings);

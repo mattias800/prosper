@@ -827,8 +827,10 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   **Its effect on the nondeterminism is UNDECIDED, not zero.** Interleaved A/B on the bundle,
   30 replays per arm on the merged (`ALL_COMMANDS`) masks, gave 1 distinct hash in *both* arms --
   the whole measurement landed in one of the quiet windows trap 223 describes, so it discriminates
-  nothing. The earlier "18 distinct against 17" figure was taken on the narrow masks that broke
-  three guarded titles and is withdrawn. Land the dependencies on their own merits; the bundle A/B
+  nothing. The earlier "18 distinct against 17" figure was taken on the narrow masks and is
+  withdrawn -- not because those masks were shown to break anything (#2950 establishes that the
+  guards used to say so fail on plain master too), but because that build's dependencies were not
+  the ones being merged. Land the dependencies on their own merits; the bundle A/B
   owes a re-run in a window where the baseline is unstable. #2945.
 - **The layer's verbatim words for the over-limit vertex interface, recorded once so nothing has to
   re-derive the arithmetic.** Everything else that cites this cites this row:
@@ -914,26 +916,34 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   machine is a usable renderer oracle until #2950 resolves. The reason to keep the masks wide is
   that a non-superset dependency removes visibility the pass relies on — which is true from the
   spec, and was true before anything was measured. #2945 / #2950.
-- **The standalone control is NOT clean, and the earlier claim that it was is withdrawn.**
-  `tools/vkprobe` drives the same dumped modules through a bare Vulkan pipeline with no prosper code
-  in the process. It was first reported here as 3,000 indexed draws with constant coverage and zero
-  failures, which was read as "the defect is prosper's, not RADV's". **It has since failed twice**:
-  one 300-iteration run with 80 arm disagreements and indexed coverage ranging 496-2731, and one
-  200-iteration run with **76 of 200 indexed draws covering ZERO pixels** while the non-indexed arm
-  beside it stayed constant at 496 — the same signature, with no prosper code anywhere in the
-  process. Against that, roughly 7,500 clean iterations over ~45 runs, so the run-level rate is low
-  but not zero.
-  **What this does and does not license.** It kills "the defect is prosper's": a process containing
-  no prosper code reproduces the class. It does NOT establish the converse, because the rates differ
-  by orders of magnitude — prosper's one-draw reproduction fails about half the time in a bad
-  window, the control needs tens of runs — so prosper is very likely amplifying something rather
-  than solely causing it. Treat the suspect as *at or below the driver*, and treat any prosper-side
-  A/B as measuring an amplifier.
-  **One correlation, deliberately not stated as a cause:** both failing runs were the FIRST execution
-  after the binary was relinked. The obvious mechanism, a cold Mesa shader cache, is falsified —
-  `MESA_SHADER_CACHE_DISABLE=true` measured 0 failures over 8x150 iterations interleaved against 0
-  over the same warm count. n=2 on the correlation; it is written down because it is the only
-  structure anyone has, not because it is evidence. #2945 / #2937 / #2950.
+- **THE CONTROL WAS INVALID, so every reading anyone has quoted from it — in either direction — is
+  void, and the corrected control reproduces the defect with no prosper code in the process.**
+  `tools/vkprobe` drives prosper's dumped SPIR-V through a bare Vulkan pipeline. It created its
+  device **without `vertexPipelineStoresAndAtomics`**, and prosper's recompiled vertex shaders fetch
+  through `STORAGE_BUFFER` descriptors, which Vulkan requires to be `NonWritable` in the vertex
+  stage unless that feature is enabled (`VUID-RuntimeSpirv-NonWritable-06341`). Every pipeline it
+  built was therefore invalid, and because it loads no validation layers it reported coverage
+  numbers regardless. That voids its 3,000-clean-iteration result, it voids the two failures that
+  were later used to withdraw that result, and it voids #2937's original 1,500-draw measurement —
+  the one that turned "RADV is broken" into "prosper is broken" and redirected that whole
+  investigation.
+  **With the feature enabled and the pipeline validating clean, the control still fails.** 3 of 5
+  iterations empty in one run *under the validation layers with zero findings*, and 38 of 200 in
+  another without them — 2 failing runs of 26 — with the non-indexed arm beside them constant at 496
+  throughout. So a bare Vulkan program, a spec-valid pipeline and no prosper code reproduce exactly
+  the #2945/#2937 signature.
+  **What that does and does not license.** It clears prosper's HOST-side Vulkan usage — descriptor
+  wiring, synchronisation, resource lifetime, pass configuration — which is the entire suspect space
+  the row above spent a session narrowing. It does NOT clear prosper's generated SPIR-V, which is
+  what the control executes. So the remaining suspects are **the recompiler's output and the
+  driver/hardware**, and the rates still differ by orders of magnitude (prosper's one-draw
+  reproduction fails ~50% in a bad window, the control needs tens of runs), so prosper is very
+  likely amplifying rather than solely causing.
+  **The transferable lesson is about the instrument, not the bug: a control is only a control once
+  it is VALID, and a program that loads no validation layers cannot tell you that it is.** Two
+  investigations were steered by this one for weeks. `vkprobe` now enables the feature, exits 2 if
+  the device lacks it, and refuses a vertex interface over `maxVertexOutputComponents`; its README
+  says a clean run proves nothing on its own. #2945 / #2937 / #2950.
 
 
 ## Recommended implementation order

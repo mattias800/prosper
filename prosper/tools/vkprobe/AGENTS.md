@@ -9,10 +9,12 @@ defect in prosper's Vulkan usage from a defect in the shader, in ACO, or in the 
 share the suspect.
 
 `vkprobe` is the arm that does not. It links **no prosper code**, creates its own instance, device
-and queue, and executes the *same SPIR-V modules prosper produced* through a bare pipeline. A draw
-that renders correctly here and wrongly through the backend rules out the recompiler, the SPIR-V,
-ACO and the GPU in a single run, and leaves only what prosper does around the draw: descriptor
-wiring, synchronisation, resource lifetime, pass configuration.
+and queue, and executes the *same SPIR-V modules prosper produced* through a bare pipeline. What
+that separates is narrower than it first appears, and getting it wrong has cost this project twice:
+it isolates prosper's **host-side Vulkan usage** — descriptor wiring, synchronisation, resource
+lifetime, pass configuration — from everything else. It does **not** clear the recompiler, because
+the SPIR-V under test is the recompiler's own output, and it does **not** clear the driver, because
+on a valid pipeline it reproduces #2945 itself.
 
 ## What belongs here
 
@@ -37,8 +39,17 @@ nothing — which is what turned "RADV is broken" into "prosper is broken". It w
 during cleanup**, and #2945 had to rebuild it from the issue comment. That is why it lives in the
 tree now: a control that has to be re-derived every time is a control nobody runs.
 
-**And the rebuilt version then falsified that conclusion.** Run enough times, it reproduces the
-class itself — twice so far, once with 76 of 200 indexed draws covering nothing. A control whose
-negative result was believed after a few hundred iterations turned out to need tens of runs before
-its first positive. Read the README's "Reading a result" section before quoting a clean run from
-this tool; that is the whole reason it says what it says.
+**And the rebuilt version then falsified that conclusion twice over.**
+
+First on rate: run enough times, it reproduces the class itself. A control whose negative was
+believed after a few hundred iterations needed tens of runs before its first positive.
+
+Then on validity, which is the one worth remembering. The rebuild — like, almost certainly, the
+original — created its device without `vertexPipelineStoresAndAtomics`, so **every pipeline it built
+from a prosper vertex module was invalid** (`VUID-RuntimeSpirv-NonWritable-06341`), and with no
+layers loaded it reported coverage for them anyway. Every reading before that fix is void, in both
+directions, including #2937's 1,500-draw result that redirected that whole investigation.
+
+The lesson the folder exists to carry: **a control is only a control once it is valid, and a program
+that loads no validation layers cannot tell you that it is.** Read the README's "Reading a result"
+before quoting anything from this tool.

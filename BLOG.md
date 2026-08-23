@@ -47,6 +47,7 @@ going on is inside Unreal's own allocator. Those thousands of refused mappings a
 either: prosper refuses them precisely because the guest already has memory there, and refusing is
 what stops us overwriting it. Details in
 [#2908](https://github.com/mattias800/prosper/issues/2908).
+
 ### The same captured frame, replayed twice, two different pictures
 
 <p align="center"><img src="assets/screenshots/balan-replay-same-file-menu.png" alt="BALAN WONDERWORLD - the language-select menu over the red-and-gold theatre backdrop, with the option pills and their text rendered"></p>
