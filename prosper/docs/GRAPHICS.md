@@ -1171,9 +1171,12 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
 - **Superseded by the rows above: "the remaining suspects are prosper's generated SPIR-V, prosper's
   host-side usage as an amplifier, and the driver/hardware."** The first is dead. The third is the
   answer. The middle one is *unresolved and now unimportant* — prosper's rate is higher than the
-  control's, but the two move together (0.79 against 0.13) and the load rows explain the gap at
-  least as well as an amplifier does: prosper's reproduction generates its own GPU load. Do not
-  spend anything more on it before the driver defect is reported. #2945.
+  control's **per draw** (10.7% of 309 replay rounds bad, against ~3.9% of the control's indexed
+  iterations) and LOWER per run (33 against 63 of those same 309 rounds), so name the unit before
+  quoting it. Either way the two move together (P(vkprobe fails | the replay drew nothing) = 0.79
+  against 0.13) and the load rows explain the association at least as well as an amplifier does:
+  prosper's reproduction generates its own GPU load. Do not spend anything more on it before the
+  driver defect is reported. #2945.
 
 
 ## Recommended implementation order
