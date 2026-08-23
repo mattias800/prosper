@@ -211,6 +211,15 @@ gap already mis-delivers `sceFontSetScalePixel`, `sceFontSetEffectSlant` and
    which is why the rung evidence above exists at all. Name the frontend in any claim about this
    one (instrument trap 127). [#2953](https://github.com/mattias800/prosper/issues/2953).
 
+## What a pad route adds, and where it then stalls
+
+`scripts/metaphor/explore-past-language-select.pad` is exploratory, not a milestone route. With it,
+the title advances off the language screen to a **SYSTEM** screen — its brush-stroke art, a `SYSTEM`
+heading and a Cross prompt, all drawn — and then returns to the loading mascot and **stays there**
+for the rest of a 120 s run (`guest=running`, 12/12 samples, 7 pixel-distinct). **No title screen is
+reached**, which is why the rung above is 1 and not 2. The next question on this title is what that
+loading state is waiting for.
+
 ## Reproduction route
 
 Frontend `tools/screenshot`, default route, no pad input, Linux / AMD Radeon 8060S (RADV
