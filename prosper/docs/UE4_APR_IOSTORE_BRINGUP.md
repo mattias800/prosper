@@ -37,21 +37,31 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   - **2 = committed** — the guest already holds it.
   - **1 = reserved, uncommitted** — the lazy-commit fault arm backs it on first touch
     (`host/image/exec_image_linux.cpp:2150`, gated on exactly `== 1` and on `addr >= 0x1000000000`).
-    Observed, not merely inferred: a Sifu census run logs
-    `[lazy-commit] #1 mapped page=0x20e1520000` — 131 GiB, the same range as the Ampr VAs.
+    The arm is live in this address region rather than merely gated for it: a Sifu census run logs
+    `[lazy-commit] #1 mapped page=0x20e1520000` — 131.5 GiB. That page is **not** one of the refused
+    VAs, so it evidences the mechanism working up here, not the disposal of any given refusal.
   - **4 = reserved but declining lazy commit** — disposes exactly as 0 does, and cannot arise for
     these VAs: the AMM window is searched upward from `kAmmWindowSearch` = 1 TiB
     (`hle_kernel_mem.cpp:2537`), far above them.
   - **0 = untracked** — nothing rescues it, because the unified-memory GPU-VA fallback spans only
-    `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit near
-    **139 GiB**. A genuinely lost commit would therefore be a **fatal** SIGSEGV at that address.
+    `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit at
+    **129.5-156.5 GiB**. A genuinely lost commit would therefore be a **fatal** SIGSEGV at that
+    address.
 
-  **Neither title takes such a fault, and the fault each does take is the discriminator** — both die
-  at `SIGSEGV addr=(nil)` on UE's own `int $0x45 ; nop ; ud2` trap, while both rescue arms are
-  floored far above zero, so a null fault cannot be a lost Ampr commit. Grepping both census runs
-  finds no fault at any address in the Ampr range. Note too that state 0 is the hypothetical branch:
-  the census below finds every refused page already carries a VMA, so on the measured population the
-  argument runs through states 1 and 2 and the state-0 arm never engages. These calls are the BUFFER
+  **Neither title takes such a fault, and the fault each does take is the discriminator — by its
+  ADDRESS, which is the part that carries it.** A lost commit at one of these VAs would fault *at*
+  that VA, in 129.5-156.5 GiB. Both titles instead die at `SIGSEGV addr=(nil)` on UE's own
+  `int $0x45 ; nop ; ud2` trap, and grepping both census runs finds no fault at any address in the
+  Ampr range at all. (Both rescue arms being floored far above zero is consistent with that, but is
+  not what settles it.) One thing the census below does **not**
+  license, and an earlier version of this entry claimed it did: it cannot say which of the four
+  states the refused pages are in. `mincore` reports whether a **VMA exists**;
+  `prosper_reserved_range_state` reports whether **prosper tracks the range**, and states 1 and 2
+  both require tracking (`hle_kernel_mem.cpp:2928`, `:2931` return 0 for anything absent from
+  `g_maps`). Untracked-but-mapped is exactly the population that yields an `EEXIST` refusal. That
+  was the same instrument-measures-X-claim-is-about-Y error recorded below, committed again in the
+  sentence written to fix it. The case analysis is complete over all four states, which is why it
+  never needed to know which one applies. These calls are the BUFFER
   flavor arriving in an argument shape `a3 == a1` does not recognise (`a3 == 0`, `a5 == a0`); leaving
   their memory untouched is correct, and is the #88 / #107 clobber the discriminator exists to
   prevent.
@@ -79,8 +89,8 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 - **The refusal was not free, though, and that half was a real defect.** Each refused map had already
   claimed a physical range from the direct-memory pool, and the claim was dropped rather than
   released: nothing referenced it, nothing could ever free it, and because the claim is made at
-  64 KiB alignment every carcass retired a full 64 KiB stride however small the request. 286 MiB per
-  Khazan boot, **1.96 GiB** per Sifu boot. Fixed in `hle_kernel_mem.cpp`; a refused map now returns
+  64 KiB alignment every carcass retired a full 64 KiB stride however small the request. 290 MiB per
+  Khazan boot, **1.94 GiB** per Sifu boot. Fixed in `hle_kernel_mem.cpp`; a refused map now returns
   its pages, and the map-flavor success path zeroes them because a released offset can now be
   recycled. `tests/hle/memory/test_ampr_map_refusal_releases_dmem.cpp`.
 

@@ -27,8 +27,8 @@ No picture with this one — neither title renders yet. *Sifu* and *The First Be
 die a few seconds into boot with Unreal's own out-of-memory report, and the suspicion was that
 prosper's direct-memory pool really had run dry. Half of that turned out to be true in a way nobody
 had spotted: every time the guest asked us to place a buffer somewhere we had to refuse, we took the
-physical memory for it anyway and then forgot we had it. Khazan does that 4,574 times per boot and
-Sifu 32,192 times, so Sifu was losing nearly two gigabytes of the pool to allocations that never
+physical memory for it anyway and then forgot we had it. Khazan does that 4,646 times per boot and
+Sifu 31,716 times, so Sifu was losing nearly two gigabytes of the pool to allocations that never
 existed. That is now fixed.
 
 The other half is the more useful finding, and it is a negative one: with the leak gone, both titles

@@ -2316,7 +2316,7 @@ HLE(k_ampr_push_map) {
         // such carcass up to a full 64 KiB stride however small the request was. Counts vary run to
         // run and the ones worth quoting are whole-run censuses rather than a remembered range: one
         // measured 6 s boot gives 4,646 refusals on PPSA20447 (Khazan) and 31,716 on PPSA03001
-        // (Sifu), i.e. ~286 MiB and ~1.94 GiB of pool retired for nothing — against the 300 MiB
+        // (Sifu), i.e. ~290 MiB and ~1.94 GiB of pool retired for nothing — against the 300 MiB
         // scratch block that is Khazan's only headroom after UE4's halving probe. Fixing this does
         // NOT get either title past its out-of-memory assert; see #2908 for what does not follow.
         if (have_phys && !p) {

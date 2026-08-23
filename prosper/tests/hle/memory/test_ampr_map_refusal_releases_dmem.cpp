@@ -11,7 +11,7 @@
 //
 // The cost is not theoretical. Counts vary run to run, so the figures worth quoting are whole-run
 // censuses rather than a remembered range: one measured 6 s boot gives *The First Berserker:
-// Khazan* (PPSA20447) 4,646 refusals — ~286 MiB of pool gone, against the 300 MiB scratch block
+// Khazan* (PPSA20447) 4,646 refusals — ~290 MiB of pool gone, against the 300 MiB scratch block
 // that is its only headroom after UE4's halving probe — and *Sifu* (PPSA03001) 31,716, i.e.
 // ~1.94 GiB.
 //
