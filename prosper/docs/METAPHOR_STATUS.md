@@ -3,10 +3,19 @@
 Atlus GFD engine + CRIWARE middleware, AGC SDK 12, 71 GB dump. Tracker
 [#2876](https://github.com/mattias800/prosper/issues/2876).
 
-**Rung 0.** The title boots in ~90 ms, loads its GFD assets, opens two audio ports, initialises
-save data, compute and fonts, and publishes 63 frames at 34.8 fps — and every one of those frames
-is black. Its primary thread then dies of a divide-by-zero about five seconds in, so every later
-sample is stale by construction.
+**Rung 1.** The title boots in ~90 ms, loads its GFD assets, opens two audio ports, initialises
+save data, compute and fonts, renders its animated loading mascot in full colour, and then reaches
+and holds its **language-selection screen** — twelve languages drawn legibly in Latin, Cyrillic,
+Japanese, Traditional and Simplified Chinese and Korean. A 60 s default-route run publishes 12 of
+12 distinct samples with `guest=running status=ok` and `max-pixel-stale=0.0s`.
+
+That is a different place from where it was earlier on 2026-08-23, when the primary thread died of
+a divide-by-zero five seconds in and all 24 samples were one retained black frame. The section
+below is the record of what that was.
+
+The screen's **background art is still absent** — the menu and its selection brush-stroke draw over
+black ([#2952](https://github.com/mattias800/prosper/issues/2952)), which is now separable for the
+first time because the guest survives to produce a population of frames to characterise.
 
 That is a different place from where it was on 2026-08-22, when it produced **zero** frames and
 died in its CRI Mana movie thread ([#2934](https://github.com/mattias800/prosper/issues/2934)).
@@ -93,11 +102,83 @@ guest is told it has. With it, the 4 MiB request succeeds at `phys=0x3ff600000`,
 This is a cross-title defect that happened to be fatal here: any guest that partitions the whole
 advertised direct-memory budget loses its last `kDmemBase` bytes.
 
+## What #2951 was — a value-returning contract that answered SCE_OK and wrote nothing
+
+The fault was `div r14d` with `r14d == 0` at `eboot+0x10019f6`, in slot 3 of `fw::font::Font_PS5`'s
+vtable (typeinfo `N2fw4font8Font_PS5E`), the routine that expands an 8-bit glyph coverage bitmap
+into a white RGBA8 texture. Every step below was measured, not inferred; the run-local addresses
+are from `tools/screenshot` with `PROSPER_HWBP`.
+
+`r14d` is bytes-per-pixel, resolved through two lookup tables from the FORMAT field of the target
+image's Gen5 T#. The getter at `eboot+0x119d740` is literally `bextr eax, [rdi+0x64], 0x914` — bits
+20..28 of the dword at `surface+0x64`, i.e. the T#'s dword1 — and both tables answer **0** for an
+unrecognised value. Probing that T# at the moment of the fault gave:
+
+```text
++0x60=0x0  +0x64=0x0  +0x68=0x0  +0x6c=0x0  +0x70=0xf  +0x74=0x0
++0x78=0xafafafaf  +0x7c=0xafafafaf
+```
+
+An all-zero descriptor with **allocator poison still in its tail** — the T# was never built. It was
+never built because the texture had been created **285,196,807 x 70**, and that width came from
+`float[font+0x38]`, which the engine computes at `eboot+0xff6425..0xff6439` as
+`max(configured_cell_width, measured_width_of('W'))`. The measured width probed as `0x10ffc207`.
+
+That number is uninitialised stack. At `eboot+0x1001623` the engine calls
+`sceFontRenderCharGlyphImage(handle, code, surface, x, y, metrics, result)` and reads the glyph's
+drawn size back out of `result+0x38`/`+0x3c`. prosper had **no registration for that NID**, so the
+dispatcher's `return 0` answered SCE_OK and touched neither out-parameter. The 0x40-byte stack
+buffer still held whatever the previous frame left there, and the engine believed it.
+
+Four of the six things prosper was missing were on this exact path, all answering 0:
+`sceFontSelectRendererFt`, `sceFontRenderSurfaceSetScissor`, `sceFontGetCharGlyphMetrics` and
+`sceFontRenderCharGlyphImage`.
+
+### The fix is a real rasterizer, because the title supplies a real font
+
+`sceFontRenderCharGlyphImage` cannot be answered honestly without rendering something: the caller
+reads the size of what was drawn, and any number prosper invents there is a number the title will
+size a texture from. There was nothing to invent from, either — until the open call was read.
+Metaphor takes the **memory** branch at `eboot+0x1001274`, not the system-font-set branch:
+`sceFontOpenFontMemory(library, bytes, 180424, 0, out)` with the bytes reading `00 01 00 00` and
+17 tables. **The title hands prosper its own TrueType file.**
+
+So `hle_font.cpp` now parses that file (vendored stb_truetype, `third_party/stb`) and reports real
+outlines, real advances and real vertical metrics for any face opened from memory. A face opened
+from a Sony **system font set** — which no dump contains and prosper does not ship — keeps the
+deterministic placeholder metrics it always had, and is marked as such in the source.
+
+Two ABI facts worth keeping, both derived rather than assumed:
+
+- **Both out-parameter sizes are pinned by the caller's own stack frame.** At `eboot+0x10013d0`
+  the metrics block is `[rbp-0x80,rbp-0x60)` = 0x20 bytes — which is `sizeof(GlyphMetrics)`,
+  independently confirming a layout prosper already had — and the render-result block is
+  `[rbp-0x60,rbp-0x20)` = 0x40 bytes, bounded above by that frame's stack cookie.
+- **The pen argument is the top-left of the line box, not the baseline origin.** The title passes
+  `x = -h_bearing_x` and `y = h_bearing_y - layout.baseline`, then blits out of the surface
+  starting at (0,0). Those reconcile under exactly one convention:
+  `glyph_left = x + h_bearing_x`, `glyph_top = y + layout.baseline - h_bearing_y`. This stays
+  self-consistent whatever Sony's absolute convention is, because prosper supplies both the metrics
+  and the baseline the caller subtracts.
+
+**Windows carries a known, named gap here** ([#2985](https://github.com/mattias800/prosper/issues/2985)):
+the import-stub trampoline converts SysV to the MS ABI by remapping integer registers **only**, so
+a handler declared with the guest's float arguments in place would read the two pointers after them
+out of the wrong slots and write through garbage. The Windows arm therefore takes the five integer
+arguments the trampoline does place correctly and renders at the line-box origin — correct for a
+one-glyph-per-surface caller like this one, and never an out-of-bounds write. The same trampoline
+gap already mis-delivers `sceFontSetScalePixel`, `sceFontSetEffectSlant` and
+`sceFontSetEffectWeight`; it predates this work.
+
 ## Where it stops now
 
-Three blockers, in the order they bite.
-
-1. **SIGFPE in the guest's primary thread at `eboot+0x10019f6`**, about 5 s in — `div r14d` with
+1. **The background art behind the language menu never draws.** The menu, its text and its
+   selection brush-stroke composite correctly over black.
+   [#2952](https://github.com/mattias800/prosper/issues/2952) — reopened in substance by this
+   change, because it is finally measurable: the run now yields 12 distinct live frames instead of
+   one stale one.
+2. ~~**SIGFPE in the guest's primary thread at `eboot+0x10019f6`**~~ — **fixed**, see above
+   ([#2951](https://github.com/mattias800/prosper/issues/2951)). The historical derivation:, about 5 s in — `div r14d` with
    `r14d == 0`. The enclosing function is `eboot+0x1001970`, and RTTI names it: it is slot 3 of
    **`fw::font::Font_PS5`**'s vtable (typeinfo `N2fw4font8Font_PS5E` at `0x237078f`), the routine
    that expands an 8-bit glyph coverage bitmap into a white RGBA8 texture. `r14d` is
@@ -116,12 +197,13 @@ Three blockers, in the order they bite.
    [#2951](https://github.com/mattias800/prosper/issues/2951).
    Once it dies, `tools/screenshot` reports `guest=faulted` and every sample after that moment is
    stale (`max-pixel-stale=115.0s`), so the run's 24 identical PNGs are one frame served 24 times.
-2. **The 63 frames it does publish are black** — 6,093 of 6,137 sampled pixels pure black, the rest
-   near-black (`0x161314`, `0x150e05`). 5 distinct of 63 published. Whether this is the composite
-   defect of [#2932](https://github.com/mattias800/prosper/issues/2932) or a title-specific absence
-   is **not established**: the guest dies before enough frames exist to characterise it. Tracked as
-   [#2952](https://github.com/mattias800/prosper/issues/2952).
-3. **A host-side null dereference in prosper's own renderer, on the guest job thread
+   *(Historical, kept because the shape is worth keeping: the four unregistered entry points named
+   above were the lead, and they were the cause. The file:line citations are to the pre-fix file.)*
+3. **The frames it published were black.** Superseded by item 1: with the guest alive the run
+   produces 12 distinct frames, the menu and its text draw, and only the background art is missing.
+   Still [#2952](https://github.com/mattias800/prosper/issues/2952), now with a population to
+   characterise.
+4. **A host-side null dereference in prosper's own renderer, on the guest job thread
    `job_render_0`** — inside a `std::unordered_map` lookup in `render_draw_pass_rgba`
    (`tests/fixtures/render_runner.h:6169`, whose `persistent_texture_images` is an unsynchronised
    function-local static). **Deterministic under `boot_trace`: 5 of 5 runs**, at two distinct

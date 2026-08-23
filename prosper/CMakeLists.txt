@@ -85,6 +85,11 @@ endif()
 if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
+  # stb_truetype.h backs the libSceFont Ft (FreeType-edition) rasterizer in
+  # src/hle/util/hle_font.cpp. PRIVATE: it is an implementation detail of one translation unit, not
+  # part of prosper_core's interface. See third_party/stb/README.md -- unlike stb_image.h next to
+  # it, THIS header is on the guest path.
+  target_include_directories(prosper_core PRIVATE third_party/stb)
   target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   if(PROSPER_DIAGNOSTICS)
@@ -790,6 +795,10 @@ if(TARGET prosper_core)
   add_executable(test_font tests/hle/test_font.cpp)
   target_link_libraries(test_font PRIVATE prosper_core)
   add_test(NAME font_hle COMMAND test_font)
+
+  add_executable(test_font_render tests/hle/test_font_render.cpp)
+  target_link_libraries(test_font_render PRIVATE prosper_core)
+  add_test(NAME font_render_hle COMMAND test_font_render)
 
   add_executable(test_fiber tests/hle/test_fiber.cpp)
   target_link_libraries(test_fiber PRIVATE prosper_core)
