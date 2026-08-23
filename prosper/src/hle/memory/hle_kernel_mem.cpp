@@ -2322,11 +2322,12 @@ HLE(k_ampr_push_map) {
             phys = 0;
         }
         // Fresh direct memory reads back ZERO on hardware, and the pool's memfd RETAINS bytes across
-        // release and reuse (see dmem_zero). Before the release above, an Ampr map-flavor offset was
-        // never freed and so never recycled, which is the only reason this path got away without
-        // punching. Now that a refusal returns the offset, the next taker of it — including this
-        // very handler, whose map flavor documents "the guest expects FRESH ZEROED pages" — must not
-        // inherit the previous tenant's bytes.
+        // release and reuse (see dmem_zero). Every other fresh-allocation path in this file punches;
+        // this one did not, and it is NOT merely a latent gap that the release above introduces.
+        // dmem_take is first-fit over the pool's free gaps, and guests genuinely release: Khazan
+        // hands back a 300 MiB scratch block mid-boot and the allocations after it are served out of
+        // that hole, so an Ampr map flavor could already land on an offset a previous tenant wrote.
+        // The release above widens the window; it did not open it. Raised in review of this change.
         if (have_phys) dmem_zero(phys, a2);
         if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-map",
                      have_phys ? kVirtualQueryDirect : 0, have_phys ? phys : 0,
@@ -2371,26 +2372,47 @@ HLE(k_ampr_push_map) {
             // "FAILED" reads as a lost page commit, and on the two titles that assert with UE4's
             // own out-of-memory report it was read that way — thousands of these on Khazan and tens
             // of thousands on Sifu sit right before the assert, which is a compelling place to be
-            // wrong about. Measured with this line, 100% of them on both titles report ALREADY
-            // MAPPED, so none of them is a lost commit.
-            // map_phys_at answers null in exactly two situations, and neither is a lost commit:
-            // MAP_FIXED_NOREPLACE refuses to clobber a range that is ALREADY MAPPED (the guest has
-            // that memory and can write it), or the address/length is not page-aligned, which no
-            // page commit ever is. Printing the discriminator makes the distinction measurable in
-            // any run instead of inferable from the mmap flags.
+            // wrong about. map_phys_at answers null in exactly two situations, and neither loses
+            // the guest anything: MAP_FIXED_NOREPLACE refuses to clobber a range that is already
+            // mapped (the guest has that memory and can write it), or the address/length is not
+            // page-aligned, which no page commit ever is.
+            //
+            // The probe covers the WHOLE range, and that is the point rather than a detail.
+            // MAP_FIXED_NOREPLACE fails if ANY page in [a1, a1+a2) is mapped, so a one-page probe
+            // would answer a strictly weaker question than the one the refusal asks — and the
+            // dominant shape here is 0x4000, four host pages, so three quarters of each range would
+            // go unexamined while the log claimed to have classified it. mincore returns -1/ENOMEM
+            // on the first hole, which is exactly the property being tested. Raised in review of
+            // this change; the earlier one-page form is why "100% already mapped" needed re-deriving.
             static const uint64_t page = [] {
                 const long v = sysconf(_SC_PAGESIZE);
                 return v > 0 ? (uint64_t)v : 4096ull;
             }();
             const bool aligned = (a1 % page) == 0 && (a2 % page) == 0;
-            unsigned char vec = 0;
-            const bool resident =
-                prosper_mincore((void*)(uintptr_t)(a1 & ~(page - 1)), 1, &vec) == 0;
+            // Diagnostic-only, and this path runs tens of thousands of times per boot: do no
+            // syscalls unless the log that consumes them is on.
+            bool fully_mapped = false;
+            if (memlog()) {
+                const uint64_t start = a1 & ~(page - 1);
+                // Round the end up to a page, refusing anything that would wrap rather than
+                // wrapping quietly: a2 is guest-supplied and this is the only arithmetic here that
+                // can overflow.
+                uint64_t end = start;
+                if (a2 <= UINT64_MAX - a1 && (a1 + a2) <= UINT64_MAX - (page - 1))
+                    end = (a1 + a2 + page - 1) & ~(page - 1);
+                fully_mapped = end > start;
+                unsigned char vec[64];
+                for (uint64_t at = start; at < end && fully_mapped; at += page * 64) {
+                    const uint64_t span = (end - at < page * 64) ? end - at : page * 64;
+                    if (prosper_mincore((void*)(uintptr_t)at, (size_t)span, vec) != 0)
+                        fully_mapped = false;
+                }
+            }
             MLOG("ampr push-map va=0x%llx len=0x%llx -> FAILED (%s; target %s)\n",
                  (unsigned long long)a1, (unsigned long long)a2,
                  aligned ? "page-aligned" : "NOT page-aligned -- never a page commit",
-                 resident ? "ALREADY MAPPED -- the guest already has this memory"
-                          : "unmapped");
+                 fully_mapped ? "every page ALREADY MAPPED -- nothing was lost here"
+                              : "contains at least one unmapped page");
         }
     }
     return 0;

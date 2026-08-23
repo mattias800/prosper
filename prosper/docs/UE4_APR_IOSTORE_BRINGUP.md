@@ -11,19 +11,27 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
-- **A refused Ampr map is a lost page commit — false, on every one of 36,766 measured refusals.**
-  `sceAmprCommandBufferSetBuffer`'s map flavor logs `ampr push-map … -> FAILED` when the host
-  declines to place the mapping, and on the two UE4 titles that assert with UE's own out-of-memory
-  report those lines arrive in bulk immediately beforehand — 4,574 on *Khazan* `PPSA20447`, 32,192 on
-  *Sifu* `PPSA03001`. That is a compelling place to conclude the guest's allocator could not commit.
-  It did not: `map_phys_at` answers null in exactly two situations, neither of which loses the guest
-  anything. `MAP_FIXED_NOREPLACE` refuses to clobber a range that is **already mapped** — the guest
-  has that memory and can write it — or the address/length is not page-aligned, and a 64-byte "map"
-  was never a page commit. The handler now prints which, and the census is unanimous: **100% of the
-  refusals on both titles report `target ALREADY MAPPED`** (4,006 + 568 unaligned; 31,857 + 335).
-  These calls are the BUFFER flavor arriving in an argument shape the `a3 == a1` discriminator does
-  not recognise (`a3 == 0`, `a5 == a0`), and refusing to touch their memory is the correct outcome —
-  it is the same #88 / #107 clobber the discriminator exists to prevent. [#2908](https://github.com/mattias800/prosper/issues/2908).
+- **A refused Ampr map is a lost page commit — false, and the disproof is structural rather than
+  statistical.** `sceAmprCommandBufferSetBuffer`'s map flavor logs `ampr push-map … -> FAILED` when
+  the host declines to place the mapping, and on the two UE4 titles that assert with UE's own
+  out-of-memory report those lines arrive in bulk immediately beforehand — thousands on *Khazan*
+  `PPSA20447`, tens of thousands on *Sifu* `PPSA03001`. That is a compelling place to conclude the
+  guest's allocator could not commit. It could. `map_phys_at` returns null in only two situations:
+  the address/length is not page-aligned — and a 64-byte "map" was never a page commit — or
+  `range_is_free_reservation` declined, which at `hle_kernel_mem.cpp:1183` means the range contains a
+  **committed** mapping or an untracked gap. A refusal therefore means the guest **already holds**
+  that memory and prosper refused to `MAP_FIXED` over it: the same #88 / #107 clobber the flavor
+  discriminator exists to prevent. These calls are the BUFFER flavor arriving in an argument shape
+  `a3 == a1` does not recognise (`a3 == 0`, `a5 == a0`), and leaving their memory untouched is the
+  correct outcome. Refusing is protective, not lossy.
+  **One correction worth carrying, because this was a wrong `## Ruled out` row for a day:** the entry
+  first rested on a measured "100% of refusals report `target ALREADY MAPPED`", produced by a
+  `mincore` probe of **one page** against ranges that are mostly `0x4000` — four host pages — while
+  `MAP_FIXED_NOREPLACE` fails if *any* page in the range is mapped. A quarter of each range was
+  examined and the result was asserted for all of it, in the direction the author wanted. Caught in
+  review of [#2947](https://github.com/mattias800/prosper/pull/2947); the probe now covers the whole
+  range and its numbers corroborate the argument above rather than standing in for it.
+  [#2908](https://github.com/mattias800/prosper/issues/2908).
 
 - **The refusal was not free, though, and that half was a real defect.** Each refused map had already
   claimed a physical range from the direct-memory pool, and the claim was dropped rather than

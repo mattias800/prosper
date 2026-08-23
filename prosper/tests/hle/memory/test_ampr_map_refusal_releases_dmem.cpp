@@ -9,11 +9,16 @@
 // made at 64 KiB alignment every carcass retired a full 64 KiB stride however small the request.
 //
 // The cost is not theoretical. On *The First Berserker: Khazan* (PPSA20447) a 6 s boot produces
-// 4,294 refusals — 605 of 0x40, 3,686 of 0x4000, 3 of 0x10000 — which is 268 MiB of pool gone,
-// against the 300 MiB scratch block that is the only headroom left after UE4's halving probe has
-// claimed the rest. The engine heap then cannot commit, and the guest prints its own
-// `PS5 Out of Memory` while its stats still report 13 GiB free: those stats describe UE's own
-// reserved pool, and the shortage is one layer below them, in prosper's.
+// 4,294-4,574 refusals — the count varies run to run — which is 268-286 MiB of pool gone, against
+// the 300 MiB scratch block that is the only headroom left after UE4's halving probe has claimed
+// the rest. *Sifu* (PPSA03001) produces 31,839-32,192 of them, i.e. 1.9-2.0 GiB.
+//
+// What this leak is NOT is the reason either of those titles asserts, and the distinction is
+// recorded here because the obvious story — "the pool runs dry, so the engine heap cannot commit" —
+// is wrong and was believed. With the leak fixed both titles still reach UE4's own out-of-memory
+// report, and at that moment prosper's pool holds a 230 MiB free block and has failed no call at
+// all (#2908, and docs/KHAZAN_STATUS.md's `## Ruled out`). So this test guards an allocator
+// invariant that stands on its own: memory prosper did not use, prosper does not keep.
 //
 // The arms below are built so that a passing result cannot be a coincidence:
 //   * The LEVER arm maps at a genuinely free VA, succeeds, and shows the pool shrink. Without it, a
