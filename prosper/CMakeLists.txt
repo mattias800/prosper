@@ -52,6 +52,17 @@ endif()
 # self_dump: SELF/ELF inspector and NID import extractor (M0).
 add_executable(self_dump tools/self_dump/self_dump.cpp)
 
+# index_fetch_probe: bare-Vulkan reproducer for #2961 (RADV/STRIX_HALO indexed draws reading
+# sequential ordinals instead of fetched indices). Standalone on purpose — no prosper code, so
+# it cannot inherit vkprobe's harness. Vulkan headers + loader only; skipped where unavailable.
+if(NOT TARGET Vulkan::Vulkan)
+  find_package(Vulkan QUIET)
+endif()
+if(TARGET Vulkan::Vulkan)
+  add_executable(index_fetch_probe tools/index_fetch_probe/probe.c)
+  target_link_libraries(index_fetch_probe PRIVATE Vulkan::Vulkan)
+endif()
+
 # --- third-party: LibAtrac9 (MIT, vendored) - ATRAC9 audio decode -------------------------
 # Vendored verbatim (see third_party/libatrac9/README.md). C99; needs libm. Compiled as its own
 # static lib so the C sources stay isolated from prosper's C++ and are trivially auditable/updatable.
