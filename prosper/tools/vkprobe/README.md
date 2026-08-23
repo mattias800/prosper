@@ -28,6 +28,15 @@ reports out of band. The tool prints the patterns per arm with `--` for a dword 
 module that does not write leaves `[--,--,--]`, which is the readback path's own positive control:
 if it ever printed something else for a non-writing module it would be reporting stale bytes.
 
+**The record slot is `16 + gl_VertexIndex`, so the window must move with the index list.** The
+readback path defaults to off entirely; when you pass one, remember that a fixed window such as
+`--readback-dwords 16:3` only contains data when the indices are (near-)identity. Run
+`--indices 3,4,5` against a *correct* driver with that window and the writes land in dwords
+19–21: the window reads back all-sentinel, and a clean fetch masquerades as "the index buffer
+was ignored" (#2961 — falsified on RADV/STRIX_HALO by `tools/index_fetch_probe`, which fetches
+correctly on the same box and drivers). For a non-identity list, pass the window your list
+implies, e.g. `--indices 3,4,5 --readback-dwords 19:3`.
+
 Each iteration renders twice into two fresh targets — once with `vkCmdDraw`, once with
 `vkCmdBindIndexBuffer` + `vkCmdDrawIndexed` — and counts pixels that differ from the blue clear.
 The non-indexed arm draws `--indices`-many vertices starting at 0, so **the two arms are directly
