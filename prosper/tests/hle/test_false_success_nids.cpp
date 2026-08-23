@@ -270,8 +270,18 @@ void test_http_ids() {
     HleFn del_fn = Hle::lookup(kHttpDeleteTemplate);
     CHECK(del_fn != nullptr, "sceHttpDeleteTemplate is registered");
     if (!del_fn) return;
-    // Kills: a delete that reports failure (or a crash) on the id this test just created.
+    // Kills three mutations at once: a delete whose body is just `return 0` (never clearing its
+    // slot), a table that never frees, and an exhaustion path answering an id-shaped value. Fill
+    // the table to exhaustion, free ONE live id, and the allocator must hand out a positive id
+    // again.
+    uint64_t probe = tmpl;
+    while ((int64_t)probe > 0)
+        probe = create_fn(ctx, 0, 0, 0, 0, 0);
+    CHECK((int64_t)probe < 0, "an exhausted template table answers NEGATIVE, not a fake id");
+    // Kills: a delete that reports failure (or a crash) on a live id.
     CHECK(del_fn(tmpl, 0, 0, 0, 0, 0) == 0, "sceHttpDeleteTemplate answers SCE_OK for a live id");
+    probe = create_fn(ctx, 0, 0, 0, 0, 0);
+    CHECK((int64_t)probe > 0, "a freed slot is handed out again (delete actually cleared its slot)");
 }
 
 } // namespace
