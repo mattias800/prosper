@@ -1,5 +1,9 @@
 # prosper — project charter & working context (read first)
 
+> **Machine-local instructions:** if a `LOCAL.md` file exists next to this one, read it before
+> starting work. It is gitignored and holds per-computer facts (hardware, paths, installed tools)
+> that must not be written into this committed charter.
+
 ## What this project is
 
 **prosper is a PS5→PC compatibility layer — "Wine/Proton for PS5."** It runs PS5 games natively on
