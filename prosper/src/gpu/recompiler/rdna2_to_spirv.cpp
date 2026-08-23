@@ -193,20 +193,38 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 
 uint32_t fragment_consumed_attribute_mask(const uint32_t* code, size_t dwords) {
     if (!code || !dwords) return 0;
-    std::vector<Rdna2Inst> instructions;
-    rdna2_walk(code, rdna2_recompile_code_span(code, dwords), instructions);
+    // Decoded instruction by instruction rather than through `rdna2_walk`, and this is the whole
+    // point of the function. `rdna2_walk` stops at the first `is_end` AND at the first Unknown
+    // encoding (rdna2_decode.cpp), which is exactly the prefix `fragment_interpolation_layout`
+    // already sees -- so routing through it would make this mask EQUAL to `attribute_mask`, not a
+    // superset, and the margin the caller's safety argument depends on would be zero. Stepping past
+    // both terminators is what buys the margin.
+    //
+    // The bias is deliberate and one-directional. Decoding past a terminator can decode data as
+    // instructions, so a spurious VINTRP hit is possible; that costs one dead output varying.
+    // MISSING an attribute would hand the fragment stage an input the vertex stage no longer
+    // exports, which is the regression this analysis must never cause. Over-report, never under.
+    const size_t span = rdna2_recompile_code_span(code, dwords);
     uint32_t mask = 0;
-    for (const auto& instruction : instructions) {
-        if (instruction.fmt != Rdna2Format::VINTRP || instruction.vintrp_attr >= 32) continue;
-        mask |= 1u << instruction.vintrp_attr;
+    for (size_t pc = 0; pc < span;) {
+        const Rdna2Inst instruction = rdna2_decode_one(code + pc, span - pc);
+        if (instruction.fmt == Rdna2Format::VINTRP && instruction.vintrp_attr < 32)
+            mask |= 1u << instruction.vintrp_attr;
+        if (!instruction.len_dwords) break;   // safety: never advance 0
+        pc += instruction.len_dwords;
     }
     return mask;
 }
 
+bool dead_varying_elimination_enabled() {
+    static const bool disabled = getenv("PROSPER_NO_DEAD_VARYING_ELIM") != nullptr;
+    return !disabled;
+}
+
 void apply_fragment_consumption(PixelInputMapping& mapping,
                                 const uint32_t* fragment_code, size_t dwords) {
-    static const bool disabled = getenv("PROSPER_NO_DEAD_VARYING_ELIM") != nullptr;
-    if (disabled || !mapping.valid_mask || !fragment_code || !dwords) return;
+    if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)
+        return;
     mapping.consumed_mask = fragment_consumed_attribute_mask(fragment_code, dwords);
     mapping.consumed_known = true;
 }

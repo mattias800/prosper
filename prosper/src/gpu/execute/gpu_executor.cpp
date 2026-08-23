@@ -1883,6 +1883,29 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     return layout;
 }
 
+uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords) {
+    static const bool no_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
+    const auto analysis = no_cache ? nullptr : analyze_shader_code_cached(code, dwords);
+    if (!analysis) return fragment_consumed_attribute_mask(code, dwords);
+    // Keyed on the immutable analysis identity, not on the address: a same-address shader mutation
+    // receives a new identity, which is the property the interpolation cache next door relies on.
+    static std::mutex mutex;
+    static std::unordered_map<uint64_t, uint32_t> masks;
+    {
+        std::lock_guard lock(mutex);
+        const auto found = masks.find(analysis->identity);
+        if (found != masks.end()) return found->second;
+    }
+    const uint32_t mask = fragment_consumed_attribute_mask(code, dwords);
+    std::lock_guard lock(mutex);
+    // Cleared wholesale rather than aged; the entries are four bytes each and the bound exists only
+    // so a pathological run cannot grow it without limit.
+    constexpr size_t max_entries = 4096;
+    if (masks.size() >= max_entries) masks.clear();
+    masks.emplace(analysis->identity, mask);
+    return mask;
+}
+
 SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,

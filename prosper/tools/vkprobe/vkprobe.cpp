@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -95,27 +96,54 @@ std::vector<uint8_t> read_bytes(const std::string& path) {
     return data;
 }
 
-// Set-0 binding numbers the module declares. Walking the module keeps the tool honest about what
-// the shader actually wants instead of encoding one capture's layout.
-std::set<uint32_t> set0_bindings(const std::vector<uint32_t>& spirv) {
-    constexpr uint32_t kOpDecorate = 71, kDecDescriptorSet = 34, kDecBinding = 33;
-    std::set<uint32_t> in_set0;
-    std::vector<std::pair<uint32_t, uint32_t>> bindings;
+// Storage-buffer bindings the module declares, and a REFUSAL for anything this tool cannot model.
+//
+// The refusal half matters more than the reflection half. vkprobe builds one descriptor set layout
+// with every binding typed STORAGE_BUFFER, so a module that declares a sampled image, or a set other
+// than 0, would get a pipeline layout inconsistent with its own shaders
+// (VUID-VkGraphicsPipelineCreateInfo-layout-00756). No validation layers are loaded here by default,
+// so nothing would say so: the tool would run, print a coverage number, and that number would be
+// undefined. A control that answers confidently on inputs it cannot model is worse than no control,
+// so those inputs exit 2 instead.
+void collect_storage_bindings(const std::vector<uint32_t>& spirv, const char* stage,
+                              std::set<uint32_t>& out) {
+    constexpr uint32_t kOpDecorate = 71, kOpVariable = 59;
+    constexpr uint32_t kDecDescriptorSet = 34, kDecBinding = 33;
+    constexpr uint32_t kStorageClassStorageBuffer = 12;
+    std::map<uint32_t, uint32_t> set_of, binding_of, storage_class_of;
     for (size_t word = 5; word < spirv.size();) {
         const uint32_t count = spirv[word] >> 16;
         const uint32_t opcode = spirv[word] & 0xffffu;
         if (count == 0 || word + count > spirv.size()) break;
         if (opcode == kOpDecorate && count >= 4) {
-            if (spirv[word + 2] == kDecDescriptorSet && spirv[word + 3] == 0)
-                in_set0.insert(spirv[word + 1]);
-            if (spirv[word + 2] == kDecBinding) bindings.push_back({spirv[word + 1], spirv[word + 3]});
+            if (spirv[word + 2] == kDecDescriptorSet) set_of[spirv[word + 1]] = spirv[word + 3];
+            if (spirv[word + 2] == kDecBinding) binding_of[spirv[word + 1]] = spirv[word + 3];
         }
+        if (opcode == kOpVariable && count >= 4) storage_class_of[spirv[word + 2]] = spirv[word + 3];
         word += count;
     }
-    std::set<uint32_t> result;
-    for (const auto& [id, binding] : bindings)
-        if (in_set0.count(id)) result.insert(binding);
-    return result;
+    for (const auto& [id, binding] : binding_of) {
+        const auto set = set_of.find(id);
+        const uint32_t descriptor_set = set == set_of.end() ? 0u : set->second;
+        if (descriptor_set != 0) {
+            std::fprintf(stderr,
+                         "vkprobe: the %s module declares binding %u in descriptor set %u; this "
+                         "probe models set 0 only\n", stage, binding, descriptor_set);
+            fail_setup("unsupported descriptor set (nothing has been measured)");
+        }
+        const auto storage_class = storage_class_of.find(id);
+        if (storage_class == storage_class_of.end() ||
+            storage_class->second != kStorageClassStorageBuffer) {
+            std::fprintf(stderr,
+                         "vkprobe: the %s module's binding %u is not a StorageBuffer variable "
+                         "(storage class %u); this probe types every binding STORAGE_BUFFER\n",
+                         stage, binding,
+                         storage_class == storage_class_of.end() ? 0xffffffffu
+                                                                 : storage_class->second);
+            fail_setup("unsupported descriptor type (nothing has been measured)");
+        }
+        out.insert(binding);
+    }
 }
 
 uint32_t memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags wanted) {
@@ -185,6 +213,18 @@ bool parse_extent(const char* text, uint32_t& width, uint32_t& height) {
     return true;
 }
 
+// A malformed value must disable the run, not quietly produce a different measurement -- the same
+// convention the PROSPER_* capture triggers use.
+uint32_t strict_u32(const char* text, const char* option) {
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (!end || end == text || *end || value > 0xffffffffu) {
+        std::fprintf(stderr, "vkprobe: %s expects a number, got '%s'\n", option, text);
+        fail_setup("malformed argument (nothing has been measured)");
+    }
+    return static_cast<uint32_t>(value);
+}
+
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --vs FILE --fs FILE [--iterations N] [--records FILE]\n"
@@ -205,8 +245,8 @@ int main(int argc, char** argv) {
         if (argument == "--vs") options.vs_path = next("--vs");
         else if (argument == "--fs") options.fs_path = next("--fs");
         else if (argument == "--records") options.records_path = next("--records");
-        else if (argument == "--iterations") options.iterations = std::strtoul(next("--iterations"), nullptr, 10);
-        else if (argument == "--device") options.device_index = std::strtoul(next("--device"), nullptr, 10);
+        else if (argument == "--iterations") options.iterations = strict_u32(next("--iterations"), "--iterations");
+        else if (argument == "--device") options.device_index = strict_u32(next("--device"), "--device");
         else if (argument == "--extent") {
             if (!parse_extent(next("--extent"), options.width, options.height)) { usage(argv[0]); return 2; }
         } else if (argument == "--indices") {
@@ -222,7 +262,7 @@ int main(int argc, char** argv) {
         else { usage(argv[0]); return 2; }
     }
     if (options.vs_path.empty() || options.fs_path.empty()) { usage(argv[0]); return 2; }
-    if (!options.iterations) options.iterations = 1;
+    if (!options.iterations) fail_setup("--iterations 0 measures nothing");
     if (options.indices.size() < 3) fail_setup("--indices needs at least three values");
 
     const std::vector<uint32_t> vs = read_spirv(options.vs_path);
@@ -294,8 +334,10 @@ int main(int argc, char** argv) {
     Buffer readback = make_host_buffer(phys, device, readback_bytes,
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
-    const std::set<uint32_t> bindings = set0_bindings(vs);
-    if (bindings.empty()) fail_setup("the vertex module declares no set-0 bindings");
+    std::set<uint32_t> bindings;
+    collect_storage_bindings(vs, "vertex", bindings);
+    collect_storage_bindings(fs, "fragment", bindings);
+    if (bindings.empty()) fail_setup("neither module declares a set-0 storage-buffer binding");
     std::vector<VkDescriptorSetLayoutBinding> layout_bindings;
     for (uint32_t binding : bindings)
         layout_bindings.push_back({binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -545,7 +587,11 @@ int main(int argc, char** argv) {
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
         if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS) fail_setup("vkQueueSubmit");
-        vkWaitForFences(device, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+        // A timeout or a device loss here is the state this control gets pointed at, and reading the
+        // staging buffer anyway would report stale bytes as a coverage number -- exit 1, "a failing
+        // draw", for something that never ran. The contract at the top of this file says 2.
+        if (vkWaitForFences(device, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) != VK_SUCCESS)
+            fail_setup("vkWaitForFences did not complete (hang or device loss); nothing measured");
 
         uint64_t covered = 0;
         const uint8_t* pixels = static_cast<const uint8_t*>(readback.mapped);

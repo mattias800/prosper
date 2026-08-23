@@ -9,11 +9,9 @@
 //   with ONE interpolant inherits 31 stale slots from whatever ran before it and reports
 //   `valid_mask == 0xffffffff`. The vertex emitter fans a single `EXP PARAM0` out to every valid
 //   slot, so that stale mask turns one export into 32 output varyings = 128 components; with
-//   gl_Position's 4 the interface is 132 against a `maxVertexOutputComponents` of 128 on every AMD
-//   device. vkCreateGraphicsPipelines is then handed an invalid interface and the vertex stage's
-//   behaviour is undefined — `VUID-RuntimeSpirv-Location-06272`, observed on BALAN WONDERWORLD
-//   (PPSA02058) as the only validation error in an offline `gpu_replay` of its language-select
-//   composite.
+//   gl_Position's 4 that is 132 components. The layer rejects it. Its verbatim message, and the
+//   caveat about reading the arithmetic beside it, are recorded once in `docs/GRAPHICS.md`; this
+//   test pins the LOCATION COUNT, which is the thing the emitter controls.
 //
 // The mask used here — every slot valid, every control selecting PARAM0 — is exactly the shape the
 // BALAN capture reports (`ps-inputs valid=ffffffff ... 0=param0 1=param0 ... 31=param0`).
@@ -99,6 +97,18 @@ int main() {
     CHECK(fragment_consumed_attribute_mask(nullptr, 0) == 0u,
           "no program to analyse consumes nothing (no read through a null pointer)");
 
+    // THE CONTAINMENT ARM. The bound is safe only if what the vertex stage keeps covers every
+    // Location the fragment stage declares, and the fragment emitter's declarations come from
+    // FragmentInterpolationLayout::attribute_mask. An earlier revision of this analysis routed
+    // through `rdna2_walk` and was therefore EQUAL to that mask rather than a superset -- correct,
+    // but with no margin, and its comment claimed a margin it did not have. This pins the real
+    // property instead of the claim.
+    const uint32_t consumed = fragment_consumed_attribute_mask(ps, ps_dwords);
+    const uint32_t declared = fragment_interpolation_layout(ps, ps_dwords).attribute_mask;
+    printf("  consumed=%08x declared=%08x\n", consumed, declared);
+    CHECK((declared & ~consumed) == 0,
+          "the consumed mask CONTAINS every attribute the interpolation layout declares");
+
     PixelInputMapping bounded = sticky_all_slots_param0();
     apply_fragment_consumption(bounded, ps, ps_dwords);
     // apply_fragment_consumption is a no-op under PROSPER_NO_DEAD_VARYING_ELIM, which would make
@@ -123,7 +133,8 @@ int main() {
     CHECK(bounded_out.size() == 1 && bounded_out.count(0) == 1,
           "one PARAM0 export against a sticky all-slots mask emits ONE output varying");
     // 4 components per location, plus gl_Position's 4. 128 is maxVertexOutputComponents on every
-    // AMD device prosper runs on, and the smallest value the Vulkan spec permits.
+    // AMD device prosper runs on. (The Vulkan minimum is 64; 128 is the value that matters here
+    // because it is what the device reporting the error actually advertises.)
     const size_t bounded_components = bounded_out.size() * 4 + 4;
     CHECK(bounded_components <= 128,
           "the bounded vertex interface fits maxVertexOutputComponents (128)");

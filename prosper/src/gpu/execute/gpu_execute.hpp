@@ -658,6 +658,24 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     const PixelSystemInputMapping* system_inputs = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr);
 
+// Memoized on the shader-analysis identity, exactly as fragment_interpolation_layout_cached is and
+// for the same reason (#2945). The uncached form walks the whole recompile span TWICE -- once
+// inside rdna2_recompile_code_span and once to find the VINTRP attributes -- and the caller is the
+// per-draw realize path, seven lines from the cache that exists to keep one such walk off it. The
+// mask is a pure function of the shader bytes, so it memoizes identically.
+uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords);
+
+// apply_fragment_consumption over the memoized mask. Honours PROSPER_NO_DEAD_VARYING_ELIM through
+// dead_varying_elimination_enabled(), so the live path and the uncached form cannot drift on the
+// lever.
+inline void apply_fragment_consumption_cached(PixelInputMapping& mapping,
+                                              const uint32_t* fragment_code, size_t dwords) {
+    if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)
+        return;
+    mapping.consumed_mask = fragment_consumed_attribute_mask_cached(fragment_code, dwords);
+    mapping.consumed_known = true;
+}
+
 struct DrawRealizationPhaseStats {
     uint64_t draws = 0;
     double table_ms = 0.0;
@@ -1641,7 +1659,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // The lever (PROSPER_NO_DEAD_VARYING_ELIM=1) lives in apply_fragment_consumption, so the live
     // path and gpu_replay's --recompile-raw substitution honour exactly the same switch.
     if (rs.ps_addr)
-        apply_fragment_consumption(
+        apply_fragment_consumption_cached(
             pixel_inputs, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
             max_shader_dwords);
     const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;

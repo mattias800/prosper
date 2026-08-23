@@ -825,6 +825,21 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   at all. Synchronization validation named it exactly — 10 × `SYNC-HAZARD-READ-AFTER-WRITE`,
   0 after the fix. Interleaved A/B on the bundle, 30 replays per arm: **18 distinct output hashes
   with the dependencies and 17 without.** Land it on its own merits; it is not this bug. #2945.
+- **The layer's verbatim words for the over-limit vertex interface, recorded once so nothing has to
+  re-derive the arithmetic.** Everything else that cites this cites this row:
+
+  ```
+  Validation Error: [ VUID-RuntimeSpirv-Location-06272 ] | MessageID = 0xa3614f8b
+  vkCreateShaderModule(): SPIR-V (Vertex stage) output interface variable
+  (Location = 31 | Component = 3 | Type = OpTypeFloat 32 bits) along with 4 built-in components,
+  exceeds component limit maxVertexOutputComponents (128).
+  ```
+
+  Note *"along with 4 built-in components"*: the layer is counting components and folding
+  gl_Position's four in, which is where 32 locations x 4 + 4 = 132 against 128 comes from. Read the
+  VUID's own spec text and you get a **Location-count** rule that 32 locations at 0..31 satisfies
+  exactly — so the arithmetic beside the observation is the layer's, not the spec sentence's. The
+  observation is the evidence; quote the message, not a re-derivation. #2945.
 - **Nor is the over-limit vertex output interface, though that was real too.** `SPI_PS_INPUT_CNTL_0..31`
   are sticky context registers and `extract_render_state` marked a slot valid when the register was
   merely present, so a pixel shader with one interpolant reported `valid_mask=0xffffffff` and the
@@ -865,6 +880,21 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   the shader read 0), the descriptor allocation result, set handles and per-binding
   buffer/offset/range, and the compiled RDNA2 ISA (`RADV_DEBUG=shaders`, byte-identical). **Do not
   re-derive any of that; start from what the control cannot see.** #2945.
+- **Declaring an explicit external subpass dependency REPLACES the implicit one, so any mask narrower
+  than the default silently removes visibility — and neither validation nor ctest can see it.** The
+  implicit incoming dependency is `srcStageMask=TOP_OF_PIPE, dstStageMask=ALL_COMMANDS,
+  srcAccessMask=0, dstAccessMask=<all reads and writes>`; the outgoing one is
+  `srcStageMask=ALL_COMMANDS, srcAccessMask=<all writes>, dstStageMask=BOTTOM_OF_PIPE,
+  dstAccessMask=0`. The first attempt at the fix above set the incoming `dstAccessMask` to the
+  ATTACHMENT accesses only, which dropped visibility for every `SHADER_READ` in the pass — every
+  texture a transfer had just uploaded and every buffer a compute dispatch had just written.
+  Synchronization validation stayed clean (removing a visibility operation the application never
+  declared is not a hazard the layer can see) and all 302 ctest cases passed; what caught it was
+  three rung-6 snapshot guards collapsing to near-white garbage at `structural matches 0`
+  (`messenger-scene`, `dead-cells-gameplay`, `gris-gameplay`). **Keep both dependencies a superset of
+  the defaults — `ALL_COMMANDS` / `MEMORY_READ|MEMORY_WRITE` — so they can only add ordering.** The
+  tempting edit to that code is to narrow the masks for performance, and nothing but a guard run
+  would stop it. #2945.
 - **The standalone control is clean, so the defect is prosper's.** `tools/vkprobe` drives the same
   dumped modules through a bare Vulkan pipeline with no prosper code in the process: 3,000 indexed
   draws in one run, coverage constant, zero disagreements with the non-indexed arm beside it. One

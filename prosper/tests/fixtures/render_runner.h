@@ -2288,6 +2288,15 @@ inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
     // STORAGE path would fall back with it. That is a performance regression rather than a
     // correctness one -- the dedicated-buffer fallback covers both -- and no such device is known.
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    // TRANSFER_SRC only when PROSPER_BUFFER_ECHO is armed. The echo reads these slices back with
+    // vkCmdCopyBuffer, and VUID-vkCmdCopyBuffer-srcBuffer-00118 requires the source to carry the
+    // bit -- without it the diagnostic is itself invalid Vulkan, which validation reports 10 times
+    // on one replay and which no amount of plausible-looking output would have revealed. Gated
+    // rather than unconditional for the reason the comment above gives about INDEX: an added usage
+    // bit can only narrow memoryRequirements.memoryTypeBits, and the default allocation path must
+    // stay exactly as it is when the diagnostic is off.
+    static const bool echo_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    if (echo_usage) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
         return {};
     VkMemoryRequirements requirements{};
@@ -2406,6 +2415,10 @@ inline RenderBufferUploadFailureStep create_transient_storage_buffer_upload(
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = bytes;
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // See the pooled path: TRANSFER_SRC only while PROSPER_BUFFER_ECHO is armed, so the echo's
+    // vkCmdCopyBuffer is legal and the default allocation is untouched.
+    static const bool echo_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    if (echo_usage) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     const VkResult create_result =
         consume_render_buffer_upload_failure(RenderBufferUploadFailureStep::CreateBuffer)
             ? VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -5625,6 +5638,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (!v.iarena) {
             VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             ibci.size = isz; ibci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            static const bool echo_index_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+            if (echo_index_usage) ibci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // #2945 echo
             vkCreateBuffer(dev, &ibci, nullptr, &v.ibuf);
             VkMemoryRequirements imr; vkGetBufferMemoryRequirements(dev, v.ibuf, &imr);
             VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; imai.allocationSize = imr.size;
@@ -7631,7 +7646,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // the values printed are the ones the shader's descriptors resolved to. It has to be after
     // vkCmdEndRenderPass: vkCmdCopyBuffer is a transfer command and is not permitted inside a
     // render pass instance. Opt-in and bounded: first 16 slices, 64 bytes each.
-    static const bool buffer_echo = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    //
+    // Gated on `flush_now` as well, and that gate is load-bearing rather than tidy: teardown below
+    // is unconditional, while the print is not, so on the ordinary BATCHED path (flush_now false)
+    // the copies would be recorded into `cmd`, the echo buffer destroyed immediately, and the batch
+    // would then submit a command buffer referencing a dead VkBuffer -- a use-after-free that also
+    // printed nothing, so the diagnostic would have been both unsafe and silent exactly where it
+    // was least likely to be noticed. Arming only on a pass that submits its own work keeps the
+    // buffer's lifetime inside the fence this function waits on.
+    static const bool buffer_echo_requested = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    const bool buffer_echo = buffer_echo_requested && flush_now;
+    if (buffer_echo_requested && !flush_now) {
+        static std::atomic<int> deferred_notice{0};
+        if (deferred_notice.fetch_add(1) == 0)
+            std::fprintf(stderr, "[buffer-echo] this pass defers its submission to a later batch; "
+                                 "the echo only arms on a pass that submits its own work\n");
+    }
     VkBuffer echo_buffer = VK_NULL_HANDLE;
     VkDeviceMemory echo_memory = VK_NULL_HANDLE;
     void* echo_mapped = nullptr;
@@ -8025,7 +8055,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
-    if (echo_mapped && flush_now) {
+    if (echo_mapped) {
         const uint8_t* bytes = static_cast<const uint8_t*>(echo_mapped);
         for (size_t i = 0; i < echo_count; ++i) {
             const uint32_t* words = reinterpret_cast<const uint32_t*>(bytes + kEchoStride * i);

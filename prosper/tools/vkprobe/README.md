@@ -49,7 +49,16 @@ geometry will be arbitrary — which is still a valid *determinism* test, but no
 | both arms cover the same pixel count on every iteration | the modules, ACO and the device are fine; a defect seen through prosper is prosper's |
 | the indexed arm is empty while the non-indexed arm is not | the index path itself; compare against #2937 |
 | coverage varies between iterations | the driver or hardware is not deterministic on this input — take it to the driver, and re-run at high `--iterations` before believing it |
-| exit 2 | the probe never ran; nothing has been measured |
+| exit 2 | the probe never ran; nothing has been measured — a hung wait, an unsupported input pair, or a malformed argument all land here rather than reading as a failing draw |
+
+The coverage predicate counts pixels that differ from the **blue clear**, ignoring alpha. A fragment
+shader whose output happens to be `(0, 0, 1, x)` therefore reads as EMPTY — a false negative in the
+alarming direction. Change the clear or the shader if that is your case.
+
+The probe models **descriptor set 0, storage buffers only**, and reflects both modules. Any other
+set, or a binding that is not a `StorageBuffer` variable, exits 2 with a message naming it rather
+than building a pipeline layout inconsistent with the shaders — with no validation layers loaded,
+nothing else would report that, and the coverage number would be undefined.
 
 Re-run before believing an unstable result. During #2945 one 300-iteration run reported 80
 disagreements between the arms and was not reproduced by 3×200 and 1×3000 iterations immediately

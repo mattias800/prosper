@@ -490,10 +490,12 @@ identity/first floats, capped) — ground truth for "which bytes did the shader 
 palette-UV audit).
 
 `PROSPER_BUFLOG=1` answers the HOST half of that question. `PROSPER_BUFFER_ECHO=1` answers the
-**device** half, and the difference is the whole point of it: after recording the draw and before
-`vkCmdEndRenderPass`, the backend copies the first 64 bytes of every bound storage slice — and of
-every bound index buffer — back through the GPU into a host-visible buffer poisoned with `0xCD`, in
-the same command buffer, and prints them after the fence. So a `[buffer-echo]` line is what the
+**device** half, and the difference is the whole point of it: immediately after
+`vkCmdEndRenderPass` — transfer commands are not permitted inside a render pass instance — the
+backend copies the first 64 bytes of every bound storage slice, and of every bound index buffer,
+back through the GPU into a host-visible buffer poisoned with `0xCD`, in the same command buffer,
+and prints them after the fence. It is armed only on a pass that flushes its own submission, so its
+buffer cannot outlive the batch that references it. So a `[buffer-echo]` line is what the
 shader's descriptors actually resolve to, not what the CPU believed it uploaded. It also prints one
 `[desc-echo]` line per draw with `vkAllocateDescriptorSets`' result, the set handles, and every
 binding's buffer/offset/range. Written for #2945, where `PROSPER_BUFLOG` and `--dump-resource` both

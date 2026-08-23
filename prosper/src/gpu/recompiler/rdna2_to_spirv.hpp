@@ -330,12 +330,20 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 
 // Every logical PS input a fragment program can read, as a mask of SPI_PS_INPUT_CNTL slots (#2945).
 //
-// Deliberately NOT FragmentInterpolationLayout::attribute_mask, even though both are built from the
-// same VINTRP attribute numbers. That walk stops at the FIRST S_ENDPGM, which for a shader with an
-// early exit is a linear prefix of the program; this one scans the whole recompile span and stops
-// at nothing, so its result is a SUPERSET. That direction is the safe one for the only decision it
-// feeds: dropping a vertex output. Over-reporting costs a dead varying; under-reporting would hand
-// the fragment stage an undeclared input, which is the regression this analysis must not cause.
+// A STRICT SUPERSET of FragmentInterpolationLayout::attribute_mask, and the margin is the point.
+// Both are built from the same VINTRP attribute numbers, but `attribute_mask` comes from a
+// `rdna2_walk`, which stops at the first `is_end` and at the first Unknown encoding; this function
+// steps past both and covers the whole `rdna2_recompile_code_span`. `test_vertex_output_budget`
+// pins the containment.
+//
+// Why the margin has to exist rather than be argued: the fragment emitter today declares inputs
+// only at the VINTRP attribute numbers of that same truncated prefix, so an equal mask would also
+// be *correct* today -- and would silently stop being correct the moment the fragment path grows a
+// tail extension of the kind `recompile_valu` and `recompile_compute` already have. Then the
+// fragment stage would declare a Location the vertex stage no longer exports.
+//
+// The bias is one-directional on purpose: over-reporting costs a dead varying, under-reporting is
+// the regression this analysis must never cause.
 uint32_t fragment_consumed_attribute_mask(const uint32_t* code, size_t dwords);
 
 // Stamp a draw's pixel-input mapping with the fragment program's real consumption (#2945). Both the
@@ -347,6 +355,10 @@ uint32_t fragment_consumed_attribute_mask(const uint32_t* code, size_t dwords);
 // Bisection lever only; leaving it set reinstates the over-limit interface.
 void apply_fragment_consumption(PixelInputMapping& mapping,
                                 const uint32_t* fragment_code, size_t dwords);
+
+// PROSPER_NO_DEAD_VARYING_ELIM is clear. Exposed so a caller that memoizes the mask itself can
+// honour exactly the same switch as `apply_fragment_consumption` rather than a second copy of it.
+bool dead_varying_elimination_enabled();
 
 // Generate the descriptor-free triangle geometry stage described above. Returns {} when no fallback
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList
