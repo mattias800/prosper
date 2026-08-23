@@ -48,6 +48,20 @@ either: prosper refuses them precisely because the guest already has memory ther
 what stops us overwriting it. Details in
 [#2908](https://github.com/mattias800/prosper/issues/2908).
 
+### The same captured frame, replayed twice, two different pictures
+
+<p align="center"><img src="assets/screenshots/balan-replay-same-file-menu.png" alt="BALAN WONDERWORLD - the language-select menu over the red-and-gold theatre backdrop, with the option pills and their text rendered"></p>
+
+<p align="center"><img src="assets/screenshots/balan-replay-same-file-slivers.png" alt="BALAN WONDERWORLD - the same menu from the same captured frame, but the theatre is gone and most of the option pills and glyphs have collapsed into thin diagonal slivers on white"></p>
+
+Both of those came out of **one captured file**, replayed offline by `gpu_replay` on the same
+binary minutes apart, with no game running. That is the defect: some of BALAN's menu draws
+intermittently produce no geometry at all, so the panels and letters that should have covered the
+screen shrink to slivers or disappear, taking the theatre backdrop with them - and it is the same
+fault that leaves several other titles showing a flat white frame. It is now reproducible from a
+single draw in about three seconds instead of a two-minute boot, and there is a long list of things
+it is not: [#2945](https://github.com/mattias800/prosper/issues/2945).
+
 ## 2026-08-22
 
 ### New Joe & Mac: Caveman Ninja plays start to finish

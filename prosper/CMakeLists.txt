@@ -1687,6 +1687,15 @@ if(TARGET prosper_core)
   add_test(NAME spv_validate
            COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 
+  # #2945: a recompiled VS must not declare more output components than the device can carry, and
+  # the bound is what the FS actually reads. Carries its own mutation arm. Registered OUTSIDE the
+  # Vulkan_FOUND block on purpose -- it inspects SPIR-V words and needs no device, so gating it on
+  # Vulkan would silently delete the guard on a configuration without it.
+  add_executable(test_vertex_output_budget tests/gpu/recompiler/test_vertex_output_budget.cpp)
+  target_include_directories(test_vertex_output_budget PRIVATE tests)
+  target_link_libraries(test_vertex_output_budget PRIVATE prosper_core)
+  add_test(NAME vertex_output_budget COMMAND test_vertex_output_budget)
+
   # AGC→Vulkan resource layer: the front-half↔back-half contract (gpu_resources.hpp). Registry
   # behavior is fixed here so both halves integrate against a stable API. Pure/cross-platform.
   add_executable(test_gpu_resources tests/gpu/resources/test_gpu_resources.cpp)
@@ -2181,6 +2190,16 @@ if(TARGET prosper_core)
         target_compile_options(prosper_live_renderer PRIVATE -Werror=switch)
       endif()
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
+
+      # vkprobe (#2945/#2937): a CONTROL that AVOIDS prosper's host-side Vulkan usage rather than
+      # reproducing it, so a failure here shows that usage is not NECESSARY for the defect -- never
+      # that it is exonerated. Drives a dumped SPIR-V pair through a bare Vulkan pipeline with no
+      # prosper code in the process. It does not clear the recompiler (the SPIR-V is prosper's own
+      # output) and it does not clear the driver -- run enough times it reproduces #2945 itself.
+      # Read tools/vkprobe/README.md before quoting a clean run. Deliberately links nothing from
+      # prosper.
+      add_executable(vkprobe tools/vkprobe/vkprobe.cpp)
+      target_link_libraries(vkprobe PRIVATE Vulkan::Vulkan)
 
       # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
       # data remains gitignored, renders it through the same live backend, and checks the captured hash.

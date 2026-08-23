@@ -2288,6 +2288,15 @@ inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
     // STORAGE path would fall back with it. That is a performance regression rather than a
     // correctness one -- the dedicated-buffer fallback covers both -- and no such device is known.
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    // TRANSFER_SRC only when PROSPER_BUFFER_ECHO is armed. The echo reads these slices back with
+    // vkCmdCopyBuffer, and VUID-vkCmdCopyBuffer-srcBuffer-00118 requires the source to carry the
+    // bit -- without it the diagnostic is itself invalid Vulkan, which validation reports 10 times
+    // on one replay and which no amount of plausible-looking output would have revealed. Gated
+    // rather than unconditional for the reason the comment above gives about INDEX: an added usage
+    // bit can only narrow memoryRequirements.memoryTypeBits, and the default allocation path must
+    // stay exactly as it is when the diagnostic is off.
+    static const bool echo_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    if (echo_usage) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
         return {};
     VkMemoryRequirements requirements{};
@@ -2406,6 +2415,10 @@ inline RenderBufferUploadFailureStep create_transient_storage_buffer_upload(
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = bytes;
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // See the pooled path: TRANSFER_SRC only while PROSPER_BUFFER_ECHO is armed, so the echo's
+    // vkCmdCopyBuffer is legal and the default allocation is untouched.
+    static const bool echo_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    if (echo_usage) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     const VkResult create_result =
         consume_render_buffer_upload_failure(RenderBufferUploadFailureStep::CreateBuffer)
             ? VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -4814,9 +4827,81 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = color_count; sub.pColorAttachments = ar.data();
     if (use_ds) sub.pDepthStencilAttachment = &dar;
+    // #2945 -- EXPLICIT external subpass dependencies. Without these the render pass gets Vulkan's
+    // DEFAULT external dependencies, and the outgoing default is
+    //   srcStageMask=ALL_COMMANDS, srcAccessMask=<all writes>,
+    //   dstStageMask=BOTTOM_OF_PIPE, dstAccessMask=0
+    // i.e. it makes this pass's writes AVAILABLE and makes them visible to NOTHING. Every
+    // attachment above whose finalLayout is TRANSFER_SRC_OPTIMAL is then read by
+    // vkCmdCopyImageToBuffer a few commands later with no dependency at all -- and the final layout
+    // transition itself is a write of the whole image, which on RADV can be a DCC decompress.
+    // Synchronization validation names it exactly: `SYNC-HAZARD-READ-AFTER-WRITE ...
+    // vkCmdCopyImageToBuffer reads VkImage <...>, which was previously written during an image
+    // layout transition initiated by vkCmdEndRenderPass` -- 10 of them on one offline replay.
+    //
+    // The barrier the readback path DOES emit (`transition_color_to_readback`) is guarded on
+    // `persistent`, so it covers only the persistent-target route; a transient target's copy has
+    // never been ordered against the pass that filled it. Declaring the dependency here rather than
+    // beside the copy covers every consumer of the pass's output in one place.
+    //
+    // THESE MASKS ARE DELIBERATELY ALL_COMMANDS / MEMORY_READ|MEMORY_WRITE, and narrowing them is a
+    // REGRESSION, not an optimisation. Declaring an explicit external dependency REPLACES the
+    // implicit one, and the implicit INCOMING default is
+    //   srcStageMask=TOP_OF_PIPE, dstStageMask=ALL_COMMANDS, srcAccessMask=0,
+    //   dstAccessMask=<all reads and writes>
+    // -- so a pass that samples a texture a transfer just uploaded, or reads a buffer a compute
+    // dispatch just wrote, is relying on that blanket visibility. The first version of this change
+    // set dstAccessMask to the ATTACHMENT accesses only, which silently removes visibility for every
+    // SHADER_READ in the pass. Both dependencies must stay a SUPERSET of the implicit defaults: they
+    // may only add ordering, never remove it.
+    //
+    // That requirement is the Vulkan contract, not an empirical result. Three rung-6 snapshot guards
+    // did fail on the narrow build, and this comment used to cite them -- but they fail identically
+    // on plain master (#2950), so that run had no control and proved nothing about these masks.
+    // Do not re-derive the rule from a guard run on this machine; derive it from the defaults above.
+    //
+    // PROSPER_NO_RENDERPASS_EXTERNAL_DEPS=1 restores the defaulted behaviour, so the A/B for this
+    // change is single-variable on ONE binary. Same reason PROSPER_NO_INDEX_ARENA and the
+    // PROSPER_NO_BACKEND_* family exist. It is a bisection lever, not a tunable: leaving it set
+    // reinstates the race.
+    static const bool no_renderpass_external_deps =
+        getenv("PROSPER_NO_RENDERPASS_EXTERNAL_DEPS") != nullptr;
+    constexpr VkAccessFlags kAllAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    // ALL_COMMANDS on the EXTERNAL side, ALL_GRAPHICS on the SUBPASS side, and the asymmetry is
+    // required rather than stylistic. VUID-VkRenderPassCreateInfo-pDependencies-00837 and -00838:
+    // when a dependency's src/dstSubpass is NOT VK_SUBPASS_EXTERNAL, that side's stage mask may
+    // contain only stages the subpass's bind point supports, and ALL_COMMANDS includes compute and
+    // host. The first version of this change used ALL_COMMANDS on both sides of both dependencies
+    // and was rejected 923 times across 15 tests by CI's validation scan -- which is the only gate
+    // in the tree that would have caught it: syncval on the replay path was clean, all 303 local
+    // ctest cases passed, and the guards were already failing for #2950's reasons.
+    //
+    // Nothing is lost by the narrowing. Subpass 0 is a graphics subpass, so ALL_GRAPHICS covers
+    // every stage that can execute inside it; the dependency remains a superset of the implicit
+    // defaults in the only sense that matters, which is that nothing the pass actually does escapes
+    // the ordering.
+    std::array<VkSubpassDependency, 2> deps{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;   // EXTERNAL side
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;   // subpass side
+    deps[0].srcAccessMask = kAllAccess;
+    deps[0].dstAccessMask = kAllAccess;
+    deps[0].dependencyFlags = 0;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;   // subpass side
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;   // EXTERNAL side
+    deps[1].srcAccessMask = kAllAccess;
+    deps[1].dstAccessMask = kAllAccess;
+    deps[1].dependencyFlags = 0;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpci.attachmentCount = color_count + (use_ds ? 1u : 0u); rpci.pAttachments = att.data();
     rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    if (!no_renderpass_external_deps) {
+        rpci.dependencyCount = static_cast<uint32_t>(deps.size());
+        rpci.pDependencies = deps.data();
+    }
     VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
     std::array<VkImageView, prosper::gpu::kColorTargetCount + 1> fbviews{};
     fbviews[0] = view;
@@ -5569,6 +5654,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (!v.iarena) {
             VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             ibci.size = isz; ibci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            static const bool echo_index_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+            if (echo_index_usage) ibci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // #2945 echo
             vkCreateBuffer(dev, &ibci, nullptr, &v.ibuf);
             VkMemoryRequirements imr; vkGetBufferMemoryRequirements(dev, v.ibuf, &imr);
             VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; imai.allocationSize = imr.size;
@@ -6617,7 +6704,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             allocate_info.descriptorPool = shared_descriptor_pool;
             allocate_info.descriptorSetCount = v.n_sets;
             allocate_info.pSetLayouts = dsls.data();
-            vkAllocateDescriptorSets(dev, &allocate_info, v.dsets.data());
+            const VkResult descriptor_alloc = vkAllocateDescriptorSets(dev, &allocate_info,
+                                                                       v.dsets.data());
+            // Read once, not per draw: getenv takes a process-wide lock on Windows and this is the
+            // per-draw resource loop (#2214).
+            static const bool descriptor_echo = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+            if (descriptor_echo) {
+                std::fprintf(stderr, "[desc-echo] draw=%zu alloc=%d sets=%u", di,
+                             (int)descriptor_alloc, v.n_sets);
+                for (uint32_t s = 0; s < v.n_sets; ++s)
+                    std::fprintf(stderr, " set%u=%p", s, (void*)v.dsets[s]);
+                for (size_t i = 0; i < R.size(); i++)
+                    std::fprintf(stderr, " [b%u type=%d cnt=%u buf=%p off=%llu range=%llu]",
+                                 R[i].binding, (int)wr[i].descriptorType, wr[i].descriptorCount,
+                                 wr[i].pBufferInfo ? (void*)wr[i].pBufferInfo->buffer : nullptr,
+                                 wr[i].pBufferInfo
+                                     ? (unsigned long long)wr[i].pBufferInfo->offset : 0ull,
+                                 wr[i].pBufferInfo
+                                     ? (unsigned long long)wr[i].pBufferInfo->range : 0ull);
+                std::fprintf(stderr, "\n");
+            }
             for (size_t i = 0; i < R.size(); i++)
                 wr[i].dstSet = v.dsets[R[i].set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(wr.size()), wr.data(), 0, nullptr);
@@ -7548,6 +7654,91 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    // PROSPER_BUFFER_ECHO=1 (#2945) -- ground truth for "what did the GPU see in this draw's
+    // storage buffers". Every other instrument reads the HOST side: PROSPER_BUFLOG prints the source
+    // words, --dump-resource prints the capture's bytes, and both were byte-identical across runs
+    // that rendered and runs whose vertices collapsed. This copies the bound slices back THROUGH THE
+    // GPU, in the same command buffer as the draw and immediately after the render pass ends, so
+    // the values printed are the ones the shader's descriptors resolved to. It has to be after
+    // vkCmdEndRenderPass: vkCmdCopyBuffer is a transfer command and is not permitted inside a
+    // render pass instance. Opt-in and bounded: first 16 slices, 64 bytes each.
+    //
+    // Gated on `flush_now` as well, and that gate is load-bearing rather than tidy: teardown below
+    // is unconditional, while the print is not, so on the ordinary BATCHED path (flush_now false)
+    // the copies would be recorded into `cmd`, the echo buffer destroyed immediately, and the batch
+    // would then submit a command buffer referencing a dead VkBuffer -- a use-after-free that also
+    // printed nothing, so the diagnostic would have been both unsafe and silent exactly where it
+    // was least likely to be noticed. Arming only on a pass that submits its own work keeps the
+    // buffer's lifetime inside the fence this function waits on.
+    static const bool buffer_echo_requested = getenv("PROSPER_BUFFER_ECHO") != nullptr;
+    const bool buffer_echo = buffer_echo_requested && flush_now;
+    if (buffer_echo_requested && !flush_now) {
+        static std::atomic<int> deferred_notice{0};
+        if (deferred_notice.fetch_add(1) == 0)
+            std::fprintf(stderr, "[buffer-echo] this pass defers its submission to a later batch; "
+                                 "the echo only arms on a pass that submits its own work\n");
+    }
+    VkBuffer echo_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory echo_memory = VK_NULL_HANDLE;
+    void* echo_mapped = nullptr;
+    size_t echo_count = 0;
+    std::vector<size_t> echo_index_slice;
+    bool echo_ready = false;
+    constexpr VkDeviceSize kEchoStride = 64;
+    constexpr size_t kEchoMax = 16;
+    if (buffer_echo && !shared_buffers.empty()) {
+        VkBufferCreateInfo eci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        eci.size = kEchoStride * kEchoMax;
+        eci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkMemoryRequirements er{};
+        if (vkCreateBuffer(dev, &eci, nullptr, &echo_buffer) == VK_SUCCESS) {
+            vkGetBufferMemoryRequirements(dev, echo_buffer, &er);
+            VkMemoryAllocateInfo eai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            eai.allocationSize = er.size;
+            eai.memoryTypeIndex = render_memory_type(
+                ctx.phys, er.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (eai.memoryTypeIndex != UINT32_MAX &&
+                vkAllocateMemory(dev, &eai, nullptr, &echo_memory) == VK_SUCCESS &&
+                vkBindBufferMemory(dev, echo_buffer, echo_memory, 0) == VK_SUCCESS &&
+                vkMapMemory(dev, echo_memory, 0, VK_WHOLE_SIZE, 0, &echo_mapped) == VK_SUCCESS) {
+                std::memset(echo_mapped, 0xCD, static_cast<size_t>(kEchoStride * kEchoMax));
+                echo_ready = true;
+            }
+        }
+    }
+    if (echo_ready) {
+        echo_count = std::min(kEchoMax, shared_buffers.size());
+        for (size_t i = 0; i < echo_count; ++i) {
+            VkBufferCopy copy{};
+            copy.srcOffset = shared_buffers[i].offset;
+            copy.dstOffset = kEchoStride * i;
+            copy.size = std::min<VkDeviceSize>(kEchoStride, shared_buffers[i].range);
+            if (!copy.size) continue;
+            vkCmdCopyBuffer(cmd, shared_buffers[i].buffer, echo_buffer, 1, &copy);
+        }
+        // ...and the INDEX buffers, which live outside `shared_buffers`. A draw whose
+        // gl_VertexIndex is out of range makes every vertex-buffer load return 0 under
+        // robustness, which is indistinguishable at the pixel from "the vertex data is
+        // wrong" -- so the index bytes have to be read back from the GPU too.
+        for (size_t d = 0; d < dv.size() && echo_count < kEchoMax; ++d) {
+            if (!dv[d].ibuf || !dv[d].icount) continue;
+            VkBufferCopy copy{};
+            copy.srcOffset = dv[d].ioffset;
+            copy.dstOffset = kEchoStride * echo_count;
+            copy.size = std::min<VkDeviceSize>(kEchoStride,
+                                               VkDeviceSize(dv[d].icount) * 4);
+            echo_index_slice.push_back(echo_count);
+            ++echo_count;
+            vkCmdCopyBuffer(cmd, dv[d].ibuf, echo_buffer, 1, &copy);
+        }
+        VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read,
+                             0, nullptr, 0, nullptr);
+    }
     backend_pass_timing_end(cmd);   // #2333
     // Fence waits used to provide the device-memory dependency between every target call. Batched
     // command buffers deliberately remove those intermediate waits, and command-buffer/submission
@@ -7880,6 +8071,31 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
+    if (echo_mapped) {
+        const uint8_t* bytes = static_cast<const uint8_t*>(echo_mapped);
+        for (size_t i = 0; i < echo_count; ++i) {
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(bytes + kEchoStride * i);
+            const bool is_index =
+                std::find(echo_index_slice.begin(), echo_index_slice.end(), i) !=
+                echo_index_slice.end();
+            if (is_index) {
+                std::fprintf(stderr,
+                             "[buffer-echo] INDEX slice=%zu gpu-read=%u %u %u %u %u %u\n",
+                             i, words[0], words[1], words[2], words[3], words[4], words[5]);
+                continue;
+            }
+            std::fprintf(stderr,
+                         "[buffer-echo] slice=%zu buf=%p off=%llu range=%llu gpu-read="
+                         "%08x %08x %08x %08x\n",
+                         i, (void*)shared_buffers[i].buffer,
+                         (unsigned long long)shared_buffers[i].offset,
+                         (unsigned long long)shared_buffers[i].range,
+                         words[0], words[1], words[2], words[3]);
+        }
+    }
+    if (echo_mapped) vkUnmapMemory(dev, echo_memory);
+    if (echo_memory) vkFreeMemory(dev, echo_memory, nullptr);
+    if (echo_buffer) vkDestroyBuffer(dev, echo_buffer, nullptr);
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
         (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);

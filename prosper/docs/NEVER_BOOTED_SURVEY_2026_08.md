@@ -402,9 +402,10 @@ One line per hypothesis this survey killed, so nobody re-derives it at full cost
   lavapipe; five fail on RADV at the same SHA. #2937.
   **Two qualifications from the depth pass on 2026-08-23, both in `docs/GRAPHICS.md` § Ruled out:**
   three of those five are *flaky* rather than deterministic (`descriptor_array_render` passes 23 of
-  30 runs of one unchanged binary), and the failure is **not** a RADV defect — a standalone Vulkan
-  program driving prosper's own dumped SPIR-V renders 1,500 indexed draws on the same device with 0
-  failures.
+  30 runs of one unchanged binary), and the standalone-control result that read as "not a RADV
+  defect" is **withdrawn** — that program built an INVALID pipeline from prosper's vertex modules
+  (`vertexPipelineStoresAndAtomics` never enabled) and reported coverage anyway, and its corrected
+  rebuild reproduces the failure with no prosper code in the process. #2945.
 - **`grep -rl` without `-a` is not usable for a dump census**, restated because this survey used it
   twice: `sceAgcDcbDrawIndirect`'s NID reads as absent from every dump without `-a` and is present
   in 49 of 54 with it. Both greps here were validated on a known positive first. Instrument trap 218.
