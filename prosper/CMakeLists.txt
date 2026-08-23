@@ -675,6 +675,15 @@ if(TARGET prosper_core)
   add_test(NAME videodec2_decode_optout COMMAND test_videodec2_decode --no-decode)
   add_test(NAME videodec2_decode_format COMMAND test_videodec2_decode --format-probe)
 
+  # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
+  # against hand-built SPS bitstreams written by an independent bit-writer in the test.
+  # The fill layout asserts every offset the guest has been observed reading, and carries
+  # a mutation arm (absent-meta fill over a poisoned buffer) so removing the fill cannot
+  # pass vacuously.
+  add_executable(test_h264_sps tests/hle/video/test_h264_sps.cpp)
+  target_link_libraries(test_h264_sps PRIVATE prosper_core)
+  add_test(NAME h264_sps COMMAND test_h264_sps)
+
   add_executable(test_json2 tests/hle/test_json2.cpp)
   target_link_libraries(test_json2 PRIVATE prosper_core)
   add_test(NAME json2_hle COMMAND test_json2)
