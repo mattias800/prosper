@@ -750,6 +750,8 @@ struct ShaderCompileKeyHash {
         if (key.has_pixel_inputs) {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
             hash = hash_mix(hash, key.pixel_inputs.passthrough_mask);
+            hash = hash_mix(hash, key.pixel_inputs.consumed_mask);   // #2945
+            hash = hash_mix(hash, key.pixel_inputs.consumed_known);
             for (uint32_t control : key.pixel_inputs.controls)
                 hash = hash_mix(hash, control);
         }
