@@ -13,7 +13,8 @@
 #   extra-name   further exact process names to count
 #
 # Exit codes follow pgrep conventions so loops read naturally
-# (`until gpu_busy.sh -q; do sleep 30; done` waits for a free box):
+# (`while gpu_busy.sh -q; do sleep 30; done` waits for a free box — while spins on success,
+# i.e. while the box is BUSY; `until` would spin while it is FREE):
 #   0  consumers running (busy)
 #   1  none running (free)
 #   2  tool or usage error — NEVER answers "free" from a broken tool
