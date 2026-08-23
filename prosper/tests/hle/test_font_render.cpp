@@ -113,7 +113,7 @@ std::vector<uint8_t> build_test_font() {
         u16(d, 3); u16(d, 1);            // platform 3, encoding 1
         u32v(d, 12);                     // offset to the subtable
         u16(d, 6);                       // format 6
-        u16(d, 10);                      // length
+        u16(d, 12);                      // length: 10 header bytes + entryCount*2
         u16(d, 0);                       // language
         u16(d, 'A');                     // firstCode
         u16(d, 1);                       // entryCount
@@ -183,6 +183,31 @@ int main() {
 
     auto P = [](const void* p) { return (uint64_t)(uintptr_t)p; };
 
+    // Call sceFontRenderCharGlyphImage through the SAME shape the platform registers.
+    //
+    // This is not portability boilerplate -- it is the finding itself, and it cost a red Windows
+    // CI run to learn. The Windows registration takes only the five INTEGER arguments, because the
+    // import trampoline remaps integer registers and never touches xmm (#2955). A test that calls
+    // the SysV seven-argument shape against it hands the handler `metrics` and `result` out of r9
+    // and the shadow stack -- garbage pointers it then writes through. That is a **SegFault**, and
+    // it is precisely the arbitrary write the Windows arm of hle_font.cpp exists to avoid; the
+    // first version of this test demonstrated it on CI rather than in the emulator.
+    //
+    // The pen is ignored on Windows, and every assertion below still holds there, because the pen
+    // Metaphor passes (`-h_bearing_x`, `h_bearing_y - baseline`) puts the glyph at the surface
+    // origin -- which is exactly where the no-pen path draws it.
+    auto call_render = [](HleFn fn, void* f, uint32_t code, void* surf, float x, float y,
+                          void* metrics, void* result) -> int32_t {
+#if defined(_WIN32)
+        (void)x; (void)y;
+        return ((int32_t (*)(void*, uint32_t, void*, void*, void*))fn)(f, code, surf, metrics,
+                                                                       result);
+#else
+        return ((int32_t (*)(void*, uint32_t, void*, float, float, void*, void*))fn)(
+            f, code, surf, x, y, metrics, result);
+#endif
+    };
+
     const std::vector<uint8_t> ttf = build_test_font();
     CHECK(ttf.size() > 200 && ttf[0] == 0 && ttf[1] == 1 && ttf[2] == 0 && ttf[3] == 0,
           "synthesized font carries the sfnt 1.0 signature");
@@ -209,7 +234,12 @@ int main() {
     auto set_scale_f = (int32_t(*)(void*, float, float))set_scale;
     set_scale_f(face, 64.0f, 64.0f);
 
-    float layout[3] = {kPoison, kPoison, kPoison};
+    // A sentinel, deliberately NOT `kPoison`: writing that byte as a float VALUE gives 175.0, not
+    // the 0xafafafaf bit pattern the memset arms rely on. Two different sentinels spelled the same
+    // way, next to arms whose entire point is that the bit pattern reads as a plausible float, is
+    // the confusion this file's header warns about. This one only has to differ from 51.2.
+    constexpr float kUnset = -1.0f;
+    float layout[3] = {kUnset, kUnset, kUnset};
     CHECK(get_horiz(P(face), P(layout), 0, 0, 0, 0) == 0,
           "GetHorizontalLayout succeeds on a memory face");
     // ascent 800 / unitsPerEm-derived scale 0.064 -> 51.2 px.
@@ -237,8 +267,8 @@ int main() {
 
     uint8_t result[0x40];
     std::memset(result, kPoison, sizeof(result));
-    auto render_f = (int32_t(*)(void*, uint32_t, void*, float, float, void*, void*))render;
-    const int32_t rrc = render_f(face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result);
+    const int32_t rrc = call_render(render, face, 'A', surface, -bearing_x,
+                                    bearing_y - layout[0], m, result);
     CHECK(rrc == 0, "RenderCharGlyphImage reports success on a glyph it can draw");
 
     // THE #2951 REGRESSION. Both fields are read unconditionally by the caller, so both must have
@@ -251,6 +281,13 @@ int main() {
     CHECK(rw >= 38 && rw <= 40 && rh >= 44 && rh <= 46,
           "the reported drawn size matches the glyph actually rasterized");
     CHECK(rd_i32(0x10) == kPitch, "the result reports the surface pitch the blit used");
+    // +0x30 is READ by the caller (eboot+0x1001432 truncates it and stores it into the engine's
+    // own glyph record), so it is not "reserved" and it must not be left as residue. What it means
+    // is underived, so the assertion is deliberately only that it was written -- see the
+    // CONFIDENCE: LOW note on RenderResult. Review found this field; the first version of this
+    // test asserted nothing here and would not have caught a regression.
+    CHECK((uint32_t)rd_i32(0x30) != 0xafafafafu,
+          "the field at +0x30 the caller also reads is written, not left as residue");
     // The poison compare is not redundant with the magnitude compare, and mutation testing is how
     // that was found: 0xafafafaf reinterpreted as a float is -3.2e-13, which sails through any
     // "close to zero" test. An untouched buffer therefore PASSES a placement assertion written the
@@ -278,7 +315,7 @@ int main() {
     CHECK(set_scissor(P(surface), 80, 80, 8, 8, 0) == 0, "SetScissor succeeds");
     uint8_t result2[0x40];
     std::memset(result2, kPoison, sizeof(result2));
-    render_f(face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result2);
+    call_render(render, face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result2);
     size_t covered2 = 0;
     for (uint8_t b : surf_bytes) if (b) ++covered2;
     int32_t rw2; std::memcpy(&rw2, result2 + 0x38, 4);
@@ -293,7 +330,7 @@ int main() {
     CHECK(set_scissor(P(surface), 0, 0, 0, 0, 0) == 0, "SetScissor accepts an empty rectangle");
     uint8_t result_empty[0x40];
     std::memset(result_empty, kPoison, sizeof(result_empty));
-    render_f(face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result_empty);
+    call_render(render, face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result_empty);
     size_t covered_empty = 0;
     for (uint8_t b : surf_bytes) if (b) ++covered_empty;
     int32_t rw_empty; std::memcpy(&rw_empty, result_empty + 0x38, 4);
@@ -306,7 +343,7 @@ int main() {
     set_scissor(P(surface), 0, 0, kDim, kDim, 0);
     uint8_t result_back[0x40];
     std::memset(result_back, kPoison, sizeof(result_back));
-    render_f(face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result_back);
+    call_render(render, face, 'A', surface, -bearing_x, bearing_y - layout[0], m, result_back);
     size_t covered_back = 0;
     for (uint8_t b : surf_bytes) if (b) ++covered_back;
     CHECK(covered_back > 500, "restoring a full scissor draws the glyph again");
@@ -314,7 +351,7 @@ int main() {
     // --- a null surface must not be answered with success over an unwritten result -----------
     uint8_t result3[0x40];
     std::memset(result3, kPoison, sizeof(result3));
-    const int32_t nrc = render_f(face, 'A', nullptr, 0.0f, 0.0f, nullptr, result3);
+    const int32_t nrc = call_render(render, face, 'A', nullptr, 0.0f, 0.0f, nullptr, result3);
     int32_t rw3; std::memcpy(&rw3, result3 + 0x38, 4);
     CHECK(nrc != 0, "a null surface is an error, not a success");
     CHECK((uint32_t)rw3 != 0xafafafafu,

@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -98,12 +99,23 @@ struct FontFace {
 //
 // Not a style preference -- a bound. Every quantity that reaches the rasterizer comes from the
 // guest: the pixel scale through `sceFontSetScalePixel`, the code point through the render call.
-// On Windows those float arguments are additionally NOT reliably delivered at all (see the
-// PROSPER_SYSV_ABI note in dispatch.hpp: the import trampoline remaps integer registers only), so
+// On Windows those float arguments are additionally NOT reliably delivered at all -- the import
+// trampoline remaps integer registers only, which is stated at
+// src/host/image/exec_image_win.cpp's emit_sysv_to_ms_prologue (dispatch.hpp says the conversion
+// happens in the trampoline, but not that it is integer-only; #2955) -- so
 // a face there can legitimately be carrying an unreviewed scale. A clamp turns every one of those
 // cases into a missing glyph instead of a multi-gigabyte allocation.
 constexpr float kMaxPixelScale = 4096.0f;
 constexpr int   kMaxGlyphDim   = 4096;
+
+// The largest font FILE prosper will copy out of guest memory.
+//
+// The length is a guest-supplied uint32 and prosper cannot see how big the guest's buffer really
+// is, so an oversized one is not a big allocation -- it is a read of that many bytes FROM guest
+// memory, i.e. a host SIGSEGV, which no `catch (...)` can turn back into an error return. 64 MiB
+// is far above any real font (Metaphor's is 180,424 bytes; a full CJK face is a few megabytes)
+// and far below anything that can walk off a mapping.
+constexpr uint32_t kMaxFontBytes = 64u * 1024u * 1024u;
 
 FontLibrary g_library;
 FontRenderer g_renderer;
@@ -173,27 +185,41 @@ FontFace* face(void* handle) {
 // stack locals: `lea rcx,[rbp-0x80]` and `lea r8,[rbp-0x60]`, with the frame's stack cookie at
 // [rbp-0x20]. That pins the two sizes exactly -- the metrics block is [rbp-0x80,rbp-0x60) = 0x20
 // bytes (which is sizeof(GlyphMetrics), independently confirming that layout), and this block is
-// [rbp-0x60,rbp-0x20) = 0x40 bytes. Writing 0x40 bytes is therefore in-bounds by construction,
-// and writing one byte more would land on the cookie.
+// [rbp-0x60,rbp-0x20) = 0x40 bytes.
 //
-// The four named fields are the ones the title reads back, at eboot+0x1001412..0x1001457:
+// 0x40 is EXACT, not merely an upper bound from the cookie: the caller's first read back is
+// `mov rax,QWORD PTR [rbp-0x28]` (eboot+0x1001412), eight bytes ending at the cookie, so it
+// consumes this block right up to its last byte. Nothing live sits inside the range this file
+// memsets.
+//
+// FIVE fields are read back, at eboot+0x1001412..0x100143f. (This comment said "four" until
+// review re-disassembled the range and found +0x30; the count is spelled out here because the
+// wrong one told the next reader there was nothing to look at.)
 //   +0x10 -> the glyph cache entry's row STRIDE. It has to be the surface's pitch: the engine
 //            later blits with `src + col + stride*row` straight out of the surface buffer
 //            (eboot+0x1001a5b..0x1001a63), so any other value walks the wrong rows.
 //   +0x28/+0x2c -> floats, truncated to int by the caller, recording WHERE in the surface the
 //            glyph landed.
+//   +0x30 -> a float, truncated to int exactly as the placement pair above is, then stored into
+//            the engine's own glyph record at [glyph+0x34] (eboot+0x1001432..0x100143f). It is
+//            CONSUMED -- what it MEANS is not derivable from anything in this title's code, which
+//            only copies it. prosper writes 0.
+//            **CONFIDENCE: LOW that 0 is the right answer.** It is the right *default* -- before
+//            this file existed the field was uninitialised stack, so 0 is strictly an improvement
+//            and at least deterministic -- but it is a guess about a value the engine keeps. If a
+//            glyph-placement defect ever shows up on this title, start here.
 //   +0x38/+0x3c -> the drawn size in pixels, as signed ints. These are the two the title maxes
 //            against its configured cell size to size its glyph atlas texture -- the pair that
 //            were uninitialised stack in #2951.
-// Everything else is left zeroed: prosper does not know what it means, and zero is the only
-// answer that does not invent one.
+// The genuinely unread remainder is zeroed: prosper does not know what it means, and zero is the
+// only answer that does not invent one.
 struct RenderResult {
     uint32_t reserved0[4];   // +0x00
     int32_t  pitch;          // +0x10
     uint32_t reserved1[5];   // +0x14
     float    x;              // +0x28
     float    y;              // +0x2c
-    float    reserved2;      // +0x30
+    float    consumed_0x30;  // +0x30  read by the caller; meaning underived. See above.
     uint32_t reserved3;      // +0x34
     int32_t  width;          // +0x38
     int32_t  height;         // +0x3c
@@ -201,6 +227,7 @@ struct RenderResult {
 static_assert(sizeof(RenderResult) == 0x40);
 static_assert(offsetof(RenderResult, pitch)  == 0x10);
 static_assert(offsetof(RenderResult, x)      == 0x28);
+static_assert(offsetof(RenderResult, consumed_0x30) == 0x30);
 static_assert(offsetof(RenderResult, width)  == 0x38);
 static_assert(offsetof(RenderResult, height) == 0x3c);
 
@@ -274,6 +301,24 @@ void blit_glyph(const RenderSurface* surf, const uint8_t* glyph, int gw, int gh,
     auto* dst = static_cast<uint8_t*>(surf->buffer);
     const int pitch = surf->width_bytes;
     if (!dst || pitch <= 0 || surf->width <= 0 || surf->height <= 0) return;
+    // One coverage byte per pixel is the only surface format this writes. Metaphor declares
+    // exactly that (`sceFontRenderSurfaceInit(..., pixel_size=1, ...)` at eboot+0x100152a, and the
+    // live probe agrees), and nothing else in the corpus reaches here -- but a wider surface would
+    // otherwise get 8-bit coverage smeared across it with no diagnostic, which is a silent skip
+    // where the charter asks for a loud one. It stays in bounds either way; the complaint is that
+    // it would look handled.
+    if (surf->pixel_size != 1) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "[font] RenderSurface pixel_size=%d is unsupported; only 1 (8-bit "
+                         "coverage) is implemented. Glyphs will not be drawn. CONFIDENCE: LOW -- "
+                         "no title in the corpus exercises this, so the layout is underived.\n",
+                         (int)surf->pixel_size);
+        }
+        return;
+    }
 
     // Clip box: the surface, intersected with its scissor. `font_surface_init` seeds the scissor to
     // the whole surface, so an untouched one clips nothing extra, and an EMPTY one clips
@@ -384,7 +429,8 @@ int32_t font_open_memory(void* library, const void* bytes, uint32_t size,
                          const void* params, void** out) {
     if (!out) return static_cast<int32_t>(0x80540002u);
     *out = nullptr;
-    if (!bytes || size < 12) return static_cast<int32_t>(0x80540002u);
+    if (!bytes || size < 12 || size > kMaxFontBytes)
+        return static_cast<int32_t>(0x80540002u);
 
     auto data = std::make_shared<FontData>();
     try {
@@ -410,7 +456,14 @@ int32_t font_open_instance(void*, void* source, void** out) {
     return rc;
 }
 int32_t font_close(void* handle) {
-    delete static_cast<FontFace*>(handle);
+    // The magic check is not cosmetic any more. FontFace gained a shared_ptr, so it is no longer
+    // trivially destructible, and `delete` on a bogus handle would run a refcount decrement
+    // through whatever the pointer happens to address -- an arbitrary write, where before this
+    // change the same mistake was only a bad free. Validate first.
+    if (!handle) return 0;
+    auto* f = face(handle);
+    if (!f) return static_cast<int32_t>(0x80540002u);
+    delete f;
     return 0;
 }
 
@@ -478,7 +531,9 @@ int32_t font_get_horizontal(void* handle, HorizontalLayout* out) {
         // baseline and line advance out of the font's own hhea. The third field is the decoration
         // (underline) position, which neither this font's exposed tables nor any guest evidence
         // pins down, so it keeps the placeholder relationship rather than acquiring an invented
-        // one. CONFIDENCE: HIGH on baseline/advance, LOW on decoration.
+        // one. CONFIDENCE: HIGH on the derivation of baseline/advance from the font's tables --
+        // but it INHERITS the MED above on what "scale pixel" means, and a label cannot exceed its
+        // weakest input, so read the absolute values as MED. LOW on decoration.
         *out = {(float)d.ascent * sy,
                 (float)(d.ascent - d.descent + d.line_gap) * sy,
                 f->height};
@@ -495,6 +550,12 @@ int32_t font_get_vertical(void* handle, VerticalLayout* out) {
     if (f && f->data && face_scale(f, &sx, &sy)) {
         const auto& d = *f->data;
         const float line = (float)(d.ascent - d.descent + d.line_gap) * sy;
+        // The line advance is the font's own. The other two are NOT: this font carries no
+        // vhea/vmtx and stb exposes none, so the vertical baseline is placed at the centre of the
+        // line box and the decoration falls back to the requested cell width.
+        // **CONFIDENCE: LOW** on both -- they are conventions, not measurements, and *Astro Bot*
+        // imports `sceFontGetVerticalLayout`, so unlike most of this file they do reach a title.
+        // Nothing observed so far depends on them; if vertical text ever looks wrong, start here.
         *out = {line * 0.5f, line, f->width};
         return 0;
     }
@@ -531,10 +592,18 @@ void font_surface_init(RenderSurface* out, void* buffer, int width_bytes, int pi
 int32_t font_surface_set_scissor(RenderSurface* surface, int32_t x, int32_t y,
                                  int32_t w, int32_t h) {
     if (!surface) return static_cast<int32_t>(0x80540002u);
-    surface->scissor[0] = (uint32_t)std::max(x, 0);
-    surface->scissor[1] = (uint32_t)std::max(y, 0);
-    surface->scissor[2] = (uint32_t)std::max(w, 0);
-    surface->scissor[3] = (uint32_t)std::max(h, 0);
+    // Clamping a negative origin to 0 has to take the same amount off the extent, or the rectangle
+    // slides instead of being cropped: (-10, 0, 20, 20) is x in [-10,10), and clamping the origin
+    // alone would turn it into [0,20) -- twice the requested area, half of it never asked for.
+    // Same fail-open asymmetry as the empty-scissor case in blit_glyph.
+    auto crop = [](int origin, int extent, uint32_t* out_origin, uint32_t* out_extent) {
+        int64_t o = origin, e = std::max(extent, 0);
+        if (o < 0) { e = std::max<int64_t>(0, e + o); o = 0; }
+        *out_origin = (uint32_t)o;
+        *out_extent = (uint32_t)e;
+    };
+    crop(x, w, &surface->scissor[0], &surface->scissor[2]);
+    crop(y, h, &surface->scissor[1], &surface->scissor[3]);
     return 0;
 }
 

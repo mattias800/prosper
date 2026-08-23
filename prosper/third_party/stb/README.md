@@ -72,8 +72,13 @@ What prosper's own glue must still do, and does in `hle_font.cpp`:
 - **Copy the guest's font bytes into a host-owned buffer at open time** rather than retaining a
   pointer into guest memory. The guest may unmap or reuse that range, and a rasterizer holding a
   dangling pointer would fault far from the cause.
-- **Bound the accepted size** and refuse a blob `stbtt_InitFont` rejects, with an error return —
-  never a success return over an unparsed font.
+- **Bound the accepted size** (`kMaxFontBytes`, 64 MiB) *before* the copy. The length is a
+  guest-supplied `uint32`, and prosper cannot see how large the guest's buffer actually is, so an
+  oversized one is not a big allocation — it is a read of that many bytes **from guest memory**,
+  i.e. a host SIGSEGV that no `catch (...)` can turn back into an error return. Review caught this
+  bullet promising a bound the code did not yet have; do not let it drift back apart.
+- **Refuse a blob `stbtt_InitFont` rejects**, with an error return — never a success return over an
+  unparsed font.
 
 Do not edit `stb_truetype.h` — keep it byte-identical to upstream so the copy is auditable and
 updatable. prosper's glue (the libSceFont ABI, surfaces, scissors, metrics) is project code in

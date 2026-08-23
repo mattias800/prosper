@@ -178,8 +178,8 @@ gap already mis-delivers `sceFontSetScalePixel`, `sceFontSetEffectSlant` and
    change, because it is finally measurable: the run now yields 12 distinct live frames instead of
    one stale one.
 2. ~~**SIGFPE in the guest's primary thread at `eboot+0x10019f6`**~~ — **fixed**, see above
-   ([#2951](https://github.com/mattias800/prosper/issues/2951)). The historical derivation:, about 5 s in — `div r14d` with
-   `r14d == 0`. The enclosing function is `eboot+0x1001970`, and RTTI names it: it is slot 3 of
+   ([#2951](https://github.com/mattias800/prosper/issues/2951)). The historical derivation, kept
+   because the shape is worth keeping: it faulted about 5 s in, on `div r14d` with `r14d == 0`. The enclosing function is `eboot+0x1001970`, and RTTI names it: it is slot 3 of
    **`fw::font::Font_PS5`**'s vtable (typeinfo `N2fw4font8Font_PS5E` at `0x237078f`), the routine
    that expands an 8-bit glyph coverage bitmap into a white RGBA8 texture. `r14d` is
    **bytes-per-pixel**, resolved through two lookup tables from the FORMAT field of the target
