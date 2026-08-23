@@ -837,6 +837,26 @@ the same six-attachment 4K scanout pass, which is the sharpest untested lead in 
 `tools/vkprobe --vs vs.spv --fs vs.spv.frag --iterations 200`. Read that tool's README before
 quoting anything from it, including a clean run.
 
+**RESOLVED 2026-08-23 — it is the DRIVER or the HARDWARE, not prosper's generated SPIR-V, and not
+storage-buffer loads.** The fork above was decided by hand-writing SPIR-V that does the same loads
+and running it beside prosper's own module *in one process*. The whole decision now costs one
+command:
+
+```bash
+# Hand-written controls: tools/vkprobe/shaders/*.spvasm (spirv-as --target-env vulkan1.1).
+# --vs-b runs a second module pair interleaved render-by-render, so both meet the same window.
+vkprobe --vs prosper_vs.spv  --fs prosper_fs.spv \
+        --vs-b minimal_ssbo_vs.spv --fs-b minimal_green_fs.spv --iterations 20
+
+# What the shader actually SAW -- "[1,2,3]" correct, "[1,--,--]" every invocation got index 0,
+# "[--,--,--]" no vertex invocation ran at all. Module a never writes, so its "[--,--,--]" is the
+# readback path's own positive control.
+vkprobe --vs no_ssbo_vs.spv --fs minimal_green_fs.spv \
+        --vs-b index_readback_vs.spv --fs-b minimal_green_fs.spv --readback-dwords 16:3
+
+# AND YOU MUST PUT LOAD ON THE GPU, or you will measure a null. See the trigger row below.
+```
+
 
 The observable is one frozen `.prgbundle` replayed offline by `gpu_replay` producing a different
 picture from run to run. Everything below was measured on master `99d5f738`, Linux / AMD Radeon
@@ -1037,6 +1057,123 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   investigations were steered by this one for weeks. `vkprobe` now enables the feature, exits 2 if
   the device lacks it, and refuses a vertex interface over `maxVertexOutputComponents`; its README
   says a clean run proves nothing on its own. #2945 / #2937 / #2950.
+
+- **THE VERDICT (2026-08-23): #2945 is RADV or the hardware. prosper's generated SPIR-V is not the
+  cause, and a storage-buffer load is not even required.** A hand-written vertex module
+  (`tools/vkprobe/shaders/minimal_ssbo_vs.spvasm`) performing the same loads through the same
+  descriptor shape, run **in the same process** as prosper's dumped module and interleaved
+  render-by-render with it (`vkprobe --vs-b`), fails at the same rate: **52 failing runs of 400 for
+  prosper's module against 54 of 400 for the hand-written one** (220 against 228 empty indexed
+  iterations of 8,000 each). The paired form is what carries this, and the sharpest statement of it
+  is not the two totals but their agreement **run by run: the two arms disagreed on 2 of 400 runs.**
+  A separate paired campaign, `no_ssbo_vs` — which declares the storage buffer and never reads it —
+  beside `index_readback_vs`, gives 142 and 138 failing runs of 400, so **a storage-buffer load is
+  not required either**. Do *not* read 142-vs-52 as "no_ssbo fails more": those are different
+  processes with a different option set (`--readback-dwords` is on for one), run in different
+  windows, and nothing in this design makes them comparable. Only the within-campaign pairs are. Every module is `spirv-val --target-env vulkan1.2` clean, prosper's
+  four dumps included. Linux, AMD Radeon 8060S (RADV STRIX_HALO, `0x1586`), Mesa 26.1.6 host /
+  26.1.4 container, kernel 7.1.5. #2945.
+- **It is `vkCmdDrawIndexed` specifically, and that arm is not noisy — it is silent.** Across the
+  same campaign the **non-indexed arm came back empty 0 times in 32,000 iterations**, while the
+  indexed arm beside it in the same iteration, on the same pipeline, over the same buffers, came
+  back empty 1,792 times. The arms alternate order every iteration and the by-position line is
+  printed beside the by-arm line, so this is an attribution to the draw KIND rather than to
+  submission order. #2945.
+- **The positive control that makes those numbers readable: the identical binary and the identical
+  module files render correctly on lavapipe.** 20 iterations, both arms, 0 empty, for prosper's
+  dumped module and for both hand-written ones — taken *during* the window in which RADV was failing
+  20 of 20. Without it "the hand-written module fails too" would be as consistent with a defect in
+  `vkprobe` as with one in the driver. #2945.
+- **What the GPU actually does — and the FIRST attempt at this row was unfalsifiable, which is worth
+  more than the answer.** `index_readback_vs` stores `gl_VertexIndex + 1` into the record buffer, so
+  the host can see which vertex indices the shader was handed. The first campaign ran it with the
+  **identity** indices `0,1,2` — where "the index was fetched correctly" and "the shader got the
+  ordinal and the index buffer was never read" produce the *same* readback. On that design the arm
+  looked 91.6% correct. Re-run with `--indices 3,4,5`, where the only correct answer is
+  `[--,--,--,4,5,6,--,--]`, **1,400 indexed iterations gave the correct answer 17 times — 1.2%**:
+  288 (20.6%) reported the shader saw `0,1,2`, the ordinals rather than the uploaded indices, and
+  1,076 (76.9%) wrote nothing in the watched window at all. So the identity design was hiding most
+  of the failures, and any rate in this section measured with identity indices is a **lower bound**.
+  **Use non-identity indices for anything diagnostic.** #2945.
+- **What that readback does NOT establish, stated because the obvious reading is over-strong.** Three
+  earlier sentences here — "the index fetch returned zeros", "no vertex invocation ran at all", and
+  "it never fetches a wrong non-zero index" — are **withdrawn**. None is separable by this
+  instrument. A shader handed an out-of-range index writes outside the descriptor's range and the
+  write is dropped, which is indistinguishable from never running; a lost index reading as `0` and
+  the same index reading as `7` both land outside the watched window in the same way; and the
+  `[1,2,3]` pattern on an indexed arm is equally consistent with the shader having been handed the
+  ordinals and with the host's sentinel reset never becoming visible, leaving the *previous*
+  render's bytes to be read back. What is established is narrower and enough: **the vertex indices
+  reaching the shader are, most of the time under load, not the ones the host uploaded**, and
+  lavapipe returns the correct distinct answer for every index set on the same binary and files.
+  #2945.
+- **The non-indexed arm's "0 of 32,000" is partly a LIMIT OF THE OBSERVABLE, not purely a property
+  of the hardware — do not quote it as a clean arm.** For `index_readback_vs` the non-indexed arm's
+  correct readback is `[1,2,3]`, which is also exactly what a stale read of the previous render
+  returns, so that arm cannot report the failure even in principle. It measured `[1,2,3]` on 1,400
+  of 1,400 diagnostic iterations, and that number is undiagnostic by construction. The arm
+  difference is still real for `minimal_ssbo_vs`, whose non-indexed coverage stayed at exactly 496
+  throughout — but "indexed draws are affected and non-indexed ones are not" is a claim this
+  apparatus supports only weakly, and it is not load-bearing for the verdict. #2945.
+- **GPU load from another process INDUCES the failing regime on demand — but it is SUFFICIENT, not
+  NECESSARY, and the first version of this row got that wrong.** Three heavy `gpu_replay`
+  full-submit replays flipped a passing box into failing **within one round** of a 3-second detector
+  loop and it recovered ~15 s after they stopped; a second `vkprobe` used purely as load reproduces
+  it more weakly, so the load need not be prosper. That is a real lever over trap 223's drift and it
+  is repeatable. **What does not hold is the converse:** an independent reviewer measured 13/20 and
+  8/20 failing with no `prosper-app`, `screenshot`, `boot_trace`, `gpu_replay` or `vkprobe` running,
+  verified through `/proc/*/fd`. So a clean arm on a quiet box is **weak, not a clearance**, and any
+  0-of-n here reads as *undecided*. Two further consequences: quote the wall-clock **span** beside
+  the n, because 400 runs inside 173 s are one drift period rather than 400 samples of what varies;
+  and `pgrep -x 'prosper-app|screenshot|boot_trace'` matches none of `gpu_replay`, `vkprobe` or
+  `ctest`, which is exactly the load that matters. #2945.
+- **prosper's own one-draw reproduction and the bare-Vulkan control go bad TOGETHER, so the
+  control's verdict transfers.** 309 interleaved rounds, each running the paired `vkprobe` and then
+  `gpu_replay s3537.prgcap --draw 42`: **P(vkprobe fails | the replay drew nothing) = 26/33 = 0.79**
+  against **P(vkprobe fails | the replay rendered) = 37/276 = 0.13**. Six-fold. This is what licenses
+  reading a `vkprobe` result as a statement about #2945 rather than about a different defect that
+  happens to look similar. #2945.
+- **Not the index type, not where the index memory lives, and not any RADV lever.** Measured in a
+  saturated window, 10 iterations each on `no_ssbo_vs`: default, `RADV_DEBUG=nongg`, `llvm`,
+  `zerovram`, `syncshaders`, `nocache`, and `--device-local-indices` all gave **10 of 10 indexed
+  empty and 0 of 10 non-indexed**. `--device-local-indices` prints the selected memory type's
+  property flags as `0x1`, so it demonstrably is not HOST_VISIBLE. `--index-bits 16` fails as well,
+  with the same readback patterns. `RADV_DEBUG=llvm` failing rules out ACO; `nongg` failing rules
+  out NGG. #2945.
+- **A clean synchronization-validation run is still not a clearance, and this time the layer was
+  proved to be printing.** Core + sync validation reported **zero findings** during a run whose
+  indexed arm was empty 10 of 10. The layer was loaded (`VK_LOADER_DEBUG=layer` shows the library)
+  *and* demonstrated to emit, by a deliberate stage-mismatch arm that printed
+  `VUID-VkPipelineShaderStageCreateInfo-pName-00707`. Without that second half the zero would have
+  been indistinguishable from a layer that never ran — which is the shape of every silent-instrument
+  trap in this file. #2945.
+- **#2937's five failures do NOT collapse into #2945 — measured, and this kills the tempting
+  unification.** The signature invites it: every failing assertion in those tests is an indexed draw
+  while the non-indexed one in the same pair passes, and they were found under `ctest -j4`, which is
+  the concurrent GPU load #2945 needs. But the two behave differently in the way that matters.
+  Interleaved A/B, six rounds, `ctest --no-tests=error -j1` over exactly those five cases: **5 of 5
+  fail in every quiet round**, and 3-5 of 5 under a sustained `gpu_replay` load beside them — if
+  anything slightly *fewer*. So load is not their trigger, and they are **deterministic** where
+  #2945 is stochastic (its worst measured arm is 142 failing runs of 400). **That is the whole of the
+  argument, and one tempting extra leg is void:** "on the same quiet GPU `vkprobe` measures 0 failing
+  runs of 48, so a generic driver indexed-draw defect cannot explain them" does not hold, both
+  because a quiet-box null here is undecided rather than negative (see the load row) and because
+  `vkprobe`'s identity-index design is structurally unable to see most of the defect — trap 122's
+  shape, a control blind to the class it is being used to exclude. So: #2937 is **not this defect's
+  load-triggered stochastic dropout**, which is what the determinism measurement shows; whether it
+  shares a deeper cause is open, and it is not excluded from being prosper's own. #2945 / #2937.
+- **And #2950 is UNTESTED against this, so do not assume it either.** Its guards fail
+  deterministically, reproduce on a 2026-08-02 build and on Mesa 26.0.3, and its two arms differ
+  only slightly (SSIM 0.0029698 against 0.0029666) — the same *deterministic* character as #2937 and
+  the opposite of #2945's. A guard run is sustained GPU load, so the load regime is consistent with
+  it, but consistency is all there is: nothing has been run. The cheap test is to run `vkprobe`
+  paired beside a guard and see whether the control fails while the guard does. #2945 / #2950.
+- **Superseded by the rows above: "the remaining suspects are prosper's generated SPIR-V, prosper's
+  host-side usage as an amplifier, and the driver/hardware."** The first is dead. The third is the
+  answer. The middle one is *unresolved and now unimportant* — prosper's rate is higher than the
+  control's, but the two move together (0.79 against 0.13) and the load rows explain the gap at
+  least as well as an amplifier does: prosper's reproduction generates its own GPU load. Do not
+  spend anything more on it before the driver defect is reported. #2945.
 
 
 ## Recommended implementation order

@@ -1,0 +1,71 @@
+; minimal_ssbo_vs.spvasm -- the HAND-WRITTEN control for #2945.
+;
+; #2945's characterised failure is "every storage-buffer load in the vertex shader intermittently
+; returns 0". Two suspects were left: prosper's generated SPIR-V, or the driver/hardware. This
+; module is the arm that separates them: it performs the SAME loads, from the SAME descriptor, with
+; the SAME addressing arithmetic as prosper's dumped vertex module, and it was written by hand from
+; the SPIR-V specification rather than emitted by prosper's recompiler.
+;
+; It is deliberately the SMALLEST module that can express the failure:
+;   * one StorageBuffer variable, set 0 binding 3, `struct { uint[] }`, ArrayStride 4
+;   * gl_VertexIndex * 8 bytes -> dword index, two consecutive OpLoads
+;   * bitcast to float for x and y; z = 0, w = 1; OpStore into gl_Position
+; Everything prosper's module carries beyond that -- the second (unused) binding, the `Aliased`
+; decorations, the absent `NonWritable`, the unused gl_InstanceIndex load -- is deliberately absent
+; here and is varied one factor at a time by the sibling modules in this folder.
+;
+; Assemble with:  spirv-as --target-env vulkan1.1 minimal_ssbo_vs.spvasm -o minimal_ssbo_vs.spv
+; (vulkan1.1 so the header says SPIR-V 1.3, matching the modules prosper emits.)
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %vertex_index %per_vertex
+               OpDecorate %vertex_index BuiltIn VertexIndex
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpDecorate %PerVertex Block
+               OpDecorate %_runtimearr_uint ArrayStride 4
+               OpMemberDecorate %Records 0 Offset 0
+               OpDecorate %Records Block
+               OpDecorate %records DescriptorSet 0
+               OpDecorate %records Binding 3
+               OpDecorate %records NonWritable
+       %void = OpTypeVoid
+     %fn_void = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+    %v4float = OpTypeVector %float 4
+%_ptr_Input_int = OpTypePointer Input %int
+%vertex_index = OpVariable %_ptr_Input_int Input
+  %PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %PerVertex
+ %per_vertex = OpVariable %_ptr_Output_PerVertex Output
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+    %Records = OpTypeStruct %_runtimearr_uint
+%_ptr_StorageBuffer_Records = OpTypePointer StorageBuffer %Records
+    %records = OpVariable %_ptr_StorageBuffer_Records StorageBuffer
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_8 = OpConstant %uint 8
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+   %vid_int = OpLoad %int %vertex_index
+  %vid_uint = OpBitcast %uint %vid_int
+ %byte_base = OpIMul %uint %vid_uint %uint_8
+%dword_index = OpShiftRightLogical %uint %byte_base %uint_2
+    %ptr_x = OpAccessChain %_ptr_StorageBuffer_uint %records %uint_0 %dword_index
+   %word_x = OpLoad %uint %ptr_x
+%dword_index_y = OpIAdd %uint %dword_index %uint_1
+    %ptr_y = OpAccessChain %_ptr_StorageBuffer_uint %records %uint_0 %dword_index_y
+   %word_y = OpLoad %uint %ptr_y
+        %x = OpBitcast %float %word_x
+        %y = OpBitcast %float %word_y
+ %clip_pos = OpCompositeConstruct %v4float %x %y %float_0 %float_1
+  %out_ptr = OpAccessChain %_ptr_Output_v4float %per_vertex %uint_0
+               OpStore %out_ptr %clip_pos
+               OpReturn
+               OpFunctionEnd
