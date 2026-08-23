@@ -203,6 +203,32 @@ struct PixelInputMapping {
     std::array<uint32_t, 32> controls{};
     uint32_t valid_mask = 0;
     uint32_t passthrough_mask = 0;
+    // Which of those logical PS inputs the FRAGMENT program actually reads (#2945).
+    //
+    // `valid_mask` cannot answer this. SPI_PS_INPUT_CNTL_0..31 are CONTEXT registers and therefore
+    // STICKY: extract_render_state marks a slot valid when the register is present in the context
+    // map at all, so a pixel shader with one interpolant inherits 31 stale slots from whatever ran
+    // before it and reports valid_mask=0xffffffff. The vertex emitter fans one PARAM export out to
+    // every valid slot, so that stale mask turns a single export into 32 output varyings =
+    // 128 components, and with gl_Position's 4 the interface is 132 against a
+    // maxVertexOutputComponents of 128 on every AMD device. The pipeline is then invalid and the
+    // vertex stage's behaviour undefined -- measured on BALAN WONDERWORLD as a fullscreen triangle
+    // whose positions the clipper discarded on ~75% of runs of ONE frozen capture.
+    //
+    // A vertex output no fragment shader reads cannot affect a pixel, so dropping it is
+    // behaviour-preserving by construction; what it removes is the interface overflow.
+    //
+    // `consumed_known` is the absent-vs-empty distinction: 0 with consumed_known=false means "the
+    // fragment program was not analysed", which must keep the historical fan-out, while 0 with
+    // consumed_known=true means "analysed, and it reads no interpolants at all".
+    uint32_t consumed_mask = 0;
+    bool consumed_known = false;
+
+    // True when `input` must be given an output varying. Unknown consumption keeps every valid slot.
+    bool consumes(uint32_t input) const {
+        if (!consumed_known) return true;
+        return input < 32 && (consumed_mask & (1u << input)) != 0;
+    }
 
     uint32_t effective_passthrough_mask() const {
         uint32_t mask = passthrough_mask;
@@ -301,6 +327,45 @@ FragmentInterpolationLayout fragment_interpolation_layout(
     const uint32_t* code, size_t dwords,
     const PixelSystemInputMapping* system_inputs = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr);
+
+// Every logical PS input a fragment program can read, as a mask of SPI_PS_INPUT_CNTL slots (#2945).
+//
+// A SUPERSET of FragmentInterpolationLayout::attribute_mask, and EQUAL to it for an ordinary
+// program. Both are built from the same VINTRP attribute numbers; `attribute_mask` comes from a
+// `rdna2_walk`, which stops at the first `is_end` and at the first Unknown encoding, and this
+// function walks `rdna2_recompile_code_span` without stopping at either. For a program whose span
+// is just its body those are the same instructions, so the masks match --
+// `test_vertex_output_budget` pins the containment, not a margin it does not have.
+//
+// The margin appears exactly where it is needed. `rdna2_recompile_code_span` is extended by
+// `extend_terminating_if_else` and by the pcrel table/dispatch detectors, and this walk follows the
+// extension while a plain `rdna2_walk` stops short of it. The hazard that makes an equal mask
+// unsafe is the fragment path gaining that same tail extension -- which `recompile_valu` and
+// `recompile_compute` already have and `recompile_fragment_impl` does not -- and in that case the
+// span grows and so does this mask.
+//
+// Do not upgrade this comment to "strict". An earlier revision claimed a superset it did not have
+// (it routed through `rdna2_walk`, which made the masks equal by construction) and the claim
+// survived review once; the conclusion was right and the reason was not, which is the failure mode
+// this file's callers can least afford.
+//
+// The bias is one-directional on purpose: over-reporting costs a dead varying, under-reporting is
+// the regression this analysis must never cause.
+uint32_t fragment_consumed_attribute_mask(const uint32_t* code, size_t dwords);
+
+// Stamp a draw's pixel-input mapping with the fragment program's real consumption (#2945). Both the
+// live realization path and gpu_replay's --recompile-raw substitution call this, so the vertex
+// interface is identical whichever one built it -- a divergence there would make an offline replay
+// disagree with the live renderer about the very interface this exists to bound.
+//
+// PROSPER_NO_DEAD_VARYING_ELIM=1 leaves the mapping untouched, restoring the historical fan-out.
+// Bisection lever only; leaving it set reinstates the over-limit interface.
+void apply_fragment_consumption(PixelInputMapping& mapping,
+                                const uint32_t* fragment_code, size_t dwords);
+
+// PROSPER_NO_DEAD_VARYING_ELIM is clear. Exposed so a caller that memoizes the mask itself can
+// honour exactly the same switch as `apply_fragment_consumption` rather than a second copy of it.
+bool dead_varying_elimination_enabled();
 
 // Generate the descriptor-free triangle geometry stage described above. Returns {} when no fallback
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList

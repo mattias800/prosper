@@ -658,6 +658,24 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     const PixelSystemInputMapping* system_inputs = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr);
 
+// Memoized on the shader-analysis identity, exactly as fragment_interpolation_layout_cached is and
+// for the same reason (#2945). The uncached form walks the whole recompile span TWICE -- once
+// inside rdna2_recompile_code_span and once to find the VINTRP attributes -- and the caller is the
+// per-draw realize path, seven lines from the cache that exists to keep one such walk off it. The
+// mask is a pure function of the shader bytes, so it memoizes identically.
+uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords);
+
+// apply_fragment_consumption over the memoized mask. Honours PROSPER_NO_DEAD_VARYING_ELIM through
+// dead_varying_elimination_enabled(), so the live path and the uncached form cannot drift on the
+// lever.
+inline void apply_fragment_consumption_cached(PixelInputMapping& mapping,
+                                              const uint32_t* fragment_code, size_t dwords) {
+    if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)
+        return;
+    mapping.consumed_mask = fragment_consumed_attribute_mask_cached(fragment_code, dwords);
+    mapping.consumed_known = true;
+}
+
 struct DrawRealizationPhaseStats {
     uint64_t draws = 0;
     double table_ms = 0.0;
@@ -1625,6 +1643,25 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, " i%u=%08x", i, pixel_inputs.controls[i]);
         fprintf(stderr, "\n");
     }
+    // #2945 -- record which of those slots the FRAGMENT program actually reads, so the vertex
+    // emitter does not materialize an output varying for a stale SPI_PS_INPUT_CNTL slot.
+    //
+    // Why this is needed at all: SPI_PS_INPUT_CNTL_0..31 are CONTEXT registers and sticky, so
+    // extract_render_state's "the register is present" test reports valid_mask=0xffffffff for a
+    // pixel shader with one interpolant. The vertex emitter then exports one PARAM to all 32
+    // locations -- 128 components, plus gl_Position's 4 -- against maxVertexOutputComponents=128 on
+    // every AMD device, so vkCreateGraphicsPipelines is fed an invalid interface and the vertex
+    // stage's behaviour is undefined. Measured on BALAN WONDERWORLD (PPSA02058): the language-menu
+    // composite triangle's transformed positions were discarded by the clipper on most runs of ONE
+    // frozen .prgbundle, with `VUID-RuntimeSpirv-Location-06272` the only validation error in the
+    // whole replay.
+    //
+    // The lever (PROSPER_NO_DEAD_VARYING_ELIM=1) lives in apply_fragment_consumption, so the live
+    // path and gpu_replay's --recompile-raw substitution honour exactly the same switch.
+    if (rs.ps_addr)
+        apply_fragment_consumption_cached(
+            pixel_inputs, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
+            max_shader_dwords);
     const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
     const PixelSystemInputMapping* system_input_ptr =
