@@ -32,7 +32,7 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 // Pool bounds mirror hle_kernel_mem.cpp (kDmemBase / kDmemTotal).
-static constexpr uint64_t kBase  = 0x10000000ull;
+static constexpr uint64_t kBase  = 0x4000ull;
 static constexpr uint64_t kTotal = 16ull * 1024 * 1024 * 1024;
 static constexpr uint64_t kEnd   = kBase + kTotal;
 using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,

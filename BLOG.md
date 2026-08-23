@@ -21,6 +21,28 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-23
 
+### Metaphor: ReFantazio was byte-reversing four gigabytes of its own heap, because we told it about memory it could not reach
+
+No picture yet — the frames it now produces are still black. But this one is worth explaining,
+because the shape of it was unusual and the cause was ours.
+
+We tell a game how much direct memory it has. Metaphor believes us completely: it carves the number
+we report into three pools that add up to it exactly, down to a deliberate twelve-megabyte remainder
+for later. The remainder was there — but we had quietly placed our pool 256 MiB further up than the
+address zero the game counts from, so those last twelve megabytes sat past the end of the region the
+game was able to ask about, and its final small allocation failed.
+
+What the game did next is the interesting part. It went on to build a reader over the resource it
+had not been given, found an empty file header, decided that meant a big-endian file, and asked its
+endian converter to swap "however many bytes I just read" — which was the error code, minus one.
+So it byte-reversed every 32-bit word of about four gigabytes of its own live heap. Seven seconds
+later a CRIWARE thread walked a list whose pointers had all been turned inside out and died.
+
+Moving the pool to where the game expects it fixes that: it now loads its assets, opens its audio,
+and publishes 63 frames at 34.8 fps before dying of something else
+([#2951](https://github.com/mattias800/prosper/issues/2951)). Details in
+[#2934](https://github.com/mattias800/prosper/issues/2934).
+
 ### Two Unreal titles were being quietly charged 2 GiB for memory they never got
 
 No picture with this one — neither title renders yet. *Sifu* and *The First Berserker: Khazan* both

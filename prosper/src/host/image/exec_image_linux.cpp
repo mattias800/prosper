@@ -39,6 +39,8 @@
 #include <map>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <thread>
 
 // Darwin mcontext/perf compatibility (PROSPER_GREGS / PROSPER_REG_ERR / PROSPER_SI_FD, the
 // HW_BREAKPOINT_*/F_SETSIG constants, and mach headers) lives in posix_shim.hpp — shared with the
@@ -3307,6 +3309,55 @@ void install_trap_handler() {
         struct sigaction ta{}; ta.sa_sigaction = fault_handler; ta.sa_flags = SA_SIGINFO;
         sigemptyset(&ta.sa_mask); sigaction(SIGTRAP, &ta, nullptr);
         arm_hwwatch(addr);
+    }
+    // PROSPER_POLLWATCH="0xADDR[,0xADDR...]" (diagnostic, default off) — sample up to 6 guest
+    // 64-bit slots from a host thread every millisecond and print every value CHANGE with the
+    // elapsed time. This answers a question no watchpoint here can answer cheaply: WHEN a slot
+    // changed, and whether it was ever correct.
+    //
+    // Why a poller and not the mprotect page-watch: that one is exact and process-wide, but it
+    // takes a SIGSEGV plus a single-step SIGTRAP per write to the whole 4 KiB page, so on a hot
+    // heap page it costs roughly two orders of magnitude. Measured on PPSA20800: armed on the
+    // page holding the CRI server's list, a boot that faults at ~7 s had not reached the fault
+    // after 240 s. The poller costs one read per slot per millisecond and changes no protection,
+    // so it cannot perturb what it is measuring — at the price of missing changes shorter than
+    // its interval, and of naming no writer. Use it to BOUND the event in time, then point an
+    // exact instrument at that window.
+    //
+    // Reads go through the same probe_readable() pipe trick the fault dumper uses, so an address
+    // that is not mapped yet is skipped rather than crashing the poller — the slot may legitimately
+    // appear late in boot.
+    if (const char* pw = getenv("PROSPER_POLLWATCH")) {
+        static uint64_t addrs[6]; static int n = 0;
+        const char* s2 = pw;
+        while (*s2 && n < 6) {
+            addrs[n++] = strtoull(s2, nullptr, 0);
+            const char* comma = strchr(s2, ','); if (!comma) break; s2 = comma + 1;
+        }
+        ensure_probe_pipe();
+        if (n > 0) {
+            fprintf(stderr, "[pollwatch] watching %d slot(s), 1 ms interval\n", n);
+            std::thread([] {
+                static uint64_t last[6]; static bool seen[6];
+                const auto t0 = std::chrono::steady_clock::now();
+                int changes = 0;
+                while (changes < 4096) {
+                    for (int i = 0; i < n; i++) {
+                        if (!probe_readable(addrs[i])) continue;
+                        const uint64_t v = *(const volatile uint64_t*)addrs[i];
+                        if (seen[i] && v == last[i]) continue;
+                        const double ms = std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - t0).count();
+                        fprintf(stderr, "[pollwatch] +%.1fms 0x%llx: 0x%llx -> 0x%llx\n", ms,
+                                (unsigned long long)addrs[i],
+                                (unsigned long long)(seen[i] ? last[i] : 0),
+                                (unsigned long long)v);
+                        last[i] = v; seen[i] = true; changes++;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }).detach();
+        }
     }
     // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — absolute guest addresses to hex-dump at fault time.
     if (const char* da = getenv("PROSPER_DUMPAT")) {
