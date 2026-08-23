@@ -217,6 +217,41 @@ rather than decoration:**
    flagged module twice, once where its exports collide and once where a single export NID differs; a
    guard that skipped every flagged module would pass the first arm exactly as well as a correct one.
 
+## Sentinels: assert on the bits, not the decoded value
+
+A test that fills a buffer with a poison byte and then checks the *decoded* field cannot always tell
+**"the code wrote 0"** from **"the code wrote nothing"**. prosper's guest allocator poisons with
+`0xaf`, and that pattern decodes to a number small enough to pass a tolerance check:
+
+| pattern | as float32 | passes `fabs(x) < 1e-6`? |
+|---|---|---|
+| **`0xafafafaf`** | **-3.196e-10** | **yes — silently** |
+| `0xcdcdcdcd` | -4.3160e+08 | no |
+| `0xcccccccc` | -1.0737e+08 | no |
+| `0xdddddddd` | -1.9984e+18 | no |
+| `0xfefefefe` | -1.6947e+38 | no |
+| `0xbaadf00d` | -1.3270e-03 | no |
+
+(`0xafaf…af` as float64 is -5.3e-79, which passes too.) Every other common fill fails loudly, which
+is exactly why this one is worth writing down: the habit of "poison the buffer and check the value"
+is safe with most patterns and quietly unsafe with ours.
+
+The failure it produces is the one hardest to see — an assertion that is **true** while the
+mechanism it is supposed to exercise never ran. It was found in #2951 only because a mutation arm
+removed the writer and the test still passed. So:
+
+- **When "the field was written at all" is the thing you are ruling out, compare the raw bits**
+  (`(uint32_t)bits != 0xafafafafu`), not the decoded float. Keep the value check too if the value
+  matters — the two are not redundant, and a comment should say so, because the next reader will
+  assume they are.
+- **Never give a byte-fill sentinel and a value sentinel the same name.** `memset(buf, kPoison, n)`
+  and `float x = kPoison;` differ by four orders of magnitude and read identically at the call site.
+- Prefer a mutation arm over inspection for this class. No amount of reading finds it; deleting the
+  writer does, in one run.
+
+Worked example and the surviving arms: `prosper/tests/hle/test_font_render.cpp`. Recorded as
+instrument trap 227 in `GAME_COMPAT_ORCHESTRATION.md`.
+
 ## Rule of thumb
 
 Prefer the cheapest layer that can catch a given bug: pure structural asserts for translation logic,
