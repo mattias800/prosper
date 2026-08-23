@@ -157,15 +157,15 @@ in shape, not per-iteration. Both failures happened to be the first execution af
 obvious mechanism, a cold Mesa shader cache, is falsified (`MESA_SHADER_CACHE_DISABLE=true`, 0 of
 8x150 either way), so that correlation is unexplained at n=2.
 
-**And the strongest form of that warning, measured 2026-08-23: a run on an IDLE GPU is void, not
-negative.** The "per-process, drifts over minutes" shape above is concurrent GPU work by another
-process. On a quiet machine this family measures 0 failing runs of 48 per arm; three heavy
-`gpu_replay` full-submit replays flipped it to failing within one round of a 3-second detector loop,
-and it recovered within ~15 s of them stopping. Under sustained load the paired campaign measured 52
-failing runs of 400 for prosper's dumped module against 54 of 400 for the hand-written control, and
-142 of 400 for `no_ssbo_vs`. **So put load on the GPU before believing a null** — and note that
+**And the practical form of that warning, measured 2026-08-23: GPU load from another process
+INDUCES the failing regime on demand, so put load beside the measurement before believing a null.**
+Three heavy `gpu_replay` full-submit replays flipped a passing box into failing within one round of
+a 3-second detector loop, and it recovered ~15 s after they stopped; a second `vkprobe` used purely
+as load reproduces it more weakly. **The converse does not hold** — an independent reviewer measured
+13/20 and 8/20 failing with no other GPU process running — so load is *sufficient*, not *necessary*,
+and a quiet-box null is undecided rather than clean. Note also that
 `pgrep -x 'prosper-app|screenshot|boot_trace'` does not see another agent's `gpu_replay`, `vkprobe`
-or ctest, which is precisely the load that matters.
+or `ctest`, which is precisely the load that matters.
 
 ### The rate table, so nobody re-derives it
 
@@ -179,10 +179,40 @@ Paired runs are one process, interleaved render-by-render, 20 iterations per run
 | `no_ssbo_vs` (hand-written) | sustained GPU load | 142 of 400 | 675 of 8,000 |
 | `index_readback_vs` (hand-written) | sustained GPU load, paired with the above | 138 of 400 | 669 of 8,000 |
 | all four, NON-indexed arm | sustained GPU load | — | **0 of 32,000** |
-| all four | idle GPU | 0 of 48 each | 0 |
+| all four | idle GPU (see the caveat below) | 0 of 48 each | 0 |
 | prosper's VS, `minimal_ssbo_vs`, `no_ssbo_vs` | **lavapipe**, during a window RADV was failing 20/20 | 0 of 1 each | 0 of 20 each |
 
-The vertex-index readback over 7,320 indexed iterations under load: `[1,2,3]` 6,707, `[--,--,--]`
-377 (no vertex invocation ran), `[1,--,--]` 236 (all three invocations handed index 0); `[1,--,3]`
-and `[1,2,--]` — one index lost, the rest correct — also occur. The non-indexed arm was `[1,2,3]`
-on 7,320 of 7,320.
+Two limits on that table, both of which matter more than the totals do. **The paired rows are the
+evidence; the cross-campaign comparison is not** — 142-vs-52 is two different processes with a
+different option set in different windows, and nothing makes them comparable. Within a campaign the
+sharpest statement is not the two totals but their run-by-run agreement: **prosper's module and the
+hand-written one disagreed on 2 of 400 runs.** And **each campaign is a single ~3-minute window**
+(48 rounds over 206 s; 400 rounds over 173 s), so "0 of 48" is one drift period rather than 48
+independent samples — read it as *undecided*, not as a clean arm. An independent reviewer measured
+13/20 and 8/20 failing on a box with no other GPU process running, so load is sufficient to induce
+the regime, not necessary for it.
+
+**Use NON-IDENTITY indices for anything diagnostic, and treat every rate above as a lower bound.**
+The campaign that produced that table ran `--indices 0,1,2`, where "the index was fetched correctly"
+and "the shader got the ordinal and the index buffer was never read" give the *same* readback — so
+it scored 91.6% correct. Re-run with `--indices 3,4,5`, where the only correct answer is
+`[--,--,--,4,5,6,--,--]`:
+
+| readback, 1,400 indexed iterations under load, `--indices 3,4,5` | count | |
+| --- | --- | --- |
+| `[--,--,--,4,5,6,--,--]` | 17 (1.2%) | correct |
+| `[--,--,--,--,--,--,--,--]` | 1,076 (76.9%) | nothing written in the watched window |
+| `[1,2,3,--,--,--,--,--]` | 288 (20.6%) | the shader saw the ordinals, not the uploaded indices |
+| other | 19 | |
+
+**What the readback does not tell you.** A shader handed an out-of-range index writes outside the
+descriptor's range and the write is dropped, which is indistinguishable from never running; an index
+lost as `0` and the same index arriving as `7` both land outside the watched window. And `[1,2,3]`
+on an indexed arm is equally consistent with the shader having been handed the ordinals and with the
+host's sentinel reset never becoming visible, leaving the previous render's bytes to be read back.
+So do not turn these into a mechanism — what they establish is that **the vertex indices reaching
+the shader are usually not the ones the host uploaded**, while lavapipe returns the correct distinct
+answer for every index set from the same binary and files.
+
+The non-indexed arm read `[1,2,3]` on 1,400 of 1,400 — which is **undiagnostic by construction**,
+since for that arm the correct answer and a stale read of the previous render are the same bytes.

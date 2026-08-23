@@ -20,6 +20,10 @@
 set -u
 probe=${1:?vkprobe binary}; work=${2:?work directory}; rounds=${3:?rounds}; gap=${4:?sleep seconds}
 shift 4; [ "${1:-}" = "--" ] && shift
+# Capture the caller's extra vkprobe arguments BEFORE any function definition: inside a
+# function "$@" is the FUNCTION's arguments, so using it there silently passes the round
+# number to vkprobe, which exits 2 and produces no measurement at all.
+extra=("$@")
 cd "$work" || exit 2
 
 emit() {   # <round> <config> <log-file>
@@ -34,19 +38,32 @@ emit() {   # <round> <config> <log-file>
     ' "$log"
 }
 
-for round in $(seq 1 "$rounds"); do
-    # Configuration 1 -- THE VERDICT: prosper's own generated module against a hand-written module
-    # doing the same storage-buffer loads, in one process.
+# The two configurations below run in SEPARATE processes with different options, so their rates are
+# NOT comparable with each other -- only the a-vs-b pair inside each one is. The order alternates
+# anyway, so that neither configuration systematically owns the earlier half of a round.
+run_c1() {   # THE VERDICT: prosper's own generated module against a hand-written module doing the
+             # same storage-buffer loads, in one process, interleaved render-by-render.
     timeout 120 "$probe" --vs prosper_vs.spv --fs prosper_fs.spv \
                          --vs-b hand_vs.spv  --fs-b hand_fs.spv \
-                         --iterations 20 "$@" > c1.log 2>&1
-    emit "$round" prosper-vs-hand c1.log
-    # Configuration 2 -- THE CHARACTERISATION: a module whose position never touches memory,
-    # against one that reports the vertex indices it was handed.
+                         --iterations 20 "${extra[@]}" > c1.log 2>&1
+    emit "$1" prosper-vs-hand c1.log
+}
+run_c2() {   # THE CHARACTERISATION: a module whose position never touches memory, against one that
+             # reports the vertex indices it was handed.
+             #
+             # --indices 3,4,5, NOT the identity sequence, and that is the whole point. With 0,1,2 a
+             # readback of [1,2,3] cannot distinguish "the index was fetched correctly" from "the
+             # shader got the ordinal and the index buffer was never read" -- which made the first
+             # version of this campaign score 91.6% correct where the diagnostic indices score 1.2%.
     timeout 120 "$probe" --vs nossbo_vs.spv --fs hand_fs.spv \
                          --vs-b idxrb_vs.spv --fs-b hand_fs.spv \
-                         --readback-dwords 16:3 --iterations 20 "$@" > c2.log 2>&1
-    emit "$round" nossbo-vs-readback c2.log
+                         --indices 3,4,5 --readback-dwords 16:8 --iterations 20 "${extra[@]}" > c2.log 2>&1
+    emit "$1" nossbo-vs-readback c2.log
     grep -hE 'readback \[' c2.log >> readback-patterns.log
+}
+
+for round in $(seq 1 "$rounds"); do
+    if [ $(( round % 2 )) -eq 1 ]; then run_c1 "$round"; run_c2 "$round"
+    else                                run_c2 "$round"; run_c1 "$round"; fi
     sleep "$gap"
 done
