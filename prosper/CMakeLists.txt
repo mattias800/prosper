@@ -2191,8 +2191,9 @@ if(TARGET prosper_core)
       endif()
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
-      # vkprobe (#2945/#2937): the CONTROL that separates prosper's HOST-side Vulkan usage from
-      # everything underneath it. Drives a dumped SPIR-V pair through a bare Vulkan pipeline with no
+      # vkprobe (#2945/#2937): a CONTROL that AVOIDS prosper's host-side Vulkan usage rather than
+      # reproducing it, so a failure here shows that usage is not NECESSARY for the defect -- never
+      # that it is exonerated. Drives a dumped SPIR-V pair through a bare Vulkan pipeline with no
       # prosper code in the process. It does not clear the recompiler (the SPIR-V is prosper's own
       # output) and it does not clear the driver -- run enough times it reproduces #2945 itself.
       # Read tools/vkprobe/README.md before quoting a clean run. Deliberately links nothing from

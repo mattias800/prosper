@@ -32,9 +32,11 @@
 // that differ from the clear colour. The arms are directly comparable only when those indices are
 // the identity sequence (the default); with a capture's real indices, read each arm on its own.
 // A run reports, per draw kind, how many iterations produced ZERO covered pixels, and the same
-// failures split by submission position beside it.
-// non-indexed arm beside it passes is the #2937 signature, and either arm failing on its own is a
-// device or shader problem rather than an indexing one.
+// failures split by submission position beside it. An indexed arm that fails while the non-indexed
+// arm beside it does not is the #2937 signature; either arm failing on its own is a device or
+// shader problem rather than an indexing one; and if the POSITION counts are lopsided while the arm
+// counts are not, it is submission order and not indexing at all -- which is why the order
+// alternates and both breakdowns are printed.
 //
 // The descriptor interface is read out of BOTH modules rather than hardcoded: every
 // `OpDecorate <id> DescriptorSet 0` + `Binding N` becomes one STORAGE_BUFFER binding, all pointing at
@@ -45,7 +47,7 @@
 // USAGE
 //
 //   vkprobe --vs vs.spv --fs fs.spv [--iterations 300] [--records FILE] [--indices 0,1,2]
-//           [--extent 64x64] [--device N] [--verbose]
+//           [--extent 64x64] [--device N] [--verbose] [--device-local-indices]
 //
 // `--records FILE` supplies the raw bytes of the vertex-record buffer; the default is three records
 // of 32 bytes forming a fullscreen triangle in the layout prosper's vertex-fetch shaders use
@@ -76,6 +78,12 @@ struct Options {
     uint32_t width = 64, height = 64;
     uint32_t device_index = 0;
     bool verbose = false;
+    // Where the index data lives. The arms differ in more than indexedness -- only the indexed one
+    // binds an index buffer -- so if the index FETCH is what reads zeros, the arm attribution is
+    // really an attribution to host-coherent index memory. `device` stages the same bytes into
+    // DEVICE_LOCAL memory through a transfer, which is what a real application does, and turns that
+    // into a single-variable A/B on one binary.
+    bool device_local_indices = false;
 };
 
 [[noreturn]] void fail_setup(const char* what) {
@@ -271,7 +279,8 @@ uint32_t strict_u32(const char* text, const char* option) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --vs FILE --fs FILE [--iterations N] [--records FILE]\n"
-                 "          [--indices i,j,k] [--extent WxH] [--device N] [--verbose]\n", argv0);
+                 "          [--indices i,j,k] [--extent WxH] [--device N] [--verbose]\n"
+                 "          [--device-local-indices]\n", argv0);
 }
 
 }  // namespace
@@ -303,6 +312,7 @@ int main(int argc, char** argv) {
                 cursor = (*end == ',') ? end + 1 : end;
             }
         } else if (argument == "--verbose") options.verbose = true;
+        else if (argument == "--device-local-indices") options.device_local_indices = true;
         else { usage(argv[0]); return 2; }
     }
     if (options.vs_path.empty() || options.fs_path.empty()) { usage(argv[0]); return 2; }
@@ -385,9 +395,38 @@ int main(int argc, char** argv) {
                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memcpy(record_buffer.mapped, records.data(), records.size());
 
-    Buffer index_buffer = make_host_buffer(phys, device, options.indices.size() * 4,
-                                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    std::memcpy(index_buffer.mapped, options.indices.data(), options.indices.size() * 4);
+    const VkDeviceSize index_bytes = options.indices.size() * 4;
+    Buffer index_staging = make_host_buffer(
+        phys, device, index_bytes,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memcpy(index_staging.mapped, options.indices.data(), index_bytes);
+    // Device-local index buffer, filled by a transfer, when asked for. Everything after this point
+    // binds `index_buffer`, which is either the host-coherent staging allocation itself or a
+    // DEVICE_LOCAL copy of it.
+    Buffer index_device;
+    if (options.device_local_indices) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = index_bytes;
+        info.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(device, &info, nullptr, &index_device.buffer) != VK_SUCCESS)
+            fail_setup("vkCreateBuffer (device-local indices)");
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(device, index_device.buffer, &requirements);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = memory_type(phys, requirements.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (allocate.memoryTypeIndex == UINT32_MAX)
+            fail_setup("no DEVICE_LOCAL memory type for indices");
+        if (vkAllocateMemory(device, &allocate, nullptr, &index_device.memory) != VK_SUCCESS)
+            fail_setup("vkAllocateMemory (device-local indices)");
+        if (vkBindBufferMemory(device, index_device.buffer, index_device.memory, 0) != VK_SUCCESS)
+            fail_setup("vkBindBufferMemory (device-local indices)");
+        index_device.size = index_bytes;
+    }
+    const VkBuffer index_binding =
+        options.device_local_indices ? index_device.buffer : index_staging.buffer;
+    Buffer& index_buffer = index_staging;   // named for the teardown loop below
 
     const VkDeviceSize readback_bytes =
         VkDeviceSize(options.width) * options.height * 4;
@@ -644,7 +683,7 @@ int main(int argc, char** argv) {
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
                                 &descriptor_set, 0, nullptr);
         if (indexed) {
-            vkCmdBindIndexBuffer(command, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindIndexBuffer(command, index_binding, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(command, static_cast<uint32_t>(options.indices.size()), 1, 0, 0, 0);
         } else {
             vkCmdDraw(command, static_cast<uint32_t>(options.indices.size()), 1, 0, 0);
@@ -697,6 +736,44 @@ int main(int argc, char** argv) {
     // well supported as "the second submit came back empty", and this tool's whole purpose is to
     // attribute a failure to the draw KIND. Swapping the order on odd iterations separates them, and
     // both breakdowns are reported so a reader can see which one moved.
+    if (options.device_local_indices) {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = command_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer upload = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(device, &ai, &upload) != VK_SUCCESS)
+            fail_setup("vkAllocateCommandBuffers (index upload)");
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(upload, &bi) != VK_SUCCESS)
+            fail_setup("vkBeginCommandBuffer (index upload)");
+        VkBufferCopy copy{0, 0, index_bytes};
+        vkCmdCopyBuffer(upload, index_staging.buffer, index_device.buffer, 1, &copy);
+        VkMemoryBarrier to_index{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        to_index.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_index.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+        vkCmdPipelineBarrier(upload, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &to_index,
+                             0, nullptr, 0, nullptr);
+        if (vkEndCommandBuffer(upload) != VK_SUCCESS) fail_setup("vkEndCommandBuffer (index)");
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence fence = VK_NULL_HANDLE;
+        if (vkCreateFence(device, &fi, nullptr, &fence) != VK_SUCCESS)
+            fail_setup("vkCreateFence (index upload)");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &upload;
+        if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
+            fail_setup("vkQueueSubmit (index upload)");
+        if (vkWaitForFences(device, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) != VK_SUCCESS)
+            fail_setup("index upload did not complete");
+        vkDestroyFence(device, fence, nullptr);
+        vkFreeCommandBuffers(device, command_pool, 1, &upload);
+    }
+    std::printf("[vkprobe] index memory: %s\n",
+                options.device_local_indices ? "DEVICE_LOCAL (staged)" : "HOST_VISIBLE|HOST_COHERENT");
+
     uint32_t plain_empty = 0, indexed_empty = 0, mismatched = 0;
     uint32_t first_empty = 0, second_empty = 0;
     uint64_t plain_min = UINT64_MAX, plain_max = 0, indexed_min = UINT64_MAX, indexed_max = 0;
@@ -729,9 +806,11 @@ int main(int argc, char** argv) {
                 indexed_empty, options.iterations);
     std::printf("[vkprobe] the two arms disagreed on %u of %u iterations\n",
                 mismatched, options.iterations);
-    // The same failures split by POSITION rather than by draw kind. If these two are comparable
-    // while the arm counts above are lopsided, the defect follows the draw kind; if it is these that
-    // are lopsided, it follows submission order and the arm attribution is an artefact.
+    // The same failures split by POSITION rather than by draw kind. Three readings, not two: arm
+    // counts lopsided and position counts comparable means the defect follows the draw kind;
+    // position lopsided and arm comparable means it follows submission order and the arm
+    // attribution is an artefact; BOTH lopsided is neither, and is what a period-4 effect looks
+    // like through this strict-parity alternation -- the alternation kills period 2, not period 4.
     std::printf("[vkprobe] by submission position: first EMPTY on %u, second EMPTY on %u "
                 "(order alternates each iteration)\n", first_empty, second_empty);
 
@@ -747,6 +826,10 @@ int main(int argc, char** argv) {
         vkUnmapMemory(device, buffer->memory);
         vkDestroyBuffer(device, buffer->buffer, nullptr);
         vkFreeMemory(device, buffer->memory, nullptr);
+    }
+    if (index_device.buffer) {
+        vkDestroyBuffer(device, index_device.buffer, nullptr);
+        vkFreeMemory(device, index_device.memory, nullptr);
     }
     vkDestroyDevice(device, nullptr);
     vkDestroyInstance(instance, nullptr);

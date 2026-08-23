@@ -734,6 +734,15 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   identically on the same device and driver: **1,500 indexed draws over five 300-iteration runs, 0
   failures.** The same SPIR-V through the renderer backend rasterizes nothing. So the defect is in
   what prosper does around the draw, not in the shader, the driver or the hardware. #2937.
+  **SUPERSEDED, do not act on the sentence above.** The rebuilt equivalent of that program
+  (`tools/vkprobe`) creates its device the same natural way and thereby builds an INVALID pipeline
+  from any prosper vertex module — `VUID-RuntimeSpirv-NonWritable-06341`, because prosper's vertex
+  shaders bind storage buffers and `vertexPipelineStoresAndAtomics` was never enabled — and with no
+  validation layers loaded it reports coverage numbers regardless. Whether the original program had
+  the same gap is INFERENCE (it was deleted and cannot be inspected), but the rebuild with the
+  feature enabled and the pipeline validating clean **does reproduce the failure**, so "not the
+  driver or the hardware" is not supported. See the vkprobe row further down this section, and
+  #2945 / #2937.
 - **And it is not in prosper's caches, pools or arenas, nor in RADV's shader path.** Every one of
   these left `test_indexed_render` at exactly 4 failures: `PROSPER_NO_INDEX_ARENA`,
   `PROSPER_NO_BACKEND_BUFFER_ARENA`, `PROSPER_NO_BACKEND_BUFFER_POOL`, `PROSPER_NO_MEMORY_POOL`,
@@ -939,9 +948,13 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   **The arm attribution survives the obvious confound.** The first version always submitted
   non-indexed then indexed, which made "the indexed draw failed" indistinguishable from "the second
   submit failed". The tool now alternates the order every iteration and reports both breakdowns:
-  across every run measured, **the non-indexed arm has never come back empty — not once in ~9,000
-  iterations** — while the indexed arm does, and in the one failing run under alternation the
-  failures split 9 first / 4 second. So the failure follows the draw KIND, not submission order.
+  the non-indexed arm has never come back empty in any run, before or after the change. **The
+  DE-CONFOUNDED evidence is narrower than that total and should be quoted as such: one failing run
+  of 150 alternating iterations, 13 indexed empties split 9 first / 4 second, 0 non-indexed.** The
+  ~9,000 iterations behind the "never" were nearly all run under the old loop, where non-indexed was
+  always first. One run is enough to refute a deterministic positional mechanism — it predicts 13/0
+  or 0/13 and predicts non-indexed empties at the same rate, and neither happened — but it is one
+  run. The alternation is also strict parity, so a period-4 alias survives it.
   **What that does and does not license, stated exactly, because the obvious phrasing is wrong.**
   The control does not reproduce prosper's host-side Vulkan usage — it *avoids* it; the pass,
   descriptors and synchronisation are vkprobe's own. So the correct conclusion is that **prosper's
@@ -952,10 +965,19 @@ picture from run to run. Everything below was measured on master `99d5f738`, Lin
   to live somewhere, and the shared SPIR-V and the shared driver are common to both sides.
   What the row above narrowed is therefore not wasted but re-scoped: those twenty levers are all
   *unnecessary* conditions too.
-  **Rates differ by orders of magnitude** — prosper's one-draw reproduction fails ~50% in a bad
-  window, the control fails in 3 runs of ~63 — so something on prosper's side is very likely
-  amplifying. The remaining suspects are prosper's generated SPIR-V (which the control executes),
+  **The rates differ, by roughly an order of magnitude on the unit this row insists on (RUNS):**
+  prosper's one-draw reproduction fails about half its runs in a bad window, the control 3 of ~63.
+  Not "orders" plural — that is only reachable per-iteration, which the drift rule above rejects.
+  A gap that size still suggests something on prosper's side raises the rate, but it is one
+  comparison across different workloads and it is not strong evidence. The remaining suspects are prosper's generated SPIR-V (which the control executes),
   prosper's host-side usage as an amplifier, and the driver/hardware.
+  **The index-memory lead is open, not falsified.** The arms differ in more than indexedness: only
+  the indexed one binds an index buffer, and vkprobe's was `HOST_VISIBLE|HOST_COHERENT`. Since the
+  characterised mechanism is loads returning zero, an index fetch reading zeros gives `0,0,0`, a
+  degenerate triangle and zero coverage — the tool's entire observable. `--device-local-indices`
+  stages the same bytes into DEVICE_LOCAL and makes it a single-variable A/B. Measured interleaved,
+  25 runs x 150 iterations per arm: **0 failures in BOTH arms** — the window was quiet, so it
+  discriminates nothing. Run it again when the machine is failing. #2945.
   **The transferable lesson is about the instrument, not the bug: a control is only a control once
   it is VALID, and a program that loads no validation layers cannot tell you that it is.** Two
   investigations were steered by this one for weeks. `vkprobe` now enables the feature, exits 2 if

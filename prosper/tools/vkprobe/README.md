@@ -47,8 +47,8 @@ geometry will be arbitrary — which is still a valid *determinism* test, but no
 | observation | what it means |
 | --- | --- |
 | both arms cover the same pixel count on every iteration | **nothing, on its own.** This tool has produced thousands of such iterations and then failed; see below. It is a negative only across tens of RUNS, and even then it shows prosper's host-side Vulkan usage is not NECESSARY for a failure — never that it is exonerated |
-| the indexed arm is empty while the non-indexed arm is not | the index path itself; compare against #2937 |
-| coverage varies between iterations | the driver or hardware is not deterministic on this input — take it to the driver, and re-run at high `--iterations` before believing it |
+| the indexed arm is empty while the non-indexed arm is not | the index path — but read the row below before attributing it to *indexing*: the arms also differ in where the index memory lives (`--device-local-indices`) |
+| coverage varies between iterations | the driver or hardware is not deterministic on this input — but check the by-position line first, and re-run across many RUNS, not many iterations, before believing it |
 | the indexed arm is empty on some iterations while the non-indexed arm is constant | the #2945 signature, reproduced with no prosper code in the process. Measured 3 of ~63 runs on a valid pipeline. The order of the two arms alternates every iteration and the by-position line is printed beside the by-arm line **so this attribution is checkable** — if the position counts are lopsided and the arm counts are not, it is submission order, not indexing |
 | exit 2 | the probe never ran; nothing has been measured — a hung wait, an unsupported input pair, or a malformed argument all land here rather than reading as a failing draw |
 
@@ -68,14 +68,23 @@ its device **without `vertexPipelineStoresAndAtomics`**, and prosper's recompile
 fetch through `STORAGE_BUFFER` descriptors — which Vulkan requires to be `NonWritable` in the vertex
 stage unless that feature is on (`VUID-RuntimeSpirv-NonWritable-06341`). So every pipeline it built
 from a prosper vertex module was **invalid**, and because it loads no layers it printed coverage
-numbers for them anyway. Every reading taken before that was fixed is void — the clean ones and the
-failures alike, including the 1,500-draw result on #2937 that turned "RADV is broken" into "prosper
-is broken".
+numbers for them anyway. Every reading **this tool** took before that fix is void, the clean ones
+and the failures alike. #2937's 1,500-draw result came from a *different, earlier* program that was
+deleted before this one was written, so whether it shared the gap is **inference** — likely, since a
+hand-written control has no reason to enable that feature, but not checkable.
 
 Two guards now exist so it cannot happen again: the feature is enabled and its absence is `exit 2`,
 and a vertex module whose output interface exceeds the device's `maxVertexOutputComponents` is
 refused by name (this is #2945's own subject — a 132-against-128 interface — and a module dumped
 before that bound was applied is refused with those exact numbers).
+
+`--device-local-indices` stages the index data into `DEVICE_LOCAL` memory through a transfer instead
+of binding a host-coherent allocation directly, which is what a real application does. It exists
+because the two arms differ in more than indexedness — only the indexed one binds an index buffer at
+all — so a failure attributed to "indexed draws" could be an attribution to host-coherent index
+memory. Measured interleaved, 25 runs x 150 iterations per arm: **0 failures in both arms**, i.e. a
+quiet window that discriminates nothing. The lever is here so the next person can run it while the
+machine is failing.
 
 **Run it under the validation layers when the answer matters** — and note that the plain form below
 enables CORE validation only, so "zero findings" from it says nothing about synchronization. Add a
