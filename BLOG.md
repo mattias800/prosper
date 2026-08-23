@@ -21,6 +21,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-22
 
+### New Joe & Mac: Caveman Ninja plays start to finish
+
+<p align="center"><img src="assets/screenshots/joe-mac.png" alt="New Joe & Mac: Caveman Ninja — gameplay: Joe crouched in a jungle level with palms, pink blossom, a volcano behind and coiled snakes either side, with the name plate, score, health bar and a lives counter reading x3"></p>
+
+<p align="center"><img src="assets/screenshots/joe-mac-menu.png" alt="New Joe & Mac: Caveman Ninja — the game's menu at 1920x1080"></p>
+
+We play this one through, and have done for a while — it is rung 6 with a reviewed `joe-mac-gameplay`
+snapshot guard, and it had somehow never appeared here. Tracker
+[#1876](https://github.com/mattias800/prosper/issues/1876).
+
+## 2026-08-22
+
 ### BALAN's language menu was never waiting for Cross
 
 <p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.png" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
