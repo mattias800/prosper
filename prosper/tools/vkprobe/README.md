@@ -135,12 +135,14 @@ Two things that follow for anyone using this tool:
 - **Reach for `--vs-b` with a `shaders/` module first.** Running a dumped module alone can never
   separate "the driver is wrong" from "prosper emitted bad SPIR-V", because both are in every run.
   A paired run separates them in one command.
-- **Concurrent GPU work from another process is what opens the failing window.** The "drift over
-  minutes" this README and `GRAPHICS.md` describe is not weather: three heavy `gpu_replay` full-submit
+- **Concurrent GPU work from another process INDUCES the failing window on demand.** The "drift over
+  minutes" this README and `GRAPHICS.md` describe responds to load: three heavy `gpu_replay` full-submit
   replays flipped a quiet machine into failing within one round and it recovered within ~15 s of
-  them stopping, and a second `vkprobe` used purely as a load reproduces it more weakly. So run the
-  control against a *quiet* GPU when you want a negative, and put a load beside it when you want the
-  defect. `pgrep -x 'prosper-app|screenshot|boot_trace'` will not see another agent's `gpu_replay`.
+  them stopping, and a second `vkprobe` used purely as a load reproduces it more weakly. Load is
+  **sufficient, not necessary** — failing windows have been measured opening on a box with no other
+  GPU process running — so put deliberate load beside the control when you want the defect to show
+  itself, and read a quiet-box negative as *undecided*, never clean (see below).
+  `pgrep -x 'prosper-app|screenshot|boot_trace'` will not see another agent's `gpu_replay`.
 
 **This probe has itself reproduced the #2945 class on a VALID pipeline, and that is its most
 important result so far.** On the corrected build, running
