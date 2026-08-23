@@ -289,7 +289,7 @@ int main() {
     CHECK((uint32_t)rd_i32(0x30) != 0xafafafafu,
           "the field at +0x30 the caller also reads is written, not left as residue");
     // The poison compare is not redundant with the magnitude compare, and mutation testing is how
-    // that was found: 0xafafafaf reinterpreted as a float is -3.2e-13, which sails through any
+    // that was found: 0xafafafaf reinterpreted as a float32 is -3.196e-10, which sails through any
     // "close to zero" test. An untouched buffer therefore PASSES a placement assertion written the
     // obvious way -- the exact shape of assertion-true-mechanism-never-ran. Check the bits too.
     CHECK((uint32_t)rd_i32(0x28) != 0xafafafafu && (uint32_t)rd_i32(0x2c) != 0xafafafafu &&
