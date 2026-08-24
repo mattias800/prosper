@@ -363,6 +363,47 @@ int main() {
     CHECK(lib_ft && rend_ft && lib_ft != rend_ft,
           "SelectLibraryFt and SelectRendererFt return distinct non-null editions");
 
+    // --- sceFontRenderCharGlyphImageHorizontal (#2957) --------------------------------------
+    // Astro Bot's four call sites pin the SAME signature as the non-Horizontal variant:
+    // rdi=handle, esi=code, rdx=surface, xmm0/xmm1=pen x/y, rcx=metrics(0x20), r8=result(0x40).
+    auto render_horiz = Hle::lookup("kAenWy1Zw5o");  // sceFontRenderCharGlyphImageHorizontal
+    CHECK(render_horiz != nullptr,
+          "RenderCharGlyphImageHorizontal is registered on its real renderer, not font_ok");
+    if (render_horiz) {
+        auto call_h = [&](void* surf, float x, float y, void* metrics,
+                          void* result) -> int32_t {
+#if defined(_WIN32)
+            (void)x; (void)y;
+            return ((int32_t (*)(void*, uint32_t, void*, void*, void*))render_horiz)(
+                face, 'A', surf, metrics, result);
+#else
+            return ((int32_t (*)(void*, uint32_t, void*, float, float, void*, void*))render_horiz)(
+                face, 'A', surf, x, y, metrics, result);
+#endif
+        };
+
+        std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
+        set_scissor(P(surface), 0, 0, kDim, kDim, 0);
+        float mh[8];
+        std::memset(mh, kPoison, sizeof(mh));
+        uint8_t resulth[0x40];
+        std::memset(resulth, kPoison, sizeof(resulth));
+        const int32_t hrc = call_h(surface, -bearing_x, bearing_y - layout[0], mh, resulth);
+        // The stub answered success while touching nothing. The poison checks are what separate
+        // "wrote the glyph description" from "returned 0 over residue" -- hrc alone cannot.
+        CHECK(hrc == 0, "RenderCharGlyphImageHorizontal reports success on a drawable glyph");
+        int32_t hw; std::memcpy(&hw, resulth + 0x38, 4);
+        CHECK(hw >= 38 && hw <= 40,
+              "the horizontal variant reports the drawn width, not caller residue");
+        uint32_t mbits; std::memcpy(&mbits, mh, 4);
+        CHECK(mbits != 0xafafafafu,
+              "the horizontal variant writes the metrics out-parameter");
+        size_t coveredh = 0;
+        for (uint8_t b : surf_bytes) if (b) ++coveredh;
+        CHECK(coveredh > 500,
+              "the horizontal variant actually rasterizes into the surface");
+    }
+
     // --- lifecycle ---------------------------------------------------------------------------
     CHECK(memory_term(P(mem), 0, 0, 0, 0, 0) == 0, "MemoryTerm releases the memory descriptor");
     void* lib2 = library;
