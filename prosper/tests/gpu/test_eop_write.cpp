@@ -837,10 +837,11 @@ int main() {
         stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
         stream[8] = 1; stream[9] = (uint32_t)dst; stream[10] = (uint32_t)(dst >> 32);
         GpuState st; run_cb(stream, 11, st);
-        CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
-              "DMA before indirect registers is retained and rejected fail-closed");
-        CHECK(target_reg.value == 0x11111111u && st.sh.find(0x44) == st.sh.end(),
-              "rejected DMA/indirect submit executes neither copy nor stale register fold");
+        CHECK(st.dma_copies.empty() && !st.dma_execution_rejected,
+              "DMA before indirect registers applies the copy and proceeds (#2975)");
+        CHECK(target_reg.value == 0xA1B2C3D4u && st.sh.find(0x44) != st.sh.end() &&
+                  st.sh[0x44] == 0xA1B2C3D4u,
+              "applied DMA lands the copy and the register fold reads the copied bytes");
     }
 
     // VA-disjoint ranges outside the authoritative guest mapping table are not evidence of physical
@@ -863,9 +864,10 @@ int main() {
         stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
         stream[8] = 1; stream[9] = (uint32_t)regs; stream[10] = (uint32_t)(regs >> 32);
         GpuState st; run_cb(stream, 11, st);
-        CHECK(st.dma_execution_rejected && untracked.target.value == 0x11111111u &&
-                  st.sh.find(untracked.independent.offset) == st.sh.end(),
-              "VA-disjoint untracked topology remains fail-closed");
+        CHECK(!st.dma_execution_rejected && untracked.target.value == 0xAABBCCDDu &&
+                  st.sh.find(untracked.independent.offset) != st.sh.end() &&
+                  st.sh[untracked.independent.offset] == 0x22222222u,
+              "VA-disjoint untracked topology: DMA applies and the register fold reads it");
     }
 
     // Tactics Ogre uploads movie rows and later reads unrelated command arrays/fence labels in the
@@ -930,10 +932,10 @@ int main() {
             stream[8] = 1; stream[9] = (uint32_t)alias_regs;
             stream[10] = (uint32_t)(alias_regs >> 32);
             GpuState aliased_regs; run_cb(stream, 11, aliased_regs);
-            CHECK(aliased_regs.dma_execution_rejected &&
-                      aliased_regs.sh.find(0x46) == aliased_regs.sh.end() &&
-                      alias_reg->value == 0x11111111u,
-                  "VA-disjoint same-physical indirect registers still reject fail-closed");
+            CHECK(!aliased_regs.dma_execution_rejected &&
+                      aliased_regs.sh.find(0x46) != aliased_regs.sh.end() &&
+                      aliased_regs.sh[0x46] == copied_reg.value,
+                  "VA-disjoint same-physical indirect registers: DMA applies, register fold reads it");
 
             auto emit_wait = [&](uint64_t condition_address, uint64_t destination_address,
                                  uint64_t source_address, uint32_t* wait_stream) {
@@ -970,8 +972,8 @@ int main() {
                       (uint64_t)(uintptr_t)wait_target,
                       (uint64_t)(uintptr_t)&wait_source, wait_stream);
             GpuState aliased_wait; run_cb(wait_stream, 15, aliased_wait);
-            CHECK(aliased_wait.dma_execution_rejected && *wait_target == 0,
-                  "VA-disjoint same-physical wait still rejects fail-closed");
+            CHECK(!aliased_wait.dma_execution_rejected && *wait_target == 1,
+                  "VA-disjoint same-physical wait: DMA applies and the wait is satisfied");
 
             // Retained effects after the first address copy are earlier producers too. Prove the
             // original copy is physically disjoint from B, then write B and eagerly read B through

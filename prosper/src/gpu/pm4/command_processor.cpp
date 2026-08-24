@@ -4152,14 +4152,21 @@ static void diagnose_ordered_wait_acceptance(
 
 
 // Apply all retained address-backed DMA copies to guest memory, in stream order, and clear the
-// retention. Called at a dependency point (WAIT_REG_MEM / SetRegsIndirect / Jump that reads a
-// retained DMA's destination) so the dependent command sees the DMA-written data — in-order
-// execution, matching real hardware where there is no "rejection", only ordering.
+// retention. Called at a DMA-overlap dependency point (WAIT_REG_MEM / SetRegsIndirect / Jump
+// that reads a retained DMA's destination) so the dependent command sees the DMA-written data —
+// in-order execution, matching real hardware where there is no "rejection", only ordering.
 void apply_retained_dma_copies(std::vector<GpuState::DmaCopy>& copies) {
     for (const auto& copy : copies) {
         if (!copy.dst || !copy.src || !copy.bytes) continue;
-        if (!guest_readable(copy.src, copy.bytes)) continue;
-        if (!guest_readable(copy.dst, copy.bytes)) continue;
+        if (!guest_readable(copy.src, copy.bytes) || !guest_readable(copy.dst, copy.bytes)) {
+            static std::atomic<int> n{0};
+            if (n.fetch_add(1) < 8)
+                fprintf(stderr, "[agc] apply_retained_dma_copies: skipping unmapped DMA "
+                        "dst=0x%llx src=0x%llx bytes=%llu\n",
+                        (unsigned long long)copy.dst, (unsigned long long)copy.src,
+                        (unsigned long long)copy.bytes);
+            continue;
+        }
         memmove(reinterpret_cast<void*>(uintptr_t(copy.dst)),
                 reinterpret_cast<const void*>(uintptr_t(copy.src)),
                 copy.bytes);
@@ -4180,10 +4187,17 @@ void GpuState::apply(const Pm4Command& c) {
             const bool overlaps_effect = !ordered_memory_effects.empty() &&
                 retained_ordered_effect_destination_overlaps(
                     ordered_memory_effects, c.regs_vaddr, regs_bytes);
-            // In-order execution: apply the retained DMAs so the reader sees the copied
-            // bytes, then proceed. Real hardware has no "rejection" — only ordering.
-            if (overlaps_dma) apply_retained_dma_copies(dma_copies);
-            if (overlaps_effect) ordered_memory_effects.clear();
+            if (overlaps_dma) {
+                // In-order execution (#2975): apply the retained DMAs so the reader sees the
+                // copied bytes, then proceed. Real hardware has no "rejection" — only ordering.
+                apply_retained_dma_copies(dma_copies);
+            }
+            if (overlaps_effect) {
+                // Effect overlaps are a different mechanism (retained WRITE_DATA, not DMA) and
+                // keep their fail-closed rejection — the correct fix for those is separate.
+                dma_execution_rejected = true;
+                break;
+            }
             // #312/#448: the indirect-register array lives in GUEST memory (regs_vaddr from the packet),
             // and a freed/decommitted or recycled command buffer can leave it unmapped. Every other
             // guest read in this file is guest_readable-guarded; this reader (up to 4096*8 = 32 KiB) was
@@ -4762,9 +4776,9 @@ void GpuState::apply(const Pm4Command& c) {
                 diagnose_ordered_wait_acceptance(
                     c, ordered_memory_effects, ordered_base_value, ordered_overlay);
             if (wait_overlaps_dma) {
-                // In-order execution: apply the retained DMAs so the wait observes the copied
-                // bytes. Real hardware has no "rejection" — the DMA engine writes, then the
-                // wait polls the written value and proceeds.
+                // In-order execution (#2975): apply the retained DMAs so the wait observes the
+                // copied bytes. Real hardware has no "rejection" — the DMA engine writes, then
+                // the wait polls the written value and proceeds.
                 apply_retained_dma_copies(dma_copies);
             }
             if (wait_overlaps_effect && !ordered_wait_satisfied) {
@@ -5065,8 +5079,8 @@ void GpuState::apply(const Pm4Command& c) {
                   retained_ordered_effect_destination_overlaps(
                       ordered_memory_effects, pred_cond_addr, 8)));
             if (jump_reads_dma) {
-                // In-order execution: apply the retained DMAs so the jump target/predication
-                // reads see the copied bytes.
+                // In-order execution (#2975): apply the retained DMAs so the jump target and
+                // predication reads see the copied bytes.
                 apply_retained_dma_copies(dma_copies);
             }
             if (jump_reads_effect) {
