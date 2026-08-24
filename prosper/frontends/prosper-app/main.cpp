@@ -136,6 +136,13 @@ bool set_environment(const char* name, const char* value) {
     return setenv(name, value, 1) == 0;
 #endif
 }
+bool clear_environment(const char* name) {
+#ifdef _WIN32
+    return _putenv_s(name, "") == 0;   // MSVC/MinGW: an empty value REMOVES the variable
+#else
+    return unsetenv(name) == 0;
+#endif
+}
 
 // ---- tiny Vulkan error helper -----------------------------------------------------------------
 #define VKCHECK(x, msg) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -1045,8 +1052,9 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
         const std::string args = prosper::frontend::guest_args_for(
             cfg, prosper::frontend::title_id_from_app0_path(app0_root));
         if (!args.empty()) {
-            set_environment("PROSPER_GUEST_ARGS", args.c_str());
+        set_environment("PROSPER_GUEST_ARGS", args.c_str());
         g_guest_args_app_set = true;
+        fprintf(stderr, "[app] guest args (config): %s\n", args.c_str());
         }
     }
 #ifdef PROSPER_HAVE_LIVE_RENDERER
