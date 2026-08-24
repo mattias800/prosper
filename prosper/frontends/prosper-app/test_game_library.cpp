@@ -21,6 +21,7 @@ using prosper::frontend::path_basename;
 using prosper::frontend::resolve_games_dir;
 using prosper::frontend::scan_game_library;
 using prosper::frontend::serialize_app_config;
+using prosper::frontend::guest_args_for;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
@@ -273,6 +274,27 @@ int main() {
     CHECK(parse_app_config("games_dir = /a\ngames_dir = /b").games_dir == "/b", "a later duplicate wins");
     CHECK(parse_app_config("future_key = 1\ngames_dir = /games").games_dir == "/games",
           "an unknown key does not break parsing");
+    CHECK(parse_app_config("guest_args = -force-gfx-direct").guest_args_default == "-force-gfx-direct",
+          "a default guest_args value is read");
+    AppConfig pt = parse_app_config("guest_args.PPSA02664 = -a\nguest_args.PPSA02664 = -b");
+    CHECK(pt.guest_args_by_title.size() == 1 && pt.guest_args_by_title.at("PPSA02664") == "-b",
+          "per-title guest_args: later duplicate wins, key splits on the dot");
+    CHECK(guest_args_for(pt, "PPSA02664") == "-b" && guest_args_for(pt, "PPSA99999") == "",
+          "per-title resolution falls back to empty without a default");
+    AppConfig both = parse_app_config(
+        "guest_args = -force-gfx-direct\nguest_args.PPSA02664 = -title-specific");
+    CHECK(guest_args_for(both, "PPSA02664") == "-title-specific" &&
+              guest_args_for(both, "PPSA24651") == "-force-gfx-direct",
+          "per-title entry wins over the default; other titles get the default");
+    AppConfig rt = parse_app_config("guest_args = d\n");
+    rt.guest_args_by_title["PPSA02664"] = "x";
+    const std::string round = serialize_app_config(rt);
+    AppConfig back = parse_app_config(round);
+    CHECK(back.guest_args_default == "d" && back.guest_args_by_title.at("PPSA02664") == "x",
+          "guest args survive a serialize round trip");
+    CHECK(round.find("guest_args.PPSA02664 = x") != std::string::npos &&
+              round.find("guest_args = d") != std::string::npos,
+          "serialized keys use the documented spellings");
     CHECK(parse_app_config("future_key = 1").unknown_lines.size() == 1,
           "an unknown key is retained rather than discarded");
     CHECK(parse_app_config("games_dir = /g").unknown_lines.empty(),

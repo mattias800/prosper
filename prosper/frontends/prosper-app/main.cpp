@@ -1033,6 +1033,19 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
         return false;
     }
     g_boot_attempted = true;
+    // Per-title guest launch arguments (#2973): Unity titles need `-force-gfx-direct` to reach
+    // their frame loop in this app (the MT gfx-jobs handshake is not emulated yet — RENDER_LOOP.md);
+    // some titles must NOT receive it, so this is explicitly configured, never a silent default.
+    // The user's own environment wins over the config file, matching the app_config precedence.
+    if (!getenv("PROSPER_GUEST_ARGS")) {
+        const prosper::frontend::AppConfig cfg = load_app_config();
+        const std::string args = prosper::frontend::guest_args_for(
+            cfg, prosper::frontend::title_id_from_app0_path(app0_root));
+        if (!args.empty()) {
+            set_environment("PROSPER_GUEST_ARGS", args.c_str());
+            fprintf(stderr, "[app] guest args (config): %s\n", args.c_str());
+        }
+    }
 #ifdef PROSPER_HAVE_LIVE_RENDERER
     prosper::frontend::register_live_renderer(
         getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".",

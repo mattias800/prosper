@@ -11,6 +11,7 @@
 // Parsing and serializing are pure and unit-tested; choosing the file's location and touching the disk
 // stays in main.cpp.
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,14 @@ struct AppConfig {
     // Reading tolerating unknown keys is not enough on its own: --set-games-dir rewrites the whole
     // file, so without this a release build would silently delete whatever a newer build had stored.
     std::vector<std::string> unknown_lines;
+
+    // Guest launch arguments (PROSPER_GUEST_ARGS), applied when the user's environment does not
+    // already set one (#2973): Unity titles need `-force-gfx-direct` to reach their frame loop in
+    // this app (the MT gfx-jobs handshake is not emulated yet — see RENDER_LOOP.md), while some
+    // titles must NOT receive it. `guest_args_default` applies to every title;
+    // `guest_args_by_title` overrides per TITLE_ID (config key spelling: `guest_args.PPSA02664`).
+    std::string guest_args_default;                                  // "" = none
+    std::map<std::string, std::string> guest_args_by_title;
 };
 
 // Trim ASCII spaces and tabs from both ends.
@@ -58,6 +67,9 @@ inline AppConfig parse_app_config(const std::string& text) {
         else if (key == "launcher_music")
             // Anything other than an explicit off is on, so a hand-edited "yes" or "1" behaves.
             cfg.launcher_music = !(value == "0" || value == "false" || value == "off" || value == "no");
+        else if (key == "guest_args") cfg.guest_args_default = value;
+        else if (key.rfind("guest_args.", 0) == 0)
+            cfg.guest_args_by_title[key.substr(11)] = value;
         else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
@@ -74,6 +86,9 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
     // whereas an absent games_dir simply means nothing was chosen.
     out += std::string("launcher_music = ") + (cfg.launcher_music ? "1" : "0") + "\n";
     for (const std::string& line : cfg.unknown_lines) out += line + "\n";
+    for (const auto& [title, args] : cfg.guest_args_by_title)
+        out += "guest_args." + title + " = " + args + "\n";
+    if (!cfg.guest_args_default.empty()) out += "guest_args = " + cfg.guest_args_default + "\n";
     return out;
 }
 
@@ -83,6 +98,15 @@ inline std::string resolve_games_dir(const std::string& flag, const std::string&
     if (!flag.empty()) return flag;
     if (!env.empty()) return env;
     return file.games_dir;
+}
+
+// Per-title launch arguments for the guest: a `guest_args.<TITLE_ID>` entry wins over the global
+// `guest_args` default; "" when neither is set. The caller decides precedence against the user's
+// own environment (see main.cpp — the environment always wins over this file).
+inline std::string guest_args_for(const AppConfig& cfg, const std::string& title_id) {
+    const auto it = cfg.guest_args_by_title.find(title_id);
+    if (it != cfg.guest_args_by_title.end()) return it->second;
+    return cfg.guest_args_default;
 }
 
 } // namespace prosper::frontend
