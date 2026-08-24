@@ -718,6 +718,31 @@ int32_t font_render_char_glyph_image(void* handle, uint32_t code, RenderSurface*
 }
 #endif
 
+// sceFontRenderCharGlyphImageHorizontal (kAenWy1Zw5o). Astro Bot is the corpus's only importer,
+// and its call sites (eboot+0xed9b46, +0xed9ba5, +0xedcb3a, +0xedcb70 of the flattened eboot,
+// read the way Metaphor's were for #2951) pin the SAME signature as the non-Horizontal variant:
+// rdi=font handle, esi=char code, rdx=surface, xmm0/xmm1=pen x/y, rcx=out metrics (0x20 bytes,
+// bounded by the caller's own -0x30 local), r8=out result (0x40, bounded by the metrics buffer).
+// One site loads xmm2 before the call; it is dead pen bookkeeping, not a third float parameter --
+// the integer out-pointers sit in rcx/r8 across all four call sites in both functions. With no
+// extra argument and both out-structures matching what render_glyph already fills, the honest
+// implementation is the same honest renderer. CONFIDENCE: HIGH on the signature (four call sites
+// in two independent functions); MED that Astro never exercises more than it (one glyph per
+// surface, like Metaphor; vertical-writing layouts are unobserved here).
+#if defined(_WIN32)
+int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code,
+                                                RenderSurface* surface, GlyphMetrics* metrics,
+                                                RenderResult* result) {
+    return render_glyph(handle, code, surface, 0.0f, 0.0f, /*have_pen=*/false, metrics, result);
+}
+#else
+int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code,
+                                                RenderSurface* surface, float x, float y,
+                                                GlyphMetrics* metrics, RenderResult* result) {
+    return render_glyph(handle, code, surface, x, y, /*have_pen=*/true, metrics, result);
+}
+#endif
+
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
                               void* parser, void* object) {
     if (!out) return static_cast<int32_t>(0x80540002u);
@@ -830,13 +855,15 @@ void register_font_hle() {
     R("vRxf4d0ulPs", (HleFn)font_surface_set_scissor, "sceFontRenderSurfaceSetScissor");
     R("L97d+3OgMlE", (HleFn)font_get_metrics, "sceFontGetCharGlyphMetrics");
     R("3G4zhgKuxE8", (HleFn)font_render_char_glyph_image, "sceFontRenderCharGlyphImage");
-    // STILL A STUB, and deliberately so -- #2957. This reports success and renders nothing, which
-    // is the same defect shape as #2951 immediately above it. It is not fixed here because the
-    // evidence that made the non-Horizontal variant implementable (argument positions, both
-    // out-parameter sizes, the pen convention) came from Metaphor's disassembly, and Metaphor does
-    // not import this one. Astro Bot is the only importer; deriving it needs Astro's own eboot.
-    // Do not guess the extra parameter the name implies -- it would be a wrong-slot write.
-    R("kAenWy1Zw5o", (HleFn)font_ok, "sceFontRenderCharGlyphImageHorizontal");
+    R("kAenWy1Zw5o", (HleFn)font_render_char_glyph_image_horizontal,
+      "sceFontRenderCharGlyphImageHorizontal");
+    // Intentional no-op lifecycle/capability surface used during Astro's initialization.
+    R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
+    R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");
+    R("CUKn5pX-NVY", (HleFn)font_ok, "sceFontAttachDeviceCacheBuffer");
+    R("7rogx92EEyc", (HleFn)font_ok, "sceFontCreateWritingLine");
+    R("1+DgKL0haWQ", (HleFn)font_ok, "sceFontWritingLineClear");
+    R("JQKWIsS9joE", (HleFn)font_ok, "sceFontWritingLineGetOrderingSpace");
     R("oaJ1BpN2FQk", (HleFn)font_text_source_init, "sceFontTextSourceInit");
     R("eCRMCSk96NU", (HleFn)font_text_default, "sceFontTextSourceSetDefaultFont");
     R("OqQKX0h5COw", (HleFn)font_text_writing_form, "sceFontTextSourceSetWritingForm");
@@ -854,14 +881,6 @@ void register_font_hle() {
     R("mxgmMj-Mq-o", (HleFn)font_character_order, "sceFontCharacterGetTextOrder");
     R("SaRlqtqaCew", (HleFn)font_character_whitespace, "sceFontCharacterLooksWhiteSpace");
     R("BkjBP+YC19w", (HleFn)font_character_next, "sceFontCharacterRefersTextNext");
-
-    // Intentional no-op lifecycle/capability surface used during Astro's initialization.
-    R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
-    R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");
-    R("CUKn5pX-NVY", (HleFn)font_ok, "sceFontAttachDeviceCacheBuffer");
-    R("7rogx92EEyc", (HleFn)font_ok, "sceFontCreateWritingLine");
-    R("1+DgKL0haWQ", (HleFn)font_ok, "sceFontWritingLineClear");
-    R("JQKWIsS9joE", (HleFn)font_ok, "sceFontWritingLineGetOrderingSpace");
     R("nlU2VnfpqTM", (HleFn)font_ok, "sceFontWritingLineGetRenderMetrics");
     R("+FYcYefsVX0", (HleFn)font_ok, "sceFontWritingLineRefersRenderStep");
     R("wyKFUOWdu3Q", (HleFn)font_ok, "sceFontWritingLineWritesOrder");
