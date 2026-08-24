@@ -128,6 +128,14 @@ hand. Settings a build does not recognize are carried through unchanged when it 
 older build will not delete a newer build's settings — but comments are not preserved, since the app
 regenerates its own header.
 
+Two more keys feed the guest's own command line (`PROSPER_GUEST_ARGS`) at boot:
+`guest_args = <args>` sets arguments for **every** title, and `guest_args.<TITLE_ID> = <args>`
+overrides for one title (e.g. `guest_args.PPSA02664 = -force-gfx-direct`). An explicit
+`PROSPER_GUEST_ARGS` in the environment still wins over both. These exist because some titles'
+engines need a specific graphics mode to render in this app — Unity titles currently need
+`-force-gfx-direct` (their default MT gfx-jobs path is not emulated yet; #2973) — while others
+must not receive it, so the choice is explicit and per-title rather than a silent global.
+
 The scan looks **one level deep** and accepts a child directory as a title when
 `resolve_app0_root()` does — the same test the drop and picker paths use. A title's own asset
 subdirectories are therefore never mistaken for separate games, and the games directory itself is not
