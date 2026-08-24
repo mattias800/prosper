@@ -38,7 +38,7 @@
 #include <map>
 #include <memory>
 #include <algorithm>
-
+#include "host/platform/precise_sleep.hpp"   // #1765: waits must not inherit the Win32 timer tick
 namespace prosper {
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
@@ -46,6 +46,8 @@ namespace prosper {
 #define P(x) ((void*)(uintptr_t)(x))
 
 extern "C" uint64_t prosper_vo_flip_count();
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();   // shared 59.94 Hz grid origin (hle_graphics.cpp)
+extern "C" uint64_t prosper_vo_vblank_period_ns();
 
 namespace {
     using clk = std::chrono::steady_clock;
@@ -399,13 +401,30 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
     return 0;
 }
 
-// real sleeps so timed wait loops actually yield the CPU (and advance real time)
-HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
+// real sleeps so timed wait loops actually yield the CPU (and advance real time). Routed through
+// host::sleep_until_steady_ns (#1765): a bare nanosleep quantizes to the Win32 timer tick on
+// Windows -- a guest usleep(1000) cost ~15.6 ms, and every guest thread pacing a frame or an
+// audio grain through these calls inherited that floor. On POSIX this is the same nanosleep loop
+// as before.
+HLE(k_usleep)   { uint64_t us = a0;
+                  prosper::host::sleep_until_steady_ns(
+                      (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          clk::now().time_since_epoch()).count() + us * 1000ull);
+                  return 0; }
 // POSIX sleep() returns the number of seconds LEFT unslept (0 on full completion), not the input.
 // Returning the input breaks the canonical resume idiom `while ((left = sleep(left))) ;` into an
 // infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
-HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
-HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
+HLE(k_sleep_s)  { prosper::host::sleep_until_steady_ns(
+                      (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          clk::now().time_since_epoch()).count() + a0 * 1000000000ull);
+                  return 0; }
+HLE(k_nanosleep){ if (!a0) return 0;
+                  const uint64_t want_ns = (uint64_t)*(const int64_t*)P(a0);
+                  prosper::host::sleep_until_steady_ns(
+                      (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          clk::now().time_since_epoch()).count() + want_ns);
+                  if (a1) { ((int64_t*)P(a1))[0] = 0; ((int64_t*)P(a1))[1] = 0; }  // slept in full
+                  return 0; }
 
 // --- select / pselect: the PURE-SLEEP shape only (#1660) --------------------------------------
 //
@@ -437,13 +456,15 @@ bool select_is_pure_sleep(uint64_t nfds, uint64_t readfds, uint64_t writefds, ui
 
 // Sleep the FULL duration. A bare nanosleep returns early on a signal, and prosper delivers signals
 // on its own (the SIGSEGV fault handler), so a short sleep would reintroduce a faster spin.
+// host::sleep_until_steady_ns loops to the deadline on every platform (and on Windows escapes the
+// timer-tick quantization that made a guest's 1 ms sleep cost ~15.6 ms -- same defect family the
+// vblank pump and the audio grain pacer hit, 2026-08-24).
 void sleep_full(struct timespec want) {
-    while (want.tv_sec > 0 || want.tv_nsec > 0) {
-        struct timespec rem{0, 0};
-        if (nanosleep(&want, &rem) == 0) return;
-        if (errno != EINTR) return;
-        want = rem;
-    }
+    const uint64_t deadline_ns =
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clk::now().time_since_epoch()).count() +
+        (uint64_t)want.tv_sec * 1000000000ull + (uint64_t)want.tv_nsec;
+    prosper::host::sleep_until_steady_ns(deadline_ns);
 }
 
 // A NULL timeout in the pure-sleep shape means "block forever". Sleep in bounded chunks rather than
@@ -1001,8 +1022,23 @@ namespace {
     }
     void vblank_pump() {
         uint64_t frame = 0;
+        // Absolute schedule on the SHARED 59.94 Hz grid (hle_graphics.cpp's vblank status/wait
+        // timebase), waited on with host::sleep_until_steady_ns. Two defects this replaces:
+        // a relative nanosleep(16.67 ms) quantizes to the Win32 timer tick on Windows
+        // (~31 ms observed, #1765/#2242), which paced every vblank-equeue consumer at ~32 Hz --
+        // Dragon Quest VII and Blasphemous 2 both framed at ~30 fps on Windows/NVIDIA against
+        // 120 fps on Linux/AMD (2026-08-24); and relative sleeps drift against the status grid,
+        // the phase disagreement recorded at hle_graphics.cpp's timebase comment. Resync after a
+        // wholly missed tick rather than bursting the missed events: consumers pace on the
+        // events' ARRIVAL, and a burst would hand them several ticks at once.
+        const uint64_t period_ns = prosper_vo_vblank_period_ns();
+        uint64_t next_ns = prosper_vo_vblank_grid_origin_ns() + period_ns;
         for (;;) {
-            struct timespec ts{ 0, 16666667 }; nanosleep(&ts, nullptr);   // ~60 Hz
+            prosper::host::sleep_until_steady_ns(next_ns);
+            const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clk::now().time_since_epoch()).count();
+            if (next_ns < now_ns) next_ns = now_ns + period_ns;   // missed a whole tick: resync
+            next_ns += period_ns;
             frame++;
             std::vector<FlipReg> vr;
             { std::lock_guard lk(g_eq_mx); vr = g_vblank_regs; }

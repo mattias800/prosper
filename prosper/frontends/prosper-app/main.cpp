@@ -101,6 +101,7 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include "host/platform/precise_sleep.hpp"   // present-loop waits must not inherit the Win32 tick (#1765)
 #include <mutex>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 #include <filesystem>                  // directory listing behind the library scan
@@ -2415,7 +2416,15 @@ int main(int argc, char** argv) {
                 if (attempt == PresentAttempt::out_of_date) {
                     swapchainDirty = true;
                 } else if (attempt == PresentAttempt::skipped) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    // Precise wait: a raw sleep_for(4 ms) quantizes to the Win32 timer tick
+                    // (~17 ms observed), and a skipped present + one tick per retry paced the
+                    // whole loop at exactly 2 ticks/frame (~32 fps) on Windows/RTX 4090
+                    // (Blasphemous 2, 2026-08-25). 4 ms of high-resolution wait retries ~4x
+                    // per vsync instead of once per two vsyncs.
+                    prosper::host::sleep_until_steady_ns(
+                        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count() +
+                        4000000ull);
                 } else if (attempt == PresentAttempt::failed) {
                     running = false;
                 } else {
@@ -2452,7 +2461,14 @@ int main(int argc, char** argv) {
                                                      fpsForPresent);
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
-                    else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    else if (a == PresentAttempt::skipped) {
+                        // Same tick-quantization hazard as the gpu-present skip above: a raw
+                        // sleep_for(4 ms) costs ~17 ms here and paced retries at half vsync.
+                        prosper::host::sleep_until_steady_ns(
+                            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count() +
+                            4000000ull);
+                    }
                     else if (a == PresentAttempt::failed) running = false;
                     else {
                         lastFrameSeq = cf.frame_seq;
@@ -2464,10 +2480,18 @@ int main(int argc, char** argv) {
                         flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height);
                     }
                 } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    prosper::host::sleep_until_steady_ns(
+                        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count() +
+                        2000000ull);
                 }
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));   // no new GPU or CPU frame yet
+                // No new GPU or CPU frame yet: same tick-quantization hazard -- a raw 2 ms
+                // sleep costs ~17 ms here and halves the loop's poll rate.
+                prosper::host::sleep_until_steady_ns(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count() +
+                    2000000ull);
             }
         } else {
         bool newFrame = testPattern || (gpu::present_frame_seq() != lastFrameSeq);

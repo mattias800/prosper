@@ -672,7 +672,8 @@ HLE(g_vo_submitflip)  {
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
-    if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
+    if (evlog()) fprintf(stderr, "[ev] GpuFlip t=%.3f handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
@@ -763,6 +764,12 @@ void vblank_sleep_until_ns(uint64_t deadline_ns) {
     host::sleep_until_steady_ns(deadline_ns);
 }
 }  // namespace
+// The kernel equeue vblank pump (hle_kernel_time.cpp) schedules on THIS grid, so the kevent
+// stream and the vblank status/wait paths above are one clock in both phase and period. They
+// were two drifting clocks before -- the follow-up noted at the timebase comment above; sharing
+// the origin here closes it.
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns() { return vblank_epoch_ns(); }
+extern "C" uint64_t prosper_vo_vblank_period_ns() { return kVblankNs; }
 
 extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns) {
     g_vblank_test_now_ns.store(now_ns, std::memory_order_relaxed);

@@ -7,6 +7,7 @@
 #include "audio_sdl3.hpp"
 #include "hle/audio/audio.hpp"
 #include "host/platform/lifecycle.hpp"
+#include "host/platform/precise_sleep.hpp"   // grain pacing must not inherit the Win32 tick (#1765)
 
 #include <SDL3/SDL.h>
 
@@ -112,7 +113,10 @@ public:
                 s.put_failed = true;
             }
         }
-        if (freq > 0) std::this_thread::sleep_until(target);
+        if (freq > 0)
+            prosper::host::sleep_until_steady_ns(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    target.time_since_epoch()).count());
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
