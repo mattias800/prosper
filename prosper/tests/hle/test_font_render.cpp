@@ -402,8 +402,25 @@ int main() {
         for (uint8_t b : surf_bytes) if (b) ++coveredh;
         CHECK(coveredh > 500,
               "the horizontal variant actually rasterizes into the surface");
-    }
 
+        // The pen floats must be consumed as placement: shift the pen and the drawn region
+        // moves with it. Without this arm an implementation that ignores xmm0/xmm1 and always
+        // draws at the origin would pass every check above.
+        std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
+        uint8_t resulth2[0x40];
+        std::memset(resulth2, kPoison, sizeof(resulth2));
+        call_h(surface, -bearing_x + 16.f, bearing_y - layout[0] + 16.f, mh, resulth2);
+        size_t covered_shifted = 0;
+        size_t first_col_shifted = SIZE_MAX;
+        for (int y = 0; y < kDim; ++y)
+            for (int x = 0; x < kPitch; ++x)
+                if (surf_bytes[(size_t)y * kPitch + x]) {
+                    ++covered_shifted;
+                    first_col_shifted = std::min(first_col_shifted, (size_t)x);
+                }
+        CHECK(covered_shifted > 500 && first_col_shifted >= 16,
+              "shifting the pen shifts the drawn glyph (the float args are real placement)");
+    }
     // --- lifecycle ---------------------------------------------------------------------------
     CHECK(memory_term(P(mem), 0, 0, 0, 0, 0) == 0, "MemoryTerm releases the memory descriptor");
     void* lib2 = library;

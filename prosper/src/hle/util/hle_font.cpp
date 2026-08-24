@@ -857,6 +857,13 @@ void register_font_hle() {
     R("3G4zhgKuxE8", (HleFn)font_render_char_glyph_image, "sceFontRenderCharGlyphImage");
     R("kAenWy1Zw5o", (HleFn)font_render_char_glyph_image_horizontal,
       "sceFontRenderCharGlyphImageHorizontal");
+    // Intentional no-op lifecycle/capability surface used during Astro's initialization.
+    R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
+    R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");
+    R("CUKn5pX-NVY", (HleFn)font_ok, "sceFontAttachDeviceCacheBuffer");
+    R("7rogx92EEyc", (HleFn)font_ok, "sceFontCreateWritingLine");
+    R("1+DgKL0haWQ", (HleFn)font_ok, "sceFontWritingLineClear");
+    R("JQKWIsS9joE", (HleFn)font_ok, "sceFontWritingLineGetOrderingSpace");
     R("oaJ1BpN2FQk", (HleFn)font_text_source_init, "sceFontTextSourceInit");
     R("eCRMCSk96NU", (HleFn)font_text_default, "sceFontTextSourceSetDefaultFont");
     R("OqQKX0h5COw", (HleFn)font_text_writing_form, "sceFontTextSourceSetWritingForm");
