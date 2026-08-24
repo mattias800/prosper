@@ -159,6 +159,7 @@ constexpr uint8_t kPoison = 0xaf;
 }  // namespace
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);   // a crash must not take the already-printed arms with it
     register_builtin_hle();
     auto create_lib   = Hle::lookup("n590hj5Oe-k");   // sceFontCreateLibraryWithEdition
     auto open_memory  = Hle::lookup("KXUpebrFk1U");   // sceFontOpenFontMemory
