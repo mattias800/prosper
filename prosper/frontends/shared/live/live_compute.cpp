@@ -993,6 +993,16 @@ struct VulkanComputeContext {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    // A second VkQueue from the same family, acquired when the adopted family exposes more than
+    // one queue. Compute submissions on the SHARED queue serialize behind prosper-app's fifo
+    // vkQueuePresentKHR, which holds shared_present_submit_mutex for the full vsync throttle
+    // (~16.7 ms) - so every dispatch's fence wait measured the presenter's stall, and the whole
+    // guest framed at exactly 2 timer ticks (32.0 fps flat) on Windows/RTX 4090 against 120 fps
+    // on Linux/AMD (Blasphemous 2 PPSA13579, 2026-08-25). A dedicated queue removes that
+    // coupling; correctness is unchanged because every dispatch fence-waits before its results
+    // are consumed (the fence signal orders them for all later host-sequenced submissions).
+    VkQueue dedicated_queue = VK_NULL_HANDLE;
+    bool queue_dedicated = false;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkCommandPool command_pool = VK_NULL_HANDLE;
@@ -2244,6 +2254,31 @@ struct VulkanComputeContext {
                 query_subgroup_support();
                 std::fprintf(stderr, "[compute] Vulkan device: adopted the renderer's device "
                                      "(shared, queue family %u)\n", queue_family);
+                // Acquire a second queue from the same family when one exists, so compute
+                // submissions do not queue behind the presenter's fifo throttle on the shared
+                // queue (see the dedicated_queue member comment). Same family: same capabilities,
+                // and the per-dispatch fence wait keeps every result ordered for its consumers.
+                uint32_t family_queue_count = 0;
+                {
+                    std::vector<VkQueueFamilyProperties> families;
+                    uint32_t family_count = 0;
+                    vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, nullptr);
+                    families.resize(family_count);
+                    vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count,
+                                                             families.data());
+                    if (queue_family < family_count)
+                        family_queue_count = families[queue_family].queueCount;
+                }
+                if (family_queue_count > 1) {
+                    vkGetDeviceQueue(device, queue_family, 1, &dedicated_queue);
+                    if (dedicated_queue) {
+                        queue_dedicated = true;
+                        std::fprintf(stderr, "[compute] dedicated compute queue acquired "
+                                             "(family %u index 1 of %u) -- submissions no longer "
+                                             "serialize behind the presenter\n",
+                                     queue_family, family_queue_count);
+                    }
+                }
                 // Report the inherited capability in BOTH directions. A log that fires only when the
                 // feature is present makes its absence silent, which is how #2458 shipped a comment
                 // claiming an inheritance that no code performed: there was nothing a run could print
@@ -8079,16 +8114,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (trace) std::fprintf(stderr, "[compute]   submitting dispatch\n");
         // #1270: when prosper-app presents on this same (shared) queue, serialize the submit CALL against
         // its present submits. No-op relaxed atomic load until the app adopts the shared queue.
+        // With a dedicated compute queue the mutex is skipped entirely: the presenter's fifo
+        // throttle no longer gates dispatches, and the per-dispatch fence keeps every result
+        // ordered for its consumers.
         VkResult compute_submit_rc;
         {
             std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
-            if (prosper::gpu::shared_present_active()) lk.lock();
+            const bool shared_queue = !ctx.queue_dedicated;
+            if (shared_queue && prosper::gpu::shared_present_active()) lk.lock();
+            VkQueue submit_queue = ctx.queue_dedicated ? ctx.dedicated_queue : ctx.queue;
             g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
             submission_entered = true;
             compute_submit_rc = g_force_next_queue_submit_device_lost_for_test.exchange(
                                     false, std::memory_order_acq_rel)
                 ? VK_ERROR_DEVICE_LOST
-                : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
+                : vkQueueSubmit(submit_queue, 1, &submit, ctx.dispatch_fence);
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
@@ -8131,8 +8171,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!ctx.device_lost) {
                 std::unique_lock<std::mutex> qlk(
                     prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
-                if (prosper::gpu::shared_present_active()) qlk.lock();
-                const VkResult drain_result = vkQueueWaitIdle(ctx.queue);
+                if (!ctx.queue_dedicated && prosper::gpu::shared_present_active()) qlk.lock();
+                const VkResult drain_result = vkQueueWaitIdle(
+                    ctx.queue_dedicated ? ctx.dedicated_queue : ctx.queue);
                 completion_proven = drain_result == VK_SUCCESS;
                 // Soft: this drain runs INSIDE the queue-wait failure path, which has already
                 // declined. Declining again would report one fence timeout as two refusals.
