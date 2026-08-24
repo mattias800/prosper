@@ -5424,11 +5424,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // (available_fragment_subgroup_features, from ctx.subgroup_operations) is computed BELOW and
         // is deliberately not memoized: it is cheap, and folding it in would key device state on a
         // shader identity.
-        struct SubgroupScanEntry { uint32_t size; uint32_t features; };
+        struct SubgroupScanEntry { uint32_t size; uint32_t features; uint32_t reasons; };
         static thread_local std::unordered_map<uint64_t, SubgroupScanEntry> subgroup_scan_memo;
         constexpr size_t kSubgroupScanMemoMaxEntries = 4096;
         uint32_t required_fragment_subgroup_size = 0;
         uint32_t required_fragment_subgroup_features = 0;
+        uint32_t required_fragment_subgroup_reasons = 0;
         // PROSPER_NO_SUBGROUP_SCAN_MEMO: opt out, so the A/B for this change is single-variable on
         // ONE binary rather than a comparison of two builds. Kept as a permanent bisection lever for
         // the same reason PROSPER_NO_INDEX_ARENA (#2258) and the PROSPER_NO_BACKEND_* family exist.
@@ -5439,6 +5440,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (found != subgroup_scan_memo.end()) {
                 required_fragment_subgroup_size = found->second.size;
                 required_fragment_subgroup_features = found->second.features;
+                required_fragment_subgroup_reasons = found->second.reasons;
                 subgroup_scan_memoized = true;
             }
         }
@@ -5447,6 +5449,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
             required_fragment_subgroup_features =
                 prosper::gpu::fragment_spirv_required_subgroup_features(bd_fs);
+            required_fragment_subgroup_reasons =
+                prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
             if (bd.fs_identity && !no_subgroup_scan_memo) {
                 // Cleared wholesale rather than aged: there is no LRU bookkeeping worth paying for
                 // on a path this hot. A non-zero clear count means this memo has STOPPED WORKING --
@@ -5456,7 +5460,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     subgroup_scan_memo.clear();
                 subgroup_scan_memo.emplace(bd.fs_identity,
                                            SubgroupScanEntry{required_fragment_subgroup_size,
-                                                             required_fragment_subgroup_features});
+                                                             required_fragment_subgroup_features,
+                                                             required_fragment_subgroup_reasons});
             }
         }
         if (timing_enabled)
@@ -5473,16 +5478,43 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupBallot;
         const bool uses_internal_gds =
             fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
-        if (required_fragment_subgroup_size &&
-            (!ctx.subgroup_size_control ||
-             required_fragment_subgroup_size < ctx.min_subgroup_size ||
-             required_fragment_subgroup_size > ctx.max_subgroup_size ||
-             !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             !prosper::gpu::fragment_subgroup_features_supported(
-                 required_fragment_subgroup_features,
-                 available_fragment_subgroup_features) ||
-             (uses_internal_gds && !ctx.fragment_stores_atomics))) {
+        if (required_fragment_subgroup_size) {
+            uint32_t skip_reasons = 0;
+            if (!ctx.subgroup_size_control)                                          skip_reasons |= 0x01;
+            if (required_fragment_subgroup_size < ctx.min_subgroup_size)             skip_reasons |= 0x02;
+            if (required_fragment_subgroup_size > ctx.max_subgroup_size)             skip_reasons |= 0x04;
+            if (!(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT)) skip_reasons |= 0x08;
+            if (!(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT))               skip_reasons |= 0x10;
+            if (!prosper::gpu::fragment_subgroup_features_supported(
+                    required_fragment_subgroup_features,
+                    available_fragment_subgroup_features))                           skip_reasons |= 0x20;
+            if (uses_internal_gds && !ctx.fragment_stores_atomics)                   skip_reasons |= 0x40;
+            // Width-agnostic branch-guard votes (#2147/#2441): a shader whose ONLY wave-width
+            // reason is OpGroupNonUniformAny needs 64 lanes for no lane identity and no data
+            // bearing mask -- two native-width votes union to the same executed-pixel set, and
+            // each half-wave simply diverges on its own. On a device whose maximum subgroup
+            // width cannot satisfy the guest wave (NVIDIA: 32..32 against a guest wave64),
+            // run the module at the device's native width instead of dropping the draw. The
+            // pipeline below pins requiredSubgroupSize to that native width, which
+            // requiredSubgroupSizeStages on such devices includes for the fragment stage.
+            if (skip_reasons == 0x04 &&
+                required_fragment_subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny) {
+                static std::mutex relax_mutex;
+                static std::unordered_set<uint64_t> relaxed_logged;
+                {
+                    std::lock_guard<std::mutex> lock(relax_mutex);
+                    if (relaxed_logged.insert(bd.fs_identity
+                            ? bd.fs_identity
+                            : hash_buffer_words(bd_fs.data(), bd_fs.size())).second)
+                        std::fprintf(stderr,
+                                     "[render] wave-any fragment shader relaxed to native "
+                                     "subgroup width %u (guest wave %u) -- draw recovered\n",
+                                     ctx.max_subgroup_size, required_fragment_subgroup_size);
+                }
+                required_fragment_subgroup_size = ctx.max_subgroup_size;
+                skip_reasons = 0;
+            }
+            if (skip_reasons) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;
@@ -5563,6 +5595,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 wave64_stats.note_skip(W, H, reason_mask);
             }
             continue;
+        }
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
             static std::once_flag logged;
