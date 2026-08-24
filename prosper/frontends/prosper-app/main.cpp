@@ -1161,7 +1161,7 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     // forbid it). Removing it lets the child re-resolve from its own title's settings. A
     // USER-authored value is left alone: the documented precedence is that the environment wins
     // over the file.
-    if (g_guest_args_app_set) unsetenv("PROSPER_GUEST_ARGS");
+    if (g_guest_args_app_set) clear_environment("PROSPER_GUEST_ARGS");
 #ifdef _WIN32
     // CreateProcess takes a single command line, so every argument is quoted — dump paths routinely
     // contain spaces, and a trailing backslash would otherwise escape the closing quote.
