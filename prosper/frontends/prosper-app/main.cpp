@@ -951,6 +951,9 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
 Program g_prog;
 std::thread g_guest_thread;
 bool g_guest_started = false;
+// True when THIS process authored PROSPER_GUEST_ARGS from the settings file (start_guest). A
+// relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
+bool g_guest_args_app_set = false;
 bool g_boot_attempted = false;
 
 // Install the host frontends (audio out, controller in, dialogs) at the same point boot_trace does:
@@ -1043,7 +1046,7 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
             cfg, prosper::frontend::title_id_from_app0_path(app0_root));
         if (!args.empty()) {
             set_environment("PROSPER_GUEST_ARGS", args.c_str());
-            fprintf(stderr, "[app] guest args (config): %s\n", args.c_str());
+        g_guest_args_app_set = true;
         }
     }
 #ifdef PROSPER_HAVE_LIVE_RENDERER
@@ -1144,6 +1147,13 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     for (int i = 1; i < argc; i++) args.emplace_back(argv[i]);
     args.emplace_back("--dump");
     args.push_back(app0_root);
+    // If THIS process authored PROSPER_GUEST_ARGS from the config (see start_guest), the value
+    // belongs to the title that is shutting down — a relaunch inherits environ verbatim, so leaving
+    // it would apply the previous title's args to the new one (whose config entry may differ or
+    // forbid it). Removing it lets the child re-resolve from its own title's settings. A
+    // USER-authored value is left alone: the documented precedence is that the environment wins
+    // over the file.
+    if (g_guest_args_app_set) unsetenv("PROSPER_GUEST_ARGS");
 #ifdef _WIN32
     // CreateProcess takes a single command line, so every argument is quoted — dump paths routinely
     // contain spaces, and a trailing backslash would otherwise escape the closing quote.
@@ -1157,7 +1167,6 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    return true;
 #else
     std::vector<char*> cargv;
     cargv.reserve(args.size() + 1);
