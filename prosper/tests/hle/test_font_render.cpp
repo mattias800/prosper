@@ -403,10 +403,11 @@ int main() {
         for (uint8_t b : surf_bytes) if (b) ++coveredh;
         CHECK(coveredh > 500,
               "the horizontal variant actually rasterizes into the surface");
-
+#if !defined(_WIN32)
         // The pen floats must be consumed as placement: shift the pen and the drawn region
         // moves with it. Without this arm an implementation that ignores xmm0/xmm1 and always
-        // draws at the origin would pass every check above.
+        // draws at the origin would pass every check above. Windows is exempt by design --
+        // its trampoline (#2955) delivers integers only, and the Win arm renders at origin.
         std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
         uint8_t resulth2[0x40];
         std::memset(resulth2, kPoison, sizeof(resulth2));
@@ -421,6 +422,7 @@ int main() {
                 }
         CHECK(covered_shifted > 500 && first_col_shifted >= 16,
               "shifting the pen shifts the drawn glyph (the float args are real placement)");
+#endif
     }
     // --- lifecycle ---------------------------------------------------------------------------
     CHECK(memory_term(P(mem), 0, 0, 0, 0, 0) == 0, "MemoryTerm releases the memory descriptor");
