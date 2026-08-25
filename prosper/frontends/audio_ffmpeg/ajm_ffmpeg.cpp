@@ -155,6 +155,10 @@ public:
             static std::atomic<int> w{0};
             while (input.size() - off >= 2) {
                 const unsigned pkt_len = input[off] | (input[off + 1] << 8);
+                // Opus caps a packet at 1275 bytes per frame; a desynchronised stream reads two
+                // payload bytes as a length and would otherwise wait forever for a packet that
+                // will never complete. Fail the decode visibly instead.
+                if (pkt_len > 1275u * 8) return fail();
                 if (input.size() - off < 2 + pkt_len) {
                     if (audiolog() && w.fetch_add(1) < 4)
                         fprintf(stderr, "[opus-stream] waiting: avail=%zu need=%u\n",

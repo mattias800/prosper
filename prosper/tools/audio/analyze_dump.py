@@ -88,12 +88,11 @@ def read_wav(path):
         elif cid == b"data":
             if rate is None:
                 raise SystemExit(f"{path}: data chunk before fmt chunk")
-            body = data[pos + 8:]
-            if size == 0 or size > len(body):
+            if size == 0 or size > len(data) - (pos + 8):
                 # Unfinalized dump (crashed run, or the pre-#2981-review offset bug): the size
                 # field was never written. Everything after the header is still valid PCM.
                 print(f"{path}: note: data size field is 0/oversized; using file remainder")
-                body = data[pos + 8:]
+                return rate, channels, width, data[pos + 8:]
             return rate, channels, width, body
         pos += 8 + size + (size & 1)
     raise SystemExit(f"{path}: no data chunk")

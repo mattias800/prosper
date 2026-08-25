@@ -3050,7 +3050,6 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 const uint32_t out_total =
                     job.out_size + (job.out2_size ? job.out2_size : 0);
                 std::vector<int16_t> pcm(out_total / sizeof(int16_t));
-                const size_t held_before = instance.host_dec->pending_bytes();
                 const ajm::DecodeResult decoded = instance.host_dec->decode(
                     std::span<const uint8_t>(input.data(), got), std::span<int16_t>(pcm));
                 const uint32_t frame_bytes = decoded.channels * sizeof(int16_t);
@@ -3061,8 +3060,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 // already consumed. Channel alignment becomes meaningful only once PCM is emitted.
                 const bool pcm_shape_valid = decoded.produced_bytes == 0 ||
                     (frame_bytes != 0 && decoded.produced_bytes % frame_bytes == 0);
-                const bool valid = decoded.ok &&
-                    decoded.consumed_bytes <= got + held_before &&
+                const bool valid = decoded.ok && decoded.consumed_bytes <= got &&
                     decoded.produced_bytes <= out_total &&
                     decoded.produced_bytes <= pcm.size() * sizeof(int16_t) &&
                     pcm_shape_valid;
@@ -3074,35 +3072,22 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 int32_t err = valid ? 0 : kAjm2ErrDecode;
                 uint32_t consumed = valid ? decoded.consumed_bytes : 0;
                 uint32_t produced = valid ? decoded.produced_bytes : 0;
-                // Wrapped-ring second half: PCM past the first buffer's capacity spills into
-                // the second output descriptor instead of being dropped (#2981 review 6a).
-                if (produced > job.out_size && job.out2_size) {
-                    const uint32_t first = job.out_size;
-                    if (!audio_store_bytes(job.out_addr, pcm.data(), first) ||
-                        !audio_store_bytes(job.out2_addr, pcm.data() + first / sizeof(int16_t),
-                                           produced - first)) {
-                        instance.host_dec->invalidate();
-                        err = kAjm2ErrDecode;
-                        consumed = produced = 0;
-                    }
-                    if (!err) ajm2_dump_decode(inst_id,
-                        std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
-                    if (!err && produced) instance.decoded_samples += produced / frame_bytes;
-                    const bool result_published = ajm2_write_result(
-                        job.result_addr, err, consumed, produced, instance.decoded_samples,
-                        err ? 0 : decoded.decoded_frames);
-                    if (!result_published) instance.host_dec->invalidate();
-                    if (log)
-                        fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%uB "
-                                "out=%u+%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
-                                (unsigned long long)ajm2_log_ms(), inst_id, instance.codec,
-                                got, (unsigned)in_total, job.out_size, job.out2_size, consumed,
-                                produced, decoded.channels, decoded.sample_rate,
-                                (unsigned long long)instance.decoded_samples,
-                                !result_published ? " RESULT_STORE_ERR" : (err ? " ERR" : ""));
-                    continue;
+                // Destination split, resolved before any store: a wrapped ring's two halves are
+                // one logical buffer. The split point is the first descriptor's capacity aligned
+                // DOWN to whole sample-frames — a mid-frame split would transpose L/R for the
+                // entire second half of every wrapping job (#2988 review B). produced is already
+                // frame-aligned (pcm_shape_valid), so only the boundary needs alignment.
+                uint32_t first = produced;
+                if (produced > job.out_size && job.out2_size)
+                    first = job.out_size - (job.out_size % frame_bytes);
+                if (produced && !audio_store_bytes(job.out_addr, pcm.data(), first)) {
+                    instance.host_dec->invalidate();
+                    err = kAjm2ErrDecode;
+                    consumed = produced = 0;
                 }
-                if (produced && !audio_store_bytes(job.out_addr, pcm.data(), produced)) {
+                if (!err && produced > first &&
+                    !audio_store_bytes(job.out2_addr, pcm.data() + first / sizeof(int16_t),
+                                       produced - first)) {
                     instance.host_dec->invalidate();
                     err = kAjm2ErrDecode;
                     consumed = produced = 0;
@@ -3121,16 +3106,16 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 }
                 if (log)
                     fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%uB "
-                            "out=%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
+                            "out=%u%s -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
                             (unsigned long long)ajm2_log_ms(), inst_id, instance.codec,
-                            got, (unsigned)in_total, job.out_size, consumed, produced, decoded.channels,
+                            got, (unsigned)in_total, job.out_size,
+                            job.out2_size ? "+2nd" : "", consumed, produced, decoded.channels,
                             decoded.sample_rate, (unsigned long long)instance.decoded_samples,
                             !result_published ? " RESULT_STORE_ERR" : (err ? " ERR" : ""));
             }
             ji = je;
             continue;
-        }
-        // A non-null invalid host decoder is deliberately terminal. Do not fall through to the
+        }        // A non-null invalid host decoder is deliberately terminal. Do not fall through to the
         // ATRAC9 path or erase the cumulative sample count on a later batch's error sideband.
         if (it != g_ajm2_inst.end() && it->second.host_dec) {
             for (size_t k = ji; k < je; ++k)

@@ -46,10 +46,6 @@ public:
     virtual void invalidate() = 0;
     virtual DecodeResult decode(std::span<const uint8_t> input,
                                 std::span<int16_t> output) = 0;
-    // Compressed bytes the decoder is holding from earlier calls (a partial packet awaiting its
-    // tail). The batch executor allows decode() to consume up to `input.size() + pending_bytes()`:
-    // retiring buffered bytes is legitimate consumption even when they were fed by an earlier job.
-    virtual size_t pending_bytes() const { return 0; }
 };
 
 // Out-of-band stream configuration, for callers that know more than AJM's instance flags can say.
