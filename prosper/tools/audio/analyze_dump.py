@@ -10,7 +10,6 @@ Usage: analyze_dump.py <dump.wav> [--min-rms 0.001] [--segment-secs 5]
 """
 import sys
 import struct
-import wave
 
 
 def main() -> int:
@@ -26,10 +25,8 @@ def main() -> int:
     if "--segment-secs" in argv:
         segment_secs = int(argv[argv.index("--segment-secs") + 1])
 
-    w = wave.open(path, "rb")
-    rate, channels, width, frames = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
-    raw = w.readframes(frames)
-    w.close()
+    rate, channels, width, raw = read_wav(path)
+    frames = len(raw) // (channels * width) if rate else 0
     dur = frames / rate if rate else 0
     print(f"{path}: {rate} Hz, {channels} ch, {width * 8}-bit, {frames} frames, {dur:.1f}s")
 
@@ -68,6 +65,38 @@ def main() -> int:
     else:
         print("NO AUDIBLE AUDIO in the entire dump")
     return 0
+
+
+
+
+def read_wav(path):
+    """Minimal RIFF parse. Python's wave module rejects WAVE_FORMAT_IEEE_FLOAT (3), which is
+    exactly what the sink dumps for f32 ports, so parse the chunks by hand."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 44 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise SystemExit(f"{path}: not a RIFF/WAVE file")
+    rate = channels = width = None
+    pos = 12
+    while pos + 8 <= len(data):
+        cid = data[pos:pos + 4]
+        size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fmt " and size >= 16:
+            _fmt_tag, channels, rate = struct.unpack("<HHI", body[0:8])
+            width = struct.unpack("<H", body[14:16])[0] // 8
+        elif cid == b"data":
+            if rate is None:
+                raise SystemExit(f"{path}: data chunk before fmt chunk")
+            body = data[pos + 8:]
+            if size == 0 or size > len(body):
+                # Unfinalized dump (crashed run, or the pre-#2981-review offset bug): the size
+                # field was never written. Everything after the header is still valid PCM.
+                print(f"{path}: note: data size field is 0/oversized; using file remainder")
+                body = data[pos + 8:]
+            return rate, channels, width, body
+        pos += 8 + size + (size & 1)
+    raise SystemExit(f"{path}: no data chunk")
 
 
 if __name__ == "__main__":

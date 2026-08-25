@@ -22,14 +22,17 @@ namespace {
 // 16 public sceAudioOut ports plus four host-only streams for concurrent AudioOut2 contexts.
 // SDL mixes the bound streams into the same playback device while each retains its own pacing
 // clock; this mirrors independent hardware contexts without serializing their sample timelines.
-// 20 covers the 16 public sceAudioOut ports plus the four host-only AudioOut2 context ports
-// (kA2SinkPortBase = 21..24 in hle_audio.cpp). The old cap of 20 made every AudioOut2 open fail
-// and fall back to silent pacing — GRIS's Wwise mix was correct and discarded at the sink (#2981).
+// 28 covers the 16 public sceAudioOut ports plus the four host-only AudioOut2 context ports
+// (kA2SinkPortBase = kMaxPorts+1 = 17..20 in hle_audio.cpp) with headroom. NOTE: the previous
+// cap of 20 already accepted ports 17..20, so it did NOT discard GRIS's mix — that claim was
+// wrong; the actual cause of GRIS's silence was the DecodeSplit job rejection (#2981).
 constexpr int kMaxPorts = 28;
 
 SDL_AudioFormat to_sdl_format(AudioFmt f) { return f == AudioFmt::F32 ? SDL_AUDIO_F32 : SDL_AUDIO_S16; }
 
-// PROSPER_AUDIO_DUMP=<path.wav>: dump every port's mixed PCM to per-port WAV files
+// PROSPER_AUDIO_DUMP_WAV=<path.wav>: dump every port's mixed PCM to per-port WAV
+// files. Distinct from the core's PROSPER_AUDIO_DUMP (<prefix>.portN.raw) so both
+// can coexist without double-dumping one variable.
 // (<path> with the port number inserted before the extension). Measures what the guest
 // actually mixed — immune to host volume/mute — so "is audio playing" is a measurement,
 // not an impression (#2981).
@@ -37,6 +40,7 @@ class WavDump {
 public:
     bool open(const char* path, int freq, int channels, bool f32) {
         if (!path || !*path) return false;
+        finalize();   // a reopen mid-run finalizes the earlier capture instead of leaking
         file_ = fopen(path, "wb");
         if (!file_) return false;
         const uint16_t fmt_tag = f32 ? 3 : 1;
@@ -49,7 +53,7 @@ public:
         w16(static_cast<uint16_t>(channels));
         w32(static_cast<uint32_t>(freq)); w32(byte_rate); w16(block); w16(f32 ? 32 : 16);
         fwrite("data", 1, 4, file_); w32(0);
-        data_size_pos_ = 44;
+        data_size_pos_ = 40;   // "data" chunk size field: 36..39 is the chunk id, 40..43 the size
         return true;
     }
     void write(const void* pcm, int frames, int channels, bool f32) {
@@ -67,6 +71,9 @@ public:
     }
     bool active() const { return file_ != nullptr; }
     ~WavDump() { finalize(); }
+    WavDump() = default;                // the deleted copy suppresses the implicit default
+    WavDump(const WavDump&) = delete;
+    WavDump& operator=(const WavDump&) = delete;
 private:
     FILE* file_ = nullptr;
     long data_size_pos_ = 0;
@@ -118,7 +125,7 @@ public:
             return false;
         }
         const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s.stream);
-        if (const char* dump = getenv("PROSPER_AUDIO_DUMP"); dump && *dump) {
+        if (const char* dump = getenv("PROSPER_AUDIO_DUMP_WAV"); dump && *dump) {
             std::string path(dump);
             const auto dot = path.rfind('.');
             const std::string port_tag = std::to_string(port);
@@ -181,22 +188,6 @@ public:
         // instead of re-triggering them. The sleep must be outside the lock so other audio
         // operations (open/close/volume) can proceed while this grain plays.
         if (freq > 0) std::this_thread::sleep_until(target);
-        // Consumption confirmation (#2978): after the pacing sleep, the grain has had its
-        // full duration to play. A brief bounded wait here gives Heaps' hxd.snd.Manager the
-        // "buffer consumed" signal its unqueueBuffer needs — without this, short SFX loop
-        // forever because Heaps can't tell a played buffer from a pending one. The wait is
-        // OUTSIDE the lock and bounded, so it cannot block other audio operations or cause
-        // underruns (the grain duration has already elapsed during the pacing sleep).
-        {
-            std::lock_guard<std::mutex> lk(mx_);
-            if (SDL_AudioStream* st = slots_[port - 1].stream) {
-                auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(2);
-                while (SDL_GetAudioStreamAvailable(st) > 0 &&
-                       std::chrono::steady_clock::now() < deadline)
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
-        }
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
@@ -214,6 +205,7 @@ public:
         Slot& s = slots_[port - 1];
         if (s.stream) { SDL_DestroyAudioStream(s.stream); s.stream = nullptr; }
         s.frame_bytes = s.grain_bytes = 0;
+        s.dump.finalize();   // a closed port's capture is complete
     }
 
     // Applies to open streams immediately AND is remembered for later opens, so it works
@@ -251,7 +243,11 @@ private:
                   int freq = 0;                                     // port sample rate for pacing
                   std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
                   int channels = 2; bool f32 = false;               // dump format (#2981)
-                  WavDump dump; };                                  // PROSPER_AUDIO_DUMP (#2981)
+                  WavDump dump;                                     // PROSPER_AUDIO_DUMP_WAV
+                  // A defaulted default ctor keeps slots_{} value-initialization off the
+                  // copy-construct path, which WavDump's deleted copy would reject.
+                  Slot() = default;
+    };
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
     bool paused_ = false;

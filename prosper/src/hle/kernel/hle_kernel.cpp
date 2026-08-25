@@ -581,7 +581,9 @@ namespace {
             // guest module (e.g. AkSoundEngine at 0x5a0000000). A destroy followed by a
             // re-manufacture on the same slot orphans every thread still parked inside the old
             // object — this names those transitions.
-            if (getenv("PROSPER_SYNCLOG") && slot_addr >= 0x5a0000000ull && slot_addr < 0x5b0000000ull) {
+            static const bool synclog = getenv("PROSPER_SYNCLOG") != nullptr;
+            if (synclog && slot_addr >= BOOT_AKSOUNDENGINE &&
+                slot_addr < BOOT_LIBC) {   // AkSoundEngine.prx module owns the contended lock
                 static std::atomic<int> n{0};
                 if (n.fetch_add(1) < 200)
                     fprintf(stderr, "[mtx-life] MANUFACTURE slot=0x%llx -> m=%p\n",
@@ -770,10 +772,13 @@ namespace { inline uint64_t fbsd_errno(int host) {
 // clears to NULL is a third divergence — FreeBSD writes a DESTROYED poison and fails EINVAL, where
 // prosper's sentinel test self-initializes a fresh unheld object instead — filed as #2170.
 // CONFIDENCE: HIGH on the table above (read out of libthr and libc, the guest's own platform);
+// CONFIDENCE: MED that Sony's libkernel did not re-write these bodies, which no evidence in the
+// corpus can currently settle either way — a title observed testing a Destroy result would.
 uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
     auto* m = (pthread_mutex_t*)pt_claim_slot(slot_addr);   // #2176: claim, then retire
     // PROSPER_SYNCLOG: the destroy half of the lifecycle probe — see ensure_mutex.
-    if (m && getenv("PROSPER_SYNCLOG") && slot_addr >= 0x5a0000000ull && slot_addr < 0x5b0000000ull) {
+    if (m && getenv("PROSPER_SYNCLOG") && slot_addr >= BOOT_AKSOUNDENGINE &&
+        slot_addr < BOOT_LIBC) {   // AkSoundEngine.prx module owns the contended lock
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 200)
             fprintf(stderr, "[mtx-life] DESTROY-CLAIM slot=0x%llx m=%p\n",
@@ -783,6 +788,8 @@ uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
                                     [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); }
     return 0;
 }
+// The body lives in `guest_mutex_destroy_slot` so the C11 `_Mtx_destroy` spelling runs THIS code
+// rather than a second, weaker copy of it (#2619).
 // pt_claim_slot exists because the pre-#2176 body read the slot with a bare
 // truthiness test and never cleared it, which made a double `_Mtx_destroy` a double FREE ~30 s
 // later, left the slot naming quarantined storage a later `_Mtx_lock` would happily take, and
@@ -832,7 +839,7 @@ namespace {
           auto it = g_mtx_waitlog_owner.find(m); if (it != g_mtx_waitlog_owner.end()) { o = it->second; have = true; } }
         char self[16] = {0}; pthread_getname_np(pthread_self(), self, sizeof self);
         static std::atomic<int> n{0};
-        if (n.fetch_add(1) < 20000)
+        if (n.fetch_add(1) < 256)
             fprintf(stderr, "[mtx-wait] '%s'(tid=%ld) BLOCKING on guest mutex slot=0x%llx held by %s\n",
                     self, (long)prosper_gettid(), (unsigned long long)slot,
                     have ? ([&]{ static char b[48]; snprintf(b, sizeof b, "'%s'(tid=%ld)", o.name, o.tid); return b; }())
@@ -865,7 +872,8 @@ uint64_t guest_mutex_lock_slot(uint64_t slot_addr) {
         guest_mutex_acquired(m); mtx_waitlog_record(m);
         // PROSPER_SYNCLOG: record the true host TID at acquisition for AK-range slots so a later
         // foreign __owner can be attributed to the writer that clobbered it.
-        if (getenv("PROSPER_SYNCLOG") && slot_addr >= 0x5a0000000ull && slot_addr < 0x5b0000000ull) {
+        if (getenv("PROSPER_SYNCLOG") && slot_addr >= BOOT_AKSOUNDENGINE &&
+            slot_addr < BOOT_LIBC) {   // AkSoundEngine.prx module owns the contended lock
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 2000)
                 fprintf(stderr, "[mtx-life] LOCK slot=0x%llx m=%p tid=%ld owner_now=%u\n",
@@ -882,24 +890,40 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
     // because the wake is asynchronous and the unlocker's cmpxchg wins every race. Scoped to the
     // AkSoundEngine slot range that owns the contended lock (#2981); penalizing every guest mutex
     // system-wide costs throughput for no benefit here.
-    const bool fair = getenv("PROSPER_MUTEX_FAIR") != nullptr;
-    const bool had_waiters = fair && slot_addr >= 0x5a0000000ull && slot_addr < 0x5b0000000ull
-                             && (*(volatile uint32_t*)(void*)m & 2u) != 0;   // glibc: bit1 = waiters
+    const bool fair = [] { static const bool on = getenv("PROSPER_MUTEX_FAIR") != nullptr; return on; }();
+#if defined(__linux__) && !defined(__ANDROID__) || defined(__GLIBC__)
+    // glibc layout only: bit1 of the first word is the waiters flag. On other libc/platforms the
+    // first word means something else entirely (macOS: a signature constant with that bit set,
+    // which would make the predicate always-true), so fairness stays off there. The read is a
+    // racy single word — diagnostic-grade, not synchronization.
+    const bool had_waiters = fair && slot_addr >= BOOT_AKSOUNDENGINE && slot_addr < BOOT_LIBC   // AkSoundEngine.prx
+                             && (*(volatile uint32_t*)(void*)m & 2u) != 0;
+#else
+    const bool had_waiters = false; (void)fair;
+#endif
     const int result = pthread_mutex_unlock(m);
     if (result == 0) {
         // A bounded sleep, not sched_yield (with 32 hw threads the yielder comes right back) and
         // not a strict futex park (parking the render thread on every contended unlock starves
         // the state-machine thread the BankManager itself waits on — measured worse). 3 ms:
         // GRIS's bank commit lands ≤30 s (#2981).
-        if (had_waiters) {
+        // Recursive mutexes (guest type 2): an inner unlock does not release the lock, so the
+        // waiters bit is still set — sleeping here would hold the lock while asleep. Sleep only
+        // when the unlock actually released it (post-unlock the glibc word's lock bit is clear).
+        const bool released = (*(volatile uint32_t*)(void*)m & 1u) == 0;   // glibc: bit0 = locked
+        if (had_waiters && released) {
+            // Bookkeeping BEFORE the sleep: during the 3 ms window another thread can acquire and
+            // record itself; clearing afterwards would erase that entry and corrupt [mtx-wait].
+            guest_mutex_released(m); mtx_waitlog_clear(m);
             // Tunable: smaller values land the bank commit earlier (the title-music event posts
             // within the first seconds); below ~300 us the render pump (5.33 ms period) starts
             // winning the re-lock race again and the commit re-starves (#2981).
             static const int fair_us = getenv("PROSPER_MUTEX_FAIR_US")
                                            ? atoi(getenv("PROSPER_MUTEX_FAIR_US")) : 3000;
             std::this_thread::sleep_for(std::chrono::microseconds(fair_us));
+        } else {
+            guest_mutex_released(m); mtx_waitlog_clear(m);
         }
-        guest_mutex_released(m); mtx_waitlog_clear(m);
     }
     return mtx_report("unlock", slot_addr, m, result);
 }

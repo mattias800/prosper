@@ -280,8 +280,10 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
         if (f) { fclose(f); }
         else {
             int err = errno;
-            say("skipping absent module: %s (errno=%d: %s, resolved_path='%s', path_len=%zu)\n",
-                in[i].path.c_str(), err, strerror(err), resolved.c_str(), in[i].path.size());
+            // NOTE: `resolved` was moved into in[i].path above when case-corrected, so the path
+            // printed here IS the resolved one; no separate resolved_path field.
+            say("skipping absent module: %s (errno=%d: %s, path_len=%zu)\n",
+                in[i].path.c_str(), err, strerror(err), in[i].path.size());
             in.erase(in.begin() + (ptrdiff_t)i);
         }
     }

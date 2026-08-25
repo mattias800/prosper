@@ -46,6 +46,10 @@ public:
     virtual void invalidate() = 0;
     virtual DecodeResult decode(std::span<const uint8_t> input,
                                 std::span<int16_t> output) = 0;
+    // Compressed bytes the decoder is holding from earlier calls (a partial packet awaiting its
+    // tail). The batch executor allows decode() to consume up to `input.size() + pending_bytes()`:
+    // retiring buffered bytes is legitimate consumption even when they were fed by an earlier job.
+    virtual size_t pending_bytes() const { return 0; }
 };
 
 // Out-of-band stream configuration, for callers that know more than AJM's instance flags can say.
@@ -88,6 +92,11 @@ inline uint32_t aac_sample_rate_from_index(uint32_t index) {
     if (index >= sizeof(kAacSampleRates) / sizeof(kAacSampleRates[0])) return 0;
     return static_cast<uint32_t>(kAacSampleRates[index]);
 }
+
+// Compressed input handed to a StreamDecoder must be zero-padded to this many trailing bytes:
+// FFmpeg's optimized parsers read AV_INPUT_BUFFER_PADDING_SIZE past the packet. The seam owns the
+// number so core HLE never encodes an FFmpeg constant whose value changed across versions.
+inline constexpr size_t kStreamInputPadding = 64;
 
 class DecoderBackend {
 public:

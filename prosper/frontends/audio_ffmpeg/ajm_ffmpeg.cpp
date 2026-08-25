@@ -23,6 +23,8 @@ extern "C" {
 
 namespace prosper::ajm {
 namespace {
+// Hot path (per decode call): getenv walks environ linearly; sample once.
+inline bool audiolog() { static const bool on = getenv("PROSPER_AUDIOLOG") != nullptr; return on; }
 
 // How a codec's byte stream is cut into packets.
 //
@@ -142,51 +144,47 @@ public:
         // Wwise streaming (#2981): accumulate fragments; each decode() emits one complete
         // Opus packet (2-byte LE size prefix + payload), reassembled from the fragment stream.
         if (framing_ == Framing::OpusStream) {
-            if (input.empty()) {
-                result.ok = true;
-                result.produced_bytes = static_cast<uint32_t>(written_samples * sizeof(int16_t));
-                result.channels = channels_;
-                result.sample_rate = sample_rate_;
-                return result;
-            }
-            opus_pending_.insert(opus_pending_.end(), input.begin(), input.end());
-            // Extract the next complete packet: 2-byte LE prefix, then that many payload bytes.
-            if (opus_pending_.size() < 2) {
-                result.ok = true;
-                // The fragment is buffered: report it consumed or the guest re-feeds the same
-                // bytes and the pending stream fills with duplicates (live GRIS feeds 2+1-byte
-                // fragments and trusts iSizeConsumed to advance its ring).
-                result.consumed_bytes = static_cast<uint32_t>(input.size());
-                return result;
-            }
-            // 2-byte LE prefix per packet — verified against live GRIS traffic (#2981).
-            const unsigned pkt_len = opus_pending_[0] | (opus_pending_[1] << 8);
-            if (opus_pending_.size() < 2 + pkt_len) {
-                static std::atomic<int> w{0};
-                if (getenv("PROSPER_AUDIOLOG") && w.fetch_add(1) < 4)
-                    fprintf(stderr, "[opus-stream] waiting: pending=%zu need=%u\n",
-                            opus_pending_.size(), 2 + pkt_len);
-                result.ok = true;   // need more fragments before a full packet
-                result.consumed_bytes = static_cast<uint32_t>(input.size());
-                return result;
-            }
-            av_packet_unref(packet_);
-            if (int ap = av_new_packet(packet_, static_cast<int>(pkt_len)); ap < 0)
-                return fail();
-            std::memcpy(packet_->data, opus_pending_.data() + 2, pkt_len);
-            int send = avcodec_send_packet(context_, packet_);
-            if (send == AVERROR(EAGAIN)) {
+            // Ring-model framing (#2981 review 2c): retire every complete packet the output span
+            // can hold — 2-byte LE size prefix + payload per packet (verified against live GRIS
+            // traffic) — and report exactly the bytes retired as consumed. Anything unconsumed
+            // (a trailing partial packet, or packets left for lack of output space) is DROPPED
+            // here: the guest's ring protocol re-submits unconsumed bytes (live GRIS re-sends
+            // the same buffer until iSizeConsumed > 0), so retaining them would duplicate them
+            // on the retry. No accumulator: memory is bounded by one input chunk.
+            size_t off = 0;   // consumed within this input
+            static std::atomic<int> w{0};
+            while (input.size() - off >= 2) {
+                const unsigned pkt_len = input[off] | (input[off + 1] << 8);
+                if (input.size() - off < 2 + pkt_len) {
+                    if (audiolog() && w.fetch_add(1) < 4)
+                        fprintf(stderr, "[opus-stream] waiting: avail=%zu need=%u\n",
+                                input.size() - off, 2 + pkt_len);
+                    break;   // trailing partial packet: dropped, the guest re-feeds it
+                }
+                // Backpressure mirrors the carry_ high-water check above: with no output space
+                // (or retained PCM at the cap), stop retiring so the guest retries.
+                if (written_samples >= output.size() ||
+                    carry_.size() - carry_offset_ >= kMaxCarrySamples)
+                    break;
+                av_packet_unref(packet_);
+                if (int ap = av_new_packet(packet_, static_cast<int>(pkt_len)); ap < 0)
+                    return fail();
+                std::memcpy(packet_->data, input.data() + off + 2, pkt_len);
+                int send = avcodec_send_packet(context_, packet_);
+                if (send == AVERROR(EAGAIN)) {
+                    if (!receive_frames(&decoded_frames)) return fail();
+                    send = avcodec_send_packet(context_, packet_);
+                }
+                if (send < 0) return fail();
                 if (!receive_frames(&decoded_frames)) return fail();
-                send = avcodec_send_packet(context_, packet_);
+                written_samples += drain(output.subspan(written_samples));
+                off += 2 + pkt_len;
             }
-            if (send < 0) return fail();
-            written_samples += drain(output.subspan(written_samples));
-            if (getenv("PROSPER_AUDIOLOG"))
-                fprintf(stderr, "[opus-stream] decoded pkt_len=%u pending_left=%zu produced=%u\n",
-                        pkt_len, opus_pending_.size() - 2 - pkt_len, written_samples);
-            opus_pending_.erase(opus_pending_.begin(), opus_pending_.begin() + 2 + pkt_len);
+            if (audiolog() && off)
+                fprintf(stderr, "[opus-stream] decoded %zu bytes produced=%zu\n",
+                        off, written_samples);
             result.ok = true;
-            result.consumed_bytes = static_cast<uint32_t>(input.size());
+            result.consumed_bytes = static_cast<uint32_t>(off);
             result.produced_bytes = static_cast<uint32_t>(written_samples * sizeof(int16_t));
             result.decoded_frames = decoded_frames;
             result.channels = channels_;
@@ -204,7 +202,7 @@ public:
                 if (int ap = av_new_packet(packet_, static_cast<int>(input.size())); ap < 0)
                     return fail();
                 std::memcpy(packet_->data, input.data(), input.size());
-                if (getenv("PROSPER_AUDIOLOG")) {
+                if (audiolog()) {
                     fprintf(stderr, "[ajm-opus] send pkt size=%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
                             packet_->size, packet_->data[0], packet_->data[1], packet_->data[2],
                             packet_->data[3], packet_->data[4], packet_->data[5], packet_->data[6],
@@ -407,7 +405,6 @@ private:
     uint32_t sample_rate_ = 0;
     std::vector<int16_t> carry_;
     size_t carry_offset_ = 0;
-    std::vector<uint8_t> opus_pending_;   // OpusStream: accumulated fragments (#2981)
 };
 
 class FfmpegDecoderBackend final : public DecoderBackend {
@@ -450,12 +447,17 @@ public:
         }
         case Codec::Opus:
         case Codec::OpusAlt:
-            // Wwise-Opus (WAVE fmt 0x3041). Two input shapes:
-            //  - streamed media: sceAjmBatchJobDecodeSplit fragments of the length-prefixed
-            //    Opus packet stream — OpusStream framing accumulates and reassembles them;
-            //  - whole-packet jobs: one raw Opus packet per job — Unit framing.
-            // The 19-byte OpusHead goes in as extradata: without it the libopus decoder's
-            // state breaks on the second sequential packet (#2981).
+            // Wwise-Opus (WAVE fmt 0x3041). The live shape is streamed media:
+            // sceAjmBatchJobDecodeSplit fragments of the length-prefixed Opus packet stream —
+            // OpusStream framing accumulates and reassembles them. NOTE: this framing is chosen
+            // unconditionally; a title submitting whole raw Opus packets per job would need
+            // Unit framing (its first two bytes would be read as a length prefix here). No
+            // such title is in the corpus; revisit if one appears.
+            // The guest path never supplies extradata (nothing in the HLE layer populates
+            // StreamConfig::extradata), and live GRIS decodes 12k+ sequential packets without
+            // it — libopus via FFmpeg initialises fine with defaults for a plain stereo
+            // stream. The earlier "breaks on the second packet" claim here was wrong; keep
+            // cfg.extradata plumbed for callers (tests) that do supply an OpusHead.
             decoder = std::make_unique<FfmpegStreamDecoder>(AV_CODEC_ID_OPUS, max_channels,
                                                             Framing::OpusStream, cfg.extradata);
             break;

@@ -70,20 +70,25 @@ static std::vector<uint8_t> framed_stream() {
     return stream;
 }
 
-// Feed the framed stream in small fragments (the real DecodeSplit jobs carry 2-3 byte
-// pieces); each decode() = one fragment. The decoder accumulates and emits PCM per
-// completed packet.
+// Feed the framed stream the way the guest's ring does: append a small fragment (the real
+// DecodeSplit jobs carry 2-3 byte pieces) to the unconsumed remainder, decode, then advance by
+// exactly the consumed count. The decoder retires complete packets and drops the trailing
+// partial packet — the ring re-feeds it with the next fragment (#2981 review 2c).
 std::vector<int16_t> decode_all(ajm::StreamDecoder& decoder, uint32_t& sample_rate,
                                 uint32_t& channels) {
     std::vector<int16_t> pcm;
     uint32_t sample_rate_out = 0, channels_out = 0;
     const std::vector<uint8_t> stream = framed_stream();
+    std::vector<uint8_t> ring;
     for (size_t pos = 0; pos < stream.size(); pos += 3) {
         const size_t frag = std::min<size_t>(3, stream.size() - pos);
-        const std::span<const uint8_t> in(stream.data() + pos, frag);
+        ring.insert(ring.end(), stream.data() + pos, stream.data() + pos + frag);
         std::vector<int16_t> out(960 * 2);
-        const ajm::DecodeResult r = decoder.decode(in, out);
+        const ajm::DecodeResult r = decoder.decode(ring, out);
         pcm.insert(pcm.end(), out.begin(), out.begin() + r.produced_bytes / sizeof(int16_t));
+        if (r.sample_rate) sample_rate_out = r.sample_rate;
+        if (r.channels) channels_out = r.channels;
+        ring.erase(ring.begin(), ring.begin() + static_cast<long>(r.consumed_bytes));
     }
     sample_rate = sample_rate_out;
     channels = channels_out;
@@ -148,11 +153,13 @@ void run_batch_case(ajm::Codec codec, const char* name) {
     int16_t peak = 0;
     uint32_t sample_rate = 0, channels = 0;
     const std::vector<uint8_t> stream = framed_stream();
+    std::vector<uint8_t> ring;   // the guest's unconsumed remainder, grown one fragment at a time
     for (size_t pos = 0; pos < stream.size(); pos += 3) {
         const size_t frag = std::min<size_t>(3, stream.size() - pos);
+        ring.insert(ring.end(), stream.data() + pos, stream.data() + pos + frag);
         Sideband sb{};
         std::vector<int16_t> out(960 * 2);
-        if (job_decode(addr(&info), instance, addr(stream.data() + pos), frag,
+        if (job_decode(addr(&info), instance, addr(ring.data()), ring.size(),
                        addr(out.data()), out.size() * sizeof(int16_t),
                        addr(&sb), 0, 0, 0) != 0) {
             CHECK(false, "JobDecode queues the fragment");
@@ -170,6 +177,9 @@ void run_batch_case(ajm::Codec codec, const char* name) {
         }
         if (sb.uiTotalDecodedSamples) sample_rate = 48000;
         (void)channels;
+        // Advance the ring by what the decoder actually consumed; the rest is re-fed.
+        const uint32_t consumed = sb.iSizeConsumed;
+        ring.erase(ring.begin(), ring.begin() + static_cast<long>(consumed));
     }
     CHECK(!pcm.empty(), "batch lifecycle produces PCM");
     if (pcm.empty()) return;
