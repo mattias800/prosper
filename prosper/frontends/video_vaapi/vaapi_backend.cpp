@@ -690,8 +690,34 @@ void decode_session(Session& session, std::stop_token stop) {
             return receive_frames(decoder, video);
         };
 
+        // Compressed video packets awaiting queue room. When the video queue fills, the worker
+        // HOLDS the packet and keeps demuxing/servicing audio instead of blocking inside
+        // enqueue_video: blocking there starves the audio consumer (the audio queue drains while
+        // the worker sleeps on video), which tripped the starvation drop path ~24 times per 10 s —
+        // 12% of the intro's frames lost (#2981 FMV). Held packets are compressed (bytes, not
+        // frames), so the hold costs kilobytes for the tens of milliseconds the queue needs to
+        // drain. RAII: every exit path through this scope, goto `finished` included, unrefs them.
+        struct HeldVideo {
+            std::deque<AVPacket*> q;
+            ~HeldVideo() { while (!q.empty()) { av_packet_unref(q.front()); q.pop_front(); } }
+        } held_video;
+        auto video_queue_has_room = [&]() {
+            std::lock_guard<std::mutex> lock(session.mutex);
+            return session.video_queue.size() < kVideoQueueCapacity;
+        };
+        auto flush_held_video = [&]() -> bool {
+            while (!held_video.q.empty() && video_queue_has_room()) {
+                AVPacket* held = held_video.q.front();
+                held_video.q.pop_front();
+                if (!submit_packet(pipeline.video, held, true)) { av_packet_unref(held); return false; }
+                av_packet_unref(held);
+            }
+            return true;
+        };
+
         bool decode_ok = true;
         while (!session_stopping(session, stop)) {
+            if (!flush_held_video()) { decode_ok = false; break; }
             result = av_read_frame(pipeline.format, pipeline.packet);
             if (result == AVERROR_EOF) break;
             if (result < 0) {
@@ -699,15 +725,36 @@ void decode_session(Session& session, std::stop_token stop) {
                 decode_ok = false;
                 break;
             }
-            if (pipeline.packet->stream_index == video_stream)
-                decode_ok = submit_packet(pipeline.video, pipeline.packet, true);
-            else if (pipeline.audio && pipeline.packet->stream_index == audio_stream)
+            if (pipeline.packet->stream_index == video_stream) {
+                if (video_queue_has_room()) {
+                    decode_ok = submit_packet(pipeline.video, pipeline.packet, true);
+                } else {
+                    AVPacket* held = av_packet_clone(pipeline.packet);
+                    if (held) held_video.q.push_back(held);
+                    else decode_ok = submit_packet(pipeline.video, pipeline.packet, true);
+                }
+            }
+            else if (pipeline.audio && pipeline.packet->stream_index == audio_stream) {
                 decode_ok = submit_packet(pipeline.audio, pipeline.packet, false);
+                if (decode_ok && !flush_held_video()) break;
+            }
             av_packet_unref(pipeline.packet);
             if (!decode_ok) break;
         }
         if (decode_ok && !session_stopping(session, stop)) {
-            decode_ok = submit_packet(pipeline.video, nullptr, true);
+            // Drain the held tail, then flush both decoders.
+            while (!held_video.q.empty() && !session_stopping(session, stop)) {
+                if (video_queue_has_room()) {
+                    AVPacket* held = held_video.q.front();
+                    held_video.q.pop_front();
+                    decode_ok = submit_packet(pipeline.video, held, true);
+                    av_packet_unref(held);
+                    if (!decode_ok) break;
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+            if (decode_ok) decode_ok = submit_packet(pipeline.video, nullptr, true);
             if (decode_ok && pipeline.audio)
                 decode_ok = submit_packet(pipeline.audio, nullptr, false);
         }
@@ -825,6 +872,23 @@ bool VaapiBackend::info(int id, StreamInfo& out) {
     return session->init_ok;
 }
 
+bool VaapiBackend::peek_video(int id, VideoFrame& out) {
+    const auto session = impl_->get(id);
+    if (!session) return false;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->video_queue.empty()) return false;
+    const auto& front = session->video_queue.front();
+    out.y = front.nv12.data();
+    const size_t y_bytes = static_cast<size_t>(front.stride) * front.height;
+    out.uv = front.nv12.data() + y_bytes;
+    out.width = front.width;
+    out.height = front.height;
+    out.y_stride = front.stride;
+    out.uv_stride = front.stride;
+    out.pts_us = front.pts_us;
+    return true;
+}
+
 bool VaapiBackend::next_video(int id, VideoFrame& out) {
     const auto session = impl_->get(id);
     if (!session) return false;
@@ -929,6 +993,11 @@ void VaapiBackend::close(int id) {
 VaapiBackend& shared_vaapi_backend() {
     static VaapiBackend backend_instance;
     return backend_instance;
+}
+
+uint64_t VaapiBackend::video_frames_dropped(int id) {
+    const auto session = impl_->get(id);
+    return session ? session->video_frames_dropped : 0;
 }
 
 uint64_t VaapiBackend::video_frames_dropped_for_test(int id) {

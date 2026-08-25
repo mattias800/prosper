@@ -1339,6 +1339,14 @@ struct AvpPlayer {
     // Those are also every place `paused` is cleared, which is what keeps paused time — during which
     // nothing is presented and nothing should be pulled — from counting as an absent consumer.
     std::chrono::steady_clock::time_point video_request_at = std::chrono::steady_clock::now();
+    // The delivery gate's clock: the next frame is due at (last delivered pts + wall time since
+    // that delivery). Re-anchoring on every delivery makes the gate self-correcting — a guest
+    // that stops polling (title screen) resumes where it stopped instead of fast-forwarding
+    // through the gap, and Pause/Resume/JumpToTime need no special cases (see
+    // s_avp_getvideodataex, #2981 FMV speed).
+    uint64_t gate_pts_ms = 0;
+    std::chrono::steady_clock::time_point gate_wall = std::chrono::steady_clock::now();
+    bool gate_started = false;
     // When the title supplies its AvPlayer texture allocator, decoded NV12 must be written into those
     // guest-visible buffers.  A host vector is invisible to the title's pre-wired texture descriptors.
     std::vector<uint8_t*> texture_frames;
@@ -2185,6 +2193,8 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                 p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
                 p.paused = false; p.stop_fired = false; p.seek_deliver = false;
                 p.video_request_at = std::chrono::steady_clock::now();
+            p.gate_pts_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
+                p.gate_pts_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
                 p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
                 p.backend = nullptr; p.backend_id = -1;
                 // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
@@ -2228,6 +2238,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false;
             p.stop_fired = false; p.seek_deliver = false;
             p.video_request_at = std::chrono::steady_clock::now();
+            p.gate_pts_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
             p.texture_frames = std::move(textures);
             p.texture_frame_bytes = texture_bytes;
             p.next_texture_frame = 0;
@@ -2283,7 +2294,7 @@ HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is
         AvpPlayer& p = it->second;
         if (p.have_source && !p.playing && !p.stop_fired) {
             p.playing = true; p.paused = false; play = true; obj = p.ev_obj; cb = p.ev_cb;
-            p.video_request_at = std::chrono::steady_clock::now();   // the media clock starts here
+            p.video_request_at = std::chrono::steady_clock::now();
         }
     }
     if (play) avp_fire(obj, cb, AVP_PLAY);
@@ -2406,9 +2417,27 @@ HLE(s_avp_getvideodata) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
+        if (p.gate_started) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - p.gate_wall > std::chrono::milliseconds(1000))
+                p.gate_wall = now;
+        }
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
-            if (b->next_video(p.backend_id, vf)) {
+            // Media-clock gate, same as GetVideoDataEx above (#2981 FMV speed).
+            bool have = b->peek_video(p.backend_id, vf);
+            if (have && !p.seek_deliver) {
+                const uint64_t pts_ms = vf.pts_us / 1000;
+                const uint64_t due_ms = p.gate_started
+                    ? p.gate_pts_ms + (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - p.gate_wall).count()
+                    : 0;
+                if (pts_ms > due_ms) have = false;
+            }
+            if (have && b->next_video(p.backend_id, vf)) {
+                p.gate_pts_ms = vf.pts_us / 1000;
+                p.gate_wall = std::chrono::steady_clock::now();
+                p.gate_started = true;
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
                 if (avp_stage_video(p, vf, false, staged, pitch)) {
@@ -2459,9 +2488,40 @@ HLE(s_avp_getvideodataex) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
+        // The media clock pauses while nobody consumes (#1973 semantics): a poll gap longer than
+        // this shifts the gate's anchor so the movie RESUMES where delivery stopped instead of
+        // fast-forwarding through the gap (a 53 s title screen must not skip the intro's first
+        // 53 s — measured live, #2981 FMV).
+        if (p.gate_started) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - p.gate_wall > std::chrono::milliseconds(1000))
+                p.gate_wall = now;
+        }
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
-            if (b->next_video(p.backend_id, vf)) {
+            // Media-clock gate: the real AvPlayer owns the clock and refuses frames whose PTS is
+            // not due yet. Measured without a gate, GRIS's 73.4 s intro delivered all 1761 frames
+            // in 19.0 s of wall (3.86x) — this title presents every frame it receives, so the
+            // pacing must live HERE, not in the guest. Peek first: next_video pops, and a frame
+            // refused after the pop would be lost. 20 ms lead = half a 24 fps frame, so the poll
+            // loop (measured ~5 ms cadence) picks the frame up on the first poll after it is due.
+            bool have = b->peek_video(p.backend_id, vf);
+            if (have && !p.seek_deliver) {
+                const uint64_t pts_ms = vf.pts_us / 1000;
+                const uint64_t due_ms = p.gate_started
+                    ? p.gate_pts_ms + (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - p.gate_wall).count()
+                    : 0;
+                // No delivery lead: a lead here accumulates per frame (each frame delivers
+                // lead-ms early, shifting the whole movie) — measured 1.59x with a 20 ms lead
+                // at the guest's ~38 Hz poll cadence. The poll interval is 5-10 ms, so the
+                // zero-lead delivery latency is bounded by one poll.
+                if (pts_ms > due_ms) have = false;   // not due yet; the guest re-polls
+            }
+            if (have && b->next_video(p.backend_id, vf)) {
+                p.gate_pts_ms = vf.pts_us / 1000;
+                p.gate_wall = std::chrono::steady_clock::now();
+                p.gate_started = true;
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
                 // Publish the frame only if its metadata is publishable: a refused fill would
@@ -2476,6 +2536,10 @@ HLE(s_avp_getvideodataex) {
                 }
             } else if (b->eof(p.backend_id) && !p.stop_fired) {
                 p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
+                if (avp_log())
+                    fprintf(stderr, "[avp] video-ex EOF handle=0x%llx decoder_dropped=%llu\n",
+                            (unsigned long long)a0,
+                            (unsigned long long)b->video_frames_dropped(p.backend_id));
             }
         } else if (p.synthetic && p.poll < avp_synth_frames()) {
             uint8_t* staged = nullptr;
@@ -2491,9 +2555,20 @@ HLE(s_avp_getvideodataex) {
         }
     }
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);
-    if (avp_log()) fprintf(stderr, "[avp] video-ex handle=0x%llx result=%llu data=%p stop=%d\n",
-                           (unsigned long long)a0, (unsigned long long)result,
-                           result ? fi->p_data : nullptr, (int)fire_stop);
+    if (avp_log()) {
+        static std::atomic<uint64_t> delivered{0};
+        static const auto t0 = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (result)
+            fprintf(stderr, "[avp] video-ex handle=0x%llx DELIVER #%llu t=%llums pts=%llums\n",
+                    (unsigned long long)a0,
+                    (unsigned long long)delivered.fetch_add(1) + 1,
+                    (unsigned long long)ms, (unsigned long long)fi->timestamp);
+        else
+            fprintf(stderr, "[avp] video-ex handle=0x%llx empty t=%llums\n",
+                    (unsigned long long)a0, (unsigned long long)ms);
+    }
     return result;
 }
 HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFrameInfo*)
@@ -2517,6 +2592,16 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
         AvpAudio details{(uint16_t)af.channels, {}, af.sample_rate,
                          (uint32_t)(af.samples * af.channels * sizeof(int16_t)), {}};
         memcpy(&fi->d0, &details, sizeof(details));
+        if (avp_log()) {
+            static std::atomic<uint64_t> adelivered{0};
+            static const auto at0 = std::chrono::steady_clock::now();
+            const auto ams = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - at0).count();
+            fprintf(stderr, "[avp] audio-deliver handle=0x%llx #%llu t=%llums pts=%llums samples=%u\n",
+                    (unsigned long long)a0,
+                    (unsigned long long)adelivered.fetch_add(1) + 1,
+                    (unsigned long long)ams, (unsigned long long)fi->timestamp, af.samples);
+        }
         return 1;
     }
     if (!p.synthetic || p.audio_poll >= avp_synth_frames()) return 0;
