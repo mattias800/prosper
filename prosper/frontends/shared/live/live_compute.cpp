@@ -4511,7 +4511,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double image_watch_ms = 0.0;
     double image_notify_ms = 0.0;
     double image_cache_ms = 0.0;
-    const std::vector<uint32_t>& spirv = item.spirv;
+    // PROSPER_LOAD_COMPUTE_SPIRV=<file>: replace the recompiled module with the file's contents
+    // before pipeline creation -- A/B shader variants in the live game with bindings/layouts
+    // exactly as the title realizes them (#2985). The descriptor layout reflects the ORIGINAL
+    // module, so the override must keep the same interface.
+    std::vector<uint32_t> spirv_override;
+    if (const char* load_path = std::getenv("PROSPER_LOAD_COMPUTE_SPIRV")) {
+        if (FILE* f = std::fopen(load_path, "rb")) {
+            uint32_t word;
+            while (std::fread(&word, sizeof word, 1, f) == 1) spirv_override.push_back(word);
+            std::fclose(f);
+            if (spirv_override.empty()) spirv_override.clear();
+            std::fprintf(stderr, "[compute] SPIR-V override loaded %zu words from %s\n",
+                         spirv_override.size(), load_path);
+        } else {
+            std::fprintf(stderr, "[compute] SPIR-V override %s could not be opened\n", load_path);
+        }
+    }
+    const std::vector<uint32_t>& spirv =
+        spirv_override.empty() ? item.spirv : spirv_override;
     const bool trace = trace_compute_item(item);
     // Per-resource table dump for a traced program. The writeback line names a BINDING and the
     // disassembly names a fetch PC; without the mapping between them, attributing a buffer's contents
