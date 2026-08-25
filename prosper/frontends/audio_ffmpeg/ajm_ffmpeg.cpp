@@ -145,19 +145,24 @@ public:
         // Opus packet (2-byte LE size prefix + payload), reassembled from the fragment stream.
         if (framing_ == Framing::OpusStream) {
             // Ring-model framing (#2981 review 2c): retire every complete packet the output span
-            // can hold — 2-byte LE size prefix + payload per packet (verified against live GRIS
-            // traffic) — and report exactly the bytes retired as consumed. Anything unconsumed
-            // (a trailing partial packet, or packets left for lack of output space) is DROPPED
-            // here: the guest's ring protocol re-submits unconsumed bytes (live GRIS re-sends
-            // the same buffer until iSizeConsumed > 0), so retaining them would duplicate them
-            // on the retry. No accumulator: memory is bounded by one input chunk.
+            // can hold — 2-byte LE size prefix + payload per packet (prefix endianness and
+            // framing verified against live GRIS traffic) — and report exactly the bytes retired
+            // as consumed. Anything unconsumed (a trailing partial packet, or packets left for
+            // lack of output space) is DROPPED here, because the guest's ring re-submits its
+            // unconsumed buffer: a live trace shows the same in=524 job submitted at t=11 ms and
+            // t=22 ms with iSizeConsumed=0, then consumed on the third submit once the packet
+            // completed. Retaining unconsumed bytes therefore duplicates them on the retry (the
+            // accumulator version corrupted 5 decode streams per session that way). No
+            // accumulator: memory is bounded by one input chunk.
             size_t off = 0;   // consumed within this input
             static std::atomic<int> w{0};
             while (input.size() - off >= 2) {
                 const unsigned pkt_len = input[off] | (input[off + 1] << 8);
                 // Opus caps a packet at 1275 bytes per frame; a desynchronised stream reads two
                 // payload bytes as a length and would otherwise wait forever for a packet that
-                // will never complete. Fail the decode visibly instead.
+                // will never complete. Fail the decode visibly instead — deliberately a hard
+                // stop for the instance: the guest re-feeds unconsumed bytes, so nothing here
+                // can resync; recovery is ClearContext (Wwise calls it on restart/seek).
                 if (pkt_len > 1275u * 8) return fail();
                 if (input.size() - off < 2 + pkt_len) {
                     if (audiolog() && w.fetch_add(1) < 4)

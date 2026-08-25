@@ -911,9 +911,9 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
     // not fire on one. That question is answered from the depth this file tracks — sampled BEFORE
     // the unlock, because a post-unlock lock-word read races the very waiter that acquired the
     // lock and would suppress the sleep exactly when it matters (#2988 review A).
-    const bool had_waiters = fair && !guest_mutex_held_recursively(m) &&
-                             slot_addr >= BOOT_AKSOUNDENGINE && slot_addr < BOOT_LIBC &&
-                             (*(volatile uint32_t*)(void*)m & 2u) != 0;   // AkSoundEngine.prx; bit1 = waiters
+    const bool had_waiters = fair && slot_addr >= BOOT_AKSOUNDENGINE && slot_addr < BOOT_LIBC &&
+                             !guest_mutex_held_recursively(m) &&
+                             (*(volatile uint32_t*)(void*)m & 2u) != 0;   // bit1 = waiters
 #else
     const bool had_waiters = false; (void)fair;
 #endif

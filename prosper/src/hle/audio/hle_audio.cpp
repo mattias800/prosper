@@ -3080,6 +3080,17 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 uint32_t first = produced;
                 if (produced > job.out_size && job.out2_size)
                     first = job.out_size - (job.out_size % frame_bytes);
+                if (produced - first > job.out2_size) {
+                    // The aligned split cannot fit the second half in the second descriptor —
+                    // only reachable when the guest's descriptors are frame-misaligned AND
+                    // produced nears out_total (the bound is out2_size + out_size%frame_bytes).
+                    // Fail visibly rather than overrun the guest buffer or drop samples
+                    // silently (#2988 review B2).
+                    instance.host_dec->invalidate();
+                    err = kAjm2ErrDecode;
+                    consumed = produced = 0;
+                    first = 0;
+                }
                 if (produced && !audio_store_bytes(job.out_addr, pcm.data(), first)) {
                     instance.host_dec->invalidate();
                     err = kAjm2ErrDecode;
@@ -3115,7 +3126,8 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             }
             ji = je;
             continue;
-        }        // A non-null invalid host decoder is deliberately terminal. Do not fall through to the
+        }
+        // A non-null invalid host decoder is deliberately terminal. Do not fall through to the
         // ATRAC9 path or erase the cumulative sample count on a later batch's error sideband.
         if (it != g_ajm2_inst.end() && it->second.host_dec) {
             for (size_t k = ji; k < je; ++k)
