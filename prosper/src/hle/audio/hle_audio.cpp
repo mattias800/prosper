@@ -3085,7 +3085,10 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     // only reachable when the guest's descriptors are frame-misaligned AND
                     // produced nears out_total (the bound is out2_size + out_size%frame_bytes).
                     // Fail visibly rather than overrun the guest buffer or drop samples
-                    // silently (#2988 review B2).
+                    // silently (#2988 review B2). The terminal invalidate is deliberate: a
+                    // misaligned descriptor pair is guest state, not decoder corruption, but
+                    // per-job rejection would re-fail every retry — and an aligned ring (every
+                    // shape GRIS submits) never reaches this branch.
                     instance.host_dec->invalidate();
                     err = kAjm2ErrDecode;
                     consumed = produced = 0;
@@ -3437,7 +3440,8 @@ HLE10(ajm_batch_job_clear_context) {
 }
 HLE10(ajm_batch_job_set_resample_ex) { return 0; } // resample params: the host backend resamples
 // GetResampleInfo/GetStatistics answer SCE_OK without writing their out-parameters. GRIS runs with
-// this and its audio verifies, so the values are ignored or benign in practice — but a title that
+// this and its audio verifies on this head (36,765 decode jobs, 0 errors, port-17 music 124.9 s of
+// 124.9 s audible), so the values are ignored or benign in practice — but a title that
 // READS them gets untouched stack (the #2951 shape). Zero-filling needs the out-argument layout,
 // which no live traffic has pinned yet.
 // CONFIDENCE: LOW that returning success-without-writes is safe beyond GRIS.

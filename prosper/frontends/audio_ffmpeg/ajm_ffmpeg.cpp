@@ -463,9 +463,9 @@ public:
             // Unit framing (its first two bytes would be read as a length prefix here). No
             // such title is in the corpus; revisit if one appears.
             // The guest path never supplies extradata (nothing in the HLE layer populates
-            // StreamConfig::extradata), and live GRIS decodes 12k+ sequential packets without
-            // it — libopus via FFmpeg initialises fine with defaults for a plain stereo
-            // stream. The earlier "breaks on the second packet" claim here was wrong; keep
+            // StreamConfig::extradata), and live GRIS decodes 36k+ sequential packets without
+            // it (36,765 decode jobs, 0 errors, on this head) — libopus via FFmpeg initialises
+            // fine with defaults for a plain stereo stream. The earlier "breaks on the second packet" claim here was wrong; keep
             // cfg.extradata plumbed for callers (tests) that do supply an OpusHead.
             decoder = std::make_unique<FfmpegStreamDecoder>(AV_CODEC_ID_OPUS, max_channels,
                                                             Framing::OpusStream, cfg.extradata);

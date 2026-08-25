@@ -19,6 +19,17 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-25
+
+### GRIS has sound now
+
+GRIS used to run in complete silence — no title music, no intro-movie audio, no gameplay music.
+The game was asking the console's audio hardware to decompress its music, and prosper was quietly
+dropping every single one of those requests. The requests are answered now: the intro movie plays
+with its soundtrack, and the music keeps playing through gameplay for the whole session.
+
+No picture for this one — it's audio. Start GRIS and listen.
+
 ## 2026-08-23
 
 ### Metaphor: ReFantazio can read its own font now, and the first thing it wanted to say was hello in twelve languages
