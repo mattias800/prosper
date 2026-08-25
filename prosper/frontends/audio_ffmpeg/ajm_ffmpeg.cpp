@@ -153,6 +153,10 @@ public:
             // Extract the next complete packet: 2-byte LE prefix, then that many payload bytes.
             if (opus_pending_.size() < 2) {
                 result.ok = true;
+                // The fragment is buffered: report it consumed or the guest re-feeds the same
+                // bytes and the pending stream fills with duplicates (live GRIS feeds 2+1-byte
+                // fragments and trusts iSizeConsumed to advance its ring).
+                result.consumed_bytes = static_cast<uint32_t>(input.size());
                 return result;
             }
             const unsigned pkt_len = opus_pending_[0] | (opus_pending_[1] << 8);   // LE (test contract; live endianness TBD #2981)
@@ -162,6 +166,7 @@ public:
                     fprintf(stderr, "[opus-stream] waiting: pending=%zu need=%u\n",
                             opus_pending_.size(), 2 + pkt_len);
                 result.ok = true;   // need more fragments before a full packet
+                result.consumed_bytes = static_cast<uint32_t>(input.size());
                 return result;
             }
             av_packet_unref(packet_);

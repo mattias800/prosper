@@ -2647,12 +2647,14 @@ struct AjmDecodeInst {
 };
 struct AjmDecJob {
     uint32_t instance = 0;
-    uint64_t in_addr = 0, out_addr = 0, result_addr = 0;
-    uint32_t in_size = 0, out_size = 0;
-    // sceAjmBatchJobDecodeSplit (#2981): a second input fragment decoded as the contiguous
-    // continuation of the first. Zero when the job is the single-buffer BatchJobDecode shape.
-    uint64_t in2_addr = 0;
-    uint32_t in2_size = 0;
+    uint64_t out_addr = 0, result_addr = 0;
+    uint32_t out_size = 0;
+    // sceAjmBatchJobDecodeSplit (#2981): the guest passes ARRAYS of {ptr,size} buffers —
+    // AkSoundEngine's live callsite builds up to four split input fragments and one or two
+    // output buffers on its stack, PS4-BatchJobRunSplitBufferRa shape.
+    uint64_t in_addr[4] = {0, 0, 0, 0};
+    uint32_t in_size[4] = {0, 0, 0, 0};
+    uint32_t num_in = 0;
 };
 // SCE_AJM_ERROR_INVALID_PARAMETER — the AJM error space (see the constants above); -1 is not a value
 // the guest's error mapping recognizes.
@@ -3034,11 +3036,13 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 // handed; the guest buffer makes no such promise, so stage zero padding after
                 // the fragment. Without this the batch path parses heap tail as a packet header
                 // (exposed by the Ajm Opus path, #2981 — the stream seam already padded).
-                std::vector<uint8_t> input(job.in_size + job.in2_size + 64, 0);
-                size_t got = audio_read_bytes_partial(job.in_addr, input.data(), job.in_size);
-                if (job.in2_size)
-                    got += audio_read_bytes_partial(job.in2_addr, input.data() + job.in_size,
-                                                    job.in2_size);
+                size_t in_total = 0;
+                for (uint32_t f = 0; f < job.num_in; ++f) in_total += job.in_size[f];
+                std::vector<uint8_t> input(in_total + 64, 0);
+                size_t got = 0;
+                for (uint32_t f = 0; f < job.num_in; ++f)
+                    got += audio_read_bytes_partial(job.in_addr[f], input.data() + got,
+                                                    job.in_size[f]);
                 std::vector<int16_t> pcm(job.out_size / sizeof(int16_t));
                 const ajm::DecodeResult decoded = instance.host_dec->decode(
                     std::span<const uint8_t>(input.data(), got), std::span<int16_t>(pcm));
@@ -3083,7 +3087,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%u "
                             "out=%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
                             (unsigned long long)ajm2_log_ms(), inst_id, instance.codec,
-                            got, job.in_size, job.out_size, consumed, produced, decoded.channels,
+                            got, (unsigned)job.num_in, job.out_size, consumed, produced, decoded.channels,
                             decoded.sample_rate, (unsigned long long)instance.decoded_samples,
                             !result_published ? " RESULT_STORE_ERR" : (err ? " ERR" : ""));
             }
@@ -3096,6 +3100,9 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             for (size_t k = ji; k < je; ++k)
                 ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0,
                                   it->second.decoded_samples);
+            if (getenv("PROSPER_AUDIOLOG"))
+                fprintf(stderr, "[ajm2] decode inst=%u SKIP n=%zu host_dec INVALID\n",
+                        inst_id, je - ji);
             ji = je;
             continue;
         }
@@ -3108,6 +3115,10 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 : 0;
             for (size_t k = ji; k < je; ++k)
                 ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0, total);
+            if (getenv("PROSPER_AUDIOLOG"))
+                fprintf(stderr, "[ajm2] decode inst=%u SKIP n=%zu no at9/host (inst_%s)\n",
+                        inst_id, je - ji,
+                        it == g_ajm2_inst.end() ? "MISSING" : "present");
             ji = je;
             continue;
         }
@@ -3144,8 +3155,12 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             // Over-allocate by a full superframe: LibAtrac9's bit reader is unbounded, so a truncated
             // or corrupt block's parse may step past the nominal superframe. decode_superframe still
             // rejects such a parse, but the read must land in memory we own.
-            in.assign((size_t)job.in_size + (size_t)sfb, 0);
-            const size_t got = audio_read_bytes_partial(job.in_addr, in.data(), job.in_size);
+            size_t in_total = 0;
+            for (uint32_t f = 0; f < job.num_in; ++f) in_total += job.in_size[f];
+            in.assign(in_total + (size_t)sfb, 0);
+            size_t got = 0;
+            for (uint32_t f = 0; f < job.num_in; ++f)
+                got += audio_read_bytes_partial(job.in_addr[f], in.data() + got, job.in_size[f]);
             // Only ever hand the guest whole sample-frames: a byte-granular partial write would shift
             // the interleave and swap L/R for the rest of the stream.
             const uint32_t out_cap = job.out_size - (job.out_size % frame_bytes);
@@ -3225,7 +3240,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             }
             if (log)
                 fprintf(stderr, "[ajm2] t=%llums decode inst=%u in=%zu/%u out=%u -> %u consumed, %u PCM, total=%llu carry=%zu%s\n",
-                        (unsigned long long)ajm2_log_ms(), inst_id, got, job.in_size, job.out_size,
+                        (unsigned long long)ajm2_log_ms(), inst_id, got, (unsigned)job.num_in, job.out_size,
                         in_cur, produced, (unsigned long long)it->second.decoded_samples,
                         carry.size() * sizeof(int16_t),
                         !result_published ? " RESULT_STORE_ERR" : (err ? " ERR" : ""));
@@ -3315,26 +3330,55 @@ HLE10(ajm_batch_job_decode) {
     // guest frame), and are never legitimate for a decode block.
     if (a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
-    g_ajm2_jobs[a0].push_back({(uint32_t)a1, a2, a4, a6, (uint32_t)a3, (uint32_t)a5});
+    g_ajm2_jobs[a0].push_back({(uint32_t)a1, a4, a6, (uint32_t)a5,
+                               {a2, 0, 0, 0}, {(uint32_t)a3, 0, 0, 0}, 1});
     return 0;
 }
 HLE10(ajm_batch_job_decode_split) {
-    // sceAjmBatchJobDecodeSplit (#2981): the two-fragment decode shape AkSoundEngine.prx imports
-    // for streamed media — a2/a3 = in1/in1Size, a4/a5 = in2/in2Size, a6/a7 = out/outSize,
-    // a8 = result sideband. The fragments are decoded as one contiguous stream.
+    // sceAjmBatchJobDecodeSplit (#2981) — GRIS/AkSoundEngine ABI, proven by live-callsite
+    // disassembly (the guest builds the call at eboot AkSoundEngine+... before `call stub`):
+    //   a0 = SceAjmBatchInfo*            a1 = SceAjmInstance
+    //   a2 = AjmBuffer* pIn  ({u64 ptr, u64 size} entries, built on the caller's stack)
+    //   a3 = numIn (1..4; the callsite loop caps at 4)
+    //   a4 = AjmBuffer* pOut ({ptr,size} entries)   a5 = numOut (1 or 2)
+    //   a6 = sideband result (instance_obj+0x78)    a7/a8 = sideband bookkeeping (0x708 cap)
+    //   a9 = return address
+    // The earlier mapping treated a2/a3 as a raw (ptr,size) input pair and read dispatcher
+    // stack residue as a 24 GB "outSize", silently rejecting EVERY job — the direct cause of
+    // total Wwise silence in this title. The real payload is whole media chunks (e.g. a
+    // 1472-byte ring-buffer block holding many framed Opus packets), not 3-byte fragments.
+    if (!a0 || !a2 || !a4 || !a6 || !a3 || !a5 || a3 > 4 || a5 > 2)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a6;
+    // Output: first buffer's {ptr, size}; cap the staging like every other builder path.
+    uint64_t out_desc[2 * 2] = {0, 0, 0, 0};
+    if (!audio_read_bytes_partial(a4, out_desc, sizeof(uint64_t) * 2 * a5))
+        return AJM_ERR_INVALID_PARAMETER;
+    job.out_addr = out_desc[0];
+    job.out_size = (uint32_t)std::min<uint64_t>(out_desc[1], AJM_MAX_BUILDER_BYTES);
+    if (!job.out_addr || !job.out_size) return AJM_ERR_INVALID_PARAMETER;
+    // Inputs: concatenate every {ptr,size} entry into one contiguous stream.
+    uint64_t in_desc[2 * 4] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (!audio_read_bytes_partial(a2, in_desc, sizeof(uint64_t) * 2 * a3))
+        return AJM_ERR_INVALID_PARAMETER;
+    job.num_in = (uint32_t)a3;
+    for (uint32_t f = 0; f < job.num_in; ++f) {
+        job.in_addr[f] = in_desc[2 * f];
+        const uint64_t sz = in_desc[2 * f + 1];
+        if (!job.in_addr[f] || sz > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+        job.in_size[f] = (uint32_t)sz;
+    }
     if (getenv("PROSPER_AUDIOLOG")) { static std::atomic<uint32_t> n{0}; if (n.fetch_add(1) < 16)
-        fprintf(stderr, "[ajm2] JobDecodeSplit batch=0x%llx inst=%llu in=0x%llx/%llu+0x%llx/%llu "
-                        "out=0x%llx/%llu result=0x%llx\n",
+        fprintf(stderr, "[ajm2] JobDecodeSplit batch=0x%llx inst=%llu in=%zxB(%u frag) "
+                        "out=0x%llx/%u result=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1,
-                (unsigned long long)a2, (unsigned long long)a3,
-                (unsigned long long)a4, (unsigned long long)a5,
-                (unsigned long long)a6, (unsigned long long)a7, (unsigned long long)a8); }
-    if (!a0 || !a2 || !a4 || !a6) return AJM_ERR_INVALID_PARAMETER;
-    if (a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES ||
-        a7 > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+                (size_t)(job.in_size[0] + job.in_size[1] + job.in_size[2] + job.in_size[3]),
+                job.num_in, (unsigned long long)job.out_addr, job.out_size,
+                (unsigned long long)job.result_addr); }
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
-    g_ajm2_jobs[a0].push_back({(uint32_t)a1, a2, a6, a8, (uint32_t)a3, (uint32_t)a7,
-                               a4, (uint32_t)a5});
+    g_ajm2_jobs[a0].push_back(std::move(job));
     return 0;
 }
 HLE10(ajm_batch_job_clear_context) { return 0; }   // per-instance scratch reset; nothing to free
