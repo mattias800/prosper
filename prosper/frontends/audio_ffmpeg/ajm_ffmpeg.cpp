@@ -16,12 +16,15 @@ extern "C" {
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <atomic>
 #include <iterator>
 #include <span>
 #include <vector>
 
 namespace prosper::ajm {
 namespace {
+// Hot path (per decode call): getenv walks environ linearly; sample once.
+inline bool audiolog() { static const bool on = getenv("PROSPER_AUDIOLOG") != nullptr; return on; }
 
 // How a codec's byte stream is cut into packets.
 //
@@ -31,7 +34,11 @@ namespace {
 //           guest's own container demuxer, with the codec configuration supplied out of band
 //           (raw AAC out of an MP4 `esds`). Running a parser over these finds no syncword and
 //           silently yields nothing, so the parser must be bypassed rather than merely tolerated.
-enum class Framing { Parser, Unit, Sniff };
+enum class Framing { Parser, Unit, Sniff,
+    // Wwise streaming (#2981): each decode() input is a fragment of a length-prefixed Opus
+    // packet stream — 2-byte little-endian size prefix, then that many payload bytes. The
+    // decoder accumulates fragments and emits one complete Opus packet per decode.
+    OpusStream };
 
 // Pack a two-byte MPEG-4 AudioSpecificConfig -- the bytes an MP4 `esds` box would have carried,
 // and the only thing that can configure a de-framed (raw) AAC elementary stream.
@@ -134,11 +141,82 @@ public:
         // Unit framing: the span IS one access unit. Send it whole and report it fully consumed --
         // there is no parser to tell us otherwise, and a partial consume would desynchronise the
         // guest's own demuxer cursor.
+        // Wwise streaming (#2981): accumulate fragments; each decode() emits one complete
+        // Opus packet (2-byte LE size prefix + payload), reassembled from the fragment stream.
+        if (framing_ == Framing::OpusStream) {
+            // Ring-model framing (#2981 review 2c): retire every complete packet the output span
+            // can hold — 2-byte LE size prefix + payload per packet (prefix endianness and
+            // framing verified against live GRIS traffic) — and report exactly the bytes retired
+            // as consumed. Anything unconsumed (a trailing partial packet, or packets left for
+            // lack of output space) is DROPPED here, because the guest's ring re-submits its
+            // unconsumed buffer: a live trace shows the same in=524 job submitted at t=11 ms and
+            // t=22 ms with iSizeConsumed=0, then consumed on the third submit once the packet
+            // completed. Retaining unconsumed bytes therefore duplicates them on the retry (the
+            // accumulator version corrupted 5 decode streams per session that way). No
+            // accumulator: memory is bounded by one input chunk.
+            size_t off = 0;   // consumed within this input
+            static std::atomic<int> w{0};
+            while (input.size() - off >= 2) {
+                const unsigned pkt_len = input[off] | (input[off + 1] << 8);
+                // Opus caps a packet at 1275 bytes per frame; a desynchronised stream reads two
+                // payload bytes as a length and would otherwise wait forever for a packet that
+                // will never complete. Fail the decode visibly instead — deliberately a hard
+                // stop for the instance: the guest re-feeds unconsumed bytes, so nothing here
+                // can resync; recovery is ClearContext (Wwise calls it on restart/seek).
+                if (pkt_len > 1275u * 8) return fail();
+                if (input.size() - off < 2 + pkt_len) {
+                    if (audiolog() && w.fetch_add(1) < 4)
+                        fprintf(stderr, "[opus-stream] waiting: avail=%zu need=%u\n",
+                                input.size() - off, 2 + pkt_len);
+                    break;   // trailing partial packet: dropped, the guest re-feeds it
+                }
+                // Backpressure mirrors the carry_ high-water check above: with no output space
+                // (or retained PCM at the cap), stop retiring so the guest retries.
+                if (written_samples >= output.size() ||
+                    carry_.size() - carry_offset_ >= kMaxCarrySamples)
+                    break;
+                av_packet_unref(packet_);
+                if (int ap = av_new_packet(packet_, static_cast<int>(pkt_len)); ap < 0)
+                    return fail();
+                std::memcpy(packet_->data, input.data() + off + 2, pkt_len);
+                int send = avcodec_send_packet(context_, packet_);
+                if (send == AVERROR(EAGAIN)) {
+                    if (!receive_frames(&decoded_frames)) return fail();
+                    send = avcodec_send_packet(context_, packet_);
+                }
+                if (send < 0) return fail();
+                if (!receive_frames(&decoded_frames)) return fail();
+                written_samples += drain(output.subspan(written_samples));
+                off += 2 + pkt_len;
+            }
+            if (audiolog() && off)
+                fprintf(stderr, "[opus-stream] decoded %zu bytes produced=%zu\n",
+                        off, written_samples);
+            result.ok = true;
+            result.consumed_bytes = static_cast<uint32_t>(off);
+            result.produced_bytes = static_cast<uint32_t>(written_samples * sizeof(int16_t));
+            result.decoded_frames = decoded_frames;
+            result.channels = channels_;
+            result.sample_rate = sample_rate_;
+            return result;
+        }
         if (framing_ == Framing::Unit) {
             if (!input.empty()) {
+                // Refcounted packet: av_new_packet allocates with FFmpeg's own padding and
+                // proper avbuffer ownership. The old spelling (av_packet_unref + manual
+                // data/size pointing at a stack-local padded buffer) left the decoder
+                // referencing freed staging when the packet size SHRANK between calls —
+                // Wwise-Opus's variable packet sizes hit exactly that (#2981).
                 av_packet_unref(packet_);
-                packet_->data = padded.data();
-                packet_->size = static_cast<int>(input.size());
+                if (int ap = av_new_packet(packet_, static_cast<int>(input.size())); ap < 0)
+                    return fail();
+                std::memcpy(packet_->data, input.data(), input.size());
+                if (audiolog()) {
+                    fprintf(stderr, "[ajm-opus] send pkt size=%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            packet_->size, packet_->data[0], packet_->data[1], packet_->data[2],
+                            packet_->data[3], packet_->data[4], packet_->data[5], packet_->data[6],
+                            packet_->data[7]);
+                }
                 int send = avcodec_send_packet(context_, packet_);
                 if (send == AVERROR(EAGAIN)) {
                     if (!receive_frames(&decoded_frames)) return fail();
@@ -211,6 +289,9 @@ private:
     // installs the out-of-band extradata instead, which is the only thing that can configure a
     // de-framed stream.
     bool open_codec(Framing framing) {
+        // Same decoder selection as the constructor: the Sniff path re-opens after the first
+        // access unit and must not swap the codec out from under the allocated context
+        // (libopus-vs-native mismatch, #2981).
         const AVCodec* codec = avcodec_find_decoder(codec_id_);
         if (!codec || !context_) return false;
         if (framing == Framing::Parser) {
@@ -373,6 +454,22 @@ public:
                                                             Framing::Sniff, std::move(asc));
             break;
         }
+        case Codec::Opus:
+        case Codec::OpusAlt:
+            // Wwise-Opus (WAVE fmt 0x3041). The live shape is streamed media:
+            // sceAjmBatchJobDecodeSplit fragments of the length-prefixed Opus packet stream —
+            // OpusStream framing accumulates and reassembles them. NOTE: this framing is chosen
+            // unconditionally; a title submitting whole raw Opus packets per job would need
+            // Unit framing (its first two bytes would be read as a length prefix here). No
+            // such title is in the corpus; revisit if one appears.
+            // The guest path never supplies extradata (nothing in the HLE layer populates
+            // StreamConfig::extradata), and live GRIS decodes 36k+ sequential packets without
+            // it (36,765 decode jobs, 0 errors, on this head) — libopus via FFmpeg initialises
+            // fine with defaults for a plain stereo stream. The earlier "breaks on the second packet" claim here was wrong; keep
+            // cfg.extradata plumbed for callers (tests) that do supply an OpusHead.
+            decoder = std::make_unique<FfmpegStreamDecoder>(AV_CODEC_ID_OPUS, max_channels,
+                                                            Framing::OpusStream, cfg.extradata);
+            break;
         default:
             return nullptr;   // ATRAC9 stays with the core's vendored LibAtrac9 implementation
         }

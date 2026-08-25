@@ -276,8 +276,16 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
             say("module path case-corrected: %s -> %s\n", in[i].path.c_str(), resolved.c_str());
             in[i].path = std::move(resolved);
         }
-        if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
-        else { say("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
+        FILE* f = fopen(in[i].path.c_str(), "rb");
+        if (f) { fclose(f); }
+        else {
+            int err = errno;
+            // NOTE: `resolved` was moved into in[i].path above when case-corrected, so the path
+            // printed here IS the resolved one; no separate resolved_path field.
+            say("skipping absent module: %s (errno=%d: %s, path_len=%zu)\n",
+                in[i].path.c_str(), err, strerror(err), in[i].path.size());
+            in.erase(in.begin() + (ptrdiff_t)i);
+        }
     }
     drop_unimported_support_modules(in, say);
     return in;
