@@ -159,8 +159,12 @@ private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
                   bool put_failed = false;
                   int freq = 0;                                     // port sample rate for pacing
-                  std::chrono::steady_clock::time_point next{}; };  // per-grain pacing deadline
-    std::mutex mx_;
+                  std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
+                  // Per-port lock: the queue-depth wait in output() can hold this for a couple
+                  // of device drain periods; a GLOBAL lock made port 18's puts wait for port
+                  // 17's pacing and micro-stuttered every other audio source (#2985 follow-up).
+                  std::mutex mx; };
+    std::mutex mx_;   // guards gain_/paused_ and the multi-slot set_gain/set_paused walks
     std::array<Slot, kMaxPorts> slots_{};
     bool paused_ = false;
     float gain_ = 1.0f;   // linear playback gain, applied via SDL_SetAudioStreamGain

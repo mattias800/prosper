@@ -2844,7 +2844,7 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
                                frontends/prosper-app/library_media.cpp
                                frontends/prosper-app/fps_overlay.cpp)
     target_include_directories(prosper-app PRIVATE src third_party/stb)
-    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
+    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui winmm
                                               prosper_performance_capture)
     target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
     # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
