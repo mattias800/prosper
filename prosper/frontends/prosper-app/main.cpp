@@ -103,6 +103,11 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <thread>
 #include "host/platform/precise_sleep.hpp"   // present-loop waits must not inherit the Win32 tick (#1765)
 #include <mutex>
+
+// PROSPER_FLIP_ON_PRESENT: the guest's flip event completes when the host presents (the display's
+// vsync becomes the guest frame loop's timing source). prosper-app retires pending flips after
+// every present and on the no-new-frame path so a paused window cannot hang the pacer.
+extern "C" void prosper_vo_flip_retire_pending();
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 #include <filesystem>                  // directory listing behind the library scan
 
@@ -117,6 +122,7 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <timeapi.h>                   // timeBeginPeriod: 1 ms timer resolution for the process (#2985)
 #else
 #include <unistd.h>
 #include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
@@ -182,6 +188,7 @@ struct Vk {
     std::vector<VkSemaphore> presentSems;
     VkSemaphore     presentSem = VK_NULL_HANDLE;   // retained: fallback before the vector is sized
     VkFence         inFlight   = VK_NULL_HANDLE;
+
 
     // Present unification (#1270): set when the app adopted the renderer's shared device and presents by
     // GPU-blitting its front-buffer image (no CPU round-trip). queue_shared means the present queue aliases
@@ -704,6 +711,7 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         return recover_submit_failure(vk, submitResult);
     }
     prevSlot = gf.slot;
+    prosper_vo_flip_retire_pending();   // the vsync just happened: complete the guest's flip
     if (requestReadback) {
         const VkResult waitResult = vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
         if (waitResult != VK_SUCCESS) {
@@ -1201,6 +1209,13 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // Games run with 1 ms system timer resolution: every pacing wait in the process (SDL's audio
+    // thread, condition-variable timeouts, remnant nanosleeps) otherwise quantizes to the 15.6 ms
+    // tick, which bimodally paced Blasphemous 2 at 15/31 ms frames on Windows/RTX 4090 (#2985).
+    // Deliberately process-wide and never undone - the OS reverts it at exit.
+    timeBeginPeriod(1);
+#endif
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     std::string dump;
@@ -2487,7 +2502,10 @@ int main(int argc, char** argv) {
                 }
             } else {
                 // No new GPU or CPU frame yet: same tick-quantization hazard -- a raw 2 ms
-                // sleep costs ~17 ms here and halves the loop's poll rate.
+                // sleep costs ~17 ms here and halves the loop's poll rate. Retire pending
+                // guest flips too: the display's vblank happened, so a paused/stalled window
+                // must not strand the guest's pacer waiting for a flip completion.
+                prosper_vo_flip_retire_pending();
                 prosper::host::sleep_until_steady_ns(
                     (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count() +

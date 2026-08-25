@@ -82,41 +82,31 @@ public:
         // Block before touching the SDL queue. Pausing the device preserves samples that were
         // already accepted; this gate prevents guest audio threads from filling it while paused.
         if (!prosper_wait_while_paused()) return;
-        int freq = 0;
-        std::chrono::steady_clock::time_point target{};
         {
             std::lock_guard<std::mutex> lk(mx_);
             Slot& s = slots_[port - 1];
             if (!s.stream) return;
-            freq = s.freq;
-            if (freq > 0) {
-                // Pace EACH call one grain of wall-clock time apart (real sceAudioOutOutput blocks
-                // until the hardware ring frees one grain — evenly spaced, never bursty). The old
-                // cap-based pacing let the guest burst a whole device quantum (4+ grains) and then
-                // stall: FMOD signals its mixer's condvar once per submitted grain, condvar signals
-                // COALESCE within a burst, so the mixer woke once per ~21 ms instead of once per
-                // grain and mixed at 1/4 real time — every DSP block audibly replayed ~4x (#1016).
-                // Same resync-if-behind model as the core's RealtimeSilentSink.
-                auto dur = std::chrono::nanoseconds((int64_t)frames * 1000000000LL / freq);
-                auto now = std::chrono::steady_clock::now();
-                if (s.next.time_since_epoch().count() == 0 || s.next < now - dur * 4) s.next = now;
-                s.next += dur;
-                target = s.next;
-            }
-            // Keep the stream protected until SDL has consumed this call. sceAudioOutOutput and
-            // sceAudioOutClose may run on different guest audio threads; copying s.stream out of
-            // the lock let close()/open()/quit() destroy it immediately before this call (#855).
-            // The pacing sleep remains outside the lock, so lifecycle calls wait only for SDL's
-            // synchronous queue copy rather than for an entire audio grain.
+            // Queue-depth pacing: hold ~3 grains buffered so scheduler jitter never drains the
+            // device queue to zero. The previous exact-target wake (put one grain, sleep until
+            // it finished playing) held the cushion at a single grain -- any guest-side
+            // lateness longer than one grain underran audibly, and at 32 fps the audio
+            // thread's jitter easily exceeded one grain (user report, Blasphemous 2 FMVs,
+            // 2026-08-25). The device drains in real time, so this is self-pacing: the guest
+            // thread blocks only while the cushion is full, then the drain releases it -- no
+            // timer dependency at all. The even per-grain spacing #1016 needs comes from the
+            // drain rate once the cushion is full.
+            const int cushion_bytes = s.grain_bytes * 3;
+            int spins = 0;
+            while (SDL_GetAudioStreamAvailable(s.stream) > cushion_bytes && spins++ < 100)
+                prosper::host::sleep_until_steady_ns(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count() +
+                    2000000ull);
             if (!SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes) && !s.put_failed) {
                 SDL_Log("prosper-audio: PutAudioStreamData failed on port %d: %s", port, SDL_GetError());
                 s.put_failed = true;
             }
         }
-        if (freq > 0)
-            prosper::host::sleep_until_steady_ns(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    target.time_since_epoch()).count());
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
