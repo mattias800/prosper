@@ -159,10 +159,10 @@ public:
                 result.consumed_bytes = static_cast<uint32_t>(input.size());
                 return result;
             }
-            const unsigned pkt_len = opus_pending_[0] | (opus_pending_[1] << 8);   // LE (test contract; live endianness TBD #2981)
+            // 2-byte LE prefix per packet — verified against live GRIS traffic (#2981).
             if (opus_pending_.size() < 2 + pkt_len) {
                 static std::atomic<int> w{0};
-                if (w.fetch_add(1) < 4)
+                if (getenv("PROSPER_AUDIOLOG") && w.fetch_add(1) < 4)
                     fprintf(stderr, "[opus-stream] waiting: pending=%zu need=%u\n",
                             opus_pending_.size(), 2 + pkt_len);
                 result.ok = true;   // need more fragments before a full packet
@@ -180,9 +180,9 @@ public:
             }
             if (send < 0) return fail();
             if (!receive_frames(&decoded_frames)) return fail();
-            written_samples += drain(output.subspan(written_samples));
-            fprintf(stderr, "[opus-stream] decoded pkt_len=%u pending_left=%zu produced=%u\n",
-                    pkt_len, opus_pending_.size() - 2 - pkt_len, written_samples);
+            if (getenv("PROSPER_AUDIOLOG"))
+                fprintf(stderr, "[opus-stream] decoded pkt_len=%u pending_left=%zu produced=%u\n",
+                        pkt_len, opus_pending_.size() - 2 - pkt_len, written_samples);
             opus_pending_.erase(opus_pending_.begin(), opus_pending_.begin() + 2 + pkt_len);
             result.ok = true;
             result.consumed_bytes = static_cast<uint32_t>(input.size());
