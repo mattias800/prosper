@@ -869,7 +869,7 @@ uint64_t guest_mutex_lock_slot(uint64_t slot_addr) {
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 2000)
                 fprintf(stderr, "[mtx-life] LOCK slot=0x%llx m=%p tid=%ld owner_now=%u\n",
-                        (unsigned long long)slot_addr, (void*)m, (long)prosper_gettid(),
+                        (unsigned long long)slot_addr, (void*)m, (long)sctid(),
                         *(unsigned*)(void*)m);
         }
     }
