@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace prosper::ajm {
 
@@ -15,6 +16,12 @@ enum class Codec : uint32_t {
     Mp3 = 0,
     Atrac9 = 1,
     Aac = 2,
+    // Observed in the wild but absent from the local SDK headers: GRIS's Wwise (PPSA09804,
+    // #2981) registers codecs 14 and 24 on its Ajm context, and libSceOpusDec.prx depends on
+    // libSceAjmi — the system Opus decoder rides through Ajm. Values verified empirically;
+    // rename from the SDK header when one is available.
+    Opus = 24,
+    OpusAlt = 14,
 };
 
 struct DecodeResult {
@@ -62,6 +69,11 @@ struct StreamConfig {
     uint32_t aac_object_type = 0;         // 0 -> not supplied
     uint32_t aac_sample_rate_index = 0;   // only meaningful when aac_object_type != 0
     uint32_t aac_channel_config = 0;      // ditto
+
+    // Raw codec header bytes (e.g. the 19-byte OpusHead), fed to the host decoder as extradata.
+    // Without the OpusHead the FFmpeg libopus decoder's state breaks on the second sequential
+    // packet (#2981). Empty when the caller has no header.
+    std::vector<uint8_t> extradata;
 };
 
 // MPEG-4 AudioSpecificConfig sampling-frequency index table (ISO/IEC 14496-3, Table 1.18). Shared

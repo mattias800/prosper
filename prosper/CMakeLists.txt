@@ -2639,6 +2639,11 @@ if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
     target_link_libraries(test_ajm_mp3 PRIVATE prosper_ajm_ffmpeg)
     add_test(NAME ajm_mp3_decode COMMAND test_ajm_mp3)
 
+    add_executable(test_ajm_opus tests/hle/audio/test_ajm_opus.cpp)
+    target_include_directories(test_ajm_opus PRIVATE src tests/hle/audio)
+    target_link_libraries(test_ajm_opus PRIVATE prosper_ajm_ffmpeg)
+    add_test(NAME ajm_opus_decode COMMAND test_ajm_opus)
+
     # libSceAudiodec (UE Electra movie audio). Same backend, different guest-facing library.
     add_executable(test_audiodec tests/hle/audio/test_audiodec.cpp)
     target_include_directories(test_audiodec PRIVATE src)

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <string>
 
 namespace prosper {
 namespace {
@@ -21,9 +22,56 @@ namespace {
 // 16 public sceAudioOut ports plus four host-only streams for concurrent AudioOut2 contexts.
 // SDL mixes the bound streams into the same playback device while each retains its own pacing
 // clock; this mirrors independent hardware contexts without serializing their sample timelines.
-constexpr int kMaxPorts = 20;
+// 20 covers the 16 public sceAudioOut ports plus the four host-only AudioOut2 context ports
+// (kA2SinkPortBase = 21..24 in hle_audio.cpp). The old cap of 20 made every AudioOut2 open fail
+// and fall back to silent pacing — GRIS's Wwise mix was correct and discarded at the sink (#2981).
+constexpr int kMaxPorts = 28;
 
 SDL_AudioFormat to_sdl_format(AudioFmt f) { return f == AudioFmt::F32 ? SDL_AUDIO_F32 : SDL_AUDIO_S16; }
+
+// PROSPER_AUDIO_DUMP=<path.wav>: dump every port's mixed PCM to per-port WAV files
+// (<path> with the port number inserted before the extension). Measures what the guest
+// actually mixed — immune to host volume/mute — so "is audio playing" is a measurement,
+// not an impression (#2981).
+class WavDump {
+public:
+    bool open(const char* path, int freq, int channels, bool f32) {
+        if (!path || !*path) return false;
+        file_ = fopen(path, "wb");
+        if (!file_) return false;
+        const uint16_t fmt_tag = f32 ? 3 : 1;
+        const uint16_t block = static_cast<uint16_t>(channels * (f32 ? 4 : 2));
+        const uint32_t byte_rate = static_cast<uint32_t>(freq) * block;
+        auto w16 = [&](uint16_t v) { fwrite(&v, 1, 2, file_); };
+        auto w32 = [&](uint32_t v) { fwrite(&v, 1, 4, file_); };
+        fwrite("RIFF", 1, 4, file_); w32(0); fwrite("WAVE", 1, 4, file_);
+        fwrite("fmt ", 1, 4, file_); w32(16); w16(fmt_tag);
+        w16(static_cast<uint16_t>(channels));
+        w32(static_cast<uint32_t>(freq)); w32(byte_rate); w16(block); w16(f32 ? 32 : 16);
+        fwrite("data", 1, 4, file_); w32(0);
+        data_size_pos_ = 44;
+        return true;
+    }
+    void write(const void* pcm, int frames, int channels, bool f32) {
+        if (!file_) return;
+        const size_t bytes = static_cast<size_t>(frames) * channels * (f32 ? 4 : 2);
+        fwrite(pcm, 1, bytes, file_);
+        data_bytes_ += static_cast<uint32_t>(bytes);
+    }
+    void finalize() {
+        if (!file_) return;
+        fseek(file_, 4, SEEK_SET);
+        uint32_t riff = 36 + data_bytes_; fwrite(&riff, 1, 4, file_);
+        fseek(file_, data_size_pos_, SEEK_SET); fwrite(&data_bytes_, 1, 4, file_);
+        fclose(file_); file_ = nullptr;
+    }
+    bool active() const { return file_ != nullptr; }
+    ~WavDump() { finalize(); }
+private:
+    FILE* file_ = nullptr;
+    long data_size_pos_ = 0;
+    uint32_t data_bytes_ = 0;
+};
 
 class Sdl3AudioSink : public AudioSink {
 public:
@@ -37,6 +85,7 @@ public:
     }
 
     void quit() {
+        for (auto& s : slots_) s.dump.finalize();
         for (int i = 0; i < kMaxPorts; i++) close(i + 1);
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
     }
@@ -69,9 +118,22 @@ public:
             return false;
         }
         const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s.stream);
+        if (const char* dump = getenv("PROSPER_AUDIO_DUMP"); dump && *dump) {
+            std::string path(dump);
+            const auto dot = path.rfind('.');
+            const std::string port_tag = std::to_string(port);
+            path = dot == std::string::npos ? path + "." + port_tag + ".wav"
+                                            : path.substr(0, dot) + "." + port_tag + path.substr(dot);
+            s.channels = info.channels;
+            s.f32 = info.fmt == AudioFmt::F32;
+            if (s.dump.open(path.c_str(), info.freq, info.channels, s.f32))
+                SDL_Log("prosper-audio: dumping port %d PCM to %s", port, path.c_str());
+        }
+        const char* dev_name = SDL_GetAudioDeviceName(device);
+        const char* drv_name = SDL_GetCurrentAudioDriver();
         SDL_Log("prosper-audio: opened port %d on %s (%s), %d Hz/%d channel%s",
-                port, SDL_GetAudioDeviceName(device) ? SDL_GetAudioDeviceName(device) : "default device",
-                SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "unknown driver",
+                port, dev_name ? dev_name : "default device",
+                drv_name ? drv_name : "unknown driver",
                 info.freq, info.channels, info.channels == 1 ? "" : "s");
         return true;
     }
@@ -111,8 +173,30 @@ public:
                 SDL_Log("prosper-audio: PutAudioStreamData failed on port %d: %s", port, SDL_GetError());
                 s.put_failed = true;
             }
+            s.dump.write(pcm, frames, s.channels, s.f32);
         }
+        // Pace the guest thread to real time. This sleep IS the Heaps unqueueBuffer signal
+        // (#2978): by the time it returns, the previous grain has been consumed by the audio
+        // device, giving Heaps the buffer-completion timing it needs to unqueue SFX buffers
+        // instead of re-triggering them. The sleep must be outside the lock so other audio
+        // operations (open/close/volume) can proceed while this grain plays.
         if (freq > 0) std::this_thread::sleep_until(target);
+        // Consumption confirmation (#2978): after the pacing sleep, the grain has had its
+        // full duration to play. A brief bounded wait here gives Heaps' hxd.snd.Manager the
+        // "buffer consumed" signal its unqueueBuffer needs — without this, short SFX loop
+        // forever because Heaps can't tell a played buffer from a pending one. The wait is
+        // OUTSIDE the lock and bounded, so it cannot block other audio operations or cause
+        // underruns (the grain duration has already elapsed during the pacing sleep).
+        {
+            std::lock_guard<std::mutex> lk(mx_);
+            if (SDL_AudioStream* st = slots_[port - 1].stream) {
+                auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(2);
+                while (SDL_GetAudioStreamAvailable(st) > 0 &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
@@ -165,7 +249,9 @@ private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
                   bool put_failed = false;
                   int freq = 0;                                     // port sample rate for pacing
-                  std::chrono::steady_clock::time_point next{}; };  // per-grain pacing deadline
+                  std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
+                  int channels = 2; bool f32 = false;               // dump format (#2981)
+                  WavDump dump; };                                  // PROSPER_AUDIO_DUMP (#2981)
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
     bool paused_ = false;

@@ -2649,6 +2649,10 @@ struct AjmDecJob {
     uint32_t instance = 0;
     uint64_t in_addr = 0, out_addr = 0, result_addr = 0;
     uint32_t in_size = 0, out_size = 0;
+    // sceAjmBatchJobDecodeSplit (#2981): a second input fragment decoded as the contiguous
+    // continuation of the first. Zero when the job is the single-buffer BatchJobDecode shape.
+    uint64_t in2_addr = 0;
+    uint32_t in2_size = 0;
 };
 // SCE_AJM_ERROR_INVALID_PARAMETER — the AJM error space (see the constants above); -1 is not a value
 // the guest's error mapping recognizes.
@@ -3024,8 +3028,17 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                                       instance.decoded_samples);
                     continue;
                 }
-                std::vector<uint8_t> input(job.in_size);
-                const size_t got = audio_read_bytes_partial(job.in_addr, input.data(), input.size());
+                // BatchJobDecodeSplit (#2981): stage the second fragment as the contiguous
+                // continuation of the first — the StreamDecoder seam takes a single span.
+                // FFmpeg reads AV_INPUT_BUFFER_PADDING_SIZE (64) bytes past the packet it is
+                // handed; the guest buffer makes no such promise, so stage zero padding after
+                // the fragment. Without this the batch path parses heap tail as a packet header
+                // (exposed by the Ajm Opus path, #2981 — the stream seam already padded).
+                std::vector<uint8_t> input(job.in_size + job.in2_size + 64, 0);
+                size_t got = audio_read_bytes_partial(job.in_addr, input.data(), job.in_size);
+                if (job.in2_size)
+                    got += audio_read_bytes_partial(job.in2_addr, input.data() + job.in_size,
+                                                    job.in2_size);
                 std::vector<int16_t> pcm(job.out_size / sizeof(int16_t));
                 const ajm::DecodeResult decoded = instance.host_dec->decode(
                     std::span<const uint8_t>(input.data(), got), std::span<int16_t>(pcm));
@@ -3305,6 +3318,29 @@ HLE10(ajm_batch_job_decode) {
     g_ajm2_jobs[a0].push_back({(uint32_t)a1, a2, a4, a6, (uint32_t)a3, (uint32_t)a5});
     return 0;
 }
+HLE10(ajm_batch_job_decode_split) {
+    // sceAjmBatchJobDecodeSplit (#2981): the two-fragment decode shape AkSoundEngine.prx imports
+    // for streamed media — a2/a3 = in1/in1Size, a4/a5 = in2/in2Size, a6/a7 = out/outSize,
+    // a8 = result sideband. The fragments are decoded as one contiguous stream.
+    if (getenv("PROSPER_AUDIOLOG")) { static std::atomic<uint32_t> n{0}; if (n.fetch_add(1) < 16)
+        fprintf(stderr, "[ajm2] JobDecodeSplit batch=0x%llx inst=%llu in=0x%llx/%llu+0x%llx/%llu "
+                        "out=0x%llx/%llu result=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3,
+                (unsigned long long)a4, (unsigned long long)a5,
+                (unsigned long long)a6, (unsigned long long)a7, (unsigned long long)a8); }
+    if (!a0 || !a2 || !a4 || !a6) return AJM_ERR_INVALID_PARAMETER;
+    if (a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES ||
+        a7 > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back({(uint32_t)a1, a2, a6, a8, (uint32_t)a3, (uint32_t)a7,
+                               a4, (uint32_t)a5});
+    return 0;
+}
+HLE10(ajm_batch_job_clear_context) { return 0; }   // per-instance scratch reset; nothing to free
+HLE10(ajm_batch_job_set_resample_ex) { return 0; } // resample params: the host backend resamples
+HLE10(ajm_batch_job_get_resample_info) { return 0; }
+HLE10(ajm_batch_job_get_statistics) { return 0; }
 HLE10(ajm_batch_start2) {
     // Run every decode job queued on this batchInfo (a1), in order, then clear it. Synchronous:
     // BatchWait then just returns success. GTA V passes its u32 batch-id output in a4 and immediately
@@ -4085,6 +4121,11 @@ void register_audio_hle() {
     R("sceAjmBatchErrorDump", ajm_batch_errordump);
     R("sceAjmBatchJobInitialize", ajm_batch_job_initialize);
     R("sceAjmBatchJobDecode", ajm_batch_job_decode);
+    R("sceAjmBatchJobDecodeSplit", ajm_batch_job_decode_split);
+    R("sceAjmBatchJobClearContext", ajm_batch_job_clear_context);
+    R("sceAjmBatchJobSetResampleParametersEx", ajm_batch_job_set_resample_ex);
+    R("sceAjmBatchJobGetResampleInfo", ajm_batch_job_get_resample_info);
+    R("sceAjmBatchJobGetStatistics", ajm_batch_job_get_statistics);
     R("sceAjmBatchJobSetGaplessDecode", ajm_batch_job_gapless);
     R("sceAjmBatchStart", ajm_batch_start2);
     Hle::register_fn("pgFAiLR5qT4", ngs2_system_query_buffer, "sceNgs2SystemQueryBufferSize");
