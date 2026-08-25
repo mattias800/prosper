@@ -107,6 +107,7 @@ namespace {
     std::mutex g_flip_mx;
     uint64_t g_flip_count = 0;      // incremented per flip so GetFlipStatus shows progress
     int32_t  g_flip_rate = 0;       // 0=60 Hz, 1=30 Hz, 2=20 Hz (stored for future pacing)
+    std::vector<int64_t> g_pending_flip_args;  // PROSPER_FLIP_ON_PRESENT: flips awaiting host present
     // The VideoOut ABI uses -1 for both fields until the first completed flip. Zero is a valid
     // buffer index/argument, so exposing zero early can fool a frame pacer into consuming a flip
     // that never happened (#394 F3).
@@ -677,7 +678,26 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
+    // PROSPER_FLIP_ON_PRESENT: complete the flip when the host PRESENTS the frame instead of at
+    // fold time. The display's vsync then paces the guest's frame loop through its flip event --
+    // the timing source the user asked for -- instead of the fold's own completion, which on
+    // Windows lands on Win32 tick boundaries and bimodally paced Blasphemous 2 at 15/31 ms
+    // (#2985). Status advances immediately (pollers never spin); only the EVENT waits.
+    static const bool flip_on_present = getenv("PROSPER_FLIP_ON_PRESENT") != nullptr;
+    if (flip_on_present) {
+        std::lock_guard<std::mutex> lk(g_flip_mx);
+        g_pending_flip_args.push_back(flip_arg);
+        return;
+    }
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
+}
+extern "C" void prosper_vo_flip_retire_pending() {
+    std::vector<int64_t> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_flip_mx);
+        pending.swap(g_pending_flip_args);
+    }
+    for (int64_t arg : pending) prosper_eq_trigger_flip(arg);
 }
 HLE(g_vo_flippending) {
     VideoOutHandleGuard handle(a0);

@@ -1306,6 +1306,7 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         }
     }
     std::unique_lock<std::mutex> lk(s->m);
+    const auto wait_begin = clk::now();
     if (s->ready.empty() && !s->deleted) {
         // timeout arg is a pointer to micro-seconds; NULL = wait forever (real semantics — the old
         // 100 ms cap-and-return-success invented a state the API never produces, and callers
@@ -1333,6 +1334,19 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         n++;
     }
     if (a3) *(int32_t*)P(a3) = n;
+    // Wait-duration histogram input (#2985 follow-up): name the waits that hold a guest thread
+    // for a full timer tick or longer -- those are the frame-pacing limiter candidates.
+    if (evlog()) {
+        const double waited_ms =
+            std::chrono::duration<double, std::milli>(clk::now() - wait_begin).count();
+        if (waited_ms > 4.0)
+            fprintf(stderr, "[ev]   slow wait %.2f ms eq=0x%llx delivered=%d timeout=%s"
+                            " ra=%s+0x%llx (ident=%lld filter=%d)\n",
+                    waited_ms, (unsigned long long)a0, n, a4 ? "yes" : "inf",
+                    prosper::guest_module_name((uint64_t)__builtin_return_address(0)),
+                    (unsigned long long)prosper::guest_module_offset((uint64_t)__builtin_return_address(0)),
+                    (long long)(ev ? ev[0].ident : 0), (int)(ev ? ev[0].filter : 0));
+    }
     if (evlog() && n > 0) fprintf(stderr, "[ev]   -> delivered %d ev(s) eq=0x%llx ra=%s+0x%llx (ident=%lld filter=%d)\n",
         n, (unsigned long long)a0, prosper::guest_module_name((uint64_t)__builtin_return_address(0)),
         (unsigned long long)prosper::guest_module_offset((uint64_t)__builtin_return_address(0)),
