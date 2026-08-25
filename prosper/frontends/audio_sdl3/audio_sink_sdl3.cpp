@@ -192,6 +192,14 @@ public:
                 active_streams, active_streams == 1 ? "" : "s");
     }
 
+    // PROSPER_AUDIO_QUEUE_TRACE=1: spawn the 1 ms queue-level sampler (queue_trace_loop).
+    void start_queue_trace_if_requested() {
+        if (!getenv("PROSPER_AUDIO_QUEUE_TRACE")) return;
+        g_trace_running.store(true, std::memory_order_relaxed);
+        std::thread(&Sdl3AudioSink::queue_trace_loop, this).detach();
+        SDL_Log("prosper-audio: queue-level trace started");
+    }
+
 private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
                   bool put_failed = false;
@@ -207,6 +215,26 @@ private:
     std::array<Slot, kMaxPorts> slots_{};
     bool paused_ = false;
     float gain_ = 1.0f;   // linear playback gain, applied via SDL_SetAudioStreamGain
+
+    // PROSPER_AUDIO_QUEUE_TRACE=1: a 1 ms sampler of every port's queued-byte level. The
+    // timeline is the direct evidence for an underrun hunt: the drain slope names the device
+    // consumption, the refill bursts name the mixer's delivery pattern, and the zero
+    // crossings are the audible underruns -- no ear test required.
+    void queue_trace_loop() {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (g_trace_running.load(std::memory_order_relaxed)) {
+            const double t = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            for (int i = 0; i < kMaxPorts; i++) {
+                std::lock_guard<std::mutex> lk(slots_[i].mx);
+                if (!slots_[i].stream) continue;
+                std::fprintf(stderr, "[audio-queue] t=%.3f port=%d avail=%d\n",
+                             t, i + 1, SDL_GetAudioStreamAvailable(slots_[i].stream));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    std::atomic<bool> g_trace_running{false};
 };
 
 Sdl3AudioSink g_sink;
@@ -219,6 +247,7 @@ bool install_sdl3_audio_sink() {
     if (!g_sink.init()) return false;
     audio_set_sink(&g_sink);
     g_installed = true;
+    g_sink.start_queue_trace_if_requested();
     SDL_Log("prosper-audio: SDL3 audio backend installed");
     return true;
 }
