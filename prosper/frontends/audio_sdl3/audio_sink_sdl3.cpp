@@ -60,17 +60,21 @@ public:
         s.put_failed = false;
         s.next = {};   // (re)start the per-grain pacing clock on the first output()
         SDL_SetAudioStreamGain(s.stream, gain_);
-        const bool stream_ready = paused_ ? SDL_PauseAudioStreamDevice(s.stream)
-                                          : SDL_ResumeAudioStreamDevice(s.stream);
+        // FILL-THEN-START: the device opens PAUSED. The guest's mixer delivers one grain per
+        // mix period (~16 ms) with tick-quantized wake jitter; a device that starts on the
+        // first grain holds ~1 grain of cushion and underruns on every jitter. output()
+        // resumes the device only once ~8 grains (~130 ms) are queued, and that cushion then
+        // absorbs the mixer's jitter for the rest of the session (#2985, Blasphemous 2 FMVs).
+        const bool stream_ready = SDL_PauseAudioStreamDevice(s.stream);
+        s.device_paused = true;
         if (!stream_ready) {
-            SDL_Log("prosper-audio: %sAudioStreamDevice failed: %s",
-                    paused_ ? "Pause" : "Resume", SDL_GetError());
+            SDL_Log("prosper-audio: PauseAudioStreamDevice failed: %s", SDL_GetError());
             SDL_DestroyAudioStream(s.stream);
             s.stream = nullptr;
             return false;
         }
         const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s.stream);
-        SDL_Log("prosper-audio: opened port %d on %s (%s), %d Hz/%d channel%s",
+        SDL_Log("prosper-audio: opened port %d on %s (%s), %d Hz/%d channel%s (fill-then-start)",
                 port, SDL_GetAudioDeviceName(device) ? SDL_GetAudioDeviceName(device) : "default device",
                 SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "unknown driver",
                 info.freq, info.channels, info.channels == 1 ? "" : "s");
@@ -83,19 +87,27 @@ public:
         // already accepted; this gate prevents guest audio threads from filling it while paused.
         if (!prosper_wait_while_paused()) return;
         {
-            std::lock_guard<std::mutex> lk(mx_);
+            std::lock_guard<std::mutex> lk(slots_[port - 1].mx);
             Slot& s = slots_[port - 1];
             if (!s.stream) return;
-            // Queue-depth pacing: hold ~3 grains buffered so scheduler jitter never drains the
-            // device queue to zero. The previous exact-target wake (put one grain, sleep until
-            // it finished playing) held the cushion at a single grain -- any guest-side
-            // lateness longer than one grain underran audibly, and at 32 fps the audio
-            // thread's jitter easily exceeded one grain (user report, Blasphemous 2 FMVs,
-            // 2026-08-25). The device drains in real time, so this is self-pacing: the guest
-            // thread blocks only while the cushion is full, then the drain releases it -- no
-            // timer dependency at all. The even per-grain spacing #1016 needs comes from the
-            // drain rate once the cushion is full.
-            const int cushion_bytes = s.grain_bytes * 3;
+            // PROSPER_AUDIO_DEBUG=1: per-call arrival cadence + queue level, for underrun
+            // forensics -- distinguishes "the guest delivered late" from "the device drained
+            // early" (user report: micro-stutters identical before/after every pacing fix).
+            static const bool audio_dbg = getenv("PROSPER_AUDIO_DEBUG") != nullptr;
+            const int avail_before = SDL_GetAudioStreamAvailable(s.stream);
+            if (audio_dbg) {
+                static thread_local std::chrono::steady_clock::time_point last{};
+                const auto now = std::chrono::steady_clock::now();
+                const double gap = last.time_since_epoch().count() == 0
+                    ? 0.0
+                    : std::chrono::duration<double, std::milli>(now - last).count();
+                last = now;
+                std::fprintf(stderr,
+                             "[audio-dbg] port=%d gap=%.2fms frames=%d queued_before=%d"
+                             " (grain=%d)\n",
+                             port, gap, frames, avail_before, s.grain_bytes);
+            }
+            const int cushion_bytes = s.grain_bytes * 8;
             int spins = 0;
             while (SDL_GetAudioStreamAvailable(s.stream) > cushion_bytes && spins++ < 100)
                 prosper::host::sleep_until_steady_ns(
@@ -105,6 +117,28 @@ public:
             if (!SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes) && !s.put_failed) {
                 SDL_Log("prosper-audio: PutAudioStreamData failed on port %d: %s", port, SDL_GetError());
                 s.put_failed = true;
+            }
+            // Fill-then-start: hold the device paused until the cushion is deep enough to
+            // absorb the mixer's tick-quantized wake jitter (~8 grains ≈ 130 ms), then let it
+            // run. From here on the cushion absorbs every late mixer wake.
+            if (s.device_paused &&
+                SDL_GetAudioStreamAvailable(s.stream) >= s.grain_bytes * 8) {
+                if (SDL_ResumeAudioStreamDevice(s.stream)) {
+                    s.device_paused = false;
+                }
+            }
+            // Clock-drift compensation (#2985): the guest's audio clock (budgeted from the
+            // flip timeline) and the WASAPI device clock are independent crystals; the ~0.8%
+            // deficit drained every cushion at a constant rate no matter how deep. Nudge the
+            // stream's frequency ratio toward the level target -- a <1% pitch shift, inaudible,
+            // and the cushion holds for the whole session.
+            {
+                const int level = SDL_GetAudioStreamAvailable(s.stream);
+                const int target_level = s.grain_bytes * 6;
+                s.freq_ratio += 0.000001 * (double)(level - target_level);
+                if (s.freq_ratio < 0.97) s.freq_ratio = 0.97;
+                if (s.freq_ratio > 1.03) s.freq_ratio = 1.03;
+                SDL_SetAudioStreamFrequencyRatio(s.stream, (float)s.freq_ratio);
             }
         }
     }
@@ -144,12 +178,15 @@ public:
         for (Slot& s : slots_) {
             if (!s.stream) continue;
             ++active_streams;
-            const bool ok = paused ? SDL_PauseAudioStreamDevice(s.stream)
-                                   : SDL_ResumeAudioStreamDevice(s.stream);
-            if (!ok)
-                SDL_Log("prosper-audio: %sAudioStreamDevice failed: %s",
-                        paused ? "Pause" : "Resume", SDL_GetError());
-            if (!paused) s.next = {};   // resume pacing from now; never catch up in a burst
+            if (paused) {
+                SDL_PauseAudioStreamDevice(s.stream);
+                s.device_paused = true;
+            } else {
+                // Resume goes through the fill-then-start path in output(): the cushion
+                // refills before the device runs, so a stale queue is never replayed.
+                s.device_paused = true;
+                s.next = {};   // resume pacing from now; never catch up in a burst
+            }
         }
         SDL_Log("prosper-audio: %s %d active stream%s", paused ? "paused" : "resumed",
                 active_streams, active_streams == 1 ? "" : "s");
@@ -160,10 +197,12 @@ private:
                   bool put_failed = false;
                   int freq = 0;                                     // port sample rate for pacing
                   std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
+                  double freq_ratio = 1.0;                          // clock-drift compensation
                   // Per-port lock: the queue-depth wait in output() can hold this for a couple
                   // of device drain periods; a GLOBAL lock made port 18's puts wait for port
                   // 17's pacing and micro-stuttered every other audio source (#2985 follow-up).
-                  std::mutex mx; };
+                  std::mutex mx;
+                  bool device_paused = true; };   // fill-then-start: paused until the cushion fills
     std::mutex mx_;   // guards gain_/paused_ and the multi-slot set_gain/set_paused walks
     std::array<Slot, kMaxPorts> slots_{};
     bool paused_ = false;
