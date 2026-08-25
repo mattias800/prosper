@@ -7405,6 +7405,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             smci.codeSize = spirv.size() * sizeof(uint32_t);
             smci.pCode = spirv.data();
+            // PROSPER_DUMP_COMPUTE_SPIRV=<dir>: write each newly compiled compute module's
+            // SPIR-V as <dir>/<hash>.spv for offline ISA/occupancy analysis (#2985).
+            if (const char* dump_dir = getenv("PROSPER_DUMP_COMPUTE_SPIRV")) {
+                const uint64_t dump_hash = gpu_capture_hash(
+                    reinterpret_cast<const uint8_t*>(spirv.data()),
+                    spirv.size() * sizeof(uint32_t));
+                char path[512];
+                std::snprintf(path, sizeof path, "%s/%016llx.spv", dump_dir,
+                              (unsigned long long)dump_hash);
+                if (FILE* f = fopen(path, "wb")) {
+                    fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+                    fclose(f);
+                    std::fprintf(stderr, "[compute] dumped SPIR-V %016llx (%zu words) -> %s\n",
+                                 (unsigned long long)dump_hash, spirv.size(), path);
+                }
+            }
             if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module"))
                 break;
             VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
