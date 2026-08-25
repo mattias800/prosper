@@ -21,6 +21,7 @@
 #include "hle/sync/pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
+#include "host/platform/precise_sleep.hpp"   // #2985: guest sem timedwait must not quantize to the Win32 tick
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/gpu_execute.hpp"   // gpu::guest_writable — validate guest out-pointers (#1963)
 #include "host/image/exec_image.hpp"
@@ -2970,7 +2971,29 @@ HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog
 HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : fbsd_errno(errno); }   // EAGAIN (would block) is 11 here, 35 on the PS5
 // scePthreadSemTimedwait is the one member of the family with no POSIX spelling registered on its
 // body, so it encodes in place; the other six go through SCE_PTHREAD_ALIAS below (#2178).
-HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return prosper::hle::kSceKernelErrorEINVAL; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : sce_pthread_rc(fbsd_errno(errno)); }
+HLE(k_sem_timedwait) {
+    auto* s = ensure_sem(a0);
+    if (!s) return prosper::hle::kSceKernelErrorEINVAL;
+    timespec dl = abs_deadline_us(a1);
+    // On Windows, sem_timedwait is winpthreads', whose timed waits quantize to its ~64 Hz
+    // master tick REGARDLESS of timeBeginPeriod -- measured on this toolchain:
+    // std::condition_variable::wait_for(5 ms) = 15.7 ms mean with the resolution raised.
+    // FMOD's mixer paced its 256-frame blocks on a guest semaphore timedwait and delivered
+    // audio at 1/3 rate (Blasphemous 2 PPSA13579 choppy audio, #2985). trywait + a precise
+    // 2 ms sleep loop: the post wakes the mixer within ~2 ms of the guest's schedule.
+    for (;;) {
+        if (sem_trywait(s) == 0) return 0;
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        const int64_t remain_us = (int64_t)(dl.tv_sec - now.tv_sec) * 1000000ll +
+                                  (int64_t)(dl.tv_nsec - now.tv_nsec) / 1000ll;
+        if (remain_us <= 0) { errno = ETIMEDOUT; return sce_pthread_rc(fbsd_errno(errno)); }
+        const uint64_t sleep_ns = remain_us > 2000 ? 2000000ull : (uint64_t)remain_us * 1000ull;
+        prosper::host::sleep_until_steady_ns(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() + sleep_ns);
+    }
+}
 HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 // Quarantined, not freed, and `sem_destroy` deferred to reclaim — a thread parked in `sem_wait` is
