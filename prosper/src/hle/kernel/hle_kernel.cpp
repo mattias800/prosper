@@ -891,7 +891,14 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
         // not a strict futex park (parking the render thread on every contended unlock starves
         // the state-machine thread the BankManager itself waits on — measured worse). 3 ms:
         // GRIS's bank commit lands ≤30 s (#2981).
-        if (had_waiters) { std::this_thread::sleep_for(std::chrono::microseconds(3000)); }
+        if (had_waiters) {
+            // Tunable: smaller values land the bank commit earlier (the title-music event posts
+            // within the first seconds); below ~300 us the render pump (5.33 ms period) starts
+            // winning the re-lock race again and the commit re-starves (#2981).
+            static const int fair_us = getenv("PROSPER_MUTEX_FAIR_US")
+                                           ? atoi(getenv("PROSPER_MUTEX_FAIR_US")) : 3000;
+            std::this_thread::sleep_for(std::chrono::microseconds(fair_us));
+        }
         guest_mutex_released(m); mtx_waitlog_clear(m);
     }
     return mtx_report("unlock", slot_addr, m, result);
