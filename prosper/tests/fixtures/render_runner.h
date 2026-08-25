@@ -5489,31 +5489,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     required_fragment_subgroup_features,
                     available_fragment_subgroup_features))                           skip_reasons |= 0x20;
             if (uses_internal_gds && !ctx.fragment_stores_atomics)                   skip_reasons |= 0x40;
-            // Width-agnostic branch-guard votes (#2147/#2441): a shader whose ONLY wave-width
-            // reason is OpGroupNonUniformAny needs 64 lanes for no lane identity and no data
-            // bearing mask -- two native-width votes union to the same executed-pixel set, and
-            // each half-wave simply diverges on its own. On a device whose maximum subgroup
-            // width cannot satisfy the guest wave (NVIDIA: 32..32 against a guest wave64),
-            // run the module at the device's native width instead of dropping the draw. The
-            // pipeline below pins requiredSubgroupSize to that native width, which
-            // requiredSubgroupSizeStages on such devices includes for the fragment stage.
-            if (skip_reasons == 0x04 &&
-                required_fragment_subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny) {
-                static std::mutex relax_mutex;
-                static std::unordered_set<uint64_t> relaxed_logged;
-                {
-                    std::lock_guard<std::mutex> lock(relax_mutex);
-                    if (relaxed_logged.insert(bd.fs_identity
-                            ? bd.fs_identity
-                            : hash_buffer_words(bd_fs.data(), bd_fs.size())).second)
-                        std::fprintf(stderr,
-                                     "[render] wave-any fragment shader relaxed to native "
-                                     "subgroup width %u (guest wave %u) -- draw recovered\n",
-                                     ctx.max_subgroup_size, required_fragment_subgroup_size);
-                }
-                required_fragment_subgroup_size = ctx.max_subgroup_size;
-                skip_reasons = 0;
-            }
             if (skip_reasons) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
@@ -5530,8 +5505,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // census that decides whether such a lowering is worth writing cannot be taken.
                 //
                 // Inside the dedupe guard, so it costs once per distinct shader, not per draw.
-                const uint32_t why =
-                    prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
+                // The memoized scan result: the same value the census and the gate use, with
+                // no per-draw rescan of the module (#2985 review finding 7).
+                const uint32_t why = required_fragment_subgroup_reasons;
                 char why_text[160];
                 if (why == UINT32_MAX) {
                     // Absent, not none. A module built before #2147 carries no marker, and printing
@@ -5582,17 +5558,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // wave64_stats.mx, and nothing takes them the other way. Preserve that if you add a lock
             // inside the census.
             if (wave64_census) {
-                uint32_t reason_mask = 0;
-                if (!ctx.subgroup_size_control)                                          reason_mask |= 0x01;
-                if (required_fragment_subgroup_size < ctx.min_subgroup_size)             reason_mask |= 0x02;
-                if (required_fragment_subgroup_size > ctx.max_subgroup_size)             reason_mask |= 0x04;
-                if (!(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT)) reason_mask |= 0x08;
-                if (!(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT))               reason_mask |= 0x10;
-                if (!prosper::gpu::fragment_subgroup_features_supported(
-                        required_fragment_subgroup_features,
-                        available_fragment_subgroup_features))                           reason_mask |= 0x20;
-                if (uses_internal_gds && !ctx.fragment_stores_atomics)                   reason_mask |= 0x40;
-                wave64_stats.note_skip(W, H, reason_mask);
+                // The mask is the SAME skip_reasons the gate computed above -- one
+                // computation, two consumers, so the census can never disagree with the
+                // gate about which disjunct fired.
+                wave64_stats.note_skip(W, H, skip_reasons);
             }
             continue;
         }

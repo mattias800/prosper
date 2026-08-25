@@ -499,6 +499,21 @@ inline constexpr uint32_t kFragmentWaveReasonShuffle    = 1u << 5;  // lane-addr
 // PPSA04263 that number was 68 of 112 skipped fragment shaders, with no way to ask how it divides.
 inline constexpr uint32_t kFragmentWaveReasonWaveBallot = 1u << 6;  // OpGroupNonUniformBallot (reduce)
 
+// Which reason sets could a wave32 lowering execute CORRECTLY on a device narrower than the
+// guest wave? Per the recorded history: NONE, and the question is settled -- #2404 gated on
+// WaveAny and was rejected in review (fragment_wave_any's result is routinely consumed as
+// guest scalar data via SCC: s_cselect_b32, s_addc_u32, s_subb_u32 -- rdna2_emit_alu.cpp);
+// #2410 strengthened the gate with a dedicated reduce bit and failed CI twice, then died on
+// decoded-instruction-stream evidence (a guarded block's emulated scalar state goes stale in
+// the half-wave that did not enter -- DOLL's FXAA shape, #273); #2414 ruled the
+// reclassification premise dead. This predicate is that falsification moved into the code:
+// any future wave32 lowering must refine it with shape-level dataflow evidence (the #2410
+// criterion), not per-call-site labels. Until then, a narrow device skips these draws
+// fail-visibly (the [render] skip-draw census measures the population).
+inline constexpr bool fragment_wave_width_relaxable(uint32_t /*reasons*/) {
+    return false;   // no recorded reason set is width-agnostic; see the history above
+}
+
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.
 uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv);
