@@ -259,8 +259,17 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[first-frame] CAPTURE MODE ENABLED\n");
         fprintf(stderr, "[first-frame] output: %s\n", capture_first_frame_path.c_str());
         
-        // Enable rendering (required for present_write_frame to produce frames)
+        // Enable rendering (required for present_write_frame to produce frames).
+        // Not bare setenv: MinGW has no POSIX setenv, so this tool did not COMPILE on Windows at
+        // all -- and because it is one target in a whole-tree build, its failure stopped ninja
+        // before most test executables were linked, which surfaced as ~15 ctest cases Not Run
+        // rather than as a broken tool. Present since the --capture-first-frame commit (#3014).
+#ifdef _WIN32
+        _putenv_s("PROSPER_RENDER", "1");
+#else
         setenv("PROSPER_RENDER", "1", 1);
+#endif
+
         
         // Register the live renderer (same as screenshot tool / prosper-app)
         prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
