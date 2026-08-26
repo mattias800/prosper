@@ -441,14 +441,29 @@ HLE(k_usleep)   { hle::WaitCensusScope c(hle::WaitKind::Usleep, a0 * 1000ull); g
 HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 1000000000ull); guest_sleep_ns(a0 * 1000000000ull); return 0; }
 // The remainder out-parameter is written ZERO rather than left untouched: we always sleep the full
 // duration, and a guest that reads an uninitialised remainder would resume a wait it already served.
+//
+// Both fields are indexed as int64 rather than reached through a HOST struct timespec, because the
+// two layouts differ on the platform this targets: the guest is FreeBSD x86-64, where tv_nsec is
+// 64-bit, while MinGW-w64 declares long tv_nsec (sys/types.h) -- 32-bit on Windows x64. A
+// host-struct write therefore covers 12 of the 16 guest bytes and leaves the HIGH half of tv_nsec
+// holding whatever was there, so the remainder a guest reads back is not zero and it may resume a
+// wait already served. The READ survived the same cast only by little-endian accident, since every
+// legal nanosecond value fits in the low half. Line 277 already indexes explicitly for this reason.
+//
+// An out-of-range tv_nsec is CARRIED into the total rather than rejected: this entry point has always
+// returned 0 unconditionally, and turning a malformed request into an error return would be a new
+// failure mode for guests that currently sleep. Negative values clamp to zero.
 HLE(k_nanosleep){
     if (!a0) return 0;
-    const struct timespec* req = (const struct timespec*)P(a0);
-    const uint64_t want_ns = (uint64_t)req->tv_sec * 1000000000ull + (uint64_t)req->tv_nsec;
+    const int64_t* req = (const int64_t*)P(a0);
+    const int64_t  sec  = req[0] > 0 ? req[0] : 0;
+    const int64_t  nsec = req[1] > 0 ? req[1] : 0;
+    const uint64_t want_ns = (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
     { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want_ns); guest_sleep_ns(want_ns); }
-    if (a1) { struct timespec* rem = (struct timespec*)P(a1); rem->tv_sec = 0; rem->tv_nsec = 0; }
+    if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }   // slept in full
     return 0;
 }
+
 
 
 // --- select / pselect: the PURE-SLEEP shape only (#1660) --------------------------------------

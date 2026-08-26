@@ -13,8 +13,14 @@
 // for a 5.33 ms audio grain is what starvation looks like from inside.
 //
 // Deliberately NOT a rate limiter on the measurement itself: every call is counted, and only the
-// REPORT is throttled. A census that sampled would answer "how often does this happen" with a number
-// about its own sampling.
+// REPORT is throttled. A census that sampled would answer "how often does this happen" with a
+// number about its own sampling.
+//
+// Counters are zeroed once printed, so each line describes ITS OWN window rather than the run so
+// far. A cumulative mean drifts toward whatever the title did early and stops responding to a
+// regime change -- which is the thing this exists to catch. Calls occurring between the read and
+// the reset are lost from the totals; that is an accepted rounding error in a diagnostic, not a
+// count anything is asserted against.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -24,7 +30,7 @@
 namespace prosper::hle {
 
 enum class WaitKind { Usleep, Nanosleep, SleepSeconds, SemTimedwait, CondTimedwait,
-                     MutexTimedlock, Count };
+                     CondTimedwaitSce, MutexTimedlock, Count };
 
 inline const char* wait_kind_name(WaitKind k) {
     switch (k) {
@@ -33,6 +39,7 @@ inline const char* wait_kind_name(WaitKind k) {
     case WaitKind::SleepSeconds:  return "sleep(s)";
     case WaitKind::SemTimedwait:  return "sem_timedwait";
     case WaitKind::CondTimedwait: return "cond_timedwait";
+    case WaitKind::CondTimedwaitSce: return "sceCondTimedwait";
     case WaitKind::MutexTimedlock: return "mutex_timedlock";
     default:                      return "?";
     }
@@ -76,17 +83,23 @@ inline void report_timedwait_census(uint64_t now_ns) {
         // wrong clock-s now from a guest deadline yields a plausible-looking number that means
         // nothing. Those report duration and call count, and no ratio.
         if (req_total == 0) {
-            fprintf(stderr, "[timedwait] %-15s calls=%-9llu requested=      ?     actual=%7.3f ms\n",
+            fprintf(stderr, "[timedwait 5s] %-16s calls=%-9llu requested=      ?     actual=%7.3f ms\n",
                     wait_kind_name((WaitKind)i), (unsigned long long)n,
                     g_wait_actual_ns[i].load(std::memory_order_relaxed) / 1e6 / n);
+        g_wait_calls[i].store(0, std::memory_order_relaxed);
+        g_wait_requested_ns[i].store(0, std::memory_order_relaxed);
+        g_wait_actual_ns[i].store(0, std::memory_order_relaxed);
             continue;
         }
         const double req_ms = req_total / 1e6 / n;
 
         const double act_ms = g_wait_actual_ns[i].load(std::memory_order_relaxed) / 1e6 / n;
-        fprintf(stderr, "[timedwait] %-15s calls=%-9llu requested=%7.3f ms  actual=%7.3f ms  x%.2f\n",
+        fprintf(stderr, "[timedwait 5s] %-16s calls=%-9llu requested=%7.3f ms  actual=%7.3f ms  x%.2f\n",
                 wait_kind_name((WaitKind)i), (unsigned long long)n, req_ms, act_ms,
                 req_ms > 0 ? act_ms / req_ms : 0.0);
+        g_wait_calls[i].store(0, std::memory_order_relaxed);
+        g_wait_requested_ns[i].store(0, std::memory_order_relaxed);
+        g_wait_actual_ns[i].store(0, std::memory_order_relaxed);
     }
 }
 

@@ -2942,6 +2942,12 @@ HLE(k_cond_timedwait_sce) {
     // host already implements the FreeBSD contract itself.
     if (guest_mutex_not_owned_by_self(m)) return prosper::hle::kSceKernelErrorEPERM;
     GuestCondWaiterScope waiting(c);   // #2168: this body parks too, and was not counted either
+    // Censused separately from k_cond_timedwait: this is the Sony spelling and its timeout is
+    // RELATIVE microseconds, so unlike the POSIX abstime form it yields an exact requested
+    // interval. Leaving it out made the census report a clean zero for cond waits on titles
+    // that only ever call this one, which is the shape CLAUDE.md warns about: the null was
+    // about the bodies instrumented, not about the guest.
+    hle::WaitCensusScope census(hle::WaitKind::CondTimedwaitSce, a2 * 1000ull);
     timespec dl = abs_deadline_us(a2);
     int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
                                           nullptr, kGuestMutexCondWaitBookkeeping);
