@@ -77,9 +77,11 @@ public:
     // Successful pull pointers remain valid until the next pull of that media type for this id.
     virtual bool next_video(int id, VideoFrame& out) = 0;  // false if no frame ready yet
     // Non-destructive front-of-queue inspection, for PTS-gated delivery: the caller decides
-    // whether the frame is due BEFORE taking it, because next_video pops. Default false means
-    // "this backend cannot peek", which leaves delivery ungated rather than blocking playback.
+    // whether the frame is due BEFORE taking it, because next_video pops. Only meaningful when
+    // can_peek_video() is true; a backend that cannot peek keeps UNGATED delivery (the caller
+    // must fall back to plain next_video, or no frame would ever be delivered).
     virtual bool peek_video(int id, VideoFrame& out) { return false; }
+    virtual bool can_peek_video() const { return false; }
     // Frames dropped inside the backend (queue-full eviction). Diagnostic: the HLE layer reports
     // it at EOF so a short-delivery measurement can name the stage that lost them.
     virtual uint64_t video_frames_dropped(int id) { return 0; }
