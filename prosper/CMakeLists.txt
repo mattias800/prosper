@@ -625,6 +625,19 @@ if(TARGET prosper_core)
   add_executable(test_kernel_nanosleep tests/hle/kernel/test_kernel_nanosleep.cpp)
   target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
   add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
+
+  # The guest semaphore timed wait, on BOTH axes (#3013). Platform-neutral like the nanosleep case
+  # above and for the same reason: the Windows fix is a poll loop and the defect is a Windows one, so
+  # gating it on UNIX would build it everywhere except where it matters. What makes this test worth
+  # having is that the two arms constrain each other -- the Windows fix buys timeout accuracy WITH
+  # wake latency, so pinning only the timeout would let a future change widen the poll slice and stay
+  # green while destroying responsiveness, and pinning only the wake would let it revert to
+  # winpthreads' 15.6 ms timeout. Thresholds are loose enough for a loaded host and still far inside
+  # both failures.
+  add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
+  target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
+  add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
+  set_tests_properties(kernel_sem_timedwait PROPERTIES TIMEOUT 60)
   # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
   # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
   # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
