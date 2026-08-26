@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-26
 
+### Tomb Raider's world stopped being a pile of shards
+
+Croft Manor now renders with correct geometry — same route, same scene, same build, before and after.
+
+![Croft Manor before the fix: the world shattered into stretched triangles](assets/screenshots/tomb-raider-world-before-index-fix.png)
+
+![Croft Manor after the fix: steps, walls, hedges and trees all correctly shaped, with Lara and Winston](assets/screenshots/tomb-raider-gameplay.png)
+
+Surfaces are still untextured — that is the next thing. [#2990](https://github.com/mattias800/prosper/issues/2990)
+
 ### Tomb Raider I-III Remastered boots for the first time, and reaches its title screen
 
 We now reach the rendered Tomb Raider I title screen. This title had never been launched in prosper
