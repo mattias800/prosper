@@ -1323,48 +1323,74 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 
 // #304, part two: the SAME unannounced 32-bit index buffer, but with indices at or above 0x10000.
 //
-// The detector above requires every high half to be ZERO, which is only true while a title's
-// indices stay under 65536. Tomb Raider I-III Remastered (PPSA16901) draws its level geometry out
-// of one shared ~775,000-vertex pool, so a draw's indices sit in a 64 KiB window well above zero
-// and every high half is the same NON-ZERO constant. The zero-fingerprint cannot see that, the
-// buffer is read as 16-bit, and every triangle becomes a degenerate (N, K, N) sliver -- which is
-// what shatters that title's world into stretched triangles while its character meshes, whose
-// index buffers are genuinely 16-bit, render correctly in the same frame.
+// The detector above requires every high half to be ZERO, which is only true while a title's indices
+// stay under 65536. Tomb Raider I-III Remastered (PPSA16901) draws its level geometry out of one
+// shared ~775,000-vertex pool, so a draw's indices sit in a 64 KiB window well above zero and every
+// high half is the same NON-ZERO constant. The zero-fingerprint cannot match that, the buffer is read
+// as 16-bit, and every triangle becomes a degenerate (N, K, N) sliver -- which is what shattered that
+// title's world while its character meshes, whose index buffers are genuinely 16-bit, rendered
+// correctly in the same frame.
 //
-// Measured on a live boot to Croft Manor (2026-08-26): 508,688 indexed draws, every one of them
-// reporting index_type=0, i.e. the title announces an index size exactly never. Of the draws whose
-// two readings were both sampled, 56,703 carry the zero high half the detector above already
-// catches and 21,567 carry a non-zero constant one, with 32-bit readings like
-// 428289,428290,428291,428292 and 596074..596077 -- consecutive, tightly clustered, and inside the
-// pool's record count.
+// Measured on a live boot to Croft Manor (2026-08-26): 508,688 indexed draws, every one reporting
+// index_type=0, i.e. the title announces an index size exactly never. Its 32-bit readings look like
+// 428289..428292 and 774895..774898 -- consecutive, tightly clustered, and inside the pool's record
+// count. (Only one decomposition of those draws is quoted here, under `kMinSamples` below. An earlier
+// pass bucketed them by different criteria and the two totals do not reconcile; publishing both
+// invited exactly that arithmetic to be checked and fail, so the superseded one is not repeated.)
+//
+// THE BYTE PATTERN ALONE IS NOT SUFFICIENT, and this is the part that matters. When the guest supplies
+// no DrawIndexOffset the two addresses are THE SAME BYTES (see the caller: `addr32 == index_addr`
+// unless `from_offset`), so a 16-bit buffer with a period-2 pattern -- a fan or cone encoded as a
+// triangle strip `[rim, apex, rim, apex, ...]`, or a line list radiating from one hub -- is
+// byte-identical to a clustered 32-bit list. No further test on these two pointers can tell them
+// apart. Verified, not assumed: a 64-spoke line list to hub vertex 7 and a triangle-strip cone with
+// apex 12 both satisfied every byte-pattern clause of an earlier version of this function.
+//
+// So the deciding evidence comes from OUTSIDE the buffer: an index must address a vertex that
+// actually exists. `vertex_upper_bound` is the bound vertex buffer's UNCLAMPED record count
+// (size/stride). The two cases separate immediately -- the cone's 32-bit reading demands 786,640
+// vertices from a mesh that has some tens, while Tomb Raider's demands 775,111 from a pool holding
+// exactly 775,111. A caller that cannot supply a bound passes 0 and this declines, because a
+// discriminator that cannot see is not a licence to guess.
 //
 // Fingerprint, every clause required:
-//   * at least `kMinSamples` entries, so "every odd word is equal" is a real constraint and not an
-//     accident of a 2-entry buffer;
-//   * every ODD 16-bit word is the same NON-ZERO value (one 64 KiB index window). A genuine 16-bit
-//     index list fails here: its odd entries are ordinary indices and vary.
-//   * read as 32-bit, the values span less than one 64 KiB window, stay under a plausibility cap,
-//     are not all zero, and are not all identical.
-// Zero high halves are deliberately left to the detector above so that every buffer it already
-// classifies keeps its existing verdict; this one only ever sees buffers that one rejected.
-// CONFIDENCE: HIGH for the fingerprint; the cap is a guard, not a measurement.
+//   * a bound vertex-buffer record count, and every 32-bit index below it;
+//   * at least `kMinSamples` entries, so "one parity is constant" is a real constraint. At most 64 are
+//     examined, and that ceiling is deliberate rather than an optimisation: a real draw whose indices
+//     straddle a 64 KiB boundary carries TWO high halves, and scanning the whole buffer would reject
+//     it on the parity clause. The ceiling costs precision in the other direction -- only the first
+//     128 16-bit words of a long buffer need the pattern -- which is why the vertex-range bound above,
+//     not the pattern, is what has to carry the decision;
+//   * one PARITY of the 16-bit reading -- either one -- holding the same NON-ZERO value. Which parity
+//     depends on how the 16-bit address aligns against the 32-bit grid: a DrawIndexOffset scaled by 2
+//     instead of 4 lands 2 mod 4 as often as not, and on the Croft Manor frame the even parity carried
+//     it for 55,677 draws against 21,871 for the odd one, so checking only one misses most of it;
+//   * the 32-bit reading spanning less than one 64 KiB window, not all zero, and at least
+//     `kMinDistinct` distinct values.
+// Zero high halves are left to the detector above so every buffer it already classifies keeps its
+// existing verdict; this one only ever sees what that one rejected.
+// CONFIDENCE: MED. The byte fingerprint plus the vertex-range bound rejects every false positive
+// constructed so far, but the fingerprint is a heuristic over guest data and the bound is a necessary
+// condition rather than a sufficient one: a title with a pool of comparable size AND period-2 fan
+// geometry with a small constant index could still satisfy both. The real fix is knowing whether the
+// guest ever announced an index size at all -- today `index_type == 0` means "16-bit" and "never told"
+// indistinguishably.
 inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const uint32_t* p32,
-                                                  uint32_t n) {
-    constexpr uint32_t kMinSamples = 8;                 // >= 4 words per parity before "all equal" means anything
-    constexpr uint32_t kMaxPlausibleIndex = 1u << 24;   // 16.7M vertices; a guard against garbage
-    constexpr uint32_t kMinDistinct = 4;                // a real index list is not two repeated values
-    if (n < kMinSamples) return false;
+                                                   uint32_t n, uint32_t vertex_upper_bound) {
+    constexpr uint32_t kMinSamples = 8;     // >= 4 words per parity before "all equal" means anything
+    constexpr uint32_t kMinDistinct = 4;    // a real index list is not two repeated values
+    if (n < kMinSamples || vertex_upper_bound == 0) return false;
     const uint32_t m = std::min(n, 64u);
 
-    // The 32-bit reading is the authoritative one: it is taken at the RECOMPUTED address, which for
-    // a DrawIndexOffset is a different address entirely (index_base + index_offset*4, not *2), so
-    // this is genuinely independent evidence rather than a restatement of the 16-bit shape.
+    // Outside evidence first: every index must address a vertex the bound buffer actually holds.
     uint32_t lo = UINT32_MAX, hi = 0;
     bool any_nonzero = false;
     uint32_t distinct = 0, seen[kMinDistinct] = {};
     for (uint32_t i = 0; i < m; i++) {
+        // memcpy loads, NOT typed derefs: p16/p32 may view the SAME guest bytes and reading one object
+        // through both element types is strict-aliasing UB (see the note on the detector above).
         uint32_t d; memcpy(&d, (const char*)p32 + 4u * i, 4);
-        if (d >= kMaxPlausibleIndex) return false;
+        if (d >= vertex_upper_bound) return false;
         if (d != 0) any_nonzero = true;
         lo = std::min(lo, d); hi = std::max(hi, d);
         if (distinct < kMinDistinct) {
@@ -1376,25 +1402,16 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
     if (!any_nonzero || distinct < kMinDistinct) return false;
     if ((hi - lo) >= 0x10000u) return false;            // must fit one 64 KiB index window
 
-    // The 16-bit reading must carry the degenerate fingerprint: one PARITY holds the repeated high
-    // half. Which parity depends on the alignment of the 16-bit address against the 32-bit grid --
-    // a DrawIndexOffset scaled by 2 instead of 4 lands 2 mod 4 as often as not, and on this title's
-    // Croft Manor frame the even parity carries it for 55,677 draws against 21,871 for the odd one.
-    // Checking only one parity silently misses most of the corruption. A genuine 16-bit index list
-    // fails both: its entries are ordinary indices at every position and vary.
+    // Then the byte fingerprint: one parity holds the repeated high half.
     bool even_const = true, odd_const = true;
     uint16_t even0 = 0, odd0 = 0;
     bool have_even = false, have_odd = false;
     for (uint32_t i = 0; i < m; i++) {
-        // memcpy loads, NOT typed derefs: p16/p32 view the SAME guest bytes and reading one object
-        // through both element types is strict-aliasing UB (see the note on the detector above).
         uint16_t w; memcpy(&w, (const char*)p16 + 2u * i, 2);
         if (i & 1) { if (!have_odd)  { odd0  = w; have_odd  = true; } else if (w != odd0)  odd_const  = false; }
         else       { if (!have_even) { even0 = w; have_even = true; } else if (w != even0) even_const = false; }
     }
-    const bool fingerprint = (have_even && even_const && even0 != 0) ||
-                             (have_odd  && odd_const  && odd0  != 0);
-    return fingerprint;
+    return (have_even && even_const && even0 != 0) || (have_odd && odd_const && odd0 != 0);
 }
 
 // #1163: choose a NON-INDEXED draw's vertex count. A DrawIndexAuto packet's count (draw_count) is the
@@ -2066,6 +2083,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     if (vrt) for (const auto& r : vrt->resources)
         if (r.cls == ResourceClass::VertexBuffer && r.stride)
             vb_entries = std::max(vb_entries, r.size / r.stride);
+    // The unclamped count, kept only as an INDEX-RANGE BOUND for the #304 part-two detector below.
+    // vb_entries itself is clamped next, and that clamp would defeat the bound: Tomb Raider's level
+    // pool holds 775,111 records and its real 32-bit indices reach 774,898, so a 65,536 ceiling would
+    // reject exactly the case the detector exists for.
+    const uint32_t vb_records_unclamped = vb_entries;
     if (vb_entries > 65536u) vb_entries = 65536u;   // sanity cap: don't stall llvmpipe on an over-sized VB
     // Indexed draw (sceAgcDcbDrawIndex): fetch the real index data from guest memory (1:1-mapped) and
     // hand it to the backend, which renders it with vkCmdDrawIndexed. This replaced the old "4-record
@@ -2100,7 +2122,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             // hundreds of thousands of indexed draws (508,688 measured on one Tomb Raider run), and
             // an unbounded line-per-draw log is a multi-gigabyte file that fills the disk before it
             // answers anything. The cap is announced so a truncated log is never read as a count.
-            if (getenv("PROSPER_INDEXTYPE_LOG")) {
+            static const bool indextype_log = getenv("PROSPER_INDEXTYPE_LOG") != nullptr;
+            if (indextype_log) {
                 static std::atomic<uint32_t> printed{0};
                 constexpr uint32_t kMaxLines = 64;
                 const uint32_t seq = printed.fetch_add(1);
@@ -2138,7 +2161,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 // what it rejected.
                 const char* how = nullptr;
                 if (index_buffer_is_unannounced_32bit(p16, p32, n))            how = "zero-high-half";
-                else if (index_buffer_is_unannounced_32bit_high(p16, p32, n))  how = "constant-high-half";
+                else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
+                    how = "constant-high-half";
                 if (how) {
                     esz = 4; index_addr = addr32;
                     if (log) fprintf(stderr, "[exec] indexed draw: auto-detected 32-bit index buffer "

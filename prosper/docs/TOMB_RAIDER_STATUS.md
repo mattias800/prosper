@@ -46,7 +46,23 @@ requires every high half to be **zero**, i.e. every index below 65536. Here the 
 64 KiB window *above* zero, so the repeated high half is a small **non-zero** constant and the
 fingerprint cannot match. `index_buffer_is_unannounced_32bit_high` handles that form.
 
-Two details cost time and are worth keeping:
+**The byte pattern alone is not enough, and that is the part a review caught.** With no
+`DrawIndexOffset` the caller passes the same pointer twice, so the two readings are the same bytes —
+and a genuine 16-bit buffer with a period-2 pattern (a fan or cone encoded as a triangle strip
+`[rim, apex, rim, apex, …]`, or a line list radiating from one hub) is then *byte-identical* to a
+clustered 32-bit list. Constructed by hand and confirmed against the shipped header: a 64-spoke line
+list to hub vertex 7, and a triangle-strip cone with apex 12, both satisfied every byte-pattern
+clause of the first version. No further test on those two pointers can separate them.
+
+So the deciding evidence comes from **outside** the buffer: an index must address a vertex that
+exists. The detector takes the bound vertex buffer's **unclamped** record count and requires every
+32-bit index to fall below it. The cases separate at once — the cone's 32-bit reading demands 786,640
+vertices from a mesh holding tens, while Tomb Raider's demands 775,111 from a pool holding exactly
+775,111. Note *unclamped*: the executor's own `vb_entries` is capped at 65,536, and that cap would
+reject precisely the case the detector exists for. A caller with no bound passes 0 and the detector
+declines, because a discriminator that cannot see is not a licence to guess.
+
+Two further details cost time and are worth keeping:
 
 - **The constant lands on either PARITY.** Which one depends on the alignment of the 16-bit address
   against the 32-bit grid: a `DrawIndexOffset` scaled by 2 instead of 4 lands 2 mod 4 as often as
