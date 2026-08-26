@@ -163,6 +163,34 @@ std::vector<uint8_t> inspect_live_target(const prosper::gpu::LiveTargetSnapshot&
         case prosper::gpu::LiveTargetPixelFormat::R11G11B10Float:
             seed.format = prosper::gpu::GpuCaptureColorFormat::R11G11B10Float;
             break;
+        // The seven single- and dual-channel formats arrived with the GTA V rendering series. The
+        // mapping is 1:1 by name in both directions, but it still has to be written out here: this
+        // switch is the SECOND place a LiveTargetPixelFormat is mapped (live_target_format.hpp is the
+        // first, and its header calls itself "the one place", which is why the miss was easy to make).
+        // -Werror=switch on this target is what turned the omission into a build failure rather than a
+        // silent fall-through leaving seed.format at its Rgba8Unorm default -- i.e. every one of these
+        // targets would have been inspected as 8-bit RGBA.
+        case prosper::gpu::LiveTargetPixelFormat::R8Unorm:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::R8Unorm;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::R32Uint:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::R32Uint;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::R32Float:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::R32Float;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::Rg8Unorm;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::Rgba32Float;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::Rg16Float;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::R16Float;
+            break;
     }
     return inspect_rtt_seed(seed);
 }
