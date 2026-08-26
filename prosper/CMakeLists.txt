@@ -603,8 +603,6 @@ if(TARGET prosper_core)
   target_link_libraries(test_self_segment_key PRIVATE prosper_core)
   add_test(NAME self_segment_key COMMAND test_self_segment_key)
 
-  # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
-  # code is Linux-only (guest %fs), so gate the test on it too.
   # sceKernelNanosleep's GUEST timespec contract (#3013). Registered OUTSIDE the if(UNIX) block
   # below ON PURPOSE: what it pins is a WINDOWS defect -- MinGW-w64 declares a 32-bit `long tv_nsec`
   # while the guest timespec is FreeBSD x86-64's 64-bit field, so writing the remainder through a
@@ -616,7 +614,13 @@ if(TARGET prosper_core)
   add_executable(test_kernel_nanosleep tests/hle/kernel/test_kernel_nanosleep.cpp)
   target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
   add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
+  # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
+  # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
+  # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
+  set_tests_properties(kernel_nanosleep PROPERTIES TIMEOUT 60)
 
+  # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
+  # code is Linux-only (guest %fs), so gate the test on it too.
   if(UNIX)
     add_executable(test_guest_tls_align tests/loader/test_guest_tls_align.cpp)
     target_link_libraries(test_guest_tls_align PRIVATE prosper_core)

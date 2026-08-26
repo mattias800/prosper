@@ -78,7 +78,12 @@ int main() {
         CHECK(ms < 500.0, "a garbage tv_nsec returns promptly rather than sleeping ~292 years");
     }
 
-    // 4. A negative tv_sec is refused the same way, and a NULL request is a no-op.
+    // 4. Contract documentation, NOT a regression arm, and labelled so rather than left to look like
+    //    one: a negative tv_sec and a NULL request both returned 0 promptly in every version of this
+    //    body -- the original (host nanosleep EINVALs), the intermediate one (negatives clamped to 0),
+    //    and the current guard. So these cannot fail for the fix's sake and pin only the stable part
+    //    of the contract. Kept because that part is worth stating; counted honestly because an arm
+    //    that cannot distinguish the versions is not evidence about them.
     {
         int64_t req[2] = { -1, 0 };
         CHECK(ns((uint64_t)(uintptr_t)req, 0, 0, 0, 0, 0) == 0, "a negative tv_sec returns 0");

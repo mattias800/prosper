@@ -450,9 +450,11 @@ HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 10000
 // wait already served. The READ survived the same cast only by little-endian accident, since every
 // legal nanosecond value fits in the low half. Line 278 already indexes explicitly for this reason.
 //
-// An out-of-range tv_nsec is CARRIED into the total rather than rejected: this entry point has always
-// returned 0 unconditionally, and turning a malformed request into an error return would be a new
-// failure mode for guests that currently sleep. Negative values clamp to zero.
+// An out-of-range or negative tv_nsec is REFUSED -- the body returns 0 without sleeping. The comment
+// on the guard itself says why that is the behaviour to preserve. (An earlier revision of this block
+// described the OPPOSITE, carrying the value into the total. That text survived the commit that added
+// the guard and read as a rationale for removing it, which is how a comment gets a safety check
+// deleted.)
 HLE(k_nanosleep){
     if (!a0) return 0;
     const int64_t* req = (const int64_t*)P(a0);
@@ -471,11 +473,16 @@ HLE(k_nanosleep){
         if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }
         return 0;
     }
-    // Saturating rather than wrapping: tv_sec is guest-controlled and unbounded, and a wrap would
-    // turn a very long sleep into a short one, which is worse than a long one.
-    const uint64_t kNsMax = ~0ull;
-    const uint64_t want_ns = (uint64_t)sec > kNsMax / 1000000000ull
-        ? kNsMax : (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
+    // Saturating, and the second disjunct is the boundary the first one misses: sec == kNsMax/1e9
+    // passes a bare `sec > kNsMax/1e9` test, and then `+ nsec` overflows for nsec > kNsMax%1e9 and
+    // wraps a 584-year sleep into a short one -- the long-to-short direction this clamp exists to
+    // prevent. tv_sec is guest-controlled, so the boundary is reachable by a hostile value.
+    const uint64_t kNsMax   = ~0ull;
+    const uint64_t kSecMax  = kNsMax / 1000000000ull;      // 18446744073
+    const uint64_t kNsecRem = kNsMax % 1000000000ull;      // 709551615
+    const uint64_t want_ns =
+        ((uint64_t)sec > kSecMax || ((uint64_t)sec == kSecMax && (uint64_t)nsec > kNsecRem))
+            ? kNsMax : (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
     { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want_ns); guest_sleep_ns(want_ns); }
     if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }   // slept in full
     return 0;
