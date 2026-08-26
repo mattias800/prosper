@@ -1369,17 +1369,27 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 //     `kMinDistinct` distinct values.
 // Zero high halves are left to the detector above so every buffer it already classifies keeps its
 // existing verdict; this one only ever sees what that one rejected.
-// CONFIDENCE: MED. The byte fingerprint plus the vertex-range bound rejects every false positive
-// constructed so far, but the fingerprint is a heuristic over guest data and the bound is a necessary
-// condition rather than a sufficient one: a title with a pool of comparable size AND period-2 fan
-// geometry with a small constant index could still satisfy both. The real fix is knowing whether the
-// guest ever announced an index size at all -- today `index_type == 0` means "16-bit" and "never told"
-// indistinguishably.
+// CONFIDENCE: MED, and the residual is smaller than "a pool like Tomb Raider's" would suggest -- do
+// not read this bound as narrow. A period-2 buffer's implied index is `constant << 16 | varying`, so
+// the constant only has to be 1 for the implied indices to start just above 2^16: the measured
+// threshold is a bound of **65,602 records** (apex vertex 1, rim 2..65), not ~775,000. The executor's
+// own clamp constant three lines above `vb_records_unclamped` is 65,536, i.e. vertex buffers of about
+// that size are routine, so a title with a modest pool AND fan/cone geometry whose apex index is small
+// can still satisfy every clause here. The real fix is knowing whether the guest ever announced an
+// index size at all -- today `index_type == 0` means "16-bit" and "never told" indistinguishably, and
+// that distinction would let both detectors decline outright for any title that announces (#3009).
 inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const uint32_t* p32,
                                                    uint32_t n, uint32_t vertex_upper_bound) {
     constexpr uint32_t kMinSamples = 8;     // >= 4 words per parity before "all equal" means anything
     constexpr uint32_t kMinDistinct = 4;    // a real index list is not two repeated values
+    // An absolute ceiling ON TOP of the caller's bound. The bound is a decoded V#'s size/stride and is
+    // therefore only as trustworthy as that descriptor: the line that clamps `vb_entries` to 65536
+    // three lines above its capture exists precisely because over-sized vertex buffers do occur. With
+    // no ceiling, a period-2 buffer whose constant is 400 implies indices near 26.2M and is accepted
+    // the moment a bound exceeds them. 16.7M records is far above any real mesh and cheap to keep.
+    constexpr uint32_t kMaxPlausibleIndex = 1u << 24;
     if (n < kMinSamples || vertex_upper_bound == 0) return false;
+    const uint32_t ceiling = std::min(vertex_upper_bound, kMaxPlausibleIndex);
     const uint32_t m = std::min(n, 64u);
 
     // Outside evidence first: every index must address a vertex the bound buffer actually holds.
@@ -1390,7 +1400,7 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
         // memcpy loads, NOT typed derefs: p16/p32 may view the SAME guest bytes and reading one object
         // through both element types is strict-aliasing UB (see the note on the detector above).
         uint32_t d; memcpy(&d, (const char*)p32 + 4u * i, 4);
-        if (d >= vertex_upper_bound) return false;
+        if (d >= ceiling) return false;
         if (d != 0) any_nonzero = true;
         lo = std::min(lo, d); hi = std::max(hi, d);
         if (distinct < kMinDistinct) {

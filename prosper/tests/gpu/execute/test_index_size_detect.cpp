@@ -124,7 +124,8 @@ int main() {
         // hold the implied indices they would be accepted. This is the honest statement of the limit
         // and it is asserted rather than left in a comment.
         CHECK(detect_alias(spokes, 64, 1u << 20),
-              "...but with a pool that large the pattern IS accepted -- the bound is the discriminator");
+              "KNOWN LIMIT: with a pool that large the pattern IS accepted -- the bound is the\n"
+          "           discriminator, and this arm is EXPECTED to flip if the detector is tightened");
     }
 
     // Genuine 16-bit buffers from the same frame must be left alone.
@@ -145,8 +146,12 @@ int main() {
     CHECK(!detect_hi({2, 41911, 7, 41916, 2, 41915, 9, 41913},
                      {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8, kTrPool),
           "mutation: parity no longer constant -> rejected");
+    // The bound must be ABOVE the injected outlier, or the vertex-range clause rejects the arm first
+    // and the span clause is never reached -- which is exactly what happened here: deleting the span
+    // clause entirely left the whole suite green. A mutation arm that another clause short-circuits
+    // tests nothing.
     CHECK(!detect_hi({2, 41911, 2, 41916, 2, 41915, 2, 41913},
-                     {301685, 999999, 301683, 301686, 301687, 301688, 301689, 301690}, 8, kTrPool),
+                     {301685, 999999, 301683, 301686, 301687, 301688, 301689, 301690}, 8, 2000000),
           "mutation: 32-bit span exceeds one 64 KiB window -> rejected");
     CHECK(!detect_hi({2, 41911, 2, 41916, 2, 41915, 2, 41913},
                      {301685, 301685, 301685, 301685, 301685, 301685, 301685, 301685}, 8, kTrPool),
@@ -156,12 +161,33 @@ int main() {
           "mutation: zero high half is the other detector's case -> rejected here");
     CHECK(!detect_hi({2, 41911, 2, 41916}, {301685, 301684, 301683, 301686}, 4, kTrPool),
           "mutation: too few samples for 'constant parity' to mean anything -> rejected");
+    // The absolute ceiling, independent of the caller's bound: a constant of 400 implies indices near
+    // 26.2M, which no real mesh reaches. Without kMaxPlausibleIndex a large enough bound accepts it.
+    {
+        std::vector<uint16_t> huge;
+        for (uint16_t i = 0; i < 64; i++) { huge.push_back(1000 + i); huge.push_back(400); }
+        CHECK(!detect_alias(huge, 64, 1u << 30),
+              "mutation: implied indices past the absolute ceiling -> rejected even with a huge bound");
+    }
     CHECK(!detect_hi({2, 41911, 2, 41916, 2, 41915, 2, 41913},
                      {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8, 301686),
           "mutation: one index at or past the vertex bound -> rejected");
     CHECK(!detect_hi({2, 41911, 2, 41916, 2, 41915, 2, 41913},
                      {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8, 0),
           "mutation: no vertex bound available -> declines rather than guesses");
+
+    // R4: the 64-sample cap is load-bearing, and this is the arm that says so. A real draw whose
+    // indices straddle a 64 KiB boundary carries TWO high halves; the cap means only the first 64
+    // entries are examined, so the run stays classifiable. Scanning the whole buffer instead would see
+    // both constants, fail the parity clause, and reject a genuine 32-bit buffer -- so changing
+    // min(n,64) to n must break this arm.
+    {
+        std::vector<uint16_t> straddle;
+        for (uint16_t i = 0; i < 64; i++) { straddle.push_back(100 + i); straddle.push_back(2); }
+        for (uint16_t i = 0; i < 128; i++) { straddle.push_back(200 + i); straddle.push_back(3); }
+        CHECK(detect_alias(straddle, 192, 300000),
+              "32-bit run straddling a 64 KiB boundary -> still 32-bit (this is why the cap exists)");
+    }
 
     // The two detectors must not overlap, so the call site's ordering can never change an existing
     // verdict.

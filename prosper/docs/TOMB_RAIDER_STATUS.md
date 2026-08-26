@@ -89,6 +89,16 @@ Two further details cost time and are worth keeping:
 
 ## Ruled out
 
+- **The byte pattern of a misread 32-bit index buffer is NOT sufficient to identify one.** A genuine
+  16-bit buffer with a period-2 pattern — a fan or cone as a triangle strip `[rim, apex, rim, apex, …]`,
+  or a line list radiating from one hub — is **byte-identical** to a clustered 32-bit list whenever the
+  guest supplies no `DrawIndexOffset`, because the caller then passes the same pointer twice. Two such
+  buffers were constructed by hand and both satisfied every byte-pattern clause of the first version of
+  `index_buffer_is_unannounced_32bit_high`. **No further test over those two pointers can separate
+  them** — do not try to tighten the pattern. The deciding evidence has to come from outside the
+  buffer, and today that is the bound vertex buffer's record count. Residual, measured: a bound of
+  65,602 records still admits the case; #3009 is the real fix. Found by independent review of PR #3006.
+
 - **The renderer is not rejecting anything, and never was.** A full boot-to-gameplay run produces
   **zero** `[recompile-reject]` lines and **zero** `[compute] skip` lines. Neither the shattered
   geometry (now fixed) nor the missing textures (still open) is an unsupported-op gap — prosper
