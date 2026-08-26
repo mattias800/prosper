@@ -19,6 +19,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-26
+
+### Tomb Raider I-III Remastered boots for the first time, and reaches its title screen
+
+We now reach the rendered Tomb Raider I title screen. This title had never been launched in prosper
+before today, and it needed no code change at all — only a pad route to clear the game's own 40-page
+EULA, which Cross refuses to accept until you have scrolled to the last page.
+
+![Tomb Raider I-III Remastered — the Tomb Raider I title screen](assets/screenshots/tomb-raider-title-screen.png)
+
 ## 2026-08-25
 
 ### GRIS has sound now

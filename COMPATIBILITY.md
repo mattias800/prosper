@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-08-23
+Last updated: 2026-08-26
 
 ## Summary
 
@@ -78,6 +78,7 @@ Last updated: 2026-08-23
 | *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — a routed run passes the title screen on Cross and skips the intro cinematic on **Square**, which is what that screen's own `Press ▢ to skip` prompt names, reaching the first level's map load (`normalvillage`, t≈78 s, absent from every default run). The level then composites as a flat two-tone clear ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/unbound-PPSA03274/` | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
+| *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🔬 Rung 2 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40) and reaches the rendered **Tomb Raider I title screen**; Up/Down also reaches Tomb Raider III's. `Lara's Home` then loads Croft Manor and the guest runs a live 3D scene with correct character models, but the static world geometry is shattered and untextured ([#2990](https://github.com/mattias800/prosper/issues/2990)). No prosper code change was needed to reach any of this. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
 
 ## At a glance
 
@@ -94,11 +95,11 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 25 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 18 |
 | **Below a title screen** — logo or splash only (rung 1) | 3 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 53 |
+| Total tracked | 54 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
