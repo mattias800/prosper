@@ -1,0 +1,40 @@
+# GTA V (PPSA04263) — DISCOVERY: the Display settings pane, reached from the LANDING menu.
+#
+# ESTABLISHED BY CAPTURE (2026-08-26):
+#   * OPTIONS opens Settings from the landing menu, before Story is entered. Not triangle, not
+#     touchpad -- both were tried and both were confirmed DELIVERED in PROSPER_PAD_SCRIPT_LOG, so
+#     they are real negatives. The on-screen prompt cannot settle it: the glyph renders as a
+#     FEATURELESS WHITE PILL with no inner symbol, while "Resume Story" beside it renders a correct
+#     circled X. That is a glyph defect, and it is why this took a button sweep to find.
+#   * Category list, top to bottom: Controls (selected on entry) | Audio | Camera | Display |
+#     Voice Chat | Notifications | Rockstar Editor | Motion Sensor Function.
+#   * The right pane FOLLOWS the highlighted category automatically. There is no "enter the
+#     category" step, and Cross on the list does nothing.
+#
+# PRESS DURATION IS LOAD-BEARING HERE, and 1-second presses do not work. The menu now runs at
+# roughly 80 flips/s after the rendering series, so a 1 s hold triggers key repeat: three Down
+# presses walked SIX rows and landed on Rockstar Editor. These are ~0.15 s (~12 flips), short
+# enough to register once. `strtod` parses the anchors, so fractional seconds are supported.
+
+f600-620:cross
+f800-820:cross
+f1000-1020:cross
+f1200-1220:cross
+f1400-1420:cross
+f1600-1620:cross
+f1800-1820:cross
+f2000-2020:cross
+f2200-2220:cross
+f2400-2420:cross
+
+60-60.15:r1
+66-66.15:r1
+72-72.15:r1
+78-78.15:r1
+
+90-90.15:options
+
+# Controls -> Audio -> Camera -> Display. One row per press, verified by reading frames.
+104-104.15:down
+112-112.15:down
+120-120.15:down
