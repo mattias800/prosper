@@ -130,6 +130,18 @@ int main() {
         record.callbacks = 1;
         record.draws = 100 + i;
         record.total_ms = 20 + i;
+        record.pass_loop_ms = 7 + i;
+        record.frontend_tex_persist_miss_ms = 2 + i;
+        record.frontend_tex_other_slowest_ms = 1.5 + i;
+        record.frontend_tex_other_addr = 0x2046960000ull + i * 0x1000;
+        record.frontend_tex_other_width = 2560;
+        record.frontend_tex_other_height = 1440;
+        record.frontend_tex_other_depth = 1;
+        record.frontend_tex_other_format = 1;
+        record.frontend_tex_other_components = 1;
+        record.frontend_tex_other_tile_mode = 24;
+        record.frontend_tex_other_compute_candidate = true;
+        record.resolve_read_count = 3 + i;
         record.setup_resources_ms = 10 + i;
         record.gpu_timestamp_samples = 2 + i;
         capture.record_renderer(record);
@@ -185,6 +197,12 @@ int main() {
           "serialized detail counts match the bounded retained records");
     check(text.find("\"gpu_timestamp_samples\":2") != std::string::npos,
           "renderer records serialize the GPU timestamp availability discriminator");
+    check(text.find("\"pass_loop_ms\":7") != std::string::npos &&
+          text.find("\"frontend_tex_persist_miss_ms\":2") != std::string::npos &&
+          text.find("\"frontend_tex_other_addr\":138623188992") != std::string::npos &&
+          text.find("\"frontend_tex_other_compute_candidate\":true") != std::string::npos &&
+          text.find("\"resolve_read_count\":3") != std::string::npos,
+          "renderer records serialize the frontend phase, cache-class, residual witness, and resolve diagnostics");
     check(text.find("\"program_addr\":78187493376") != std::string::npos &&
           text.find("\"program_hash\":18364758544493064720") != std::string::npos,
           "compute records serialize the bounded program identity");

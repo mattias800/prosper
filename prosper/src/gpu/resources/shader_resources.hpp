@@ -122,6 +122,27 @@ constexpr bool native_float_storage_image_supported(DataFormat format, uint32_t 
     return storage_image_feature && native_float_storage_image(format, components, srgb);
 }
 
+// Narrow unsigned integer storage has the same exact byte contract as the guest surface:
+// Vulkan zero-extends narrow texels on load and discards the high bits on store. Keeping these
+// images typed avoids the portable RGBA32_UINT interchange representation (16 bytes per texel)
+// without changing any shader-visible value. The 16-bit arm is important for GTA V's layered depth
+// copies: the raw fallback expands a six-face 512x512 Uint16 cube from 3 MiB to 24 MiB for every
+// single-face dispatch. RGBA8_UINT is equally exact and avoids expanding GTA V's 4K transition
+// target from 33 MiB to 127 MiB. Keep integer 3D separate so no unqueried dimensional contract is
+// implied.
+constexpr bool native_uint_storage_image(DataFormat format, uint32_t components, bool srgb) {
+    return !srgb &&
+           ((components == 1 &&
+             (format == DataFormat::Uint32 || format == DataFormat::Uint16 ||
+              format == DataFormat::Uint8)) ||
+            (components == 4 && format == DataFormat::Uint8));
+}
+
+constexpr bool native_uint_storage_image_supported(DataFormat format, uint32_t components,
+                                                   bool srgb, bool storage_image_feature) {
+    return storage_image_feature && native_uint_storage_image(format, components, srgb);
+}
+
 // Stable, Vulkan-independent bits used to carry per-format storage-image capabilities from the
 // device-owning frontend into the compute recompiler. Zero means the semantic format is not a native
 // typed-storage candidate; otherwise each exact VkFormat candidate has its own bit.
@@ -136,6 +157,11 @@ constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t
         return components == 1 ? 1u << 6 : components == 2 ? 1u << 7
              : components == 4 ? 1u << 8 : 0u;
     if (format == DataFormat::Float10_11_11 && components == 3) return 1u << 9;
+    // Bits 10..19 retain their capture-stable meaning as the 3D mirrors of bits 0..9.
+    if (format == DataFormat::Uint32 && components == 1) return 1u << 20;
+    if (format == DataFormat::Uint8 && components == 1) return 1u << 21;
+    if (format == DataFormat::Uint16 && components == 1) return 1u << 22;
+    if (format == DataFormat::Uint8 && components == 4) return 1u << 23;
     return 0;
 }
 
@@ -144,10 +170,11 @@ constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t
 // the corresponding 3D image never compiles a shader the live backend cannot bind.
 constexpr uint32_t native_storage_3d_format_support_bit(DataFormat format,
                                                         uint32_t components) {
-    return native_storage_format_support_bit(format, components) << 10;
+    const uint32_t format_bit = native_storage_format_support_bit(format, components);
+    return (format_bit & ((1u << 10) - 1u)) ? format_bit << 10 : 0u;
 }
 
-constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 20) - 1u;
+constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 24) - 1u;
 
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
@@ -569,6 +596,23 @@ constexpr bool shader_resource_uses_native_2d_storage_image(
             !resource.depth_compare);
 }
 
+// Exact unsigned integer storage also admits a real multi-layer 2D-array view. The live backend
+// already stages every physical slice independently and creates an array image with the reflected
+// layer count; keeping this separate from the float predicate prevents an unrelated format from
+// silently broadening its dimensional contract. A shader-declared non-arrayed view still uses the
+// ordinary/base-slice rule above.
+constexpr bool shader_resource_uses_native_uint_2d_storage_image(
+    const ShaderResource& resource,
+    bool shader_2d,
+    bool shader_arrayed,
+    bool shader_multisampled) {
+    return shader_resource_uses_native_2d_storage_image(
+               resource, shader_2d, shader_arrayed, shader_multisampled) ||
+           (shader_2d && shader_arrayed && !shader_multisampled &&
+            resource.img_dim == 5 && resource.depth >= 1 &&
+            !resource.depth_compare);
+}
+
 // The RESOURCE half of "may this R32_UINT storage image be lowered to a detiled linear atomic SSBO"
 // (the RADV image-atomic workaround: RADV hangs/reset-poisons the device on a compute R32_UINT image
 // atomic, so compute reaches the image through a buffer view instead).
@@ -796,6 +840,9 @@ enum class StorageBufferTailSemantic : uint32_t {
 // SPIR-V Image Format operand used by the exact one-word storage fallback. Keep this public so the
 // recompiler, reflection, live backend, and their contract tests cannot drift through magic values.
 constexpr uint32_t kSpirvImageFormatR32ui = 33;
+constexpr uint32_t kSpirvImageFormatRgba8ui = 32;
+constexpr uint32_t kSpirvImageFormatR16ui = 38;
+constexpr uint32_t kSpirvImageFormatR8ui = 39;
 
 // A declared descriptor-array length that reflection could not read (#2412). Distinct from 0, which
 // means exactly `OpTypeRuntimeArray` -- a length deliberately supplied at bind time and therefore

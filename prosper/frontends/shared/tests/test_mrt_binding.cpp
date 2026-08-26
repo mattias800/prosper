@@ -180,6 +180,8 @@ int main() {
         // become the same image.
         CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, true, true,
                                  format_defined));
+        CHECK(mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, true, true,
+                                format_defined, /*feedback_copy_supported=*/true));
         // The non-feedback preconditions still gate it.
         CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
                                  /*is_storage_image=*/true, 1u, true, true,

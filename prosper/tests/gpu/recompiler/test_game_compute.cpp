@@ -80,9 +80,11 @@ int main() {
 #ifdef _WIN32
     _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
     _putenv_s("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
+    _putenv_s("PROSPER_NO_DISK_PIPELINE_CACHE", "1");
 #else
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
     setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
+    setenv("PROSPER_NO_DISK_PIPELINE_CACHE", "1", 1);
 #endif
     const bool adaptive_storage_result_validation_enabled =
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
@@ -119,6 +121,36 @@ int main() {
           prosper::frontend::compute_image_cache_default_limit_bytes(UINT64_MAX) ==
               2048ull * 1024ull * 1024ull,
           "image cache limit scales with local memory and retains bounded floor and ceiling");
+    CHECK(!prosper::frontend::compute_pipeline_is_large(32u * 1024u - 1u) &&
+          prosper::frontend::compute_pipeline_is_large(32u * 1024u),
+          "large portable compute modules retain an exact diagnostic policy boundary");
+    std::array<uint8_t, 32> pipeline_cache_header{};
+    const uint32_t pipeline_header_size = static_cast<uint32_t>(pipeline_cache_header.size());
+    const uint32_t pipeline_header_version = 1;
+    const uint32_t pipeline_vendor = 0x10de;
+    const uint32_t pipeline_device = 0x2b85;
+    std::array<uint8_t, 16> pipeline_uuid{};
+    for (size_t i = 0; i < pipeline_uuid.size(); ++i)
+        pipeline_uuid[i] = static_cast<uint8_t>(i * 7u + 3u);
+    std::memcpy(pipeline_cache_header.data() + 0, &pipeline_header_size, sizeof(uint32_t));
+    std::memcpy(pipeline_cache_header.data() + 4, &pipeline_header_version, sizeof(uint32_t));
+    std::memcpy(pipeline_cache_header.data() + 8, &pipeline_vendor, sizeof(uint32_t));
+    std::memcpy(pipeline_cache_header.data() + 12, &pipeline_device, sizeof(uint32_t));
+    std::memcpy(pipeline_cache_header.data() + 16, pipeline_uuid.data(), pipeline_uuid.size());
+    CHECK(prosper::frontend::compute_pipeline_cache_blob_compatible(
+              pipeline_cache_header.data(), pipeline_cache_header.size(),
+              pipeline_vendor, pipeline_device, pipeline_uuid.data(), pipeline_uuid.size()),
+          "disk compute pipeline cache accepts its exact Vulkan device identity");
+    pipeline_cache_header[16] ^= 1u;
+    CHECK(!prosper::frontend::compute_pipeline_cache_blob_compatible(
+              pipeline_cache_header.data(), pipeline_cache_header.size(),
+              pipeline_vendor, pipeline_device, pipeline_uuid.data(), pipeline_uuid.size()),
+          "disk compute pipeline cache rejects a mismatched driver UUID");
+    pipeline_cache_header[16] ^= 1u;
+    CHECK(!prosper::frontend::compute_pipeline_cache_blob_compatible(
+              pipeline_cache_header.data(), pipeline_cache_header.size() - 1,
+              pipeline_vendor, pipeline_device, pipeline_uuid.data(), pipeline_uuid.size()),
+          "disk compute pipeline cache rejects a truncated Vulkan header");
     CHECK(prosper::frontend::compute_sampled_guest_prepare_required(false, false, false),
           "guest-backed sampled image prepares its source");
     CHECK(!prosper::frontend::compute_sampled_guest_prepare_required(false, true, false),
@@ -1594,6 +1626,433 @@ int main() {
         if (bad) std::printf("  image copy mismatched bytes = %u/%u (b0 src=%02x dst=%02x)\n",
                              bad, W * 4, img_src[0], img_dst[0]);
         CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
+    }
+
+    // GTA V's heavy Windows transition copies two 2560x1440 single-channel surfaces and writes a
+    // 3840x2160 Uint8x4 target. Keeping them in the raw RGBA32_UINT interchange image inflated the
+    // allocations to 59/127 MiB; exercise the device-gated typed path end to end, including the
+    // exact reflected image format.
+    auto run_native_typed_copy = [&](DataFormat format, uint32_t spirv_format,
+                                     SpirvImageNumericClass numeric_class,
+                                     uint32_t components, uint32_t texel_bytes,
+                                     const std::vector<uint8_t>& source,
+                                     DataFormat sampled_format = DataFormat::Unknown) {
+        std::vector<uint8_t> destination(source.size(), 0xa5);
+        ShaderResourceTable table;
+        auto add_uint_image = [&](uint32_t binding, uint32_t sgpr, void* data) {
+            ShaderResource image{};
+            image.cls = ResourceClass::StorageImage;
+            image.img_dim = 1;
+            image.binding = binding;
+            image.sgpr_base = sgpr;
+            image.format = format;
+            image.num_components = components;
+            image.width = W;
+            image.height = image.depth = 1;
+            image.gpu_addr = reinterpret_cast<uint64_t>(data);
+            image.size = W * texel_bytes;
+            table.resources.push_back(image);
+        };
+        add_uint_image(4, 0, const_cast<uint8_t*>(source.data()));
+        add_uint_image(5, 8, destination.data());
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(16);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(format, components);
+        const std::vector<uint32_t> spirv = recompile_compute(
+            image_copy_2d, std::size(image_copy_2d), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const bool typed = !spirv.empty() && report.ok() && report.descriptors.size() == 2 &&
+            std::all_of(report.descriptors.begin(), report.descriptors.end(),
+                        [&](const SpirvDescriptorBinding& descriptor) {
+                            return descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                                   descriptor.image_numeric_class == numeric_class &&
+                                   descriptor.storage_image_format == spirv_format;
+                        });
+        if (!typed) return std::tuple{false, destination, false, uint32_t{0}};
+        ComputeItem item;
+        item.spirv = spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(table);
+        item.launch.threads_x = W;
+        item.launch.local_x = W;
+        item.launch.groups_x = 1;
+        item.launch.threads_y = item.launch.threads_z = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = format == DataFormat::Float32 ? 0x59059fu
+            : format == DataFormat::Uint32 ? 0x5905a0u
+            : format == DataFormat::Uint16 ? 0x5905a1u : 0x5905a2u;
+        // The first sight of a write-only program poison-proves full coverage. The following
+        // ordered submit is the production state: the proven output may retain/export its exact
+        // typed image to the immediately following graphics consumer.
+        const bool coverage_proven =
+            prosper::frontend::execute_live_compute_items({item});
+        item.dispatch_index = format == DataFormat::Float32 ? 50u
+            : format == DataFormat::Uint32 ? 51u
+            : format == DataFormat::Uint16 ? 52u : 53u;
+        item.command_order = 10;
+        DrawItem consumer;
+        consumer.draw_index = format == DataFormat::Float32 ? 60u
+            : format == DataFormat::Uint32 ? 61u
+            : format == DataFormat::Uint16 ? 62u : 63u;
+        consumer.command_order = 20;
+        bool imported = false;
+        uint32_t imported_format = 0;
+        const OrderedSubmitResult ordered = execute_ordered_items(
+            {{SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order},
+             {SubmitOperationKind::Draw, consumer.draw_index, consumer.command_order}},
+            {consumer}, {item},
+            [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                ShaderResource sampled = table.resources.back();
+                sampled.cls = ResourceClass::Texture;
+                if (sampled_format != DataFormat::Unknown)
+                    sampled.format = sampled_format;
+                prosper::frontend::LiveComputeImageImport compute_import;
+                imported = prosper::frontend::import_live_compute_storage_image(
+                    sampled, sampled.size, compute_import) && compute_import.valid();
+                if (imported) imported_format = compute_import.native_format;
+                return RenderedFrame{};
+            },
+            [&](const std::vector<ComputeItem>& items) {
+                return prosper::frontend::execute_live_compute_items(items);
+            },
+            1, 1);
+        return std::tuple{
+            coverage_proven && ordered.compute_executed,
+            destination, imported, imported_format};
+    };
+    {
+        static const uint32_t fill_r32_2d[] = {
+            0x7e080300u,                         // v4 = x
+            0x7e0a0280u,                         // v5 = y = 0
+            0x7e0002f2u,                         // v0 = 1.0f
+            0xf0200108u, 0x00020004u,            // IMAGE_STORE x at (v4,v5)
+            0xbf810000u,
+        };
+        std::vector<uint32_t> destination(W, 0xdeadbeefu);
+        ShaderResource output{};
+        output.cls = ResourceClass::StorageImage;
+        output.img_dim = 1;
+        output.binding = 5;
+        output.sgpr_base = 8;
+        output.format = DataFormat::Float32;
+        output.num_components = 1;
+        output.width = W;
+        output.height = output.depth = 1;
+        output.gpu_addr = reinterpret_cast<uint64_t>(destination.data());
+        output.size = static_cast<uint32_t>(destination.size() * sizeof(uint32_t));
+        ShaderResourceTable table;
+        table.resources.push_back(output);
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(16);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Float32, 1);
+        const std::vector<uint32_t> spirv = recompile_compute(
+            fill_r32_2d, std::size(fill_r32_2d), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const SpirvDescriptorBinding* binding =
+            find_spirv_descriptor_binding(report, 0, output.binding);
+        // Native float storage keeps the SPIR-V image format Unknown and carries the exact
+        // R32_SFLOAT choice in the resource/device contract. That preserves the existing
+        // formatless float shader ABI; the imported VkFormat assertion below pins the concrete
+        // device image separately.
+        CHECK(!spirv.empty() && report.ok() && binding && binding->storage_float &&
+                  binding->image_numeric_class == SpirvImageNumericClass::Float &&
+                  binding->storage_image_format == 0u,
+              "R32_SFLOAT fill reflects native float storage");
+        if (!spirv.empty() && report.ok() && binding && binding->storage_float) {
+            ComputeItem item;
+            item.spirv = spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(table);
+            item.launch.threads_x = W;
+            item.launch.local_x = W;
+            item.launch.groups_x = 1;
+            item.launch.threads_y = item.launch.threads_z = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x59059fu;
+            const bool coverage_proven =
+                prosper::frontend::execute_live_compute_items({item});
+            item.dispatch_index = 50;
+            item.command_order = 10;
+            DrawItem consumer;
+            consumer.draw_index = 60;
+            consumer.command_order = 20;
+            bool imported = false;
+            const OrderedSubmitResult ordered = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order},
+                 {SubmitOperationKind::Draw, consumer.draw_index, consumer.command_order}},
+                {consumer}, {item},
+                [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                    ShaderResource sampled = output;
+                    sampled.cls = ResourceClass::Texture;
+                    prosper::frontend::LiveComputeImageImport compute_import;
+                    imported = prosper::frontend::import_live_compute_storage_image(
+                        sampled, sampled.size, compute_import) && compute_import.valid() &&
+                        compute_import.native_format == 100u &&
+                        compute_import.producer_command_order == item.command_order;
+                    return RenderedFrame{};
+                },
+                [&](const std::vector<ComputeItem>& items) {
+                    return prosper::frontend::execute_live_compute_items(items);
+                },
+                1, 1);
+            CHECK(coverage_proven && ordered.compute_executed &&
+                      std::all_of(destination.begin(), destination.end(),
+                                  [](uint32_t value) { return value == 0x3f800000u; }),
+                  "typed R32_SFLOAT fill executes and writes every finite value exactly");
+            CHECK(imported,
+                  "same-submit graphics consumer leases the exact typed R32_SFLOAT result");
+        }
+    }
+    {
+        std::vector<uint8_t> source(W * sizeof(uint32_t));
+        for (uint32_t x = 0; x < W; ++x) {
+            const uint32_t value = 0xf0120000u ^ (x * 0x1020304u);
+            std::memcpy(source.data() + x * sizeof(value), &value, sizeof(value));
+        }
+        const auto [executed, destination, imported, imported_format] = run_native_typed_copy(
+            DataFormat::Uint32, kSpirvImageFormatR32ui, SpirvImageNumericClass::Uint,
+            1, sizeof(uint32_t), source);
+        CHECK(executed && destination == source,
+              "typed R32_UINT storage copy reflects and executes byte-exactly");
+        CHECK(imported && imported_format == 98u, // VK_FORMAT_R32_UINT
+              "same-submit graphics consumer leases the exact typed R32_UINT result");
+    }
+    {
+        std::vector<uint8_t> source(W * sizeof(uint16_t));
+        for (uint32_t x = 0; x < W; ++x) {
+            const uint16_t value = static_cast<uint16_t>(0xf000u ^ (x * 0x123u));
+            std::memcpy(source.data() + x * sizeof(value), &value, sizeof(value));
+        }
+        const auto [executed, destination, imported, imported_format] = run_native_typed_copy(
+            DataFormat::Uint16, kSpirvImageFormatR16ui, SpirvImageNumericClass::Uint,
+            1, sizeof(uint16_t), source);
+        CHECK(executed && destination == source,
+              "typed R16_UINT storage copy reflects and executes byte-exactly");
+        CHECK(imported && imported_format == 74u, // VK_FORMAT_R16_UINT
+              "same-submit graphics consumer leases the exact typed R16_UINT result");
+        const auto [alias_executed, alias_destination, alias_imported, alias_format] =
+            run_native_typed_copy(DataFormat::Uint16, kSpirvImageFormatR16ui,
+                                  SpirvImageNumericClass::Uint, 1,
+                                  sizeof(uint16_t), source, DataFormat::Unorm16);
+        CHECK(alias_executed && alias_destination == source,
+              "typed R16_UINT storage remains byte-exact for an R16_UNORM graphics consumer");
+        CHECK(alias_imported && alias_format == 70u, // VK_FORMAT_R16_UNORM
+              "same-submit R16_UNORM consumer leases a mutable view of the exact R16_UINT result");
+    }
+    {
+        // GTA V writes a six-layer R16_UINT DIM=2D_ARRAY shadow allocation, then samples the same
+        // bytes through a DIM=CUBE descriptor. The graphics recompiler's established cube ABI is a
+        // vertically stacked 2D image, so import must preserve the exact producer identity while
+        // explicitly requesting a six-layer device-local stack copy.
+        constexpr uint32_t layers = 6;
+        static const uint32_t fill_r16_2d_array[] = {
+            0x7e080300u,                         // v4 = x
+            0x7e0a0301u,                         // v5 = y
+            0x7e0c0302u,                         // v6 = array layer
+            0x7e000302u,                         // v0 = layer value
+            0xf0200128u, 0x00020004u,            // IMAGE_STORE x at (v4,v5,v6), DIM=2D_ARRAY
+            0xbf810000u,
+        };
+        const size_t layer_bytes = W * sizeof(uint16_t);
+        std::vector<uint8_t> destination(layer_bytes * layers, 0xa5);
+        ShaderResource output{};
+        output.cls = ResourceClass::StorageImage;
+        output.img_dim = 5;
+        output.binding = 5;
+        output.sgpr_base = 8;
+        output.format = DataFormat::Uint16;
+        output.num_components = 1;
+        output.width = W;
+        output.height = 1;
+        output.depth = layers;
+        output.gpu_addr = reinterpret_cast<uint64_t>(destination.data());
+        output.size = static_cast<uint32_t>(destination.size());
+        output.linear_row_pitch_bytes = static_cast<uint32_t>(layer_bytes);
+        output.layer_stride_bytes = static_cast<uint32_t>(layer_bytes);
+        ShaderResourceTable table;
+        table.resources.push_back(output);
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(16);
+        config.local_x = W;
+        config.local_y = 1;
+        config.local_z = layers;
+        config.tidig_comp_cnt = 2;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Uint16, 1);
+        const std::vector<uint32_t> spirv = recompile_compute(
+            fill_r16_2d_array, std::size(fill_r16_2d_array), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const SpirvDescriptorBinding* binding =
+            find_spirv_descriptor_binding(report, 0, output.binding);
+        CHECK(!spirv.empty() && report.ok() && binding && binding->image_arrayed &&
+                  binding->image_numeric_class == SpirvImageNumericClass::Uint &&
+                  binding->storage_image_format == kSpirvImageFormatR16ui,
+              "six-layer R16 producer reflects exact arrayed typed storage");
+        if (!spirv.empty() && report.ok() && binding) {
+            ComputeItem item;
+            item.spirv = spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(table);
+            item.launch.threads_x = W;
+            item.launch.threads_y = 1;
+            item.launch.threads_z = layers;
+            item.launch.local_x = W;
+            item.launch.local_y = 1;
+            item.launch.local_z = layers;
+            item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x5905a3u;
+            const bool coverage_proven = prosper::frontend::execute_live_compute_items({item});
+            item.dispatch_index = 54;
+            item.command_order = 10;
+            DrawItem consumer;
+            consumer.draw_index = 64;
+            consumer.command_order = 20;
+            bool imported = false;
+            bool normalized_imported = false;
+            bool mismatches_rejected = false;
+            const OrderedSubmitResult ordered = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order},
+                 {SubmitOperationKind::Draw, consumer.draw_index, consumer.command_order}},
+                {consumer}, {item},
+                [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                    ShaderResource cube = output;
+                    cube.cls = ResourceClass::Texture;
+                    cube.img_dim = 3;
+                    prosper::frontend::LiveComputeImageImport compute_import;
+                    imported = prosper::frontend::import_live_compute_storage_image(
+                        cube, cube.size, compute_import) && compute_import.valid() &&
+                        compute_import.native_format == 74u &&
+                        compute_import.vertical_stack_layers == layers &&
+                        compute_import.producer_command_order == item.command_order;
+                    ShaderResource normalized_cube = cube;
+                    normalized_cube.format = DataFormat::Unorm16;
+                    CHECK(prosper::frontend::live_compute_graphics_import_guest_bytes(
+                              normalized_cube, layer_bytes) == normalized_cube.size,
+                          "R16 cube import identity covers all six faces, not one decoded face");
+                    prosper::frontend::LiveComputeImageImport normalized_import;
+                    normalized_imported =
+                        prosper::frontend::import_live_compute_storage_image(
+                            normalized_cube, normalized_cube.size, normalized_import) &&
+                        normalized_import.valid() && normalized_import.native_format == 70u &&
+                        normalized_import.vertical_stack_layers == layers &&
+                        normalized_import.producer_command_order == item.command_order;
+                    ShaderResource mismatch = cube;
+                    --mismatch.depth;
+                    prosper::frontend::LiveComputeImageImport rejected;
+                    const bool depth_rejected =
+                        !prosper::frontend::import_live_compute_storage_image(
+                            mismatch, cube.size, rejected);
+                    mismatch = cube;
+                    mismatch.layer_stride_bytes += sizeof(uint16_t);
+                    const bool stride_rejected =
+                        !prosper::frontend::import_live_compute_storage_image(
+                            mismatch, cube.size, rejected);
+                    mismatches_rejected = depth_rejected && stride_rejected;
+                    return RenderedFrame{};
+                },
+                [&](const std::vector<ComputeItem>& items) {
+                    return prosper::frontend::execute_live_compute_items(items);
+                },
+                1, 1);
+            CHECK(coverage_proven && ordered.compute_executed && imported,
+                  "same-submit cube consumer leases exact six-layer R16 storage for GPU stacking");
+            CHECK(normalized_imported,
+                  "R16_UNORM cube consumer leases the mutable exact R16_UINT array producer");
+            CHECK(mismatches_rejected,
+                  "cube-array import rejects depth and layer-stride identity mismatches");
+        }
+    }
+    {
+        std::vector<uint8_t> source(W);
+        for (uint32_t x = 0; x < W; ++x)
+            source[x] = static_cast<uint8_t>(x * 53u + 7u);
+        const auto [executed, destination, imported, imported_format] = run_native_typed_copy(
+            DataFormat::Uint8, kSpirvImageFormatR8ui, SpirvImageNumericClass::Uint,
+            1, 1, source);
+        CHECK(executed && destination == source,
+              "typed R8_UINT storage copy reflects and executes byte-exactly");
+        CHECK(imported && imported_format == 13u, // VK_FORMAT_R8_UINT
+              "same-submit graphics consumer leases the exact typed R8_UINT result");
+        const auto [alias_executed, alias_destination, alias_imported, alias_format] =
+            run_native_typed_copy(DataFormat::Uint8, kSpirvImageFormatR8ui,
+                                  SpirvImageNumericClass::Uint, 1, 1, source,
+                                  DataFormat::Unorm8);
+        CHECK(alias_executed && alias_destination == source,
+              "typed R8_UINT storage remains byte-exact for an R8_UNORM graphics consumer");
+        CHECK(alias_imported && alias_format == 9u, // VK_FORMAT_R8_UNORM
+              "same-submit R8_UNORM consumer leases a mutable view of the exact R8_UINT result");
+    }
+    {
+        std::vector<uint8_t> source(W * 4u);
+        for (uint32_t x = 0; x < W; ++x) {
+            source[x * 4u + 0u] = static_cast<uint8_t>(x * 53u + 7u);
+            source[x * 4u + 1u] = static_cast<uint8_t>(x * 31u + 11u);
+            source[x * 4u + 2u] = static_cast<uint8_t>(x * 17u + 13u);
+            source[x * 4u + 3u] = static_cast<uint8_t>(255u - x * 3u);
+        }
+        const auto [executed, destination, imported, imported_format] = run_native_typed_copy(
+            DataFormat::Uint8, kSpirvImageFormatRgba8ui, SpirvImageNumericClass::Uint,
+            4, 4, source);
+        CHECK(executed && destination == source,
+              "typed RGBA8_UINT storage copy reflects and executes byte-exactly");
+        CHECK(imported && imported_format == 41u, // VK_FORMAT_R8G8B8A8_UINT
+              "same-submit graphics consumer leases the exact typed RGBA8_UINT result");
+    }
+    {
+        static const uint32_t store_low_byte_2d[] = {
+            0x7e080300u,                         // v4 = x
+            0x7e0002ffu, 0x00001234u,            // v0 = value; guest Uint8 store keeps low byte
+            0x7e0a0280u,                         // v5 = y = 0
+            0xf0200108u, 0x00020004u,            // IMAGE_STORE x to binding 5
+            0xbf810000u,
+        };
+        std::vector<uint8_t> destination(W, 0xa5);
+        ShaderResourceTable table;
+        ShaderResource output{};
+        output.cls = ResourceClass::StorageImage;
+        output.img_dim = 1;
+        output.binding = 5;
+        output.sgpr_base = 8;
+        output.format = DataFormat::Uint8;
+        output.num_components = 1;
+        output.width = W;
+        output.height = output.depth = 1;
+        output.gpu_addr = reinterpret_cast<uint64_t>(destination.data());
+        output.size = W;
+        table.resources.push_back(output);
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(16);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Uint8, 1);
+        const std::vector<uint32_t> spirv = recompile_compute(
+            store_low_byte_2d, std::size(store_low_byte_2d), &table, config);
+        ComputeItem item;
+        item.spirv = spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(table);
+        item.launch.threads_x = W;
+        item.launch.local_x = W;
+        item.launch.groups_x = 1;
+        item.launch.threads_y = item.launch.threads_z = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x5905a3u;
+        CHECK(!spirv.empty() && prosper::frontend::execute_live_compute_items({item}) &&
+                  std::all_of(destination.begin(), destination.end(),
+                              [](uint8_t value) { return value == 0x34u; }),
+              "typed R8_UINT storage truncates a 32-bit guest value to its exact low byte");
     }
 
     // GTA V gameplay's exact IMAGE_LOAD_MIP / IMAGE_STORE_MIP packets. The live backend has one
@@ -3247,6 +3706,93 @@ int main() {
         CHECK(live_dst != stale_rtt, "renderer RTT import does not use stale guest backing");
     }
 
+    // GTA V Fidelity retains single-channel R16F post-process targets in the renderer and later
+    // samples them from compute. The CPU fallback must bind the snapshot at its native texel width:
+    // treating R16F as the historical RGBA8 fallback doubled the memcpy byte count, read past the
+    // immutable snapshot, and crashed Windows in ucrtbase!memmove before gameplay. RG16F has the
+    // same byte count as RGBA8 but still needs its native numeric interpretation, so cover both.
+    auto run_live_narrow_float16 = [&](uint32_t components,
+                                       LiveTargetPixelFormat pixel_format) {
+        const uint32_t source_bytes = W * components * sizeof(uint16_t);
+        std::vector<uint8_t> stale(source_bytes, 0);
+        auto live = std::make_shared<std::vector<uint8_t>>(source_bytes);
+        std::vector<uint8_t> destination(W * 4, 0xee);
+        for (uint32_t texel = 0; texel < W; ++texel) {
+            for (uint32_t channel = 0; channel < components; ++channel) {
+                const float value = ((texel >> channel) & 1u) ? 1.0f : 0.0f;
+                const uint16_t half = float_to_half(value);
+                std::memcpy(live->data() +
+                                (texel * components + channel) * sizeof(half),
+                            &half, sizeof(half));
+            }
+        }
+        ShaderResourceTable table = live_rt;
+        for (ShaderResource& resource : table.resources) {
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.format = DataFormat::Float16;
+                resource.num_components = components;
+                resource.width = W;
+                resource.height = resource.depth = 1;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(stale.data());
+                resource.size = source_bytes;
+            } else if (resource.binding == 5) {
+                resource.cls = ResourceClass::StorageImage;
+                resource.format = DataFormat::Unorm8;
+                resource.num_components = 4;
+                resource.width = W;
+                resource.height = resource.depth = 1;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(destination.data());
+                resource.size = static_cast<uint32_t>(destination.size());
+            }
+        }
+        const uint64_t address = reinterpret_cast<uint64_t>(stale.data());
+        set_live_target_query([address](uint64_t candidate) { return candidate == address; });
+        set_live_target_reader(
+            [address, live, pixel_format, W](uint64_t candidate, LiveTargetSnapshot& snapshot) {
+                if (candidate != address) return false;
+                snapshot.width = W;
+                snapshot.height = 1;
+                snapshot.format = pixel_format;
+                snapshot.pixels = live;
+                return true;
+            });
+        const std::vector<uint32_t> spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &table);
+        CHECK(!spirv.empty(), components == 1
+              ? "R16F renderer RTT sampled-image copy kernel recompiles"
+              : "RG16F renderer RTT sampled-image copy kernel recompiles");
+        bool executed = false;
+        if (!spirv.empty()) {
+            ComputeItem item;
+            item.spirv = spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(table);
+            item.launch.threads_x = W;
+            item.launch.local_x = 64;
+            item.launch.groups_x = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = components == 1 ? 0x5905b0 : 0x5905b1;
+            executed = prosper::frontend::execute_live_compute_items({item});
+        }
+        CHECK(executed, components == 1
+              ? "live backend samples an R16F renderer RTT without widening its upload"
+              : "live backend samples an RG16F renderer RTT at native width");
+        bool exact = executed;
+        for (uint32_t texel = 0; texel < W && exact; ++texel) {
+            exact &= destination[texel * 4 + 0] == ((texel & 1u) ? 255u : 0u);
+            exact &= destination[texel * 4 + 1] ==
+                (components == 2 && (texel & 2u) ? 255u : 0u);
+            exact &= destination[texel * 4 + 2] == 0u;
+            exact &= destination[texel * 4 + 3] == 255u;
+        }
+        CHECK(exact, components == 1
+              ? "R16F renderer snapshot preserves R and Vulkan missing-channel defaults"
+              : "RG16F renderer snapshot preserves RG and Vulkan missing-channel defaults");
+    };
+    run_live_narrow_float16(1, LiveTargetPixelFormat::R16Float);
+    run_live_narrow_float16(2, LiveTargetPixelFormat::Rg16Float);
+
     // A renderer target can become a writable storage image before its pixels have been materialized
     // in guest RAM. Seed the dispatch from the immutable renderer snapshot, modify row zero, and
     // prove writeback preserves every untouched row while publishing a cache-invalidation write.
@@ -3479,6 +4025,8 @@ int main() {
           "tiled R32_UINT sampled values reach storage writeback byte-exactly");
     CHECK(sampled_uint_roundtrip(DataFormat::Uint16, 4, 8, 0x590164),
           "tiled RGBA16_UINT sampled values reach storage writeback byte-exactly");
+    CHECK(sampled_uint_roundtrip(DataFormat::Unorm2_10_10_10, 4, 4, 0x590210),
+          "tiled R10G10B10A2_UNORM sampled words reach storage writeback bit-exactly");
 
     // GPU captures preserve descriptor addresses but materialize resource bytes in owned host
     // arrays. Warm replay must retain those sampled images just like the live guest-backed path,
@@ -3706,6 +4254,186 @@ int main() {
                       journal_imported,
                   "same-submit journal authorizes the first retained compute-image consumer");
 
+            // GTA V's transition depth-like surface is written through R32_UINT storage and then
+            // sampled as R32_SFLOAT. The guest allocation is one exact 32-bit word per texel; only
+            // the consumer view changes its numeric interpretation. Prove the integer producer can
+            // be leased by the float descriptor without a guest readback/detile/upload round trip.
+            std::vector<uint32_t> uint_alias_guest(W, 0x3f000000u);
+            ShaderResourceTable uint_alias_rt;
+            ShaderResource uint_alias_dst = fdst;
+            uint_alias_dst.format = DataFormat::Uint32;
+            uint_alias_dst.num_components = 1;
+            uint_alias_dst.gpu_addr = reinterpret_cast<uint64_t>(uint_alias_guest.data());
+            uint_alias_dst.size = static_cast<uint32_t>(uint_alias_guest.size() * sizeof(uint32_t));
+            uint_alias_rt.resources.push_back(uint_alias_dst);
+            ComputeShaderConfig uint_alias_config = fill_config;
+            uint_alias_config.native_storage_format_support =
+                native_storage_format_support_bit(DataFormat::Uint32, 1);
+            const std::vector<uint32_t> uint_alias_spirv = recompile_compute(
+                fill_1d, std::size(fill_1d), &uint_alias_rt, uint_alias_config);
+            const DescriptorValidationReport uint_alias_report =
+                validate_spirv_descriptor_interface(
+                    uint_alias_spirv, &uint_alias_rt, 0, SpirvShaderStage::Compute, false);
+            const SpirvDescriptorBinding* uint_alias_binding =
+                find_spirv_descriptor_binding(
+                    uint_alias_report, 0, uint_alias_dst.binding);
+            CHECK(!uint_alias_spirv.empty() && uint_alias_report.ok() && uint_alias_binding &&
+                      uint_alias_binding->image_numeric_class == SpirvImageNumericClass::Uint &&
+                      uint_alias_binding->storage_image_format == kSpirvImageFormatR32ui,
+                  "R32_UINT alias producer retains an exact typed storage contract");
+            if (!uint_alias_spirv.empty() && uint_alias_report.ok() && uint_alias_binding) {
+                ComputeItem uint_alias_item = it;
+                uint_alias_item.spirv = uint_alias_spirv;
+                uint_alias_item.resources =
+                    std::make_shared<ShaderResourceTable>(uint_alias_rt);
+                uint_alias_item.code_addr = 0x1122f13du;
+                uint_alias_item.dispatch_index = 35;
+                uint_alias_item.command_order = 10;
+                CHECK(prosper::frontend::execute_live_compute_items({uint_alias_item}),
+                      "R32_UINT alias producer proves complete write coverage");
+                CHECK(prosper::frontend::execute_live_compute_items({uint_alias_item}),
+                      "R32_UINT alias producer repeats after its full-coverage proof");
+                ShaderResource cross_submit_float_alias = uint_alias_dst;
+                cross_submit_float_alias.cls = ResourceClass::Texture;
+                cross_submit_float_alias.format = DataFormat::Float32;
+                prosper::frontend::LiveComputeImageImport cross_submit_import;
+                const bool cross_submit_imported =
+                    prosper::frontend::import_live_compute_storage_image(
+                        cross_submit_float_alias, uint_alias_dst.size,
+                        cross_submit_import) && cross_submit_import.valid();
+#if defined(_WIN32)
+                CHECK(cross_submit_imported,
+                      "Windows exact guest mirror authorizes a cross-submit R32_UINT-to-R32_SFLOAT import");
+#else
+                CHECK(!cross_submit_imported,
+                      "Linux does not replace journal/write-watch authority with byte equality");
+#endif
+                cross_submit_import = {};
+                const uint32_t uint_alias_word = uint_alias_guest[1];
+                uint_alias_guest[1] ^= 1u;
+                prosper::frontend::LiveComputeImageImport rejected_cross_submit_import;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          cross_submit_float_alias, uint_alias_dst.size,
+                          rejected_cross_submit_import),
+                      "an unnotified CPU write rejects the exact cross-submit compute image");
+                uint_alias_guest[1] = uint_alias_word;
+                bool uint_float_imported = false;
+                DrawItem uint_alias_consumer;
+                uint_alias_consumer.draw_index = 49;
+                uint_alias_consumer.command_order = 20;
+                const OrderedSubmitResult uint_alias_result = execute_ordered_items(
+                    {{SubmitOperationKind::Dispatch, uint_alias_item.dispatch_index,
+                      uint_alias_item.command_order},
+                     {SubmitOperationKind::Draw, uint_alias_consumer.draw_index,
+                      uint_alias_consumer.command_order}},
+                    {uint_alias_consumer}, {uint_alias_item},
+                    [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                        ShaderResource sampled_alias = uint_alias_dst;
+                        sampled_alias.cls = ResourceClass::Texture;
+                        sampled_alias.format = DataFormat::Float32;
+                        prosper::frontend::LiveComputeImageImport compute_import;
+                        uint_float_imported =
+                            prosper::frontend::import_live_compute_storage_image(
+                                sampled_alias, uint_alias_dst.size, compute_import) &&
+                            compute_import.valid() && compute_import.native_format == 100u;
+                        return RenderedFrame{};
+                    },
+                    [&](const std::vector<ComputeItem>& items) {
+                        return prosper::frontend::execute_live_compute_items(items);
+                    },
+                    1, 1);
+                CHECK(uint_alias_result.compute_executed &&
+                          uint_alias_result.render_spans == 1 && uint_float_imported,
+                      "R32_UINT storage result imports directly through an R32_SFLOAT graphics view");
+
+                // The next GTA V pass consumes the same numeric-view alias from compute, not
+                // graphics. Keep the sampled destination separate and prove that the Float32
+                // descriptor is seeded by a device-local copy of the retained Uint32 producer.
+                // Exact output bits are the oracle: R32_UINT -> R32_SFLOAT must not numerically
+                // convert the producer words on the way to the sampled image.
+                std::vector<uint32_t> uint_alias_copy_guest(W, 0xdeadbeefu);
+                ShaderResourceTable uint_alias_consumer_rt;
+                ShaderResource uint_alias_sampled = uint_alias_dst;
+                uint_alias_sampled.cls = ResourceClass::Texture;
+                uint_alias_sampled.format = DataFormat::Float32;
+                uint_alias_sampled.binding = 4;
+                uint_alias_sampled.sgpr_base = 0;
+                uint_alias_sampled.swizzle[0] = 4;
+                uint_alias_sampled.swizzle[1] = 5;
+                uint_alias_sampled.swizzle[2] = 6;
+                uint_alias_sampled.swizzle[3] = 7;
+                uint_alias_consumer_rt.resources.push_back(uint_alias_sampled);
+                ShaderResource uint_alias_copy_dst = uint_alias_sampled;
+                uint_alias_copy_dst.cls = ResourceClass::StorageImage;
+                uint_alias_copy_dst.binding = 5;
+                uint_alias_copy_dst.sgpr_base = 8;
+                uint_alias_copy_dst.gpu_addr =
+                    reinterpret_cast<uint64_t>(uint_alias_copy_guest.data());
+                uint_alias_consumer_rt.resources.push_back(uint_alias_copy_dst);
+                ComputeShaderConfig uint_alias_consumer_config = fill_config;
+                uint_alias_consumer_config.native_storage_format_support =
+                    native_storage_format_support_bit(DataFormat::Float32, 1);
+                const std::vector<uint32_t> uint_alias_consumer_spirv = recompile_compute(
+                    image_copy_2d, std::size(image_copy_2d),
+                    &uint_alias_consumer_rt, uint_alias_consumer_config);
+                CHECK(!uint_alias_consumer_spirv.empty(),
+                      "R32_SFLOAT compute alias consumer recompiles");
+                if (!uint_alias_consumer_spirv.empty()) {
+                    ComputeItem uint_alias_consumer = uint_alias_item;
+                    uint_alias_consumer.spirv = uint_alias_consumer_spirv;
+                    uint_alias_consumer.resources =
+                        std::make_shared<ShaderResourceTable>(uint_alias_consumer_rt);
+                    uint_alias_consumer.code_addr = 0x1122f13eu;
+                    uint_alias_consumer.dispatch_index = 36;
+                    uint_alias_consumer.command_order = 20;
+                    const uint64_t cross_submit_seeds_before =
+                        prosper::frontend::live_compute_storage_transfer_seeds();
+                    CHECK(prosper::frontend::execute_live_compute_items(
+                              {uint_alias_consumer}) &&
+                              uint_alias_copy_guest == uint_alias_guest,
+                          "cross-submit R32_SFLOAT compute consumer preserves exact producer bits");
+#if defined(_WIN32)
+                    CHECK(!native_2d_compute_transfer_available ||
+                              prosper::frontend::live_compute_storage_transfer_seeds() >
+                                  cross_submit_seeds_before,
+                          "Windows exact guest mirror seeds the cross-submit compute consumer on-GPU");
+#else
+                    CHECK(prosper::frontend::live_compute_storage_transfer_seeds() ==
+                              cross_submit_seeds_before,
+                          "Linux cross-submit consumer keeps the authority-unknown image on guest fallback");
+#endif
+                    const uint64_t uint_alias_seeds_before =
+                        prosper::frontend::live_compute_storage_transfer_seeds();
+                    const OrderedSubmitResult uint_alias_compute_result =
+                        execute_ordered_items(
+                            {{SubmitOperationKind::Dispatch,
+                              uint_alias_item.dispatch_index,
+                              uint_alias_item.command_order},
+                             {SubmitOperationKind::Dispatch,
+                              uint_alias_consumer.dispatch_index,
+                              uint_alias_consumer.command_order}},
+                            {}, {uint_alias_item, uint_alias_consumer},
+                            [](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                                return RenderedFrame{};
+                            },
+                            [&](const std::vector<ComputeItem>& items) {
+                                return prosper::frontend::execute_live_compute_items(items);
+                            },
+                            1, 1);
+                    const uint64_t uint_alias_seeds_after =
+                        prosper::frontend::live_compute_storage_transfer_seeds();
+                    CHECK(uint_alias_compute_result.compute_executed &&
+                              uint_alias_copy_guest == uint_alias_guest,
+                          "R32_UINT producer to R32_SFLOAT compute consumer preserves exact bits");
+                    CHECK(!native_2d_compute_transfer_available ||
+                              uint_alias_seeds_after > uint_alias_seeds_before,
+                          "R32_UINT producer seeds R32_SFLOAT compute consumer on-GPU");
+                    CHECK(native_2d_compute_transfer_available ||
+                              uint_alias_seeds_after == uint_alias_seeds_before,
+                          "disabled native transfer keeps the numeric-view alias on the guest fallback");
+                }
+            }
+
             // Syberia's save-warning pass dispatches eleven shrinking rectangles over one native
             // Float32x1 atlas in a single ordered guest submit. Its producer uses a real one-layer
             // DIM=2D_ARRAY storage image while the next dispatch samples an ordinary DIM=2D view of
@@ -3717,9 +4445,32 @@ int main() {
             // cannot silently turn the production check into the guest fallback.
             CHECK(prosper::frontend::compute_native_2d_transfer_format_compatible(
                       DataFormat::Float32, 1) &&
+                      prosper::frontend::compute_native_2d_transfer_format_compatible(
+                          DataFormat::Float10_11_11, 3) &&
                       !prosper::frontend::compute_native_2d_transfer_format_compatible(
                           DataFormat::Float16, 1),
-                  "native 2D transfer candidate requires exact sampled/storage format equality");
+                  "native 2D transfer admits exact formats and packed R11 bit-copy compatibility");
+            CHECK(prosper::frontend::live_compute_graphics_import_native_format(
+                      DataFormat::Float32, 1) == 100u && // VK_FORMAT_R32_SFLOAT
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Unorm8, 1) == 9u && // VK_FORMAT_R8_UNORM
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Unorm8, 4) == 37u && // VK_FORMAT_R8G8B8A8_UNORM
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Float16, 1) == 76u && // VK_FORMAT_R16_SFLOAT
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Float16, 2) == 83u && // VK_FORMAT_R16G16_SFLOAT
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Float16, 4) == 97u && // VK_FORMAT_R16G16B16A16_SFLOAT
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Float10_11_11, 3) == 122u &&
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Unorm16, 1) == 70u && // VK_FORMAT_R16_UNORM
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Uint8, 4) == 41u &&
+                      prosper::frontend::live_compute_graphics_import_native_format(
+                          DataFormat::Unorm8, 3) == 0u,
+                  "graphics import policy includes exact FP16/RGBA8 post-FX outputs and rejects unsupported views");
             static const uint32_t transfer_fill_2d_array[] = {
                 0x7E080300u,             // v4 = x coordinate
                 0x7E0A0280u,             // v5 = y = 0
@@ -4132,21 +4883,34 @@ int main() {
             const uint64_t cold_result_snapshots_after =
                 prosper::frontend::live_compute_image_result_snapshot_bytes();
             if (cold_storage_snapshot_deferral_enabled) {
+#if defined(_WIN32)
+                CHECK(cold_source_snapshots_after >=
+                          cold_source_snapshots_before + fill_guest_bytes,
+                      "Windows retains an exact guest mirror for a cold exportable target");
+#else
                 CHECK(cold_source_snapshots_after == cold_source_snapshots_before,
                       "deferring policy admits a cold proven-full target without a source copy");
+#endif
 
                 // A later standalone backend invocation has no same-submit journal authority. The
-                // first repeat therefore cannot trust the deferred source: it must take ordinary
-                // writeback and establish the exact baseline used by later source validation.
+                // first repeat uses either Windows' exact mirror or the platform write-watch/
+                // deferred-source path. Both remain collision-free and preserve the guest result.
                 const std::vector<uint8_t> cold_expected = cold_guest;
                 const uint64_t repeat_snapshots_before =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
                 CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
                       "first invalidated repeat repairs a deferred cold target");
+#if defined(_WIN32)
+                CHECK(cold_guest == cold_expected &&
+                          prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                              repeat_snapshots_before,
+                      "Windows exact mirror authorizes the repeat without recopying its baseline");
+#else
                 CHECK(cold_guest == cold_expected &&
                           prosper::frontend::live_compute_storage_result_snapshot_bytes() >=
                               repeat_snapshots_before + fill_guest_bytes,
                       "first invalidated repeat establishes exact source authority");
+#endif
 
                 cold_guest[0] ^= 0xff;
                 CHECK(cold_guest != cold_expected,
@@ -4752,6 +5516,22 @@ int main() {
             consumer_item.command_order = 20;
             consumer_item.code_addr = native_capability_present ? 0x1790a119u : 0x1790b119u;
 
+            // Poison-prove the producer against an independent destination. The ordered handoff
+            // below must exercise the steady-state retained image, while the real LUT remains the
+            // old sentinel so the separately primed sampled cache is a meaningful stale positive.
+            std::vector<uint8_t> proof_guest = lut_guest;
+            ShaderResourceTable proof_rt = producer_rt;
+            proof_rt.resources.back().gpu_addr =
+                reinterpret_cast<uint64_t>(proof_guest.data());
+            ComputeItem proof_item = producer_item;
+            proof_item.resources = std::make_shared<ShaderResourceTable>(proof_rt);
+            proof_item.dispatch_index += 2000;
+            proof_item.command_order = 2;
+            CHECK(prosper::frontend::execute_live_compute_items({proof_item}),
+                  native_capability_present
+                      ? "native-capability packed R11 producer proves complete coverage"
+                      : "portable packed R11 producer proves complete coverage");
+
             // Prime the sampled-image cache with the old guest LUT. The ordered run must still see
             // the producer's new result; otherwise a first-use upload would accidentally make the
             // test green without exercising same-submit invalidation/authority.
@@ -4783,6 +5563,9 @@ int main() {
             std::array<uint32_t, 2> callback_dispatches = {UINT32_MAX, UINT32_MAX};
             size_t callback_count = 0;
             bool callbacks_ok = true;
+            bool packed_graphics_imported = false;
+            const uint64_t packed_transfer_seeds_before =
+                prosper::frontend::live_compute_storage_transfer_seeds();
             const OrderedSubmitResult submit = execute_ordered_items(
                 {{SubmitOperationKind::Dispatch, producer_item.dispatch_index,
                   producer_item.command_order},
@@ -4797,12 +5580,21 @@ int main() {
                     if (callback_count < callback_dispatches.size() && singleton)
                         callback_dispatches[callback_count] = items[0].dispatch_index;
                     ++callback_count;
-                    const bool ok = singleton &&
-                        prosper::frontend::execute_live_compute_items(items);
-                    callbacks_ok &= ok;
+                     const bool ok = singleton &&
+                         prosper::frontend::execute_live_compute_items(items);
+                     if (ok && items[0].dispatch_index == producer_item.dispatch_index) {
+                         prosper::frontend::LiveComputeImageImport graphics_import;
+                         packed_graphics_imported =
+                             prosper::frontend::import_live_compute_storage_image(
+                                 sampled_lut, lut_guest.size(), graphics_import) &&
+                             graphics_import.valid() && graphics_import.native_format == 122u;
+                     }
+                     callbacks_ok &= ok;
                     return ok;
                 },
                 1, 1);
+            const uint64_t packed_transfer_seeds_after =
+                prosper::frontend::live_compute_storage_transfer_seeds();
             CHECK(submit.compute_executed && callbacks_ok && callback_count == 2,
                   native_capability_present
                       ? "native-capability ordered submit executes both dispatches exactly once"
@@ -4812,6 +5604,20 @@ int main() {
                   native_capability_present
                       ? "native-capability submit preserves producer-before-consumer order"
                       : "portable submit preserves producer-before-consumer order");
+            CHECK(!native_2d_compute_transfer_available ||
+                      packed_transfer_seeds_after > packed_transfer_seeds_before,
+                  native_capability_present
+                      ? "native-capability packed R11 producer seeds sampled volume on-GPU"
+                      : "portable packed R11 producer seeds sampled volume on-GPU");
+            CHECK(native_2d_compute_transfer_available ||
+                      packed_transfer_seeds_after == packed_transfer_seeds_before,
+                  native_capability_present
+                      ? "disabled transfer keeps native-capability packed R11 on the guest fallback"
+                      : "disabled transfer keeps portable packed R11 on the guest fallback");
+            CHECK(!native_2d_compute_transfer_available || packed_graphics_imported,
+                  native_capability_present
+                      ? "native-capability packed R11 storage result exports to graphics on-GPU"
+                      : "portable packed R11 storage result exports to graphics on-GPU");
 
             std::vector<uint32_t> produced_packed(LUT_TEXELS, 0xDEADBEEFu);
             const bool produced_detiled = detile_volume(
