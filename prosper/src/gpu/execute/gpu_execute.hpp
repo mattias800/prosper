@@ -1355,12 +1355,15 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 //
 // Fingerprint, every clause required:
 //   * a bound vertex-buffer record count, and every 32-bit index below it;
-//   * at least `kMinSamples` entries, so "one parity is constant" is a real constraint. At most 64 are
-//     examined, and that ceiling is deliberate rather than an optimisation: a real draw whose indices
-//     straddle a 64 KiB boundary carries TWO high halves, and scanning the whole buffer would reject
-//     it on the parity clause. The ceiling costs precision in the other direction -- only the first
-//     128 16-bit words of a long buffer need the pattern -- which is why the vertex-range bound above,
-//     not the pattern, is what has to carry the decision;
+//   * at least `kMinSamples` entries, so "one parity is constant" is a real constraint. At most 64
+//     entries are examined -- note that means the first 64 WORDS (dwords 0..31) for the parity loop
+//     and 64 DWORDS for the range loop, which are different extents. The cap is deliberate rather
+//     than an optimisation: a real run straddling a 64 KiB boundary carries TWO high halves and a
+//     full scan would reject it on the parity clause. **It only rescues LATE crossings**, though --
+//     swept and measured, a crossing at dword 5, 22 or 31 is still rejected, and only crossings at
+//     dword 32 or beyond survive. So the cap is a partial mitigation, and it costs precision in the
+//     other direction: only the first 32 dwords of a long buffer need the pattern. That is why the
+//     vertex-range bound above, and not the pattern, has to carry the decision;
 //   * one PARITY of the 16-bit reading -- either one -- holding the same NON-ZERO value. Which parity
 //     depends on how the 16-bit address aligns against the 32-bit grid: a DrawIndexOffset scaled by 2
 //     instead of 4 lands 2 mod 4 as often as not, and on the Croft Manor frame the even parity carried
@@ -1371,8 +1374,11 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 // existing verdict; this one only ever sees what that one rejected.
 // CONFIDENCE: MED, and the residual is smaller than "a pool like Tomb Raider's" would suggest -- do
 // not read this bound as narrow. A period-2 buffer's implied index is `constant << 16 | varying`, so
-// the constant only has to be 1 for the implied indices to start just above 2^16: the measured
-// threshold is a bound of **65,602 records** (apex vertex 1, rim 2..65), not ~775,000. The executor's
+// the constant only has to be 1 for the implied indices to start just above 2^16. The general form is
+// `(constant << 16) + max_sampled_varying + 1`, so the threshold moves with the construction: 65,602
+// records for apex 1 / rim 2..65, 65,600 for rim 0..63, and as low as 65,544 for an n=8 draw -- do
+// not quote any single one of these as a safe line. All of them are just above 2^16, not ~775,000,
+// which is the point. The executor's
 // own clamp constant three lines above `vb_records_unclamped` is 65,536, i.e. vertex buffers of about
 // that size are routine, so a title with a modest pool AND fan/cone geometry whose apex index is small
 // can still satisfy every clause here. The real fix is knowing whether the guest ever announced an
@@ -1389,6 +1395,11 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
     // the moment a bound exceeds them. 16.7M records is far above any real mesh and cheap to keep.
     constexpr uint32_t kMaxPlausibleIndex = 1u << 24;
     if (n < kMinSamples || vertex_upper_bound == 0) return false;
+    // Folding the two ceilings is exact -- `d >= min(A,B)` is `d >= A || d >= B` -- and the bound-0
+    // early-return above means `ceiling` is never 0. What it hides is that the absolute ceiling also
+    // lowers a LEGITIMATE large bound: a genuine pool of more than 16.7M vertices is declined here,
+    // silently and without a distinguishable reason. No such pool has been measured; if one turns up,
+    // this is the line to split.
     const uint32_t ceiling = std::min(vertex_upper_bound, kMaxPlausibleIndex);
     const uint32_t m = std::min(n, 64u);
 

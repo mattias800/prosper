@@ -176,17 +176,45 @@ int main() {
                      {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8, 0),
           "mutation: no vertex bound available -> declines rather than guesses");
 
-    // R4: the 64-sample cap is load-bearing, and this is the arm that says so. A real draw whose
-    // indices straddle a 64 KiB boundary carries TWO high halves; the cap means only the first 64
-    // entries are examined, so the run stays classifiable. Scanning the whole buffer instead would see
-    // both constants, fail the parity clause, and reject a genuine 32-bit buffer -- so changing
-    // min(n,64) to n must break this arm.
+    // R4: the 64-sample cap is load-bearing, but only PARTIALLY, and the arm has to say which.
+    //
+    // The 16-bit loop examines the first 64 WORDS, i.e. dwords 0..31; the 32-bit loop examines 64
+    // DWORDS. So a contiguous 32-bit run crossing a 64 KiB boundary is rescued by the cap only when
+    // the crossing falls beyond dword 31 — swept and measured: a crossing at dword 5, 22 or 31 is
+    // REJECTED, at dword 32, 40, 63 or 100 accepted. The cap does not make straddling runs safe in
+    // general; it makes the ones that cross late survive.
+    //
+    // The arm below is a genuine contiguous run (131040.., crossing 0x20000 at dword 32), NOT two
+    // disjoint runs — an earlier version used two runs 65,573 dwords apart, whose second constant the
+    // 16-bit loop never even reached, so it pinned "uniform head, disagreeing tail must be ACCEPTED"
+    // rather than anything about straddling. That is the head-only permissiveness this cap COSTS, and
+    // freezing it as desired behaviour is the opposite of what the arm is for.
     {
         std::vector<uint16_t> straddle;
-        for (uint16_t i = 0; i < 64; i++) { straddle.push_back(100 + i); straddle.push_back(2); }
-        for (uint16_t i = 0; i < 128; i++) { straddle.push_back(200 + i); straddle.push_back(3); }
-        CHECK(detect_alias(straddle, 192, 300000),
-              "32-bit run straddling a 64 KiB boundary -> still 32-bit (this is why the cap exists)");
+        for (uint32_t d = 131040; d < 131040 + 160; d++) {
+            straddle.push_back((uint16_t)(d & 0xFFFF));
+            straddle.push_back((uint16_t)(d >> 16));
+        }
+        CHECK(detect_alias(straddle, 160, 200000),
+              "32-bit run crossing a 64 KiB boundary AFTER dword 31 -> still 32-bit (why the cap exists)");
+        // And the half the cap does not rescue, asserted so the limit cannot be quietly forgotten.
+        std::vector<uint16_t> early;
+        for (uint32_t d = 131067; d < 131067 + 160; d++) {   // crosses at dword 5
+            early.push_back((uint16_t)(d & 0xFFFF));
+            early.push_back((uint16_t)(d >> 16));
+        }
+        CHECK(!detect_alias(early, 160, 200000),
+              "KNOWN LIMIT: the same run crossing at dword 5 is rejected -- the cap rescues late "
+              "crossings only");
+    }
+
+    // T2: the ceiling comparison is `>=`, and nothing pinned that. Implied indices here are
+    // 65536..65599, so a bound of exactly 65599 must REJECT; with `>` it would be accepted.
+    {
+        std::vector<uint16_t> apex;
+        for (uint16_t rim = 0; rim < 64; rim++) { apex.push_back(rim); apex.push_back(1); }
+        CHECK(!detect_alias(apex, 64, 65599),
+              "mutation: an index exactly AT the ceiling is rejected (pins >= rather than >)");
     }
 
     // The two detectors must not overlap, so the call site's ordering can never change an existing

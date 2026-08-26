@@ -72,6 +72,12 @@ Two further details cost time and are worth keeping:
 - **The 16-bit and 32-bit addresses are different memory**, not two views of the same bytes, for any
   `DrawIndexOffset` — `index_base + offset*2` against `index_base + offset*4`. The regression test
   therefore feeds the detector two independent arrays, as the executor does.
+- **The 64-entry sample cap is a PARTIAL mitigation, not a total one.** It exists so a run straddling
+  a 64 KiB boundary (which carries two high halves) is not rejected on the parity clause — but the
+  parity loop reads the first 64 *words*, i.e. dwords 0..31, while the range loop reads 64 *dwords*.
+  Those are different extents, and only crossings at dword 32 or later are rescued: swept, crossings
+  at dword 5, 22 and 31 are still rejected. Both halves are pinned by tests, because stated as a
+  total mitigation it reads as a guarantee the code does not provide.
 
 ## Open defects
 
