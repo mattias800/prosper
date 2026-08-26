@@ -5,6 +5,8 @@
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
+#include "host/platform/precise_sleep.hpp"   // guest sleeps must not inherit the winpthreads tick (#3013)
+#include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS: which primitive a title paces on
 #include "host/image/runtime_module_load.hpp"   // #639: real runtime PRX loading
 #include "host/memory/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
 #include "hle/dispatch/callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
@@ -399,13 +401,118 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
     return 0;
 }
 
-// real sleeps so timed wait loops actually yield the CPU (and advance real time)
-HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
+// Real sleeps so timed wait loops actually yield the CPU (and advance real time).
+//
+// NOT nanosleep, and on Windows that is the whole point (#3013). MinGW's nanosleep is winpthreads',
+// whose timed waits resolve on the winpthreads master tick REGARDLESS of timeBeginPeriod -- measured
+// on this toolchain at 15.67 ms mean for a 5.33 ms request, unchanged (15.59 ms) with the process
+// timer resolution raised to 1 ms. A guest audio mixer pacing 256-frame grains at 48 kHz asks for
+// 5.33 ms and got 15.6 ms: it delivered one grain per tick instead of per grain, ~2.9x too slowly,
+// and every title underran continuously on Windows while Linux was clean.
+//
+// sleep_until_steady_ns uses CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, which is independent of the
+// process timer period: 5.64 ms mean / 5.99 ms worst for the same request on the same box. It also
+// takes an ABSOLUTE deadline, so the per-call overhead cannot compound across a pacing loop the way
+// a relative sleep's does.
+//
+// The deadline is taken as early as the body allows, because it is the guest's schedule and any work
+// done first is silently added to the interval it asked for. Not an absolute: the census scope's
+// constructor and, in k_nanosleep, the guest read and range guard necessarily precede it. Those are
+// a few hundred nanoseconds against a millisecond-scale request, which is why the ordering is worth
+// stating as an intent rather than asserting as an invariant.
+static inline void guest_sleep_ns(uint64_t ns) {
+    // PROSPER_GUEST_SLEEP_LEGACY=1 restores the pre-#3013 nanosleep path. It exists ONLY so the A/B
+    // that established the fix stays reproducible -- the same reason PROSPER_UD_TAIL_ALIGN survives
+    // (CLAUDE.md). Do not set it to fix anything.
+    //
+    // What the A/B does and does NOT show, because an earlier version of this comment cited the
+    // wrong half: audio DELIVERY RATE does not discriminate. The Messenger measures ~100% of the
+    // 384,000 B/s that f32/2ch/48 kHz needs in BOTH arms (385,024-389,120 B/s legacy), which is
+    // exactly why a delivery-rate check cannot find this defect -- quoting the 100.8% as evidence
+    // for the fix, as that comment did, points a reader at a number that separates nothing. What the
+    // lever does separate is sleep ACCURACY: requested 18.17 -> actual 23.74 ms (x1.31) legacy
+    // against 15.41 -> 15.69 (x1.02) fixed, on the same route.
+    static const bool legacy = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
+    if (legacy) {
+        struct timespec ts{ (time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull) };
+        nanosleep(&ts, nullptr);
+        return;
+    }
+    const uint64_t deadline = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count() + ns;
+    prosper::host::sleep_until_steady_ns(deadline);
+}
+
+// Saturating, for the same reason k_nanosleep saturates: the argument is guest-controlled and a wrap
+// turns a long sleep into a short one. Benign in consequence here -- a wrapped deadline lands in the
+// past and precise_sleep returns at once -- but having one of these three saturate and the others
+// wrap is an inconsistency the next reader has to re-derive, so they all do.
+static inline uint64_t guest_ns_from(uint64_t value, uint64_t ns_per_unit) {
+    const uint64_t kNsMax = ~0ull;
+    return value > kNsMax / ns_per_unit ? kNsMax : value * ns_per_unit;
+}
+
+HLE(k_usleep)   { const uint64_t ns = guest_ns_from(a0, 1000ull);
+                  hle::WaitCensusScope c(hle::WaitKind::Usleep, ns); guest_sleep_ns(ns); return 0; }
+
 // POSIX sleep() returns the number of seconds LEFT unslept (0 on full completion), not the input.
 // Returning the input breaks the canonical resume idiom `while ((left = sleep(left))) ;` into an
 // infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
-HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
-HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
+HLE(k_sleep_s)  { const uint64_t ns = guest_ns_from(a0, 1000000000ull);
+                  hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, ns); guest_sleep_ns(ns); return 0; }
+// The remainder out-parameter is written ZERO rather than left untouched, on BOTH exits: a served
+// request sleeps in full so nothing remains, and a refused one slept nothing but must still not hand
+// back whatever was in that memory. Either way a guest reading an uninitialised remainder could
+// resume a wait it should not. (This paragraph previously said "we always sleep the full duration",
+// which the refusal path made false.)
+//
+// Both fields are indexed as int64 rather than reached through a HOST struct timespec, because the
+// two layouts differ on the platform this targets: the guest is FreeBSD x86-64, where tv_nsec is
+// 64-bit, while MinGW-w64 declares long tv_nsec (sys/types.h) -- 32-bit on Windows x64. A
+// host-struct write therefore covers 12 of the 16 guest bytes and leaves the HIGH half of tv_nsec
+// holding whatever was there, so the remainder a guest reads back is not zero and it may resume a
+// wait already served. The READ survived the same cast only by little-endian accident, since every
+// legal nanosecond value fits in the low half. Line 278 already indexes explicitly for this reason.
+//
+// A negative tv_sec, or a negative or out-of-range tv_nsec, is REFUSED -- the body returns 0 without sleeping. The comment
+// on the guard itself says why that is the behaviour to preserve. (An earlier revision of this block
+// described the OPPOSITE, carrying the value into the total. That text survived the commit that added
+// the guard and read as a rationale for removing it, which is how a comment gets a safety check
+// deleted.)
+HLE(k_nanosleep){
+    if (!a0) return 0;
+    const int64_t* req = (const int64_t*)P(a0);
+    const int64_t  sec = req[0], nsec = req[1];
+    // A malformed request returns WITHOUT sleeping, which is what this entry point already did: the
+    // old body handed the guest struct straight to the host nanosleep, and POSIX makes a tv_nsec
+    // outside [0, 1e9) EINVAL -- so the host refused instantly and the HLE returned 0 having slept
+    // nothing. Preserving that matters in BOTH directions. An earlier version of this fix carried an
+    // out-of-range tv_nsec into the total, which turns a garbage 0x7fff... into a near-infinite
+    // sleep: a hang where there used to be an immediate return. Returning an error instead would be
+    // the opposite new failure mode, for guests that currently see success. Same range rule as
+    // hle_kernel.cpp:1313, which validates the guest timespec it is handed.
+    if (sec < 0 || nsec < 0 || nsec >= 1000000000ll) {
+        // Zeroed rather than left untouched (the host would have left it) so a guest reading the
+        // remainder after a refused request cannot resume on uninitialised memory.
+        if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }
+        return 0;
+    }
+    // Saturating, and the second disjunct is the boundary the first one misses: sec == kNsMax/1e9
+    // passes a bare `sec > kNsMax/1e9` test, and then `+ nsec` overflows for nsec > kNsMax%1e9 and
+    // wraps a 584-year sleep into a short one -- the long-to-short direction this clamp exists to
+    // prevent. tv_sec is guest-controlled, so the boundary is reachable by a hostile value.
+    const uint64_t kNsMax   = ~0ull;
+    const uint64_t kSecMax  = kNsMax / 1000000000ull;      // 18446744073
+    const uint64_t kNsecRem = kNsMax % 1000000000ull;      // 709551615
+    const uint64_t want_ns =
+        ((uint64_t)sec > kSecMax || ((uint64_t)sec == kSecMax && (uint64_t)nsec > kNsecRem))
+            ? kNsMax : (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
+    { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want_ns); guest_sleep_ns(want_ns); }
+    if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }   // slept in full
+    return 0;
+}
+
+
 
 // --- select / pselect: the PURE-SLEEP shape only (#1660) --------------------------------------
 //
