@@ -150,11 +150,14 @@ VUIDs have been fixed off the back of it** (#1713, #1714, #1717, #1726). **That 
 validation guard, and it works without any messenger**, because VVL's default `debug_action` writes
 to stdout/stderr on its own.
 
-Read the id and message counts from `allowlist.txt` itself rather than from anywhere that quotes
-them. Its header amends its own baseline on every fix — three times so far — and the file's own rule
-is that an unexplained drop in the id count reads as *"the scan broke"*. A figure quoted elsewhere
-and left to go stale therefore manufactures exactly that false alarm; this paragraph used to carry
-one.
+**Do not quote id or message counts from anywhere — including `allowlist.txt`'s own header.** Run
+`vk_validation_scan.py` and read what it computes (`[vkval] N distinct message ID(s), M message(s)
+total`). The header records a baseline and is amended *sometimes*: #1726, #1717 and #1713 each
+amended it, but #1714 deleted its entry without doing so, which leaves the header's last stated
+ledger one id high in both columns, and the lavapipe figure at the top has never been amended at
+all. This paragraph twice carried a stale figure of its own before saying that — the file's rule is
+that an unexplained drop in the id count reads as *"the scan broke"*, so a quoted count is a false
+alarm waiting to happen, wherever it is quoted from.
 
 `PROSPER_VK_VALIDATION=1` is for the other case: validating **one interactive or routed run** of a
 title, in-process. It enables the layer and registers a `VkDebugUtilsMessenger`, which adds over the

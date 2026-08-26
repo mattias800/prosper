@@ -983,10 +983,12 @@ inline const RenderVkCtx& render_vk_ctx() {
         // (#1704, ctest `vkval_scan_logic`) has been scanning the suite for a long time and carries
         // its own baseline, because VVL's default debug_action writes to stdout/stderr by itself.
         // Four VUIDs were fixed off the back of it (#1713, #1714, #1717, #1726). Counts are
-        // deliberately not quoted here: allowlist.txt amends its baseline on every fix, and a stale
-        // figure there reads as "the scan broke". An earlier revision of
-        // this comment claimed validation "had never once been a measurement in this project",
-        // which was simply false and would have retired a working guard as unmeasured.
+        // deliberately not quoted here, and should not be quoted from allowlist.txt's header
+        // either -- that header is amended only SOMETIMES (#1714 deleted its entry without
+        // amending it, leaving the stated ledger one id high). Run the scan and read the count it
+        // computes. An earlier revision of this comment claimed validation "had never once been a
+        // measurement in this project", which was simply false and would have retired a working
+        // guard as unmeasured.
         //
         // What a messenger adds over the default action: in-process capture, so output can be
         // rate-limited (one violated VUID in a per-draw path otherwise fills the disk) and tagged;
