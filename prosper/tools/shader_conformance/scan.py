@@ -156,6 +156,19 @@ def spirv_dis_cmd():
     return ["spirv-dis"]
 
 
+def replay_cmd(replay):
+    """gpu_replay, as an argv prefix.
+
+    A `.py` value is run with this interpreter. In production `replay` is a real executable and this
+    is the identity; the `.py` arm exists so --self-test can drive a stub. Windows `CreateProcess`
+    cannot execute a `.py` by path the way a POSIX shebang can, and getting this wrong is not merely
+    a red CI square: the ten `rc == 2` arms would still PASS, because a stub that cannot start looks
+    exactly like a capture that could not be scanned. Half the suite would be vacuously green on
+    Windows.
+    """
+    return [sys.executable, replay] if str(replay).endswith(".py") else [replay]
+
+
 def run(cmd, **kw):
     """Every child gets a timeout. A hung gpu_replay on a shared GPU otherwise hangs the scan
     silently, and the reflex is to kill the scanner -- which loses the partial result too."""
@@ -168,7 +181,7 @@ def run(cmd, **kw):
 
 def enumerate_shaders(replay, capture):
     """Unique (draw, stage, hash) triples, so one shader compiled into many draws is dumped once."""
-    r = run([replay, "--inspect-only", capture])
+    r = run(replay_cmd(replay) + ["--inspect-only", capture])
     if r.returncode != 0:
         return None, f"gpu_replay --inspect-only failed ({r.returncode}): {r.stderr.strip()[:200]}"
     seen, out = set(), []
@@ -211,12 +224,12 @@ def materialize(replay, path, tmp):
     """
     if not path.endswith(".prgbundle"):
         return path, None
-    r = run([replay, "--bundle", path, os.path.join(tmp, "b.bmp")])
+    r = run(replay_cmd(replay) + ["--bundle", path, os.path.join(tmp, "b.bmp")])
     subs = re.findall(r"bundle-submit=(\d+)", r.stdout + r.stderr)
     if not subs:
         return None, f"no submits found in bundle ({r.returncode}): {r.stderr.strip()[:160]}"
     out = os.path.join(tmp, os.path.basename(path) + ".prgcap")
-    e = run([replay, "--bundle", path, "--bundle-extract-submit", subs[-1], out])
+    e = run(replay_cmd(replay) + ["--bundle", path, "--bundle-extract-submit", subs[-1], out])
     if not os.path.exists(out):
         return None, f"could not extract submit {subs[-1]}: {e.stderr.strip()[:160]}"
     return out, None
@@ -236,11 +249,11 @@ def scan_capture(replay, capture, tmp):
         raw_p = os.path.join(tmp, f"{sh}.raw")
         spv_p = os.path.join(tmp, f"{sh}.spv")
         if stage == "cs":
-            a = run([replay, "--dump-compute-raw", str(draw), raw_p, capture, bmp])
-            b = run([replay, "--dump-compute", str(draw), spv_p, capture, bmp])
+            a = run(replay_cmd(replay) + ["--dump-compute-raw", str(draw), raw_p, capture, bmp])
+            b = run(replay_cmd(replay) + ["--dump-compute", str(draw), spv_p, capture, bmp])
         else:
-            a = run([replay, "--dump-realized-shader", f"{draw}:{stage}", raw_p, capture, bmp])
-            b = run([replay, "--dump-shader", f"{draw}:{stage}", spv_p, capture, bmp])
+            a = run(replay_cmd(replay) + ["--dump-realized-shader", f"{draw}:{stage}", raw_p, capture, bmp])
+            b = run(replay_cmd(replay) + ["--dump-shader", f"{draw}:{stage}", spv_p, capture, bmp])
         # The child's exit code, not the file's existence. `tmp` is per-capture now, but within one
         # capture two draws can share a shader hash, so a failed dump could still find the previous
         # draw's file sitting there and be scored as a successful read of the wrong shader.
@@ -409,7 +422,13 @@ def self_test():
     script = os.path.abspath(__file__)
     with tempfile.TemporaryDirectory() as tmp:
         rc, out, err = _run_self_test_case(tmp, script, ["good"])
-        check(rc == 0, "a capture whose module IS arrayed exits 0 (clean)")
+        # The positive count matters as much as the exit code. Every `rc == 2` arm below would pass
+        # if the stub could not START -- a stub that never runs is indistinguishable from a capture
+        # that could not be scanned -- so at least one arm has to assert that the stub really
+        # enumerated shaders. Without this, half the suite is vacuously green on any platform where
+        # launching the stub fails, which is exactly what happened on Windows/MinGW.
+        check(rc == 0 and "examined=2" in out,
+              "a capture whose module IS arrayed exits 0 AND reports its 2 examined shaders")
 
         rc, out, err = _run_self_test_case(tmp, script, ["bad"])
         check(rc == 1 and "array-layer-dropped" in out, "a real mismatch exits 1 and is printed")
