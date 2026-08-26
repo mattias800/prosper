@@ -1658,18 +1658,46 @@ int main() {
                             code17d1_vcc_low_cselect_pair_read.size(), nullptr,
                             native_cfg17d).empty(),
           "same-site B64 CSELECT mutation observes VCC_HI and remains fail-visible");
+    // THESE TWO ARMS ARE INVERTED DELIBERATELY, and the reason is an ISA fact rather than a
+    // convenience. Both used to require a decline, which was correct while the dead-sibling proof
+    // ran under ScalarMergeProof::AnyRead. It now runs under MaskDomainOnly, whose entire purpose is
+    // to admit a SCALAR-DATA touch of the half while still refusing any mask-domain observation --
+    // so a data read of VCC_HI must now be ACCEPTED, and asserting otherwise pins conservatism the
+    // tree deliberately gave up.
+    //
+    // The mask-domain half of the contract is NOT weakened by this, and is still pinned above by
+    // the pair-reading and B64-CSELECT arms, which continue to require a decline.
+    //
+    // Arm 1, `S_WAITCNT_VSCNT` with VCC_HI in place of NULL. The encoded field is a SOURCE, not a
+    // destination. "RDNA 2" ISA (document 70648), S_WAITCNT_VSCNT: it waits until
+    //     vscnt <= S0.u[5:0] + S1.u[5:0]
+    // and says "To wait on a literal constant only, write 'null' for the GPR argument" -- which is
+    // exactly why NULL is the register-transparent spelling. So this reads SIX BITS of the half as a
+    // number; it cannot consume it as a 64-bit lane mask. rdna2_emit_alu.cpp says the same thing for
+    // the sibling opcode: "The encoded SDST field is the SOURCE SGPR."
+    //
+    // Arm 2's comment was also wrong about its own bytes. 0xb70803fb is SOPK opcode 14, and the ISA
+    // opcode table gives 14 = S_CMPK_LE_U32 (S_ADDK_I32 is 15). It compares s8 against 1019 and
+    // writes SCC -- it does not touch VCC at all, so there was never a VCC_HI observation here to
+    // be conservative about.
+    //
+    // A previous attempt "fixed" arm 1 by making sgpr_dead_at_merge refuse a non-NULL
+    // WAITCNT_VSCNT. That was withdrawn: it rested on the inverted reading above, bought no
+    // soundness (the emitter's case 0x17 only acts on dst==125 && simm16==0 and otherwise emits
+    // nothing, so the SGPR never reaches SPIR-V), and covered one of the four identically-encoded
+    // waitcnt opcodes -- 23/24/25/26 in the ISA table -- leaving the other three open.
     std::vector<uint32_t> code17d1_vcc_low_sopk_write = code17d1_vcc_low_add3;
     code17d1_vcc_low_sopk_write[15] = 0xbbeb0000u; // same opcode: VCC_HI replaces NULL source
-    CHECK(recompile_compute(code17d1_vcc_low_sopk_write.data(),
-                            code17d1_vcc_low_sopk_write.size(), nullptr,
-                            native_cfg17d).empty(),
-          "same-site non-null WAIT source observes VCC_HI and remains fail-visible");
+    CHECK(!recompile_compute(code17d1_vcc_low_sopk_write.data(),
+                             code17d1_vcc_low_sopk_write.size(), nullptr,
+                             native_cfg17d).empty(),
+          "a non-null WAIT source reads VCC_HI as scalar data and is admitted");
     std::vector<uint32_t> code17d1_vcc_low_sopk_rmw = code17d1_vcc_low_add3;
-    code17d1_vcc_low_sopk_rmw[17] = 0xb70803fbu; // same pc282 site: s_addk_i32 is RMW
-    CHECK(recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
-                            code17d1_vcc_low_sopk_rmw.size(), nullptr,
-                            native_cfg17d).empty(),
-          "same-site SOPK RMW mutation remains conservative in the death proof");
+    code17d1_vcc_low_sopk_rmw[17] = 0xb70803fbu; // same pc282 site: s_cmpk_le_u32 s8, 1019
+    CHECK(!recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
+                             code17d1_vcc_low_sopk_rmw.size(), nullptr,
+                             native_cfg17d).empty(),
+          "an SOPK compare on an unrelated SGPR does not observe VCC_HI and is admitted");
 
     // The complete captured CFG is essential here. Its pc213 VOPC replaces both physical VCC
     // words with a wave mask, then pc227 starts a fresh scalar lifetime in VCC_LO only. A stale
