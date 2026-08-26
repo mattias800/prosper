@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Self-test for audio_delivery_report.py.
+
+The report's whole job is to name the failure mode (clock deficit vs quantized mixer wake
+vs device starvation) from a delivery log. Each case here is a failure mode the report must
+classify, plus the traps: a port filter that must exclude other ports, and a zero-queue
+all-fast log that must NOT be called a clock deficit.
+
+Run: python3 tools/perf/test_audio_delivery_report.py
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+TOOL = Path(__file__).resolve().parent / "audio_delivery_report.py"
+
+
+def dbg(port=17, gap=5.33, frames=256, queued=1024):
+    return f"[audio-dbg] port={port} gap={gap:.2f}ms frames={frames} queued_before={queued} (grain=1024)\n"
+
+
+def run(log_text, extra=None):
+    proc = subprocess.run(
+        [sys.executable, str(TOOL), "-", *(extra or [])],
+        input=log_text, capture_output=True, text=True)
+    return proc.stdout + proc.stderr, proc.returncode
+
+
+def main():
+    failures = []
+
+    def expect(text, needle, what):
+        if needle not in text:
+            failures.append(f"{what}: expected {needle!r} in the report")
+
+    def reject(text, needle, what):
+        if needle in text:
+            failures.append(f"{what}: expected {needle!r} to be absent")
+
+    # 1. Real-time delivery, deep queue: no defect. The verdict must NOT name a clock
+    #    deficit (a plausible wrong call: an average at the device rate with jitter).
+    log = "".join(dbg(gap=5.33, queued=3072) for _ in range(200))
+    out, _ = run(log)
+    expect(out, "delivery matches the device rate", "case 1 verdict")
+
+    # 2. Clock deficit: every call arrives 1/3 late with an empty queue. The verdict must
+    #    name the clock deficit -- this is exactly the Blasphemous 2 signature.
+    log = "".join(dbg(gap=15.7, queued=64) for _ in range(300))
+    out, _ = run(log)
+    expect(out, "clock deficit", "case 2 verdict")
+    expect(out, "the device starved between deliveries", "case 2 starvation row")
+
+    # 3. Quantized mixer wake: the combined delivery averages real-time (256 frames per
+    #    5.33 ms) but the arrivals cluster -- 1 ms after a tick, then 9.66 ms of silence.
+    #    The verdict must name the burst/quantization problem, not a clock deficit.
+    log = "".join(dbg(gap=1.0, queued=4096) + dbg(gap=9.66, queued=4096)
+                  for _ in range(300))
+    out, _ = run(log)
+    expect(out, "delivery matches the device rate", "case 3 drift verdict")
+    expect(out, "burst/quantization problem", "case 3 burst verdict")
+    reject(out, "the guest's audio clock runs below the device rate", "case 3 must not miscall a clock deficit")
+
+    # 4. Port filter: records for another port must not leak into the report.
+    log = ("".join(dbg(port=17, gap=15.7, queued=64) for _ in range(100))
+           + "".join(dbg(port=18, gap=99.0, queued=0) for _ in range(100)))
+    out, _ = run(log, ["--port", "17"])
+    reject(out, "99.00", "case 4 port filter")
+    expect(out, "port 17:", "case 4 port header")
+
+    # 5. Empty input: a clean refusal, not a traceback.
+    out, _ = run("")
+    if "no [audio-dbg] records" not in out:
+        failures.append(f"case 5: expected the no-records refusal, got: {out!r}")
+
+    if failures:
+        print("FAILURES:")
+        for failure in failures:
+            print(" -", failure)
+        return 1
+    print("audio_delivery_report self-test: all cases pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
