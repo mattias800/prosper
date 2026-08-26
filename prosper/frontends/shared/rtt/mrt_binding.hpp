@@ -91,11 +91,31 @@ template <typename FormatDefined, typename FormatAt>
 bool mrt_same_color_pass(const prosper::gpu::DrawItem& first,
                          const prosper::gpu::DrawItem& candidate,
                          FormatDefined format_defined, FormatAt format_at) {
+    // Slot 0 is compared on the NAMED triple whenever it names a surface, because that is the
+    // surface the pass actually renders to: live_renderer takes `pass_bases[0]` from `color0_base`,
+    // while every slot above 0 goes through the array. Reading slot 0's identity from the array
+    // instead makes GROUPING and TARGET SELECTION consult different representations of one
+    // attachment -- and two draws that render to DIFFERENT addresses then share a pass, so the
+    // second draw's target is silently discarded and its pixels are never published.
+    //
+    // On captured and live draws the two representations are identical, because every producer
+    // derives color_targets[0] from the named fields rather than filling it independently
+    // (gpu_capture.cpp:518/2392/5190, gpu_execute.hpp:2398 and :1603) -- so this is a no-op there.
+    // It differs only for a caller that builds a DrawItem directly and populates the named aliases
+    // alone, which is exactly the shape gpu_execute.hpp:2398 exists to repair and which the render
+    // fixtures construct. Falling back to `mrt_color_binding` when `color0_base` is 0 keeps the
+    // previous answer for a draw that names no slot-0 surface at all.
+    auto pass_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
+        if (slot == 0 && draw.color0_base)
+            return prosper::gpu::DrawItem::ColorTargetBinding{
+                draw.color0_base, draw.color0_width, draw.color0_height};
+        return mrt_color_binding(draw, slot);
+    };
     const uint32_t count = mrt_active_color_count(first, format_defined);
     if (mrt_active_color_count(candidate, format_defined) != count) return false;
     for (uint32_t slot = 0; slot < count; ++slot) {
-        const auto a = mrt_color_binding(first, slot);
-        const auto b = mrt_color_binding(candidate, slot);
+        const auto a = pass_binding(first, slot);
+        const auto b = pass_binding(candidate, slot);
         const uint64_t a_base = slot == 0 ? a.base
             : mrt_active_color(first, slot, format_defined);
         const uint64_t b_base = slot == 0 ? b.base
