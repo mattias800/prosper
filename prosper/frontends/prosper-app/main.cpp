@@ -1200,6 +1200,11 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
 } // namespace
 
 int main(int argc, char** argv) {
+    // Line-buffer stdout: the boot/loader diagnostics go through printf (stdout), and under a
+    // file redirect stdout block-buffers — every boot-time line then flushes at exit and lands
+    // AFTER hours' worth of unbuffered stderr in a merged `> log 2>&1`, making the log read as
+    // if the modules loaded at shutdown (misled a #2981 FMV measurement session).
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     std::string dump;
