@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <thread>
 #include <deque>
 #include <filesystem>
 #include <mutex>
@@ -1339,13 +1340,13 @@ struct AvpPlayer {
     // Those are also every place `paused` is cleared, which is what keeps paused time — during which
     // nothing is presented and nothing should be pulled — from counting as an absent consumer.
     std::chrono::steady_clock::time_point video_request_at = std::chrono::steady_clock::now();
-    // The delivery gate's clock: the next frame is due at (last delivered pts + wall time since
-    // that delivery). Re-anchoring on every delivery makes the gate self-correcting — a guest
-    // that stops polling (title screen) resumes where it stopped instead of fast-forwarding
-    // through the gap, and Pause/Resume/JumpToTime need no special cases (see
-    // s_avp_getvideodataex, #2981 FMV speed).
-    uint64_t gate_media_ms = 0;
-    std::chrono::steady_clock::time_point gate_wall = std::chrono::steady_clock::now();
+    // The media-clock anchor for BLOCKING video delivery: the frame with pts P is due at
+    // play_start_wall + (P - play_start_pts). The caller is held until due — the real
+    // AvPlayer's contract, and the only pacing this guest respects: it sleeps its whole
+    // poll budget when a non-blocking gate refuses a frame, which collapsed playback to
+    // ~1 frame per sleep (measured 0.4-1.2 fps, #2981 FMV).
+    std::chrono::steady_clock::time_point play_start_wall = std::chrono::steady_clock::now();
+    uint64_t play_start_pts = 0;
     bool gate_started = false;
     // When the title supplies its AvPlayer texture allocator, decoded NV12 must be written into those
     // guest-visible buffers.  A host vector is invisible to the title's pre-wired texture descriptors.
@@ -2200,7 +2201,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                 p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
                 p.paused = false; p.stop_fired = false; p.seek_deliver = false;
                 p.video_request_at = std::chrono::steady_clock::now();
-                p.gate_media_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
+                p.play_start_wall = p.video_request_at; p.play_start_pts = 0; p.gate_started = false;
                 p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
                 p.backend = nullptr; p.backend_id = -1;
                 // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
@@ -2244,7 +2245,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false;
             p.stop_fired = false; p.seek_deliver = false;
             p.video_request_at = std::chrono::steady_clock::now();
-            p.gate_media_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
+            p.play_start_wall = p.video_request_at; p.play_start_pts = 0; p.gate_started = false;
             p.texture_frames = std::move(textures);
             p.texture_frame_bytes = texture_bytes;
             p.next_texture_frame = 0;
@@ -2383,6 +2384,12 @@ HLE(s_avp_jumptotime) {
                 // does it, so nothing here revives one; it stays stopped with a repositioned source.
                 p.last_ts_ms = target_ms;
                 p.seek_deliver = true;
+                // Re-anchor the delivery gate at the new position: without this, post-seek
+                // frames deliver un-paced against the stale pre-seek anchor until the media
+                // clock climbs back over it (#2989 re-review).
+                p.play_start_wall = std::chrono::steady_clock::now();
+                p.play_start_pts = target_ms;
+                p.gate_started = true;
                 // The source was just repositioned: the media clock measures the remainder from the
                 // new position, starting now.
                 p.video_request_at = std::chrono::steady_clock::now();
@@ -2401,6 +2408,36 @@ HLE(s_avp_jumptotime) {
     return 0;
 }
 // bool sceAvPlayerGetVideoData(handle, AvPlayerFrameInfo*) — deliver the next decoded frame (NV12).
+// BLOCKING media-clock gate: hold the caller until the frame's PTS is due. The real AvPlayer
+// delivers a frame when its PTS reaches the media clock; this guest sleeps its whole poll budget
+// when a call returns "no frame yet", so a non-blocking refusal collapsed playback to ~1 frame
+// per sleep (measured 0.4-1.2 fps, #2981 FMV). Releases g_avp_mx in 8 ms steps and aborts the
+// wait on stop/pause/seek/destroy; caps the wait at 5 s so a broken anchor can never hang the
+// guest's video thread for the whole movie.
+// BLOCKING media-clock gate: hold the caller until the frame's PTS is due. The real AvPlayer
+// delivers a frame when its PTS reaches the media clock; this guest sleeps its whole poll budget
+// when a call returns "no frame yet", so a non-blocking refusal collapsed playback to ~1 frame
+// per sleep (measured 0.4-1.2 fps, #2981 FMV). g_avp_mx is HELD by the caller for the whole
+// wait — deliberate: no player state (stop/pause/seek/destroy) can change mid-wait, so the
+// only exit is due time; the 5 s cap keeps a broken anchor from hanging the video thread.
+void avp_await_due(AvpPlayer& p, uint64_t pts_ms) {
+    if (!p.gate_started) return;   // no anchor yet: the first delivery arms the clock
+    const auto due_wall = p.play_start_wall + std::chrono::milliseconds(
+        pts_ms > p.play_start_pts ? pts_ms - p.play_start_pts : 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= due_wall || now >= deadline) return;
+        // Sleep the remaining wait, clamped: a long first sleep keeps the loop cheap, and the
+        // final steps shrink so the wakeup lands within ~1 ms of due (an 8 ms flat quantum
+        // overshot every frame by ~4 ms and cost ~10% of the playback rate).
+        const auto remaining = due_wall - now;
+        std::this_thread::sleep_for(
+            remaining > std::chrono::milliseconds(8) ? std::chrono::milliseconds(8) : remaining);
+    }
+}
+
+
 HLE(s_avp_getvideodata) {
     svc_log("sceAvPlayerGetVideoData", a0,a1,a2,a3,a4,a5);
     auto* fi = (AvpFrameInfo*)PW(a1); if (!fi) return 0;
@@ -2423,37 +2460,20 @@ HLE(s_avp_getvideodata) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
-        {
-            const auto now = std::chrono::steady_clock::now();
-            // Tick the media clock between polls; a gap longer than 200 ms pauses it (title
-            // screens, stream transitions) — shorter ones are decode jitter and count as media
-            // time, matching a player that plays autonomously between polls.
-            if (p.gate_started) {
-                if (now - p.gate_wall > std::chrono::milliseconds(200))
-                    p.gate_wall = now;
-                else {
-                    p.gate_media_ms +=
-                        (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - p.gate_wall).count();
-                    p.gate_wall = now;
-                }
-            } else {
-                p.gate_wall = now;
-            }
-        }
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             // Media-clock gate, same as GetVideoDataEx above (#2981 FMV speed).
             const bool gated = p.gate_started && b->can_peek_video();
             bool have = gated ? b->peek_video(p.backend_id, vf) : true;
             if (have && gated && !p.seek_deliver) {
-                if (vf.pts_us / 1000 > p.gate_media_ms) have = false;   // not due; re-poll
+                // BLOCKING media-clock gate: hold until the frame's PTS is due (see the
+                // Ex handler; measured 0.4-1.2 fps with a non-blocking gate on this guest).
+                avp_await_due(p, vf.pts_us / 1000);
             }
             if (have && b->next_video(p.backend_id, vf)) {
-                if (!p.gate_started) {
-                    p.gate_media_ms = vf.pts_us / 1000;   // anchor at the first frame's PTS
-                    p.gate_started = true;
-                }
+                p.play_start_wall = std::chrono::steady_clock::now();
+                p.play_start_pts = vf.pts_us / 1000;
+                p.gate_started = true;
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
                 if (avp_stage_video(p, vf, false, staged, pitch)) {
@@ -2495,6 +2515,7 @@ HLE(s_avp_getvideodataex) {
     auto* fi = (AvpFrameInfoEx*)PW(a1); if (!fi) return 0;
     void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t result = 0;
     uint64_t media_snapshot = UINT64_MAX;
+    prosper::video::VideoBackend* log_backend = nullptr; int log_backend_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
@@ -2505,50 +2526,28 @@ HLE(s_avp_getvideodataex) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
-        // The media clock pauses while nobody consumes (#1973 semantics): a poll gap longer than
-        // this shifts the gate's anchor so the movie RESUMES where delivery stopped instead of
-        // fast-forwarding through the gap (a 53 s title screen must not skip the intro's first
-        // 53 s — measured live, #2981 FMV).
-        {
-            const auto now = std::chrono::steady_clock::now();
-            // Tick the media clock between polls; a gap longer than 200 ms pauses it (title
-            // screens, stream transitions) — shorter ones are decode jitter and count as media
-            // time, matching a player that plays autonomously between polls.
-            if (p.gate_started) {
-                if (now - p.gate_wall > std::chrono::milliseconds(200))
-                    p.gate_wall = now;
-                else {
-                    p.gate_media_ms +=
-                        (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - p.gate_wall).count();
-                    p.gate_wall = now;
-                }
-            } else {
-                p.gate_wall = now;
-            }
-        }
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             // Media-clock gate: the real AvPlayer owns the clock and refuses frames whose PTS is
             // not due yet. Measured without a gate, GRIS's 73.4 s intro delivered all 1761 frames
             // in 19.0 s of wall (3.86x) — this title presents every frame it receives, so the
             // pacing must live HERE, not in the guest. Peek first: next_video pops, and a frame
-            // refused after the pop would be lost. 20 ms lead = half a 24 fps frame, so the poll
-            // loop (measured ~5 ms cadence) picks the frame up on the first poll after it is due.
+            // refused after the pop would be lost.
             // The PTS gate needs a non-destructive peek. A backend without one keeps ungated
             // delivery (the pre-gate behavior) — refusing frames it cannot re-inspect would
             // deliver nothing at all (#2989 review, blocking 1).
             const bool gated = p.gate_started && b->can_peek_video();
             bool have = gated ? b->peek_video(p.backend_id, vf) : true;
             if (have && gated && !p.seek_deliver) {
-                if (vf.pts_us / 1000 > p.gate_media_ms) have = false;   // not due; re-poll
+                // BLOCKING media-clock gate: hold until the frame's PTS is due (see the
+                // non-Ex handler; measured 0.4-1.2 fps with a non-blocking gate on this guest).
+                avp_await_due(p, vf.pts_us / 1000);
             }
             if (have && b->next_video(p.backend_id, vf)) {
-                if (!p.gate_started) {
-                    p.gate_media_ms = vf.pts_us / 1000;   // anchor at the first frame's PTS
-                    p.gate_started = true;
-                }
-                media_snapshot = p.gate_media_ms;
+                p.play_start_wall = std::chrono::steady_clock::now();
+                p.play_start_pts = vf.pts_us / 1000;
+                p.gate_started = true;
+                media_snapshot = p.play_start_pts;
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
                 // Publish the frame only if its metadata is publishable: a refused fill would
@@ -2591,8 +2590,10 @@ HLE(s_avp_getvideodataex) {
                     (unsigned long long)avp_ms(), (unsigned long long)fi->timestamp,
                     (unsigned long long)media_snapshot);
         else
-            fprintf(stderr, "[avp] video-ex handle=0x%llx empty t=%llums\n",
-                    (unsigned long long)a0, (unsigned long long)avp_ms());
+            fprintf(stderr, "[avp] video-ex handle=0x%llx empty t=%llums media=%llums q=%d\n",
+                    (unsigned long long)a0, (unsigned long long)avp_ms(),
+                    (unsigned long long)media_snapshot,
+                    log_backend ? log_backend->video_queue_depth(log_backend_id) : -2);
     }
     return result;
 }

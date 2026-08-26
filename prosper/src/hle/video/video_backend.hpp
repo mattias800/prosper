@@ -85,6 +85,8 @@ public:
     // Frames dropped inside the backend (queue-full eviction). Diagnostic: the HLE layer reports
     // it at EOF so a short-delivery measurement can name the stage that lost them.
     virtual uint64_t video_frames_dropped(int id) { return 0; }
+    // Diagnostic: queued decoded-video frames (-1 = unsupported).
+    virtual int video_queue_depth(int id) { return -1; }
     virtual bool next_audio(int id, AudioFrame& out) = 0;  // false if no audio ready yet
     // AvPlayer video completion is driven by the video stream. Queued audio must not keep a
     // video-only consumer active after decode has ended and the final video frame was delivered.

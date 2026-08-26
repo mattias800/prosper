@@ -32,6 +32,7 @@ public:
 
     // The implementation behind vaapi_video_frames_dropped below.
     uint64_t video_frames_dropped(int id) override;
+    int video_queue_depth(int id) override;
     uint64_t video_frames_dropped_for_test(int id);
 
     // sceVideodec2's access-unit path (#2270). The guest submits one compressed access unit and
