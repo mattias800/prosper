@@ -605,6 +605,18 @@ if(TARGET prosper_core)
 
   # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
   # code is Linux-only (guest %fs), so gate the test on it too.
+  # sceKernelNanosleep's GUEST timespec contract (#3013). Registered OUTSIDE the if(UNIX) block
+  # below ON PURPOSE: what it pins is a WINDOWS defect -- MinGW-w64 declares a 32-bit `long tv_nsec`
+  # while the guest timespec is FreeBSD x86-64's 64-bit field, so writing the remainder through a
+  # host struct covered 12 of 16 bytes -- and a Unix-only registration would build it everywhere
+  # except the platform it is about. The second property, that a malformed tv_nsec returns promptly
+  # rather than sleeping ~2 s or ~292 years, is platform-independent. Asserts promptness, not
+  # accuracy: sleep precision belongs to host::sleep_until_steady_ns and a wall-clock assertion on
+  # it would flake on a loaded host.
+  add_executable(test_kernel_nanosleep tests/hle/kernel/test_kernel_nanosleep.cpp)
+  target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
+  add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
+
   if(UNIX)
     add_executable(test_guest_tls_align tests/loader/test_guest_tls_align.cpp)
     target_link_libraries(test_guest_tls_align PRIVATE prosper_core)

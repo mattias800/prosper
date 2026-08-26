@@ -86,9 +86,9 @@ inline void report_timedwait_census(uint64_t now_ns) {
             fprintf(stderr, "[timedwait 5s] %-16s calls=%-9llu requested=      ?     actual=%7.3f ms\n",
                     wait_kind_name((WaitKind)i), (unsigned long long)n,
                     g_wait_actual_ns[i].load(std::memory_order_relaxed) / 1e6 / n);
-        g_wait_calls[i].store(0, std::memory_order_relaxed);
-        g_wait_requested_ns[i].store(0, std::memory_order_relaxed);
-        g_wait_actual_ns[i].store(0, std::memory_order_relaxed);
+            g_wait_calls[i].store(0, std::memory_order_relaxed);
+            g_wait_requested_ns[i].store(0, std::memory_order_relaxed);
+            g_wait_actual_ns[i].store(0, std::memory_order_relaxed);
             continue;
         }
         const double req_ms = req_total / 1e6 / n;

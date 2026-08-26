@@ -448,7 +448,7 @@ HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 10000
 // host-struct write therefore covers 12 of the 16 guest bytes and leaves the HIGH half of tv_nsec
 // holding whatever was there, so the remainder a guest reads back is not zero and it may resume a
 // wait already served. The READ survived the same cast only by little-endian accident, since every
-// legal nanosecond value fits in the low half. Line 277 already indexes explicitly for this reason.
+// legal nanosecond value fits in the low half. Line 278 already indexes explicitly for this reason.
 //
 // An out-of-range tv_nsec is CARRIED into the total rather than rejected: this entry point has always
 // returned 0 unconditionally, and turning a malformed request into an error return would be a new
@@ -456,9 +456,26 @@ HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 10000
 HLE(k_nanosleep){
     if (!a0) return 0;
     const int64_t* req = (const int64_t*)P(a0);
-    const int64_t  sec  = req[0] > 0 ? req[0] : 0;
-    const int64_t  nsec = req[1] > 0 ? req[1] : 0;
-    const uint64_t want_ns = (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
+    const int64_t  sec = req[0], nsec = req[1];
+    // A malformed request returns WITHOUT sleeping, which is what this entry point already did: the
+    // old body handed the guest struct straight to the host nanosleep, and POSIX makes a tv_nsec
+    // outside [0, 1e9) EINVAL -- so the host refused instantly and the HLE returned 0 having slept
+    // nothing. Preserving that matters in BOTH directions. An earlier version of this fix carried an
+    // out-of-range tv_nsec into the total, which turns a garbage 0x7fff... into a near-infinite
+    // sleep: a hang where there used to be an immediate return. Returning an error instead would be
+    // the opposite new failure mode, for guests that currently see success. Same range rule as
+    // hle_kernel.cpp:1313, which validates the guest timespec it is handed.
+    if (sec < 0 || nsec < 0 || nsec >= 1000000000ll) {
+        // Zeroed rather than left untouched (the host would have left it) so a guest reading the
+        // remainder after a refused request cannot resume on uninitialised memory.
+        if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }
+        return 0;
+    }
+    // Saturating rather than wrapping: tv_sec is guest-controlled and unbounded, and a wrap would
+    // turn a very long sleep into a short one, which is worse than a long one.
+    const uint64_t kNsMax = ~0ull;
+    const uint64_t want_ns = (uint64_t)sec > kNsMax / 1000000000ull
+        ? kNsMax : (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
     { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want_ns); guest_sleep_ns(want_ns); }
     if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }   // slept in full
     return 0;
