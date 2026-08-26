@@ -394,8 +394,10 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
 constexpr uint32_t kFpsSampleW = 256, kFpsSampleH = 144;
 constexpr VkDeviceSize kFpsSampleBytes = (VkDeviceSize)kFpsSampleW * kFpsSampleH * 4;
 
-// True once the sample grid is usable. Failure is not fatal and not retried: --fps degrades to the
-// unmeasured HUD rather than taking the app down over an instrument.
+// True once the sample grid is usable. Failure is not fatal: --fps degrades to the unmeasured HUD
+// rather than taking the app down over an instrument. It IS re-attempted, because the caller runs
+// this whenever the overlay is not yet ready -- the early-out on the first line is what makes a
+// success cheap, not a latch that would stop a retry.
 bool ensure_fps_sample(Vk& vk) {
     if (vk.sampleBuf) return true;
 
@@ -820,8 +822,14 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     }
     if (submitResult != VK_SUCCESS) {
         prosper::frontend::present_blit_release(gf.slot);
+        // The sample copy was RECORDED but never executed, so the buffer still holds the previous
+        // frame (or is indeterminate on the first pass). Clearing the flag keeps the counter from
+        // signing bytes no present produced -- one spurious distinct-or-not verdict, in bounds and
+        // harmless, but it would be a measurement of nothing.
+        vk.samplePending = false;
         return recover_submit_failure(vk, submitResult);
     }
+
     prevSlot = gf.slot;
     if (requestReadback) {
         const VkResult waitResult = vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
@@ -2588,7 +2596,15 @@ int main(int argc, char** argv) {
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
                         double s = std::chrono::duration<double>(now - t0).count();
+                        // present_frame_rate.hpp says any caller of frame_rate_is_mostly_unchanged
+                        // must report active_fraction beside it, to separate "a static menu that HAS
+                        // produced frames" from "a title producing nothing". frame_rate_between
+                        // cannot supply it (:290 leaves it unfilled by construction), so the
+                        // PRESENTED rate printed on this same line carries that job: a non-zero
+                        // presented rate is exactly the evidence that frames are still arriving.
+                        // Recorded as #3027 rather than left as a silent divergence.
                         // The PRESENTED rate, and -- when --fps armed the content sample (#3010) --
+
                         // the DISTINCT rate beside it. Both, because they answer different questions:
                         // a title whose picture is frozen still presents at 60, and this line alone
                         // read healthy right through the Windows splash stall in #3011.

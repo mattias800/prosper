@@ -366,14 +366,14 @@ void dense_signature_pins_the_gpu_path() {
     CHECK(dense_content_signature(nullptr, 0) == dense_content_signature(nullptr, 0),
           "an empty sample signs consistently rather than trapping");
 
-    // WHY dense: at this buffer size the sparse whole-frame signature reads only a few hundred
-    // bytes, so it can miss the same change. Recorded as a measurement, not an assumption -- if
-    // this ever stops holding, the dense variant has lost its justification and should go.
-    const bool sparse_misses_it =
-        frame_content_signature(a.data(), a.size(), 256, 144) ==
-        frame_content_signature(b.data(), b.size(), 256, 144);
-    std::printf("   sparse signature on a 256x144 sample %s this change\n",
-                sparse_misses_it ? "MISSES" : "sees");
+    // WHY dense, ASSERTED rather than printed: at this buffer size the sparse whole-frame signature
+    // reads only a few hundred bytes and misses the same change. This was a printf, which made it an
+    // experiment that could not fail -- if the sparse signature ever became sensitive enough here the
+    // dense variant would have lost its justification and nobody would have been told. Now the day
+    // that changes, this goes red and someone removes dense_content_signature on purpose.
+    CHECK(frame_content_signature(a.data(), a.size(), 256, 144) ==
+              frame_content_signature(b.data(), b.size(), 256, 144),
+          "the sparse whole-frame signature MISSES it at this size -- which is why dense exists");
 
     // And the publication accounting is the same as the pixel entry point's.
     present_reset();
