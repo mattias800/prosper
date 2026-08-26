@@ -7,22 +7,29 @@
 # Route shape, and why each step exists (every claim below is measured, see
 # docs/SONIC_FRONTIERS_STATUS.md):
 #
-# THIS ROUTE REQUIRES AN EMPTY SAVE ROOT. It is not optional and it fails silently.
+# RUN THIS AGAINST AN EMPTY SAVE ROOT.
 #
-#     PROSPER_SAVE0=$(mktemp -d) PROSPER_PAD_SCRIPT=@<this file> ...
+#     PROSPER_SAVE0=~/prosper-run/save-$$ PROSPER_PAD_SCRIPT=@<this file> ...
 #
-# The twelve confirms below assume a TWELVE-page boot notice queue, which is what a first boot
-# shows. With a save present (`savedata0/PPSA03831/` -- `option` is enough) the queue is shorter,
-# so the surplus confirms fall through to the main menu and ACTIVATE the entry under the cursor.
-# That entry is "Extras", and every later input then navigates inside the Extras submenu. Measured
-# 2026-08-27: a run with a save present sits in Extras for its whole length -- 24/24 frames with
-# content, `pixel-distinct=24`, guest healthy -- and never reaches the stage. It looks exactly like
-# an input or render wall and costs a full run to diagnose (#2790).
+# (A path under $HOME, not /tmp -- save_paths.hpp records that the save defaults were deliberately
+# moved off tmpfs.)
 #
-# Budget: this title runs ~1.5-2.8 flips/s on a live 4K renderer arm, so f2900 (GameModeStage) is
-# 17-31 MINUTES of wall clock, and the rate varies enough between runs that a fixed timeout will
-# sometimes miss the stage. `--render-every` does not help: the title is logic-bound, not
-# render-bound (2.84 -> 4.27 flips/s at `--render-every 6`).
+# MEASURED (2026-08-27, three arms of this route on one build): with `savedata0/PPSA03831/` present
+# the run sits in the EXTRAS menu for its whole length -- 24/24 frames with content,
+# `pixel-distinct=24`, guest healthy -- and never reaches the stage. With that directory moved
+# aside, and again with PROSPER_SAVE0 pointed at an empty root, it reaches GameModeStage. So
+# "save present => this route fails" is established.
+#
+# THE MECHANISM IS NOT. The plausible story is that the twelve confirms below assume the
+# twelve-page queue a FIRST boot shows, so a shorter queue lets the surplus confirms fall through
+# and activate the entry under the cursor ("Extras"). Nobody has counted the notice pages with a
+# save present, and docs/SONIC_FRONTIERS_STATUS.md already records the SAME end state arising from
+# flip/wall-clock desync under host load instead. Check `uptime` before blaming a save (#2790).
+#
+# Budget: single-run rates of 1.5, 2.8 and 3.4 flips/s were seen across three arms of this route,
+# so f2900 (GameModeStage) landed between ~14 and ~32 minutes and one arm missed it inside a 1400 s
+# timeout. `--render-every 6` moves the rate ~1.5x (2.84 -> 4.27) -- real, but not enough to make
+# iteration cheap.
 #
 #   f1100-f1540   Twelve confirms, 40 flips apart, clear the twelve-page boot notice queue
 #                 ("Extras", "Update notification", "Game update", "Update Details", "Update",

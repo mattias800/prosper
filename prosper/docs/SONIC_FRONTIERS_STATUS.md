@@ -51,19 +51,31 @@ incomplete — see below.
 `scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`, flip-anchored, with a header explaining
 every window.
 
-**It requires an EMPTY SAVE ROOT, and fails silently without one** — run it as
-`PROSPER_SAVE0=$(mktemp -d) ...`. The twelve confirms below assume the twelve-page queue a *first*
-boot shows; with a save present (`savedata0/PPSA03831/` — `option` alone is enough) the queue is
-shorter, the surplus confirms fall through to the main menu and **activate the entry under the
-cursor**, which is "Extras". Every later input then navigates inside that submenu. Measured
-2026-08-27 on `d2b2e4d3`: such a run sits in Extras for its entire length — 24/24 frames with
-content, `pixel-distinct=24`, guest healthy — and never reaches the stage. It presents exactly like
-an input or render wall (#2790).
+**Run it against an EMPTY SAVE ROOT** — `PROSPER_SAVE0=~/prosper-run/save-$$ ...` (a path under
+`$HOME`, not `/tmp`: `save_paths.hpp` records that the defaults were deliberately moved off tmpfs).
 
-**Budget the wall clock:** ~1.5–2.8 flips/s on a live 4K renderer arm, so `f2900` is **17–31
-minutes**, and the rate varies enough between runs that a fixed timeout will sometimes miss the
-stage. `--render-every 6` does not help — 2.84 → 4.27 flips/s, i.e. this title is logic-bound rather
-than render-bound.
+**What is measured** (2026-08-27, `d2b2e4d3`, three arms, same build and route): with
+`savedata0/PPSA03831/` present the run sits in the **Extras** menu for its entire length — 24/24
+frames with content, `pixel-distinct=24`, guest healthy — and never reaches the stage. With that
+directory moved aside, and again with `PROSPER_SAVE0` pointed at an empty root, the same route
+reaches `GameModeStage`. So **save state present ⇒ this route fails** is established.
+
+**What is NOT established is the mechanism.** The plausible story is that the twelve confirms assume
+the twelve-page queue a *first* boot shows, so a shorter queue lets the surplus confirms fall through
+and activate the entry under the cursor ("Extras"). Nobody has counted the notice pages with a save
+present, which is the load-bearing step. And the Ruled-out row below records the **same end state —
+"activated 'Extras' with the f2100 confirm" — arising from flip/wall-clock desync under host load**,
+not from a shorter queue. The two are not discriminated here, so treat the queue-length account as a
+hypothesis and check `uptime` before assuming a save caused it. It presents exactly like an input or
+render wall either way (#2790).
+
+**Budget the wall clock generously.** Single-run figures from 2026-08-27, quoted as the spread they
+are rather than as a rate: **1.5, 2.8 and 3.4 flips/s** across three arms of the identical route, so
+`f2900` landed anywhere between ~14 and ~32 minutes and one arm missed the stage inside a 1400 s
+timeout. Elsewhere this document quotes ~3 and 3.2–3.5 from other sessions; nothing here contradicts
+those, the variance is simply wide. `--render-every 6` moves it 2.84 → 4.27 flips/s in a matched
+pair — a real ~1.5x, but not the order of magnitude that would make iteration cheap, and it is one
+pair, not a characterisation.
 
 The shape:
 
@@ -460,8 +472,8 @@ to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
-| The three scene-target-width kernels are blocked by `s_cbranch_execz` / `image_load_mip` as the #2790 census records | **Falsified — that census is stale.** The `V_LSHL_ADD_U32` allowlist entry it predated has landed, and re-measuring on `d2b2e4d3` shows the three kernels rejecting *further in*, on the MIMG instructions that were previously unreachable: `image_load_mip` at pc=33/81 (`0x2005714000`, `0x200571bd00`) and `image_get_resinfo` at pc=73 (`0x2005717e00`). Exactly what that commit predicted — "a reject PC names where a fact was consumed, not where it was lost". Both remaining ops are real gaps: the `image_load_mip` gate admits only the case it can specialise away (`declared_mip_levels != 1`, `proven_zero_mip`, `img_dim != mimg_dim` all fail here, against a 12-mip resource), and `image_get_resinfo` is gated on `mimg_dim <= 2` while this call is `dim=5`. #2790 |
-| `boot_trace` can serve as a fast route oracle for this title (~30 flips/s vs ~3) | **Falsified for this purpose.** It logs guest `.pac` asset opens, so the mode markers the route header names are in principle visible — but it emits no flip/scanout counter, so a flip-anchored route cannot be positioned against it, and a 180 s arm produced 155 lines with none of `ui_gamemodetitle/opening/stage`. Also note `timeout` alone does not stop it; it needs `timeout -s KILL`. Measured 2026-08-27. |
+| The three scene-target-width kernels are blocked by `s_cbranch_execz` as the #2790 census records | **Partly falsified — two of the three moved, one never did.** The `V_LSHL_ADD_U32` allowlist entry the census predates has landed, and re-measuring on `d2b2e4d3` shows `0x2005717e00` and `0x200571bd00` no longer rejecting on `s_cbranch_execz` at pc=28 but on `image_load_mip` at **pc=81** — "a reject PC names where a fact was consumed, not where it was lost", exactly as that commit predicted. `0x2005714000` did **not** move: the census already recorded it at pc=33 `image_load_mip`, byte-identical. So all three now stop on the SAME instruction, and the world frontier for this title is one unimplemented operation rather than three. Their `[mimg-mip]` profiles are identical too — `img_dim=5/1 mips=12 addr=0x2026900000 2048x2048`. Note `image_get_resinfo` at pc=73 belongs to `0x2005a13f00` / `0x2006e24000`, **not** to any of these three; an earlier revision of this row mis-attributed it by pairing separately-collected program and reject lists. #2790, #3048 |
+| `boot_trace` cannot position a flip-anchored route because it prints no flip counter | **NOT a falsification — this row was wrong and is retracted.** It was written from a 180 s arm that produced 155 lines with no flip marker, but the arm simply had no counter switch enabled. Two exist, both in `src/hle` and so linked into `boot_trace`: `PROSPER_PAD_SCRIPT_LOG=1` prints `[pad-script] elapsed=… frame=<flips since first poll> read=… buttons=…`, i.e. the route's own flip position per input (`hle_pad.cpp`, `docs/INPUT_REPLAY.md`), and `PROSPER_PROGRESS=<secs>` prints `flips=` from `prosper_vo_flip_count()`. Structurally it could not have been true either: `fN` anchors are resolved by `pad_frame_now()` reading that same counter in every frontend. Kept as a row because the mistake is the reusable part — **a null from an instrument whose switch was never thrown is not evidence**, and this document already says four times over that the CPU-only `boot_trace` arm IS the fast loop and does reach the stage. Only the operational note stands: `boot_trace` ignores plain `timeout` and needs `timeout -s KILL`. |
 | The unregistered `libSceFont` surface is why some of this title's text or UI fails to draw | **Falsified, by counting.** This dump names `libSceFont` and `libSceFontFt` only as `_stub_weak` entries in its dynamic library table, and its eboot and every `sce_module/*.prx` import **zero** of the 156 NIDs those two libraries export. Positive control on the same sweep in the same run: *Metaphor* 25, *Astro Bot* 54. Confirmed by the authoritative instrument too — `self_dump --import-slots` reports 0 import slots here against 25 / 54 there. A library named in a binary is not a library called from it. #2951 |
 | The stall after `ui_gamemodeinitialize.pac` is a rendering, present or publish defect | **Falsified.** It was one unregistered Sony import. With `RjMlsR8EXrw` registered and nothing else changed, the same binary reaches the title screen and the main menu — while the renderer, present path and publish gate are byte-identical. (This PR.) |
 | The guest stops submitting GPU work after the opening logo | **Falsified.** A same-process A/B across the freeze recorded 11 `agc_driver_submit_dcb`, 4 draws, 7 dispatches and 1 flip per frame *after* it, against 15/1/3/1 during the intro. (#1968.) |
