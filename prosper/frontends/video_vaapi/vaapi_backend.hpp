@@ -22,6 +22,8 @@ public:
     int open(const std::string& host_path) override;
     int open_memory(const std::string& debug_name, const uint8_t* data, size_t bytes) override;
     bool info(int id, StreamInfo& out) override;
+    bool peek_video(int id, VideoFrame& out) override;
+    bool can_peek_video() const override { return true; }
     bool next_video(int id, VideoFrame& out) override;
     bool next_audio(int id, AudioFrame& out) override;
     bool eof(int id) override;
@@ -29,6 +31,8 @@ public:
     void close(int id) override;
 
     // The implementation behind vaapi_video_frames_dropped below.
+    uint64_t video_frames_dropped(int id) override;
+    int video_queue_depth(int id) override;
     uint64_t video_frames_dropped_for_test(int id);
 
     // sceVideodec2's access-unit path (#2270). The guest submits one compressed access unit and

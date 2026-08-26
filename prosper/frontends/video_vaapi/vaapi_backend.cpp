@@ -34,7 +34,12 @@ namespace prosper::video {
 namespace {
 
 constexpr size_t kVideoQueueCapacity = 6;
-constexpr size_t kAudioQueueCapacity = 32;
+// Runway against the demux interleave: AAC frames arrive ~2:1 over video frames, so the worker
+// services audio ~48/s while the guest consumes ~46.9/s — barely positive. Any jitter (a video
+// enqueue blocking a frame longer, a poll hiccup) emptied the old 32-frame queue (682 ms) and the
+// starvation drop path fired ~24 times per 10 s, losing 12% of GRIS's intro frames (#2981 FMV).
+// 512 frames ≈ 10.9 s of audio ≈ 4 MB: the drain margin stops being reachable in practice.
+constexpr size_t kAudioQueueCapacity = 512;
 
 // A guest counts as an ACTIVE audio consumer for this long after its last next_audio() call. It has
 // to be a window rather than a flag because both of the states that matter -- "this title routes
@@ -825,6 +830,23 @@ bool VaapiBackend::info(int id, StreamInfo& out) {
     return session->init_ok;
 }
 
+bool VaapiBackend::peek_video(int id, VideoFrame& out) {
+    const auto session = impl_->get(id);
+    if (!session) return false;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->video_queue.empty()) return false;
+    const auto& front = session->video_queue.front();
+    out.y = front.nv12.data();
+    const size_t y_bytes = static_cast<size_t>(front.stride) * front.height;
+    out.uv = front.nv12.data() + y_bytes;
+    out.width = front.width;
+    out.height = front.height;
+    out.y_stride = front.stride;
+    out.uv_stride = front.stride;
+    out.pts_us = front.pts_us;
+    return true;
+}
+
 bool VaapiBackend::next_video(int id, VideoFrame& out) {
     const auto session = impl_->get(id);
     if (!session) return false;
@@ -929,6 +951,20 @@ void VaapiBackend::close(int id) {
 VaapiBackend& shared_vaapi_backend() {
     static VaapiBackend backend_instance;
     return backend_instance;
+}
+
+int VaapiBackend::video_queue_depth(int id) {
+    const auto session = impl_->get(id);
+    if (!session) return -1;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return (int)session->video_queue.size();
+}
+
+uint64_t VaapiBackend::video_frames_dropped(int id) {
+    const auto session = impl_->get(id);
+    if (!session) return 0;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->video_frames_dropped;
 }
 
 uint64_t VaapiBackend::video_frames_dropped_for_test(int id) {
