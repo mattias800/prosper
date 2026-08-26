@@ -910,7 +910,10 @@ namespace {
     // frames, so the missing caller frame is immaterial. The recorded alignment makes the contract
     // regression-testable on Windows rather than relying on current compiler tolerance (#633).
     extern "C" {
-        volatile uint64_t prosper_veh_recover_call_rsp_mod16 = ~uint64_t{0};
+        // The handwritten thunk names this C symbol directly. GCC 15 otherwise gives the
+        // anonymous-namespace definition an internal assembler name and leaves it unresolved.
+        volatile uint64_t prosper_veh_recover_call_rsp_mod16
+            __asm__("prosper_veh_recover_call_rsp_mod16") = ~uint64_t{0};
         void prosper_veh_recover_thunk();
     }
     extern "C" __attribute__((noinline, noreturn)) void prosper_veh_recover_longjmp() {
