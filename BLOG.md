@@ -31,6 +31,15 @@ Croft Manor now renders with correct geometry — same route, same scene, same b
 
 Surfaces are still untextured — that is the next thing. [#2990](https://github.com/mattias800/prosper/issues/2990)
 
+### The fps counter works now, and it can tell a frozen picture from a running one
+
+`--fps` read `no frames published yet` for the whole life of every real game boot, on every platform.
+It now shows the presented rate and the rate the picture actually *changes* at, and says
+`picture not changing` when those disagree -- which is what a hung title looks like from outside,
+since a frozen picture still presents at 60.
+
+No picture: it is a number on a HUD, easier to see by running `--fps` than to photograph.
+
 ### Tomb Raider I-III Remastered boots for the first time, and reaches its title screen
 
 We now reach the rendered Tomb Raider I title screen. This title had never been launched in prosper

@@ -344,6 +344,50 @@ void present_layer_wiring() {
     present_reset();
 }
 
+// The GPU present path signs a SMALL sample densely instead of a large frame sparsely (#3010).
+// Both halves of that choice are pinned here, and the sample buffers are built BY HAND rather than
+// drawn from whatever the accumulator would produce (instrument trap 122).
+void dense_signature_pins_the_gpu_path() {
+    // The grid prosper-app actually uses: 256x144 RGBA8.
+    constexpr size_t kBytes = 256u * 144u * 4u;
+    std::vector<uint8_t> a(kBytes, 0x40);
+    std::vector<uint8_t> b = a;
+    // ONE pixel, in the middle, changed by one step. This is the case the counter has to see: a
+    // title whose picture changes only in a small region must not read as frozen.
+    const size_t px = ((144u / 2) * 256u + 128u) * 4u;
+    b[px + 1] = 0x41;
+
+    CHECK(dense_content_signature(a.data(), a.size()) !=
+          dense_content_signature(b.data(), b.size()),
+          "the dense signature sees a single changed pixel in the sample grid");
+    CHECK(dense_content_signature(a.data(), a.size()) ==
+          dense_content_signature(a.data(), a.size()),
+          "...and is stable for identical bytes");
+    CHECK(dense_content_signature(nullptr, 0) == dense_content_signature(nullptr, 0),
+          "an empty sample signs consistently rather than trapping");
+
+    // WHY dense, ASSERTED rather than printed: at this buffer size the sparse whole-frame signature
+    // reads only a few hundred bytes and misses the same change. This was a printf, which made it an
+    // experiment that could not fail -- if the sparse signature ever became sensitive enough here the
+    // dense variant would have lost its justification and nobody would have been told. Now the day
+    // that changes, this goes red and someone removes dense_content_signature on purpose.
+    CHECK(frame_content_signature(a.data(), a.size(), 256, 144) ==
+              frame_content_signature(b.data(), b.size(), 256, 144),
+          "the sparse whole-frame signature MISSES it at this size -- which is why dense exists");
+
+    // And the publication accounting is the same as the pixel entry point's.
+    present_reset();
+    const uint64_t sig_a = dense_content_signature(a.data(), a.size());
+    const uint64_t sig_b = dense_content_signature(b.data(), b.size());
+    note_present_publication_signature(sig_a);
+    note_present_publication_signature(sig_a);
+    note_present_publication_signature(sig_b);
+    const PresentRateSnapshot s = present_rate_snapshot();
+    CHECK(s.published == 3, "three signatures published");
+    CHECK(s.distinct == 2, "the repeat is not distinct; the changed one is");
+    present_reset();
+}
+
 } // namespace
 
 int main() {
@@ -355,6 +399,7 @@ int main() {
     std::printf("== estimator accuracy ==\n");           interval_estimator_is_accurate();
     std::printf("== window arithmetic ==\n");            window_math();
     std::printf("== present-layer wiring ==\n");         present_layer_wiring();
+    std::printf("== dense signature (GPU path) ==\n"); dense_signature_pins_the_gpu_path();
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }
