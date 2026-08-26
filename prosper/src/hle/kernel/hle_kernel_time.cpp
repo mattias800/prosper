@@ -5,6 +5,8 @@
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
+#include "host/platform/precise_sleep.hpp"   // guest sleeps must not inherit the winpthreads tick (#3013)
+#include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS: which primitive a title paces on
 #include "host/image/runtime_module_load.hpp"   // #639: real runtime PRX loading
 #include "host/memory/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
 #include "hle/dispatch/callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
@@ -399,13 +401,55 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
     return 0;
 }
 
-// real sleeps so timed wait loops actually yield the CPU (and advance real time)
-HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
+// Real sleeps so timed wait loops actually yield the CPU (and advance real time).
+//
+// NOT nanosleep, and on Windows that is the whole point (#3013). MinGW's nanosleep is winpthreads',
+// whose timed waits resolve on the winpthreads master tick REGARDLESS of timeBeginPeriod -- measured
+// on this toolchain at 15.67 ms mean for a 5.33 ms request, unchanged (15.59 ms) with the process
+// timer resolution raised to 1 ms. A guest audio mixer pacing 256-frame grains at 48 kHz asks for
+// 5.33 ms and got 15.6 ms: it delivered one grain per tick instead of per grain, ~2.9x too slowly,
+// and every title underran continuously on Windows while Linux was clean.
+//
+// sleep_until_steady_ns uses CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, which is independent of the
+// process timer period: 5.64 ms mean / 5.99 ms worst for the same request on the same box. It also
+// takes an ABSOLUTE deadline, so the per-call overhead cannot compound across a pacing loop the way
+// a relative sleep's does.
+//
+// The deadline is computed BEFORE anything else in the body: it is the guest's schedule, and any
+// work done first would be silently added to the interval the guest asked for.
+static inline void guest_sleep_ns(uint64_t ns) {
+    // PROSPER_GUEST_SLEEP_LEGACY=1 restores the pre-#3013 nanosleep path. It exists ONLY so the A/B
+    // that established the fix stays reproducible -- the same reason PROSPER_UD_TAIL_ALIGN survives
+    // (CLAUDE.md). Measured with it on/off, The Messenger audio delivery against the 384,000 B/s that
+    // f32/2ch/48 kHz needs: 100.8% off (healthy) vs the legacy path. Do not set it to fix anything.
+    static const bool legacy = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
+    if (legacy) {
+        struct timespec ts{ (time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull) };
+        nanosleep(&ts, nullptr);
+        return;
+    }
+    const uint64_t deadline = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count() + ns;
+    prosper::host::sleep_until_steady_ns(deadline);
+}
+
+HLE(k_usleep)   { hle::WaitCensusScope c(hle::WaitKind::Usleep, a0 * 1000ull); guest_sleep_ns(a0 * 1000ull); return 0; }
+
 // POSIX sleep() returns the number of seconds LEFT unslept (0 on full completion), not the input.
 // Returning the input breaks the canonical resume idiom `while ((left = sleep(left))) ;` into an
 // infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
-HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
-HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
+HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 1000000000ull); guest_sleep_ns(a0 * 1000000000ull); return 0; }
+// The remainder out-parameter is written ZERO rather than left untouched: we always sleep the full
+// duration, and a guest that reads an uninitialised remainder would resume a wait it already served.
+HLE(k_nanosleep){
+    if (!a0) return 0;
+    const struct timespec* req = (const struct timespec*)P(a0);
+    const uint64_t want_ns = (uint64_t)req->tv_sec * 1000000000ull + (uint64_t)req->tv_nsec;
+    { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want_ns); guest_sleep_ns(want_ns); }
+    if (a1) { struct timespec* rem = (struct timespec*)P(a1); rem->tv_sec = 0; rem->tv_nsec = 0; }
+    return 0;
+}
+
 
 // --- select / pselect: the PURE-SLEEP shape only (#1660) --------------------------------------
 //

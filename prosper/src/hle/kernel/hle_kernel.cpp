@@ -19,6 +19,7 @@
 #include "host/image/exec_image.hpp"      // describe_code_address (host frame naming)
 #include "host/platform/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
 #include "hle/sync/pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
+#include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS (#3013)
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "gpu/execute/mb3_freelist.hpp"
@@ -1312,6 +1313,7 @@ HLE(k_cond_timedwait) {
     if (gts[0] < 0 || gts[1] < 0 || gts[1] >= 1'000'000'000ll) return 22;
     struct timespec dl { (time_t)gts[0], (long)gts[1] };
     const int32_t clock_id = guest_cond_snapshot(c).clock_id;
+    hle::WaitCensusScope census(hle::WaitKind::CondTimedwait, 0);
     int rc = interruptible_cond_clock_timedwait(
         c, m, dl, clock_id, nullptr, kGuestMutexCondWaitBookkeeping);
     return fbsd_errno(rc);   // host ETIMEDOUT (Linux 110) -> FreeBSD 60
@@ -2914,6 +2916,7 @@ static timespec abs_deadline_us(uint64_t usec) {
 HLE(k_mutex_timedlock) {
     auto* m = ensure_mutex(a0); if (!m) return prosper::hle::kSceKernelErrorEINVAL;
     if (guest_mutex_self_deadlock(m)) return prosper::hle::kSceKernelErrorEDEADLK;
+    hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock, a1 * 1000ull);
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_mutex_timedlock(m, &dl);
     if (rc == 0) guest_mutex_acquired(m);
@@ -3049,7 +3052,7 @@ HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog
 HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : fbsd_errno(errno); }   // EAGAIN (would block) is 11 here, 35 on the PS5
 // scePthreadSemTimedwait is the one member of the family with no POSIX spelling registered on its
 // body, so it encodes in place; the other six go through SCE_PTHREAD_ALIAS below (#2178).
-HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return prosper::hle::kSceKernelErrorEINVAL; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : sce_pthread_rc(fbsd_errno(errno)); }
+HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return prosper::hle::kSceKernelErrorEINVAL; hle::WaitCensusScope c(hle::WaitKind::SemTimedwait, a1 * 1000ull); timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : sce_pthread_rc(fbsd_errno(errno)); }
 HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 // Quarantined, not freed, and `sem_destroy` deferred to reclaim — a thread parked in `sem_wait` is
