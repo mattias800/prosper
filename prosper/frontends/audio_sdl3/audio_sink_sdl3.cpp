@@ -7,17 +7,31 @@
 #include "audio_sdl3.hpp"
 #include "hle/audio/audio.hpp"
 #include "host/platform/lifecycle.hpp"
+#include "host/platform/precise_sleep.hpp"   // the grain pacer must not quantize to the winpthreads tick (#3016)
 
 #include <SDL3/SDL.h>
 
 #include <array>
 #include <chrono>
+#include <cstdlib>   // getenv, for the opt-in gates below (transitive via libstdc++, not via libc++)
 #include <mutex>
 #include <thread>
 #include <string>
 
 namespace prosper {
 namespace {
+
+// Both off by default: reading the device queue at every handoff is cheap, but an instrument that
+// runs unasked is how a measurement pass ends up measuring itself (#2113).
+bool legacy_pacer() {
+    static const bool on = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
+    return on;
+}
+bool queue_trace() {
+    static const bool on = getenv("PROSPER_AUDIO_QUEUE_TRACE") != nullptr;
+    return on;
+}
+
 
 // 16 public sceAudioOut ports plus four host-only streams for concurrent AudioOut2 contexts.
 // SDL mixes the bound streams into the same playback device while each retains its own pacing
@@ -181,13 +195,61 @@ public:
                 s.put_failed = true;
             }
             s.dump.write(pcm, frames, s.channels, s.f32);
+            // PROSPER_AUDIO_QUEUE_TRACE=1: the device queue depth AT each grain handoff, reported
+            // as a per-second MINIMUM rather than a mean. A mean cannot see this defect -- #3016
+            // averaged 100% of real time while the queue emptied in every gap -- so the minimum is
+            // the whole point, together with the count of handoffs that found less than one grain
+            // buffered, which is the moment a real device would underrun.
+            if (queue_trace()) {
+                const int queued = SDL_GetAudioStreamQueued(s.stream);
+                if (queued >= 0) {
+                    if (s.q_min < 0 || queued < s.q_min) s.q_min = queued;
+                    if (queued > s.q_max) s.q_max = queued;
+                    if (s.grain_bytes > 0 && queued < s.grain_bytes) s.q_starved++;
+                    s.q_calls++;
+                    const auto now2 = std::chrono::steady_clock::now();
+                    if (s.q_last.time_since_epoch().count() == 0) s.q_last = now2;
+                    if (now2 - s.q_last >= std::chrono::seconds(1)) {
+                        SDL_Log("prosper-audio: port %d queue min=%d max=%d bytes (grain=%d) "
+                                "handoffs=%llu below-one-grain=%llu",
+                                port, s.q_min, s.q_max, s.grain_bytes,
+                                (unsigned long long)s.q_calls, (unsigned long long)s.q_starved);
+                        s.q_min = -1; s.q_max = 0; s.q_calls = 0; s.q_starved = 0; s.q_last = now2;
+                    }
+                }
+            }
+
         }
         // Pace the guest thread to real time. This sleep IS the Heaps unqueueBuffer signal
         // (#2978): by the time it returns, the previous grain has been consumed by the audio
         // device, giving Heaps the buffer-completion timing it needs to unqueue SFX buffers
         // instead of re-triggering them. The sleep must be outside the lock so other audio
         // operations (open/close/volume) can proceed while this grain plays.
-        if (freq > 0) std::this_thread::sleep_until(target);
+        if (freq > 0) {
+            // NOT std::this_thread::sleep_until (#3016). On Windows that resolves on the
+            // winpthreads master tick -- measured 15.6 ms for a 5.33 ms request, and unaffected by
+            // timeBeginPeriod -- while one 256-frame grain at 48 kHz IS 5.33 ms. Because `s.next`
+            // accumulates an ABSOLUTE target, an overshoot leaves the next few targets already in
+            // the past, so those calls returned instantly: delivery clumped into bursts of ~3
+            // grains every ~15.6 ms. The one-second AVERAGE stayed at ~100% of real time, which is
+            // why this hid from a delivery-rate check, while the device queue drained inside every
+            // gap -- continuous small underruns in every title, Windows only.
+            //
+            // sleep_until_steady_ns uses a high-resolution waitable timer, so the grain boundary is
+            // honoured and the pacing stays evenly spaced, which is the property the comment above
+            // this function has always depended on.
+            // PROSPER_GUEST_SLEEP_LEGACY=1 restores the pre-fix pacer so the A/B stays
+            // reproducible, the same way PROSPER_UD_TAIL_ALIGN does. Do not set it to fix anything.
+            if (legacy_pacer()) {
+                std::this_thread::sleep_until(target);
+            } else {
+                prosper::host::sleep_until_steady_ns(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        target.time_since_epoch()).count());
+            }
+
+        }
+
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
@@ -244,6 +306,11 @@ private:
                   std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
                   int channels = 2; bool f32 = false;               // dump format (#2981)
                   WavDump dump;                                     // PROSPER_AUDIO_DUMP_WAV
+                  // PROSPER_AUDIO_QUEUE_TRACE accounting, reset each reporting second (#3016).
+                  int q_min = -1, q_max = 0;
+                  unsigned long long q_calls = 0, q_starved = 0;
+                  std::chrono::steady_clock::time_point q_last{};
+
                   // A defaulted default ctor keeps slots_{} value-initialization off the
                   // copy-construct path, which WavDump's deleted copy would reject.
                   Slot() = default;
