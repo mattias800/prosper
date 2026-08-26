@@ -27,6 +27,25 @@ bool legacy_pacer() {
     static const bool on = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
     return on;
 }
+// PROSPER_AUDIO_QUEUE_TIMELINE[=<ms>]: sampling interval for the queue-level timeline, 0 = off.
+// Its OWN variable rather than folded into PROSPER_AUDIO_QUEUE_TRACE, which already means the
+// per-second min/max summary (#3016): the two differ by three orders of magnitude in output
+// volume -- roughly 1,000 lines per second per port here against one -- and overloading one
+// switch would make a cheap summary and a firehose indistinguishable at the call site.
+int queue_timeline_ms() {
+    static const int ms = [] {
+        const char* e = getenv("PROSPER_AUDIO_QUEUE_TIMELINE");
+        if (!e || !*e) return 0;
+        const int v = atoi(e);
+        return v > 0 ? v : 1;          // bare =1 (or any non-numeric) means the 1 ms default
+    }();
+    return ms;
+}
+
+bool audio_debug() {
+    static const bool on = getenv("PROSPER_AUDIO_DEBUG") != nullptr;
+    return on;
+}
 bool queue_trace() {
     static const bool on = getenv("PROSPER_AUDIO_QUEUE_TRACE") != nullptr;
     return on;
@@ -102,10 +121,16 @@ public:
             SDL_Log("prosper-audio: SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
             return false;
         }
+        start_queue_timeline();   // no-op unless PROSPER_AUDIO_QUEUE_TIMELINE is set
         return true;
     }
 
     void quit() {
+        // Stopped FIRST, before any stream is destroyed: the sampler reads slots_[i].stream
+        // under mx_, so a close() racing a live sampler would be a use-after-free the moment
+        // the sampler won the lock. Clearing the flag here means the loop observes it and
+        // exits at its next wake, and close() below takes the same mutex it does.
+        timeline_running_.store(false, std::memory_order_relaxed);
         for (auto& s : slots_) s.dump.finalize();
         for (int i = 0; i < kMaxPorts; i++) close(i + 1);
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -170,6 +195,23 @@ public:
             std::lock_guard<std::mutex> lk(mx_);
             Slot& s = slots_[port - 1];
             if (!s.stream) return;
+            // PROSPER_AUDIO_DEBUG=1: one line per guest grain delivery -- arrival gap, frame
+            // count and the queue level BEFORE the put. This is the emitter that
+            // tools/perf/audio_delivery_report.py consumes; that tool landed in #3034 without
+            // it, so until now master carried a parser with no producer and the tool could not
+            // be run at all (its self-test passes on synthetic records, so nothing went red).
+            // Recovered from #2984 e389440a, diagnostic half only -- that commit also changed
+            // the device open to fill-then-start, which is a behavioural change and belongs
+            // with the pacer decision on #3033, not with an instrument.
+            if (audio_debug()) {
+                const auto now = std::chrono::steady_clock::now();
+                const double gap = s.dbg_last.time_since_epoch().count() == 0
+                    ? 0.0
+                    : std::chrono::duration<double, std::milli>(now - s.dbg_last).count();
+                s.dbg_last = now;
+                SDL_Log("[audio-dbg] port=%d gap=%.2fms frames=%d queued_before=%d (grain=%d)",
+                        port, gap, frames, SDL_GetAudioStreamAvailable(s.stream), s.grain_bytes);
+            }
             freq = s.freq;
             if (freq > 0) {
                 // Pace EACH call one grain of wall-clock time apart (real sceAudioOutOutput blocks
@@ -252,6 +294,58 @@ public:
 
     }
 
+    // PROSPER_AUDIO_QUEUE_TIMELINE: a time-based sampler of every open port's queue level.
+    //
+    // This is the instrument #3016 records as the missing one. The per-second summary there
+    // samples AT each grain handoff, so a queue that drains to zero BETWEEN handoffs is
+    // invisible to it -- which is why `below-one-grain=0` appeared in both arms of that A/B and
+    // could not settle it. Sampling on a clock instead makes the drain slope, the refill bursts
+    // and the zero crossings all directly visible, so an underrun can be established without
+    // an ear in the room.
+    //
+    // Paced with host::sleep_until_steady_ns on an ABSOLUTE grid, and that is not incidental:
+    // as recovered from #2984 this loop used std::this_thread::sleep_for(1ms), which on Windows
+    // resolves on the winpthreads tick (#3013) -- so the '1 ms sampler' would have sampled at
+    // ~15.6 ms, coarser than the grain period it exists to resolve, while its own log said 1 ms.
+    // An instrument subject to the defect it measures is worse than no instrument. Absolute
+    // rather than relative so the interval cannot drift under load.
+    //
+    // Values are snapshotted under the lock and printed outside it: at 1 kHz, holding the audio
+    // mutex across an fprintf would put the sampler's own I/O into the path it is measuring.
+    void queue_timeline_loop(int interval_ms) {
+        const uint64_t interval_ns = (uint64_t)interval_ms * 1000000ull;
+        const auto     t0 = std::chrono::steady_clock::now();
+        uint64_t deadline = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                t0.time_since_epoch()).count();
+        struct Sample { int port; int avail; int grain; };
+        std::array<Sample, kMaxPorts> samples{};
+        while (timeline_running_.load(std::memory_order_relaxed)) {
+            int n = 0;
+            {
+                std::lock_guard<std::mutex> lk(mx_);
+                for (int i = 0; i < kMaxPorts; i++) {
+                    if (!slots_[i].stream) continue;
+                    samples[n++] = { i + 1, SDL_GetAudioStreamAvailable(slots_[i].stream),
+                                     slots_[i].grain_bytes };
+                }
+            }
+            const double t = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            for (int i = 0; i < n; i++)
+                SDL_Log("[audio-queue] t=%.3f port=%d avail=%d grain=%d",
+                        t, samples[i].port, samples[i].avail, samples[i].grain);
+            deadline += interval_ns;
+            prosper::host::sleep_until_steady_ns(deadline);
+        }
+    }
+
+    void start_queue_timeline() {
+        const int ms = queue_timeline_ms();
+        if (ms <= 0 || timeline_running_.exchange(true)) return;
+        std::thread(&Sdl3AudioSink::queue_timeline_loop, this, ms).detach();
+        SDL_Log("prosper-audio: queue-level timeline started at %d ms", ms);
+    }
+
     void set_volume(int port, uint32_t mask, const int* vols) override {
         if (port < 1 || port > kMaxPorts || !vols) return;
         // Approximate the PS5 per-channel volumes as a single stream gain (0..1) from the loudest set channel.
@@ -306,6 +400,14 @@ private:
                   std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
                   int channels = 2; bool f32 = false;               // dump format (#2981)
                   WavDump dump;                                     // PROSPER_AUDIO_DUMP_WAV
+                  // PROSPER_AUDIO_DEBUG: previous arrival, PER PORT. Deliberately not
+                  // thread_local, which is how this arrived from #2984: a title whose mixer
+                  // interleaves three threads onto one port records three independent gaps,
+                  // each ~3x the port's real arrival interval -- and audio_delivery_report.py
+                  // aggregates BY PORT, so its headline cadence would have been ~3x wrong on
+                  // exactly the title the instrument was built for. Guarded by mx_ like the
+                  // rest of the slot.
+                  std::chrono::steady_clock::time_point dbg_last{};
                   // PROSPER_AUDIO_QUEUE_TRACE accounting, reset each reporting second (#3016).
                   int q_min = -1, q_max = 0;
                   unsigned long long q_calls = 0, q_starved = 0;
@@ -317,6 +419,9 @@ private:
     };
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
+    // Set once when the timeline starts; cleared on quit() so the detached sampler exits rather
+    // than outliving the streams it reads.
+    std::atomic<bool> timeline_running_{false};
     bool paused_ = false;
     float gain_ = 1.0f;   // linear playback gain, applied via SDL_SetAudioStreamGain
 };
