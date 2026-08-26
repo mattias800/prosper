@@ -414,12 +414,18 @@ inline bool backend_storage_image_numeric_contract_valid(const FrameResource& re
 // The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
 // historical implicit byte-span behavior; a 2D_MSAA plane array must prove all four complete R32F
 // planes are readable before any Vulkan object or memcpy is attempted.
-// Vulkan guarantees `maxImageArrayLayers >= 2048`; a guest T# can declare up to 8192. Since this
-// predicate has no device handle, it bounds against the guaranteed minimum rather than the actual
-// limit, so a resource it admits is creatable on every conformant device. Anything above is
-// rejected fail-visibly here instead of reaching vkCreateImage, whose result the upload path does
-// not check (pre-existing, all image creation, filed separately) -- an over-large arrayLayers would
-// otherwise yield VK_NULL_HANDLE and be passed straight to vkGetImageMemoryRequirements.
+// A pragmatic ceiling, NOT a portability guarantee -- an earlier revision of this comment claimed
+// 2048 was "Vulkan's guaranteed minimum for maxImageArrayLayers" and that is wrong. The Core
+// Required Limits table gives **256**; 2048 is the Roadmap 2022 / Vulkan 1.4 figure, and this
+// backend requests VK_API_VERSION_1_1 (see vkCreateInstance below), so the guarantee that actually
+// applies here is 256. This box's RADV reports 8192.
+//
+// So what this bound does is keep an absurd layer count away from vkCreateImage, whose result the
+// upload path discards (#3045) -- an over-large arrayLayers yields VK_NULL_HANDLE and is passed
+// straight to vkGetImageMemoryRequirements. It does NOT prove creatability on an arbitrary device;
+// a device reporting the Core minimum of 256 can still reject a 512-layer image, and it will do so
+// through that same unchecked path until #3045 lands. Querying the real limit is the correct fix
+// and belongs with #3045, since this predicate has no device handle.
 inline constexpr uint32_t kBackendMaxArrayLayers = 2048u;
 
 // A guest 2D_ARRAY is the same shape as the MSAA plane array with a different provenance: N

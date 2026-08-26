@@ -95,24 +95,33 @@ Two further details cost time and are worth keeping:
 
 ## Ruled out
 
+> The `PROSPER_*` probes cited below are **not on master**. They live on the unmerged WIP branch
+> `wip/issue-325-texture-arrays` (`e1b0fbb2` and later), which exists so these measurements stay
+> reproducible. Check that branch out before trying to re-run one.
+
 - **"Memory pressure is why 256 decoded layers fail" — false.** A `PROSPER_ARRAY_MAX_LAYERS` bisect
   over an early array upload rendered at 1 layer and failed identically at **4, 16 and 64**. Four
   layers is trivially small, so the failure was structural, not a working-set problem. The actual
   cause was `backend_texture_plane_span_valid`, which admitted `sample_count > 1` only for the
   four-plane R32_SFLOAT guest-MSAA shape and rejected everything else (#3043).
 - **"The world samples its array with a non-array instruction, so it always reads slice 0" — false.**
-  A full `PROSPER_MIMGCENSUS` census over a gameplay route — the whole population, not a sample —
-  found **every** MIMG touching an array texture uses `DIM=5`: op `0x2f` on bindings 39-46 at depth 1
-  (64 events), and op `0x20` on bindings 34/36/47 at depth 256 (16 events). There is no DIM≠5 case
-  to explain the flat world (#2998).
+  A full census over a gameplay route — the whole population, not a sample — found **every** MIMG
+  touching an array texture uses `DIM=5`: op `0x2f` on bindings 39-46 at depth 1 (64 events), and
+  op `0x20` on bindings 34/36/47 (20 events, of which 12 are at depth 256; binding 34's four span
+  depths 1/29/32/256). The census is not circular: it selects on the resource's `img_dim` and
+  reports the *instruction's* `mimg_dim`, which are independent fields. There is no DIM≠5 case to
+  explain the flat world (#2998).
 - **The decoded slices are not duplicates of slice 0.** Per-layer checksums (`PROSPER_ARRAYTEX`) give
   13 distinct hashes for one array binding and 8 for another, so the decoder does not replicate the
   base slice (#2998).
-- **Forcing the array layer to a constant changes nothing, and the probe proves it fired.**
-  `PROSPER_FORCE_LAYER=200` substitutes a constant layer *and prints when it does*; it fired on all
-  four array bindings and the gameplay frame was unchanged — identical average- and difference-hash,
-  luma differing in one byte of 288. So the layer coordinate was never the variable; the resource was
-  being uploaded with one layer (#2998).
+- **Forcing the array layer to a constant changes nothing for the plain-SAMPLE path.** A probe
+  substituting a constant layer *and printing when it does* fired on the four bindings reached by op
+  `0x20`, and the gameplay frame was unchanged — identical average- and difference-hash, luma
+  differing in one byte of 288. **Scope, because the first version of this line overstated it:** the
+  probe sits in the implicit-LOD array sampler only, so it covers the `0x20` events and
+  *structurally cannot* cover the 64 `SAMPLE_C_LZ` (`0x2f`) events, which take a different lowering.
+  Within that scope the layer coordinate was not the variable; the resource was uploaded with one
+  layer (#2998).
 - **Binding numbers are not texture identities.** A binding is a per-shader descriptor slot, and the
   decoded-texture cache keys by guest address — so "binding 36 never reaches the array decode gate"
   does not mean its texture is never decoded there. It is decoded once under whatever slot referenced

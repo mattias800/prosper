@@ -1106,11 +1106,12 @@ int main() {
     }
 
     // #325: a guest 2D_ARRAY rides the same `sample_count` layer channel as the MSAA plane array.
-    // Before this, the span predicate admitted sample_count > 1 ONLY for the four-plane R32F MSAA
-    // shape, so every graphics array texture was rejected at the backend boundary and fell back to
-    // its base slice -- which is why Tomb Raider I-III Remastered, whose whole world is textured
-    // from one 256-slice array, rendered flat. The arms below are chosen to fail if the bounds
-    // arithmetic is dropped rather than merely to agree with the implementation.
+    // The span predicate admitted sample_count > 1 ONLY for the four-plane R32F MSAA shape, so it
+    // is what a frontend publishing a layer count would run into first. It was NOT what made
+    // Tomb Raider I-III Remastered render flat: every graphics array arrives with sample_count == 1
+    // today and passes at the `== 1u` fast path, so nothing is being rejected here yet. The arms
+    // below are chosen to fail if the bounds arithmetic is dropped rather than merely to agree with
+    // the implementation.
     {
         const uint32_t LW = 4, LH = 4, LAYERS = 8;
         std::vector<uint8_t> layer_bytes(static_cast<size_t>(LW) * LH * 4u * LAYERS, 0x40);
@@ -1145,10 +1146,11 @@ int main() {
               "2D_ARRAY span scales with the format's bytes per texel, not a fixed 4");
 
         // An unbounded layer count reaches vkCreateImage, whose result the upload path does not
-        // check -- so a guest T# declaring more layers than any conformant device allows would
-        // produce VK_NULL_HANDLE and be handed to vkGetImageMemoryRequirements. Guest arrays reach
-        // 8192; Vulkan guarantees only 2048. A 4x4 RGBA8 array of 8192 layers is 512 KiB, so the
-        // span check alone does NOT bound this in practice -- which is why the arm exists.
+        // check -- so an absurd arrayLayers produces VK_NULL_HANDLE and is handed to
+        // vkGetImageMemoryRequirements (#3045). A 4x4 RGBA8 array of 8192 layers is only 512 KiB,
+        // so the span check alone does NOT bound this in practice -- which is why the arm exists.
+        // kBackendMaxArrayLayers is a pragmatic ceiling, not a portability guarantee: Vulkan Core
+        // requires only 256 and this backend requests 1.1.
         {
             const uint32_t huge = prosper::test::kBackendMaxArrayLayers + 1u;
             std::vector<uint8_t> huge_bytes(static_cast<size_t>(LW) * LH * 4u * huge, 0x40);
@@ -1157,7 +1159,7 @@ int main() {
             too_many.tex_byte_size = huge_bytes.size();
             too_many.sample_count = huge;
             CHECK(!prosper::test::backend_texture_plane_span_valid(too_many),
-                  "a layer count above the guaranteed device maximum is rejected even when its "
+                  "a layer count above the backend's array-layer ceiling is rejected even when its "
                   "span is complete");
             prosper::test::FrameResource at_limit = arr;
             at_limit.sample_count = prosper::test::kBackendMaxArrayLayers;
@@ -1166,7 +1168,7 @@ int main() {
             std::vector<uint8_t> limit_bytes(at_limit.tex_byte_size, 0x40);
             at_limit.tex_rgba = limit_bytes.data();
             CHECK(prosper::test::backend_texture_plane_span_valid(at_limit),
-                  "exactly the guaranteed device maximum is still accepted");
+                  "exactly the backend's array-layer ceiling is still accepted");
         }
 
         prosper::test::FrameResource volume = arr;
