@@ -7,6 +7,23 @@
 # Route shape, and why each step exists (every claim below is measured, see
 # docs/SONIC_FRONTIERS_STATUS.md):
 #
+# THIS ROUTE REQUIRES AN EMPTY SAVE ROOT. It is not optional and it fails silently.
+#
+#     PROSPER_SAVE0=$(mktemp -d) PROSPER_PAD_SCRIPT=@<this file> ...
+#
+# The twelve confirms below assume a TWELVE-page boot notice queue, which is what a first boot
+# shows. With a save present (`savedata0/PPSA03831/` -- `option` is enough) the queue is shorter,
+# so the surplus confirms fall through to the main menu and ACTIVATE the entry under the cursor.
+# That entry is "Extras", and every later input then navigates inside the Extras submenu. Measured
+# 2026-08-27: a run with a save present sits in Extras for its whole length -- 24/24 frames with
+# content, `pixel-distinct=24`, guest healthy -- and never reaches the stage. It looks exactly like
+# an input or render wall and costs a full run to diagnose (#2790).
+#
+# Budget: this title runs ~1.5-2.8 flips/s on a live 4K renderer arm, so f2900 (GameModeStage) is
+# 17-31 MINUTES of wall clock, and the rate varies enough between runs that a fixed timeout will
+# sometimes miss the stage. `--render-every` does not help: the title is logic-bound, not
+# render-bound (2.84 -> 4.27 flips/s at `--render-every 6`).
+#
 #   f1100-f1540   Twelve confirms, 40 flips apart, clear the twelve-page boot notice queue
 #                 ("Extras", "Update notification", "Game update", "Update Details", "Update",
 #                 "Additional options", "Action Marks", "New Game+", ...). The queue advances one
