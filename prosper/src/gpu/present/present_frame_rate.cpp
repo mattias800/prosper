@@ -239,6 +239,32 @@ void note_present_publication(const uint8_t* pixels, size_t bytes, uint32_t widt
     g_rate.observe(signature, at);
 }
 
+uint64_t dense_content_signature(const uint8_t* pixels, size_t bytes) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    mix(h, static_cast<uint64_t>(bytes));
+    if (!pixels || bytes == 0) return h;
+    // Every 8-byte word, then the unaligned tail. The buffer is small by construction (the caller
+    // owns the sample grid), so there is nothing to gain by skipping any of it.
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= bytes; i += sizeof(uint64_t)) {
+        uint64_t word = 0;
+        std::memcpy(&word, pixels + i, sizeof word);
+        mix(h, word);
+    }
+    if (i < bytes) {
+        uint64_t tail = 0;
+        std::memcpy(&tail, pixels + i, bytes - i);
+        mix(h, tail);
+    }
+    return h;
+}
+
+void note_present_publication_signature(uint64_t signature) {
+    const double at = now_seconds();
+    std::lock_guard<std::mutex> lk(g_rate_mx);
+    g_rate.observe(signature, at);
+}
+
 void reset_present_rate() {
     std::lock_guard<std::mutex> lk(g_rate_mx);
     g_rate.reset();
