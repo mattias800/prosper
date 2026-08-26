@@ -343,6 +343,38 @@ bool frame_rate_is_mostly_unchanged(const FrameRate& rate,
 // state, so it must not lengthen that critical section.
 void note_present_publication(const uint8_t* pixels, size_t bytes, uint32_t width, uint32_t height);
 
+// The GPU present path (#1270) has no CPU pixels: prosper-app blits the renderer's front-buffer image
+// straight to the swapchain and the renderer skips the CPU readback entirely (live_renderer.cpp), so
+// note_present_publication above is never reached and this counter stayed unfed for the whole life of
+// every interactive boot -- the HUD read "no frames published yet" while thousands of frames were on
+// screen (#3010). That path feeds these two instead: it samples the presented image into a small
+// host-visible buffer on the GPU, signs the sample DENSELY, and publishes the signature.
+//
+// Dense, not sampled, and the distinction is the point. frame_content_signature reads 16 bytes per
+// 4 KiB block, which is the right ratio for a multi-megabyte frame but would reduce a 256x144 sample
+// to ~144 sampled pixels -- weak enough to call a changing picture frozen. Signing every byte of a
+// deliberately small point-sampled image keeps the sensitivity in ONE place (the sample grid) instead
+// of multiplying two lossy stages together.
+//
+// The resulting distinct rate remains a LOWER bound on the true rate of new frames, for the same
+// reason the CPU path's is: a change confined to pixels the grid misses is invisible to it. The grid
+// is 36,864 points against the CPU path's ~8,100 sampled pixels at 1080p, so it is a tighter bound
+// than the path it stands in for -- but it is still a bound, and must not be read as an exact count.
+//
+// One asymmetry to know about: these two entry points sign in DIFFERENT spaces (a dense 256x144
+// sample here, a sparse whole-frame hash there), so a run that alternates between them -- GPU
+// present with occasional publish misses falling back to the CPU path -- records a distinct frame at
+// every crossing even when the picture did not change. Misses are rare enough that this does not
+// move a rate in practice, but it means the distinct count is not a strict lower bound on a MIXED
+// run the way it is on either path alone.
+
+uint64_t dense_content_signature(const uint8_t* pixels, size_t bytes);
+
+// Publish a signature computed by the caller. Same accounting as note_present_publication -- one
+// publication, distinct if the signature differs from the immediately preceding one.
+void note_present_publication_signature(uint64_t signature);
+
+
 // Cleared by present_reset(), so a test that resets the present layer resets the rate with it.
 void reset_present_rate();
 
