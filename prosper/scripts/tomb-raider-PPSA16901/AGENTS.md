@@ -29,9 +29,19 @@ Two independent axes, which is what makes this menu easy to misread:
   Left and right traverse it in opposite directions; `Lara's Home` is the item selected on arrival.
 - **Cross selects the ring item.**
 
-**There is no New Game or Load Game item on that ring**, which is why `reach-gameplay.pad` enters
-the world through `Lara's Home` (Croft Manor, a real playable level) rather than through a new-game
-flow. Whether the missing passport item is a prosper defect is open — see the status doc.
+**The item labelled `Game` IS the New Game entry** — not a settings category. An earlier version of
+this file said the ring carried no New Game item; that was wrong, and it was wrong in the expensive
+direction, because it sent a lane looking for a missing passport item that is not missing. Three
+LEFTs from the default `Lara's Home` reach it, and Cross starts a new game with its opening cutscene.
+`reach-fmv.pad` does exactly that.
+
+`reach-gameplay.pad` still enters through `Lara's Home` because that reaches a playable level in a
+few seconds with no cutscene to sit through — a route choice, not a limitation.
+
+**The cutscenes are the title's own Theora files and the guest decodes them itself**: a run of
+`reach-fmv.pad` logs zero AvPlayer and zero videodec activity. Their pacing is therefore the game's
+clock, not prosper's video backend, so a timing defect seen in a cutscene is not an AvPlayer bug.
+Ground truth for timing work is in the dump — `ffprobe` the FMV and count its packets.
 
 ## Timing
 
