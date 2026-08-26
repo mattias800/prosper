@@ -1960,6 +1960,14 @@ HLE(audio2_ctx_push) {
             }
             wait_duration = std::chrono::nanoseconds(
                 (long long)(context->grain ? context->grain : 256) * 1000000000LL / 48000);
+            {   // TEMP #2993: queue-state visibility during the pacing loop
+                static std::atomic<uint32_t> n{0};
+                if (n.fetch_add(1) % 200 == 0)
+                    fprintf(stderr, "[a2-push] t=%llu ctx_slot=%u queued=%u depth=%u grain=%u\n",
+                            (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count() % 1000000,
+                            context_slot, context->queued, context->queue_depth, context->grain);
+            }
         }
         if (!a1) {
             if (audio_flow()) {

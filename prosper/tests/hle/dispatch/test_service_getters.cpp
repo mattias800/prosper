@@ -1311,7 +1311,7 @@ int main() {
         }
 
         if (HleFn entitlement = Hle::lookup("xddD23+8TfQ")) {
-            uint8_t info[32]; memset(info, 0xAB, sizeof info);
+            alignas(8) uint8_t info[8196]; memset(info, 0xAB, sizeof info);
             CHECK(entitlement(0, (uint64_t)(uintptr_t)"DEADCELLSBASESEED",
                               (uint64_t)(uintptr_t)info, 0, 0, 0) != 0,
                   "unknown addcont entitlement fails cleanly while signed out");
@@ -1358,8 +1358,17 @@ int main() {
                                          (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) ==
                       0x80553807ull && value[0] == 0,
                   "no-intent property lookup reports VALUE_NOT_FOUND with an empty output");
+            // The first poll delivers the system OnResume event (the app becoming active):
+            // the full struct is written zeroed with only the type set, and the stream then
+            // goes idle (#2993 — GRIS's Wwise resumes its audio engine on this event).
+            // The OnResume delivery writes the full 8196-byte SceSystemServiceEvent
+            // (4-byte type + zeroed union) — the buffer must be the real contract size.
+            CHECK(system_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0 &&
+                  *(uint32_t*)info == 0x10000000u &&
+                  info[4] == 0 && info[8195] == 0 && info[8196] == 0xAB,
+                  "the first poll delivers the system OnResume event (zeroed 8196-byte struct, tail untouched)");
             CHECK(system_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0x80A10004ull,
-                  "no host activity leaves the system event stream idle");
+                  "after OnResume the system event stream is idle");
             CHECK(game_intent_term(0, 0, 0, 0, 0, 0) == 0,
                   "sceNpGameIntentTerminate succeeds");
 

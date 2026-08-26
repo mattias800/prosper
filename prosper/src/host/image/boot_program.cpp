@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <set>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 // Optional diagnostics (zero-cost when disabled — stubs inline to no-ops).
@@ -328,6 +330,19 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
            "%zu aliased exports\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(),
            p.init_fns.size(), p.aliased_exports.size());
+
+    // Optional boot delay BEFORE the title's init fns and entry run. Real hardware's boot is
+    // slower than prosper's, and some titles race their own subsystem init against device
+    // readiness — GRIS's Wwise engine, for example, samples the audio-output state during init
+    // and starts SUSPENDED if the host audio path hasn't settled yet, silencing the title music
+    // (#2993). Default 0 (no delay); PROSPER_BOOT_DELAY_MS=<ms> for timing-sensitive boots.
+    if (const char* d = getenv("PROSPER_BOOT_DELAY_MS")) {
+        const unsigned long ms = strtoul(d, nullptr, 10);
+        if (ms) {
+            printf("[boot] delaying guest start by %lu ms (PROSPER_BOOT_DELAY_MS)\n", ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    }
 
     // Diagnostics: linking complete.
     diagnostics::record_boot_phase(diagnostics::BootPhase::LINKING);
