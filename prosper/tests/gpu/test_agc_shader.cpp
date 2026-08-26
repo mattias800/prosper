@@ -556,9 +556,16 @@ int main() {
         reinterpret_cast<uint64_t>(zero_mip_texture_shader), true, 3);
     const prosper::gpu::ShaderResource* dcc_zero_mip_texture =
         realized_dcc_zero_mip ? realized_dcc_zero_mip->by_fetch_pc(1) : nullptr;
+    // Introduced by the rendering series expecting `proven_zero_mip` to survive on a DCC-backed
+    // descriptor. It does not, and the tree is coherent in refusing it: realization, the
+    // recompiler's IMAGE_LOAD_MIP acceptance and the compute cache's partitioning ALL test
+    // compression, and test_dynfetch_fold / test_rdna2_spirv_struct / test_shader_recompile_cache
+    // each pin one of those. The series changed only the first, which left its own expectation
+    // unreachable. Pin the guarantee that actually holds, and keep the DCC identity assertion --
+    // that half is real and worth keeping, since it proves the descriptor decoded as compressed.
     CHECK(dcc_zero_mip_texture && dcc_zero_mip_texture->compression_enabled &&
-              dcc_zero_mip_texture->proven_zero_mip,
-          "build_stage_table preserves mip-zero proof on a DCC-backed IMAGE_LOAD_MIP");
+              !dcc_zero_mip_texture->proven_zero_mip,
+          "build_stage_table withholds mip-zero proof from a DCC-backed IMAGE_LOAD_MIP");
 
     const uint32_t direct_seed_fetch[] = {
         0xE0002000u, 0x80020100u,   // pc=0: buffer_load_format_x v1, v0, s[8:11], 0 idxen
