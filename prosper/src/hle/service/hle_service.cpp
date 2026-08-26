@@ -2411,12 +2411,6 @@ HLE(s_avp_jumptotime) {
 // BLOCKING media-clock gate: hold the caller until the frame's PTS is due. The real AvPlayer
 // delivers a frame when its PTS reaches the media clock; this guest sleeps its whole poll budget
 // when a call returns "no frame yet", so a non-blocking refusal collapsed playback to ~1 frame
-// per sleep (measured 0.4-1.2 fps, #2981 FMV). Releases g_avp_mx in 8 ms steps and aborts the
-// wait on stop/pause/seek/destroy; caps the wait at 5 s so a broken anchor can never hang the
-// guest's video thread for the whole movie.
-// BLOCKING media-clock gate: hold the caller until the frame's PTS is due. The real AvPlayer
-// delivers a frame when its PTS reaches the media clock; this guest sleeps its whole poll budget
-// when a call returns "no frame yet", so a non-blocking refusal collapsed playback to ~1 frame
 // per sleep (measured 0.4-1.2 fps, #2981 FMV). g_avp_mx is HELD by the caller for the whole
 // wait — deliberate: no player state (stop/pause/seek/destroy) can change mid-wait, so the
 // only exit is due time; the 5 s cap keeps a broken anchor from hanging the video thread.
@@ -2460,6 +2454,7 @@ HLE(s_avp_getvideodata) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
+        log_backend = p.backend; log_backend_id = p.backend_id;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             // Media-clock gate, same as GetVideoDataEx above (#2981 FMV speed).
@@ -2526,6 +2521,7 @@ HLE(s_avp_getvideodataex) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
+        log_backend = p.backend; log_backend_id = p.backend_id;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             // Media-clock gate: the real AvPlayer owns the clock and refuses frames whose PTS is
