@@ -13,6 +13,109 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## What the rendering series changed, and what it teaches (2026-08-26)
+
+A nine-commit series lands the mechanisms below. Recorded here as *mechanisms*, because most of them
+are not GTA V facts at all — they are contracts prosper was getting wrong that this title happened to
+exercise hardest, and several map onto open issues for other reasons.
+
+### The core rendering defect: two descriptors at one address were two images
+
+**GTA V's 4K output shader writes the four 8x8 quadrants of each 16x16 block through FOUR bindings at
+the same guest address.** Captures materialize each descriptor's bytes into an independently-owned
+blob, so pointer equality is not a backing identity — and prosper treated the four reconstructed blobs
+as four separate images. **Three of the four stores were therefore lost**, leaving the red/green
+checker pattern in Performance mode. Two exact image descriptors naming the same non-null guest range
+must alias **one** Vulkan image.
+
+This is the single change most directly responsible for the world appearing, and it is worth reading
+as a general lesson: *reconstructed* bytes lose the aliasing that the guest expressed through
+addresses, so identity has to be re-established explicitly rather than inherited from the capture.
+
+### Typed storage aliases: the guest writes integers and samples them as something else
+
+GTA V writes full-resolution transition surfaces through **integer storage images** and then samples
+the *same bits* through normalized, Float32 or packed views. Geometry and allocation are identical;
+only the view's numeric interpretation differs. The series creates exactly those storage allocations
+**mutable** and leases the consumer's view without a copy. Admitted pairs, deliberately narrow:
+
+| producer | consumer | note |
+| --- | --- | --- |
+| `R32_UINT` | `R32_SFLOAT` | a depth-like transition surface; exact equal-width copy |
+| `Uint8` / `Uint16` storage | UNORM sampled | integer texels sampled as normalized values |
+| `R32_UINT` (carrier) | `B10G11R11` | packed R11G11B10; storage stays `R32_UINT` so driver float rounding cannot alter the bits |
+| `R10G10B10A2` (GFX10 format 50) | Vulkan `A2B10G10R10` | same low-to-high bit placement; detile + byte copy |
+
+**Not generalized** to signed, sRGB, component-count or size aliases — the series is explicit that this
+is an allowlist, not a relaxed key, and that is the right shape.
+
+Note the Fidelity bug in that table: the packed sampled path **fell through the generic
+per-component-width test**, because packed formats deliberately report zero width there, and the whole
+dispatch was skipped. A zero-width probe silently meaning "unsupported" is a trap worth remembering.
+
+### Two open issues this addresses directly
+
+- **#2723** — every shadow input refused by the DS bridge, cubes gated on `img_dim != 1`. The series
+  adds the explicit shape alias: a compute `U#` writes the six `R16_UINT` shadow faces through
+  `DIM=2D_ARRAY`, while the later graphics `T#` names the byte-identical allocation as `DIM=CUBE`, and
+  graphics lowers cube sampling to a vertical 2D stack.
+- **#2402** — the YUV composite draw skipped on NVIDIA because its fragment shader requires subgroup
+  size 64 on a 32-wide device. The series runs Wave64 fragment programs at native Wave32 **for this
+  title only**, and only for the narrow class whose sole remaining width reason is a control-flow
+  `WaveAny`; ballots, lane identity and scalar reductions stay exact, and every other title keeps
+  master's fail-visible exact-width contract.
+
+### Wave-vote exactness — and what it means for the hang investigation
+
+The series models the guest Wave64 **exactly** on a host subgroup that is not 64 wide, through
+`guest_wave_readlane` with an LDS-scratch path when the guest wave does not fit the host subgroup, and
+adds `V_READLANE_B32` / `V_WRITELANE` support. One added comment names a specific defect: a MAC between
+a uniform compare and `VCCZ` **created a false Wave64 vote**.
+
+That is the same area this file's own analysis pointed at. The recorded frontier reading was that
+`0x413dc6700`'s only loop exit is `v_cmpx` → EXEC → `s_cbranch_execz`, that the emitted module votes
+workgroup-wide where the guest votes per-wave, and that the dispatcher ran ~117x past what the data
+could justify (#2858). A false wave vote is exactly a defect of that shape. **This is corroboration of
+the direction, not proof of the mechanism** — nothing here has yet shown that this specific correction
+is what stops that dispatch running away, and #2858's per-ordinal histogram would still be what
+settles it.
+
+### Platform contracts worth knowing outside this title
+
+- **Windows cannot page-protect guest mappings for dirty tracking.** A VEH frame is built below the
+  interrupted SysV RSP and would corrupt the guest's live red zone. The series keeps one exact
+  guest-format mirror for exportable compute results instead, with `memcmp` validation so direct CPU
+  writes still fail closed. Linux keeps the ordered journal plus page-protection write watch; the
+  mirror must never launder a *known* architectural writer whose bytes happen to compare equal.
+- **Driver pipeline caches are not safe to load by default.** Repeated GTA V runs on NVIDIA reproduced
+  an `nvoglv64.dll` crash **only** on the cache-load route. UUID/header validation proves device
+  compatibility, not blob robustness, so persistence is opt-in. The version-one header prefix is
+  parsed field by field rather than cast, so short or unaligned files are rejected before any read,
+  and a driver rejection is treated as a cache miss rather than a reason to disable compute.
+- **Disabling driver optimization for large modules is a false economy.** It reduced cold compile
+  latency on NVIDIA but turned GTA V's repeated 1440p dispatches from ~1.7 ms into **47-50 ms**.
+  Optimization is on by default for large portable-CFG modules; the opt-out remains for investigations
+  where bounded first-use latency matters more than steady state.
+- **Win32 surfaces can transiently publish `currentExtent = 0x0`** during a minimize/fullscreen/DPI
+  transition even after SDL reports a non-zero pixel size. That is an unavailable surface, not a fatal
+  swapchain failure — keep the old swapchain and retry.
+
+### What is NOT established
+
+- **The validation is Windows/NVIDIA, on a route this repository does not contain.** The compute-skip
+  section below cites `scripts/gta5/reach-story-mode-static.pad` and `PROSPER_WAVE64_APPROX`; **neither
+  exists in this tree**. So its 25/25-sample result cannot be reproduced here as written, and the
+  Linux/RADV behaviour of this series is **unmeasured**.
+- **Six tests that pass on master fail with the series applied** — `dynfetch_fold`,
+  `indirect_pointer_static_footprint`, `indirect_pointer_descriptor_range`, `gpu_capture_render_replay`,
+  `rdna2_to_spirv_exec`, `gpu_execute`. Measured against an unpatched-master control on the same
+  machine (302/302 vs 296/302). Four are not referenced by the series, so they are existing assertions
+  the new behaviour breaks, and each needs triage before merge.
+- **`live_target_format.hpp` calls itself "the one place a LiveTargetPixelFormat is mapped onto
+  anything else." It is not** — `tools/gpu_replay/gpu_replay.cpp` maps it a second time, and extending
+  the enum from three values to ten left that switch behind. `-Werror=switch` (#2844) caught it; a
+  fall-through would have inspected every R8/R32/Rg8/Rgba32/Rg16/R16 target as 8-bit RGBA.
+
 ## The Windows Performance route does not require a compute skip (2026-08-26)
 
 The routed native-4K Performance-mode scene now completes with
