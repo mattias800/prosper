@@ -1344,7 +1344,7 @@ struct AvpPlayer {
     // that stops polling (title screen) resumes where it stopped instead of fast-forwarding
     // through the gap, and Pause/Resume/JumpToTime need no special cases (see
     // s_avp_getvideodataex, #2981 FMV speed).
-    uint64_t gate_pts_ms = 0;
+    uint64_t gate_media_ms = 0;
     std::chrono::steady_clock::time_point gate_wall = std::chrono::steady_clock::now();
     bool gate_started = false;
     // When the title supplies its AvPlayer texture allocator, decoded NV12 must be written into those
@@ -1562,6 +1562,13 @@ uint64_t avp_synth_duration_ms() {
     return value ? strtoull(value, nullptr, 0) : avp_synth_frames() * 33;
 }
 bool avp_log() { static const bool enabled = getenv("PROSPER_AVPLOG") != nullptr; return enabled; }
+// One shared monotonic timeline for every [avp] log line — per-site static t0s made cross-
+// referencing deliveries against each other guesswork (#2981 FMV measurement).
+uint64_t avp_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
 // PROSPER_AVP_PAUSED_DELIVER — a PRESERVED FALSIFICATION LEVER, NOT A FEATURE, AND NOT A FIX.
 // It MUST stay off by default; do not "enable" it and do not promote it into the paused contract.
 //
@@ -2193,8 +2200,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                 p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
                 p.paused = false; p.stop_fired = false; p.seek_deliver = false;
                 p.video_request_at = std::chrono::steady_clock::now();
-            p.gate_pts_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
-                p.gate_pts_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
+                p.gate_media_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
                 p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
                 p.backend = nullptr; p.backend_id = -1;
                 // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
@@ -2238,7 +2244,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false;
             p.stop_fired = false; p.seek_deliver = false;
             p.video_request_at = std::chrono::steady_clock::now();
-            p.gate_pts_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
+            p.gate_media_ms = 0; p.gate_wall = p.video_request_at; p.gate_started = false;
             p.texture_frames = std::move(textures);
             p.texture_frame_bytes = texture_bytes;
             p.next_texture_frame = 0;
@@ -2417,27 +2423,37 @@ HLE(s_avp_getvideodata) {
         if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
-        if (p.gate_started) {
+        {
             const auto now = std::chrono::steady_clock::now();
-            if (now - p.gate_wall > std::chrono::milliseconds(1000))
+            // Tick the media clock between polls; a gap longer than 200 ms pauses it (title
+            // screens, stream transitions) — shorter ones are decode jitter and count as media
+            // time, matching a player that plays autonomously between polls.
+            if (p.gate_started) {
+                if (now - p.gate_wall > std::chrono::milliseconds(200))
+                    p.gate_wall = now;
+                else {
+                    p.gate_media_ms +=
+                        (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - p.gate_wall).count();
+                    p.gate_wall = now;
+                }
+            } else {
                 p.gate_wall = now;
+            }
         }
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             // Media-clock gate, same as GetVideoDataEx above (#2981 FMV speed).
-            bool have = b->peek_video(p.backend_id, vf);
-            if (have && !p.seek_deliver) {
-                const uint64_t pts_ms = vf.pts_us / 1000;
-                const uint64_t due_ms = p.gate_started
-                    ? p.gate_pts_ms + (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - p.gate_wall).count()
-                    : 0;
-                if (pts_ms > due_ms) have = false;
+            const bool gated = p.gate_started && b->can_peek_video();
+            bool have = gated ? b->peek_video(p.backend_id, vf) : true;
+            if (have && gated && !p.seek_deliver) {
+                if (vf.pts_us / 1000 > p.gate_media_ms) have = false;   // not due; re-poll
             }
             if (have && b->next_video(p.backend_id, vf)) {
-                p.gate_pts_ms = vf.pts_us / 1000;
-                p.gate_wall = std::chrono::steady_clock::now();
-                p.gate_started = true;
+                if (!p.gate_started) {
+                    p.gate_media_ms = vf.pts_us / 1000;   // anchor at the first frame's PTS
+                    p.gate_started = true;
+                }
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
                 if (avp_stage_video(p, vf, false, staged, pitch)) {
@@ -2478,6 +2494,7 @@ HLE(s_avp_getvideodataex) {
     svc_log("sceAvPlayerGetVideoDataEx", a0,a1,a2,a3,a4,a5);
     auto* fi = (AvpFrameInfoEx*)PW(a1); if (!fi) return 0;
     void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t result = 0;
+    uint64_t media_snapshot = UINT64_MAX;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
@@ -2492,10 +2509,23 @@ HLE(s_avp_getvideodataex) {
         // this shifts the gate's anchor so the movie RESUMES where delivery stopped instead of
         // fast-forwarding through the gap (a 53 s title screen must not skip the intro's first
         // 53 s — measured live, #2981 FMV).
-        if (p.gate_started) {
+        {
             const auto now = std::chrono::steady_clock::now();
-            if (now - p.gate_wall > std::chrono::milliseconds(1000))
+            // Tick the media clock between polls; a gap longer than 200 ms pauses it (title
+            // screens, stream transitions) — shorter ones are decode jitter and count as media
+            // time, matching a player that plays autonomously between polls.
+            if (p.gate_started) {
+                if (now - p.gate_wall > std::chrono::milliseconds(200))
+                    p.gate_wall = now;
+                else {
+                    p.gate_media_ms +=
+                        (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - p.gate_wall).count();
+                    p.gate_wall = now;
+                }
+            } else {
                 p.gate_wall = now;
+            }
         }
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
@@ -2505,23 +2535,20 @@ HLE(s_avp_getvideodataex) {
             // pacing must live HERE, not in the guest. Peek first: next_video pops, and a frame
             // refused after the pop would be lost. 20 ms lead = half a 24 fps frame, so the poll
             // loop (measured ~5 ms cadence) picks the frame up on the first poll after it is due.
-            bool have = b->peek_video(p.backend_id, vf);
-            if (have && !p.seek_deliver) {
-                const uint64_t pts_ms = vf.pts_us / 1000;
-                const uint64_t due_ms = p.gate_started
-                    ? p.gate_pts_ms + (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - p.gate_wall).count()
-                    : 0;
-                // No delivery lead: a lead here accumulates per frame (each frame delivers
-                // lead-ms early, shifting the whole movie) — measured 1.59x with a 20 ms lead
-                // at the guest's ~38 Hz poll cadence. The poll interval is 5-10 ms, so the
-                // zero-lead delivery latency is bounded by one poll.
-                if (pts_ms > due_ms) have = false;   // not due yet; the guest re-polls
+            // The PTS gate needs a non-destructive peek. A backend without one keeps ungated
+            // delivery (the pre-gate behavior) — refusing frames it cannot re-inspect would
+            // deliver nothing at all (#2989 review, blocking 1).
+            const bool gated = p.gate_started && b->can_peek_video();
+            bool have = gated ? b->peek_video(p.backend_id, vf) : true;
+            if (have && gated && !p.seek_deliver) {
+                if (vf.pts_us / 1000 > p.gate_media_ms) have = false;   // not due; re-poll
             }
             if (have && b->next_video(p.backend_id, vf)) {
-                p.gate_pts_ms = vf.pts_us / 1000;
-                p.gate_wall = std::chrono::steady_clock::now();
-                p.gate_started = true;
+                if (!p.gate_started) {
+                    p.gate_media_ms = vf.pts_us / 1000;   // anchor at the first frame's PTS
+                    p.gate_started = true;
+                }
+                media_snapshot = p.gate_media_ms;
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
                 // Publish the frame only if its metadata is publishable: a refused fill would
@@ -2557,17 +2584,15 @@ HLE(s_avp_getvideodataex) {
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);
     if (avp_log()) {
         static std::atomic<uint64_t> delivered{0};
-        static const auto t0 = std::chrono::steady_clock::now();
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count();
         if (result)
-            fprintf(stderr, "[avp] video-ex handle=0x%llx DELIVER #%llu t=%llums pts=%llums\n",
+            fprintf(stderr, "[avp] video-ex handle=0x%llx DELIVER #%llu t=%llums pts=%llums media=%llums\n",
                     (unsigned long long)a0,
                     (unsigned long long)delivered.fetch_add(1) + 1,
-                    (unsigned long long)ms, (unsigned long long)fi->timestamp);
+                    (unsigned long long)avp_ms(), (unsigned long long)fi->timestamp,
+                    (unsigned long long)media_snapshot);
         else
             fprintf(stderr, "[avp] video-ex handle=0x%llx empty t=%llums\n",
-                    (unsigned long long)a0, (unsigned long long)ms);
+                    (unsigned long long)a0, (unsigned long long)avp_ms());
     }
     return result;
 }
@@ -2592,16 +2617,11 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
         AvpAudio details{(uint16_t)af.channels, {}, af.sample_rate,
                          (uint32_t)(af.samples * af.channels * sizeof(int16_t)), {}};
         memcpy(&fi->d0, &details, sizeof(details));
-        if (avp_log()) {
-            static std::atomic<uint64_t> adelivered{0};
-            static const auto at0 = std::chrono::steady_clock::now();
-            const auto ams = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - at0).count();
+        if (avp_log())
             fprintf(stderr, "[avp] audio-deliver handle=0x%llx #%llu t=%llums pts=%llums samples=%u\n",
                     (unsigned long long)a0,
-                    (unsigned long long)adelivered.fetch_add(1) + 1,
-                    (unsigned long long)ams, (unsigned long long)fi->timestamp, af.samples);
-        }
+                    (unsigned long long)0, (unsigned long long)avp_ms(),
+                    (unsigned long long)fi->timestamp, af.samples);
         return 1;
     }
     if (!p.synthetic || p.audio_poll >= avp_synth_frames()) return 0;

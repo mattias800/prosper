@@ -34,7 +34,12 @@ namespace prosper::video {
 namespace {
 
 constexpr size_t kVideoQueueCapacity = 6;
-constexpr size_t kAudioQueueCapacity = 32;
+// Runway against the demux interleave: AAC frames arrive ~2:1 over video frames, so the worker
+// services audio ~48/s while the guest consumes ~46.9/s — barely positive. Any jitter (a video
+// enqueue blocking a frame longer, a poll hiccup) emptied the old 32-frame queue (682 ms) and the
+// starvation drop path fired ~24 times per 10 s, losing 12% of GRIS's intro frames (#2981 FMV).
+// 512 frames ≈ 10.9 s of audio ≈ 4 MB: the drain margin stops being reachable in practice.
+constexpr size_t kAudioQueueCapacity = 512;
 
 // A guest counts as an ACTIVE audio consumer for this long after its last next_audio() call. It has
 // to be a window rather than a flag because both of the states that matter -- "this title routes
@@ -690,13 +695,16 @@ void decode_session(Session& session, std::stop_token stop) {
             return receive_frames(decoder, video);
         };
 
-        // Compressed video packets awaiting queue room. When the video queue fills, the worker
-        // HOLDS the packet and keeps demuxing/servicing audio instead of blocking inside
-        // enqueue_video: blocking there starves the audio consumer (the audio queue drains while
-        // the worker sleeps on video), which tripped the starvation drop path ~24 times per 10 s —
-        // 12% of the intro's frames lost (#2981 FMV). Held packets are compressed (bytes, not
-        // frames), so the hold costs kilobytes for the tens of milliseconds the queue needs to
-        // drain. RAII: every exit path through this scope, goto `finished` included, unrefs them.
+        // Audio runway: the demux interleaves ~2 audio packets per video packet, but a worker
+        // blocked on a full video queue services audio only between video pops — a net drain of
+        // ~1 packet/s against a queue that starts EMPTY. Any jitter then empties it and the
+        // starvation drop path fires ~24 times per 10 s (12% of GRIS's intro frames, #2981 FMV).
+        // So: while the audio queue is below the runway target, video packets are HELD
+        // (compressed — kilobytes) and the demux keeps flowing to the audio packets until the
+        // runway is built. Past the target the video queue's own backpressure throttles decode
+        // as before, with the runway absorbing jitter. The hold is bounded twice: it ends when
+        // the runway is built; enqueue_audio's own backpressure then paces the demux.
+        constexpr size_t kAudioRunwayTarget = kAudioQueueCapacity / 2;
         struct HeldVideo {
             std::deque<AVPacket*> q;
             ~HeldVideo() { while (!q.empty()) { av_packet_unref(q.front()); q.pop_front(); } }
@@ -705,19 +713,23 @@ void decode_session(Session& session, std::stop_token stop) {
             std::lock_guard<std::mutex> lock(session.mutex);
             return session.video_queue.size() < kVideoQueueCapacity;
         };
-        auto flush_held_video = [&]() -> bool {
-            while (!held_video.q.empty() && video_queue_has_room()) {
-                AVPacket* held = held_video.q.front();
-                held_video.q.pop_front();
-                if (!submit_packet(pipeline.video, held, true)) { av_packet_unref(held); return false; }
-                av_packet_unref(held);
-            }
-            return true;
+        auto audio_queue_has_runway = [&]() {
+            std::lock_guard<std::mutex> lock(session.mutex);
+            return !session.stream_info.has_audio ||
+                   session.audio_queue.size() >= kAudioRunwayTarget;
         };
-
         bool decode_ok = true;
         while (!session_stopping(session, stop)) {
-            if (!flush_held_video()) { decode_ok = false; break; }
+            // Flush held packets while the video queue has room.
+            while (!held_video.q.empty() && video_queue_has_room() &&
+                   !session_stopping(session, stop)) {
+                AVPacket* held = held_video.q.front();
+                held_video.q.pop_front();
+                decode_ok = submit_packet(pipeline.video, held, true);
+                av_packet_unref(held);
+                if (!decode_ok) break;
+            }
+            if (!decode_ok || session_stopping(session, stop)) break;
             result = av_read_frame(pipeline.format, pipeline.packet);
             if (result == AVERROR_EOF) break;
             if (result < 0) {
@@ -726,7 +738,13 @@ void decode_session(Session& session, std::stop_token stop) {
                 break;
             }
             if (pipeline.packet->stream_index == video_stream) {
-                if (video_queue_has_room()) {
+                // Direct-submit only when nothing is held (stream order — submitting a newer
+                // packet while older ones are held corrupts libavcodec's decode order) and both
+                // queues are healthy; otherwise hold. The hold is bounded by the audio-runway
+                // build: once kAudioRunwayTarget is reached, enqueue_audio's own backpressure
+                // paces the demux, and the guest's pops drain the held tail.
+                if (held_video.q.empty() && video_queue_has_room() &&
+                    audio_queue_has_runway()) {
                     decode_ok = submit_packet(pipeline.video, pipeline.packet, true);
                 } else {
                     AVPacket* held = av_packet_clone(pipeline.packet);
@@ -734,25 +752,23 @@ void decode_session(Session& session, std::stop_token stop) {
                     else decode_ok = submit_packet(pipeline.video, pipeline.packet, true);
                 }
             }
-            else if (pipeline.audio && pipeline.packet->stream_index == audio_stream) {
+            else if (pipeline.audio && pipeline.packet->stream_index == audio_stream)
                 decode_ok = submit_packet(pipeline.audio, pipeline.packet, false);
-                if (decode_ok && !flush_held_video()) break;
-            }
             av_packet_unref(pipeline.packet);
             if (!decode_ok) break;
         }
         if (decode_ok && !session_stopping(session, stop)) {
             // Drain the held tail, then flush both decoders.
             while (!held_video.q.empty() && !session_stopping(session, stop)) {
-                if (video_queue_has_room()) {
-                    AVPacket* held = held_video.q.front();
-                    held_video.q.pop_front();
-                    decode_ok = submit_packet(pipeline.video, held, true);
-                    av_packet_unref(held);
-                    if (!decode_ok) break;
-                } else {
+                if (!video_queue_has_room()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
                 }
+                AVPacket* held = held_video.q.front();
+                held_video.q.pop_front();
+                decode_ok = submit_packet(pipeline.video, held, true);
+                av_packet_unref(held);
+                if (!decode_ok) break;
             }
             if (decode_ok) decode_ok = submit_packet(pipeline.video, nullptr, true);
             if (decode_ok && pipeline.audio)
@@ -997,7 +1013,9 @@ VaapiBackend& shared_vaapi_backend() {
 
 uint64_t VaapiBackend::video_frames_dropped(int id) {
     const auto session = impl_->get(id);
-    return session ? session->video_frames_dropped : 0;
+    if (!session) return 0;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->video_frames_dropped;
 }
 
 uint64_t VaapiBackend::video_frames_dropped_for_test(int id) {
