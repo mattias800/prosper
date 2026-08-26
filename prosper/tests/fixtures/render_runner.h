@@ -414,17 +414,26 @@ inline bool backend_storage_image_numeric_contract_valid(const FrameResource& re
 // The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
 // historical implicit byte-span behavior; a 2D_MSAA plane array must prove all four complete R32F
 // planes are readable before any Vulkan object or memcpy is attempted.
+// Vulkan guarantees `maxImageArrayLayers >= 2048`; a guest T# can declare up to 8192. Since this
+// predicate has no device handle, it bounds against the guaranteed minimum rather than the actual
+// limit, so a resource it admits is creatable on every conformant device. Anything above is
+// rejected fail-visibly here instead of reaching vkCreateImage, whose result the upload path does
+// not check (pre-existing, all image creation, filed separately) -- an over-large arrayLayers would
+// otherwise yield VK_NULL_HANDLE and be passed straight to vkGetImageMemoryRequirements.
+inline constexpr uint32_t kBackendMaxArrayLayers = 2048u;
+
 // A guest 2D_ARRAY is the same shape as the MSAA plane array with a different provenance: N
 // ordinary color layers laid out one after another, carried through the SAME `sample_count`
 // channel, and owed the same proof that every layer is readable before any Vulkan object or memcpy
 // exists. Everything downstream is already layer-generic -- the staging buffer sizes itself
 // `tw*th*td*sample_count*bpp`, the image takes `arrayLayers = sample_count`, and the view selects
-// VK_IMAGE_VIEW_TYPE_2D_ARRAY above 1 -- so this predicate was the single gate keeping graphics
-// array textures out (#325). Mip generation is already excluded for `sample_count > 1`, which is
-// what stops a generated chain bleeding across layer boundaries.
+// VK_IMAGE_VIEW_TYPE_2D_ARRAY above 1 -- so once a frontend publishes a layer count, this predicate
+// is what stands between it and the upload (#325). Mip generation is already excluded for
+// `sample_count > 1`, which is what stops a generated chain bleeding across layer boundaries.
 inline bool backend_texture_array_span_valid(const FrameResource& resource) {
     if (resource.img_dim != 5u || resource.td != 1u || resource.is_storage_image ||
-        !resource.tex_rgba || !resource.tw || !resource.th || resource.sample_count < 2u)
+        !resource.tex_rgba || !resource.tw || !resource.th || resource.sample_count < 2u ||
+        resource.sample_count > kBackendMaxArrayLayers)
         return false;
     const uint32_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
     if (!bpp) return false;

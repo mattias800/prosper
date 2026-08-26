@@ -1144,6 +1144,31 @@ int main() {
         CHECK(!prosper::test::backend_texture_plane_span_valid(wide_format),
               "2D_ARRAY span scales with the format's bytes per texel, not a fixed 4");
 
+        // An unbounded layer count reaches vkCreateImage, whose result the upload path does not
+        // check -- so a guest T# declaring more layers than any conformant device allows would
+        // produce VK_NULL_HANDLE and be handed to vkGetImageMemoryRequirements. Guest arrays reach
+        // 8192; Vulkan guarantees only 2048. A 4x4 RGBA8 array of 8192 layers is 512 KiB, so the
+        // span check alone does NOT bound this in practice -- which is why the arm exists.
+        {
+            const uint32_t huge = prosper::test::kBackendMaxArrayLayers + 1u;
+            std::vector<uint8_t> huge_bytes(static_cast<size_t>(LW) * LH * 4u * huge, 0x40);
+            prosper::test::FrameResource too_many = arr;
+            too_many.tex_rgba = huge_bytes.data();
+            too_many.tex_byte_size = huge_bytes.size();
+            too_many.sample_count = huge;
+            CHECK(!prosper::test::backend_texture_plane_span_valid(too_many),
+                  "a layer count above the guaranteed device maximum is rejected even when its "
+                  "span is complete");
+            prosper::test::FrameResource at_limit = arr;
+            at_limit.sample_count = prosper::test::kBackendMaxArrayLayers;
+            at_limit.tex_byte_size =
+                static_cast<size_t>(LW) * LH * 4u * prosper::test::kBackendMaxArrayLayers;
+            std::vector<uint8_t> limit_bytes(at_limit.tex_byte_size, 0x40);
+            at_limit.tex_rgba = limit_bytes.data();
+            CHECK(prosper::test::backend_texture_plane_span_valid(at_limit),
+                  "exactly the guaranteed device maximum is still accepted");
+        }
+
         prosper::test::FrameResource volume = arr;
         volume.td = 2;
         CHECK(!prosper::test::backend_texture_plane_span_valid(volume),

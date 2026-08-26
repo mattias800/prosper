@@ -95,6 +95,30 @@ Two further details cost time and are worth keeping:
 
 ## Ruled out
 
+- **"Memory pressure is why 256 decoded layers fail" — false.** A `PROSPER_ARRAY_MAX_LAYERS` bisect
+  over an early array upload rendered at 1 layer and failed identically at **4, 16 and 64**. Four
+  layers is trivially small, so the failure was structural, not a working-set problem. The actual
+  cause was `backend_texture_plane_span_valid`, which admitted `sample_count > 1` only for the
+  four-plane R32_SFLOAT guest-MSAA shape and rejected everything else (#3043).
+- **"The world samples its array with a non-array instruction, so it always reads slice 0" — false.**
+  A full `PROSPER_MIMGCENSUS` census over a gameplay route — the whole population, not a sample —
+  found **every** MIMG touching an array texture uses `DIM=5`: op `0x2f` on bindings 39-46 at depth 1
+  (64 events), and op `0x20` on bindings 34/36/47 at depth 256 (16 events). There is no DIM≠5 case
+  to explain the flat world (#2998).
+- **The decoded slices are not duplicates of slice 0.** Per-layer checksums (`PROSPER_ARRAYTEX`) give
+  13 distinct hashes for one array binding and 8 for another, so the decoder does not replicate the
+  base slice (#2998).
+- **Forcing the array layer to a constant changes nothing, and the probe proves it fired.**
+  `PROSPER_FORCE_LAYER=200` substitutes a constant layer *and prints when it does*; it fired on all
+  four array bindings and the gameplay frame was unchanged — identical average- and difference-hash,
+  luma differing in one byte of 288. So the layer coordinate was never the variable; the resource was
+  being uploaded with one layer (#2998).
+- **Binding numbers are not texture identities.** A binding is a per-shader descriptor slot, and the
+  decoded-texture cache keys by guest address — so "binding 36 never reaches the array decode gate"
+  does not mean its texture is never decoded there. It is decoded once under whatever slot referenced
+  it first, then served from cache under every later slot. Chasing a binding number instead of an
+  address cost a full measurement cycle (#2998).
+
 - **The byte pattern of a misread 32-bit index buffer is NOT sufficient to identify one.** A genuine
   16-bit buffer with a period-2 pattern — a fan or cone as a triangle strip `[rim, apex, rim, apex, …]`,
   or a line list radiating from one hub — is **byte-identical** to a clustered 32-bit list whenever the
