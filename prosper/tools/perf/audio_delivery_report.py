@@ -112,14 +112,24 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame):
 
     if queued:
         mean_q = sum(queued) / len(queued)
-        under_one = sum(1 for q in queued if q < bytes_per_frame * channels)
-        under_quarter = sum(1 for q in queued if q < bytes_per_frame * channels // 4)
+        # A GRAIN, not a frame. These two thresholds were bytes_per_frame * channels, which is one
+        # FRAME -- 8 bytes for f32 stereo -- so "below 1 grain" tested q < 8 and "below 1/4 grain"
+        # tested q < 2. Both were really asking "is the queue empty", and reported it under labels
+        # promising something far weaker, which is the direction that gets quoted: a run showing 1.1%
+        # "below a quarter grain" was in fact 1.1% COMPLETELY DRY. grain_frames is computed twenty
+        # lines above and was simply not used here.
+        grain_bytes = grain_frames * bytes_per_frame * channels
+        under_one = sum(1 for q in queued if q < grain_bytes) if grain_bytes else 0
+        under_quarter = sum(1 for q in queued if q < grain_bytes // 4) if grain_bytes else 0
+        empty = sum(1 for q in queued if q == 0)
         print(f"  queue at arrival: mean {mean_q:.0f} B  min {queued[0]} B")
         print(f"  arrivals below 1 grain of buffer:  {under_one}"
               f" ({100 * under_one / len(queued):.1f}%) -- the device starved between"
               f" deliveries")
         print(f"  arrivals below 1/4 grain:          {under_quarter}"
               f" ({100 * under_quarter / len(queued):.1f}%) -- audible underrun territory")
+        print(f"  arrivals with an EMPTY queue:      {empty}"
+              f" ({100 * empty / len(queued):.1f}%) -- the device had nothing left to play")
 
     if span_s > 0 and device_hz:
         delivered_hz = frames_total / span_s

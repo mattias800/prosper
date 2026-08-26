@@ -38,6 +38,27 @@ def main():
         if needle in text:
             failures.append(f"{what}: expected {needle!r} to be absent")
 
+    # 0. The queue thresholds mean GRAINS, and this arm exists because they did not.
+    #
+    #    They were bytes_per_frame * channels -- one FRAME, 8 bytes for f32 stereo -- so "below 1
+    #    grain" tested q < 8 and "below 1/4 grain" tested q < 2. Every case below passed anyway,
+    #    because they only ever assert that a LABEL is present, never that the number under it is
+    #    right. A run reporting "1.1% below a quarter grain" was really 1.1% completely dry, and that
+    #    figure was quoted into an issue before anyone noticed.
+    #
+    #    grain here is 256 frames * 4 bytes * 2 channels = 2048 B. A queue of 1024 B is half a
+    #    grain: below one grain, above a quarter. Under the old arithmetic it was above BOTH
+    #    thresholds, so this arm fails on the bug and passes on the fix.
+    log = "".join(dbg(gap=5.33, frames=256, queued=1024) for _ in range(200))
+    out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
+    expect(out, "arrivals below 1 grain of buffer:  200", "case 0: half a grain is below one grain")
+    expect(out, "arrivals below 1/4 grain:          0", "case 0: half a grain is NOT below a quarter")
+
+    #    And an empty queue must register as empty, on its own row rather than only as "below".
+    log = "".join(dbg(gap=5.33, frames=256, queued=0) for _ in range(200))
+    out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
+    expect(out, "arrivals with an EMPTY queue:      200", "case 0: an empty queue is reported empty")
+
     # 1. Real-time delivery, deep queue: no defect. The verdict must NOT name a clock
     #    deficit (a plausible wrong call: an average at the device rate with jitter).
     log = "".join(dbg(gap=5.33, queued=3072) for _ in range(200))
