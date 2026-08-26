@@ -1,0 +1,85 @@
+# Grand Theft Auto V (PPSA04263) — select the game's own PERFORMANCE graphics mode, then start Story.
+#
+# Motive: #2863. A user reported that the in-game Performance mode renders more world content, and
+# the rendering series is itself a Performance-mode series. This route makes the setting testable
+# under measurement, and it does so from the LANDING menu so the choice is in effect before the
+# world ever loads.
+#
+# EVERYTHING BELOW WAS ESTABLISHED BY CAPTURE (2026-08-26). Four facts cost a run each:
+#
+# 1. OPTIONS opens Settings from the landing menu. NOT triangle, NOT touchpad -- both were tried and
+#    both were confirmed DELIVERED in PROSPER_PAD_SCRIPT_LOG (read= advanced, buttons= named them),
+#    so they are real negatives rather than lost inputs. The on-screen prompt cannot settle this:
+#    its glyph renders as a FEATURELESS WHITE PILL with no inner symbol, while "Resume Story" beside
+#    it renders a correct circled X. That is a prosper glyph defect, and it is why the button had to
+#    be found by sweeping candidates.
+#
+# 2. PRESS DURATION IS LOAD-BEARING. The menu runs at ~80 flips/s since the rendering series, so a
+#    1-second hold triggers key repeat -- three Down presses walked SIX rows and landed on Rockstar
+#    Editor. Every menu press here is ~0.15 s (~12 flips). `strtod` parses the anchors, so
+#    fractional seconds work.
+#
+# 3. The Settings category list is: Controls (selected on entry) | Audio | Camera | Display |
+#    Voice Chat | Notifications | Rockstar Editor | Motion Sensor Function. Display is THREE downs.
+#    The right pane FOLLOWS the highlighted category automatically -- there is no "enter" step, and
+#    Cross on the category list does nothing.
+#
+# 4. Display's FIRST row is `Graphics Mode`, default `Fidelity`. So no Down is needed inside the
+#    pane; move Right into it and change the value there.
+#
+# DISCRIMINATOR worth reusing on this title: the STORY page CYCLES its key art, so a FROZEN frame
+# means the menu left it. Mean luminance held at 110.8 for 60+ s while Settings was open and began
+# varying again the moment Circle closed it. The older bright-vs-dark luminance test is VOID -- the
+# rendering series moved gameplay from ~0.3-2.2 to ~22, overlapping the menu range.
+
+# --- Boot -> title card -> main menu -------------------------------------------------------------
+f600-620:cross
+f800-820:cross
+f1000-1020:cross
+f1200-1220:cross
+f1400-1420:cross
+f1600-1620:cross
+f1800-1820:cross
+f2000-2020:cross
+f2200-2220:cross
+f2400-2420:cross
+
+# --- Settle on STORY (rightmost tab; extra R1 clamps rather than overshoots) ----------------------
+60-60.15:r1
+66-66.15:r1
+72-72.15:r1
+78-78.15:r1
+
+# --- Settings -> Display -------------------------------------------------------------------------
+90-90.15:options
+104-104.15:down
+112-112.15:down
+120-120.15:down
+
+# --- Into the pane, onto Graphics Mode, and change it --------------------------------------------
+# CROSS moves focus into the option column, not Right. Measured both ways: with Right the Graphics
+# Mode row stayed unhighlighted and its value stayed `Fidelity`, while the earlier Notifications
+# capture -- taken from a run that pressed Cross -- showed the pane's first row highlighted with
+# `< On >` chevrons. Chevrons appear only on a FOCUSED row, so they are the tell that focus arrived.
+#
+# Graphics Mode is Display's first row, so no Down is needed once focus is in the pane. The value is
+# a left/right enum, and its ORDER was measured rather than assumed:
+#
+#     Performance RT  <  Fidelity  >  Performance
+#
+# Fidelity is the default and sits in the MIDDLE. Left therefore moves AWAY from what we want: one
+# Left lands on `Performance RT` (a different mode -- it keeps ray tracing) and further Lefts clamp
+# there, which is exactly what three of them did when this was first written. Plain `Performance` is
+# a single Right.
+132-132.15:cross
+144-144.15:right
+
+# --- Back out and start Story --------------------------------------------------------------------
+182-182.15:circle
+194-194.15:circle
+208-208.15:cross
+
+# Past Story entry: the save-slot / Resume prompts.
+227-227.15:cross
+242-242.15:cross
+257-257.15:cross
