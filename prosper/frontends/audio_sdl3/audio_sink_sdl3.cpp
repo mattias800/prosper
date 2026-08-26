@@ -27,6 +27,7 @@ bool queue_trace() {
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <cstdlib>   // getenv: the trace/legacy gates below. Transitive via libstdc++ on GCC, absent on clang.
 #include <chrono>
 #include <mutex>
 #include <thread>
