@@ -555,6 +555,25 @@ jobs:
           cmake --build prosper/build-windows-app
           --target prosper-app test_prosper_app_pad_overlay test_audio_sdl3 test_pad_sdl3
 
+      # Separate step, and deliberately NOT folded into the target list above: prosper-app does not
+      # depend on boot_trace, and naming it in the app build would make this job cover something its
+      # name does not claim. What it IS here for: this is the only Windows job that installs the
+      # Vulkan headers and loader, so it is the only one where PROSPER_HAVE_VULKAN gets defined
+      # (CMakeLists.txt sets it only when Vulkan is found). windows-mingw builds the whole tree but
+      # passes -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE, so every Vulkan-gated block is preprocessed
+      # away there.
+      #
+      # That split is how #3014 survived a fortnight: boot_trace.cpp called POSIX setenv inside its
+      # PROSPER_HAVE_VULKAN block, so the job that builds the target never compiled the code and the
+      # job that would compile the code never built the target. Neither was red. Any Windows tool with
+      # Vulkan-gated code needs a line here, or it is uncompiled on this platform.
+      - name: Build Windows tools that only compile with Vulkan enabled
+        shell: msys2 {0}
+        run: >-
+          cmake --build prosper/build-windows-app
+          --target boot_trace
+
+
       # See the linux job (#2187) for --no-tests=error. This job is the one it matters most for:
       # it is the only job testing a directory other than build-ci, so a --test-dir that drifted
       # back to the common name would find an absent or unbuilt tree, register nothing, and pass.
