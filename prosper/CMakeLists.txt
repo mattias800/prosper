@@ -379,6 +379,17 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME compute_phase_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_phase_report.py")
+  # The audio-delivery and flip-pacing reports, recovered from #2984 (#3033). Registered rather
+  # than left as scripts with a --self-test nobody runs: both shipped with working self-tests in
+  # that PR and neither was wired into ctest, which is a test that cannot go red. Same synthetic-
+  # record caveat as compute_phase_report_logic above — these pin each tool against its own model
+  # of the log format, so they catch a parser regression and cannot notice the EMITTER drifting.
+  add_test(NAME audio_delivery_report_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_audio_delivery_report.py")
+  add_test(NAME flip_pacing_report_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
   # stack_profile's frame classifier, against RECORDED gdb output. Deliberately needs no gdb and no
   # ptrace: an end-to-end variant would skip silently wherever ptrace is unavailable, and a silently
   # skipped test is indistinguishable from a passing one. What it pins is the case that already
