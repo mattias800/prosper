@@ -1,7 +1,8 @@
 // boot_trace — link the game's modules, boot the guest, and report how far it got:
 // the unimplemented-call trace (via stderr from dispatch), first-frame capture (--capture-first-frame),
 // plus, on a fault, the register state and an rbp-chain backtrace classified by module. The primary bring-up debugging
-// tool. Linux only. Usage: boot_trace <dump-root> [--capture-first-frame [output.bmp]]
+// tool. Builds on Linux and Windows (the Windows path is narrower; --capture-first-frame needs a
+// Vulkan-enabled build). Usage: boot_trace <dump-root> [--capture-first-frame [output.bmp]]
 #include "loader/linker.hpp"
 #include "host/image/exec_image.hpp"
 #include "host/image/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
@@ -260,17 +261,20 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[first-frame] output: %s\n", capture_first_frame_path.c_str());
         
         // Enable rendering (required for present_write_frame to produce frames).
-        // Not bare setenv: MinGW has no POSIX setenv, so this tool did not COMPILE on Windows at
-        // all -- and because it is one target in a whole-tree build, its failure stopped ninja
-        // before most test executables were linked, which surfaced as ~15 ctest cases Not Run
-        // rather than as a broken tool. Present since the --capture-first-frame commit (#3014).
+        // Not bare setenv: MinGW has no POSIX setenv. This block is inside PROSPER_HAVE_VULKAN, so
+        // the tool still built in the no-Vulkan configuration CI uses -- which is exactly why the
+        // break survived a fortnight, and why the earlier wording here ("did not COMPILE on Windows
+        // at all") was wrong. A Vulkan-enabled Windows build failed here, and ninja stopping at it
+        // left ~15 ctest cases unbuilt on that build -- a -k 1 scheduling effect, not a dependency,
+        // since nothing links against boot_trace. Introduced with --capture-first-frame, fixed in
+        // #3014; ci.yml now builds this target in the Vulkan-enabled Windows job so the two
+        // configurations cannot hide it between them again.
 #ifdef _WIN32
         _putenv_s("PROSPER_RENDER", "1");
 #else
         setenv("PROSPER_RENDER", "1", 1);
 #endif
 
-        
         // Register the live renderer (same as screenshot tool / prosper-app)
         prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
         
