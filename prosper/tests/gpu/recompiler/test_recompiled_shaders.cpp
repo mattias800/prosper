@@ -88,16 +88,36 @@ int main() {
             (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
         if (p) printf("  scalar-vcc center=(%u,%u,%u,%u) wave64-vote=%d\n",
                       p[0], p[1], p[2], p[3], static_cast<int>(supports_fragment_wave64_vote));
-        // The skipped arm pairs the clear colour with the module's own declared requirement, so it
-        // asserts "this shader demanded wave64 and the device therefore left the target untouched"
-        // rather than the weaker "no draw landed here", which any pipeline failure would satisfy.
-        CHECK(p && (supports_fragment_wave64_vote
-                        ? (p[0] > 0x80 && p[1] < 0x40 && p[2] < 0x40)
-                        : (fragment_spirv_required_subgroup_size(scalar_vcc_frag) == 64 &&
-                           p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40)),
-              supports_fragment_wave64_vote
-                  ? "fragment scalar VCC_LO dword reaches compare/select exactly"
-                  : "device without fragment wave64 vote skips the scalar-VCC draw fail-visible");
+        // This arm is NOT device-gated, and the reason is a measurement rather than a preference.
+        //
+        // It used to be: on a device without fragment wave64 vote it demanded that the target stay
+        // at its BLUE clear, pairing that with `required_subgroup_size == 64` so the assertion meant
+        // "this shader demanded wave64 and the device therefore left the target untouched" rather
+        // than the weaker "no draw landed here". The pairing is good practice; the premise is false
+        // for this shader. The module declares **no** required subgroup size, and the backend's skip
+        // is `required_fragment_subgroup_size && (...device terms...)` -- so a zero short-circuits
+        // the whole conjunction and the draw runs on every device, whatever it supports. The arm
+        // could therefore never hold where it was actually evaluated, and CI is exactly there: it
+        // reported `center=(255,0,0,255)`, which is this arm's own SUCCESS colour.
+        //
+        // Zero is the CORRECT answer here, which is why it is pinned rather than tolerated. VCC_LO
+        // in this fixture is a 32-bit scratch dword -- `s_and_b32 vcc_lo, s18, 3` writes it and
+        // `s_cmp_eq_u32 1, vcc_lo` reads the whole dword straight back. Nothing consults it as a
+        // lane mask, so the result cannot depend on the wave width, and demanding a 64-lane wave
+        // would over-constrain the module onto hardware with no reason to be excluded.
+        //
+        // The device gate is not weakened in general -- it is simply not this shader's contract.
+        // `test_recompiled_fragment` still exercises it through `skipped_wave64_draw`, and those
+        // modules still declare 64 (measured the same day: `direct_break_frag` -> 64 against this
+        // one's 0). That contrast is what separates "the requirement was correctly narrowed to the
+        // shaders that need it" from "the requirement stopped being emitted", and only the first is
+        // consistent with both numbers.
+        const uint32_t scalar_vcc_required =
+            fragment_spirv_required_subgroup_size(scalar_vcc_frag);
+        CHECK(scalar_vcc_required == 0,
+              "width-independent VCC_LO dword use declares no required subgroup size");
+        CHECK(p && p[0] > 0x80 && p[1] < 0x40 && p[2] < 0x40,
+              "fragment scalar VCC_LO dword reaches compare/select exactly on any wave width");
     }
 
     // An NGG hardware vertex program uses LDS even when its logical output is an ordinary vertex.

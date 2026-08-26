@@ -217,6 +217,62 @@ int main() {
                                 format_defined));
     }
 
+    // Slot 0's pass identity is the surface the pass RENDERS to.
+    //
+    // live_renderer takes `pass_bases[0]` from the named `color0_base`, while every slot above 0
+    // goes through the array. Grouping therefore has to read slot 0 from the same place: when it
+    // read the array instead, two draws rendering to DIFFERENT addresses grouped into one pass and
+    // the second draw's target was silently discarded -- it produced no pass, published no pixels,
+    // and the chain returned the previous draw's surface at the previous draw's extent.
+    //
+    // Every production producer derives `color_targets[0]` from the named fields rather than
+    // filling it independently -- `restore_legacy_color_target_aliases` on every capture load, and
+    // the mirror at `realize_draw_item`'s single success exit for live draws -- so the two agree on
+    // captured and live draws and this costs nothing there. They diverge only for a caller that
+    // builds a DrawItem directly and sets the named aliases alone: the "direct/synthetic callers"
+    // that mirror exists to repair, and the shape the render fixtures construct. Regression for
+    // four gpu_capture_render_replay arms.
+    {
+        auto producer = make_draw();
+        producer.color_targets[0].base = 0x200000ull;  // a stale mirror of an earlier target
+        producer.color0_base = 0x300000ull;
+        producer.color0_width = 32u;
+        producer.color0_height = 2u;
+
+        auto consumer = producer;                      // same stale array entry ...
+        consumer.color0_base = 0x400000ull;            // ... a different rendered surface
+        consumer.color0_width = 16u;
+        consumer.color0_height = 16u;
+        CHECK(!mrt_same_color_pass(producer, consumer, format_defined, format_at));
+        CHECK(mrt_same_color_pass(producer, producer, format_defined, format_at));
+
+        // Isolate the BASE term: same named extent, a different rendered surface. Without this arm
+        // the set is satisfied by a change that keeps the ARRAY base and takes only the named
+        // EXTENT -- which gets this fix's whole subject, the address the pass renders to, backwards.
+        // The arm above cannot catch that mutant because it differs in base AND extent, and the one
+        // below isolates the extent; nothing else here varies the base alone.
+        auto other_surface = producer;
+        other_surface.color0_base = 0x400000ull;  // extents stay 32x2
+        CHECK(!mrt_same_color_pass(producer, other_surface, format_defined, format_at));
+
+        // The series added the extent term to stop GTA V's 64x32 and 32x16 mip levels sharing one
+        // attachment. Reading slot 0 from the array defeated that term as well, because a stale
+        // array entry carries no extent and unknown extents never conflict: same address, both
+        // extents 0x0, grouped. The named extents are what conflict.
+        auto smaller_level = producer;
+        smaller_level.color0_width = 16u;
+        smaller_level.color0_height = 16u;
+        CHECK(!mrt_same_color_pass(producer, smaller_level, format_defined, format_at));
+
+        // With no named slot-0 surface the array remains the answer, exactly as before.
+        auto array_only = make_draw();
+        array_only.color_targets[0].base = 0x500000ull;
+        auto array_other = array_only;
+        array_other.color_targets[0].base = 0x600000ull;
+        CHECK(!mrt_same_color_pass(array_only, array_other, format_defined, format_at));
+        CHECK(mrt_same_color_pass(array_only, array_only, format_defined, format_at));
+    }
+
     if (failures == 0) std::printf("mrt_binding: OK\n");
     return failures == 0 ? 0 : 1;
 }
