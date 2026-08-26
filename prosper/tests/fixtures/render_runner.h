@@ -469,6 +469,9 @@ struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
+    // Live-title authority for GTA V's reviewed WaveAny-only fragment route. Tests, replay and all
+    // other titles leave this false, preserving the strict exact-wave admission contract.
+    bool allow_native_fragment_vote_width = false;
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
     uint64_t draw_index = UINT64_MAX;
@@ -5709,7 +5712,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupBallot;
         const bool uses_internal_gds =
             fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
-        if (required_fragment_subgroup_size &&
+        bool fragment_subgroup_skip = required_fragment_subgroup_size &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
@@ -5718,7 +5721,39 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              !prosper::gpu::fragment_subgroup_features_supported(
                  required_fragment_subgroup_features,
                  available_fragment_subgroup_features) ||
-             (uses_internal_gds && !ctx.fragment_stores_atomics))) {
+             (uses_internal_gds && !ctx.fragment_stores_atomics));
+        uint32_t subgroup_reasons = UINT32_MAX;
+        if (fragment_subgroup_skip && bd.allow_native_fragment_vote_width &&
+            (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+            prosper::gpu::fragment_subgroup_features_supported(
+                required_fragment_subgroup_features,
+                available_fragment_subgroup_features) &&
+            !(uses_internal_gds && !ctx.fragment_stores_atomics)) {
+            subgroup_reasons =
+                prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
+            // This is deliberately title-scoped and narrower than PROSPER_WAVE64_APPROX: only a
+            // WaveAny with no lane, ballot, shuffle or scalar-reduction qualifier is admitted.
+            // The source branch's reviewed bank route preserves both world and characters under
+            // this exact classifier; every unreviewed title remains on the strict master path.
+            if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny) {
+                const uint64_t shader_key = bd.fs_identity
+                    ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
+                static std::mutex native_width_log_mutex;
+                static std::unordered_set<uint64_t> native_width_logged;
+                std::lock_guard<std::mutex> lock(native_width_log_mutex);
+                if (native_width_logged.insert(shader_key).second)
+                    std::fprintf(stderr,
+                                 "[render] GTA V native-width fragment vote: subgroup %u -> %u "
+                                 "(why=0x%x)\n",
+                                 required_fragment_subgroup_size, ctx.max_subgroup_size,
+                                 subgroup_reasons);
+                // Omitting the required-size pNext below selects the device's native fragment
+                // subgroup. On the current NVIDIA host that is 32 lanes.
+                required_fragment_subgroup_size = 0;
+                fragment_subgroup_skip = false;
+            }
+        }
+        if (fragment_subgroup_skip) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;
@@ -5734,8 +5769,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // census that decides whether such a lowering is worth writing cannot be taken.
                 //
                 // Inside the dedupe guard, so it costs once per distinct shader, not per draw.
-                const uint32_t why =
-                    prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
+                const uint32_t why = subgroup_reasons != UINT32_MAX
+                    ? subgroup_reasons
+                    : prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
                 char why_text[160];
                 if (why == UINT32_MAX) {
                     // Absent, not none. A module built before #2147 carries no marker, and printing
@@ -5752,6 +5788,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         {prosper::gpu::kFragmentWaveReasonReadLane64, " readlane64"},
                         {prosper::gpu::kFragmentWaveReasonShuffle,    " shuffle"},
                         {prosper::gpu::kFragmentWaveReasonWaveBallot, " wave-ballot"},
+                        {prosper::gpu::kFragmentWaveReasonScalarReduce, " scalar-reduce"},
                     };
                     for (const auto& entry : kReasonNames)
                         if ((why & entry.bit) && n > 0 && n < static_cast<int>(sizeof why_text))

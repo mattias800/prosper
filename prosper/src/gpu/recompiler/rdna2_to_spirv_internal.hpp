@@ -554,6 +554,13 @@ struct SpirvCompute {
     // `required-ops` field scans for Vote/Arithmetic/Shuffle CAPABILITIES and the lane-id path
     // declares none of them -- so the two cases printed identically.
     uint32_t fragment_wave_reasons=0;
+    // SSA provenance for fragment WaveAny results. A vote needs the exact guest-wave width when
+    // that particular bool reaches a guest scalar-data consumer. Tracking result ids avoids the
+    // false whole-module inference "this shader contains both a vote and S_CSELECT".
+    std::unordered_set<uint32_t> fragment_wave_vote_values;
+    std::unordered_set<uint32_t> fragment_wave_vote_scalar_consumers;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> fragment_wave_vote_dependents;
+    std::unordered_map<size_t, uint32_t> fragment_wave_vote_phi_patch_results;
     uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
@@ -751,7 +758,46 @@ struct SpirvCompute {
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
-    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_bool, r, cond, tval, fval}); return r; }  // bool-domain select (wave masks)
+    bool is_fragment_wave_vote_value(uint32_t value) const {
+        return fragment_wave_vote_values.contains(value);
+    }
+    void mark_fragment_wave_vote_value(uint32_t value) {
+        std::vector<uint32_t> pending{value};
+        while (!pending.empty()) {
+            const uint32_t current = pending.back();
+            pending.pop_back();
+            if (!fragment_wave_vote_values.insert(current).second) continue;
+            if (fragment_wave_vote_scalar_consumers.contains(current))
+                fragment_wave_reasons |= kFragmentWaveReasonScalarReduce;
+            const auto dependent = fragment_wave_vote_dependents.find(current);
+            if (dependent != fragment_wave_vote_dependents.end())
+                pending.insert(pending.end(), dependent->second.begin(), dependent->second.end());
+        }
+    }
+    void add_fragment_wave_vote_dependency(uint32_t result, uint32_t source) {
+        fragment_wave_vote_dependents[source].push_back(result);
+        if (is_fragment_wave_vote_value(source)) mark_fragment_wave_vote_value(result);
+    }
+    void propagate_fragment_wave_vote(uint32_t result, uint32_t source) {
+        add_fragment_wave_vote_dependency(result, source);
+    }
+    void propagate_fragment_wave_vote(uint32_t result, uint32_t a, uint32_t b_) {
+        add_fragment_wave_vote_dependency(result, a);
+        add_fragment_wave_vote_dependency(result, b_);
+    }
+    void mark_fragment_wave_scalar_use(uint32_t value) {
+        fragment_wave_vote_scalar_consumers.insert(value);
+        if (is_fragment_wave_vote_value(value))
+            fragment_wave_reasons |= kFragmentWaveReasonScalarReduce;
+    }
+    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) {
+        uint32_t r = id();
+        put(code, Op_Select, {t_bool, r, cond, tval, fval});
+        add_fragment_wave_vote_dependency(r, cond);
+        add_fragment_wave_vote_dependency(r, tval);
+        add_fragment_wave_vote_dependency(r, fval);
+        return r;
+    }  // bool-domain select (wave masks)
 
     // --- Structured control-flow primitives (for counted-loop reconstruction) ---
     uint32_t cur_block = 0;   // label id of the block currently being emitted (predecessor for OpPhi)
@@ -765,9 +811,17 @@ struct SpirvCompute {
         uint32_t r = id();
         put(code, Op_Phi, {type, r, v0, l0, 0u, 0u});
         patch_off = code.size() - 2;   // the trailing {v1, l1} placeholders
+        propagate_fragment_wave_vote(r, v0);
+        fragment_wave_vote_phi_patch_results[patch_off] = r;
         return r;
     }
-    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) { code[patch_off] = v1; code[patch_off + 1] = l1; }
+    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) {
+        code[patch_off] = v1;
+        code[patch_off + 1] = l1;
+        const auto result = fragment_wave_vote_phi_patch_results.find(patch_off);
+        if (result != fragment_wave_vote_phi_patch_results.end())
+            propagate_fragment_wave_vote(result->second, v1);
+    }
     void emit_selmerge(uint32_t m) { put(code, Op_SelectionMerge, {m, 0}); }   // structured if (before condbranch)
     void emit_switch(uint32_t selector, uint32_t fallback,
                      const std::vector<std::pair<uint32_t, uint32_t>>& cases) {
@@ -868,11 +922,22 @@ struct SpirvCompute {
         replace(index + 1u, 0, bits - low_bits, low_bits);
     }
     uint32_t load_function(uint32_t type, uint32_t var) {
-        uint32_t value = id(); put(code, Op_Load, {type, value, var}); return value;
+        uint32_t value = id();
+        put(code, Op_Load, {type, value, var});
+        add_fragment_wave_vote_dependency(value, var);
+        return value;
     }
-    void store_function(uint32_t var, uint32_t value) { put(code, Op_Store, {var, value}); }
+    void store_function(uint32_t var, uint32_t value) {
+        put(code, Op_Store, {var, value});
+        // Function storage can join dynamic paths and loops. Keep an explicit dependency edge so
+        // a vote emitted later can propagate back through loads already generated by a dispatcher.
+        add_fragment_wave_vote_dependency(var, value);
+    }
     uint32_t logical_not(uint32_t value) {
-        uint32_t result = id(); put(code, Op_LogicalNot, {t_bool, result, value}); return result;
+        uint32_t result = id();
+        put(code, Op_LogicalNot, {t_bool, result, value});
+        propagate_fragment_wave_vote(result, value);
+        return result;
     }
     uint32_t subgroup_local_id() {
         if (!declared_subgroup) {
@@ -919,6 +984,7 @@ struct SpirvCompute {
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
+        mark_fragment_wave_vote_value(result);
         return result;
     }
     // Fragment-side ballot (#2412). Same exactness argument as native_wave_ballot_half, but the
@@ -1408,7 +1474,10 @@ struct SpirvCompute {
     }
     // OpPhi with two fully-known predecessors (both edges' values available now) — for an if/merge join.
     uint32_t emit_phi_2way(uint32_t type, uint32_t va, uint32_t la, uint32_t vb, uint32_t lb) {
-        uint32_t r = id(); put(code, Op_Phi, {type, r, va, la, vb, lb}); return r;
+        uint32_t r = id();
+        put(code, Op_Phi, {type, r, va, la, vb, lb});
+        propagate_fragment_wave_vote(r, va, vb);
+        return r;
     }
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
@@ -3263,6 +3332,38 @@ struct SpirvCompute {
         put(code, Op_Load, {t_u32, result, result_ptr_all});
         return ucmp(Op_INotEqual, result, zero);
     }
+    // V_READLANE_B32 at a workgroup-uniform site. Publish every invocation's source value and
+    // address the selected lane within this invocation's own guest wave. This is exact at any
+    // host subgroup width; unlike a native subgroup shuffle it does not require a Wave64 guest
+    // wave to fit inside one Vulkan subgroup. V_READLANE ignores EXEC, so publication is
+    // unconditional. Missing lanes in a partial final wave read as zero.
+    uint32_t guest_wave_readlane(uint32_t source_value, uint32_t selector) {
+        declare_wave_lds();
+        uint32_t source_ptr = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_wg_u32b, source_ptr, lds_wave, linear_localid});
+        put(code, Op_Store, {source_ptr, source_value});
+        barrier();
+
+        const uint32_t wave_shift = wave_size == 32 ? 5u : 6u;
+        const uint32_t wave_base = ibin(
+            Op_ShiftLeftLogical,
+            ibin(Op_ShiftRightLogical, linear_localid, uconst(wave_shift)),
+            uconst(wave_shift));
+        const uint32_t lane = ibin(
+            Op_BitwiseAnd, selector, uconst(wave_size - 1u));
+        const uint32_t index = ibin(Op_IAdd, wave_base, lane);
+        const uint32_t zero = uconst(0);
+        const uint32_t valid = ucmp(Op_ULessThan, index, uconst(local_count));
+        const uint32_t safe_index = sel(valid, index, zero);
+        uint32_t result_ptr = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_wg_u32b, result_ptr, lds_wave, safe_index});
+        uint32_t result = id();
+        put(code, Op_Load, {t_u32, result, result_ptr});
+        barrier();
+        return sel(valid, result, zero);
+    }
     // v_mbcnt_lo/hi: count active lanes below this one. active_bool = this lane's mask bit (EXEC); acc =
     // src1 accumulator (bits); `lo` selects the [0,32) half (lo) or [32,64) half (hi). Combined lo→hi over
     // a wave = the lane's compaction index among active lanes. Populate LDS[lane]=active, barrier, then an
@@ -3524,8 +3625,18 @@ struct SpirvCompute {
         return value;
     }
     // Logical AND / OR of two bools (EXEC narrowing / saveexec).
-    uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
-    uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
+    uint32_t land(uint32_t a, uint32_t b_) {
+        uint32_t r = id();
+        put(code, Op_LogicalAnd, {t_bool, r, a, b_});
+        propagate_fragment_wave_vote(r, a, b_);
+        return r;
+    }
+    uint32_t lor(uint32_t a, uint32_t b_) {
+        uint32_t r = id();
+        put(code, Op_LogicalOr, {t_bool, r, a, b_});
+        propagate_fragment_wave_vote(r, a, b_);
+        return r;
+    }
 
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,

@@ -1163,11 +1163,17 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
 
-void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested) {
+void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
+                            const std::string& title_id) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
+    // GTA V's reviewed Performance-mode route contains Wave64 fragment programs whose only
+    // remaining width reason is a control-flow WaveAny. The backend may run that narrow class at
+    // NVIDIA's native Wave32 only for this title; every other title keeps master's fail-visible
+    // exact-width contract, and ballots/lane identity/scalar reductions stay exact even here.
+    const bool gta5_native_fragment_vote = title_id == "PPSA04263";
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -1651,7 +1657,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     if (batch_backend_submits)
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps, invalidate_ds](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds, gta5_native_fragment_vote](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             // #2215 instrument: publish which thread is inside a submit-render callback right
@@ -6777,6 +6783,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
+                    bd.allow_native_fragment_vote_width =
+                        !fs_ov && gta5_native_fragment_vote;
                     bd.draw_index = it.draw_index;
                     bd.command_order = it.command_order;
                     bd.vcount = refvs ? 3u : it.vertex_count;

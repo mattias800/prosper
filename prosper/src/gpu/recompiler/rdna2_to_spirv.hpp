@@ -506,6 +506,11 @@ inline constexpr uint32_t kFragmentWaveReasonShuffle    = 1u << 5;  // lane-addr
 // be. Reporting both as "wave-any" made the recoverable and unrecoverable cases one number: on
 // PPSA04263 that number was 68 of 112 skipped fragment shaders, with no way to ask how it divides.
 inline constexpr uint32_t kFragmentWaveReasonWaveBallot = 1u << 6;  // OpGroupNonUniformBallot (reduce)
+// A WaveAny result that reaches a guest scalar-data consumer. A native Wave32 subgroup may
+// disagree with the other half of the guest Wave64, so this qualifier always retains the exact
+// width contract. Kept separate from WaveAny so a title-scoped, empirically reviewed control-flow
+// route cannot accidentally admit a scalar reduction.
+inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.

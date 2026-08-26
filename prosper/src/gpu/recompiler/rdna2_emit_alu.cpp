@@ -220,9 +220,27 @@ uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
+static bool instruction_reads_scc_as_scalar_data(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::SOP2:
+            return in.opcode == kSop2OpcodeAddcU32 || in.opcode == 0x05u ||
+                   in.opcode == kSop2OpcodeCselectB32 ||
+                   in.opcode == kSop2OpcodeCselectB64;
+        case Rdna2Format::SOP1:
+            return in.opcode == kSop1OpcodeCmovB32 ||
+                   in.opcode == kSop1OpcodeCmovB64;
+        case Rdna2Format::SOPK:
+            return in.opcode == kSopkOpcodeCmovkI32;
+        default:
+            return false;
+    }
+}
+
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
               const std::unordered_set<uint32_t>* safe_execz, bool allow_smem,
               const ShaderResourceTable* rt, bool allow_wave) {
+    if (b.is_fragment && instruction_reads_scc_as_scalar_data(in))
+        b.mark_fragment_wave_scalar_use(rs.scc);
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o, &ok); };
     auto write_vop3b_carry_output = [&](uint32_t carry_mask) {
@@ -2080,9 +2098,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value] = result;
                     rs.sreg_srt.erase(in.dst.value);
                     rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+                    const bool writes_hi = in.dst.value == 107;
+                    // A whole-CFG proof can establish that this physical VCC word is scalar data
+                    // only: the untouched sibling dies before any mask-domain read. Do not ask for
+                    // a guest lane merely to manufacture a predicate that no later instruction can
+                    // observe. Vertex emission has a separate one-lane virtual-wave contract, so
+                    // this applies only to fragment and compute stages.
+                    const bool scalar_low_only = (b.is_fragment || b.is_compute) &&
+                        b.vcc_b32_low_only_pcs.contains(in.pc);
+                    if (b.wave_size != 32 && scalar_low_only) {
+                        rs.vcc = 0;
+                        rs.sreg_bool.erase(106);
+                        rs.sreg_bool_narrowed.erase(106);
+                        rs.sreg_bool_b32.erase(106);
+                        rs.sreg_bool.erase(107);
+                        rs.sreg_bool_narrowed.erase(107);
+                        rs.sreg_bool_b32.erase(107);
+                        return true;
+                    }
                     uint32_t lane = b.guest_lane_id();
                     lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(b.wave_size - 1));
-                    const bool writes_hi = in.dst.value == 107;
                     const uint32_t in_written_half = writes_hi
                         ? b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32))
                         : b.ucmp(Op_ULessThan, lane, b.uconst(32));
@@ -2092,8 +2127,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ibin(Op_BitwiseAnd,
                                b.ibin(Op_ShiftRightLogical, result, bit), b.uconst(1)),
                         b.uconst(0));
-                    const bool scalar_low_only = b.is_compute &&
-                        b.vcc_b32_low_only_pcs.contains(in.pc);
                     if (b.wave_size == 32) {
                         // A complete scalar write covers every architectural bit of VCC_LO in
                         // Wave32, so it establishes a fresh predicate without needing the old VCC
@@ -3978,15 +4011,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (source == rs.vreg.end()) { ok = false; return true; }
                     const uint32_t selector = val(in.src[1]);
                     if (!ok) return true;
-                    if (b.wave_size == 64) b.mark_subgroup_min64();
-                    else b.mark_subgroup_min32();
-                    const uint32_t native_lane = b.subgroup_local_id();
-                    const uint32_t wave_mask = b.uconst(b.wave_size - 1u);
-                    const uint32_t wave_base = b.ibin(
-                        Op_BitwiseAnd, native_lane, b.uconst(~(b.wave_size - 1u)));
-                    const uint32_t source_lane = b.ibin(
-                        Op_BitwiseOr, wave_base, b.ibin(Op_BitwiseAnd, selector, wave_mask));
-                    const uint32_t result = b.subgroup_shuffle(source->second, source_lane);
+                    uint32_t result = 0;
+                    if (allow_wave && b.is_compute &&
+                        b.native_subgroup_size != b.wave_size) {
+                        // A workgroup-uniform site can model the guest wave exactly through
+                        // scratch even when a Wave64 guest does not fit in the host subgroup.
+                        result = b.guest_wave_readlane(source->second, selector);
+                    } else {
+                        if (b.wave_size == 64) b.mark_subgroup_min64();
+                        else b.mark_subgroup_min32();
+                        const uint32_t native_lane = b.subgroup_local_id();
+                        const uint32_t wave_mask = b.uconst(b.wave_size - 1u);
+                        const uint32_t wave_base = b.ibin(
+                            Op_BitwiseAnd, native_lane, b.uconst(~(b.wave_size - 1u)));
+                        const uint32_t source_lane = b.ibin(
+                            Op_BitwiseOr, wave_base,
+                            b.ibin(Op_BitwiseAnd, selector, wave_mask));
+                        result = b.subgroup_shuffle(source->second, source_lane);
+                    }
                     rs.sreg[in.dst.value] = result;
                     rs.sreg_bool.erase(in.dst.value);
                     rs.sreg_bool_narrowed.erase(in.dst.value);
@@ -7565,15 +7607,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
+                const bool load_2d_array = b.is_compute && in.opcode == 0x00 &&
+                    in.mimg_dim == 5u && res->img_dim == 5u;
                 const bool mip_load_2d_array = b.is_compute && is_zero_mip_load &&
                     in.mimg_dim == 5u && res->img_dim == 5u;
                 const bool array_sample = b.is_compute && in.mimg_dim == 5u &&
                     res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
-                const bool host_array = mip_load_2d_array || array_sample || msaa_array_fetch;
+                const bool host_array = load_2d_array || mip_load_2d_array ||
+                    array_sample || msaa_array_fetch;
                 if (!b.declare_texture(res->binding, Dim_2D, uint_texture, host_array)) {
                     ok = false; return true;
                 }
-                if (msaa_array_fetch || mip_load_2d_array) {
+                if (msaa_array_fetch || load_2d_array || mip_load_2d_array) {
                     b.image_fetch_2d_array(
                         res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 } else if (array_sample) {
