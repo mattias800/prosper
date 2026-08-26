@@ -107,7 +107,7 @@ Two further details cost time and are worth keeping:
 - **"The world samples its array with a non-array instruction, so it always reads slice 0" — false.**
   A full census over a gameplay route — the whole population, not a sample — found **every** MIMG
   touching an array texture uses `DIM=5`: op `0x2f` on bindings 39-46 at depth 1 (64 events), and
-  op `0x20` on bindings 34/36/47 (20 events, of which 12 are at depth 256; binding 34's four span
+  op `0x20` on bindings 34/36/39/47 (17 events, of which 14 are at depth 256; binding 34's four span
   depths 1/29/32/256). The census is not circular: it selects on the resource's `img_dim` and
   reports the *instruction's* `mimg_dim`, which are independent fields. There is no DIM≠5 case to
   explain the flat world (#2998).
@@ -115,8 +115,8 @@ Two further details cost time and are worth keeping:
   13 distinct hashes for one array binding and 8 for another, so the decoder does not replicate the
   base slice (#2998).
 - **Forcing the array layer to a constant changes nothing for the plain-SAMPLE path.** A probe
-  substituting a constant layer *and printing when it does* fired on the four bindings reached by op
-  `0x20`, and the gameplay frame was unchanged — identical average- and difference-hash, luma
+  substituting a constant layer *and printing when it does* fired on all four bindings reached by op
+  `0x20` (34/36/39/47), and the gameplay frame was unchanged — identical average- and difference-hash, luma
   differing in one byte of 288. **Scope, because the first version of this line overstated it:** the
   probe sits in the implicit-LOD array sampler only, so it covers the `0x20` events and
   *structurally cannot* cover the 64 `SAMPLE_C_LZ` (`0x2f`) events, which take a different lowering.
