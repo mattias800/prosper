@@ -1658,18 +1658,79 @@ int main() {
                             code17d1_vcc_low_cselect_pair_read.size(), nullptr,
                             native_cfg17d).empty(),
           "same-site B64 CSELECT mutation observes VCC_HI and remains fail-visible");
+    // THESE TWO ARMS ARE INVERTED DELIBERATELY, and the reason is an ISA fact rather than a
+    // convenience. Both used to require a decline, which was correct while the dead-sibling proof
+    // ran under ScalarMergeProof::AnyRead. It now runs under MaskDomainOnly, whose entire purpose is
+    // to admit a SCALAR-DATA touch of the half while still refusing any mask-domain observation --
+    // so a data read of VCC_HI must now be ACCEPTED, and asserting otherwise pins conservatism the
+    // tree deliberately gave up.
+    //
+    // The mask-domain half of the contract is NOT weakened by this, and is still pinned above by
+    // the pair-reading and B64-CSELECT arms, which continue to require a decline.
+    //
+    // Arm 1, `S_WAITCNT_VSCNT` with VCC_HI in place of NULL. The encoded field is a SOURCE, not a
+    // destination. "RDNA 2" ISA (document 70648), S_WAITCNT_VSCNT: it waits until
+    //     vscnt <= S0.u[5:0] + S1.u[5:0]
+    // and says "To wait on a literal constant only, write 'null' for the GPR argument" -- which is
+    // exactly why NULL is the register-transparent spelling. So this reads SIX BITS of the half as a
+    // number; it cannot consume it as a 64-bit lane mask. The same reading of the encoding appears
+    // elsewhere in this tree -- rdna2_emit_alu.cpp's `case 0x13` (s_setreg_b32) says "The encoded
+    // SDST field is the SOURCE SGPR" -- though note that is a DIFFERENT SOPK opcode, not a waitcnt
+    // sibling, so the ISA reference above is what actually establishes it for 23/24/25/26.
+    //
+    // Arm 2's comment was also wrong about its own bytes. 0xb70803fb is SOPK opcode 14, and the ISA
+    // opcode table gives 14 = S_CMPK_LE_U32 (S_ADDK_I32 is 15). It compares s8 against 1019 and
+    // writes SCC, and touches no VCC word at all.
+    //
+    // Its admission does NOT follow from that, and saying so would be wrong: the SOPK case in
+    // sgpr_dead_at_merge is fail-closed PER FORMAT, not per register. Delete the data-read
+    // admission and this same compare on an unrelated SGPR is declined as `unmodelled-sopk`. So what
+    // this arm pins is the MaskDomainOnly data-read RULE, not a property of s8.
+    //
+    // A previous attempt "fixed" arm 1 by making sgpr_dead_at_merge refuse a non-NULL
+    // WAITCNT_VSCNT. That was withdrawn: it rested on the inverted reading above, bought no
+    // soundness (the emitter's case 0x17 only acts on dst==125 && simm16==0 and otherwise emits
+    // nothing, so the SGPR never reaches SPIR-V), and covered one of the four identically-encoded
+    // waitcnt opcodes -- 23/24/25/26 in the ISA table -- leaving the other three open.
     std::vector<uint32_t> code17d1_vcc_low_sopk_write = code17d1_vcc_low_add3;
     code17d1_vcc_low_sopk_write[15] = 0xbbeb0000u; // same opcode: VCC_HI replaces NULL source
-    CHECK(recompile_compute(code17d1_vcc_low_sopk_write.data(),
-                            code17d1_vcc_low_sopk_write.size(), nullptr,
-                            native_cfg17d).empty(),
-          "same-site non-null WAIT source observes VCC_HI and remains fail-visible");
+    CHECK(!recompile_compute(code17d1_vcc_low_sopk_write.data(),
+                             code17d1_vcc_low_sopk_write.size(), nullptr,
+                             native_cfg17d).empty(),
+          "a non-null WAIT source reads VCC_HI as scalar data and is admitted");
     std::vector<uint32_t> code17d1_vcc_low_sopk_rmw = code17d1_vcc_low_add3;
-    code17d1_vcc_low_sopk_rmw[17] = 0xb70803fbu; // same pc282 site: s_addk_i32 is RMW
-    CHECK(recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
-                            code17d1_vcc_low_sopk_rmw.size(), nullptr,
+    code17d1_vcc_low_sopk_rmw[17] = 0xb70803fbu; // same pc282 site: s_cmpk_le_u32 s8, 1019
+    CHECK(!recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
+                             code17d1_vcc_low_sopk_rmw.size(), nullptr,
+                             native_cfg17d).empty(),
+          "an SOPK scalar-data compare is admitted by the MaskDomainOnly data-read rule");
+
+    // COMPANION DECLINE ARMS, and the reason they exist is a weakness of the two arms above rather
+    // than a further property of the tree.
+    //
+    // An arm asserting `!empty()` cannot notice its own mutation going inert. Delete the mutation
+    // entirely and the assertion still passes, because the unmutated shader compiles too -- so the
+    // two arms above prove that the data-read rule admits, but NOT that the walk still reaches these
+    // sites at all. If a future edit stops the proof from ever visiting index 15 or 17, they would
+    // stay green while covering nothing.
+    //
+    // These two pin the other half: the SAME sites, mutated instead into a MASK-domain observation,
+    // must still decline. 0x02000100 is VOP2 opcode 1, `v_cndmask_b32_e32 v0, v0, v0`, which reads
+    // VCC implicitly -- verified by decoding the word with shader_inspect rather than by assuming
+    // the encoding. A decline here means the walk reached the site and refused for the right reason;
+    // together with the arms above it distinguishes "admits data reads" from "never looked".
+    std::vector<uint32_t> code17d1_vcc_low_mask_read_15 = code17d1_vcc_low_add3;
+    code17d1_vcc_low_mask_read_15[15] = 0x02000100u;
+    CHECK(recompile_compute(code17d1_vcc_low_mask_read_15.data(),
+                            code17d1_vcc_low_mask_read_15.size(), nullptr,
                             native_cfg17d).empty(),
-          "same-site SOPK RMW mutation remains conservative in the death proof");
+          "a mask-domain VCC read at the WAIT site still declines, so the walk reaches it");
+    std::vector<uint32_t> code17d1_vcc_low_mask_read_17 = code17d1_vcc_low_add3;
+    code17d1_vcc_low_mask_read_17[17] = 0x02000100u;
+    CHECK(recompile_compute(code17d1_vcc_low_mask_read_17.data(),
+                            code17d1_vcc_low_mask_read_17.size(), nullptr,
+                            native_cfg17d).empty(),
+          "a mask-domain VCC read at the compare site still declines, so the walk reaches it");
 
     // The complete captured CFG is essential here. Its pc213 VOPC replaces both physical VCC
     // words with a wave mask, then pc227 starts a fresh scalar lifetime in VCC_LO only. A stale
