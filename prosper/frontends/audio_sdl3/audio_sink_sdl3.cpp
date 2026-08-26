@@ -9,32 +9,29 @@
 #include "host/platform/lifecycle.hpp"
 #include "host/platform/precise_sleep.hpp"   // the grain pacer must not quantize to the winpthreads tick (#3016)
 
-namespace {
-// Off by default: reading the device queue at every handoff is cheap, but an instrument that runs
-// unasked is how a measurement pass ends up measuring itself.
-bool legacy_pacer() {
-    static const bool on = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
-    return on;
-}
-
-bool queue_trace() {
-    static const bool on = getenv("PROSPER_AUDIO_QUEUE_TRACE") != nullptr;
-    return on;
-}
-}  // namespace
-
-
 #include <SDL3/SDL.h>
 
 #include <array>
-#include <cstdlib>   // getenv: the trace/legacy gates below. Transitive via libstdc++ on GCC, absent on clang.
 #include <chrono>
+#include <cstdlib>   // getenv, for the opt-in gates below (transitive via libstdc++, not via libc++)
 #include <mutex>
 #include <thread>
 #include <string>
 
 namespace prosper {
 namespace {
+
+// Both off by default: reading the device queue at every handoff is cheap, but an instrument that
+// runs unasked is how a measurement pass ends up measuring itself (#2113).
+bool legacy_pacer() {
+    static const bool on = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
+    return on;
+}
+bool queue_trace() {
+    static const bool on = getenv("PROSPER_AUDIO_QUEUE_TRACE") != nullptr;
+    return on;
+}
+
 
 // 16 public sceAudioOut ports plus four host-only streams for concurrent AudioOut2 contexts.
 // SDL mixes the bound streams into the same playback device while each retains its own pacing
