@@ -1321,6 +1321,82 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
     return has_odd && odd_zero && all_small && any_nonzero;
 }
 
+// #304, part two: the SAME unannounced 32-bit index buffer, but with indices at or above 0x10000.
+//
+// The detector above requires every high half to be ZERO, which is only true while a title's
+// indices stay under 65536. Tomb Raider I-III Remastered (PPSA16901) draws its level geometry out
+// of one shared ~775,000-vertex pool, so a draw's indices sit in a 64 KiB window well above zero
+// and every high half is the same NON-ZERO constant. The zero-fingerprint cannot see that, the
+// buffer is read as 16-bit, and every triangle becomes a degenerate (N, K, N) sliver -- which is
+// what shatters that title's world into stretched triangles while its character meshes, whose
+// index buffers are genuinely 16-bit, render correctly in the same frame.
+//
+// Measured on a live boot to Croft Manor (2026-08-26): 508,688 indexed draws, every one of them
+// reporting index_type=0, i.e. the title announces an index size exactly never. Of the draws whose
+// two readings were both sampled, 56,703 carry the zero high half the detector above already
+// catches and 21,567 carry a non-zero constant one, with 32-bit readings like
+// 428289,428290,428291,428292 and 596074..596077 -- consecutive, tightly clustered, and inside the
+// pool's record count.
+//
+// Fingerprint, every clause required:
+//   * at least `kMinSamples` entries, so "every odd word is equal" is a real constraint and not an
+//     accident of a 2-entry buffer;
+//   * every ODD 16-bit word is the same NON-ZERO value (one 64 KiB index window). A genuine 16-bit
+//     index list fails here: its odd entries are ordinary indices and vary.
+//   * read as 32-bit, the values span less than one 64 KiB window, stay under a plausibility cap,
+//     are not all zero, and are not all identical.
+// Zero high halves are deliberately left to the detector above so that every buffer it already
+// classifies keeps its existing verdict; this one only ever sees buffers that one rejected.
+// CONFIDENCE: HIGH for the fingerprint; the cap is a guard, not a measurement.
+inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const uint32_t* p32,
+                                                  uint32_t n) {
+    constexpr uint32_t kMinSamples = 8;                 // >= 4 words per parity before "all equal" means anything
+    constexpr uint32_t kMaxPlausibleIndex = 1u << 24;   // 16.7M vertices; a guard against garbage
+    constexpr uint32_t kMinDistinct = 4;                // a real index list is not two repeated values
+    if (n < kMinSamples) return false;
+    const uint32_t m = std::min(n, 64u);
+
+    // The 32-bit reading is the authoritative one: it is taken at the RECOMPUTED address, which for
+    // a DrawIndexOffset is a different address entirely (index_base + index_offset*4, not *2), so
+    // this is genuinely independent evidence rather than a restatement of the 16-bit shape.
+    uint32_t lo = UINT32_MAX, hi = 0;
+    bool any_nonzero = false;
+    uint32_t distinct = 0, seen[kMinDistinct] = {};
+    for (uint32_t i = 0; i < m; i++) {
+        uint32_t d; memcpy(&d, (const char*)p32 + 4u * i, 4);
+        if (d >= kMaxPlausibleIndex) return false;
+        if (d != 0) any_nonzero = true;
+        lo = std::min(lo, d); hi = std::max(hi, d);
+        if (distinct < kMinDistinct) {
+            bool dup = false;
+            for (uint32_t k = 0; k < distinct; k++) if (seen[k] == d) { dup = true; break; }
+            if (!dup) seen[distinct++] = d;
+        }
+    }
+    if (!any_nonzero || distinct < kMinDistinct) return false;
+    if ((hi - lo) >= 0x10000u) return false;            // must fit one 64 KiB index window
+
+    // The 16-bit reading must carry the degenerate fingerprint: one PARITY holds the repeated high
+    // half. Which parity depends on the alignment of the 16-bit address against the 32-bit grid --
+    // a DrawIndexOffset scaled by 2 instead of 4 lands 2 mod 4 as often as not, and on this title's
+    // Croft Manor frame the even parity carries it for 55,677 draws against 21,871 for the odd one.
+    // Checking only one parity silently misses most of the corruption. A genuine 16-bit index list
+    // fails both: its entries are ordinary indices at every position and vary.
+    bool even_const = true, odd_const = true;
+    uint16_t even0 = 0, odd0 = 0;
+    bool have_even = false, have_odd = false;
+    for (uint32_t i = 0; i < m; i++) {
+        // memcpy loads, NOT typed derefs: p16/p32 view the SAME guest bytes and reading one object
+        // through both element types is strict-aliasing UB (see the note on the detector above).
+        uint16_t w; memcpy(&w, (const char*)p16 + 2u * i, 2);
+        if (i & 1) { if (!have_odd)  { odd0  = w; have_odd  = true; } else if (w != odd0)  odd_const  = false; }
+        else       { if (!have_even) { even0 = w; have_even = true; } else if (w != even0) even_const = false; }
+    }
+    const bool fingerprint = (have_even && even_const && even0 != 0) ||
+                             (have_odd  && odd_const  && odd0  != 0);
+    return fingerprint;
+}
+
 // #1163: choose a NON-INDEXED draw's vertex count. A DrawIndexAuto packet's count (draw_count) is the
 // AUTHORITATIVE hardware vertex count — the GPU draws exactly that many vertices with auto indices
 // 0..draw_count-1. The bound vertex buffer's record count (vb_records = size/stride) is ONLY a fallback for
@@ -2016,13 +2092,60 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         if (esz == 2 && n >= 2) {
             uint64_t addr32 = draw->from_offset ? (draw->index_base + (uint64_t)draw->index_offset * 4u)
                                                 : draw->index_addr;
-            if (guest_readable(draw->index_addr, n * 2u) && guest_readable(addr32, n * 4u) &&
-                index_buffer_is_unannounced_32bit((const uint16_t*)(uintptr_t)draw->index_addr,
-                                                  (const uint32_t*)(uintptr_t)addr32, n)) {
-                esz = 4; index_addr = addr32;
-                if (log) fprintf(stderr, "[exec] indexed draw: auto-detected 32-bit index buffer "
-                                 "(unannounced) at 0x%llx (was 16-bit 0x%llx)\n",
-                                 (unsigned long long)addr32, (unsigned long long)draw->index_addr);
+            // PROSPER_INDEXTYPE_LOG=1 -- what the guest ANNOUNCED against what its bytes actually
+            // hold. Without it, "the title never set an index size" and "it set one and we dropped
+            // it" produce identical evidence and point at different files; #304 and its part-two
+            // sibling below both turn on that distinction. Prints index_type plus the same bytes
+            // read both ways, so the fingerprint is checkable by eye. BOUNDED: a boot issues
+            // hundreds of thousands of indexed draws (508,688 measured on one Tomb Raider run), and
+            // an unbounded line-per-draw log is a multi-gigabyte file that fills the disk before it
+            // answers anything. The cap is announced so a truncated log is never read as a count.
+            if (getenv("PROSPER_INDEXTYPE_LOG")) {
+                static std::atomic<uint32_t> printed{0};
+                constexpr uint32_t kMaxLines = 64;
+                const uint32_t seq = printed.fetch_add(1);
+                if (seq < kMaxLines) {
+                    char line[512]; int off = 0;
+                    off += snprintf(line + off, sizeof(line) - off,
+                                    "[idxtype] index_type=%u esz=%u n=%u from_offset=%u addr=0x%llx addr32=0x%llx",
+                                    ds.index_type, esz, n, (unsigned)draw->from_offset,
+                                    (unsigned long long)draw->index_addr, (unsigned long long)addr32);
+                    if (guest_readable(draw->index_addr, 16u)) {
+                        off += snprintf(line + off, sizeof(line) - off, " u16=");
+                        for (uint32_t k = 0; k < 8 && off < (int)sizeof(line) - 8; k++) {
+                            uint16_t w; memcpy(&w, (const char*)(uintptr_t)draw->index_addr + 2u * k, 2);
+                            off += snprintf(line + off, sizeof(line) - off, "%s%u", k ? "," : "", (unsigned)w);
+                        }
+                    }
+                    if (guest_readable(addr32, 16u)) {
+                        off += snprintf(line + off, sizeof(line) - off, " u32=");
+                        for (uint32_t k = 0; k < 4 && off < (int)sizeof(line) - 12; k++) {
+                            uint32_t w; memcpy(&w, (const char*)(uintptr_t)addr32 + 4u * k, 4);
+                            off += snprintf(line + off, sizeof(line) - off, "%s%u", k ? "," : "", w);
+                        }
+                    }
+                    fprintf(stderr, "%s\n", line);
+                    if (seq + 1 == kMaxLines)
+                        fprintf(stderr, "[idxtype] line cap %u reached; further indexed draws are not "
+                                        "printed (this is a CAP, not a draw count)\n", kMaxLines);
+                }
+            }
+            if (guest_readable(draw->index_addr, n * 2u) && guest_readable(addr32, n * 4u)) {
+                const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw->index_addr;
+                const uint32_t* p32 = (const uint32_t*)(uintptr_t)addr32;
+                // Zero high halves first, so every buffer that detector already classifies keeps
+                // its existing verdict; the constant-non-zero form (#304 part two) only ever sees
+                // what it rejected.
+                const char* how = nullptr;
+                if (index_buffer_is_unannounced_32bit(p16, p32, n))            how = "zero-high-half";
+                else if (index_buffer_is_unannounced_32bit_high(p16, p32, n))  how = "constant-high-half";
+                if (how) {
+                    esz = 4; index_addr = addr32;
+                    if (log) fprintf(stderr, "[exec] indexed draw: auto-detected 32-bit index buffer "
+                                     "(unannounced, %s) at 0x%llx (was 16-bit 0x%llx)\n",
+                                     how, (unsigned long long)addr32,
+                                     (unsigned long long)draw->index_addr);
+                }
             }
         }
         if (esz == 0) {

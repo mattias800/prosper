@@ -50,6 +50,72 @@ int main() {
     // small-index quad -> reject (the fingerprint requires all values < 0x10000).
     CHECK(!detect32({0x10005, 1, 2}, 3), "32-bit indices >= 0x10000 -> not the quad fingerprint");
 
+    // ---------------------------------------------------------------------------------------
+    // #304 part two: the same unannounced 32-bit buffer with indices AT OR ABOVE 0x10000.
+    //
+    // Tomb Raider I-III Remastered (PPSA16901) draws its level from one ~775,000-vertex pool, so a
+    // draw's indices sit in a 64 KiB window above zero and the repeated high half is a NON-ZERO
+    // constant, which the fingerprint above cannot match (its last assertion pins that).
+    //
+    // The two pointers address DIFFERENT memory here, and that is not an artifact of the test: for a
+    // DrawIndexOffset the 16-bit address is index_base + offset*2 while the 32-bit one is
+    // index_base + offset*4, so they diverge. Every vector below is a live capture from a boot to
+    // Croft Manor (2026-08-26), paired as the executor sees them.
+    printf("-- part two: constant non-zero high half --\n");
+
+    auto detect_high = [](std::vector<uint16_t> i16, std::vector<uint32_t> i32, uint32_t n) {
+        i16.resize(i16.size() + 2 * n, 0);
+        i32.resize(i32.size() + n, 0);
+        return index_buffer_is_unannounced_32bit_high(i16.data(), i32.data(), n);
+    };
+
+    // Odd parity carries the high half (the 16-bit address is 4-byte aligned).
+    CHECK(detect_high({33161, 3, 33160, 3, 33159, 3, 33162, 3},
+                      {428291, 428290, 428289, 428292, 428293, 428294, 428295, 428296}, 8),
+          "TR world draw, odd-parity high half -> 32-bit");
+    // Even parity carries it (the 16-bit address is 2 mod 4). 55,677 of the frame's draws look like
+    // this against 21,871 of the shape above, so checking one parity misses most of the corruption.
+    CHECK(detect_high({2, 41911, 2, 41916, 2, 41915, 2, 41913},
+                      {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8),
+          "TR world draw, even-parity high half -> 32-bit");
+
+    // Genuine 16-bit buffers from the SAME frame must be left alone. Each is rejected by a
+    // different clause, which is why all three are kept.
+    CHECK(!detect_high({36, 37, 41, 36, 41, 40, 37, 38},
+                       {5308496, 5242965, 5505109, 5701718, 5308496, 5242965, 5505109, 5701718}, 8),
+          "TR character quad -> stays 16-bit (32-bit span too wide)");
+    CHECK(!detect_high({4436, 4435, 4434, 4436, 4434, 4437, 4436, 4437},
+                       {3256607121u, 3280918884u, 3242189160u, 3256607121u,
+                        3280918884u, 3242189160u, 3256607121u, 3280918884u}, 8),
+          "TR 16-bit mesh -> stays 16-bit (32-bit values past the plausibility cap)");
+    CHECK(!detect_high({0, 1, 2, 3, 4, 2, 0, 5},
+                       {65536, 196610, 131076, 327680, 65536, 196610, 131076, 327680}, 8),
+          "16-bit list whose aliased dwords are small-ish -> stays 16-bit (no constant parity)");
+
+    // Mutation arms: take the confirmed even-parity case and break exactly one clause each. Without
+    // these the positive above cannot distinguish "the fingerprint matched" from "the function
+    // returns true for anything shaped roughly like this".
+    CHECK(!detect_high({2, 41911, 7, 41916, 2, 41915, 9, 41913},
+                       {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8),
+          "mutation: parity no longer constant -> rejected");
+    CHECK(!detect_high({2, 41911, 2, 41916, 2, 41915, 2, 41913},
+                       {301685, 999999, 301683, 301686, 301687, 301688, 301689, 301690}, 8),
+          "mutation: 32-bit span exceeds one 64 KiB window -> rejected");
+    CHECK(!detect_high({2, 41911, 2, 41916, 2, 41915, 2, 41913},
+                       {301685, 301685, 301685, 301685, 301685, 301685, 301685, 301685}, 8),
+          "mutation: 32-bit reading has one repeated value -> rejected");
+    CHECK(!detect_high({0, 41911, 0, 41916, 0, 41915, 0, 41913},
+                       {301685, 301684, 301683, 301686, 301687, 301688, 301689, 301690}, 8),
+          "mutation: zero high half is the other detector's case -> rejected here");
+    CHECK(!detect_high({2, 41911, 2, 41916},
+                       {301685, 301684, 301683, 301686}, 4),
+          "mutation: too few samples for 'constant parity' to mean anything -> rejected");
+
+    // The two detectors must not overlap: what the zero-high-half one accepts, this one declines,
+    // so the call site's ordering can never change an existing verdict.
+    CHECK(!detect_high({0, 0, 1, 0, 2, 0, 17, 0}, {0, 1, 2, 17, 0, 1, 2, 17}, 8),
+          "DOLL zero-high-half quad -> declined here, still owned by the original detector");
+
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }

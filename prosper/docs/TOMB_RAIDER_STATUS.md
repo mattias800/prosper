@@ -3,12 +3,13 @@
 Tracker: [#2990](https://github.com/mattias800/prosper/issues/2990).
 Route files and the menu map: `prosper/scripts/tomb-raider-PPSA16901/AGENTS.md`.
 
-**Rung 2** — the Tomb Raider I title screen is reached and rendered on a default launch.
+**Rung 3** — Croft Manor runs with real GPU draws and the scene renders with correct geometry.
+Every surface is still untextured ([#2998](https://github.com/mattias800/prosper/issues/2998)),
+which is what keeps this below a rung-4 claim.
 
-The headline fact about this title is that **no prosper code change was needed to get here.** It
-booted and rendered real 1920x1080 frames on the first attempt, and everything below rung 3 was
-reached with pad input alone. Prior to 2026-08-26 the title had no record anywhere in this
-repository — no `COMPATIBILITY.md` row, no tracker, no mention in any source file or script.
+Prior to 2026-08-26 the title had no record anywhere in this repository — no `COMPATIBILITY.md`
+row, no tracker, no mention in any source file or script. It reached rung 2 with **no prosper code
+change at all**; rung 3 needed exactly one fix, below.
 
 ## The dump
 
@@ -21,46 +22,88 @@ submit-race signature ever shows up here, though nothing so far points that way.
 
 | State | Result |
 | --- | --- |
-| EULA gate (40 pages) | renders and scrolls; body text garbled (below) |
+| EULA gate (40 pages) | renders and scrolls; body text garbled (#2999) |
 | Publisher/developer logos | correct — the Saber Interactive logo is pixel-clean |
 | Tomb Raider I title screen | logo, Lara portrait, animated ring menu and labels all correct |
-| Tomb Raider III title screen | logo, Lara model and background art correct; ring area is a solid violet block |
-| Croft Manor (`Lara's Home`) | live 3D scene, animating; **severely degraded** (below) |
+| Tomb Raider II title screen | logo, Lara model, villain silhouette and background all correct |
+| Tomb Raider III title screen | art correct; ring area is a solid violet block |
+| Croft Manor (`Lara's Home`) | correct geometry, correct character models, **untextured** (#2998) |
+
+## The one fix that produced rung 3: an unannounced 32-bit index buffer with large indices
+
+The world used to render as long stretched triangles radiating from a point, while character meshes
+in the same frame were shaped correctly. That was **#304's defect, in a form its detector could not
+see**.
+
+This title announces an index size **exactly never**: `index_type=0` on all **508,688** indexed
+draws of a boot to Croft Manor. Its world index buffers are nevertheless 32-bit, because the level
+is drawn from one shared **775,111-vertex** pool — which 16-bit indices cannot address. Read as
+16-bit, each 32-bit index becomes two, and every triangle collapses to a degenerate `(N, K, N)`
+sliver.
+
+`index_buffer_is_unannounced_32bit` already recovers exactly this case for DOLL, but its fingerprint
+requires every high half to be **zero**, i.e. every index below 65536. Here the indices sit in a
+64 KiB window *above* zero, so the repeated high half is a small **non-zero** constant and the
+fingerprint cannot match. `index_buffer_is_unannounced_32bit_high` handles that form.
+
+Two details cost time and are worth keeping:
+
+- **The constant lands on either PARITY.** Which one depends on the alignment of the 16-bit address
+  against the 32-bit grid: a `DrawIndexOffset` scaled by 2 instead of 4 lands 2 mod 4 as often as
+  not. On the sampled frame the **even** parity carried it for 55,677 draws against 21,871 for the
+  odd one, so a first version that checked only odd words fixed a visible minority of the scene and
+  left the world shattered. Check both.
+- **The 16-bit and 32-bit addresses are different memory**, not two views of the same bytes, for any
+  `DrawIndexOffset` — `index_base + offset*2` against `index_base + offset*4`. The regression test
+  therefore feeds the detector two independent arrays, as the executor does.
 
 ## Open defects
 
-1. **Gameplay world geometry is shattered and untextured.** In Croft Manor the character models are
-   correct and recognisable — Lara's silhouette and Winston carrying the tea tray both read
-   immediately — while the static level geometry is torn into long stretched triangles and every
-   surface draws untextured. This is what holds the title at rung 2 rather than rung 3.
-2. **Text is intermittently garbled.** The EULA body and the Tomb Raider III title labels draw the
-   wrong glyphs; the *same font* renders correctly for the `EULA` heading, the `1/40` page counter
-   and every Tomb Raider I ring label. Right font, right layout, wrong glyph selection — so this is
-   a selection or source-string problem, not a rasterization one.
-3. **Solid untextured quads on the menus** — small magenta quads on the Tomb Raider I ring and a
-   large violet block over the whole Tomb Raider III ring. Plausibly the same root cause as (1),
-   since both are "a surface that should be textured is not", but that link is a hypothesis and has
-   not been tested.
+1. **Every world and character surface is untextured** and the scene is over-bright
+   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The atlas is bound and holds real
+   data (84 MB non-zero), nothing is rejected, and the menus are fully textured.
+2. **Text is intermittently garbled** ([#2999](https://github.com/mattias800/prosper/issues/2999)) —
+   the EULA body and the title-screen game selector draw the wrong glyphs while the same font
+   renders headings, numerals and every ring label correctly.
+3. **Solid untextured quads on the menus** — small pale quads on the Tomb Raider I and II rings and
+   a large violet block over the whole Tomb Raider III ring.
 4. **No savedata is written, and the ring menu has no passport item.** No `savedata0` directory
    appears across a full boot, and the five-item ring carries no New Game or Load Game. Whether
    those are one defect or two is unestablished.
 
 ## Ruled out
 
-- **The renderer is not rejecting anything.** A full boot-to-gameplay run produces **zero**
-  `[recompile-reject]` lines and **zero** `[compute] skip` lines, so neither the missing textures
-  nor the torn geometry is an unsupported-op gap. Whatever is wrong is semantic — prosper is
-  executing the title's draws and getting a wrong answer, not declining to execute them.
-  (run08, 2026-08-26, `606fd6ae`.)
-- **The EULA hold is not a hang, and not a renderer stall.** A no-input launch sits on a single
-  distinct frame for its whole run, which reads exactly like a stalled title; it is the game waiting
-  for input on page 1 of 40. The tell is that the *content* is a correctly rendered EULA page.
-  Cross does not clear it — only reaching page 40 does.
-- **Acceptance is not persisted, so route desync is not a savedata-staleness effect.** No
-  `savedata0` directory is created at all, and the EULA re-shows identically on every cold start.
+- **The renderer is not rejecting anything, and never was.** A full boot-to-gameplay run produces
+  **zero** `[recompile-reject]` lines and **zero** `[compute] skip` lines. Neither the shattered
+  geometry (now fixed) nor the missing textures (still open) is an unsupported-op gap — prosper
+  executes the title's draws and gets a wrong answer, rather than declining them. (run08, `606fd6ae`.)
+- **The vertex data and its descriptors were never wrong.** The world's positions decode cleanly as
+  `Sint16 x 4` at stride 20 — quantized on the 1024-unit grid the original games used, spanning a
+  sane room-sized box — and the four attribute V#s tile the 20-byte record exactly. The shattering
+  was entirely downstream, in the index buffer. Do not re-open the vertex-format path on the strength
+  of the geometry looking torn.
+- **#305's user-data window mismatch is not involved.** That path skips draws fail-visibly; here
+  every draw executes.
+- **The EULA hold is not a hang, and not a renderer stall.** A no-input launch sits on one distinct
+  frame for its whole run, which reads exactly like a stalled title; it is the game waiting for input
+  on page 1 of 40, and only reaching page 40 clears it. Cross, Circle and Options are all inert
+  before then.
+- **Acceptance is not persisted**, so route desync is not a savedata-staleness effect. No
+  `savedata0` directory is created at all and the EULA re-shows identically on every cold start.
+
+## Instrument note, and a trap worth avoiding
+
+**A `.prgbundle` replays PRE-DECODED draws.** An instrument in the index or vertex decode path does
+not fire under `gpu_replay --bundle` — measured here: the `[idxtype]` diagnostic printed 0 lines
+offline and 508,688 live. The offline bundle is the right tool for "which draw wrote this pixel" and
+the wrong tool for anything upstream of the decoded draw, and the two are not distinguishable from
+the replay output. `PROSPER_INDEXTYPE_LOG=1` (bounded to 64 lines) prints what the guest announced
+beside both readings of its own bytes, and must be run **live**.
 
 ## Not yet investigated
 
 - Whether the missing New Game item is caused by the absent savedata, or is independent.
-- Whether the garbled text and the untextured quads share a root cause.
-- Tomb Raider II, beyond confirming that Up/Down reaches its title screen.
+- Why `reach-title-screen.pad` arrives on Tomb Raider I while `reach-gameplay.pad` arrives on
+  Tomb Raider II. Each is internally consistent across runs (3 of 3 for the gameplay route), so both
+  are reproducible, but the reason they differ is unexplained and no mechanism should be assumed.
+- Tomb Raider III beyond its title screen.
