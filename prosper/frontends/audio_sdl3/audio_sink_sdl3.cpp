@@ -12,6 +12,7 @@
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>   // getenv, for the opt-in gates below (transitive via libstdc++, not via libc++)
 #include <mutex>
@@ -36,8 +37,18 @@ int queue_timeline_ms() {
     static const int ms = [] {
         const char* e = getenv("PROSPER_AUDIO_QUEUE_TIMELINE");
         if (!e || !*e) return 0;
-        const int v = atoi(e);
-        return v > 0 ? v : 1;          // bare =1 (or any non-numeric) means the 1 ms default
+        // A malformed or zero value DISABLES, per the convention CLAUDE.md states for these
+        // triggers: a typo must cost you the measurement, never fire one you did not ask for.
+        // The previous form returned 1 for anything atoi could not parse -- so `=0`, documented
+        // as off, armed the 1 ms firehose, failing in the loud direction.
+        char* end = nullptr;
+        const long v = strtol(e, &end, 10);
+        if (!end || *end || v <= 0 || v > 60000) {
+            SDL_Log("prosper-audio: PROSPER_AUDIO_QUEUE_TIMELINE=%s is not a positive"
+                    " millisecond count; timeline disabled", e);
+            return 0;
+        }
+        return (int)v;
     }();
     return ms;
 }
@@ -126,11 +137,10 @@ public:
     }
 
     void quit() {
-        // Stopped FIRST, before any stream is destroyed: the sampler reads slots_[i].stream
-        // under mx_, so a close() racing a live sampler would be a use-after-free the moment
-        // the sampler won the lock. Clearing the flag here means the loop observes it and
-        // exits at its next wake, and close() below takes the same mutex it does.
-        timeline_running_.store(false, std::memory_order_relaxed);
+        // Stopped and JOINED first, before any stream is destroyed. Clearing a flag was not
+        // enough: it only asks, and the close() below would then race a sampler that had already
+        // entered its critical section. The join makes the ordering a fact rather than a hope.
+        stop_queue_timeline();
         for (auto& s : slots_) s.dump.finalize();
         for (int i = 0; i < kMaxPorts; i++) close(i + 1);
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -210,7 +220,7 @@ public:
                     : std::chrono::duration<double, std::milli>(now - s.dbg_last).count();
                 s.dbg_last = now;
                 SDL_Log("[audio-dbg] port=%d gap=%.2fms frames=%d queued_before=%d (grain=%d)",
-                        port, gap, frames, SDL_GetAudioStreamAvailable(s.stream), s.grain_bytes);
+                        port, gap, frames, SDL_GetAudioStreamQueued(s.stream), s.grain_bytes);
             }
             freq = s.freq;
             if (freq > 0) {
@@ -317,7 +327,10 @@ public:
         const auto     t0 = std::chrono::steady_clock::now();
         uint64_t deadline = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 t0.time_since_epoch()).count();
-        struct Sample { int port; int avail; int grain; };
+        // queued, not available: SDL_GetAudioStreamAvailable reports DEVICE-format bytes while
+        // grain_bytes, the [audio-dbg] field name and the #3016 sibling meter are all guest
+        // format. Mixing them is benign on an F32 title by luck and silently 2x out on an S16 one.
+        struct Sample { int port; int queued; int grain; };
         std::array<Sample, kMaxPorts> samples{};
         while (timeline_running_.load(std::memory_order_relaxed)) {
             int n = 0;
@@ -325,16 +338,32 @@ public:
                 std::lock_guard<std::mutex> lk(mx_);
                 for (int i = 0; i < kMaxPorts; i++) {
                     if (!slots_[i].stream) continue;
-                    samples[n++] = { i + 1, SDL_GetAudioStreamAvailable(slots_[i].stream),
-                                     slots_[i].grain_bytes };
+                    const int q = SDL_GetAudioStreamQueued(slots_[i].stream);
+                    if (q < 0) continue;          // an errored stream reports -1; do not log it as a level
+                    samples[n++] = { i + 1, q, slots_[i].grain_bytes };
                 }
             }
-            const double t = std::chrono::duration<double>(
+            const uint64_t t_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
+            // Microseconds, and as an integer. %.3f of a SECONDS value quantizes the timestamp to
+            // exactly the sampling interval, so a 1 ms sampler could only ever print gaps of
+            // 1.000/2.000/3.000 -- the honesty figures quoted for this instrument were partly an
+            // artifact of its own format string.
             for (int i = 0; i < n; i++)
-                SDL_Log("[audio-queue] t=%.3f port=%d avail=%d grain=%d",
-                        t, samples[i].port, samples[i].avail, samples[i].grain);
+                SDL_Log("[audio-queue] t_us=%llu port=%d queued=%d grain=%d",
+                        (unsigned long long)t_us, samples[i].port, samples[i].queued,
+                        samples[i].grain);
+            // Advance the grid, but RESYNC if a pass overran it. Without this, one slow pass
+            // leaves every subsequent deadline in the past, sleep_until_steady_ns returns
+            // immediately by contract, and the loop becomes a busy spin hammering mx_ at full
+            // core speed -- while still logging as though it were sampling on schedule. Overruns
+            // are expected rather than hypothetical here: SDL_Log on Windows writes through
+            // OutputDebugString and a console handle under a global lock, a thousand times a
+            // second.
+            const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             deadline += interval_ns;
+            if (deadline <= now_ns) deadline = now_ns + interval_ns;
             prosper::host::sleep_until_steady_ns(deadline);
         }
     }
@@ -342,9 +371,30 @@ public:
     void start_queue_timeline() {
         const int ms = queue_timeline_ms();
         if (ms <= 0 || timeline_running_.exchange(true)) return;
-        std::thread(&Sdl3AudioSink::queue_timeline_loop, this, ms).detach();
+        timeline_thread_ = std::thread(&Sdl3AudioSink::queue_timeline_loop, this, ms);
         SDL_Log("prosper-audio: queue-level timeline started at %d ms", ms);
     }
+
+    // JOINED, not detached, and joined from both places that can actually run.
+    //
+    // The first version cleared a flag at the top of quit() and called that sufficient. Review
+    // found the argument was about dead code: shutdown_sdl3_audio_sink() -- the only caller of
+    // quit() -- is invoked ONLY from test_audio_sdl3.cpp. prosper-app and boot_trace install the
+    // sink and never shut it down, so on neither path where this instrument is used did the flag
+    // ever get cleared.
+    //
+    // What that leaves per path: prosper-app ends in std::_Exit, which runs no destructors at all,
+    // so a sampler alive at exit is harmless by construction. boot_trace returns from main and
+    // drops into static destruction of mx_ and slots_ WITH the sampler live -- that one was a real
+    // use-after-free, and the destructor below is what closes it. A detached thread cannot be made
+    // safe here by any flag, because the flag only says "please stop" and static destruction does
+    // not wait to be asked.
+    void stop_queue_timeline() {
+        timeline_running_.store(false, std::memory_order_relaxed);
+        if (timeline_thread_.joinable()) timeline_thread_.join();
+    }
+
+    ~Sdl3AudioSink() override { stop_queue_timeline(); }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
         if (port < 1 || port > kMaxPorts || !vols) return;
@@ -422,6 +472,7 @@ private:
     // Set once when the timeline starts; cleared on quit() so the detached sampler exits rather
     // than outliving the streams it reads.
     std::atomic<bool> timeline_running_{false};
+    std::thread       timeline_thread_;
     bool paused_ = false;
     float gain_ = 1.0f;   // linear playback gain, applied via SDL_SetAudioStreamGain
 };
