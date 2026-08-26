@@ -745,6 +745,21 @@ int main() {
               fixed_phys, 0x4000) == 0 && fixed_alias,
           "map ordinary alias for incompatible fixed view");
     if (fixed_mapped && fixed_alias) {
+        // GTA V submits an identical fixed BatchMap MAP_DIRECT twice without unmapping it. Linux
+        // accepts the second mmap(MAP_FIXED) as replacement semantics; Windows must not turn the
+        // live MapViewOfFile3 collision into ENOMEM.
+        alignas(8) uint8_t duplicate_direct[0x20]{};
+        *(uint64_t*)(duplicate_direct + 0x00) = fixed_va;
+        *(uint64_t*)(duplicate_direct + 0x08) = fixed_phys;
+        *(uint64_t*)(duplicate_direct + 0x10) = fixed_len;
+        duplicate_direct[0x18] = 0x2;
+        *(int32_t*)(duplicate_direct + 0x1c) = 0; // MAP_DIRECT
+        int32_t duplicate_done = -1;
+        CHECK(batch((uint64_t)(uintptr_t)duplicate_direct, 1,
+                    (uint64_t)(uintptr_t)&duplicate_done, 0, 0, 0) == 0 &&
+                  duplicate_done == 1,
+              "identical fixed BatchMap direct remap is idempotent");
+
         *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) = 0x1111222233334444ull;
         *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x4100) = 0x5555666677778888ull;
         *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) = 0x9999aaaabbbbccccull;
@@ -865,6 +880,116 @@ int main() {
     if (readonly_va) CHECK(unmap(readonly_va, fixed_len, 0, 0, 0, 0) == 0,
                            "clean up reserved read-only alias range");
     if (fixed_phys) release(fixed_phys, fixed_len, 0, 0, 0, 0);
+
+    // GTA V's gameplay allocator reserves disjoint Windows placeholders with one genuinely free
+    // allocation granule between them, then BatchMap MAP_DIRECTs across the whole fragmented range.
+    // MapViewOfFile3 cannot replace multiple placeholders; the HLE must normalize only this
+    // completely guest-owned topology into one replaceable placeholder first.
+    constexpr uint64_t fragmented_base = 0x30000500000ull;
+    constexpr uint64_t fragmented_map_len = 0x40000;
+    constexpr uint64_t fragmented_tail_base = fragmented_base + 0x20000;
+    constexpr uint64_t fragmented_tail_len = 0x30000;
+    uint64_t fragmented_head = fragmented_base;
+    uint64_t fragmented_tail = fragmented_tail_base;
+    uint64_t fragmented_phys = 0;
+    uint64_t fragmented_alias = 0;
+    const bool fragmented_reserved =
+        reserve((uint64_t)(uintptr_t)&fragmented_head, 0x10000,
+                0x10 /* SCE_KERNEL_MAP_FIXED */, 0x10000, 0, 0) == 0 &&
+        fragmented_head == fragmented_base &&
+        reserve((uint64_t)(uintptr_t)&fragmented_tail, fragmented_tail_len,
+                0x10 /* SCE_KERNEL_MAP_FIXED */, 0x10000, 0, 0) == 0 &&
+        fragmented_tail == fragmented_tail_base;
+    CHECK(fragmented_reserved,
+          "reserve the guest/free/guest placeholder topology from GTA V gameplay");
+    CHECK(alloc(0, kEnd, fragmented_map_len, 0x4000, 0,
+                (uint64_t)(uintptr_t)&fragmented_phys) == 0 && fragmented_phys,
+          "allocate physical pages for fragmented fixed BatchMap");
+    bool fragmented_mapped = false;
+    if (fragmented_reserved && fragmented_phys) {
+        alignas(8) uint8_t entry[0x20]{};
+        *(uint64_t*)(entry + 0x00) = fragmented_base;
+        *(uint64_t*)(entry + 0x08) = fragmented_phys;
+        *(uint64_t*)(entry + 0x10) = fragmented_map_len;
+        entry[0x18] = 0x2;
+        *(int32_t*)(entry + 0x1c) = 0; // MAP_DIRECT
+        int32_t done = -1;
+        fragmented_mapped =
+            batch((uint64_t)(uintptr_t)entry, 1, (uint64_t)(uintptr_t)&done,
+                  0, 0, 0) == 0 && done == 1;
+        CHECK(fragmented_mapped,
+              "fragmented guest/free/guest BatchMap MAP_DIRECT succeeds exactly");
+        MEMORY_BASIC_INFORMATION mapped_info{}, retained_tail_info{};
+        VirtualQuery((void*)(uintptr_t)fragmented_base, &mapped_info,
+                     sizeof(mapped_info));
+        VirtualQuery((void*)(uintptr_t)(fragmented_base + fragmented_map_len),
+                     &retained_tail_info, sizeof(retained_tail_info));
+        CHECK(fragmented_mapped && mapped_info.State == MEM_COMMIT &&
+                  mapped_info.RegionSize >= fragmented_map_len,
+              "fragmented fixed range becomes one committed section view");
+        CHECK(retained_tail_info.State == MEM_RESERVE,
+              "unconsumed suffix of the second guest placeholder remains reserved");
+        CHECK(map((uint64_t)(uintptr_t)&fragmented_alias, fragmented_map_len, 0x2, 0,
+                  fragmented_phys, 0x4000) == 0 && fragmented_alias,
+              "map an alias for fragmented fixed BatchMap coherence");
+        if (fragmented_mapped && fragmented_alias) {
+            *(volatile uint64_t*)(uintptr_t)(fragmented_base + 0x21000) =
+                0x5a17f1edb47c0deull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(fragmented_alias + 0x21000) ==
+                      0x5a17f1edb47c0deull,
+                  "normalized fragmented mapping preserves physical alias coherence");
+        }
+    }
+    if (fragmented_mapped)
+        CHECK(unmap(fragmented_base, fragmented_map_len, 0, 0, 0, 0) == 0,
+              "unmap normalized fragmented fixed view");
+    if (fragmented_alias)
+        CHECK(unmap(fragmented_alias, fragmented_map_len, 0, 0, 0, 0) == 0,
+              "unmap fragmented fixed alias");
+    if (fragmented_reserved)
+        CHECK(unmap(fragmented_base + fragmented_map_len, 0x10000, 0, 0, 0, 0) == 0,
+              "clean up retained fragmented guest-placeholder suffix");
+    if (fragmented_phys)
+        release(fragmented_phys, fragmented_map_len, 0, 0, 0, 0);
+
+    // The same RAGE allocator unmaps across a fragmented guest/free/guest range before a later
+    // fixed remap.  A real host hole is already unmapped and must not turn the whole guest UNMAP
+    // into ERROR_INVALID_ADDRESS.
+    constexpr uint64_t fragmented_unmap_base = 0x30000600000ull;
+    uint64_t fragmented_unmap_head = fragmented_unmap_base;
+    uint64_t fragmented_unmap_tail = fragmented_unmap_base + 0x20000;
+    const bool fragmented_unmap_reserved =
+        reserve((uint64_t)(uintptr_t)&fragmented_unmap_head, 0x10000,
+                0x10 /* SCE_KERNEL_MAP_FIXED */, 0x10000, 0, 0) == 0 &&
+        fragmented_unmap_head == fragmented_unmap_base &&
+        reserve((uint64_t)(uintptr_t)&fragmented_unmap_tail, 0x30000,
+                0x10 /* SCE_KERNEL_MAP_FIXED */, 0x10000, 0, 0) == 0 &&
+        fragmented_unmap_tail == fragmented_unmap_base + 0x20000;
+    CHECK(fragmented_unmap_reserved,
+          "reserve fragmented guest/free/guest topology for BatchMap UNMAP");
+    if (fragmented_unmap_reserved) {
+        alignas(8) uint8_t entry[0x20]{};
+        *(uint64_t*)(entry + 0x00) = fragmented_unmap_base;
+        *(uint64_t*)(entry + 0x10) = fragmented_map_len;
+        *(int32_t*)(entry + 0x1c) = 1; // UNMAP
+        int32_t done = -1;
+        CHECK(batch((uint64_t)(uintptr_t)entry, 1, (uint64_t)(uintptr_t)&done,
+                    0, 0, 0) == 0 && done == 1,
+              "fragmented guest/free/guest BatchMap UNMAP succeeds exactly");
+        MEMORY_BASIC_INFORMATION unmap_info{}, unmap_tail_info{};
+        VirtualQuery((void*)(uintptr_t)fragmented_unmap_base, &unmap_info,
+                     sizeof(unmap_info));
+        VirtualQuery((void*)(uintptr_t)(fragmented_unmap_base + fragmented_map_len),
+                     &unmap_tail_info, sizeof(unmap_tail_info));
+        CHECK(unmap_info.State == MEM_RESERVE &&
+                  unmap_info.RegionSize >= fragmented_map_len,
+              "fragmented UNMAP leaves one reusable placeholder");
+        CHECK(unmap_tail_info.State == MEM_RESERVE,
+              "fragmented UNMAP preserves the unconsumed guest-placeholder suffix");
+        CHECK(unmap(fragmented_unmap_base + fragmented_map_len, 0x10000,
+                    0, 0, 0, 0) == 0,
+              "clean up fragmented UNMAP retained suffix");
+    }
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");

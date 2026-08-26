@@ -557,8 +557,8 @@ int main() {
     const prosper::gpu::ShaderResource* dcc_zero_mip_texture =
         realized_dcc_zero_mip ? realized_dcc_zero_mip->by_fetch_pc(1) : nullptr;
     CHECK(dcc_zero_mip_texture && dcc_zero_mip_texture->compression_enabled &&
-              !dcc_zero_mip_texture->proven_zero_mip,
-          "build_stage_table leaves DCC-backed IMAGE_LOAD_MIP fail-visible");
+              dcc_zero_mip_texture->proven_zero_mip,
+          "build_stage_table preserves mip-zero proof on a DCC-backed IMAGE_LOAD_MIP");
 
     const uint32_t direct_seed_fetch[] = {
         0xE0002000u, 0x80020100u,   // pc=0: buffer_load_format_x v1, v0, s[8:11], 0 idxen

@@ -844,7 +844,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame descriptor_array_replay;
     CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
               deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
-              descriptor_array_loaded.format_version == 55 &&
+              descriptor_array_loaded.format_version == 56 &&
               materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
               descriptor_array_replay.computes.size() == 1 &&
               descriptor_array_replay.computes[0].resources &&
@@ -1226,7 +1226,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 55 &&
+              msaa_loaded.format_version == 56 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1317,6 +1317,17 @@ int main(int argc, char** argv) {
     video_chroma.size = 1920u * 1080u;
     CHECK(gpu_capture_resource_footprint(video_chroma) == 2048u * 1080u,
           "capture includes 256-byte row padding for a guest-backed linear R8 sampled image");
+    ShaderResource gta_visibility = video_chroma;
+    gta_visibility.gpu_addr = 0x2078aa0000ull;
+    gta_visibility.format = DataFormat::Uint32;
+    gta_visibility.num_components = 2;
+    gta_visibility.width = 640;
+    gta_visibility.height = 360;
+    gta_visibility.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+    gta_visibility.size = 640u * 360u * 8u;
+    CHECK(gpu_capture_resource_footprint(gta_visibility) ==
+              tiled_surface_bytes(640, 360, static_cast<uint32_t>(TileMode::Sw64KbRX), 0, 8),
+          "capture retains GTA V's padded Uint32x2 sampled visibility surface");
     uint8_t host_video_texel = 0;
     video_chroma.host_data = &host_video_texel;
     CHECK(gpu_capture_resource_footprint(video_chroma) == 1920u * 1080u,
@@ -1341,7 +1352,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 55 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 56 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1352,7 +1363,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 55 &&
+              video_loaded.format_version == 56 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1396,7 +1407,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 55 &&
+              upgraded_video.format_version == 56 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1478,7 +1489,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 55 &&
+              array_layout_loaded.format_version == 56 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1706,7 +1717,7 @@ int main(int argc, char** argv) {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    CHECK(loaded.format_version == 55 &&
+    CHECK(loaded.format_version == 56 &&
               loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
@@ -2142,6 +2153,39 @@ int main(int argc, char** argv) {
           fp16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba16Float &&
           fp16_loaded.rtt_seeds[0].rgba == fp16_capture.rtt_seeds[0].rgba,
           "native FP16 RTT seed format and bytes round-trip");
+    GpuCaptureFile rg16_capture = captured;
+    rg16_capture.rtt_seeds[0].format = GpuCaptureColorFormat::Rg16Float;
+    rg16_capture.rtt_seeds[0].rgba.assign(2 * 2 * 4, 0x36);
+    std::vector<uint8_t> rg16_bytes;
+    GpuCaptureFile rg16_loaded;
+    CHECK(serialize_gpu_capture(rg16_capture, rg16_bytes, error) &&
+          deserialize_gpu_capture(rg16_bytes, rg16_loaded, error) &&
+          rg16_loaded.rtt_seeds.size() == 1 &&
+          rg16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rg16Float &&
+          rg16_loaded.rtt_seeds[0].rgba == rg16_capture.rtt_seeds[0].rgba,
+          "native RG16F RTT seed format and bytes round-trip");
+    GpuCaptureFile r16_capture = captured;
+    r16_capture.rtt_seeds[0].format = GpuCaptureColorFormat::R16Float;
+    r16_capture.rtt_seeds[0].rgba.assign(2 * 2 * 2, 0x3a);
+    std::vector<uint8_t> r16_bytes;
+    GpuCaptureFile r16_loaded;
+    CHECK(serialize_gpu_capture(r16_capture, r16_bytes, error) &&
+          deserialize_gpu_capture(r16_bytes, r16_loaded, error) &&
+          r16_loaded.rtt_seeds.size() == 1 &&
+          r16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::R16Float &&
+          r16_loaded.rtt_seeds[0].rgba == r16_capture.rtt_seeds[0].rgba,
+          "native R16F RTT seed format and bytes round-trip");
+    GpuCaptureFile fp32_capture = captured;
+    fp32_capture.rtt_seeds[0].format = GpuCaptureColorFormat::Rgba32Float;
+    fp32_capture.rtt_seeds[0].rgba.assign(2 * 2 * 16, 0x3f);
+    std::vector<uint8_t> fp32_bytes;
+    GpuCaptureFile fp32_loaded;
+    CHECK(serialize_gpu_capture(fp32_capture, fp32_bytes, error) &&
+          deserialize_gpu_capture(fp32_bytes, fp32_loaded, error) &&
+          fp32_loaded.rtt_seeds.size() == 1 &&
+          fp32_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba32Float &&
+          fp32_loaded.rtt_seeds[0].rgba == fp32_capture.rtt_seeds[0].rgba,
+          "native RGBA32F RTT seed format and bytes round-trip");
     GpuCaptureFile scalar_seed_capture = captured;
     scalar_seed_capture.rtt_seeds[0].format = GpuCaptureColorFormat::R8Unorm;
     scalar_seed_capture.rtt_seeds[0].rgba.assign(2 * 2, 0x7f);
@@ -3263,7 +3307,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 55 &&
+              failed_compute_loaded.format_version == 56 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3502,7 +3546,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 55 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 56 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -3790,9 +3834,9 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 56;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 57;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 56",
+          error == "unsupported capture version 57",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

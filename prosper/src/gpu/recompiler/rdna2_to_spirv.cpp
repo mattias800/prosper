@@ -230,9 +230,10 @@ void apply_fragment_consumption(PixelInputMapping& mapping,
 }
 
 std::vector<uint32_t> recompile_interpolation_geometry(
-        const FragmentInterpolationLayout& layout, bool capture_position) {
+        const FragmentInterpolationLayout& layout, bool capture_position,
+        bool synthesize_rect) {
     SpirvCompute builder;
-    return builder.build_interpolation_geometry(layout, capture_position);
+    return builder.build_interpolation_geometry(layout, capture_position, synthesize_rect);
 }
 
 namespace {
@@ -2124,7 +2125,10 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
                                      const ShaderResourceTable* rt, uint32_t lds_bytes,
-                                     uint32_t compute_pgm_rsrc1) {
+                                     uint32_t compute_pgm_rsrc1,
+                                     bool force_cfg_for_test,
+                                     uint32_t local_x_for_test,
+                                     uint32_t threads_x_for_test) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     // This shell publishes register state after the structured region, so both terminal arms can
@@ -2146,16 +2150,28 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
         uint32_t dw = (lds_bytes + 3) / 4;
         b.lds_dwords = dw > 16384u ? 16384u : (dw ? dw : 1u);
     }
-    b.begin(num_inputs ? num_inputs : 1, rt);
+    if (!local_x_for_test || local_x_for_test > 1024) return {};
+    b.begin(num_inputs ? num_inputs : 1, rt, local_x_for_test, 1, 1, 64, 0);
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
     // Compute kernels have no EXP output; reject if one appears.
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
-                   [](RegState&, const Rdna2Inst&){ return false; }, code, dwords,
-                   nullptr, true, 0, false, lds_fminmax_synchronization.needs_dispatcher)) return {};
+    const auto no_export = [](RegState&, const Rdna2Inst&){ return false; };
+    const uint32_t initial_active =
+        force_cfg_for_test && threads_x_for_test &&
+                threads_x_for_test % local_x_for_test != 0
+            ? b.invocation_within_extent(threads_x_for_test, 1, 1)
+            : 0;
+    const bool emitted = force_cfg_for_test
+        ? emit_cfg_state_machine(
+              b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
+              /*allow_smem*/true, no_export, code, dwords, initial_active, false)
+        : emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
+                    /*allow_smem*/true, no_export, code, dwords,
+                    nullptr, true, 0, false, lds_fminmax_synchronization.needs_dispatcher);
+    if (!emitted) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
     // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
@@ -2163,6 +2179,13 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     if (!rs.exec_narrowed) b.store_output(outbits);
     else                   b.store_output_pred(outbits, rs.exec);
     return b.finish();
+}
+
+bool fragment_vcc_branch_is_wave_uniform_for_test(
+        const uint32_t* code, size_t dwords, uint32_t branch_pc) {
+    std::vector<Rdna2Inst> instructions;
+    rdna2_walk(code, dwords, instructions);
+    return vcc_exit_is_wave_uniform(instructions, branch_pc);
 }
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,

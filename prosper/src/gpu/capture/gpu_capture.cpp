@@ -133,7 +133,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // source records, and carrier witnesses instead of being trusted as serialized authority.
 // v54: retain the explicit scalar S_BUFFER dword bound. The ordinary resource size remains the V#'s
 // independent vector footprint; replay cannot reconstruct one from the other when STRIDE < 4.
-constexpr uint32_t kVersion = 55;
+// v55: append each depth/stencil seed's optional stencil bytes and stencil-presence marker.
+// v56: extend the append-only RTT-seed format enum with native RGBA32F surfaces.
+constexpr uint32_t kVersion = 56;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -680,10 +682,15 @@ uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tig
         }
     } else {
         uint32_t bpt = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
-        const bool native_wide = r.cls == ResourceClass::StorageImage ||
-            (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8)) ||
-            (r.format == DataFormat::Float32 && (bpt == 4 || bpt == 8 || bpt == 16));
-        if (bpt == 0 || (bpt > 4 && !native_wide)) bpt = 4;
+        // This is the GUEST allocation footprint, not the backend's eventual upload width.  A
+        // sampled image may be converted to RGBA8 later, but its captured source must still include
+        // every native component.  Clamping sampled texels wider than four bytes truncated GTA V's
+        // 640x360 Uint32x2 SW_64KB_R_X surface to its declared tight span (1,843,200 bytes) instead
+        // of the padded tiled span (1,966,080 bytes).  The live compute consumer could read it while
+        // replay declined the same ordered producer -> consumer edge as "sampled surface unreadable".
+        // Packed formats deliberately report zero per-component width and retain the four-byte word
+        // fallback below.
+        if (bpt == 0) bpt = 4;
         if (tile_mode_is_tiled(r.tile_mode)) {
             const bool tiled_msaa = r.img_dim == 6u && r.sample_count > 1u;
             if (tiled_msaa) {
@@ -1087,10 +1094,7 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
                 : resource_width;
             uint32_t bpt = bc ? bc : data_format_bytes(r.format) *
                 (r.num_components ? r.num_components : 1u);
-            const bool native_wide =
-                (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8)) ||
-                (r.format == DataFormat::Float32 && (bpt == 4 || bpt == 8 || bpt == 16));
-            if (bpt == 0 || (bpt > 4 && !native_wide && !bc)) bpt = 4;
+            if (bpt == 0) bpt = 4;
             c.resource.linear_row_pitch_bytes = resolved_linear_row_pitch(
                 r, pitch_width, bpt);
         }
@@ -1165,6 +1169,11 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
         case GpuCaptureColorFormat::R11G11B10Float: bytes_per_pixel = 4; break;
         case GpuCaptureColorFormat::R8Unorm: bytes_per_pixel = 1; break;
         case GpuCaptureColorFormat::R32Uint: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::R32Float: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::Rg8Unorm: bytes_per_pixel = 2; break;
+        case GpuCaptureColorFormat::Rgba32Float: bytes_per_pixel = 16; break;
+        case GpuCaptureColorFormat::Rg16Float: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::R16Float: bytes_per_pixel = 2; break;
         default: error = "RTT seed has an unsupported color format"; return false;
     }
     const uint64_t pixels = checked_mul(seed.width, seed.height);

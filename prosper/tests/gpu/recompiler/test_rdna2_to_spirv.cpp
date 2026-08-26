@@ -11509,23 +11509,19 @@ int main() {
         codeT25e, std::size(codeT25e), 1, 0);
     CHECK(!spvT25e.empty(),
           "recompiled T25e (Plucky V_READLANE_B32 lane 63 exact word) -> SPIR-V");
-    CHECK(compute_spirv_min_subgroup_size(spvT25e) == 64,
-          "T25e: wave64 readlane advertises its 64-lane host contract");
-    if (can_shuffleT25b && subgroupT25b.size >= 64) {
+    CHECK(compute_spirv_min_subgroup_size(spvT25e) == 0,
+          "T25e: portable wave64 readlane carries no host-width demand");
+    if (can_shuffleT25b) {
         std::vector<float> inT25e(128), expectedT25e(128);
         for (uint32_t i = 0; i < 128; ++i) inT25e[i] = static_cast<float>(i);
-        for (uint32_t i = 0; i < 128; ++i) {
-            const uint32_t subgroup_lane = i % subgroupT25b.size;
-            const uint32_t subgroup_base = i - subgroup_lane;
-            expectedT25e[i] = inT25e[subgroup_base + (subgroup_lane & ~63u) + 63u];
-        }
+        for (uint32_t i = 0; i < 128; ++i)
+            expectedT25e[i] = inT25e[(i & ~63u) + 63u];
         const std::vector<float> gotT25e = prosper::test::run_compute(
             spvT25e, inT25e, 128, 128);
         CHECK(gotT25e == expectedT25e,
               "T25e: V_READLANE_B32 broadcasts lane 63 within each guest wave64");
     } else {
-        std::printf("  [skip] T25e execution: host subgroup %u is narrower than 64\n",
-                    subgroupT25b.size);
+        std::printf("  [skip] T25e execution: no compute-capable host device\n");
     }
 
     // T25f (#1390): DS_SWIZZLE_B32 does not access LDS; it maps the source VGPR across active

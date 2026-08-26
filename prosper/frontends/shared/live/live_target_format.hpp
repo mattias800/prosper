@@ -27,7 +27,18 @@ namespace prosper::frontend {
 // How one texel of the renderer's CPU snapshot is laid out. Conversion loops that implement a
 // subset of the layouts branch on THIS rather than on "is it RGBA8, else assume FP16", so a new
 // pixel format must be classified explicitly before it can reach a decoder that cannot read it.
-enum class LiveTargetSourceLayout : uint8_t { Unorm8x4, Float16x4, PackedR11G11B10 };
+enum class LiveTargetSourceLayout : uint8_t {
+    Unorm8x4,
+    Float16x4,
+    PackedR11G11B10,
+    Unorm8x1,
+    Uint32x1,
+    Float32x1,
+    Unorm8x2,
+    Float32x4,
+    Float16x2,
+    Float16x1,
+};
 
 constexpr LiveTargetSourceLayout live_target_source_layout(
     prosper::gpu::LiveTargetPixelFormat format) {
@@ -38,6 +49,20 @@ constexpr LiveTargetSourceLayout live_target_source_layout(
             return LiveTargetSourceLayout::Float16x4;
         case prosper::gpu::LiveTargetPixelFormat::R11G11B10Float:
             return LiveTargetSourceLayout::PackedR11G11B10;
+        case prosper::gpu::LiveTargetPixelFormat::R8Unorm:
+            return LiveTargetSourceLayout::Unorm8x1;
+        case prosper::gpu::LiveTargetPixelFormat::R32Uint:
+            return LiveTargetSourceLayout::Uint32x1;
+        case prosper::gpu::LiveTargetPixelFormat::R32Float:
+            return LiveTargetSourceLayout::Float32x1;
+        case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:
+            return LiveTargetSourceLayout::Unorm8x2;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
+            return LiveTargetSourceLayout::Float32x4;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:
+            return LiveTargetSourceLayout::Float16x2;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:
+            return LiveTargetSourceLayout::Float16x1;
     }
     return LiveTargetSourceLayout::Unorm8x4;
 }
@@ -53,6 +78,20 @@ constexpr VkFormat live_target_pixel_format_vk(prosper::gpu::LiveTargetPixelForm
             return VK_FORMAT_R16G16B16A16_SFLOAT;
         case prosper::gpu::LiveTargetPixelFormat::R11G11B10Float:
             return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        case prosper::gpu::LiveTargetPixelFormat::R8Unorm:
+            return VK_FORMAT_R8_UNORM;
+        case prosper::gpu::LiveTargetPixelFormat::R32Uint:
+            return VK_FORMAT_R32_UINT;
+        case prosper::gpu::LiveTargetPixelFormat::R32Float:
+            return VK_FORMAT_R32_SFLOAT;
+        case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:
+            return VK_FORMAT_R8G8_UNORM;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
+            return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:
+            return VK_FORMAT_R16G16_SFLOAT;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:
+            return VK_FORMAT_R16_SFLOAT;
     }
     return VK_FORMAT_UNDEFINED;
 }
@@ -64,6 +103,13 @@ constexpr uint32_t live_target_pixel_format_bytes(prosper::gpu::LiveTargetPixelF
         case prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm:      return 4u;
         case prosper::gpu::LiveTargetPixelFormat::Rgba16Float:     return 8u;
         case prosper::gpu::LiveTargetPixelFormat::R11G11B10Float:  return 4u;
+        case prosper::gpu::LiveTargetPixelFormat::R8Unorm:         return 1u;
+        case prosper::gpu::LiveTargetPixelFormat::R32Uint:         return 4u;
+        case prosper::gpu::LiveTargetPixelFormat::R32Float:        return 4u;
+        case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:        return 2u;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return 16u;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:       return 4u;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:        return 2u;
     }
     return 0u;
 }
@@ -75,6 +121,13 @@ constexpr const char* live_target_pixel_format_name(prosper::gpu::LiveTargetPixe
         case prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm:      return "rgba8";
         case prosper::gpu::LiveTargetPixelFormat::Rgba16Float:     return "rgba16f";
         case prosper::gpu::LiveTargetPixelFormat::R11G11B10Float:  return "r11g11b10";
+        case prosper::gpu::LiveTargetPixelFormat::R8Unorm:         return "r8";
+        case prosper::gpu::LiveTargetPixelFormat::R32Uint:         return "r32ui";
+        case prosper::gpu::LiveTargetPixelFormat::R32Float:        return "r32f";
+        case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:        return "rg8";
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return "rgba32f";
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:       return "rg16f";
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:        return "r16f";
     }
     return "unknown";
 }
@@ -97,7 +150,44 @@ constexpr bool live_target_pixel_format_from_vk(VkFormat vk_format,
         format = prosper::gpu::LiveTargetPixelFormat::R11G11B10Float;
         return true;
     }
+    if (vk_format == VK_FORMAT_R8_UNORM) {
+        format = prosper::gpu::LiveTargetPixelFormat::R8Unorm;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R32_UINT) {
+        format = prosper::gpu::LiveTargetPixelFormat::R32Uint;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R32_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::R32Float;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R8G8_UNORM) {
+        format = prosper::gpu::LiveTargetPixelFormat::Rg8Unorm;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R32G32B32A32_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::Rgba32Float;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R16G16_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::Rg16Float;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R16_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::R16Float;
+        return true;
+    }
     return false;
+}
+
+// Packed-HDR render targets can be the independently rendered levels of one sampled mip chain.
+// The frontend therefore keeps each such target resident until the logical submit ends: otherwise
+// ordinary LRU pressure can evict one middle level before the final consumer assembles the chain,
+// and deriving the missing level with a linear blit changes the guest's custom downsample result.
+// Keep this predicate exact rather than treating every four-byte target as interchangeable.
+constexpr bool renderer_mip_target_requires_submit_retention(VkFormat format) {
+    return format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 }
 
 } // namespace prosper::frontend

@@ -310,9 +310,19 @@ inline std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
 // word. The scalar-data-vs-mask decision remains path-local in emit_alu; this predicate only names
 // B32 packets for which a dead-high proof can make that scalar path discard the old predicate.
 inline bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
-    return is_wave64_vcc_lo_scalar_cselect(in) ||
+    const auto scalar_constant = [](const Operand& operand) {
+        return operand.kind == OperandKind::InlineInt ||
+               operand.kind == OperandKind::InlineFloat ||
+               operand.kind == OperandKind::Literal;
+    };
+    const bool scalar_cselect_hi =
+        in.fmt == Rdna2Format::SOP2 && in.opcode == kSop2OpcodeCselectB32 &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value == 107 &&
+        scalar_constant(in.src[0]) && scalar_constant(in.src[1]);
+    return is_wave64_vcc_lo_scalar_cselect(in) || scalar_cselect_hi ||
         (in.fmt == Rdna2Format::SOP2 && sop2_is_b32_logical(in.opcode) &&
-         in.dst.kind == OperandKind::SGPR && in.dst.value == 106);
+         in.dst.kind == OperandKind::SGPR &&
+         (in.dst.value == 106 || in.dst.value == 107));
 }
 
 inline std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
@@ -323,8 +333,13 @@ inline std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
         const bool candidate = include_logical
             ? is_wave64_vcc_lo_scalar_b32_candidate(in)
             : is_wave64_vcc_lo_scalar_cselect(in);
+        // Scalar scratch may use either physical VCC word and combine the two as ordinary dwords.
+        // The sibling may be read as scalar data, but it must be dead before any pair/mask-domain
+        // observation. MaskDomainOnly is exactly that whole-CFG proof.
+        const int sibling = in.dst.value == 107 ? 106 : 107;
         if (candidate &&
-            sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
+            sgpr_dead_at_merge(ins, in.pc + in.len_dwords, sibling,
+                               ScalarMergeProof::MaskDomainOnly))
             result.insert(in.pc);
     }
     return result;
@@ -528,14 +543,12 @@ inline bool cannot_write_vcc(const Rdna2Inst& in) {
             // sequences of these two ops between a uniform VOPC and its s_cbranch_vccz.
             if (in.opcode == 0x361) return true;
             if (in.opcode == 0x360) return sgpr_dst_misses_vcc(1);
-            if (in.opcode == 0x176)
-                return in.sdst.value != 106 && in.sdst.value != 107; // v_mad_u64_u32 carry-out
-            // The remaining VOP3B ops inside the plain-VALU window — v_div_scale_f32/f64 (0x16D/
-            // 0x16E) and v_mad_i64_i32 (0x177) — write a scalar carry/flag SDST that may be VCC;
-            // their VGPR dst would otherwise satisfy sgpr_dst_misses_vcc. Stop the walk for them.
-            if (in.opcode == 0x16D || in.opcode == 0x16E || in.opcode == 0x177) return false;
-            return in.opcode >= 0x140 && in.opcode < 0x300 &&
-                   sgpr_dst_misses_vcc(1);                         // plain-VALU window only
+            // Decoder storage has an SDST-shaped field for every VOP3 packet, but only VOP3B
+            // operations architecturally write it. Treat ordinary VOP3A VALU as VCC-transparent;
+            // otherwise a MAC between a uniform compare and VCCZ creates a false Wave64 vote.
+            if (vop3_writes_mask_sdst(in))
+                return in.sdst.value != 106 && in.sdst.value != 107;
+            return in.dst.kind == OperandKind::VGPR;
         case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
             return sgpr_dst_misses_vcc(2);                         // conservative 64-bit pair
         case Rdna2Format::SMEM: {
@@ -2182,7 +2195,10 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
     // A proved guard is deliberately excluded: every invocation in the workgroup takes it together.
     result.guarded = guarded;
     const size_t body_begin = guarded ? result.guard_index + 1 : 0;
-    bool valid = result.end_index < ins.size() && branch_count > 2;
+    // Safety comes from the cross-edge, trap and EXEC-save checks below. A straight-line kernel
+    // whose only control-flow instruction is a barrier satisfies that proof trivially; requiring
+    // an unrelated branch-count threshold dropped GTA V's partial-workgroup barrier passes.
+    bool valid = result.end_index < ins.size();
 
     for (size_t i = body_begin; valid && i < result.end_index; ++i)
         if (ins[i].fmt == Rdna2Format::SOPP && ins[i].opcode == 0x0a)

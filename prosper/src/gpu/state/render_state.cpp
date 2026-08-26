@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/texture/tile.hpp"
 #include "gpu/state/vk_translate.hpp"
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,68 @@ uint32_t rd(const RegisterFile& file, uint32_t off) {
 // GraphicsRun.cpp (`(lo<<8) | ((hi&0xff)<<40)`).
 uint64_t addr_of(uint32_t lo, uint32_t hi) {
     return (static_cast<uint64_t>(lo) << 8) | (static_cast<uint64_t>(hi & 0xffu) << 40);
+}
+
+uint32_t color_format_bytes_per_texel(uint32_t format, uint32_t number_type,
+                                      uint32_t comp_swap) {
+    switch (vk_color_format(format, number_type, comp_swap)) {
+        case VkFormat::R8_UNORM:
+        case VkFormat::R8_SNORM:
+        case VkFormat::R8_UINT:
+        case VkFormat::R8_SINT:
+            return 1u;
+        case VkFormat::R16_UNORM:
+        case VkFormat::R16_SNORM:
+        case VkFormat::R16_UINT:
+        case VkFormat::R16_SINT:
+        case VkFormat::R16_SFLOAT:
+        case VkFormat::R8G8_UNORM:
+        case VkFormat::R8G8_SNORM:
+        case VkFormat::R8G8_UINT:
+        case VkFormat::R8G8_SINT:
+        case VkFormat::B5G6R5_UNORM_PACK16:
+        case VkFormat::R5G6B5_UNORM_PACK16:
+            return 2u;
+        case VkFormat::R32_UINT:
+        case VkFormat::R32_SINT:
+        case VkFormat::R32_SFLOAT:
+        case VkFormat::R16G16_UNORM:
+        case VkFormat::R16G16_SNORM:
+        case VkFormat::R16G16_UINT:
+        case VkFormat::R16G16_SINT:
+        case VkFormat::R16G16_SFLOAT:
+        case VkFormat::B10G11R11_UFLOAT_PACK32:
+        case VkFormat::A2B10G10R10_UNORM_PACK32:
+        case VkFormat::A2R10G10B10_UNORM_PACK32:
+        case VkFormat::A2B10G10R10_UINT_PACK32:
+        case VkFormat::A2R10G10B10_UINT_PACK32:
+        case VkFormat::R8G8B8A8_UNORM:
+        case VkFormat::R8G8B8A8_SNORM:
+        case VkFormat::R8G8B8A8_UINT:
+        case VkFormat::R8G8B8A8_SINT:
+        case VkFormat::R8G8B8A8_SRGB:
+        case VkFormat::B8G8R8A8_UNORM:
+        case VkFormat::B8G8R8A8_SNORM:
+        case VkFormat::B8G8R8A8_UINT:
+        case VkFormat::B8G8R8A8_SINT:
+        case VkFormat::B8G8R8A8_SRGB:
+            return 4u;
+        case VkFormat::R32G32_UINT:
+        case VkFormat::R32G32_SINT:
+        case VkFormat::R32G32_SFLOAT:
+        case VkFormat::R16G16B16A16_UNORM:
+        case VkFormat::R16G16B16A16_SNORM:
+        case VkFormat::R16G16B16A16_UINT:
+        case VkFormat::R16G16B16A16_SINT:
+        case VkFormat::R16G16B16A16_SFLOAT:
+            return 8u;
+        case VkFormat::R32G32B32A32_UINT:
+        case VkFormat::R32G32B32A32_SINT:
+        case VkFormat::R32G32B32A32_SFLOAT:
+            return 16u;
+        default:
+            return 0u;
+    }
 }
 
 // PA_CL_VPORT_* registers hold IEEE-754 floats.
@@ -267,21 +330,63 @@ RenderState extract_render_state(const GpuState& st) {
         const uint32_t info_reg = P::CB_COLOR0_INFO + slot * kColorRegisterStride;
         const uint32_t clear0_reg = P::CB_COLOR0_CLEAR_WORD0 + slot * kColorRegisterStride;
         const uint32_t clear1_reg = clear0_reg + 1u;
-        target.base = addr_of(rd(st.cx, base_reg), rd(st.cx, P::CB_COLOR0_BASE_EXT + slot));
+        target.allocation_base =
+            addr_of(rd(st.cx, base_reg), rd(st.cx, P::CB_COLOR0_BASE_EXT + slot));
+        target.base = target.allocation_base;
         const uint32_t info = rd(st.cx, info_reg);
         target.format = PM4_FIELD(info, CB_COLOR0_INFO, FORMAT);
         target.number_type = PM4_FIELD(info, CB_COLOR0_INFO, NUMBER_TYPE);
         target.comp_swap = PM4_FIELD(info, CB_COLOR0_INFO, COMP_SWAP);
+        const uint32_t view = rd(st.cx, P::CB_COLOR0_VIEW + slot * kColorRegisterStride);
+        target.mip_level = PM4_FIELD(view, CB_COLOR0_VIEW, MIP_LEVEL);
         const auto attrib2 = st.cx.find(P::CB_COLOR0_ATTRIB2 + slot);
         if (attrib2 != st.cx.end()) {
             target.has_extent = true;
             target.width = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_WIDTH) + 1u;
             target.height = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
+            target.max_mip = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MAX_MIP);
+        }
+        const uint32_t attrib3 = rd(st.cx, P::CB_COLOR0_ATTRIB3 + slot);
+        target.color_sw_mode = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, COLOR_SW_MODE);
+
+        // The CB base is the allocation origin, not necessarily the address of the selected view.
+        // GTA V's environment-lighting pass renders a six-level 1024x512 R11G11B10F chain by keeping
+        // BASE fixed and advancing VIEW.MIP_LEVEL. Treating all six draws as mip 0 made every pass
+        // overwrite one surface and left the later lighting shader sampling stale guest bytes.
+        if (target.has_extent && target.base && target.mip_level <= target.max_mip) {
+            const uint32_t mip0_width = target.width;
+            const uint32_t mip0_height = target.height;
+            const uint32_t bytes_per_texel = color_format_bytes_per_texel(
+                target.format, target.number_type, target.comp_swap);
+            const TiledMipLevelLayout layout = tiled_mip_level_layout(
+                mip0_width, mip0_height, bytes_per_texel, target.color_sw_mode,
+                target.max_mip, target.mip_level);
+            if (layout.supported) {
+                target.in_mip_tail = layout.in_tail;
+                target.mip_tail_offset = static_cast<uint32_t>(layout.byte_offset);
+                target.mip_tail_x = layout.tail_x;
+                target.mip_tail_y = layout.tail_y;
+                if (!layout.in_tail && layout.byte_offset <= UINT64_MAX - target.base)
+                    target.base += layout.byte_offset;
+                target.width = std::max(mip0_width >> target.mip_level, 1u);
+                target.height = std::max(mip0_height >> target.mip_level, 1u);
+            }
         }
         target.has_clear = st.cx.count(clear0_reg) || st.cx.count(clear1_reg);
         target.clear_word0 = st.cx.count(clear0_reg) ? rd(st.cx, clear0_reg) : 0u;
         target.clear_word1 = st.cx.count(clear1_reg) ? rd(st.cx, clear1_reg) : 0u;
     }
+
+    // The named MRT0/MRT1 fields are compatibility aliases used by older capture and backend paths.
+    // Keep them identical to the complete array after applying CB_COLORn_VIEW.
+    rs.color0_base = rs.color_targets[0].base;
+    rs.color0_has_extent = rs.color_targets[0].has_extent;
+    rs.color0_width = rs.color_targets[0].width;
+    rs.color0_height = rs.color_targets[0].height;
+    rs.color1_base = rs.color_targets[1].base;
+    rs.color1_has_extent = rs.color_targets[1].has_extent;
+    rs.color1_width = rs.color_targets[1].width;
+    rs.color1_height = rs.color_targets[1].height;
 
     // Primitive topology. VGT_PRIMITIVE_TYPE (0x242) is a UCONFIG register in RDNA2 (the game sets it via
     // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.

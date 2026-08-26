@@ -35,20 +35,81 @@ struct RendererTimingRecord {
     uint64_t texture_bytes = 0;
     uint64_t buffer_bytes = 0;
     double total_ms = 0;
+    double prelude_ms = 0;
+    double pass_ms = 0;
     double build_resources_ms = 0;
     double backend_ms = 0;
     double output_copy_ms = 0;
+    double pass_head_ms = 0;
+    double pass_loop_ms = 0;
+    double pass_pre_ms = 0;
+    double pass_post_ms = 0;
+    double pass_tail_ms = 0;
+    double post_stats_ms = 0;
+    double post_slot0_ms = 0;
+    double post_mrt_ms = 0;
+    double post_rest_ms = 0;
+    double resolve_stall_ms = 0;
+    double resolve_read_ms = 0;
+    double resolve_copy_stall_ms = 0;
+    double resolve_copy_ms = 0;
+    uint64_t resolve_count = 0;
+    uint64_t resolve_read_count = 0;
+    uint64_t resolve_bytes = 0;
     double gpu_wait_ms = 0;
     uint64_t gpu_timestamp_samples = 0;
     double gpu_device_ms = 0;
     double readback_ms = 0;
+    double backend_target_ms = 0;
+    double backend_draw_setup_ms = 0;
+    double backend_record_upload_ms = 0;
+    double backend_cleanup_ms = 0;
+    double backend_setup_shader_ms = 0;
+    double backend_setup_fixed_ms = 0;
     double setup_resources_ms = 0;
+    double backend_setup_pipeline_ms = 0;
+    uint64_t backend_pipeline_refs = 0;
+    uint64_t backend_pipeline_hits = 0;
+    uint64_t backend_pipeline_misses = 0;
+    uint64_t backend_pipeline_bypasses = 0;
+    uint64_t backend_pipeline_entries = 0;
+    uint64_t backend_pipeline_evictions = 0;
     // FRONTEND resource time, accumulated in build_resources. These are NOT sub-buckets of
     // setup_resources_ms below: that one is the BACKEND's, and the two are different layers.
     // Subtracting these from it is a category error that produces a large, plausible, meaningless
     // residue -- I published one (#2215) before noticing, so the names now say which layer they are.
     double frontend_texture_ms = 0;
     double frontend_buffer_ms = 0;
+    double frontend_tex_rtt_ms = 0;
+    double frontend_tex_compute_ms = 0;
+    double frontend_tex_local_ms = 0;
+    double frontend_tex_persist_hit_ms = 0;
+    double frontend_tex_persist_reuse_ms = 0;
+    double frontend_tex_persist_miss_ms = 0;
+    // Slowest texture reference that reached none of the named outcome classes in this semantic
+    // submit. One fixed-size witness keeps F8 non-perturbing while still giving an offline report
+    // the exact resource identity needed to explain the residual.
+    double frontend_tex_other_slowest_ms = 0;
+    uint64_t frontend_tex_other_addr = 0;
+    uint64_t frontend_tex_other_source_bytes = 0;
+    uint32_t frontend_tex_other_width = 0;
+    uint32_t frontend_tex_other_height = 0;
+    uint32_t frontend_tex_other_depth = 0;
+    uint32_t frontend_tex_other_format = 0;
+    uint32_t frontend_tex_other_components = 0;
+    uint32_t frontend_tex_other_tile_mode = 0;
+    uint32_t frontend_tex_other_img_dim = 0;
+    uint32_t frontend_tex_other_class = 0;
+    bool frontend_tex_other_compute_candidate = false;
+    bool frontend_tex_other_persistent_candidate = false;
+    bool frontend_tex_other_compressed = false;
+    bool frontend_tex_other_depth_compare = false;
+    bool frontend_tex_other_host_backed = false;
+    double frontend_build_draw_ms = 0;
+    double frontend_validate_ms = 0;
+    double frontend_poison_ms = 0;
+    double frontend_indices_ms = 0;
+    double frontend_reflect_ms = 0;
     // BACKEND sub-buckets, which DO decompose setup_resources_ms:
     //     setup_resources_ms = res_texture + res_buffer + res_descriptor + other
     // `other` is deliberately not stored -- it is the remainder, and storing a number the reader can
@@ -83,6 +144,18 @@ struct ComputeTimingRecord {
     std::optional<uint64_t> program_addr;
     std::optional<uint64_t> program_hash;
     double total_ms = 0;
+    uint64_t gpu_timestamp_samples = 0;
+    double gpu_device_ms = 0;
+    double gpu_shader_ms = 0;
+    double gpu_pre_ms = 0;
+    double gpu_storage_copy_ms = 0;
+    double gpu_compare_ms = 0;
+    double gpu_restore_ms = 0;
+    double setup_ms = 0;
+    double pipeline_ms = 0;
+    double dispatch_wait_ms = 0;
+    double writeback_ms = 0;
+    double cleanup_ms = 0;
 };
 
 struct CaptureConfig {

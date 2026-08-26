@@ -5133,8 +5133,144 @@ namespace {
         }
         return nullptr;
     }
+
+    // Turn a fragmented, entirely guest-owned fixed range into one free placeholder which
+    // MapViewOfFile3 can replace.  Windows cannot replace several adjacent placeholders with one
+    // section view, even when every byte belongs to the guest.  RAGE produces exactly that shape:
+    //
+    //   guest placeholder | MEM_FREE gap | guest placeholder
+    //
+    // and then BatchMap MAP_DIRECTs across all three pieces.  MAP_FIXED on the guest is allowed to
+    // replace its reservations; the host ownership split is an implementation detail.  Admit only
+    // tracked free/guest placeholders plus genuinely MEM_FREE regions.  A committed page, direct
+    // view, private placeholder view, or untracked reservation keeps the old fail-visible result.
+    bool normalize_fragmented_guest_placeholder_range(uint64_t base, uint64_t len) {
+        if (!base || !len || base > UINT64_MAX - len || (base & 0xfff) || (len & 0xfff))
+            return false;
+        const PlaceholderApis& apis = placeholder_apis();
+        if (!apis.virtual_alloc2 || !apis.map_view_of_file3) return false;
+        const uint64_t end = base + len;
+
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        for (const DmemView& view : g_dviews)
+            if (view.guest_base < end && base < view.guest_base + view.guest_size)
+                return false;
+        for (const PrivatePlaceholderView& view : g_private_placeholder_views)
+            if (view.base < end && base < view.base + view.size)
+                return false;
+
+        // Do not turn an arbitrary free address into a successful guest UNMAP.  This repair is
+        // only for fragmentation around at least one reservation already owned by the guest/HLE.
+        bool has_tracked_placeholder = false;
+        for (const PlaceholderSpan& span : g_free_placeholders)
+            has_tracked_placeholder |= span.base < end && base < span.base + span.size;
+        for (const PlaceholderSpan& span : g_guest_placeholders)
+            has_tracked_placeholder |= span.base < end && base < span.base + span.size;
+        if (!has_tracked_placeholder) return false;
+
+        // Claim every real host hole first.  VirtualAlloc2 at an exact base is the atomic ownership
+        // check: if another thread obtains any hole, this fails without touching that memory.  The
+        // cover may extend by less than one allocation granule outside the guest request, but only
+        // within the same VirtualQuery-proven MEM_FREE region; the surplus remains in the free pool.
+        uint64_t cursor = base;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                              &mbi, sizeof(mbi))) return false;
+            const uint64_t region_base =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress));
+            if (region_base > UINT64_MAX - static_cast<uint64_t>(mbi.RegionSize)) return false;
+            const uint64_t region_end = region_base + static_cast<uint64_t>(mbi.RegionSize);
+            const uint64_t piece_end = std::min(end, region_end);
+            if (piece_end <= cursor) return false;
+            if (mbi.State == MEM_COMMIT) return false;
+            if (mbi.State == MEM_FREE) {
+                const uint64_t cover_base =
+                    cursor & ~(kWinAllocationGranularity - 1);
+                if (piece_end > UINT64_MAX - (kWinAllocationGranularity - 1)) return false;
+                const uint64_t cover_end =
+                    align_up(piece_end, kWinAllocationGranularity);
+                if (cover_base < region_base || cover_end > region_end) return false;
+                void* got = apis.virtual_alloc2(
+                    GetCurrentProcess(),
+                    reinterpret_cast<void*>(static_cast<uintptr_t>(cover_base)),
+                    static_cast<SIZE_T>(cover_end - cover_base),
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+                if (!got) return false;
+                remember_free_placeholder_locked(cover_base, cover_end - cover_base);
+            } else if (mbi.State != MEM_RESERVE) {
+                return false;
+            }
+            cursor = piece_end;
+        }
+
+        // Registry coverage is the authority for every reserved byte.  A plain host reservation
+        // that happens to be PAGE_NOACCESS is not enough: it may belong to the loader or frontend.
+        std::vector<PlaceholderSpan> covered;
+        std::vector<PlaceholderSpan> guest_cuts;
+        auto collect = [&](const std::vector<PlaceholderSpan>& spans, bool guest) {
+            for (const PlaceholderSpan& span : spans) {
+                const uint64_t cut_begin = std::max(base, span.base);
+                const uint64_t cut_end = std::min(end, span.base + span.size);
+                if (cut_begin >= cut_end) continue;
+                covered.push_back({cut_begin, cut_end - cut_begin});
+                if (guest) guest_cuts.push_back({cut_begin, cut_end - cut_begin});
+            }
+        };
+        collect(g_free_placeholders, false);
+        collect(g_guest_placeholders, true);
+        std::sort(covered.begin(), covered.end(),
+                  [](const PlaceholderSpan& a, const PlaceholderSpan& b) {
+                      return a.base < b.base;
+                  });
+        cursor = base;
+        for (const PlaceholderSpan& span : covered) {
+            if (span.base > cursor) break;
+            if (span.base + span.size > cursor)
+                cursor = std::min(end, span.base + span.size);
+            if (cursor == end) break;
+        }
+        if (cursor != end) return false;
+
+        // A fixed mapping consumes the guest reservations it overlaps.  Splitting a guest span at
+        // either edge preserves the unconsumed prefix/suffix under guest ownership.  Moving each cut
+        // to the free list lets remember_placeholder_locked coalesce it with the newly claimed holes.
+        for (const PlaceholderSpan& cut : guest_cuts) {
+            if (!take_guest_placeholder_locked(cut.base, cut.size, 0x1000)) return false;
+            remember_free_placeholder_locked(cut.base, cut.size);
+        }
+        for (const PlaceholderSpan& span : g_free_placeholders) {
+            if (base >= span.base && end <= span.base + span.size) {
+                MLOG("map_dmem FIXED repair: normalized fragmented placeholder range "
+                     "0x%llx +0x%llx\n",
+                     (unsigned long long)base, (unsigned long long)len);
+                return true;
+            }
+        }
+        return false;
+    }
+
     void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
                        bool fixed) {
+        // MAP_FIXED is replacement semantics on the guest. RAGE also uses it idempotently: GTA V
+        // submits the exact same one-page BatchMap MAP_DIRECT twice without an intervening UNMAP.
+        // Linux mmap(MAP_FIXED) accepts that naturally, while MapViewOfFile3 cannot replace a live
+        // view and reports ERROR_INVALID_ADDRESS. Treat only a byte-for-byte identical existing
+        // direct view as an idempotent remap; a different physical offset or extent still follows
+        // the fail-visible replacement path below rather than silently preserving the wrong alias.
+        if (fixed && hint && len) {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            for (const DmemView& view : g_dviews) {
+                if (view.guest_base != hint || view.guest_size != len || view.phys != phys)
+                    continue;
+                if (!protect_committed_regions(hint, len, hp)) return nullptr;
+                MLOG("map_dmem FIXED identical view already present va=0x%llx len=0x%llx "
+                     "phys=0x%llx\n",
+                     (unsigned long long)hint, (unsigned long long)len,
+                     (unsigned long long)phys);
+                return reinterpret_cast<void*>(static_cast<uintptr_t>(hint));
+            }
+        }
         if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
         // Without SCE_KERNEL_MAP_FIXED, addrInOut is a search hint. If Windows cannot extend a
         // run of adjacent section views at that exact VA, relocate the mapping and return the
@@ -5142,6 +5278,10 @@ namespace {
         if (hint && !fixed) {
             if (void* p = map_section_view(0, len, hp, phys, align)) return p;
         }
+        // A fixed guest range may be split across several host placeholders and real free gaps.
+        // Normalize only ranges whose complete ownership the registries prove, then retry once.
+        if (fixed && normalize_fragmented_guest_placeholder_range(hint, len))
+            if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
         // FIXED MAP_DIRECT over a placeholder too small for it (#2424). The guest maps a range,
         // unmaps it, then remaps the SAME base with a LARGER length -- GTA V (PPSA04263) does exactly
         // this at 0x1550880000: 0x40000, unmap, then 0x80000. The unmap leaves a free placeholder of
@@ -5180,6 +5320,10 @@ namespace {
                     const uint64_t span_end = s.base + s.size;
                     const uint64_t req_end = hint + len;
                     if (s.base > hint || hint >= span_end || req_end <= span_end) continue;
+                    // remember_free_placeholder_locked() mutates and can reallocate this vector.
+                    // Keep the values used by the diagnostic before invalidating the reference.
+                    const uint64_t span_base = s.base;
+                    const uint64_t span_size = s.size;
                     const uint64_t tail_base = span_end;
                     const uint64_t tail_size =
                         align_up(req_end - span_end, kWinAllocationGranularity);
@@ -5216,8 +5360,8 @@ namespace {
                     // grew.
                     MLOG("map_dmem FIXED repair: free placeholder 0x%llx grew 0x%llx -> 0x%llx to "
                          "cover request 0x%llx +0x%llx -- retrying view\n",
-                         (unsigned long long)s.base, (unsigned long long)s.size,
-                         (unsigned long long)(s.size + tail_size),
+                         (unsigned long long)span_base, (unsigned long long)span_size,
+                         (unsigned long long)(span_size + tail_size),
                          (unsigned long long)hint, (unsigned long long)len);
                     retry = true;
                     break;
@@ -6358,6 +6502,11 @@ HLE(k_batch_map) {
             }
             case 1: {                               // UNMAP
                 ok = !start || win_unmap(start, len);
+                // A guest unmap may span several Windows placeholders with real MEM_FREE holes
+                // between them.  The holes are already unmapped from the guest's perspective;
+                // normalize the completely guest-owned topology and retry the transactional path.
+                if (!ok && normalize_fragmented_guest_placeholder_range(start, len))
+                    ok = win_unmap(start, len);
                 if (!ok) { win_err = GetLastError(); win_err_valid = true; }
                 if (ok && start) untrack(start, len);
                 break;

@@ -745,9 +745,24 @@ int main() {
         0x7e040282u, // 6: v_mov_b32 v2, 2
         0xbf810000u, // 7: s_endpgm
     };
+    // A partial workgroup whose barrier cannot be lifted into uniform control flow.
+    //
+    // This was `{ s_barrier, s_endpgm }` -- a partial workgroup with ANY barrier used to reject, so
+    // the shortest such program served as the vehicle. That combination now compiles: the stream is
+    // split at its barriers and each barrier-free phase runs under the dispatcher's ACTIVE bit, with
+    // the barrier emitted at function scope. Keeping the old bytes here would have quietly turned an
+    // assertion about the diagnostic plumbing into an assertion that nothing had changed.
+    //
+    // The branch at pc1 jumps from before the barrier to after it, so no phase boundary is legal at
+    // pc2 and the split is refused -- which is a real and permanent limit, not a missing lowering.
+    // The reject, its reason string, and the extents below are therefore unchanged.
     static const uint32_t kPartialBarrierReject[] = {
-        0xbf8a0000u, // s_barrier
-        0xbf810000u, // s_endpgm
+        0xbf060000u, // 0: s_cmp_eq_u32 s0, s0
+        0xbf840002u, // 1: s_cbranch_scc0 +2 -> pc4, crossing the barrier
+        0xbf8a0000u, // 2: s_barrier
+        0x7e040282u, // 3: v_mov_b32 v2, 2
+        0x7e040281u, // 4: v_mov_b32 v2, 1
+        0xbf810000u, // 5: s_endpgm
     };
     ComputeShaderConfig rejected_config;
     rejected_config.local_x = 64;
@@ -867,9 +882,15 @@ int main() {
     // consequent even though the compiler's terminal diagnostic and the helper itself still work.
     prosper::register_agc_hle();
     auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+    // Same shape, and for the same reason, as kPartialBarrierReject above: a barrier the phase split
+    // cannot lift, because a guest branch crosses it.
     alignas(256) static const uint32_t kLivePartialBarrierReject[] = {
-        0xbf8a0000u, // s_barrier
-        0xbf810000u, // s_endpgm
+        0xbf060000u, // 0: s_cmp_eq_u32 s0, s0
+        0xbf840002u, // 1: s_cbranch_scc0 +2 -> pc4, crossing the barrier
+        0xbf8a0000u, // 2: s_barrier
+        0x7e040282u, // 3: v_mov_b32 v2, 2
+        0x7e040281u, // 4: v_mov_b32 v2, 1
+        0xbf810000u, // 5: s_endpgm
     };
     ShaderReg live_reject_registers[2] = {
         {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
