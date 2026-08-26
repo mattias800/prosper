@@ -1127,6 +1127,10 @@ struct VulkanComputeContext {
     uint32_t descriptor_buffer_capacity = 0;
     uint32_t descriptor_sampled_capacity = 0;
     uint32_t descriptor_storage_capacity = 0;
+    // VUID-VkWriteDescriptorSet-descriptorType-00328: a STORAGE_BUFFER descriptor's offset must be
+    // a multiple of this. It is 4 on RADV and 16 on lavapipe, which is why binding one 4-byte flag
+    // per compare target at a 4-byte stride passed every developer GPU and failed CI (#1727).
+    VkDeviceSize storage_buffer_offset_alignment = 1;
     std::unordered_map<std::string, CachedComputePipeline> pipelines;
     uint32_t queue_family = UINT32_MAX;
     VkPhysicalDeviceMemoryProperties memory{};
@@ -2549,6 +2553,16 @@ struct VulkanComputeContext {
         subgroup_operations = subgroup.supportedOperations;
         std::copy_n(properties.properties.limits.maxComputeWorkGroupCount, 3,
                     max_compute_workgroup_count.begin());
+        storage_buffer_offset_alignment = std::max<VkDeviceSize>(
+            1, properties.properties.limits.minStorageBufferOffsetAlignment);
+    }
+
+    // Byte distance between consecutive per-target compare flags. Each flag is one uint32_t, but it
+    // is addressed through its OWN storage-buffer descriptor at `index * stride`, so the stride is
+    // governed by the descriptor-offset limit rather than by the datum's size. Both terms are powers
+    // of two, so the max is a multiple of the alignment for every value the limit can take.
+    VkDeviceSize compare_flag_stride() const {
+        return std::max<VkDeviceSize>(sizeof(uint32_t), storage_buffer_offset_alignment);
     }
 
     bool init() {
@@ -8021,7 +8035,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         bool compare_ready = compare_targets.empty();
         if (!compare_targets.empty() && ctx.prepare_compare_pipeline()) {
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bci.size = compare_targets.size() * sizeof(uint32_t);
+            bci.size = compare_targets.size() * ctx.compare_flag_stride();
             bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             compare_ready = vk_soft_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &compare_flags),
@@ -8068,7 +8082,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     CompareTarget& target = compare_targets[j];
                     infos[j][0] = {target.current, 0, target.bytes};
                     infos[j][1] = {target.baseline, 0, target.bytes};
-                    infos[j][2] = {compare_flags, j * sizeof(uint32_t), sizeof(uint32_t)};
+                    infos[j][2] = {compare_flags, j * ctx.compare_flag_stride(),
+                                   sizeof(uint32_t)};
                     for (uint32_t binding = 0; binding < 3; ++binding) {
                         VkWriteDescriptorSet& write = writes[j * 3 + binding];
                         write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -8525,7 +8540,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // becomes a four-byte host read after the fence.
         if (!compare_targets.empty()) {
             vkCmdFillBuffer(command, compare_flags, 0,
-                            compare_targets.size() * sizeof(uint32_t), 0);
+                            compare_targets.size() * ctx.compare_flag_stride(), 0);
             std::vector<VkBufferMemoryBarrier> before_compare;
             before_compare.reserve(compare_targets.size() * 2 + 1);
             for (const CompareTarget& target : compare_targets) {
@@ -8551,7 +8566,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             flags.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             flags.srcQueueFamilyIndex = flags.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             flags.buffer = compare_flags;
-            flags.size = compare_targets.size() * sizeof(uint32_t);
+            flags.size = compare_targets.size() * ctx.compare_flag_stride();
             before_compare.push_back(flags);
             vkCmdPipelineBarrier(command,
                                  VK_PIPELINE_STAGE_HOST_BIT |
@@ -8625,7 +8640,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             flags.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
             flags.srcQueueFamilyIndex = flags.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             flags.buffer = compare_flags;
-            flags.size = compare_targets.size() * sizeof(uint32_t);
+            flags.size = compare_targets.size() * ctx.compare_flag_stride();
             vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &flags,
                                  0, nullptr);
@@ -8768,13 +8783,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
         if (!compare_targets.empty()) {
             void* mapped = nullptr;
+            const VkDeviceSize flag_stride = ctx.compare_flag_stride();
             if (ctx.map_memory(compare_flags_memory, 0,
-                               compare_targets.size() * sizeof(uint32_t), &mapped) == VK_SUCCESS) {
-                const auto* changed = static_cast<const uint32_t*>(mapped);
+                               compare_targets.size() * flag_stride, &mapped) == VK_SUCCESS) {
+                // Step by the DESCRIPTOR stride, not by sizeof(uint32_t). Indexing a uint32_t* by
+                // target would read the padding between flags on any device whose alignment exceeds
+                // four, reporting every target after the first as unchanged.
+                const auto* flag_bytes = static_cast<const uint8_t*>(mapped);
                 for (size_t j = 0; j < compare_targets.size(); ++j) {
                     CompareTarget& target = compare_targets[j];
-                    if (target.buffer) target.buffer->gpu_result_unchanged = changed[j] == 0;
-                    if (target.image) target.image->gpu_result_unchanged = changed[j] == 0;
+                    uint32_t changed = 0;
+                    std::memcpy(&changed, flag_bytes + j * flag_stride, sizeof(changed));
+                    if (target.buffer) target.buffer->gpu_result_unchanged = changed == 0;
+                    if (target.image) target.image->gpu_result_unchanged = changed == 0;
                 }
                 ctx.unmap_memory(compare_flags_memory);
             }
