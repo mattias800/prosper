@@ -171,6 +171,24 @@ struct Vk {
     VkDeviceMemory  stageImgMem = VK_NULL_HANDLE;
     uint32_t        stageW = 0, stageH = 0;
 
+    // --fps content sampling on the GPU present path (#3010). The swapchain blit reads the
+    // renderer's image and never touches host memory, so the distinct-frame counter had nothing to
+    // observe. These take a small NEAREST-filtered copy of the same image in the same command
+    // buffer, which is a point-sample grid over the presented picture, and read it back one frame
+    // late so no extra fence wait is introduced.
+    //
+    // Allocated only when --fps asked for the counter: this is an instrument, and an instrument that
+    // runs when nobody asked for it is how a measurement pass ends up measuring itself (#2113).
+    VkImage         sampleImg    = VK_NULL_HANDLE;
+    VkDeviceMemory  sampleImgMem = VK_NULL_HANDLE;
+    VkBuffer        sampleBuf    = VK_NULL_HANDLE;
+    VkDeviceMemory  sampleMem    = VK_NULL_HANDLE;
+    void*           sampleMapped = nullptr;
+    // A sample recorded last present and not yet signed. The fence that guards it is inFlight,
+    // which present_frame_gpu already waits on at entry, so the read is free.
+    bool            samplePending = false;
+
+
     VkCommandPool   cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd     = VK_NULL_HANDLE;
     VkSemaphore     acquireSem = VK_NULL_HANDLE;
@@ -364,6 +382,64 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
     VKCHECK(vkAllocateMemory(vk.device, &ai, nullptr, &vk.stageImgMem), "stage image mem");
     vkBindImageMemory(vk.device, vk.stageImg, vk.stageImgMem, 0);
     return true;
+}
+
+// The --fps content-sample grid (#3010). Fixed size, so it survives swapchain and source-extent
+// changes untouched: the signature only has to be comparable with the PREVIOUS signature, and a grid
+// that resized would make consecutive frames incomparable for one frame every time the guest
+// reconfigured VideoOut -- reporting a content change that did not happen.
+//
+// 256x144 is 36,864 points, above the ~8,100 pixels frame_content_signature samples from a 1080p
+// frame, and it costs 147,456 bytes of host memory and one small blit per present.
+constexpr uint32_t kFpsSampleW = 256, kFpsSampleH = 144;
+constexpr VkDeviceSize kFpsSampleBytes = (VkDeviceSize)kFpsSampleW * kFpsSampleH * 4;
+
+// True once the sample grid is usable. Failure is not fatal and not retried: --fps degrades to the
+// unmeasured HUD rather than taking the app down over an instrument.
+bool ensure_fps_sample(Vk& vk) {
+    if (vk.sampleBuf) return true;
+
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = kFpsSampleBytes;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk.device, &bi, nullptr, &vk.sampleBuf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk.device, vk.sampleBuf, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(vk.device, &ai, nullptr, &vk.sampleMem) != VK_SUCCESS) goto fail;
+    vkBindBufferMemory(vk.device, vk.sampleBuf, vk.sampleMem, 0);
+    if (vkMapMemory(vk.device, vk.sampleMem, 0, kFpsSampleBytes, 0, &vk.sampleMapped) != VK_SUCCESS)
+        goto fail;
+
+    {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.extent = {kFpsSampleW, kFpsSampleH, 1};
+        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(vk.device, &ii, nullptr, &vk.sampleImg) != VK_SUCCESS) goto fail;
+        VkMemoryRequirements imr; vkGetImageMemoryRequirements(vk.device, vk.sampleImg, &imr);
+        VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        iai.allocationSize = imr.size;
+        iai.memoryTypeIndex = find_mem(vk.phys, imr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(vk.device, &iai, nullptr, &vk.sampleImgMem) != VK_SUCCESS) goto fail;
+        vkBindImageMemory(vk.device, vk.sampleImg, vk.sampleImgMem, 0);
+    }
+    return true;
+
+fail:
+    fprintf(stderr, "[fps] content sampling unavailable; the HUD will report the presented rate only\n");
+    if (vk.sampleMapped) { vkUnmapMemory(vk.device, vk.sampleMem); vk.sampleMapped = nullptr; }
+    if (vk.sampleImg)    { vkDestroyImage(vk.device, vk.sampleImg, nullptr); vk.sampleImg = VK_NULL_HANDLE; }
+    if (vk.sampleImgMem) { vkFreeMemory(vk.device, vk.sampleImgMem, nullptr); vk.sampleImgMem = VK_NULL_HANDLE; }
+    if (vk.sampleBuf)    { vkDestroyBuffer(vk.device, vk.sampleBuf, nullptr); vk.sampleBuf = VK_NULL_HANDLE; }
+    if (vk.sampleMem)    { vkFreeMemory(vk.device, vk.sampleMem, nullptr); vk.sampleMem = VK_NULL_HANDLE; }
+    return false;
 }
 
 void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout to,
@@ -600,7 +676,7 @@ bool try_adopt_shared_present(Vk& vk, SDL_Window* win) {
 // now in flight and returns the acquire/present outcome.
 prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::frontend::GpuScanoutFrame& gf,
                                                     int& prevSlot, bool requestReadback,
-                                                    bool& readbackReady,
+                                                    bool& readbackReady, bool sampleContent,
                                                     const std::vector<std::string>* overlayLines = nullptr) {
     readbackReady = false;
     const VkResult previousWait = vkWaitForFences(
@@ -614,6 +690,15 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         fprintf(stderr, "[app] gpu-present fence wait failed (%d); stopping\n",
                 static_cast<int>(previousWait));
         return prosper::frontend::PresentAttempt::failed;
+    }
+    // The wait above is the same fence that guarded last present's sample copy, so the sample is
+    // readable here at no cost. Signing it one frame late is invisible in a rate: the counter needs
+    // the interval between distinct frames, not the frame's own timestamp.
+    if (vk.samplePending) {
+        vk.samplePending = false;
+        gpu::note_present_publication_signature(
+            gpu::dense_content_signature(static_cast<const uint8_t*>(vk.sampleMapped),
+                                         (size_t)kFpsSampleBytes));
     }
     if (prevSlot >= 0) { prosper::frontend::present_blit_release(prevSlot); prevSlot = -1; }
     if (requestReadback && !ensure_stage(vk, gf.width, gf.height)) {
@@ -651,6 +736,41 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     blit.dstOffsets[1] = {(int32_t)vk.scExtent.width, (int32_t)vk.scExtent.height, 1};
     vkCmdBlitImage(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    // --fps content sample (#3010): a NEAREST-filtered reduction of the SAME image the swapchain
+    // blit just read, copied to host memory. NEAREST rather than LINEAR on purpose -- averaging
+    // would let a small bright change cancel against its neighbours, and this exists to detect
+    // change, not to look good. Signed at the top of the NEXT present, under the fence already
+    // waited on there, so this adds no synchronisation.
+    if (sampleContent && vk.sampleImg) {
+        barrier(vk.cmd, vk.sampleImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit sb{};
+        sb.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        sb.srcOffsets[1] = {(int32_t)gf.width, (int32_t)gf.height, 1};
+        sb.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        sb.dstOffsets[1] = {(int32_t)kFpsSampleW, (int32_t)kFpsSampleH, 1};
+        vkCmdBlitImage(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       vk.sampleImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &sb, VK_FILTER_NEAREST);
+        barrier(vk.cmd, vk.sampleImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy sc{};
+        sc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        sc.imageExtent = {kFpsSampleW, kFpsSampleH, 1};
+        vkCmdCopyImageToBuffer(vk.cmd, vk.sampleImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               vk.sampleBuf, 1, &sc);
+        VkBufferMemoryBarrier sh{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        sh.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        sh.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        sh.srcQueueFamilyIndex = sh.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sh.buffer = vk.sampleBuf; sh.offset = 0; sh.size = kFpsSampleBytes;
+        vkCmdPipelineBarrier(vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, nullptr, 1, &sh, 0, nullptr);
+        vk.samplePending = true;
+    }
+
     if (requestReadback) {
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1764,6 +1884,9 @@ int main(int argc, char** argv) {
     prosper::gpu::PresentRateSnapshot fpsWindow = prosper::gpu::present_rate_snapshot();
     prosper::gpu::FrameRate fpsRate;
     std::vector<std::string> fpsLines;
+    // The extent last presented through the GPU path, for the HUD's resolution field (#3010).
+    uint32_t gpuPresentedW = 0, gpuPresentedH = 0;
+
 #ifdef PROSPER_HAVE_LIBRARY_UI
     // The library replaces the empty idle window. Only meaningful when this run has no game of its own
     // and is not feeding a test pattern; a failure to bring it up is not fatal — the flat idle colour
@@ -2403,15 +2526,26 @@ int main(int argc, char** argv) {
                                      vk.scFormat, vk.scImages, vk.scExtent)) {
                     fprintf(stderr, "[app] --fps could not start; continuing without the counter.\n");
                     showFps = false;
+                } else if (vk.gpu_present) {
+                    // GPU present publishes no CPU pixels, so the counter has to sample the
+                    // presented image itself (#3010). Allocated only here: with --fps off the
+                    // present path stays byte-for-byte what it was.
+                    ensure_fps_sample(vk);
                 }
             }
+
             const prosper::gpu::PresentRateSnapshot now = prosper::gpu::present_rate_snapshot();
             if (prosper::frontend::fps_window_due(fpsWindow.now_seconds, now.now_seconds,
                                                   kFpsWindowSeconds)) {
                 fpsRate = prosper::gpu::frame_rate_between(fpsWindow, now);
                 fpsWindow = now;
+                // present_frame_width/height are fed by the CPU publish path and read 0 under GPU
+                // present, so the HUD showed "0x0" there. Prefer the extent actually presented.
                 fpsLines = prosper::frontend::fps_hud_lines(
-                    fpsRate, gpu::present_frame_width(), gpu::present_frame_height(), now.distinct);
+                    fpsRate,
+                    gpuPresentedW ? gpuPresentedW : gpu::present_frame_width(),
+                    gpuPresentedH ? gpuPresentedH : gpu::present_frame_height(),
+                    now.distinct);
             }
         }
         // Only a HUD that has something to say is passed down; an empty list leaves both present
@@ -2433,7 +2567,9 @@ int main(int argc, char** argv) {
                 }
                 bool grabReady = false;
                 PresentAttempt attempt = present_frame_gpu(
-                    vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady, fpsForPresent);
+                    vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady,
+                    showFps, fpsForPresent);
+                gpuPresentedW = gf.width; gpuPresentedH = gf.height;
                 if (grabReady)
                     flushGrabScreenshot(static_cast<const uint8_t*>(vk.stageMapped),
                                         gf.width, gf.height);
@@ -2452,8 +2588,19 @@ int main(int argc, char** argv) {
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
                         double s = std::chrono::duration<double>(now - t0).count();
-                        fprintf(stderr, "[app] %.1f fps (%llu frames, gpu-present)\n",
-                                (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown);
+                        // The PRESENTED rate, and -- when --fps armed the content sample (#3010) --
+                        // the DISTINCT rate beside it. Both, because they answer different questions:
+                        // a title whose picture is frozen still presents at 60, and this line alone
+                        // read healthy right through the Windows splash stall in #3011.
+                        char distinct[64] = "";
+                        if (showFps && fpsRate.measured)
+                            snprintf(distinct, sizeof distinct, ", %.1f distinct%s",
+                                     fpsRate.distinct_fps,
+                                     prosper::gpu::frame_rate_is_mostly_unchanged(fpsRate)
+                                         ? " PICTURE NOT CHANGING" : "");
+                        fprintf(stderr, "[app] %.1f fps (%llu frames, gpu-present%s)\n",
+                                (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown, distinct);
+
                         t0 = now; mark = shown;
                     }
                 }
@@ -2539,10 +2686,20 @@ int main(int argc, char** argv) {
                                     (unsigned long long)gpu::present_count(), nonzeroRgbBytes,
                                     (size_t)w * h * 3);
                         } else {
-                            fprintf(stderr, "[app] %.1f fps (%llu frames)\n",
+                            // Same two rates as the GPU branch (#3010), so a run can be compared
+                            // across present paths. Here the distinct rate comes from the CPU
+                            // publish hash rather than from a sampled grid.
+                            char distinct[64] = "";
+                            if (showFps && fpsRate.measured)
+                                snprintf(distinct, sizeof distinct, ", %.1f distinct%s",
+                                         fpsRate.distinct_fps,
+                                         prosper::gpu::frame_rate_is_mostly_unchanged(fpsRate)
+                                             ? " PICTURE NOT CHANGING" : "");
+                            fprintf(stderr, "[app] %.1f fps (%llu frames%s)\n",
                                     (shown - mark) / (s > 0 ? s : 1),
-                                    (unsigned long long)shown);
+                                    (unsigned long long)shown, distinct);
                         }
+
                         t0 = now; mark = shown;
                     }
                 }
@@ -2596,6 +2753,14 @@ int main(int argc, char** argv) {
     libraryUi.shutdown();
 #endif
     vkDeviceWaitIdle(vk.device);
+    // After the idle above: these are read by the present command buffer, so they can only be
+    // released once no submit can still be reading them (#3010).
+    if (vk.sampleMapped) vkUnmapMemory(vk.device, vk.sampleMem);
+    if (vk.sampleImg)    vkDestroyImage(vk.device, vk.sampleImg, nullptr);
+    if (vk.sampleImgMem) vkFreeMemory(vk.device, vk.sampleImgMem, nullptr);
+    if (vk.sampleBuf)    vkDestroyBuffer(vk.device, vk.sampleBuf, nullptr);
+    if (vk.sampleMem)    vkFreeMemory(vk.device, vk.sampleMem, nullptr);
+
     SDL_DestroyWindow(win); SDL_Quit();
     return exitCode;
 }
