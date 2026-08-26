@@ -80,19 +80,63 @@ uint32_t mrt_active_color_count(const prosper::gpu::DrawItem& draw, FormatDefine
     return count;
 }
 
-// Does this draw bind `addr` as any ACTIVE colour target? The feedback question, answered through
-// the same rule pass grouping uses rather than a second interpretation of it.
+// Can two consecutive draws share one backend colour pass?
+//
+// A target address is not a complete attachment identity.  Packed mip tails legitimately give two
+// rendered levels the same guest address while their extents still differ.  Grouping only on
+// address and format made GTA V's 64x32 and 32x16 R11G11B10F levels share
+// one 64x32 Vulkan attachment.  The missing last level was then sampled as undefined max-float data
+// by deferred lighting.  Unknown 0x0 extents remain non-conflicting, matching mrt_extent_conflicts.
+template <typename FormatDefined, typename FormatAt>
+bool mrt_same_color_pass(const prosper::gpu::DrawItem& first,
+                         const prosper::gpu::DrawItem& candidate,
+                         FormatDefined format_defined, FormatAt format_at) {
+    const uint32_t count = mrt_active_color_count(first, format_defined);
+    if (mrt_active_color_count(candidate, format_defined) != count) return false;
+    for (uint32_t slot = 0; slot < count; ++slot) {
+        const auto a = mrt_color_binding(first, slot);
+        const auto b = mrt_color_binding(candidate, slot);
+        const uint64_t a_base = slot == 0 ? a.base
+            : mrt_active_color(first, slot, format_defined);
+        const uint64_t b_base = slot == 0 ? b.base
+            : mrt_active_color(candidate, slot, format_defined);
+        if (a_base != b_base || format_at(first, slot) != format_at(candidate, slot))
+            return false;
+        const bool active = slot == 0 || a_base || b_base;
+        if (active && mrt_extent_conflicts(a.width, a.height, b.width, b.height))
+            return false;
+    }
+    return true;
+}
+
+// Does this draw bind the sampled VIEW as any ACTIVE colour target? Address alone is insufficient:
+// packed mip tails may give two levels the same guest base even though they are separate Vulkan
+// images. Known, conflicting extents therefore prove that the sampled view is not the attachment.
+// Unknown extents remain conservative and count an address match as feedback -- unlike pass
+// grouping, this decision protects us from binding one image simultaneously for sampling and
+// rendering, so absence of evidence cannot make the operation safe.
+template <typename FormatDefined>
+bool mrt_draw_binds_target_view(const prosper::gpu::DrawItem& draw, uint64_t addr,
+                                uint32_t sampled_width, uint32_t sampled_height,
+                                FormatDefined format_defined) {
+    if (!addr) return false;
+    for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+        if (mrt_active_color(draw, slot, format_defined) != addr) continue;
+        const auto binding = mrt_color_binding(draw, slot);
+        if (mrt_extent_conflicts(binding.width, binding.height,
+                                 sampled_width, sampled_height))
+            continue;
+        return true;
+    }
+    return false;
+}
+
+// Address-only compatibility wrapper. With an unknown sampled extent it deliberately keeps the
+// historical conservative behaviour.
 template <typename FormatDefined>
 bool mrt_draw_binds_target(const prosper::gpu::DrawItem& draw, uint64_t addr,
                            FormatDefined format_defined) {
-    if (!addr) return false;
-    uint64_t bases[prosper::gpu::kColorTargetCount]{};
-    bool active[prosper::gpu::kColorTargetCount]{};
-    for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
-        bases[slot] = mrt_active_color(draw, slot, format_defined);
-        active[slot] = bases[slot] != 0u;
-    }
-    return mrt_target_feedback(bases, active, prosper::gpu::kColorTargetCount, addr);
+    return mrt_draw_binds_target_view(draw, addr, 0u, 0u, format_defined);
 }
 
 // The two materialization decisions that key on feedback, as seams that OWN their gate.
@@ -110,10 +154,12 @@ bool mrt_draw_binds_target(const prosper::gpu::DrawItem& draw, uint64_t addr,
 // May the retained GPU image serve this sample directly?
 template <typename FormatDefined>
 bool mrt_direct_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
+                       uint32_t sampled_width, uint32_t sampled_height,
                        bool is_storage_image, uint32_t img_dim, bool extent_compatible,
                        bool has_persistent_target, FormatDefined format_defined) {
     return !is_storage_image && img_dim == 1u && extent_compatible && has_persistent_target &&
-           !mrt_draw_binds_target(draw, sampled, format_defined);
+           !mrt_draw_binds_target_view(draw, sampled, sampled_width, sampled_height,
+                                       format_defined);
 }
 
 // May the uniform-colour fast path serve this sample? `preconditions` folds the caller's own
@@ -121,8 +167,11 @@ bool mrt_direct_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
 // with a usable extent) so this seam owns exactly the feedback gate and nothing it cannot see.
 template <typename FormatDefined>
 bool mrt_uniform_live_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
+                             uint32_t sampled_width, uint32_t sampled_height,
                              bool preconditions, FormatDefined format_defined) {
-    return preconditions && !mrt_draw_binds_target(draw, sampled, format_defined);
+    return preconditions &&
+           !mrt_draw_binds_target_view(draw, sampled, sampled_width, sampled_height,
+                                       format_defined);
 }
 
 }  // namespace prosper::frontend

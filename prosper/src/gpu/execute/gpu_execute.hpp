@@ -93,6 +93,10 @@ struct DrawItem {
     uint32_t raw_draw_count = 0;
     bool raw_indexed = false;
     uint64_t raw_draw_modifier = 0;
+    // A vertex-buffer-backed PS5 RectList is submitted as three vertices. GFX10 synthesizes the
+    // post-VS affine fourth corner; Vulkan does not, so the generated geometry stage does it.
+    // Capture keeps this semantic bit so current-translator replay can rebuild that generated stage.
+    bool rect_list_synthesis = false;
     // GE_INDX_OFFSET at this draw. Vulkan consumes it as firstVertex for non-indexed draws and as
     // vertexOffset for indexed draws, preserving the hardware gl_VertexIndex contract.
     int32_t vertex_offset = 0;
@@ -1062,6 +1066,7 @@ enum class LiveTargetPixelFormat : uint8_t {
     R32Uint,
     R32Float,
     Rg8Unorm,
+    Rgba32Float,
 };
 struct LiveTargetSnapshot {
     uint32_t width = 0, height = 0;
@@ -1330,6 +1335,19 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 // (#400) before this runs, so draw_count is non-zero in practice and the vb_records fallback is a guard.
 inline uint32_t resolve_nonindexed_vertex_count(uint32_t draw_count, uint32_t vb_records) {
     return draw_count ? draw_count : vb_records;
+}
+
+inline bool needs_rect_list_synthesis(uint32_t primitive_type, bool indexed,
+                                      uint32_t draw_count,
+                                      const ShaderResourceTable* vertex_resources) {
+    if ((primitive_type != 7u && primitive_type != 17u) || indexed || draw_count != 3u ||
+        !vertex_resources)
+        return false;
+    return std::any_of(
+        vertex_resources->resources.begin(), vertex_resources->resources.end(),
+        [](const ShaderResource& resource) {
+            return resource.cls == ResourceClass::VertexBuffer && resource.stride != 0u;
+        });
 }
 
 struct ColorStateTraceConfig {
@@ -1606,6 +1624,22 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(
         ds, rs.ps_addr, true, vcount_hint, draw ? draw->command_order : 0);
+    const bool rect_list = rs.prim_type == 7u || rs.prim_type == 17u;
+    const bool rect_list_synthesis = needs_rect_list_synthesis(
+        rs.prim_type, draw && draw->indexed, vcount_hint, vrt.get());
+    // Keep this diagnostic narrow enough for a routed title run.  PROSPER_DBG/GFXLOG both perturb
+    // GTA V heavily and generate enormous logs; this switch proves that the post-VS RectList path
+    // actually armed, and names the exact producer/consumer pair, without changing execution.
+    if (rect_list_synthesis && getenv("PROSPER_RECTLOG")) {
+        static std::atomic<uint32_t> logged{0};
+        const uint32_t ordinal = logged.fetch_add(1, std::memory_order_relaxed);
+        if (ordinal < 64u)
+            fprintf(stderr,
+                    "[rect-list] synthesize draw=%llu prim=%u count=%u vs=0x%llx ps=0x%llx\n",
+                    (unsigned long long)(draw ? draw->command_order : 0), rs.prim_type,
+                    vcount_hint, (unsigned long long)vs_program_addr,
+                    (unsigned long long)rs.ps_addr);
+    }
     const auto table_done = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // PROSPER_RTLOG: correlate this draw's render-target address (CB_COLOR0_BASE) with the addresses of
@@ -1678,7 +1712,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
         max_shader_dwords, system_input_ptr, pixel_input_ptr);
     const bool capture_vertex_position = getenv("PROSPER_GEOM_PROBE") != nullptr &&
-                                         !interpolation.requires_geometry;
+                                         !interpolation.requires_geometry &&
+                                         !rect_list_synthesis;
     uint64_t vs_identity = 0, fs_identity = 0;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
@@ -1748,14 +1783,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
     const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
     std::vector<uint32_t> gs;
-    if (interpolation.requires_geometry && interpolation.valid) {
+    if ((interpolation.requires_geometry || rect_list_synthesis) && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
         // provide the three AMD vertex parameters and remain fail-visible.
         const bool triangle_topology = resolved_pipeline.topology >= 3u &&
                                        resolved_pipeline.topology <= 5u;
         if (triangle_topology)
             gs = recompile_interpolation_geometry(
-                interpolation, getenv("PROSPER_GEOM_PROBE") != nullptr);
+                interpolation, getenv("PROSPER_GEOM_PROBE") != nullptr,
+                rect_list_synthesis);
     }
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
@@ -1784,7 +1820,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             nd++;
         }
     }
-    if (vs_words.empty() || fs_words.empty() || (interpolation.requires_geometry && gs.empty())) {
+    if (vs_words.empty() || fs_words.empty() ||
+        ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty())) {
         report_dropped_draw_target(rs.color0_base, "shader-recompile", rs.cb_target_mask,
                                    rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
@@ -2042,7 +2079,6 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // no vertex-buffer inputs, and submits count=3; invoke index 3 and render the four results as a
     // triangle strip. Restrict the expansion to that observed no-VB form: a general VB-backed RectList
     // needs post-VS fourth-vertex synthesis and must not speculatively fetch a fourth input record.
-    const bool rect_list = rs.prim_type == 7u || rs.prim_type == 17u;
     if (rect_list && out.indices.empty() && vertex_count == 3u && vb_entries == 0u) {
         vertex_count = 4u;
         if (log) fprintf(stderr, "[exec] RectList: expanded procedural 3-vertex rectangle to 4-vertex strip\n");
@@ -2163,6 +2199,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
     // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
     out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
+    out.rect_list_synthesis = rect_list_synthesis;
     out.raw_draw_modifier = draw ? draw->modifier : 0;
     out.vertex_offset = draw && draw->has_vertex_offset_override
         ? draw->indirect_vertex_offset

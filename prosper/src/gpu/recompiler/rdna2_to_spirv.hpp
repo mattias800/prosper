@@ -372,7 +372,8 @@ bool dead_varying_elimination_enabled();
 // triangle-strip lowering all feed Vulkan's `Triangles` geometry input primitive. The optional
 // capture flag decorates this final pre-rasterization stage for the geometry diagnostic only.
 std::vector<uint32_t> recompile_interpolation_geometry(
-    const FragmentInterpolationLayout& layout, bool capture_position = false);
+    const FragmentInterpolationLayout& layout, bool capture_position = false,
+    bool synthesize_rect = false);
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional

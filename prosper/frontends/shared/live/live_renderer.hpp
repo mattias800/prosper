@@ -6,6 +6,7 @@
 // present layer (present_write_frame → present_readback). All the boot-time diagnostics
 // (PROSPER_RENDER_*, PROSPER_DUMP_*, PROSPER_TESTTEX, …) are preserved and remain env-gated.
 #pragma once
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -92,6 +93,27 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
 bool sampled_msaa_fetch_shape_supported(const prosper::gpu::ShaderResource& resource,
                                         bool is_storage_image,
                                         bool reflected_msaa_fetch);
+
+// Preserve an ordinary guest R11G11B10F sampled texture in its native packed-HDR representation.
+// Expanding this format to RGBA8 is not merely a precision loss: every channel above 1.0 is clamped,
+// which removes the light energy from environment maps before the shader can consume it. Keep the
+// first exact path deliberately narrow; compressed, sRGB, array/cube/volume, and storage images retain
+// their existing materialization until those shapes have their own upload contracts.
+bool native_r11_sampled_upload_supported(const prosper::gpu::ShaderResource& resource);
+
+// Reconstruct the independently addressable CB_COLOR identities belonging to a sampled thin-2D
+// mip chain. Tiled allocations are tail-first/reverse: level zero is generally not the allocation
+// base, while every packed-tail level shares that base. The result describes address layout only;
+// the caller must still prove which identities currently exist in the renderer-owned target cache.
+struct RendererMipChainLayout {
+    std::array<uint64_t, 16> level_ids{};
+    uint32_t level_count = 0;
+};
+RendererMipChainLayout renderer_mip_chain_layout(uint64_t level_zero_address,
+                                                 uint32_t width, uint32_t height,
+                                                 uint32_t bytes_per_texel,
+                                                 uint32_t tile_mode,
+                                                 uint32_t declared_mip_levels);
 
 // Apply the remaining runtime gates to a texture_decode_cache_candidate(). Keeping the candidate
 // explicit is important: DCC metadata can provide a nonzero source span even when renderer-owned

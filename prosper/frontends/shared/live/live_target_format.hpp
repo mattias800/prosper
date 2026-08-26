@@ -35,6 +35,7 @@ enum class LiveTargetSourceLayout : uint8_t {
     Uint32x1,
     Float32x1,
     Unorm8x2,
+    Float32x4,
 };
 
 constexpr LiveTargetSourceLayout live_target_source_layout(
@@ -54,6 +55,8 @@ constexpr LiveTargetSourceLayout live_target_source_layout(
             return LiveTargetSourceLayout::Float32x1;
         case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:
             return LiveTargetSourceLayout::Unorm8x2;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
+            return LiveTargetSourceLayout::Float32x4;
     }
     return LiveTargetSourceLayout::Unorm8x4;
 }
@@ -77,6 +80,8 @@ constexpr VkFormat live_target_pixel_format_vk(prosper::gpu::LiveTargetPixelForm
             return VK_FORMAT_R32_SFLOAT;
         case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:
             return VK_FORMAT_R8G8_UNORM;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
+            return VK_FORMAT_R32G32B32A32_SFLOAT;
     }
     return VK_FORMAT_UNDEFINED;
 }
@@ -92,6 +97,7 @@ constexpr uint32_t live_target_pixel_format_bytes(prosper::gpu::LiveTargetPixelF
         case prosper::gpu::LiveTargetPixelFormat::R32Uint:         return 4u;
         case prosper::gpu::LiveTargetPixelFormat::R32Float:        return 4u;
         case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:        return 2u;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return 16u;
     }
     return 0u;
 }
@@ -107,6 +113,7 @@ constexpr const char* live_target_pixel_format_name(prosper::gpu::LiveTargetPixe
         case prosper::gpu::LiveTargetPixelFormat::R32Uint:         return "r32ui";
         case prosper::gpu::LiveTargetPixelFormat::R32Float:        return "r32f";
         case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:        return "rg8";
+        case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return "rgba32f";
     }
     return "unknown";
 }
@@ -145,7 +152,20 @@ constexpr bool live_target_pixel_format_from_vk(VkFormat vk_format,
         format = prosper::gpu::LiveTargetPixelFormat::Rg8Unorm;
         return true;
     }
+    if (vk_format == VK_FORMAT_R32G32B32A32_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::Rgba32Float;
+        return true;
+    }
     return false;
+}
+
+// Packed-HDR render targets can be the independently rendered levels of one sampled mip chain.
+// The frontend therefore keeps each such target resident until the logical submit ends: otherwise
+// ordinary LRU pressure can evict one middle level before the final consumer assembles the chain,
+// and deriving the missing level with a linear blit changes the guest's custom downsample result.
+// Keep this predicate exact rather than treating every four-byte target as interchangeable.
+constexpr bool renderer_mip_target_requires_submit_retention(VkFormat format) {
+    return format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 }
 
 } // namespace prosper::frontend

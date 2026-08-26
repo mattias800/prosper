@@ -30,6 +30,15 @@ struct ColorTargetState {
     bool separate_alpha_blend = false;
     uint32_t alpha_src_blend = 0, alpha_dst_blend = 0, alpha_comb_fcn = 0;
     bool disable_rop3 = false;
+
+    // GFX10 color-target view identity. CB_COLORn_BASE names the complete allocation while
+    // CB_COLORn_VIEW.MIP_LEVEL selects the level rendered by this attachment. `base`, `width`, and
+    // `height` above are the effective level view consumed by the backend; these fields retain the
+    // allocation programming needed to diagnose packed-tail aliases and reconstruct full chains.
+    uint64_t allocation_base = 0;
+    uint32_t mip_level = 0, max_mip = 0, color_sw_mode = 0;
+    bool in_mip_tail = false;
+    uint32_t mip_tail_offset = 0, mip_tail_x = 0, mip_tail_y = 0;
 };
 
 struct RenderState {

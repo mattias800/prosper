@@ -181,6 +181,14 @@ struct FrameResource {
     // target is available, bind its GPU image directly instead of uploading `tex_rgba` again.
     // `tex_rgba` remains an optional conservative fallback for an invalidated/missing target.
     uint64_t persistent_render_target_id = 0;
+    // A guest mip chain is rendered as one independent persistent color target per level because
+    // CB_COLOR names a single mip view at a time. A later T# names the complete allocation as one
+    // sampled image. The frontend records the renderer-owned level identities here so the backend
+    // can assemble them into one Vulkan mip image instead of binding level zero and silently
+    // discarding every smaller level. Zero entries are missing levels; the backend derives those
+    // from the previous available destination level. The count is the requested chain length.
+    std::array<uint64_t, 16> persistent_render_target_mip_ids{};
+    uint32_t persistent_render_target_mip_count = 0;
     // Non-zero identifies a persistent depth/stencil surface whose DEPTH plane this resource
     // samples (a shadow map / depth pyramid tap, #1275). The backend binds the retained Vulkan
     // depth image directly — prosper never writes rendered depth back to guest memory, so there
@@ -314,6 +322,8 @@ inline VkFormat backend_color_format(VkFormat format) {
         return VK_FORMAT_R32_UINT;
     if (format == VK_FORMAT_R32G32B32A32_UINT)
         return VK_FORMAT_R32G32B32A32_UINT;
+    if (format == VK_FORMAT_R32G32B32A32_SFLOAT)
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
     if (format == VK_FORMAT_R32_SFLOAT)
         return VK_FORMAT_R32_SFLOAT;
     return VK_FORMAT_R8G8B8A8_UNORM;
@@ -321,7 +331,8 @@ inline VkFormat backend_color_format(VkFormat format) {
 
 inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     format = backend_color_format(format);
-    if (format == VK_FORMAT_R32G32B32A32_UINT) return 16u;
+    if (format == VK_FORMAT_R32G32B32A32_UINT ||
+        format == VK_FORMAT_R32G32B32A32_SFLOAT) return 16u;
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
     if (format == VK_FORMAT_R8_UNORM) return 1u;
     if (format == VK_FORMAT_R8G8_UNORM) return 2u;
@@ -338,6 +349,7 @@ inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat
         case VK_FORMAT_R8G8_UNORM:
         case VK_FORMAT_R8G8B8A8_UNORM:
         case VK_FORMAT_R16G16B16A16_SFLOAT:
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
         case VK_FORMAT_R32_SFLOAT:
         case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
             return NumericClass::Float;
@@ -1852,6 +1864,22 @@ inline size_t persistent_color_target_count_limit() {
     return count;
 }
 
+// One ordered frontend callback may record several render groups into one Vulkan submission batch.
+// While that batch is open, none of the existing targets can be evicted because an earlier command
+// buffer may still reference it. Refusing every new persistent target at the nominal count limit is
+// nevertheless incorrect: the new target becomes transient before the frontend can pin it, so a
+// producer followed by a later group in the same batch loses the only GPU-authoritative copy. Keep a
+// small, bounded admission window while eviction is deferred. Once the batch completes, the normal
+// cleanup path prunes unpinned entries back to the configured limit; targets claimed by the frontend
+// remain protected until their consumer releases them.
+inline size_t persistent_color_target_count_ceiling(bool eviction_deferred) {
+    const size_t limit = persistent_color_target_count_limit();
+    constexpr size_t kDeferredEvictionHeadroom = 64;
+    if (!eviction_deferred) return limit;
+    return limit > SIZE_MAX - kDeferredEvictionHeadroom
+        ? SIZE_MAX : limit + kDeferredEvictionHeadroom;
+}
+
 inline PersistentColorTargetImage* find_persistent_color_target(
     uint64_t id, uint32_t width, uint32_t height, VkFormat format, bool require_valid = true) {
     if (!id) return nullptr;
@@ -3144,7 +3172,19 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             const char* v = getenv("PROSPER_DS_HTILE_INVALIDATE");
             return !(v && v[0] == '0');
         }();
-        const bool htile_kill = htile_overlap && htile_invalidates;
+        // A byte-preserving HTILE write cannot change the logical depth/stencil surface. This is
+        // narrower than treating every compute HTILE pass as a harmless "decompress": a changed
+        // metadata plane can still encode a real fast clear and therefore keeps the conservative
+        // invalidation below.
+        //
+        // GTA V's transition kernel 0x413cdf900 is the hand-checkable positive instance. It reads
+        // and rewrites exactly the 294,912-byte HTILE plane at 0x204ca00000; the GPU comparator
+        // proves changed=0, after which `notify_guest_gpu_write_preserving_bytes` names the write
+        // `gpu-preserving`. Invalidating on that notification discarded the non-zero retained
+        // depth produced by submits 3416-3425 immediately before deferred lighting.
+        const bool byte_preserving =
+            std::strcmp(prosper::gpu::guest_gpu_write_origin(), "gpu-preserving") == 0;
+        const bool htile_kill = htile_overlap && htile_invalidates && !byte_preserving;
         if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
         if (depth_overlap || htile_kill) image.depth_valid = false;
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
@@ -4414,11 +4454,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Protect every GPU target sampled by this call from LRU eviction while its descriptors are built.
     for (const auto& draw : draws)
         for (const auto& resource : draw.R)
-            if (persistent_color_targets_enabled && resource.persistent_render_target_id)
+            if (persistent_color_targets_enabled && resource.persistent_render_target_id) {
                 if (auto* sampled = find_persistent_color_target(
                         resource.persistent_render_target_id, resource.tw, resource.th,
                         backend_color_format(resource.texture_format)))
                     sampled->last_use = color_target_generation;
+                const uint32_t mip_count = std::min<uint32_t>(
+                    resource.persistent_render_target_mip_count,
+                    static_cast<uint32_t>(resource.persistent_render_target_mip_ids.size()));
+                for (uint32_t level = 1; level < mip_count; ++level) {
+                    const uint64_t id = resource.persistent_render_target_mip_ids[level];
+                    if (!id) continue;
+                    if (auto* sampled = find_persistent_color_target(
+                            id, std::max(resource.tw >> level, 1u),
+                            std::max(resource.th >> level, 1u),
+                            backend_color_format(resource.texture_format)))
+                        sampled->last_use = color_target_generation;
+                }
+            }
 
     bool persistent_color = persistent_color_enabled;
     PersistentColorTargetKey color_key{};
@@ -4459,7 +4512,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    (persistent_color_target_cache().size() > persistent_color_target_count_limit() || ir.size > limit ||
                     persistent_color_target_bytes() > limit - ir.size) &&
                    evict_persistent_color_target(ctx, color_target_generation)) {}
-            if (ir.size <= limit && persistent_color_target_cache().size() <= persistent_color_target_count_limit() &&
+            if (ir.size <= limit && persistent_color_target_cache().size() <=
+                    persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - ir.size &&
                 vkAllocateMemory(dev, &iai, nullptr, &imem) == VK_SUCCESS) {
                 cached_color->bytes = ir.size;
@@ -4572,7 +4626,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    evict_persistent_color_target(ctx, color_target_generation)) {}
             if (color1_requirements.size <= limit &&
                 persistent_color_target_cache().size() <=
-                    persistent_color_target_count_limit() &&
+                    persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - color1_requirements.size &&
                 vkAllocateMemory(dev, &color1_allocation, nullptr, &imem1) == VK_SUCCESS) {
                 cached_color1->bytes = color1_requirements.size;
@@ -4679,7 +4733,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    evict_persistent_color_target(ctx, color_target_generation)) {}
             if (requirements.size <= limit &&
                 persistent_color_target_cache().size() <=
-                    persistent_color_target_count_limit() &&
+                    persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - requirements.size &&
                 vkAllocateMemory(dev, &allocation, nullptr, &extra_memories[slot]) == VK_SUCCESS) {
                 cached_extra[slot]->bytes = requirements.size;
@@ -4735,6 +4789,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (uint32_t slot = 2; slot < color_count; ++slot)
         load_extra[slot] = cached_extra[slot] && cached_extra[slot]->valid &&
                            color_target && color_target->load_existing_slots[slot];
+    if (color_target && getenv("PROSPER_BACKEND_LOAD_LOG")) {
+        if (use_color1)
+            fprintf(stderr,
+                    "[backend-load] slot=1 id=0x%llx %ux%u fmt=%d cached=%d valid=%d "
+                    "load_existing=%d seed=%d readback=%d -> load=%d\n",
+                    (unsigned long long)color_target->persistent_id1, W, H, (int)FMT1,
+                    cached_color1 != nullptr, cached_color1 ? (int)cached_color1->valid : -1,
+                    (int)color_target->load_existing1, effective_seed1 != nullptr,
+                    (int)color_target->readback1, (int)load_cached_color1);
+        for (uint32_t slot = 2; slot < color_count; ++slot)
+            fprintf(stderr,
+                    "[backend-load] slot=%u id=0x%llx %ux%u fmt=%d cached=%d valid=%d "
+                    "load_existing=%d seed=%d readback=%d -> load=%d\n",
+                    slot,
+                    (unsigned long long)color_target->persistent_id_slots[slot], W, H,
+                    (int)color_formats[slot], cached_extra[slot] != nullptr,
+                    cached_extra[slot] ? (int)cached_extra[slot]->valid : -1,
+                    (int)color_target->load_existing_slots[slot],
+                    color_target->seed_slots[slot] != nullptr,
+                    (int)color_target->readback_slots[slot], (int)load_extra[slot]);
+    }
 
     if (use_ds && !dimg) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -4988,6 +5063,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool uniform_clear = false;
         VkClearColorValue uniform_color{};
         bool borrowed_target = false;
+        // Independent one-level renderer targets copied into this upload's mip levels. Sources
+        // retain their persistent-cache layout after the copy; a zero image is generated from the
+        // preceding destination level.
+        bool assembled_target_mips = false;
+        std::array<VkImage, 16> target_mip_images{};
+        std::array<VkImageLayout, 16> target_mip_layouts{};
         bool borrowed_compute = false;
         VkImageLayout borrowed_compute_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         std::shared_ptr<void> borrowed_compute_lease;
@@ -5524,10 +5605,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         std::snprintf(why_text + n, sizeof why_text - n, " none");
                 }
                 std::fprintf(stderr,
-                             "[render] skip draw: fragment shader requires subgroup size %u "
+                             "[render] skip draw=%zu fs=%016llx: fragment shader requires subgroup size %u "
                              "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
                              "ops=0x%x required-ops=0x%x control=%d gds=%d fragment-atomics=%d "
                              "why=%s)\n",
+                             static_cast<size_t>(bd.draw_index != UINT64_MAX
+                                 ? bd.draw_index : di),
+                             static_cast<unsigned long long>(shader_key),
                              required_fragment_subgroup_size, ctx.min_subgroup_size,
                              ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
                              ctx.subgroup_stages, ctx.subgroup_operations,
@@ -6110,6 +6194,39 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     texture_references++;
+                    // Every ACTIVE bound slot, not just 0 and 1. A sampled renderer mip chain must
+                    // not copy any level that is also an attachment of this pass; the copy is
+                    // recorded before the render pass and would observe the previous contents.
+                    auto target_is_feedback = [&](uint64_t target_id,
+                                                  uint32_t target_w,
+                                                  uint32_t target_h) {
+                        if (!color_target || !target_id) return false;
+                        uint64_t bases[prosper::gpu::kColorTargetCount]{};
+                        bool active[prosper::gpu::kColorTargetCount]{};
+                        bases[0] = color_target->persistent_id;
+                        active[0] = persistent_color;
+                        bases[1] = color_target->persistent_id1;
+                        active[1] = persistent_color1;
+                        for (uint32_t slot = 2; slot < color_count; ++slot) {
+                            bases[slot] = color_target->persistent_id_slots[slot];
+                            active[slot] = cached_extra[slot] != nullptr;
+                        }
+                        return prosper::frontend::mrt_target_view_feedback(
+                            bases, active, color_count, target_id,
+                            target_w, target_h, W, H);
+                    };
+                    const bool target_feedback = target_is_feedback(
+                        r.persistent_render_target_id, r.tw, r.th);
+                    bool target_mip_feedback = target_feedback;
+                    const uint32_t requested_target_mips = std::min<uint32_t>(
+                        r.persistent_render_target_mip_count,
+                        static_cast<uint32_t>(r.persistent_render_target_mip_ids.size()));
+                    for (uint32_t level = 1;
+                         !target_mip_feedback && level < requested_target_mips; ++level)
+                        target_mip_feedback = target_is_feedback(
+                            r.persistent_render_target_mip_ids[level],
+                            std::max(r.tw >> level, 1u),
+                            std::max(r.th >> level, 1u));
                     // #1272: effective generated-mip chain — bounded by the chain the T# itself
                     // declares (declared_mip_levels; 1 = historical single-level behavior), and
                     // restricted to plain-2D RGBA8 sampled guest textures. Cube/volume stacks,
@@ -6128,11 +6245,49 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 (unsigned long long)r.persistent_depth_target_id,
                                 r.tex_rgba != nullptr, r.min_lod, r.max_lod,
                                 r.mag_filter, r.min_filter, r.mip_filter);
+                    const VkFormat sampled_format = backend_color_format(r.texture_format);
+                    bool generated_mip_format_supported =
+                        sampled_format == VK_FORMAT_R8G8B8A8_UNORM;
+                    if (sampled_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+                        VkFormatProperties properties{};
+                        vkGetPhysicalDeviceFormatProperties(phys, sampled_format, &properties);
+                        constexpr VkFormatFeatureFlags required =
+                            VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                            VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+                        generated_mip_format_supported =
+                            (properties.optimalTilingFeatures & required) == required;
+                    }
+                    std::array<VkImage, 16> renderer_mip_images{};
+                    std::array<VkImageLayout, 16> renderer_mip_layouts{};
+                    uint32_t renderer_mip_sources = 0;
+                    if (!r.is_storage_image && !target_mip_feedback && r.img_dim == 1u &&
+                        r.td == 1u && r.sample_count == 1u && generated_mip_format_supported &&
+                        requested_target_mips > 1u &&
+                        requested_target_mips == r.declared_mip_levels) {
+                        for (uint32_t level = 0; level < requested_target_mips; ++level) {
+                            const uint64_t id = r.persistent_render_target_mip_ids[level];
+                            if (!id) continue;
+                            auto* target = find_persistent_color_target(
+                                id, std::max(r.tw >> level, 1u),
+                                std::max(r.th >> level, 1u), sampled_format);
+                            if (!target || !target->image ||
+                                target->layout == VK_IMAGE_LAYOUT_UNDEFINED)
+                                continue;
+                            target->last_use = color_target_generation;
+                            renderer_mip_images[level] = target->image;
+                            renderer_mip_layouts[level] = target->layout;
+                            ++renderer_mip_sources;
+                        }
+                    }
+                    const bool assemble_renderer_mips = renderer_mip_sources > 1u &&
+                        renderer_mip_images[0] != VK_NULL_HANDLE;
                     if (!r.is_storage_image && r.img_dim == 1 && r.td == 1 &&
-                        !r.persistent_render_target_id && r.tex_rgba &&
+                        ((!r.persistent_render_target_id && r.tex_rgba) ||
+                         assemble_renderer_mips) &&
                         // Widening this format gate requires BLIT_SRC/BLIT_DST +
                         // SAMPLED_IMAGE_FILTER_LINEAR on the new format (the blit cascade below).
-                        backend_color_format(r.texture_format) == VK_FORMAT_R8G8B8A8_UNORM &&
+                        generated_mip_format_supported &&
                         r.declared_mip_levels > 1 && (r.tw > 1 || r.th > 1)) {
                         uint32_t full = 1;
                         for (uint32_t m = r.tw > r.th ? r.tw : r.th; m > 1; m >>= 1) full++;
@@ -6182,28 +6337,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             upload.borrowed_compute_lease = r.borrowed_compute_image_lease;
                         }
 
-                        // Every ACTIVE bound slot, not just 0 and 1. A higher slot's image is now
-                        // persistent and SAMPLED-capable, so without this a draw sampling an active
-                        // MRT2+ target borrows the very same VkImage as both descriptor and colour
-                        // attachment -- bypassing the established CPU fallback and using one image
-                        // as shader-read and colour-attachment simultaneously.
-                        const bool target_feedback = [&] {
-                            if (!color_target || !r.persistent_render_target_id) return false;
-                            uint64_t bases[prosper::gpu::kColorTargetCount]{};
-                            bool active[prosper::gpu::kColorTargetCount]{};
-                            bases[0] = color_target->persistent_id;
-                            active[0] = persistent_color;
-                            bases[1] = color_target->persistent_id1;
-                            active[1] = persistent_color1;
-                            for (uint32_t slot = 2; slot < color_count; ++slot) {
-                                bases[slot] = color_target->persistent_id_slots[slot];
-                                active[slot] = cached_extra[slot] != nullptr;
-                            }
-                            return prosper::frontend::mrt_target_feedback(
-                                bases, active, color_count, r.persistent_render_target_id);
-                        }();
+                        if (assemble_renderer_mips) {
+                            upload.assembled_target_mips = true;
+                            upload.target_mip_images = renderer_mip_images;
+                            upload.target_mip_layouts = renderer_mip_layouts;
+                        }
                         if (!upload.borrowed_compute && !r.is_storage_image &&
-                            persistent_color_targets_enabled && !target_feedback &&
+                            !upload.assembled_target_mips && persistent_color_targets_enabled &&
+                            !target_feedback &&
                             r.persistent_render_target_id && r.img_dim == 1) {
                             if (auto* target = find_persistent_color_target(
                                     r.persistent_render_target_id, r.tw, r.th,
@@ -6350,7 +6491,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.uniform_clear = true;
                                 std::copy(r.uniform_color.begin(), r.uniform_color.end(),
                                           upload.uniform_color.float32);
-                            } else {
+                            } else if (!upload.assembled_target_mips) {
                                 const VkDeviceSize tbytes =
                                     static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
                                     r.sample_count *
@@ -7015,7 +7156,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.uniform_clear) continue;
+        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips)
+            continue;
         ++texture_stats.unique_uploads;
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
                                       upload.key.depth * upload.key.sample_count *
@@ -7291,7 +7433,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.uniform_clear)
+        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips)
             continue;  // exact-validated persistent image already has shader-read layout
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = upload.persistent_refresh
@@ -7314,7 +7456,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 0, upload.key.sample_count};
             vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &upload.uniform_color, 1, &range);
-        } else {
+        } else if (!upload.assembled_target_mips) {
             VkBufferImageCopy tc{};
             tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
                                    upload.key.sample_count};
@@ -7322,11 +7464,78 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
         }
+        if (upload.assembled_target_mips) {
+            // Each source is an independent one-level persistent color target resting in its
+            // recorded cache layout. Zero the destination first, then copy only levels the guest
+            // actually rendered and restore every source immediately. A missing level must remain
+            // unavailable/black: deriving it from a neighbour invents guest output and amplified
+            // GTA V's incomplete bloom chain into a full-screen glare.
+            const VkClearColorValue missing_level_clear{};
+            const VkImageSubresourceRange missing_level_range{
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+            vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &missing_level_clear, 1, &missing_level_range);
+            for (uint32_t level = 0; level < upload.key.mip_levels; ++level) {
+                const uint32_t level_w = std::max(upload.key.width >> level, 1u);
+                const uint32_t level_h = std::max(upload.key.height >> level, 1u);
+                if (upload.target_mip_images[level]) {
+                    VkImageMemoryBarrier source_to_copy{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    source_to_copy.oldLayout = upload.target_mip_layouts[level];
+                    source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    source_to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                                   VK_ACCESS_SHADER_READ_BIT |
+                                                   VK_ACCESS_TRANSFER_READ_BIT;
+                    source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                        VK_QUEUE_FAMILY_IGNORED;
+                    source_to_copy.image = upload.target_mip_images[level];
+                    source_to_copy.subresourceRange = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdPipelineBarrier(
+                        cmd,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                        0, nullptr, 0, nullptr, 1, &source_to_copy);
+                    VkImageCopy copy{};
+                    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                    copy.extent = {level_w, level_h, 1};
+                    vkCmdCopyImage(
+                        cmd, upload.target_mip_images[level],
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, upload.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                    VkImageMemoryBarrier source_restore{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    source_restore.newLayout = upload.target_mip_layouts[level];
+                    source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    source_restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
+                        VK_QUEUE_FAMILY_IGNORED;
+                    source_restore.image = upload.target_mip_images[level];
+                    source_restore.subresourceRange = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdPipelineBarrier(
+                        cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &source_restore);
+                }
+            }
+        }
         // #1272: generate levels 1..N-1 with a linear-filtered blit cascade (GPU-side, once per
         // upload — a CPU box filter here collapsed titles that re-upload large textures per frame).
         // Each source level transitions DST->SRC before feeding the next; the final barrier below
         // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
-        for (uint32_t l = 1; !upload.uniform_clear && l < upload.key.mip_levels; l++) {
+        for (uint32_t l = 1; !upload.uniform_clear && !upload.assembled_target_mips &&
+             l < upload.key.mip_levels; l++) {
             VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             bs.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -7352,7 +7561,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                            upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                            VK_FILTER_LINEAR);
         }
-        if (!upload.uniform_clear && upload.key.mip_levels > 1) {
+        if (!upload.uniform_clear && !upload.assembled_target_mips &&
+            upload.key.mip_levels > 1) {
             // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
             // TRANSFER_DST so the single final-layout barrier below covers the whole chain.
             VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

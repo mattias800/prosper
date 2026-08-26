@@ -139,6 +139,16 @@ int main() {
         CHECK(!prosper::frontend::mrt_target_feedback(bases, all_active, 8, 0));
         CHECK(!prosper::frontend::mrt_target_feedback(nullptr, all_active, 8, 0x2050000000ull));
         CHECK(!prosper::frontend::mrt_target_feedback(bases, nullptr, 8, 0x2050000000ull));
+
+        // Packed-tail image views can share a guest base without sharing an attachment identity.
+        // Known 64x32 versus 32x16 extents prove this is not feedback; equal or unknown extents
+        // preserve the conservative collision answer.
+        CHECK(!prosper::frontend::mrt_target_view_feedback(
+            bases, all_active, 8, 0x2050000000ull, 64, 32, 32, 16));
+        CHECK(prosper::frontend::mrt_target_view_feedback(
+            bases, all_active, 8, 0x2050000000ull, 32, 16, 32, 16));
+        CHECK(prosper::frontend::mrt_target_view_feedback(
+            bases, all_active, 8, 0x2050000000ull, 0, 0, 32, 16));
     }
 
     // Printed LAST, after every check above has run. It sat before the checks added in the

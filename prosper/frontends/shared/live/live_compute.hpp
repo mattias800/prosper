@@ -160,6 +160,14 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
                                    prosper::gpu::LiveTargetPixelFormat target_format,
                                    bool float_sampled_values);
 
+// Whether a CPU snapshot of a renderer-owned target can be copied byte-for-byte into the sampled
+// image format requested by a compute descriptor. Unlike direct binding, this may admit a
+// same-width typed alias (for example R32_SFLOAT -> R32_UINT): the snapshot is uploaded into a new
+// image with the descriptor's exact Vulkan type, so no incompatible image view is created.
+bool sampled_rtt_snapshot_byte_compatible(
+    prosper::gpu::DataFormat format, uint32_t components,
+    prosper::gpu::LiveTargetPixelFormat target_format);
+
 // Reconstruct a packed R11G11B10 sampled surface from the renderer's canonical color snapshot.
 // The renderer keeps float targets as RGBA16F and ordinary targets as RGBA8; compute descriptors
 // can subsequently alias that same target as GFX10 10_11_11_FLOAT. This conversion restores the

@@ -104,6 +104,13 @@ static bool set_test_env(const char* name, const char* value) {
 } // namespace
 
 int main() {
+    const size_t target_count_limit = prosper::test::persistent_color_target_count_limit();
+    CHECK(prosper::test::persistent_color_target_count_ceiling(false) == target_count_limit &&
+              prosper::test::persistent_color_target_count_ceiling(true) >= target_count_limit &&
+              prosper::test::persistent_color_target_count_ceiling(true) - target_count_limit ==
+                  64u,
+          "an open submission batch gets bounded color-target admission headroom");
+
     // The renderer's replay seed writer is the only public way to publish an RTT identity, and it is
     // registered only when this is set at registration time.
     set_test_env("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
@@ -118,7 +125,8 @@ int main() {
                                          LiveTargetPixelFormat::R8Unorm,
                                          LiveTargetPixelFormat::R32Uint,
                                          LiveTargetPixelFormat::R32Float,
-                                         LiveTargetPixelFormat::Rg8Unorm};
+                                         LiveTargetPixelFormat::Rg8Unorm,
+                                         LiveTargetPixelFormat::Rgba32Float};
     bool mapped = true, round_trips = true;
     for (LiveTargetPixelFormat format : all) {
         const VkFormat vk = prosper::frontend::live_target_pixel_format_vk(format);
@@ -136,6 +144,13 @@ int main() {
     CHECK(prosper::frontend::live_target_pixel_format_vk(
               LiveTargetPixelFormat::R11G11B10Float) == VK_FORMAT_B10G11R11_UFLOAT_PACK32,
           "R11G11B10Float maps to VK_FORMAT_B10G11R11_UFLOAT_PACK32, not RGBA8");
+    CHECK(prosper::frontend::renderer_mip_target_requires_submit_retention(
+              VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
+              !prosper::frontend::renderer_mip_target_requires_submit_retention(
+                  VK_FORMAT_R8G8B8A8_UNORM) &&
+              !prosper::frontend::renderer_mip_target_requires_submit_retention(
+                  VK_FORMAT_R16G16B16A16_SFLOAT),
+          "submit-lifetime mip retention selects packed HDR targets only");
 
     // The load-bearing assertions: the registered notifier, for each format the importer accepts.
     const FormatCase cases[] = {
@@ -154,6 +169,8 @@ int main() {
          LiveTargetPixelFormat::R32Float, VK_FORMAT_R32_SFLOAT, 4, "r32f"},
         {prosper::gpu::GpuCaptureColorFormat::Rg8Unorm,
          LiveTargetPixelFormat::Rg8Unorm, VK_FORMAT_R8G8_UNORM, 2, "rg8"},
+        {prosper::gpu::GpuCaptureColorFormat::Rgba32Float,
+         LiveTargetPixelFormat::Rgba32Float, VK_FORMAT_R32G32B32A32_SFLOAT, 16, "rgba32f"},
     };
     uint64_t base = 0x2110310000ull;
     for (const FormatCase& c : cases) {
