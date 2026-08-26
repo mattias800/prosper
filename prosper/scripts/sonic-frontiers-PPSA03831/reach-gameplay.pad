@@ -9,10 +9,13 @@
 #
 # RUN THIS AGAINST AN EMPTY SAVE ROOT.
 #
-#     PROSPER_SAVE0=~/prosper-run/save-$$ PROSPER_PAD_SCRIPT=@<this file> ...
+#     mkdir -p ~/prosper-run
+#     PROSPER_SAVE0=$(mktemp -d -p ~/prosper-run) PROSPER_PAD_SCRIPT=@<this file> ...
 #
-# (A path under $HOME, not /tmp -- save_paths.hpp records that the save defaults were deliberately
-# moved off tmpfs.)
+# A FRESH directory each run, under $HOME rather than /tmp -- save_paths.hpp records that the save
+# defaults were deliberately moved off tmpfs. Do not spell it with $$: that is the SHELL's pid, so two
+# runs from one terminal share a directory and the second inherits the first's save, which is exactly
+# the failure described below.
 #
 # MEASURED (2026-08-27, three arms of this route on one build): with `savedata0/PPSA03831/` present
 # the run sits in the EXTRAS menu for its whole length -- 24/24 frames with content,
