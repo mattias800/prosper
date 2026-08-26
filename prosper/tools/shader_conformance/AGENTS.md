@@ -59,7 +59,9 @@ capture yielded zero examined shaders**. That last clause is the one that was wr
 global, so one readable capture certified an entire run, and a barren capture alongside it exited 0.
 Findings could also be attributed to a capture whose dumps had all failed, because one temp directory
 was shared across captures and success was judged by whether a file existed rather than by the
-child's exit code. Both are fixed, and both are pinned by arms in `--self-test`.
+child's exit code. Both are fixed, and each half is pinned **independently**: a stub capture that
+writes a file and exits non-zero is caught only by the return-code check, and one that exits 0
+having written nothing is caught only by the per-capture temp directory.
 
 Every run prints, per capture, how many shaders it examined and how many it could not read. **Quote
 those counts alongside any clean result** — an exit code alone is not falsifiable.
@@ -71,8 +73,15 @@ These two directions do **not** carry the same weight, and the difference is str
 The ISA walk is **not length-aware**. A correct walk needs per-instruction lengths (prosper's own
 `rdna2_decode.cpp` has them, and records what mis-sizing costs: a phantom instruction that derails
 the stream walk). Without them, a literal constant whose top six bits happen to read as the MIMG
-encoding looks like an instruction. The walk does skip the dword after a match, since MIMG is at
-minimum two dwords, but that is a partial mitigation and not a fix.
+encoding looks like an instruction.
+
+**Every dword is tested, including the one after a match.** Skipping it looks free — a real MIMG is
+at minimum two dwords, so its dword1 cannot start an instruction — but that is true of a *real*
+MIMG and false of a *phantom*, and a phantom that swallows the next dword can hide a genuine
+instruction. Review of #3039 demonstrated exactly that: an aliasing literal followed by a real
+`image_sample dim:2D_ARRAY` against a non-arrayed image scanned CLEAN. `--json` reports
+`phantom_risk` per shader (candidates sitting immediately after another candidate) so the suspicion
+is visible; it never suppresses a finding.
 
 So the error is **one-directional**: the finder can invent an MIMG that is not there, and cannot hide
 one that is.

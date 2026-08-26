@@ -32,38 +32,57 @@ DIM_3D = {2}
 MIMG_ENCODING = 0b111100          # dword0[31:26]
 
 
-def decode_mimg(raw: bytes):
-    """Every MIMG instruction in a raw RDNA2 shader, as (opcode, dim).
-
-    This is an OVER-APPROXIMATION and the direction of the error matters. A correct walk needs
-    per-instruction lengths (prosper's own `rdna2_decode.cpp` carries them, and its comments record
-    what mis-sizing costs: "the extra dword is mis-decoded as a phantom instruction, derailing the
-    stream walk"). Without lengths, a literal constant or an operand dword whose top six bits happen
-    to be 0b111100 reads as an instruction start.
-
-    So: this finder can invent an MIMG that is not there, and CANNOT hide one that is. Every
-    reported finding is therefore a candidate to confirm, while a clean result IS sound for the
-    classes below -- a superset that finds nothing means there was nothing to find. `--json` carries
-    `phantom_risk` per shader so a caller can see when adjacency makes aliasing likely.
-
-    The one structural rule that is free: MIMG is at minimum two dwords, so a matched instruction's
-    successor dword cannot itself be an instruction start.
-    """
+def decode_mimg_sites(raw: bytes):
+    """(dword_index, opcode, dim) for every dword matching the MIMG encoding."""
     n = len(raw) // 4
     if not n:
         return []
     words = struct.unpack(f"<{n}I", raw[:n * 4])
-    out, i = [], 0
-    while i < n:
-        w = words[i]
+    out = []
+    for i, w in enumerate(words):
         if (w >> 26) != MIMG_ENCODING:
-            i += 1
             continue
         # opcode spans a split field, exactly as rdna2_decode.cpp reconstructs it.
-        opcode = ((w & 1) << 7) | ((w >> 18) & 0x7F)
-        out.append((opcode, (w >> 3) & 0x7))
-        i += 2                      # dword1 is operands, never an instruction start
+        out.append((i, ((w & 1) << 7) | ((w >> 18) & 0x7F), (w >> 3) & 0x7))
     return out
+
+
+def decode_mimg(raw: bytes):
+    """Every MIMG instruction in a raw RDNA2 shader, as (opcode, dim).
+
+    This is an OVER-APPROXIMATION and the direction of the error is the whole basis for trusting a
+    clean result. A correct walk needs per-instruction lengths (prosper's own `rdna2_decode.cpp`
+    has them, and records what mis-sizing costs: "the extra dword is mis-decoded as a phantom
+    instruction, derailing the stream walk"). Without them, a literal constant whose top six bits
+    read as the MIMG encoding looks like an instruction start.
+
+    So: this finder can invent an MIMG that is not there, and CANNOT hide one that is. A finding is
+    a candidate to confirm; a clean result IS sound for the classes checked.
+
+    **Every dword is tested, including the one after a match.** An earlier revision skipped it, on
+    the reasoning that MIMG is at minimum two dwords so its dword1 cannot start an instruction.
+    That is true of a REAL MIMG and false of a phantom -- and it broke the property above, which is
+    the only reason a clean result means anything. Review of #3039 demonstrated it end to end: a
+    `v_mov_b32 v0, 0xF0000000` whose literal aliases the encoding, immediately followed by a genuine
+    `image_sample dim:2D_ARRAY` against a non-arrayed image -- the literal #325 defect -- scanned
+    CLEAN, because the phantom consumed the real instruction. The skip also bought almost nothing:
+    the false positives it removed need a real MIMG dword1 with the reserved bits 28/29 set, which
+    prosper's own decoder rejects (`rdna2_decode.cpp:901`), and `classify()` already collapses
+    repeated hits of one class into a single finding.
+    """
+    return [(op, dim) for _, op, dim in decode_mimg_sites(raw)]
+
+
+def phantom_risk(raw: bytes):
+    """Candidates sitting immediately after another candidate.
+
+    Real MIMG instructions are at minimum two dwords, so back-to-back matches mean at least one of
+    them is an operand or literal misreading as an instruction. This does not identify WHICH, and a
+    zero here does not certify the rest -- it is a "this shader's findings deserve extra suspicion"
+    signal, reported per shader in --json and never used to suppress a finding.
+    """
+    idx = [i for i, _, _ in decode_mimg_sites(raw)]
+    return sum(1 for a, b in zip(idx, idx[1:]) if b - a == 1)
 
 
 def parse_spirv_images(dis: str):
@@ -123,6 +142,20 @@ def classify(mimg, types, arities):
     return out
 
 
+def spirv_dis_cmd():
+    """The disassembler, as an argv prefix.
+
+    `PROSPER_SPIRV_DIS` overrides it, and a `.py` value is run with this interpreter. That override
+    is what lets --self-test be hermetic ON EVERY PLATFORM: the first version shipped a `/bin/sh`
+    shim on PATH, which is unrunnable on Windows/MinGW, so the suite went red there while passing
+    locally. A PATH shim also cannot be made portable -- Windows resolves executables by extension.
+    """
+    override = os.environ.get("PROSPER_SPIRV_DIS")
+    if override:
+        return [sys.executable, override] if override.endswith(".py") else [override]
+    return ["spirv-dis"]
+
+
 def run(cmd, **kw):
     """Every child gets a timeout. A hung gpu_replay on a shared GPU otherwise hangs the scan
     silently, and the reflex is to kill the scanner -- which loses the partial result too."""
@@ -136,8 +169,6 @@ def run(cmd, **kw):
 def enumerate_shaders(replay, capture):
     """Unique (draw, stage, hash) triples, so one shader compiled into many draws is dumped once."""
     r = run([replay, "--inspect-only", capture])
-    if r.returncode == 0 and not r.stdout.strip():
-        r = subprocess.run([replay, "--inspect-only", capture], capture_output=True, text=True)
     if r.returncode != 0:
         return None, f"gpu_replay --inspect-only failed ({r.returncode}): {r.stderr.strip()[:200]}"
     seen, out = set(), []
@@ -218,7 +249,7 @@ def scan_capture(replay, capture, tmp):
             skipped += 1
             skip_reasons.append(f"draw[{draw}] {stage}: dump exit {a.returncode}/{b.returncode}")
             continue
-        dis = run(["spirv-dis", spv_p])
+        dis = run(spirv_dis_cmd() + [spv_p])
         if dis.returncode != 0:
             skipped += 1
             skip_reasons.append(f"draw[{draw}] {stage}: spirv-dis exit {dis.returncode}")
@@ -236,8 +267,10 @@ def scan_capture(replay, capture, tmp):
             continue
         types, arities = parse_spirv_images(dis.stdout)
         examined += 1
+        risk = phantom_risk(raw)
         for f in classify(mimg, types, arities):
-            f.update(capture=os.path.basename(capture), draw=draw, stage=stage, shader=sh)
+            f.update(capture=os.path.basename(capture), draw=draw, stage=stage, shader=sh,
+                     phantom_risk=risk)
             findings.append(f)
     return dict(examined=examined, skipped=skipped, findings=findings,
                 skip_reasons=skip_reasons), None
@@ -262,6 +295,11 @@ for flag in ("--dump-realized-shader", "--dump-shader"):
         out = a[a.index(flag) + 2]
         if tag == "nodump":
             sys.exit(2)                       # writes nothing, and SAYS so
+        if tag == "partial":
+            open(out, "wb").write(b"\x00\x00\x00\x00")
+            sys.exit(2)                       # writes a file AND fails: only the exit code tells
+        if tag == "silentzero":
+            sys.exit(0)                       # writes nothing and claims success
         if flag == "--dump-realized-shader":
             if tag == "emptyisa":
                 open(out, "wb").write(b"")    # exits 0 having written nothing readable
@@ -285,11 +323,12 @@ def _run_self_test_case(tmp, script, captures):
     # A `spirv-dis` shim, so the suite is hermetic: it runs identically on a host without the
     # Vulkan toolchain, and cannot be quietly reduced to "spirv-dis missing -> exit 2" -- which is
     # what made four of these arms pass for the wrong reason the first time they were written.
-    shim = os.path.join(tmp, "spirv-dis")
+    # Named through PROSPER_SPIRV_DIS rather than dropped on PATH, because a PATH shim is inherently
+    # POSIX-only and turned the Windows/MinGW job red.
+    shim = os.path.join(tmp, "spirv_dis_shim.py")
     with open(shim, "w") as f:
-        f.write("#!/bin/sh\nexec cat \"$1\"\n")
-    os.chmod(shim, 0o755)
-    env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""))
+        f.write("import sys\nsys.stdout.write(open(sys.argv[1]).read())\n")
+    env = dict(os.environ, PROSPER_SPIRV_DIS=shim)
     paths = []
     for name in captures:
         q = os.path.join(tmp, f"{name}.prgcap")
@@ -327,8 +366,17 @@ def self_test():
     check(decode_mimg(struct.pack("<II", 0xF4800028, 0)) == [],
           "encoding 0b111101 is NOT MIMG (pins MIMG_ENCODING against an off-by-one)")
     check(decode_mimg(struct.pack("<I", 0x12345678)) == [], "a non-MIMG word decodes to nothing")
-    check(decode_mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5)],
-          "the dword after an MIMG is operands, not a second instruction")
+    check(decode_mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5), (0x20, 5)],
+          "EVERY dword is tested, including the one after a match -- skipping it lets a phantom "
+          "swallow a real MIMG, which is what makes a clean result unsound")
+    check(phantom_risk(struct.pack("<II", 0xF0800028, 0xF0800028)) == 1
+          and phantom_risk(struct.pack("<II", 0xF0800028, 0)) == 0,
+          "phantom_risk counts back-to-back candidates and is 0 for an isolated one")
+    # The exact sequence review of #3039 used: a literal aliasing the encoding, then a REAL
+    # 2D_ARRAY sample. The real one must survive the phantom.
+    swallow = struct.pack("<III", 0x7E0002FF, 0xF0000000, 0xF0800028)
+    check((0x20, 5) in decode_mimg(swallow),
+          "a real MIMG immediately after an aliasing literal is still found")
     check(decode_mimg(b"") == [] and decode_mimg(b"\x01\x02") == [], "short/empty input is safe")
 
     # --- SPIR-V parse, both directions.
@@ -390,10 +438,20 @@ def self_test():
         # Cross-capture contamination: `nodump` writes nothing, so it must contribute no findings
         # even when a previous capture in the SAME run wrote files under the same shader hashes.
         _, alone, _ = _run_self_test_case(tmp, script, ["bad"])
-        _, pair, _ = _run_self_test_case(tmp, script, ["bad", "nodump"])
-        check(alone.count("array-layer-dropped") == pair.count("array-layer-dropped")
-              and "nodump" not in [f.split()[0] for f in pair.splitlines() if "guest" in f],
-              "a capture whose dumps all failed contributes no findings of its own")
+        finding_lines = lambda out: [ln for ln in out.splitlines() if "guest " in ln]
+        for bad_tag in ("nodump", "partial", "silentzero"):
+            _, pair, _ = _run_self_test_case(tmp, script, ["bad", bad_tag])
+            attributed = [ln for ln in finding_lines(pair) if ln.startswith(bad_tag)]
+            check(len(finding_lines(pair)) == len(finding_lines(alone)) and not attributed,
+                  f"'{bad_tag}' contributes no findings of its own")
+        # These three pin the two halves of the contamination fix INDEPENDENTLY, which the first
+        # version did not: `partial` writes a file and exits non-zero, so ONLY the return-code check
+        # rejects it; `silentzero` exits 0 having written nothing, so ONLY the per-capture temp
+        # directory stops it inheriting the previous capture's file under the same shader hash.
+        rc, _, err = _run_self_test_case(tmp, script, ["partial"])
+        check(rc == 2, "a dump that writes a file but exits non-zero is not an examined shader")
+        rc, _, err = _run_self_test_case(tmp, script, ["silentzero"])
+        check(rc == 2, "a dump that exits 0 having written nothing is not an examined shader")
 
     print("== self-test PASSED ==" if ok else "== self-test FAILED ==")
     return 0 if ok else 1
@@ -412,7 +470,7 @@ def main():
         return self_test()
     if not a.captures:
         ap.error("give at least one capture, or --self-test")
-    if not shutil.which("spirv-dis"):
+    if not os.environ.get("PROSPER_SPIRV_DIS") and not shutil.which("spirv-dis"):
         print("scan: spirv-dis not on PATH -- cannot read emitted shaders, so a clean result would\n"
               "      be meaningless. Run inside the toolchain container.", file=sys.stderr)
         return 2
