@@ -414,8 +414,31 @@ inline bool backend_storage_image_numeric_contract_valid(const FrameResource& re
 // The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
 // historical implicit byte-span behavior; a 2D_MSAA plane array must prove all four complete R32F
 // planes are readable before any Vulkan object or memcpy is attempted.
+// A guest 2D_ARRAY is the same shape as the MSAA plane array with a different provenance: N
+// ordinary color layers laid out one after another, carried through the SAME `sample_count`
+// channel, and owed the same proof that every layer is readable before any Vulkan object or memcpy
+// exists. Everything downstream is already layer-generic -- the staging buffer sizes itself
+// `tw*th*td*sample_count*bpp`, the image takes `arrayLayers = sample_count`, and the view selects
+// VK_IMAGE_VIEW_TYPE_2D_ARRAY above 1 -- so this predicate was the single gate keeping graphics
+// array textures out (#325). Mip generation is already excluded for `sample_count > 1`, which is
+// what stops a generated chain bleeding across layer boundaries.
+inline bool backend_texture_array_span_valid(const FrameResource& resource) {
+    if (resource.img_dim != 5u || resource.td != 1u || resource.is_storage_image ||
+        !resource.tex_rgba || !resource.tw || !resource.th || resource.sample_count < 2u)
+        return false;
+    const uint32_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
+    if (!bpp) return false;
+    const size_t row_bytes = static_cast<size_t>(resource.tw) * bpp;
+    if (row_bytes / bpp != resource.tw) return false;
+    if (resource.th > SIZE_MAX / row_bytes) return false;
+    const size_t layer_bytes = row_bytes * resource.th;
+    if (resource.sample_count > SIZE_MAX / layer_bytes) return false;
+    return resource.tex_byte_size >= layer_bytes * resource.sample_count;
+}
+
 inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
     if (resource.sample_count == 1u) return true;
+    if (resource.img_dim == 5u) return backend_texture_array_span_valid(resource);
     if (resource.sample_count != 4u || resource.img_dim != 6u || resource.td != 1u ||
         resource.declared_mip_levels != 1u || resource.is_storage_image ||
         backend_color_format(resource.texture_format) != VK_FORMAT_R32_SFLOAT ||
