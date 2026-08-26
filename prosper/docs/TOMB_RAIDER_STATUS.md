@@ -95,6 +95,39 @@ Two further details cost time and are worth keeping:
 
 ## Ruled out
 
+> The `PROSPER_*` probes cited below are **not on master**. They live on the unmerged WIP branch
+> `wip/issue-325-texture-arrays` (`e1b0fbb2` and later), which exists so these measurements stay
+> reproducible. Check that branch out before trying to re-run one.
+
+- **"Memory pressure is why 256 decoded layers fail" — false.** A `PROSPER_ARRAY_MAX_LAYERS` bisect
+  over an early array upload rendered at 1 layer and failed identically at **4, 16 and 64**. Four
+  layers is trivially small, so the failure was structural, not a working-set problem. The actual
+  cause was `backend_texture_plane_span_valid`, which admitted `sample_count > 1` only for the
+  four-plane R32_SFLOAT guest-MSAA shape and rejected everything else (#3043).
+- **"The world samples its array with a non-array instruction, so it always reads slice 0" — false.**
+  A full census over a gameplay route — the whole population, not a sample — found **every** MIMG
+  touching an array texture uses `DIM=5`: op `0x2f` on bindings 39-46 at depth 1 (64 events), and
+  op `0x20` on bindings 34/36/39/47 (17 events, of which 14 are at depth 256; binding 34's four span
+  depths 1/29/32/256). The census is not circular: it selects on the resource's `img_dim` and
+  reports the *instruction's* `mimg_dim`, which are independent fields. There is no DIM≠5 case to
+  explain the flat world (#2998).
+- **The decoded slices are not duplicates of slice 0.** Per-layer checksums (`PROSPER_ARRAYTEX`) give
+  13 distinct hashes for one array binding and 8 for another, so the decoder does not replicate the
+  base slice (#2998).
+- **Forcing the array layer to a constant changes nothing for the plain-SAMPLE path.** A probe
+  substituting a constant layer *and printing when it does* fired on all four bindings reached by op
+  `0x20` (34/36/39/47), and the gameplay frame was unchanged — identical average- and difference-hash, luma
+  differing in one byte of 288. **Scope, because the first version of this line overstated it:** the
+  probe sits in the implicit-LOD array sampler only, so it covers the `0x20` events and
+  *structurally cannot* cover the 64 `SAMPLE_C_LZ` (`0x2f`) events, which take a different lowering.
+  Within that scope the layer coordinate was not the variable; the resource was uploaded with one
+  layer (#2998).
+- **Binding numbers are not texture identities.** A binding is a per-shader descriptor slot, and the
+  decoded-texture cache keys by guest address — so "binding 36 never reaches the array decode gate"
+  does not mean its texture is never decoded there. It is decoded once under whatever slot referenced
+  it first, then served from cache under every later slot. Chasing a binding number instead of an
+  address cost a full measurement cycle (#2998).
+
 - **The byte pattern of a misread 32-bit index buffer is NOT sufficient to identify one.** A genuine
   16-bit buffer with a period-2 pattern — a fan or cone as a triangle strip `[rim, apex, rim, apex, …]`,
   or a line list radiating from one hub — is **byte-identical** to a clustered 32-bit list whenever the

@@ -414,8 +414,46 @@ inline bool backend_storage_image_numeric_contract_valid(const FrameResource& re
 // The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
 // historical implicit byte-span behavior; a 2D_MSAA plane array must prove all four complete R32F
 // planes are readable before any Vulkan object or memcpy is attempted.
+// A pragmatic ceiling, NOT a portability guarantee -- an earlier revision of this comment claimed
+// 2048 was "Vulkan's guaranteed minimum for maxImageArrayLayers" and that is wrong. The Core
+// Required Limits table gives **256**; 2048 is the Roadmap 2022 / Vulkan 1.4 figure, and this
+// backend requests VK_API_VERSION_1_1 (see vkCreateInstance below), so the guarantee that actually
+// applies here is 256. This box's RADV reports 8192.
+//
+// So what this bound does is keep an absurd layer count away from vkCreateImage, whose result the
+// upload path discards (#3045) -- an over-large arrayLayers yields VK_NULL_HANDLE and is passed
+// straight to vkGetImageMemoryRequirements. It does NOT prove creatability on an arbitrary device;
+// a device reporting the Core minimum of 256 can still reject a 512-layer image, and it will do so
+// through that same unchecked path until #3045 lands. Querying the real limit is the correct fix
+// and belongs with #3045, since this predicate has no device handle.
+inline constexpr uint32_t kBackendMaxArrayLayers = 2048u;
+
+// A guest 2D_ARRAY is the same shape as the MSAA plane array with a different provenance: N
+// ordinary color layers laid out one after another, carried through the SAME `sample_count`
+// channel, and owed the same proof that every layer is readable before any Vulkan object or memcpy
+// exists. Everything downstream is already layer-generic -- the staging buffer sizes itself
+// `tw*th*td*sample_count*bpp`, the image takes `arrayLayers = sample_count`, and the view selects
+// VK_IMAGE_VIEW_TYPE_2D_ARRAY above 1 -- so once a frontend publishes a layer count, this predicate
+// is what stands between it and the upload (#325). Mip generation is already excluded for
+// `sample_count > 1`, which is what stops a generated chain bleeding across layer boundaries.
+inline bool backend_texture_array_span_valid(const FrameResource& resource) {
+    if (resource.img_dim != 5u || resource.td != 1u || resource.is_storage_image ||
+        !resource.tex_rgba || !resource.tw || !resource.th || resource.sample_count < 2u ||
+        resource.sample_count > kBackendMaxArrayLayers)
+        return false;
+    const uint32_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
+    if (!bpp) return false;
+    const size_t row_bytes = static_cast<size_t>(resource.tw) * bpp;
+    if (row_bytes / bpp != resource.tw) return false;
+    if (resource.th > SIZE_MAX / row_bytes) return false;
+    const size_t layer_bytes = row_bytes * resource.th;
+    if (resource.sample_count > SIZE_MAX / layer_bytes) return false;
+    return resource.tex_byte_size >= layer_bytes * resource.sample_count;
+}
+
 inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
     if (resource.sample_count == 1u) return true;
+    if (resource.img_dim == 5u) return backend_texture_array_span_valid(resource);
     if (resource.sample_count != 4u || resource.img_dim != 6u || resource.td != 1u ||
         resource.declared_mip_levels != 1u || resource.is_storage_image ||
         backend_color_format(resource.texture_format) != VK_FORMAT_R32_SFLOAT ||

@@ -1105,6 +1105,102 @@ int main() {
               "unsupported host sample-plane counts remain fail-visible at the backend boundary");
     }
 
+    // #325: a guest 2D_ARRAY rides the same `sample_count` layer channel as the MSAA plane array.
+    // The span predicate admitted sample_count > 1 ONLY for the four-plane R32F MSAA shape, so it
+    // is what a frontend publishing a layer count would run into first. It was NOT what made
+    // Tomb Raider I-III Remastered render flat: every graphics array arrives with sample_count == 1
+    // today and passes at the `== 1u` fast path, so nothing is being rejected here yet. The arms
+    // below are chosen to fail if the bounds arithmetic is dropped rather than merely to agree with
+    // the implementation.
+    {
+        const uint32_t LW = 4, LH = 4, LAYERS = 8;
+        std::vector<uint8_t> layer_bytes(static_cast<size_t>(LW) * LH * 4u * LAYERS, 0x40);
+        prosper::test::FrameResource arr{};
+        arr.tex_rgba = layer_bytes.data();
+        arr.tex_byte_size = layer_bytes.size();
+        arr.tw = LW; arr.th = LH; arr.td = 1;
+        arr.img_dim = 5;
+        arr.sample_count = LAYERS;
+        arr.texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+        CHECK(prosper::test::backend_texture_plane_span_valid(arr),
+              "a complete 8-layer 2D_ARRAY span is accepted (#325)");
+
+        prosper::test::FrameResource short_arr = arr;
+        short_arr.tex_byte_size = layer_bytes.size() - 1;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(short_arr),
+              "a 2D_ARRAY one byte short of its last layer is rejected before Vulkan");
+
+        // The bound must scale with the LAYER COUNT, not merely with one layer. A predicate that
+        // checked a single layer's worth of bytes would pass this, and would then memcpy 8 layers
+        // out of a 1-layer allocation.
+        prosper::test::FrameResource one_layer_span = arr;
+        one_layer_span.tex_byte_size = static_cast<size_t>(LW) * LH * 4u;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(one_layer_span),
+              "a 2D_ARRAY span covering only one layer is rejected for an 8-layer resource");
+
+        // Bytes-per-texel must come from the format. Declaring a 16-byte format over the same
+        // buffer needs four times the span, so this arm fails if bpp is assumed to be 4.
+        prosper::test::FrameResource wide_format = arr;
+        wide_format.texture_format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(wide_format),
+              "2D_ARRAY span scales with the format's bytes per texel, not a fixed 4");
+
+        // An unbounded layer count reaches vkCreateImage, whose result the upload path does not
+        // check -- so an absurd arrayLayers produces VK_NULL_HANDLE and is handed to
+        // vkGetImageMemoryRequirements (#3045). A 4x4 RGBA8 array of 8192 layers is only 512 KiB,
+        // so the span check alone does NOT bound this in practice -- which is why the arm exists.
+        // kBackendMaxArrayLayers is a pragmatic ceiling, not a portability guarantee: Vulkan Core
+        // requires only 256 and this backend requests 1.1.
+        {
+            const uint32_t huge = prosper::test::kBackendMaxArrayLayers + 1u;
+            std::vector<uint8_t> huge_bytes(static_cast<size_t>(LW) * LH * 4u * huge, 0x40);
+            prosper::test::FrameResource too_many = arr;
+            too_many.tex_rgba = huge_bytes.data();
+            too_many.tex_byte_size = huge_bytes.size();
+            too_many.sample_count = huge;
+            CHECK(!prosper::test::backend_texture_plane_span_valid(too_many),
+                  "a layer count above the backend's array-layer ceiling is rejected even when its "
+                  "span is complete");
+            prosper::test::FrameResource at_limit = arr;
+            at_limit.sample_count = prosper::test::kBackendMaxArrayLayers;
+            at_limit.tex_byte_size =
+                static_cast<size_t>(LW) * LH * 4u * prosper::test::kBackendMaxArrayLayers;
+            std::vector<uint8_t> limit_bytes(at_limit.tex_byte_size, 0x40);
+            at_limit.tex_rgba = limit_bytes.data();
+            CHECK(prosper::test::backend_texture_plane_span_valid(at_limit),
+                  "exactly the backend's array-layer ceiling is still accepted");
+        }
+
+        prosper::test::FrameResource volume = arr;
+        volume.td = 2;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(volume),
+              "a layered resource that is also a volume is not an array upload");
+
+        prosper::test::FrameResource storage = arr;
+        storage.is_storage_image = true;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(storage),
+              "a layered storage image is not admitted by the array arm");
+
+        prosper::test::FrameResource no_pixels = arr;
+        no_pixels.tex_rgba = nullptr;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(no_pixels),
+              "a layered resource with no pixels is rejected");
+
+        // The historical single-layer contract is untouched: tex_byte_size == 0 still means "no
+        // explicit span" and must keep passing, or every ordinary texture in the project regresses.
+        prosper::test::FrameResource single = arr;
+        single.sample_count = 1;
+        single.tex_byte_size = 0;
+        CHECK(prosper::test::backend_texture_plane_span_valid(single),
+              "single-layer resources keep the historical implicit-span contract");
+
+        // And the MSAA arm still routes by img_dim, so admitting arrays cannot widen it.
+        prosper::test::FrameResource msaa_two = arr;
+        msaa_two.img_dim = 6; msaa_two.sample_count = 2;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(msaa_two),
+              "the MSAA plane-array arm is unchanged by the 2D_ARRAY addition");
+    }
+
     // The same image_load instruction becomes OpImageRead when its resource class is StorageImage.
     // That SPIR-V interface must be backed by a STORAGE_IMAGE descriptor over an image with STORAGE
     // usage in GENERAL layout, not the sampled texture's combined-image-sampler contract (#374).
