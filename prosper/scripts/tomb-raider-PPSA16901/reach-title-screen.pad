@@ -1,0 +1,11 @@
+# Tomb Raider I-III Remastered (PPSA16901): default-launch route past the EULA gate.
+#
+# The title opens on a 40-page EULA and holds there indefinitely. Cross is inert
+# until the last page is reached: pulses at pages 1 and 32 both left the frame
+# byte-identical (run02, 2026-08-26). Down auto-repeats -- three 2 s holds moved
+# 1/40 -> 32/40 -- so one long hold walks to 40/40, after which Cross accepts.
+6-14:down
+16-18:cross
+20-22:cross
+26-28:cross
+32-34:cross

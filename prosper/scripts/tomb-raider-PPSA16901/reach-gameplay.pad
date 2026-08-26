@@ -1,0 +1,8 @@
+# PPSA16901: EULA gate, then select the ring's default item ("Lara's Home",
+# TR1's playable mansion level) on the Tomb Raider I title screen.
+# The ring is a 5-item cycle with no New Game item on it (run05/run06), so this
+# is the shortest route from a default launch to a real playable level.
+6-14:down
+16-18:cross
+44-46:cross
+52-54:cross

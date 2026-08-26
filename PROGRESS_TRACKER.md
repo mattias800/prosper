@@ -156,6 +156,7 @@ of its manifest.
 | The Oregon Trail | `PPSA19244` | 2 | `12----` | - | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#1606](https://github.com/mattias800/prosper/issues/1606), [#1641](https://github.com/mattias800/prosper/issues/1641), [#1634](https://github.com/mattias800/prosper/issues/1634) | [#1886](https://github.com/mattias800/prosper/issues/1886) | [`OREGON_TRAIL_STATUS.md`](prosper/docs/OREGON_TRAIL_STATUS.md) |
 | The Pathless | `PPSA01826` | 2 | `12----` | - | - | none | [#1570](https://github.com/mattias800/prosper/issues/1570), [#1213](https://github.com/mattias800/prosper/issues/1213) | [#1883](https://github.com/mattias800/prosper/issues/1883) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | The Plucky Squire | `PPSA15319` | 2 | `12----` | - | - | none | [#1390](https://github.com/mattias800/prosper/issues/1390) | [#1882](https://github.com/mattias800/prosper/issues/1882) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
+| Tomb Raider I-III Remastered | `PPSA16901` | 2 | `12----` | - | - | none | - | [#2990](https://github.com/mattias800/prosper/issues/2990) | [`TOMB_RAIDER_STATUS.md`](prosper/docs/TOMB_RAIDER_STATUS.md) |
 | Unbound: Worlds Apart | `PPSA03274` | 2 | `12----` | **17.9** fps · 21% active · 4K · past the title screen and intro to the first level's map load, level a flat clear · screenshot · 2026-08-22 | - | none | [#2932](https://github.com/mattias800/prosper/issues/2932), [#2931](https://github.com/mattias800/prosper/issues/2931), [#2930](https://github.com/mattias800/prosper/issues/2930) | [#2886](https://github.com/mattias800/prosper/issues/2886) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Beast of Reincarnation | `PPSA29343` | 1 | `1-----` | **9.2** fps · 56% active · 4K · GAME FREAK logo then the Digital Deluxe bonus dialog, with PROSPER_CB_EFC_NO_COLOR=1 · screenshot · 2026-08-22 | - | none | [#1588](https://github.com/mattias800/prosper/issues/1588), [#2911](https://github.com/mattias800/prosper/issues/2911), [#2915](https://github.com/mattias800/prosper/issues/2915) | [#2916](https://github.com/mattias800/prosper/issues/2916) | [`BEAST_OF_REINCARNATION_STATUS.md`](prosper/docs/BEAST_OF_REINCARNATION_STATUS.md) |
 | Little Nightmares II | `PPSA02154` | 1 | `1-----` | **6.9** fps · 19% active · 4K · boot logo sequence, then a flat white clear · screenshot · 2026-08-22 | - | none | [#2932](https://github.com/mattias800/prosper/issues/2932), [#2929](https://github.com/mattias800/prosper/issues/2929), [#2930](https://github.com/mattias800/prosper/issues/2930) | [#2884](https://github.com/mattias800/prosper/issues/2884) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) |
@@ -177,10 +178,10 @@ of its manifest.
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 2 |
 | 3 -- gameplay with the scene rendering | 8 |
-| 2 -- title screen | 18 |
+| 2 -- title screen | 19 |
 | 1 -- any real graphics | 3 |
 | 0 -- not started | 9 |
 
-**4 of 54** trackers record a PS5 hardware-oracle comparison; the rest carry
+**4 of 55** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
