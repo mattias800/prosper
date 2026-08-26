@@ -2182,7 +2182,10 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
     // A proved guard is deliberately excluded: every invocation in the workgroup takes it together.
     result.guarded = guarded;
     const size_t body_begin = guarded ? result.guard_index + 1 : 0;
-    bool valid = result.end_index < ins.size() && branch_count > 2;
+    // Safety comes from the cross-edge, trap and EXEC-save checks below. A straight-line kernel
+    // whose only control-flow instruction is a barrier satisfies that proof trivially; requiring
+    // an unrelated branch-count threshold dropped GTA V's partial-workgroup barrier passes.
+    bool valid = result.end_index < ins.size();
 
     for (size_t i = body_begin; valid && i < result.end_index; ++i)
         if (ins[i].fmt == Rdna2Format::SOPP && ins[i].opcode == 0x0a)

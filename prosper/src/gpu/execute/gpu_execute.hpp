@@ -1054,7 +1054,15 @@ void set_metadata_kind_query(MetadataKindQueryFn fn);
 CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindRequest& request);
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
-enum class LiveTargetPixelFormat : uint8_t { Rgba8Unorm, Rgba16Float, R11G11B10Float };
+enum class LiveTargetPixelFormat : uint8_t {
+    Rgba8Unorm,
+    Rgba16Float,
+    R11G11B10Float,
+    R8Unorm,
+    R32Uint,
+    R32Float,
+    Rg8Unorm,
+};
 struct LiveTargetSnapshot {
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;

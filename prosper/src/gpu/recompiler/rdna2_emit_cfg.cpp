@@ -6020,7 +6020,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
             if (F.on_vcc && !rs.vcc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
-            if (b.is_fragment && (F.on_exec || F.on_vcc))
+            if (b.is_fragment && (F.on_exec || F.on_vcc) &&
+                !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
+                  vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                 condition = b.fragment_wave_any(condition);
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
@@ -6680,7 +6682,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // EXECZ/VCCZ are scalar wave decisions. Keeping every fragment invocation in the loop
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
-            if (b.is_fragment && L.condition != DivLoop::Condition::Scc)
+            if (b.is_fragment && L.condition != DivLoop::Condition::Scc &&
+                !(L.condition == DivLoop::Condition::Vcc &&
+                  rs.vcc == rs.vcc_wave_uniform &&
+                  vcc_exit_is_wave_uniform(ins, L.exit_branch_pc)))
                 loop_cond = b.fragment_wave_any(loop_cond);
             const uint32_t chk_end = b.cur_block;
             b.emit_condbranch(loop_cond, body, merge);         // canonical exit: branch on continue predicate
@@ -6813,7 +6818,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     cond_reg = b.native_subgroup_size
                         ? b.native_wave_any(cond_reg)
                         : b.guest_wave_any(cond_reg);
-                else if (b.is_fragment && (F.on_exec || F.on_vcc))
+                else if (b.is_fragment && (F.on_exec || F.on_vcc) &&
+                         !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
+                           vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                     cond_reg = b.fragment_wave_any(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 if (active_direct_wave_loop && active_direct_wave_continue &&

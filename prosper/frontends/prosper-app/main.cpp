@@ -274,7 +274,7 @@ bool pick_device(Vk& vk) {
 bool create_swapchain(Vk& vk, uint32_t w, uint32_t h,
                       prosper::frontend::AppPresentMode requestedPresentMode) {
     VkSurfaceCapabilitiesKHR caps; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps);
-    vk.scExtent = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : VkExtent2D{w, h};
+    vk.scExtent = prosper::frontend::select_swapchain_extent(caps.currentExtent, {w, h});
     if (vk.scExtent.width == 0 || vk.scExtent.height == 0) return false;   // minimized
 
     uint32_t fmtN = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(vk.phys, vk.surface, &fmtN, nullptr);
@@ -2134,6 +2134,25 @@ int main(int argc, char** argv) {
             if (dw <= 0 || dh <= 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;   // minimized or between fullscreen modes; retry after the next event
+            }
+            // SDL's non-zero pixel size can lead the Win32 Vulkan surface during a display/DPI
+            // transition. Do not destroy the still-valid swapchain until the surface publishes a
+            // usable extent too; create_swapchain would otherwise see 0x0 and the app would exit
+            // after an ordinary transient resize.
+            VkSurfaceCapabilitiesKHR resizeCaps{};
+            const VkResult resizeCapsResult = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+                vk.phys, vk.surface, &resizeCaps);
+            if (resizeCapsResult != VK_SUCCESS) {
+                fprintf(stderr, "[app] Vulkan error %d while querying a resized surface\n",
+                        static_cast<int>(resizeCapsResult));
+                running = false;
+                break;
+            }
+            if (!prosper::frontend::swapchain_extent_available(
+                    resizeCaps.currentExtent,
+                    {static_cast<uint32_t>(dw), static_cast<uint32_t>(dh)})) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
             }
             {
                 // #1270: on a shared present queue, hold the submit mutex across the device drain so no

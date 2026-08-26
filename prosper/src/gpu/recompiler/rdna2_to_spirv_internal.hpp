@@ -4202,6 +4202,10 @@ struct SpirvCompute {
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
+    // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
+    // that exact value is already scalar and needs no subgroup vote. Tying the proof to the SSA id
+    // makes an overwrite or control-flow merge invalidate it automatically.
+    uint32_t vcc_wave_uniform = 0;
     // Before the first compact structured construct, map presence means that the scalar value
     // reaches this exact linear path. Branch/loop PHIs can synthesize zero for an absent SGPR and
     // clear this marker. The CFG dispatcher likewise allocates Function variables for every
@@ -4722,6 +4726,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 
 // emit_body and the CFG state machine it drives live in rdna2_emit_cfg.cpp. As with emit_alu, the
 // default arguments are stated here and nowhere else.
+bool emit_cfg_state_machine(
+    SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
+    bool allow_exec_update, bool allow_smem,
+    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const uint32_t* code, size_t dwords, uint32_t initial_active,
+    bool synchronize_lds_fminmax);
+
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
                bool allow_exec_update, bool allow_smem,

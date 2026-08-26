@@ -5135,6 +5135,25 @@ namespace {
     }
     void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
                        bool fixed) {
+        // MAP_FIXED is replacement semantics on the guest. RAGE also uses it idempotently: GTA V
+        // submits the exact same one-page BatchMap MAP_DIRECT twice without an intervening UNMAP.
+        // Linux mmap(MAP_FIXED) accepts that naturally, while MapViewOfFile3 cannot replace a live
+        // view and reports ERROR_INVALID_ADDRESS. Treat only a byte-for-byte identical existing
+        // direct view as an idempotent remap; a different physical offset or extent still follows
+        // the fail-visible replacement path below rather than silently preserving the wrong alias.
+        if (fixed && hint && len) {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            for (const DmemView& view : g_dviews) {
+                if (view.guest_base != hint || view.guest_size != len || view.phys != phys)
+                    continue;
+                if (!protect_committed_regions(hint, len, hp)) return nullptr;
+                MLOG("map_dmem FIXED identical view already present va=0x%llx len=0x%llx "
+                     "phys=0x%llx\n",
+                     (unsigned long long)hint, (unsigned long long)len,
+                     (unsigned long long)phys);
+                return reinterpret_cast<void*>(static_cast<uintptr_t>(hint));
+            }
+        }
         if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
         // Without SCE_KERNEL_MAP_FIXED, addrInOut is a search hint. If Windows cannot extend a
         // run of adjacent section views at that exact VA, relocate the mapping and return the
@@ -5180,6 +5199,10 @@ namespace {
                     const uint64_t span_end = s.base + s.size;
                     const uint64_t req_end = hint + len;
                     if (s.base > hint || hint >= span_end || req_end <= span_end) continue;
+                    // remember_free_placeholder_locked() mutates and can reallocate this vector.
+                    // Keep the values used by the diagnostic before invalidating the reference.
+                    const uint64_t span_base = s.base;
+                    const uint64_t span_size = s.size;
                     const uint64_t tail_base = span_end;
                     const uint64_t tail_size =
                         align_up(req_end - span_end, kWinAllocationGranularity);
@@ -5216,8 +5239,8 @@ namespace {
                     // grew.
                     MLOG("map_dmem FIXED repair: free placeholder 0x%llx grew 0x%llx -> 0x%llx to "
                          "cover request 0x%llx +0x%llx -- retrying view\n",
-                         (unsigned long long)s.base, (unsigned long long)s.size,
-                         (unsigned long long)(s.size + tail_size),
+                         (unsigned long long)span_base, (unsigned long long)span_size,
+                         (unsigned long long)(span_size + tail_size),
                          (unsigned long long)hint, (unsigned long long)len);
                     retry = true;
                     break;

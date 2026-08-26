@@ -308,6 +308,8 @@ enum class GpuCaptureColorFormat : uint32_t {
     R11G11B10Float = 3,
     R8Unorm = 4,
     R32Uint = 5,
+    R32Float = 6,
+    Rg8Unorm = 7,
 };
 
 struct GpuCaptureRttSeed {

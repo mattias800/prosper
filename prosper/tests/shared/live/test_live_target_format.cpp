@@ -114,7 +114,11 @@ int main() {
     using prosper::gpu::LiveTargetPixelFormat;
     const LiveTargetPixelFormat all[] = {LiveTargetPixelFormat::Rgba8Unorm,
                                          LiveTargetPixelFormat::Rgba16Float,
-                                         LiveTargetPixelFormat::R11G11B10Float};
+                                         LiveTargetPixelFormat::R11G11B10Float,
+                                         LiveTargetPixelFormat::R8Unorm,
+                                         LiveTargetPixelFormat::R32Uint,
+                                         LiveTargetPixelFormat::R32Float,
+                                         LiveTargetPixelFormat::Rg8Unorm};
     bool mapped = true, round_trips = true;
     for (LiveTargetPixelFormat format : all) {
         const VkFormat vk = prosper::frontend::live_target_pixel_format_vk(format);
@@ -142,6 +146,14 @@ int main() {
         {prosper::gpu::GpuCaptureColorFormat::R11G11B10Float,
          LiveTargetPixelFormat::R11G11B10Float, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4,
          "r11g11b10"},
+        {prosper::gpu::GpuCaptureColorFormat::R8Unorm,
+         LiveTargetPixelFormat::R8Unorm, VK_FORMAT_R8_UNORM, 1, "r8"},
+        {prosper::gpu::GpuCaptureColorFormat::R32Uint,
+         LiveTargetPixelFormat::R32Uint, VK_FORMAT_R32_UINT, 4, "r32ui"},
+        {prosper::gpu::GpuCaptureColorFormat::R32Float,
+         LiveTargetPixelFormat::R32Float, VK_FORMAT_R32_SFLOAT, 4, "r32f"},
+        {prosper::gpu::GpuCaptureColorFormat::Rg8Unorm,
+         LiveTargetPixelFormat::Rg8Unorm, VK_FORMAT_R8G8_UNORM, 2, "rg8"},
     };
     uint64_t base = 0x2110310000ull;
     for (const FormatCase& c : cases) {

@@ -2636,19 +2636,45 @@ int main() {
 
     // A partial AGC thread-dimension workgroup needs a divergent entry guard to mask Vulkan's padded
     // invocations. That is safe for ordinary kernels, but not when the module contains a workgroup
-    // barrier: every Vulkan invocation must reach OpControlBarrier uniformly. Keep exact workgroups
-    // supported and reject the partial+barrier combination rather than risking a hang or undefined LDS.
+    // barrier: every Vulkan invocation must reach OpControlBarrier uniformly.
+    //
+    // This combination USED to be rejected outright, and this assertion pinned that. The rejection
+    // was a conservative stand-in for a lowering the recompiler already had and was not permitting
+    // itself to use: split the stream at its barriers, compile each barrier-free phase through the
+    // dispatcher's per-lane ACTIVE bit, and emit each barrier from the outer phase shell at function
+    // scope, where a padded invocation reaches it because it never left uniform control flow. The
+    // divergent entry guard is not emitted on that route at all.
+    //
+    // So the property worth asserting is the one the rejection was protecting -- the barrier is
+    // uniform -- and not the rejection itself. The `>= 1` barrier count rules out the degenerate way
+    // to satisfy that (dropping the barrier in translation), which would otherwise pass silently.
     const uint32_t barrier_only[] = { 0xBF8A0000u, 0xBF810000u };
     ComputeShaderConfig exact_barrier;
     exact_barrier.local_x = 64;
     exact_barrier.exact_thread_extent = true;
     exact_barrier.threads_x = 64;
     exact_barrier.threads_y = exact_barrier.threads_z = 1;
-    CHECK(!recompile_compute(barrier_only, 2, nullptr, exact_barrier).empty(),
+    const std::vector<uint32_t> exact_barrier_spirv =
+        recompile_compute(barrier_only, 2, nullptr, exact_barrier);
+    CHECK(!exact_barrier_spirv.empty(),
           "an exact thread-dimension workgroup may retain a uniform barrier");
     exact_barrier.threads_x = 63;
-    CHECK(recompile_compute(barrier_only, 2, nullptr, exact_barrier).empty(),
-          "a partial thread-dimension workgroup with a barrier rejects fail-visibly");
+    const std::vector<uint32_t> partial_barrier_spirv =
+        recompile_compute(barrier_only, 2, nullptr, exact_barrier);
+    auto spirv_opcode_count = [](const std::vector<uint32_t>& words, uint16_t opcode) {
+        size_t count = 0;
+        for (size_t at = 5; at < words.size();) {
+            const uint32_t length = words[at] >> 16;
+            if (length == 0) break;
+            count += static_cast<uint16_t>(words[at]) == opcode;
+            at += length;
+        }
+        return count;
+    };
+    CHECK(!partial_barrier_spirv.empty() &&
+              spirv_opcode_count(partial_barrier_spirv, /*OpControlBarrier=*/224) >= 1,
+          "a partial thread-dimension workgroup keeps its barrier through the phase split "
+          "instead of being rejected");
 
     // A wave-empty saveexec/execz guard may surround a scalar counted loop when the body preserves
     // both EXEC and the guard's saved mask. This is the Evergate color-conversion shape.

@@ -383,7 +383,10 @@ std::vector<uint32_t> recompile_interpolation_geometry(
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
                                      const ShaderResourceTable* rt = nullptr, uint32_t lds_bytes = 0,
-                                     uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1);
+                                     uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1,
+                                     bool force_cfg_for_test = false,
+                                     uint32_t local_x_for_test = 64,
+                                     uint32_t threads_x_for_test = 0);
 
 // Register and launch state for a real compute program. User SGPR values are supplied as one
 // push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
@@ -467,6 +470,10 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
     const uint32_t* code, size_t dwords);
+// Test hook for the static half of the scalar-uniform VCC branch proof. Production additionally
+// requires the live VCC SSA value to carry the matching uniform marker.
+bool fragment_vcc_branch_is_wave_uniform_for_test(
+    const uint32_t* code, size_t dwords, uint32_t branch_pc);
 // Test hook for the byte-exact legacy capture exception: it must select one coherent Wave32
 // contract, not Wave32 masks inside a Wave64 native subgroup.
 uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
