@@ -50,11 +50,51 @@ compute for a long time, so a graphics-only scanner would have reported the heal
 
 ## It refuses to report a clean result it did not earn
 
-This is the design point worth preserving. If `spirv-dis` is missing, `gpu_replay` is not where it
-was told, no shader could be dumped, or a capture holds nothing with shaders, it exits **2** and says
-so — it never prints `mismatches: 0`. A silent scanner and a healthy codebase produce identical
-output, and this project has lost real time to exactly that. Every run prints the number of shaders
-it actually examined; quote that count alongside any clean result.
+This is the design point worth preserving — and the first version of this tool **did not actually
+hold it**, which is why the claim is now spelled out with its limits attached.
 
-That guard has already earned itself: the first cross-title run hit a bundle it could not read and
-refused to clear the title.
+It exits **2**, never printing a clean result, when `spirv-dis` is missing, `gpu_replay` is not where
+it was told, a capture holds nothing with shaders, a capture could not be inspected, or **any single
+capture yielded zero examined shaders**. That last clause is the one that was wrong: the guard was
+global, so one readable capture certified an entire run, and a barren capture alongside it exited 0.
+Findings could also be attributed to a capture whose dumps had all failed, because one temp directory
+was shared across captures and success was judged by whether a file existed rather than by the
+child's exit code. Both are fixed, and both are pinned by arms in `--self-test`.
+
+Every run prints, per capture, how many shaders it examined and how many it could not read. **Quote
+those counts alongside any clean result** — an exit code alone is not falsifiable.
+
+### What a finding is, and what a clean result is
+
+These two directions do **not** carry the same weight, and the difference is structural.
+
+The ISA walk is **not length-aware**. A correct walk needs per-instruction lengths (prosper's own
+`rdna2_decode.cpp` has them, and records what mis-sizing costs: a phantom instruction that derails
+the stream walk). Without them, a literal constant whose top six bits happen to read as the MIMG
+encoding looks like an instruction. The walk does skip the dword after a match, since MIMG is at
+minimum two dwords, but that is a partial mitigation and not a fix.
+
+So the error is **one-directional**: the finder can invent an MIMG that is not there, and cannot hide
+one that is.
+
+- **A finding is a candidate**, not a defect. Confirm it against the shader before acting on it.
+- **A clean result is sound for the classes it checks** — a superset that found nothing means there
+  was nothing to find.
+
+Two further recall limits, both deliberate: `OpTypeImage` is parsed module-wide, so a shader that
+declares *any* arrayed image clears *every* arrayed sample in it (without per-binding attribution,
+claiming otherwise would report shaders that are actually correct); and `max_coord_arity` is
+reported for information only — it feeds no decision, and reads 0 when a coordinate is not built by
+`OpCompositeConstruct`.
+
+## Self-test
+
+`scan.py --self-test` is hermetic: it drives the scanner end to end against a stub `gpu_replay` and a
+`spirv-dis` shim, so it needs no GPU and no Vulkan toolchain. It is registered with ctest as
+`shader_conformance_scan_logic`. It covers both parsers, the classifier in both directions, and the
+exit contract; ten mutations of the covered logic each turn it red, including `DIM_ARRAYED` dropping
+the 2D_ARRAY case that is the tool's entire reason to exist.
+
+The suite it replaced passed under all of those mutations. Its MIMG fixture was assembled from the
+same constant it was checking, so mutating the constant mutated the fixture — a same-source positive
+control, which tests the discriminator and never the domain.

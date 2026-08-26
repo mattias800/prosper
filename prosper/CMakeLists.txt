@@ -390,6 +390,17 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # The shader-conformance scanner (#3036), registered because its whole value is a CLEAN result
+  # and its original failure mode was manufacturing one: a capture that yielded zero examined
+  # shaders exited 0, and findings could be attributed to a capture whose dumps had all failed.
+  # The suite is hermetic -- it drives the scanner end to end against a stub gpu_replay and a
+  # `spirv-dis` shim, so it needs neither a GPU nor the Vulkan toolchain, and it pins the exit
+  # contract (0 clean / 1 mismatch / 2 could-not-scan) rather than only the two parsers. Ten
+  # mutations of the logic it covers, including `DIM_ARRAYED` dropping the 2D_ARRAY case that is
+  # the tool's entire reason to exist, each turn it red.
+  add_test(NAME shader_conformance_scan_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/shader_conformance/scan.py" "--self-test")
   # stack_profile's frame classifier, against RECORDED gdb output. Deliberately needs no gdb and no
   # ptrace: an end-to-end variant would skip silently wherever ptrace is unavailable, and a silently
   # skipped test is indistinguishable from a passing one. What it pins is the case that already
