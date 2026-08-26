@@ -144,12 +144,17 @@ the GPU vendor cannot see.
 
 ## Vulkan validation (`PROSPER_VK_VALIDATION=1`)
 
-**Read `tools/vkval/` first.** `vk_validation_scan.py` (#1704) runs the whole ctest suite under the
-validation layer and diffs against `tools/vkval/allowlist.txt`, which carries a dated baseline —
-7 ids / 187 messages on lavapipe, 9 ids / 51 messages on RADV, measured 2026-08-01 — and it is
-registered with ctest as `vkval_scan_logic`. Three VUIDs were fixed off the back of it (#1713,
-#1717, #1726). **That is the project's validation guard, and it works without any messenger**,
-because VVL's default `debug_action` writes to stdout/stderr on its own.
+`vk_validation_scan.py` (#1704) runs the whole ctest suite under the validation layer and diffs
+against `tools/vkval/allowlist.txt`, and is registered with ctest as `vkval_scan_logic`. **Four
+VUIDs have been fixed off the back of it** (#1713, #1714, #1717, #1726). **That is the project's
+validation guard, and it works without any messenger**, because VVL's default `debug_action` writes
+to stdout/stderr on its own.
+
+Read the id and message counts from `allowlist.txt` itself rather than from anywhere that quotes
+them. Its header amends its own baseline on every fix — three times so far — and the file's own rule
+is that an unexplained drop in the id count reads as *"the scan broke"*. A figure quoted elsewhere
+and left to go stale therefore manufactures exactly that false alarm; this paragraph used to carry
+one.
 
 `PROSPER_VK_VALIDATION=1` is for the other case: validating **one interactive or routed run** of a
 title, in-process. It enables the layer and registers a `VkDebugUtilsMessenger`, which adds over the

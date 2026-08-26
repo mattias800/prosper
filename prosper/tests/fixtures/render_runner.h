@@ -981,8 +981,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         //
         // This does NOT make validation newly possible -- `tools/vkval/vk_validation_scan.py`
         // (#1704, ctest `vkval_scan_logic`) has been scanning the suite for a long time and carries
-        // a dated baseline, because VVL's default debug_action writes to stdout/stderr by itself.
-        // Three VUIDs were fixed off the back of it (#1713, #1717, #1726). An earlier revision of
+        // its own baseline, because VVL's default debug_action writes to stdout/stderr by itself.
+        // Four VUIDs were fixed off the back of it (#1713, #1714, #1717, #1726). Counts are
+        // deliberately not quoted here: allowlist.txt amends its baseline on every fix, and a stale
+        // figure there reads as "the scan broke". An earlier revision of
         // this comment claimed validation "had never once been a measurement in this project",
         // which was simply false and would have retired a working guard as unmeasured.
         //
@@ -1073,7 +1075,7 @@ inline const RenderVkCtx& render_vk_ctx() {
                 // than one thread (see present_queue_shared), so the rate-limit map needs a lock.
                 static std::mutex seen_mu;
                 static std::unordered_map<int32_t, uint32_t> seen;
-                constexpr uint32_t kPerIdLimit = 8;   // keep in step with kMessengerPerIdLimit
+                constexpr uint32_t kPerIdLimit = kMessengerPerIdLimit;
                 uint32_t n;
                 {
                     std::lock_guard<std::mutex> lk(seen_mu);
