@@ -145,6 +145,15 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 // it: continuing the walk is the conservative direction, and a later genuine mask
                 // read still fails the proof. Being wrong about the kill would be unsound; being
                 // silent about it only costs acceptances.
+                // WAITCNT_VSCNT is EXCLUDED from the read-modify-write admission above. It is
+                // register-transparent only in its NULL form, handled at the top of this case; with
+                // any other encoded destination it is not a scalar-data RMW at all, so the argument
+                // that licenses the RMW family ("a 32-bit data touch cannot consume the half as a
+                // 64-bit lane mask") simply does not apply to it. Admitting it here let a mutation
+                // that puts VCC_HI in that field pass the dead-sibling proof, which the
+                // "same-site non-null WAIT source observes VCC_HI" guard in test_rdna2_to_spirv.cpp
+                // exists to catch.
+                if (in.opcode == kSopkOpcodeWaitcntVscnt) return block(in, "waitcnt-vscnt-nonnull");
                 if (data_read_ok && in.dst.kind == OperandKind::SGPR) break;
                 return block(in, "unmodelled-sopk");
             case Rdna2Format::SOPP:
