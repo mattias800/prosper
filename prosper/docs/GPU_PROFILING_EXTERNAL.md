@@ -141,3 +141,36 @@ to that class of error, costs nothing to run, and needs no maintenance from us.
 
 Reach for these first. Build a `PROSPER_*` switch only for something the guest-facing layer knows and
 the GPU vendor cannot see.
+
+## Vulkan validation (`PROSPER_VK_VALIDATION=1`)
+
+Enables the Khronos validation layer **and** registers a debug messenger for it. Both halves matter,
+and only the first is obvious: the loader will happily load the layer from the environment alone
+(`VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`), but with no `VkDebugUtilsMessenger`
+registered every message it produces is discarded. That reads exactly like a clean validation run.
+
+**Before this existed, prosper had no messenger anywhere** — so "no validation errors" had never once
+been a measurement in this project, on any title. If you find a note in an issue or a status doc
+saying validation was clean, and it predates this, it is void.
+
+```bash
+PROSPER_VK_VALIDATION=1 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+    ./prosper/build-linux/screenshot --out ~/work --seconds 2 --count 30 <DUMP_ROOT>/<TITLE_ID>-app0
+```
+
+It announces itself, which is the point — the tool tells you whether it is actually running:
+
+| line | meaning |
+| --- | --- |
+| `[vk-validation] active (warnings and errors, 8 per message id)` | armed; a clean run is a real result |
+| `[vk-validation] PROSPER_VK_VALIDATION set but ... is not installed; NO validation is running` | the layer is absent — install it, do not read the silence |
+| `[vk-validation] layer loaded but the debug messenger could NOT be registered ...` | output would be discarded; treat a clean result as void |
+
+Off by default: the layer costs real time per draw. Reports are **rate-limited to 8 per message id**,
+because one violated VUID in a per-draw path otherwise fills the disk — and on this machine a large
+run log takes the shared tmpfs, and the Bash tool with it.
+
+Worked example (#325, 2026-08-27): a change that made Tomb Raider's gameplay render as a uniform
+single-colour fill produced **zero** VUIDs with the sink armed. That turned "we cannot tell whether
+this is a Vulkan misuse" into "it is not one, so look at the logic" — a question that had been
+unanswerable in this project until the messenger existed.

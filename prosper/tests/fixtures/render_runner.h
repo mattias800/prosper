@@ -880,6 +880,8 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // Give compute an explicit release-before-teardown handshake before adding a destructor here.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
+    // Non-null only under PROSPER_VK_VALIDATION; without it the layer has no output sink.
+    VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     VkDeviceSize storage_buffer_alignment = 1;
     double timestamp_period_ns = 0.0;
@@ -971,6 +973,41 @@ inline const RenderVkCtx& render_vk_ctx() {
                 ici.ppEnabledExtensionNames = inst_exts.data();
             }
         }
+        // PROSPER_VK_VALIDATION=1: enable the Khronos validation layer AND give it somewhere to
+        // report. Both halves are required and only the first is obvious -- the loader will happily
+        // load the layer from the environment alone (VK_LOADER_LAYERS_ENABLE), but with no debug
+        // messenger registered every message it produces is discarded. That reads exactly like a
+        // clean validation run, which is the most dangerous null this project can produce: prosper
+        // had NO messenger anywhere, so "no validation errors" has never once been a measurement.
+        // Off by default; the layer costs real time per draw.
+        const bool want_validation = [] {
+            const char* e = getenv("PROSPER_VK_VALIDATION");
+            return e && *e && strcmp(e, "0");
+        }();
+        static const char* const kValidationLayer = "VK_LAYER_KHRONOS_validation";
+        bool validation_enabled = false;
+        std::vector<const char*> inst_layers;
+        if (want_validation) {
+            uint32_t nl = 0; vkEnumerateInstanceLayerProperties(&nl, nullptr);
+            std::vector<VkLayerProperties> layers(nl);
+            if (nl) vkEnumerateInstanceLayerProperties(&nl, layers.data());
+            for (const auto& l : layers)
+                if (!strcmp(l.layerName, kValidationLayer)) validation_enabled = true;
+            if (validation_enabled) {
+                inst_layers.push_back(kValidationLayer);
+                ici.enabledLayerCount = (uint32_t)inst_layers.size();
+                ici.ppEnabledLayerNames = inst_layers.data();
+                inst_exts.push_back("VK_EXT_debug_utils");
+                ici.enabledExtensionCount = (uint32_t)inst_exts.size();
+                ici.ppEnabledExtensionNames = inst_exts.data();
+            } else {
+                // Say so. A requested-but-absent layer is the silent-instrument case again.
+                fprintf(stderr, "[vk-validation] PROSPER_VK_VALIDATION set but %s is not installed; "
+                                "NO validation is running\n", kValidationLayer);
+                fflush(stderr);
+            }
+        }
+
         // If the driver rejects the surface set (should not happen since each was advertised), retry with
         // no instance extensions so the headless render path never regresses on an unexpected loader.
         if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS || !r.inst) {
@@ -982,6 +1019,45 @@ inline const RenderVkCtx& render_vk_ctx() {
                 return r;
             }
         }
+        if (validation_enabled) {
+            auto create = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+                r.inst, "vkCreateDebugUtilsMessengerEXT");
+            VkDebugUtilsMessengerCreateInfoEXT dci{
+                VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            dci.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT sev,
+                                     VkDebugUtilsMessageTypeFlagsEXT,
+                                     const VkDebugUtilsMessengerCallbackDataEXT* d,
+                                     void*) -> VkBool32 {
+                // Rate-limited per message id: one violated VUID in a per-draw path otherwise
+                // produces gigabytes, and this project's guidance is explicit that a run log on the
+                // tmpfs takes the machine down with it.
+                static std::unordered_map<int32_t, uint32_t> seen;
+                constexpr uint32_t kPerIdLimit = 8;
+                const uint32_t n = ++seen[d ? d->messageIdNumber : 0];
+                if (n > kPerIdLimit) return VK_FALSE;
+                fprintf(stderr, "[vk-validation] %s %s%s\n",
+                        sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "ERROR" : "WARN",
+                        d && d->pMessage ? d->pMessage : "(no message)",
+                        n == kPerIdLimit ? "  [further reports of this id suppressed]" : "");
+                fflush(stderr);
+                return VK_FALSE;
+            };
+            if (!create || create(r.inst, &dci, nullptr, &r.debug_messenger) != VK_SUCCESS) {
+                fprintf(stderr, "[vk-validation] layer loaded but the debug messenger could NOT be "
+                                "registered; its output would be discarded, so treat any clean "
+                                "result from this run as void\n");
+                fflush(stderr);
+            } else {
+                fprintf(stderr, "[vk-validation] active (warnings and errors, %u per message id)\n",
+                        8u);
+                fflush(stderr);
+            }
+        }
+
         uint32_t nd = 0; vkEnumeratePhysicalDevices(r.inst, &nd, nullptr);
         if (!nd) return r;
         std::vector<VkPhysicalDevice> devs(nd); vkEnumeratePhysicalDevices(r.inst, &nd, devs.data());
