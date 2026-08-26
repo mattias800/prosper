@@ -13,16 +13,27 @@
 // classified stale named state as a live binding, which denies the authoritative direct-GPU path and
 // — when no CPU snapshot exists — degrades to guest bytes rather than to a slower correct source.
 //
+// One asymmetry this header does NOT itself resolve: for SLOT 0 the two read different
+// representations. Grouping takes slot 0's identity from the named fields (see
+// `mrt_same_color_pass`), because that is where live_renderer takes the address it renders to,
+// while feedback stays array-first through `mrt_active_color`. They agree because every producer
+// mirrors `color_targets[0]` from the named triple, not because anything here enforces it — so a
+// producer that ever filled the two independently would break the agreement without this header
+// changing.
+//
 // The rule: a slot is active when it has a base, a non-zero write mask, and a format the backend
 // accepts. That last term is TOTAL in the current backend -- `backend_color_format` maps every
 // unrecognised value, zero included, onto R8G8B8A8_UNORM, so it never rejects anything and a zero
 // format means "use the fallback" rather than "undefined". It is kept as a parameter because it is
 // the backend's decision to make, not this header's, and a backend that ever narrows it must narrow
-// grouping and feedback together. The
+// grouping and feedback together. For the ACTIVE-BINDING rule above, the
 // named `color0_*` / `color1_*` fields are consulted ONLY when the array representation is absent,
 // because `DrawItem` predates the complete array and capture versions through v33 carry the first
 // two attachments in those fields. Falling back whenever the array mask merely reads zero is a
 // different and wrong rule: a genuinely masked-off slot then inherits a stale named mask.
+//
+// That "ONLY" scopes to the active-binding rule and does not extend to slot 0's PASS IDENTITY,
+// which is named-first for the reason given at `mrt_same_color_pass`.
 namespace prosper::frontend {
 
 inline prosper::gpu::DrawItem::ColorTargetBinding mrt_color_binding(
@@ -98,13 +109,17 @@ bool mrt_same_color_pass(const prosper::gpu::DrawItem& first,
     // attachment -- and two draws that render to DIFFERENT addresses then share a pass, so the
     // second draw's target is silently discarded and its pixels are never published.
     //
-    // On captured and live draws the two representations are identical, because every producer
-    // derives color_targets[0] from the named fields rather than filling it independently
-    // (gpu_capture.cpp:518/2392/5190, gpu_execute.hpp:2398 and :1603) -- so this is a no-op there.
-    // It differs only for a caller that builds a DrawItem directly and populates the named aliases
-    // alone, which is exactly the shape gpu_execute.hpp:2398 exists to repair and which the render
-    // fixtures construct. Falling back to `mrt_color_binding` when `color0_base` is 0 keeps the
-    // previous answer for a draw that names no slot-0 surface at all.
+    // On captured and live draws the two representations are identical, so this is a no-op there.
+    // For captures a divergence is not merely absent but INEXPRESSIBLE: the wire format carries
+    // slots 2 and up only, and `restore_legacy_color_target_aliases` re-derives slots 0/1 from the
+    // named triple on every load. For live draws the same mirror sits at the single success exit of
+    // `realize_draw_item`. Neither is asserted anywhere, which is the one soft spot -- they are
+    // conventions held by every producer rather than a checked invariant.
+    //
+    // The two differ only for a caller that builds a DrawItem directly and populates the named
+    // aliases alone: exactly the shape `realize_draw_item`'s mirror exists to repair, and the shape
+    // the render fixtures construct. Falling back to `mrt_color_binding` when `color0_base` is 0
+    // keeps the previous answer for a draw that names no slot-0 surface at all.
     auto pass_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
         if (slot == 0 && draw.color0_base)
             return prosper::gpu::DrawItem::ColorTargetBinding{
