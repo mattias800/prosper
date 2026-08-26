@@ -415,13 +415,23 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
 // takes an ABSOLUTE deadline, so the per-call overhead cannot compound across a pacing loop the way
 // a relative sleep's does.
 //
-// The deadline is computed BEFORE anything else in the body: it is the guest's schedule, and any
-// work done first would be silently added to the interval the guest asked for.
+// The deadline is taken as early as the body allows, because it is the guest's schedule and any work
+// done first is silently added to the interval it asked for. Not an absolute: the census scope's
+// constructor and, in k_nanosleep, the guest read and range guard necessarily precede it. Those are
+// a few hundred nanoseconds against a millisecond-scale request, which is why the ordering is worth
+// stating as an intent rather than asserting as an invariant.
 static inline void guest_sleep_ns(uint64_t ns) {
     // PROSPER_GUEST_SLEEP_LEGACY=1 restores the pre-#3013 nanosleep path. It exists ONLY so the A/B
     // that established the fix stays reproducible -- the same reason PROSPER_UD_TAIL_ALIGN survives
-    // (CLAUDE.md). Measured with it on/off, The Messenger audio delivery against the 384,000 B/s that
-    // f32/2ch/48 kHz needs: 100.8% off (healthy) vs the legacy path. Do not set it to fix anything.
+    // (CLAUDE.md). Do not set it to fix anything.
+    //
+    // What the A/B does and does NOT show, because an earlier version of this comment cited the
+    // wrong half: audio DELIVERY RATE does not discriminate. The Messenger measures ~100% of the
+    // 384,000 B/s that f32/2ch/48 kHz needs in BOTH arms (385,024-389,120 B/s legacy), which is
+    // exactly why a delivery-rate check cannot find this defect -- quoting the 100.8% as evidence
+    // for the fix, as that comment did, points a reader at a number that separates nothing. What the
+    // lever does separate is sleep ACCURACY: requested 18.17 -> actual 23.74 ms (x1.31) legacy
+    // against 15.41 -> 15.69 (x1.02) fixed, on the same route.
     static const bool legacy = getenv("PROSPER_GUEST_SLEEP_LEGACY") != nullptr;
     if (legacy) {
         struct timespec ts{ (time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull) };
@@ -433,14 +443,28 @@ static inline void guest_sleep_ns(uint64_t ns) {
     prosper::host::sleep_until_steady_ns(deadline);
 }
 
-HLE(k_usleep)   { hle::WaitCensusScope c(hle::WaitKind::Usleep, a0 * 1000ull); guest_sleep_ns(a0 * 1000ull); return 0; }
+// Saturating, for the same reason k_nanosleep saturates: the argument is guest-controlled and a wrap
+// turns a long sleep into a short one. Benign in consequence here -- a wrapped deadline lands in the
+// past and precise_sleep returns at once -- but having one of these three saturate and the others
+// wrap is an inconsistency the next reader has to re-derive, so they all do.
+static inline uint64_t guest_ns_from(uint64_t value, uint64_t ns_per_unit) {
+    const uint64_t kNsMax = ~0ull;
+    return value > kNsMax / ns_per_unit ? kNsMax : value * ns_per_unit;
+}
+
+HLE(k_usleep)   { const uint64_t ns = guest_ns_from(a0, 1000ull);
+                  hle::WaitCensusScope c(hle::WaitKind::Usleep, ns); guest_sleep_ns(ns); return 0; }
 
 // POSIX sleep() returns the number of seconds LEFT unslept (0 on full completion), not the input.
 // Returning the input breaks the canonical resume idiom `while ((left = sleep(left))) ;` into an
 // infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
-HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 1000000000ull); guest_sleep_ns(a0 * 1000000000ull); return 0; }
-// The remainder out-parameter is written ZERO rather than left untouched: we always sleep the full
-// duration, and a guest that reads an uninitialised remainder would resume a wait it already served.
+HLE(k_sleep_s)  { const uint64_t ns = guest_ns_from(a0, 1000000000ull);
+                  hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, ns); guest_sleep_ns(ns); return 0; }
+// The remainder out-parameter is written ZERO rather than left untouched, on BOTH exits: a served
+// request sleeps in full so nothing remains, and a refused one slept nothing but must still not hand
+// back whatever was in that memory. Either way a guest reading an uninitialised remainder could
+// resume a wait it should not. (This paragraph previously said "we always sleep the full duration",
+// which the refusal path made false.)
 //
 // Both fields are indexed as int64 rather than reached through a HOST struct timespec, because the
 // two layouts differ on the platform this targets: the guest is FreeBSD x86-64, where tv_nsec is
@@ -450,7 +474,7 @@ HLE(k_sleep_s)  { hle::WaitCensusScope c(hle::WaitKind::SleepSeconds, a0 * 10000
 // wait already served. The READ survived the same cast only by little-endian accident, since every
 // legal nanosecond value fits in the low half. Line 278 already indexes explicitly for this reason.
 //
-// An out-of-range or negative tv_nsec is REFUSED -- the body returns 0 without sleeping. The comment
+// A negative tv_sec, or a negative or out-of-range tv_nsec, is REFUSED -- the body returns 0 without sleeping. The comment
 // on the guard itself says why that is the behaviour to preserve. (An earlier revision of this block
 // described the OPPOSITE, carrying the value into the total. That text survived the commit that added
 // the guard and read as a rationale for removing it, which is how a comment gets a safety check
