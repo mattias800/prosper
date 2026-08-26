@@ -1394,6 +1394,11 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
     // no ceiling, a period-2 buffer whose constant is 400 implies indices near 26.2M and is accepted
     // the moment a bound exceeds them. 16.7M records is far above any real mesh and cheap to keep.
     constexpr uint32_t kMaxPlausibleIndex = 1u << 24;
+    // The `vertex_upper_bound == 0` half is REDUNDANT and kept only to state intent, in the same
+    // spirit as compute_address_range_contains() above: with no bound, `ceiling` folds to
+    // min(0, 1<<24) = 0 and the very first `d >= ceiling` rejects anyway. Deleting it alone changes
+    // no behaviour and no mutation can catch it -- which is exactly why it is annotated rather than
+    // defended with an arm. Do not read it as load-bearing.
     if (n < kMinSamples || vertex_upper_bound == 0) return false;
     // Folding the two ceilings is exact -- `d >= min(A,B)` is `d >= A || d >= B` -- and the bound-0
     // early-return above means `ceiling` is never 0. What it hides is that the absolute ceiling also
@@ -1405,6 +1410,9 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
 
     // Outside evidence first: every index must address a vertex the bound buffer actually holds.
     uint32_t lo = UINT32_MAX, hi = 0;
+    // `any_nonzero` is likewise dead: an all-zero reading has exactly one distinct value, so the
+    // `distinct < kMinDistinct` test below already rejects it. Kept for symmetry with the detector
+    // above, whose version is load-bearing because it has no distinct-count clause.
     bool any_nonzero = false;
     uint32_t distinct = 0, seen[kMinDistinct] = {};
     for (uint32_t i = 0; i < m; i++) {

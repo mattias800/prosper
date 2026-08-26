@@ -23,18 +23,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Tomb Raider's world stopped being a pile of shards
 
-Croft Manor now renders with correct geometry. Both shots are the same route and the same scene on
-the same build — the only difference is the fix itself.
+Croft Manor now renders with correct geometry — same route, same scene, same build, before and after.
 
 ![Croft Manor before the fix: the world shattered into stretched triangles](assets/screenshots/tomb-raider-world-before-index-fix.png)
 
 ![Croft Manor after the fix: steps, walls, hedges and trees all correctly shaped, with Lara and Winston](assets/screenshots/tomb-raider-gameplay.png)
 
-The title draws its whole level from one 775,111-vertex pool, which 16-bit indices cannot address —
-so its index buffers are 32-bit. It never tells anyone that, and prosper already had a detector for
-exactly this, built for another game. That detector only recognises the case where every index is
-below 65536, which is precisely the case a 775,000-vertex pool never produces. Read as 16-bit, every
-triangle collapsed to a sliver. Surfaces are still untextured, which is the next thing.
+Surfaces are still untextured — that is the next thing. [#2990](https://github.com/mattias800/prosper/issues/2990)
 
 ### Tomb Raider I-III Remastered boots for the first time, and reaches its title screen
 

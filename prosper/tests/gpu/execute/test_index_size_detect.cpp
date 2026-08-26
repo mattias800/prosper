@@ -204,9 +204,17 @@ int main() {
             early.push_back((uint16_t)(d >> 16));
         }
         CHECK(!detect_alias(early, 160, 200000),
-              "KNOWN LIMIT: the same run crossing at dword 5 is rejected -- the cap rescues late "
-              "crossings only");
+              "KNOWN LIMIT: the same run crossing at dword 5 is rejected -- the cap rescues late\n"
+              "           crossings only. EXPECTED to flip if the parity scan is widened; this is the\n"
+              "           likelier of the two limit arms to change, so do not weaken a guard to keep it green");
     }
+
+    // The span comparison is `>=` too, and that is a correctness boundary rather than a tunable:
+    // `hi - lo == 0x10000` covers 65,537 values, which does NOT fit one 64 KiB index window. Indices
+    // 300000..365536 are exactly that, and must be rejected.
+    CHECK(!detect_hi({2, 41911, 2, 41916, 2, 41915, 2, 41913},
+                     {300000, 365536, 300001, 300002, 300003, 300004, 300005, 300006}, 8, 2000000),
+          "mutation: a span of exactly 0x10000 is 65,537 values -> rejected (pins >= on the span)");
 
     // T2: the ceiling comparison is `>=`, and nothing pinned that. Implied indices here are
     // 65536..65599, so a bound of exactly 65599 must REJECT; with `>` it would be accepted.
