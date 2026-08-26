@@ -5724,7 +5724,27 @@ bool shader_resource_allows_zero_mip_specialization(
     const DecodedImageView& view) {
     return use.proven_zero_mip && descriptor.sample_count == 1u &&
         descriptor.base_level == 0u && descriptor.last_level == 0u &&
-        descriptor.max_mip == 0u && !view.in_mip_tail;
+        descriptor.max_mip == 0u && !view.in_mip_tail &&
+        // RESTORED. The rendering series removed this term, but only here -- the recompiler's
+        // IMAGE_LOAD_MIP acceptance (rdna2_emit_alu.cpp, `res->compression_enabled`) and the compute
+        // cache's partitioning both still refuse a DCC resource, so removing it here alone leaves the
+        // two halves of one contract disagreeing: realization marks the descriptor proven and the
+        // recompiler then declines it as `unresolved-operand`, which drops the whole dispatch.
+        //
+        // Three existing tests enforce the invariant -- test_dynfetch_fold ("DCC-backed
+        // IMAGE_LOAD_MIP remains fail-visible"), test_rdna2_spirv_struct ("IMAGE_LOAD_MIP accepted an
+        // unproven, DCC, or multilevel resource") and test_shader_recompile_cache ("compute cache
+        // partitions zero-mip proof, levels, DCC, and texture-tail safety") -- against one new
+        // assertion that expects the opposite. Dropping the term in all three places was tried and
+        // makes those three fail, so the change is incomplete rather than merely unlanded here.
+        //
+        // The argument for eventually removing it is real and recorded in the recompiler beside its
+        // own copy of the term: compression describes how bytes are ENCODED while this marker is
+        // about which LOD is ADDRESSED, and GTA V's 0x2042f49a00 is declined partly for bytes that
+        // resource never reads. Making that change coherently means moving the refusal to the point
+        // that knows whether authoritative pixels were acquired, and doing it in all three places at
+        // once. That is its own piece of work, not a side effect of this series.
+        !descriptor.compression_enabled;
 }
 
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
