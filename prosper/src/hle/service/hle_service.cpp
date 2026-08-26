@@ -2436,6 +2436,7 @@ HLE(s_avp_getvideodata) {
     svc_log("sceAvPlayerGetVideoData", a0,a1,a2,a3,a4,a5);
     auto* fi = (AvpFrameInfo*)PW(a1); if (!fi) return 0;
     void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t result = 0;
+    prosper::video::VideoBackend* log_backend = nullptr; int log_backend_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
