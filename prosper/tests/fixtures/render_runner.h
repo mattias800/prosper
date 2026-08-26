@@ -940,6 +940,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         // SDL_Vulkan_GetInstanceExtensions; instead enable every platform surface extension present and
         // let the app fall back to its own device if SDL still needs one we didn't get (#1270 R4).
         std::vector<const char*> inst_exts;
+        // Hoisted so the validation block below can consult it: pushing an unadvertised extension
+        // fails the WHOLE vkCreateInstance, which would also drop every WSI extension and turn off
+        // present_surface_capable (#1270) -- a debugging switch must not degrade the present path.
+        std::vector<VkExtensionProperties> avail;
         {
             static const char* const kWsiExts[] = {
                 "VK_KHR_surface",
@@ -952,7 +956,7 @@ inline const RenderVkCtx& render_vk_ctx() {
 #endif
             };
             uint32_t nie = 0; vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
-            std::vector<VkExtensionProperties> avail(nie);
+            avail.resize(nie);
             if (nie) vkEnumerateInstanceExtensionProperties(nullptr, &nie, avail.data());
             auto has = [&](const char* name) {
                 for (const auto& e : avail) if (!strcmp(e.extensionName, name)) return true;
@@ -973,19 +977,28 @@ inline const RenderVkCtx& render_vk_ctx() {
                 ici.ppEnabledExtensionNames = inst_exts.data();
             }
         }
-        // PROSPER_VK_VALIDATION=1: enable the Khronos validation layer AND give it somewhere to
-        // report. Both halves are required and only the first is obvious -- the loader will happily
-        // load the layer from the environment alone (VK_LOADER_LAYERS_ENABLE), but with no debug
-        // messenger registered every message it produces is discarded. That reads exactly like a
-        // clean validation run, which is the most dangerous null this project can produce: prosper
-        // had NO messenger anywhere, so "no validation errors" has never once been a measurement.
+        // PROSPER_VK_VALIDATION=1: enable the Khronos validation layer and register a messenger.
+        //
+        // This does NOT make validation newly possible -- `tools/vkval/vk_validation_scan.py`
+        // (#1704, ctest `vkval_scan_logic`) has been scanning the suite for a long time and carries
+        // a dated baseline, because VVL's default debug_action writes to stdout/stderr by itself.
+        // Three VUIDs were fixed off the back of it (#1713, #1717, #1726). An earlier revision of
+        // this comment claimed validation "had never once been a measurement in this project",
+        // which was simply false and would have retired a working guard as unmeasured.
+        //
+        // What a messenger adds over the default action: in-process capture, so output can be
+        // rate-limited (one violated VUID in a per-draw path otherwise fills the disk) and tagged;
+        // a run that says whether it is armed; and coverage when the default action is off, which
+        // is how some SDK builds and any VK_LAYER_* settings file can configure it.
         // Off by default; the layer costs real time per draw.
         const bool want_validation = [] {
             const char* e = getenv("PROSPER_VK_VALIDATION");
             return e && *e && strcmp(e, "0");
         }();
         static const char* const kValidationLayer = "VK_LAYER_KHRONOS_validation";
+        constexpr uint32_t kMessengerPerIdLimit = 8;
         bool validation_enabled = false;
+        bool messenger_wanted = true;
         std::vector<const char*> inst_layers;
         if (want_validation) {
             uint32_t nl = 0; vkEnumerateInstanceLayerProperties(&nl, nullptr);
@@ -997,9 +1010,20 @@ inline const RenderVkCtx& render_vk_ctx() {
                 inst_layers.push_back(kValidationLayer);
                 ici.enabledLayerCount = (uint32_t)inst_layers.size();
                 ici.ppEnabledLayerNames = inst_layers.data();
-                inst_exts.push_back("VK_EXT_debug_utils");
-                ici.enabledExtensionCount = (uint32_t)inst_exts.size();
-                ici.ppEnabledExtensionNames = inst_exts.data();
+                bool have_debug_utils = false;
+                for (const auto& e : avail)
+                    if (!strcmp(e.extensionName, "VK_EXT_debug_utils")) have_debug_utils = true;
+                if (have_debug_utils) {
+                    inst_exts.push_back("VK_EXT_debug_utils");
+                    ici.enabledExtensionCount = (uint32_t)inst_exts.size();
+                    ici.ppEnabledExtensionNames = inst_exts.data();
+                } else {
+                    fprintf(stderr, "[vk-validation] VK_EXT_debug_utils is not advertised; the layer "
+                                    "will run with its DEFAULT stdout/stderr action and this process "
+                                    "will not rate-limit or tag its output\n");
+                    fflush(stderr);
+                    messenger_wanted = false;
+                }
             } else {
                 // Say so. A requested-but-absent layer is the silent-instrument case again.
                 fprintf(stderr, "[vk-validation] PROSPER_VK_VALIDATION set but %s is not installed; "
@@ -1015,11 +1039,21 @@ inline const RenderVkCtx& render_vk_ctx() {
                 r.present_surface_capable = false;
                 VkInstanceCreateInfo bare{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; bare.pApplicationInfo = &app;
                 if (vkCreateInstance(&bare, nullptr, &r.inst) != VK_SUCCESS || !r.inst) return r;
+                // The retry carries no layers and no extensions, so validation is GONE on this
+                // instance. Announcing "active" here would be the exact laundered null this switch
+                // exists to prevent -- a fourth silent state, and the worst of them.
+                if (validation_enabled) {
+                    fprintf(stderr, "[vk-validation] instance creation fell back to a bare create "
+                                    "info; the validation layer was DROPPED and NO validation is "
+                                    "running -- treat any clean result from this run as void\n");
+                    fflush(stderr);
+                    validation_enabled = false;
+                }
             } else {
                 return r;
             }
         }
-        if (validation_enabled) {
+        if (validation_enabled && messenger_wanted) {
             auto create = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
                 r.inst, "vkCreateDebugUtilsMessengerEXT");
             VkDebugUtilsMessengerCreateInfoEXT dci{
@@ -1035,9 +1069,16 @@ inline const RenderVkCtx& render_vk_ctx() {
                 // Rate-limited per message id: one violated VUID in a per-draw path otherwise
                 // produces gigabytes, and this project's guidance is explicit that a run log on the
                 // tmpfs takes the machine down with it.
+                // The spec requires this callback to be thread-safe, and prosper submits from more
+                // than one thread (see present_queue_shared), so the rate-limit map needs a lock.
+                static std::mutex seen_mu;
                 static std::unordered_map<int32_t, uint32_t> seen;
-                constexpr uint32_t kPerIdLimit = 8;
-                const uint32_t n = ++seen[d ? d->messageIdNumber : 0];
+                constexpr uint32_t kPerIdLimit = 8;   // keep in step with kMessengerPerIdLimit
+                uint32_t n;
+                {
+                    std::lock_guard<std::mutex> lk(seen_mu);
+                    n = ++seen[d ? d->messageIdNumber : 0];
+                }
                 if (n > kPerIdLimit) return VK_FALSE;
                 fprintf(stderr, "[vk-validation] %s %s%s\n",
                         sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "ERROR" : "WARN",
@@ -1053,7 +1094,7 @@ inline const RenderVkCtx& render_vk_ctx() {
                 fflush(stderr);
             } else {
                 fprintf(stderr, "[vk-validation] active (warnings and errors, %u per message id)\n",
-                        8u);
+                        kMessengerPerIdLimit);
                 fflush(stderr);
             }
         }

@@ -144,33 +144,44 @@ the GPU vendor cannot see.
 
 ## Vulkan validation (`PROSPER_VK_VALIDATION=1`)
 
-Enables the Khronos validation layer **and** registers a debug messenger for it. Both halves matter,
-and only the first is obvious: the loader will happily load the layer from the environment alone
-(`VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`), but with no `VkDebugUtilsMessenger`
-registered every message it produces is discarded. That reads exactly like a clean validation run.
+**Read `tools/vkval/` first.** `vk_validation_scan.py` (#1704) runs the whole ctest suite under the
+validation layer and diffs against `tools/vkval/allowlist.txt`, which carries a dated baseline —
+7 ids / 187 messages on lavapipe, 9 ids / 51 messages on RADV, measured 2026-08-01 — and it is
+registered with ctest as `vkval_scan_logic`. Three VUIDs were fixed off the back of it (#1713,
+#1717, #1726). **That is the project's validation guard, and it works without any messenger**,
+because VVL's default `debug_action` writes to stdout/stderr on its own.
 
-**Before this existed, prosper had no messenger anywhere** — so "no validation errors" had never once
-been a measurement in this project, on any title. If you find a note in an issue or a status doc
-saying validation was clean, and it predates this, it is void.
+`PROSPER_VK_VALIDATION=1` is for the other case: validating **one interactive or routed run** of a
+title, in-process. It enables the layer and registers a `VkDebugUtilsMessenger`, which adds over the
+default action:
+
+- **rate limiting** — 8 reports per message id. One violated VUID in a per-draw path otherwise fills
+  the disk, and on this machine a large run log takes the shared tmpfs (and every agent's shell)
+  with it.
+- **a run that says whether it is armed**, so a clean result is falsifiable rather than merely quiet.
+- **coverage when the default action is off**, which any `VK_LAYER_*` settings file can arrange.
 
 ```bash
 PROSPER_VK_VALIDATION=1 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
     ./prosper/build-linux/screenshot --out ~/work --seconds 2 --count 30 <DUMP_ROOT>/<TITLE_ID>-app0
 ```
 
-It announces itself, which is the point — the tool tells you whether it is actually running:
+It announces which state it is in — the point of the switch:
 
 | line | meaning |
 | --- | --- |
 | `[vk-validation] active (warnings and errors, 8 per message id)` | armed; a clean run is a real result |
-| `[vk-validation] PROSPER_VK_VALIDATION set but ... is not installed; NO validation is running` | the layer is absent — install it, do not read the silence |
-| `[vk-validation] layer loaded but the debug messenger could NOT be registered ...` | output would be discarded; treat a clean result as void |
+| `... is not installed; NO validation is running` | the layer is absent — do not read the silence |
+| `... VK_EXT_debug_utils is not advertised; the layer will run with its DEFAULT ... action` | the layer still validates, but this process does not rate-limit or tag it |
+| `... the validation layer was DROPPED and NO validation is running` | instance creation fell back to a bare create info; a clean result is void |
+| `... layer loaded but the debug messenger could NOT be registered` | output discarded; a clean result is void |
 
-Off by default: the layer costs real time per draw. Reports are **rate-limited to 8 per message id**,
-because one violated VUID in a per-draw path otherwise fills the disk — and on this machine a large
-run log takes the shared tmpfs, and the Bash tool with it.
+Off by default: the layer costs real time per draw.
 
-Worked example (#325, 2026-08-27): a change that made Tomb Raider's gameplay render as a uniform
-single-colour fill produced **zero** VUIDs with the sink armed. That turned "we cannot tell whether
-this is a Vulkan misuse" into "it is not one, so look at the logic" — a question that had been
-unanswerable in this project until the messenger existed.
+**Coverage caveat.** This covers the shared render-runner instance only. `prosper-app` creates its
+own instance, and `live_compute` has a private fallback instance; neither is affected by this
+variable.
+
+Worked example (#2998, 2026-08-27): a change that made Tomb Raider's gameplay render as a uniform
+single-colour fill produced **zero** VUIDs with the messenger armed, which moved the question from
+"is this a Vulkan misuse?" to "it is not, so look at the logic".
