@@ -234,6 +234,10 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
            target_format == LiveTargetPixelFormat::Rgba8Unorm) ||
           (format == DataFormat::Float16 &&
            target_format == LiveTargetPixelFormat::Rgba16Float))) ||
+        (components == 2 && format == DataFormat::Float16 &&
+         target_format == LiveTargetPixelFormat::Rg16Float) ||
+        (components == 1 && format == DataFormat::Float16 &&
+         target_format == LiveTargetPixelFormat::R16Float) ||
         (components == 3 && format == DataFormat::Float10_11_11 &&
          target_format == LiveTargetPixelFormat::R11G11B10Float) ||
         (components == 1 && format == DataFormat::Unorm8 &&
@@ -268,7 +272,11 @@ bool sampled_rtt_snapshot_byte_compatible(
              target_format == LiveTargetPixelFormat::R32Uint)) ||
         (components == 4 &&
          (format == DataFormat::Float32 || format == DataFormat::Uint32) &&
-         target_format == LiveTargetPixelFormat::Rgba32Float);
+         target_format == LiveTargetPixelFormat::Rgba32Float) ||
+        (components == 2 && format == DataFormat::Float16 &&
+         target_format == LiveTargetPixelFormat::Rg16Float) ||
+        (components == 1 && format == DataFormat::Float16 &&
+         target_format == LiveTargetPixelFormat::R16Float);
 }
 
 namespace {
@@ -5888,6 +5896,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          r->format == DataFormat::Unorm8 && nc == 4) ||
                         (live_target.format == LiveTargetPixelFormat::Rgba16Float &&
                          r->format == DataFormat::Float16 && nc == 4) ||
+                        (live_target.format == LiveTargetPixelFormat::Rg16Float &&
+                         r->format == DataFormat::Float16 && nc == 2) ||
+                        (live_target.format == LiveTargetPixelFormat::R16Float &&
+                         r->format == DataFormat::Float16 && nc == 1) ||
                         (live_target.format == LiveTargetPixelFormat::R11G11B10Float &&
                          r->format == DataFormat::Float10_11_11 && nc == 3) ||
                         (live_target.format == LiveTargetPixelFormat::R8Unorm &&
@@ -6792,13 +6804,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const bool source_r32 = source_layout == LiveTargetSourceLayout::Uint32x1;
                     const bool source_f32 = source_layout == LiveTargetSourceLayout::Float32x1;
                     const bool source_f32x4 = source_layout == LiveTargetSourceLayout::Float32x4;
+                    const bool source_f16x2 = source_layout == LiveTargetSourceLayout::Float16x2;
+                    const bool source_f16x1 = source_layout == LiveTargetSourceLayout::Float16x1;
                     const bool exact_narrow_layout =
                         (source_r8 &&
                          (r8 || (sampled_uint8_native && sampled_components == 1))) ||
                         (source_rg8 &&
                          (sampled_unorm8x2 ||
                           (sampled_uint8_native && sampled_components == 2))) ||
-                        ((source_r32 || source_f32 || source_f32x4) &&
+                        ((source_r32 || source_f32 || source_f32x4 || source_f16x2 || source_f16x1) &&
                          sampled_rtt_snapshot_byte_compatible(
                              r->format, sampled_components, live_target.format));
                     // This is not redundant: the packed-view check above is written as
@@ -6826,6 +6840,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          r->width, r->height,
                                          prosper::frontend::live_target_pixel_format_name(
                                              live_target.format));
+                    } else if ((source_f16x2 || source_f16x1) && f16) {
+                        std::memcpy(upload, pixels.data(), upload_size);
                     } else if (sampled_float32_native || sampled_uint16_native ||
                                sampled_uint32_native) {
                         // A renderer-owned target is authoritative only when its cached texel is

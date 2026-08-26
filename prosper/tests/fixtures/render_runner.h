@@ -169,6 +169,12 @@ struct FrameResource {
     // T# DST_SEL channel swizzle (SQ_SEL per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Default = identity
     // (R,G,B,A) == a no-op VkComponentMapping, so tests that build FrameResources directly are unchanged.
     uint32_t swizzle[4] = {4, 5, 6, 7};
+    // Original guest CB_COLOR format when these pixels came from a renderer-owned target. The
+    // backend stores color attachments in `backend_color_format()`'s canonical component order;
+    // a later T# still describes the guest allocation's component order. Keeping the producer
+    // format lets the sampled view compose those two mappings instead of applying the storage-order
+    // swap a second time. Undefined means ordinary guest texture / no such canonicalization.
+    VkFormat render_target_guest_format = VK_FORMAT_UNDEFINED;
     // Non-zero only when the frontend has revalidated the complete guest source backing and can
     // prove these decoded pixels are the same content version as a prior callback. The Vulkan
     // backend may retain an uploaded image under this ID; zero remains callback-local/transient.
@@ -311,7 +317,9 @@ struct BackendMrtOutputs {
 };
 
 inline VkFormat backend_color_format(VkFormat format) {
-    if (format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+    if (format == VK_FORMAT_R16_SFLOAT ||
+        format == VK_FORMAT_R16G16_SFLOAT ||
+        format == VK_FORMAT_R16G16B16A16_SFLOAT ||
         format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
         return format;
     if (format == VK_FORMAT_R8_UNORM)
@@ -329,11 +337,35 @@ inline VkFormat backend_color_format(VkFormat format) {
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
+inline std::array<uint32_t, 4> backend_sampled_component_swizzle(
+    const FrameResource& resource) {
+    std::array<uint32_t, 4> result{
+        resource.swizzle[0], resource.swizzle[1],
+        resource.swizzle[2], resource.swizzle[3]};
+    // CB_COLOR ALT stores COLOR_8_8_8_8 as BGRA, while prosper deliberately materializes that
+    // attachment as canonical RGBA8. SQ_IMG_RSRC DST_SEL is expressed against the guest's format
+    // components, so translate R<->B selectors into the canonical host image's component space.
+    // Constants, G/A, ordinary textures, and targets whose storage order was already RGBA remain
+    // unchanged. This is composition, not suppression: semantic permutations still survive.
+    if ((resource.render_target_guest_format == VK_FORMAT_B8G8R8A8_UNORM ||
+         resource.render_target_guest_format == VK_FORMAT_B8G8R8A8_SRGB) &&
+        backend_color_format(resource.render_target_guest_format) ==
+            VK_FORMAT_R8G8B8A8_UNORM) {
+        for (uint32_t& selector : result) {
+            if (selector == 4u) selector = 6u;
+            else if (selector == 6u) selector = 4u;
+        }
+    }
+    return result;
+}
+
 inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     format = backend_color_format(format);
     if (format == VK_FORMAT_R32G32B32A32_UINT ||
         format == VK_FORMAT_R32G32B32A32_SFLOAT) return 16u;
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
+    if (format == VK_FORMAT_R16G16_SFLOAT) return 4u;
+    if (format == VK_FORMAT_R16_SFLOAT) return 2u;
     if (format == VK_FORMAT_R8_UNORM) return 1u;
     if (format == VK_FORMAT_R8G8_UNORM) return 2u;
     return 4u;
@@ -348,6 +380,8 @@ inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat
         case VK_FORMAT_R8_UNORM:
         case VK_FORMAT_R8G8_UNORM:
         case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R16_SFLOAT:
+        case VK_FORMAT_R16G16_SFLOAT:
         case VK_FORMAT_R16G16B16A16_SFLOAT:
         case VK_FORMAT_R32G32B32A32_SFLOAT:
         case VK_FORMAT_R32_SFLOAT:
@@ -6571,8 +6605,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         }
                     };
                     // Vulkan component mappings do not apply to storage-image accesses.
-                    if (!r.is_storage_image && !getenv("PROSPER_NO_SWIZZLE"))
-                        tvci.components = {vkswz(r.swizzle[0]), vkswz(r.swizzle[1]), vkswz(r.swizzle[2]), vkswz(r.swizzle[3])};
+                    if (!r.is_storage_image && !getenv("PROSPER_NO_SWIZZLE")) {
+                        const auto swizzle = backend_sampled_component_swizzle(r);
+                        tvci.components = {vkswz(swizzle[0]), vkswz(swizzle[1]),
+                                           vkswz(swizzle[2]), vkswz(swizzle[3])};
+                    }
                     tvci.subresourceRange =
                         {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
                          0, r.sample_count};

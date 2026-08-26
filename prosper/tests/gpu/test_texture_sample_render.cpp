@@ -24,6 +24,14 @@ static int fails = 0;
 int main() {
     printf("== test_texture_sample_render ==\n");
     const uint32_t W = 64, H = 64;
+    const auto center_red_at = [](const std::vector<uint8_t>& pixels,
+                                  uint32_t width, uint32_t height) -> uint8_t {
+        return pixels.size() == static_cast<size_t>(width) * height * 4
+            ? pixels[(static_cast<size_t>(height / 2) * width + width / 2) * 4] : 0;
+    };
+    const auto center_red = [=](const std::vector<uint8_t>& pixels) -> uint8_t {
+        return center_red_at(pixels, W, H);
+    };
 
     using prosper::test::BackendSubmissionState;
     using prosper::test::backend_submission_state;
@@ -35,6 +43,35 @@ int main() {
               prosper::test::backend_timestamp_delta(11u, 29u, 64) == 18u &&
               prosper::test::backend_timestamp_delta(11u, 29u, 0) == 0u,
           "device timestamp deltas handle valid-bit wrap and unsupported queues");
+
+    {
+        prosper::test::FrameResource bgra_target;
+        bgra_target.swizzle[0] = 6u;
+        bgra_target.swizzle[1] = 5u;
+        bgra_target.swizzle[2] = 4u;
+        bgra_target.swizzle[3] = 7u;
+        bgra_target.render_target_guest_format = VK_FORMAT_B8G8R8A8_UNORM;
+        const auto canonical =
+            prosper::test::backend_sampled_component_swizzle(bgra_target);
+        CHECK((canonical == std::array<uint32_t, 4>{4u, 5u, 6u, 7u}),
+              "BGRA renderer target composes DST_SEL into canonical RGBA component order");
+
+        bgra_target.render_target_guest_format = VK_FORMAT_R8G8B8A8_UNORM;
+        const auto semantic =
+            prosper::test::backend_sampled_component_swizzle(bgra_target);
+        CHECK((semantic == std::array<uint32_t, 4>{6u, 5u, 4u, 7u}),
+              "RGBA renderer target retains a semantic BGR component permutation");
+
+        bgra_target.render_target_guest_format = VK_FORMAT_B8G8R8A8_UNORM;
+        bgra_target.swizzle[0] = 4u;
+        bgra_target.swizzle[1] = 4u;
+        bgra_target.swizzle[2] = 4u;
+        bgra_target.swizzle[3] = 1u;
+        const auto replicated =
+            prosper::test::backend_sampled_component_swizzle(bgra_target);
+        CHECK((replicated == std::array<uint32_t, 4>{6u, 6u, 6u, 1u}),
+              "BGRA target composition preserves replication and constant selectors");
+    }
 
     {
         bool speculative_state_valid = true;
@@ -131,6 +168,19 @@ int main() {
                   VK_FORMAT_R8G8_UNORM &&
                   prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R8G8_UNORM) == 2,
               "native RG8 upload retains two channels and accounts two bytes per texel");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R16G16_SFLOAT) ==
+                  VK_FORMAT_R16G16_SFLOAT &&
+                  prosper::test::backend_color_bytes_per_pixel(
+                      VK_FORMAT_R16G16_SFLOAT) == 4 &&
+                  prosper::test::backend_image_numeric_class(
+                      VK_FORMAT_R16G16_SFLOAT) == SpirvImageNumericClass::Float,
+              "native RG16F targets retain two half-float channels and their sampled type");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R16_SFLOAT) ==
+                  VK_FORMAT_R16_SFLOAT &&
+                  prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R16_SFLOAT) == 2 &&
+                  prosper::test::backend_image_numeric_class(VK_FORMAT_R16_SFLOAT) ==
+                      SpirvImageNumericClass::Float,
+              "native R16F targets retain one half-float channel and their sampled type");
         CHECK(prosper::test::backend_color_format(VK_FORMAT_R32_UINT) == VK_FORMAT_R32_UINT &&
                   prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R32_UINT) == 4,
               "R32_UINT storage images retain their typed four-byte Vulkan format");
@@ -418,6 +468,19 @@ int main() {
                   sampled_stats.sampled_hits == 1,
               "GPU-resident target sampling matches CPU readback+upload byte-for-byte");
 
+        prosper::test::FrameResource bgra_gpu_resource = gpu_resource;
+        bgra_gpu_resource.render_target_guest_format = VK_FORMAT_B8G8R8A8_UNORM;
+        bgra_gpu_resource.swizzle[0] = 6u;
+        bgra_gpu_resource.swizzle[1] = 5u;
+        bgra_gpu_resource.swizzle[2] = 4u;
+        bgra_gpu_resource.swizzle[3] = 7u;
+        prosper::test::BackendDraw bgra_gpu_sample = gpu_sample;
+        bgra_gpu_sample.R = {bgra_gpu_resource};
+        const std::vector<uint8_t> bgra_canonical_sample =
+            prosper::test::render_draws_rgba({bgra_gpu_sample}, W, H);
+        CHECK(bgra_canonical_sample == cpu_roundtrip && center_red(bgra_canonical_sample) > 0x80,
+              "BGRA target plus BGR DST_SEL samples the canonical renderer red channel");
+
         // A packed mip tail may use the same guest ID for two independently rendered extents. The
         // 32x16 destination is not feedback against the retained 64x32 source: declining the borrow
         // on address alone leaves this resource with neither GPU pixels nor a CPU fallback and
@@ -430,7 +493,8 @@ int main() {
                 &same_id_smaller_target);
         const auto same_id_stats = prosper::test::backend_color_target_stats();
         CHECK(!same_id_different_extent.empty() &&
-                  center_red(same_id_different_extent) == center_red(cpu_roundtrip) &&
+                  center_red_at(same_id_different_extent, W / 2u, H / 2u) ==
+                      center_red(cpu_roundtrip) &&
                   same_id_stats.sampled_hits == 1,
               "same-address different-extent target borrows the retained source view");
 
@@ -701,10 +765,6 @@ int main() {
             consumer.vcount = 3;
             std::vector<uint8_t> cpu_sampled = prosper::test::render_draws_rgba(
                 {consumer}, W, H);
-            auto center_red = [&](const std::vector<uint8_t>& pixels) -> uint8_t {
-                return pixels.size() == static_cast<size_t>(W) * H * 4
-                    ? pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : 0;
-            };
             const uint8_t cpu_red = center_red(cpu_sampled);
             CHECK(cpu_red >= 126 && cpu_red <= 129,
                   "FP16 readback/upload consumer observes 2.0 before scaling to 0.5");
@@ -740,6 +800,104 @@ int main() {
                       borrowed_fp16_followup == cpu_sampled,
                   "borrowed native FP16 image preserves HDR sampling, layout, and lifetime");
             prosper::test::invalidate_persistent_color_target(fp16_target_id);
+
+            // GTA V's normal/material G-buffer is a two-channel FP16 attachment. Treating its four
+            // bytes as RGBA8 leaves allocation sizes deceptively valid while changing both numeric
+            // values. Prove the exact native producer, readback/upload, and resident-image routes.
+            ResolvedPipelineState rg16_state = fp16_state;
+            rg16_state.color0_format = VK_FORMAT_R16G16_SFLOAT;
+            producer.ps = &rg16_state;
+            constexpr uint64_t rg16_target_id = 0x7590000000000012ull;
+            prosper::test::BackendColorTarget rg16_target{
+                rg16_target_id, false, true, VK_FORMAT_R16G16_SFLOAT};
+            const std::vector<uint8_t> rg16_native = prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &rg16_target);
+            bool rg16_native_ok = rg16_native.size() == static_cast<size_t>(W) * H * 4;
+            if (rg16_native_ok) {
+                uint16_t halves[2]{};
+                std::memcpy(halves, rg16_native.data() +
+                    ((static_cast<size_t>(H / 2) * W + W / 2) * 4), sizeof(halves));
+                const float red_value = half_to_float(halves[0]);
+                const float green_value = half_to_float(halves[1]);
+                rg16_native_ok = red_value > 1.99f && red_value < 2.01f &&
+                                 green_value > 0.249f && green_value < 0.251f;
+            }
+            CHECK(rg16_native_ok,
+                  "native RG16F G-buffer readback preserves two half-float values");
+
+            prosper::test::FrameResource rg16_resource;
+            rg16_resource.binding = 4; rg16_resource.set = 1;
+            rg16_resource.tex_rgba = rg16_native.data();
+            rg16_resource.tw = W; rg16_resource.th = H;
+            rg16_resource.texture_format = VK_FORMAT_R16G16_SFLOAT;
+            consumer.R = {rg16_resource};
+            const std::vector<uint8_t> rg16_cpu_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            const size_t rg16_center_offset =
+                (static_cast<size_t>(H / 2) * W + W / 2) * 4;
+            const bool rg16_cpu_ok = rg16_cpu_sampled.size() ==
+                    static_cast<size_t>(W) * H * 4 &&
+                rg16_cpu_sampled[rg16_center_offset] >= 126 &&
+                rg16_cpu_sampled[rg16_center_offset] <= 129 &&
+                rg16_cpu_sampled[rg16_center_offset + 1] >= 63 &&
+                rg16_cpu_sampled[rg16_center_offset + 1] <= 65;
+            CHECK(rg16_cpu_ok,
+                  "RG16F readback/upload consumer observes native R and G values");
+
+            prosper::test::FrameResource gpu_rg16_resource = rg16_resource;
+            gpu_rg16_resource.tex_rgba = nullptr;
+            gpu_rg16_resource.persistent_render_target_id = rg16_target_id;
+            consumer.R = {gpu_rg16_resource};
+            const std::vector<uint8_t> rg16_gpu_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            const auto rg16_sample_stats = prosper::test::backend_color_target_stats();
+            CHECK(rg16_sample_stats.sampled_hits == 1 &&
+                      rg16_gpu_sampled == rg16_cpu_sampled,
+                  "GPU-resident RG16F G-buffer sampling matches its native CPU round-trip");
+            prosper::test::invalidate_persistent_color_target(rg16_target_id);
+
+            // The adjacent one-channel material target must retain the same FP16 numeric contract;
+    // widening it to RGBA8 changed both texel width and numeric values.
+            ResolvedPipelineState r16_state = fp16_state;
+            r16_state.color0_format = VK_FORMAT_R16_SFLOAT;
+            producer.ps = &r16_state;
+            constexpr uint64_t r16_target_id = 0x7590000000000013ull;
+            prosper::test::BackendColorTarget r16_target{
+                r16_target_id, false, true, VK_FORMAT_R16_SFLOAT};
+            const std::vector<uint8_t> r16_native = prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &r16_target);
+            bool r16_native_ok = r16_native.size() == static_cast<size_t>(W) * H * 2;
+            if (r16_native_ok) {
+                uint16_t half = 0;
+                std::memcpy(&half, r16_native.data() +
+                    ((static_cast<size_t>(H / 2) * W + W / 2) * 2), sizeof(half));
+                const float red_value = half_to_float(half);
+                r16_native_ok = red_value > 1.99f && red_value < 2.01f;
+            }
+            CHECK(r16_native_ok,
+                  "native R16F material target readback preserves its half-float value");
+
+            prosper::test::FrameResource r16_resource;
+            r16_resource.binding = 4; r16_resource.set = 1;
+            r16_resource.tex_rgba = r16_native.data();
+            r16_resource.tw = W; r16_resource.th = H;
+            r16_resource.texture_format = VK_FORMAT_R16_SFLOAT;
+            consumer.R = {r16_resource};
+            const std::vector<uint8_t> r16_cpu_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            prosper::test::FrameResource gpu_r16_resource = r16_resource;
+            gpu_r16_resource.tex_rgba = nullptr;
+            gpu_r16_resource.persistent_render_target_id = r16_target_id;
+            consumer.R = {gpu_r16_resource};
+            const std::vector<uint8_t> r16_gpu_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            const auto r16_sample_stats = prosper::test::backend_color_target_stats();
+            CHECK(r16_sample_stats.sampled_hits == 1 &&
+                      center_red(r16_cpu_sampled) >= 126 &&
+                      center_red(r16_cpu_sampled) <= 129 &&
+                      r16_gpu_sampled == r16_cpu_sampled,
+                  "GPU-resident R16F material sampling matches its native CPU round-trip");
+            prosper::test::invalidate_persistent_color_target(r16_target_id);
 
             ResolvedPipelineState r11_state = fp16_state;
             r11_state.color0_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;

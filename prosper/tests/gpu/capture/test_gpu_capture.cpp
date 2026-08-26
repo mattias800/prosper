@@ -2153,6 +2153,28 @@ int main(int argc, char** argv) {
           fp16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba16Float &&
           fp16_loaded.rtt_seeds[0].rgba == fp16_capture.rtt_seeds[0].rgba,
           "native FP16 RTT seed format and bytes round-trip");
+    GpuCaptureFile rg16_capture = captured;
+    rg16_capture.rtt_seeds[0].format = GpuCaptureColorFormat::Rg16Float;
+    rg16_capture.rtt_seeds[0].rgba.assign(2 * 2 * 4, 0x36);
+    std::vector<uint8_t> rg16_bytes;
+    GpuCaptureFile rg16_loaded;
+    CHECK(serialize_gpu_capture(rg16_capture, rg16_bytes, error) &&
+          deserialize_gpu_capture(rg16_bytes, rg16_loaded, error) &&
+          rg16_loaded.rtt_seeds.size() == 1 &&
+          rg16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rg16Float &&
+          rg16_loaded.rtt_seeds[0].rgba == rg16_capture.rtt_seeds[0].rgba,
+          "native RG16F RTT seed format and bytes round-trip");
+    GpuCaptureFile r16_capture = captured;
+    r16_capture.rtt_seeds[0].format = GpuCaptureColorFormat::R16Float;
+    r16_capture.rtt_seeds[0].rgba.assign(2 * 2 * 2, 0x3a);
+    std::vector<uint8_t> r16_bytes;
+    GpuCaptureFile r16_loaded;
+    CHECK(serialize_gpu_capture(r16_capture, r16_bytes, error) &&
+          deserialize_gpu_capture(r16_bytes, r16_loaded, error) &&
+          r16_loaded.rtt_seeds.size() == 1 &&
+          r16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::R16Float &&
+          r16_loaded.rtt_seeds[0].rgba == r16_capture.rtt_seeds[0].rgba,
+          "native R16F RTT seed format and bytes round-trip");
     GpuCaptureFile fp32_capture = captured;
     fp32_capture.rtt_seeds[0].format = GpuCaptureColorFormat::Rgba32Float;
     fp32_capture.rtt_seeds[0].rgba.assign(2 * 2 * 16, 0x3f);

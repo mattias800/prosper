@@ -248,6 +248,35 @@ static void set_descriptor_mode(const char* value) {
 }
 
 int main() {
+    {
+        // A metadata texture can be reused for an exact instruction-time T# match. Its paired
+        // metadata sampler is not authoritative in that case: scalar code may have loaded or
+        // patched a different S# before this exact MIMG use.
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.fetch_pc = 0xFFFFFFFFu;
+        const uint32_t sampler[4] = {
+            (1u << 3) | (6u << 6) | (5u << 9) | (4u << 12) | (1u << 15),
+            0x180u | (0xA40u << 12),
+            0x3F00u | (1u << 20) | (2u << 22) | (3u << 26),
+            2u << 30,
+        };
+        CHECK(attach_image_use(texture, 0x138u, sampler) &&
+                  texture.fetch_pc == 0x138u &&
+                  texture.addr_uvw[0] == 0u && texture.addr_uvw[1] == 1u &&
+                  texture.addr_uvw[2] == 6u && texture.mag_filter == 1u &&
+                  texture.min_filter == 1u && texture.mip_filter == 1u &&
+                  texture.max_aniso_ratio == 5u && texture.depth_compare_func == 4u &&
+                  texture.unnormalized == 1u && texture.min_lod == 1.5f &&
+                  texture.max_lod == 10.25f && texture.lod_bias == -1.0f &&
+                  texture.border_color_type == 2u,
+              "an exact image use replaces a reused metadata texture's stale paired sampler");
+        const uint32_t retained_address_u = texture.addr_uvw[0];
+        CHECK(!attach_image_use(texture, 0x139u, sampler) &&
+                  texture.fetch_pc == 0x138u && texture.addr_uvw[0] == retained_address_u,
+              "a resource already owned by another image PC is not mutated during merge");
+    }
+
     printf("== test_shader_resources ==\n");
 
     CHECK(data_format_bytes(DataFormat::Float32) == 4 && data_format_bytes(DataFormat::Uint32) == 4,

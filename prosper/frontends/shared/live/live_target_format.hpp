@@ -36,6 +36,8 @@ enum class LiveTargetSourceLayout : uint8_t {
     Float32x1,
     Unorm8x2,
     Float32x4,
+    Float16x2,
+    Float16x1,
 };
 
 constexpr LiveTargetSourceLayout live_target_source_layout(
@@ -57,6 +59,10 @@ constexpr LiveTargetSourceLayout live_target_source_layout(
             return LiveTargetSourceLayout::Unorm8x2;
         case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
             return LiveTargetSourceLayout::Float32x4;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:
+            return LiveTargetSourceLayout::Float16x2;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:
+            return LiveTargetSourceLayout::Float16x1;
     }
     return LiveTargetSourceLayout::Unorm8x4;
 }
@@ -82,6 +88,10 @@ constexpr VkFormat live_target_pixel_format_vk(prosper::gpu::LiveTargetPixelForm
             return VK_FORMAT_R8G8_UNORM;
         case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:
             return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:
+            return VK_FORMAT_R16G16_SFLOAT;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:
+            return VK_FORMAT_R16_SFLOAT;
     }
     return VK_FORMAT_UNDEFINED;
 }
@@ -98,6 +108,8 @@ constexpr uint32_t live_target_pixel_format_bytes(prosper::gpu::LiveTargetPixelF
         case prosper::gpu::LiveTargetPixelFormat::R32Float:        return 4u;
         case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:        return 2u;
         case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return 16u;
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:       return 4u;
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:        return 2u;
     }
     return 0u;
 }
@@ -114,6 +126,8 @@ constexpr const char* live_target_pixel_format_name(prosper::gpu::LiveTargetPixe
         case prosper::gpu::LiveTargetPixelFormat::R32Float:        return "r32f";
         case prosper::gpu::LiveTargetPixelFormat::Rg8Unorm:        return "rg8";
         case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return "rgba32f";
+        case prosper::gpu::LiveTargetPixelFormat::Rg16Float:       return "rg16f";
+        case prosper::gpu::LiveTargetPixelFormat::R16Float:        return "r16f";
     }
     return "unknown";
 }
@@ -154,6 +168,14 @@ constexpr bool live_target_pixel_format_from_vk(VkFormat vk_format,
     }
     if (vk_format == VK_FORMAT_R32G32B32A32_SFLOAT) {
         format = prosper::gpu::LiveTargetPixelFormat::Rgba32Float;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R16G16_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::Rg16Float;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R16_SFLOAT) {
+        format = prosper::gpu::LiveTargetPixelFormat::R16Float;
         return true;
     }
     return false;

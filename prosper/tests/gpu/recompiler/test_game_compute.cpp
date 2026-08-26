@@ -353,9 +353,13 @@ int main() {
                                         LiveTargetPixelFormat::Rgba8Unorm, false) &&
           direct_sampled_rtt_compatible(DataFormat::Float16, 4,
                                         LiveTargetPixelFormat::Rgba16Float, false) &&
+          direct_sampled_rtt_compatible(DataFormat::Float16, 2,
+                                        LiveTargetPixelFormat::Rg16Float, false) &&
+          direct_sampled_rtt_compatible(DataFormat::Float16, 1,
+                                        LiveTargetPixelFormat::R16Float, false) &&
           direct_sampled_rtt_compatible(DataFormat::Float10_11_11, 3,
                                         LiveTargetPixelFormat::R11G11B10Float, false),
-          "renderer RTT direct bind accepts exact RGBA8, RGBA16F, and R11G11B10 views");
+          "renderer RTT direct bind accepts exact RGBA8, RG16F, RGBA16F, and R11G11B10 views");
     CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
                                          LiveTargetPixelFormat::Rgba8Unorm, true) &&
           !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
@@ -381,6 +385,22 @@ int main() {
           !direct_sampled_rtt_compatible(DataFormat::Float32, 1,
                                          LiveTargetPixelFormat::R32Uint, true),
           "single-channel live RTT imports require an exact Vulkan sampled type");
+    using prosper::frontend::sampled_rtt_snapshot_byte_compatible;
+    CHECK(sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Uint32, 1, LiveTargetPixelFormat::R32Float) &&
+          sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Float32, 1, LiveTargetPixelFormat::R32Uint) &&
+          sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Uint32, 4, LiveTargetPixelFormat::Rgba32Float) &&
+          sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Float16, 2, LiveTargetPixelFormat::Rg16Float) &&
+          sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Float16, 1, LiveTargetPixelFormat::R16Float) &&
+          !sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Uint32, 1, LiveTargetPixelFormat::Rgba32Float) &&
+          !sampled_rtt_snapshot_byte_compatible(
+              DataFormat::Float16, 2, LiveTargetPixelFormat::R32Float),
+           "renderer RTT snapshots preserve exact-width float/integer bit aliases only");
     // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
     // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
     // than sampling stale guest backing or dropping the dispatch.
