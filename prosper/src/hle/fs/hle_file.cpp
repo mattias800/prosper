@@ -1080,6 +1080,33 @@ static uint32_t file_sce_error(int error) {
     return (uint32_t)prosper::hle::sce_error_from_host_errno(error, prosper::hle::FreeBsdErrno::EIo);
 }
 
+// Cumulative .bnk read progress: the observable front edge of Wwise bank loading (the #2993
+// title-music investigation turns on WHEN/HOW MUCH of BNK_Music_Menus.bnk the guest reads).
+// Always-on: bank reads are a handful of large chunks per run.
+static std::mutex g_bnkread_mx;
+static std::map<int, std::string> g_bnkread_paths;
+static std::map<int, uint64_t> g_bnkread_bytes;
+static void bnkread_note(int fd, const std::string& path) {
+    if (path.find(".bnk") == std::string::npos) return;
+    std::lock_guard<std::mutex> lk(g_bnkread_mx);
+    g_bnkread_paths[fd] = path;
+}
+static void bnkread_log(int fd, int64_t got) {
+    if (got <= 0) return;
+    std::lock_guard<std::mutex> lk(g_bnkread_mx);
+    auto pit = g_bnkread_paths.find(fd);
+    if (pit == g_bnkread_paths.end()) return;
+    auto& total = g_bnkread_bytes[fd];
+    const uint64_t before = total;
+    total += (uint64_t)got;
+    static const auto t0 = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "[fs-audio] t=%llums read fd=%d %s +got=%lld total=%llu bytes\n",
+            (unsigned long long)ms, fd, pit->second.c_str(),
+            (long long)got, (unsigned long long)total);
+}
+
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
 #ifdef _WIN32
                int fd;
@@ -1105,6 +1132,18 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
 #endif
                int err = fd < 0 ? errno : 0;
                filelog_remember_fd(fd, h);
+               bnkread_note(fd, h);
+               // Wwise bank/media opens are rare and are the observable front edge of the
+               // audio pipeline: always log them with a monotonic stamp (the #2993 title-music
+               // race turns on WHEN these happen relative to engine init).
+               if (fd >= 0 && (h.find(".bnk") != std::string::npos ||
+                               h.find(".wem") != std::string::npos)) {
+                   static const auto t0 = std::chrono::steady_clock::now();
+                   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0).count();
+                   fprintf(stderr, "[fs-audio] t=%llums open fd=%d %s\n",
+                           (unsigned long long)ms, fd, h.c_str());
+               }
                if (filelog()) fprintf(stderr,
                    "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
                    h.c_str(), (unsigned long long)a1, host_flags, fd, err);
@@ -1401,6 +1440,7 @@ static int64_t write_full(int fd, const void* buf, size_t count, bool positioned
     return (int64_t)done;
 }
 #endif
+
 HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
 #ifdef _WIN32
                ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
@@ -1410,6 +1450,7 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
                auto logged_return = [&](int64_t r) -> uint64_t {
                    const int error = r < 0 ? errno : 0;
                    filelog_fd_io("read", fd, off, a2, r, error);
+                   bnkread_log(fd, r);
                    if (r < 0) errno = error;
                    return (uint64_t)r;
                };
@@ -1478,6 +1519,7 @@ HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lse
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); int64_t r = read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3);
+               bnkread_log((int)a0, r);
                 const int error = r < 0 ? errno : 0;
                 filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, error);
                 if (r < 0) errno = error;

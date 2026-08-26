@@ -1207,6 +1207,21 @@ HLE(s_user_getevent)  {
 HLE(s_sysservice_receiveevent) {
     svc_log("sceSystemServiceReceiveEvent", a0,a1,a2,a3,a4,a5);
     if (!a0) return 0x80A10003ull;
+    // The system delivers OnResume when the app becomes active — at launch the title runs
+    // with its audio engine SUSPENDED and this event unsuspends it. GRIS's Wwise integration
+    // gates AkSoundEngine::Resume on exactly this event: without it the title screen sits
+    // silent forever (the AK "Suspended" thread, zero decode activity — #2993).
+    static std::atomic<bool> onresume_delivered{false};
+    if (!onresume_delivered.exchange(true, std::memory_order_acq_rel)) {
+        // The event struct is 4-byte type + 8192-byte union; the title's handler may read
+        // payload fields, so deliver the whole struct zeroed with only the type set.
+        static constexpr size_t kSysEventSize = 4 + 8192;
+        std::vector<uint8_t> ev(kSysEventSize, 0);
+        const uint32_t event_type = 0x10000000u;   // OrbisSystemServiceEventType::OnResume
+        memcpy(ev.data(), &event_type, sizeof(event_type));
+        if (svc_write_bytes(a0, ev.data(), ev.size())) return 0;
+        onresume_delivered.store(false, std::memory_order_release);
+    }
     if (g_gameintent_initialized.load(std::memory_order_acquire) && gameintent_activity_id()) {
         bool expected = false;
         if (g_gameintent_event_delivered.compare_exchange_strong(expected, true)) {

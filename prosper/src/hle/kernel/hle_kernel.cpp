@@ -2375,6 +2375,17 @@ void* win_thread_trampoline(void* p) {
 HLE(k_pthread_create) {
     auto entry = (void* (*)(void*))(uintptr_t)a2;
     void* arg  = (void*)(uintptr_t)a3;
+    // Always-on: guest thread creation is rare (~60/run) and the created-thread LIST is the
+    // diagnostic that separates boot-flow divergence from threading bugs (the #2993 title-music
+    // investigation: the silent boot created 3 threads where the working boot created 60).
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[thread] create t=%llums entry=0x%llx name=%s\n",
+                (unsigned long long)ms, (unsigned long long)a2,
+                a4 ? (const char*)(uintptr_t)a4 : "");
+    }
     if (getenv("PROSPER_SYNCLOG"))
         fprintf(stderr, "[thread] create entry=0x%llx arg=0x%llx name=%s\n",
                 (unsigned long long)a2, (unsigned long long)a3, a4 ? (const char*)(uintptr_t)a4 : "");
@@ -2424,6 +2435,7 @@ HLE(k_pthread_create) {
     if (t_pending_guest_thread_hooks) ts->hooks = *t_pending_guest_thread_hooks;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
+    fprintf(stderr, "[thread] create-result rc=%d\n", r);
     if (getenv("PROSPER_SYNCLOG")) fprintf(stderr, "[thread] pthread_create rc=%d\n", r);
     pthread_attr_destroy(&la);
     if (r) { delete ts; return fbsd_errno(r); }   // EAGAIN (out of threads) is 11 here, 35 on the PS5
