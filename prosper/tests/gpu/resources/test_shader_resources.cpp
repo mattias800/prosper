@@ -248,6 +248,35 @@ static void set_descriptor_mode(const char* value) {
 }
 
 int main() {
+    {
+        // A metadata texture can be reused for an exact instruction-time T# match. Its paired
+        // metadata sampler is not authoritative in that case: scalar code may have loaded or
+        // patched a different S# before this exact MIMG use.
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.fetch_pc = 0xFFFFFFFFu;
+        const uint32_t sampler[4] = {
+            (1u << 3) | (6u << 6) | (5u << 9) | (4u << 12) | (1u << 15),
+            0x180u | (0xA40u << 12),
+            0x3F00u | (1u << 20) | (2u << 22) | (3u << 26),
+            2u << 30,
+        };
+        CHECK(attach_image_use(texture, 0x138u, sampler) &&
+                  texture.fetch_pc == 0x138u &&
+                  texture.addr_uvw[0] == 0u && texture.addr_uvw[1] == 1u &&
+                  texture.addr_uvw[2] == 6u && texture.mag_filter == 1u &&
+                  texture.min_filter == 1u && texture.mip_filter == 1u &&
+                  texture.max_aniso_ratio == 5u && texture.depth_compare_func == 4u &&
+                  texture.unnormalized == 1u && texture.min_lod == 1.5f &&
+                  texture.max_lod == 10.25f && texture.lod_bias == -1.0f &&
+                  texture.border_color_type == 2u,
+              "an exact image use replaces a reused metadata texture's stale paired sampler");
+        const uint32_t retained_address_u = texture.addr_uvw[0];
+        CHECK(!attach_image_use(texture, 0x139u, sampler) &&
+                  texture.fetch_pc == 0x138u && texture.addr_uvw[0] == retained_address_u,
+              "a resource already owned by another image PC is not mutated during merge");
+    }
+
     printf("== test_shader_resources ==\n");
 
     CHECK(data_format_bytes(DataFormat::Float32) == 4 && data_format_bytes(DataFormat::Uint32) == 4,
@@ -498,6 +527,13 @@ int main() {
     CHECK(!native_float_storage_image_supported(DataFormat::Unorm8, 4, true, true) &&
               !native_float_storage_image_supported(DataFormat::Float16, 3, false, true),
           "device support cannot override semantic native-storage exclusions");
+    CHECK(native_uint_storage_image_supported(DataFormat::Uint32, 1, false, true) &&
+              native_uint_storage_image_supported(DataFormat::Uint16, 1, false, true) &&
+              native_uint_storage_image_supported(DataFormat::Uint8, 1, false, true) &&
+              native_uint_storage_image_supported(DataFormat::Uint8, 4, false, true) &&
+              !native_uint_storage_image_supported(DataFormat::Uint16, 4, false, true) &&
+              !native_uint_storage_image_supported(DataFormat::Uint8, 1, true, true),
+          "native unsigned storage accepts exact scalar and RGBA8 linear formats");
     const uint32_t r8_storage =
         native_storage_format_support_bit(DataFormat::Unorm8, 1);
     const uint32_t rg8_storage =
@@ -506,11 +542,26 @@ int main() {
         native_storage_format_support_bit(DataFormat::Float10_11_11, 3);
     const uint32_t fp16_3d_storage =
         native_storage_3d_format_support_bit(DataFormat::Float16, 4);
+    const uint32_t r32ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint32, 1);
+    const uint32_t r8ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint8, 1);
+    const uint32_t r16ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint16, 1);
+    const uint32_t rgba8ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint8, 4);
     CHECK(r8_storage && rg8_storage && packed_storage && fp16_3d_storage &&
+              r32ui_storage && r16ui_storage && r8ui_storage && rgba8ui_storage &&
               r8_storage != rg8_storage &&
               rg8_storage != packed_storage &&
+              r32ui_storage != r16ui_storage && r16ui_storage != r8ui_storage &&
+              r8ui_storage != rgba8ui_storage &&
               !(fp16_3d_storage & ((1u << 10) - 1u)) &&
               !(fp16_3d_storage & ~kNativeStorageFormatSupportMask) &&
+              !(r32ui_storage & ~kNativeStorageFormatSupportMask) &&
+              !(r16ui_storage & ~kNativeStorageFormatSupportMask) &&
+              !(rgba8ui_storage & ~kNativeStorageFormatSupportMask) &&
+              native_storage_3d_format_support_bit(DataFormat::Uint32, 1) == 0 &&
               native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
           "native storage capability bits distinguish exact typed VkFormat and dimension candidates");
 

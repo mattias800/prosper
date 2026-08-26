@@ -352,16 +352,83 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"texture_bytes\":" << record.texture_bytes
                 << ",\"buffer_bytes\":" << record.buffer_bytes
                 << ",\"total_ms\":" << record.total_ms
+                << ",\"prelude_ms\":" << record.prelude_ms
+                << ",\"pass_ms\":" << record.pass_ms
                 << ",\"build_resources_ms\":" << record.build_resources_ms
                 << ",\"backend_ms\":" << record.backend_ms
                 << ",\"output_copy_ms\":" << record.output_copy_ms
+                << ",\"pass_head_ms\":" << record.pass_head_ms
+                << ",\"pass_loop_ms\":" << record.pass_loop_ms
+                << ",\"pass_pre_ms\":" << record.pass_pre_ms
+                << ",\"pass_post_ms\":" << record.pass_post_ms
+                << ",\"pass_tail_ms\":" << record.pass_tail_ms
+                << ",\"post_stats_ms\":" << record.post_stats_ms
+                << ",\"post_slot0_ms\":" << record.post_slot0_ms
+                << ",\"post_mrt_ms\":" << record.post_mrt_ms
+                << ",\"post_rest_ms\":" << record.post_rest_ms
+                << ",\"resolve_stall_ms\":" << record.resolve_stall_ms
+                << ",\"resolve_read_ms\":" << record.resolve_read_ms
+                << ",\"resolve_copy_stall_ms\":" << record.resolve_copy_stall_ms
+                << ",\"resolve_copy_ms\":" << record.resolve_copy_ms
+                << ",\"resolve_count\":" << record.resolve_count
+                << ",\"resolve_read_count\":" << record.resolve_read_count
+                << ",\"resolve_bytes\":" << record.resolve_bytes
                 << ",\"gpu_wait_ms\":" << record.gpu_wait_ms
                 << ",\"gpu_timestamp_samples\":" << record.gpu_timestamp_samples
                 << ",\"gpu_device_ms\":" << record.gpu_device_ms
                 << ",\"readback_ms\":" << record.readback_ms
+                << ",\"backend_target_ms\":" << record.backend_target_ms
+                << ",\"backend_draw_setup_ms\":" << record.backend_draw_setup_ms
+                << ",\"backend_record_upload_ms\":" << record.backend_record_upload_ms
+                << ",\"backend_cleanup_ms\":" << record.backend_cleanup_ms
+                << ",\"backend_setup_shader_ms\":" << record.backend_setup_shader_ms
+                << ",\"backend_setup_fixed_ms\":" << record.backend_setup_fixed_ms
                 << ",\"setup_resources_ms\":" << record.setup_resources_ms
+                << ",\"backend_setup_pipeline_ms\":" << record.backend_setup_pipeline_ms
+                << ",\"backend_pipeline_refs\":" << record.backend_pipeline_refs
+                << ",\"backend_pipeline_hits\":" << record.backend_pipeline_hits
+                << ",\"backend_pipeline_misses\":" << record.backend_pipeline_misses
+                << ",\"backend_pipeline_bypasses\":" << record.backend_pipeline_bypasses
+                << ",\"backend_pipeline_entries\":" << record.backend_pipeline_entries
+                << ",\"backend_pipeline_evictions\":" << record.backend_pipeline_evictions
                 << ",\"frontend_texture_ms\":" << record.frontend_texture_ms
                 << ",\"frontend_buffer_ms\":" << record.frontend_buffer_ms
+                << ",\"frontend_tex_rtt_ms\":" << record.frontend_tex_rtt_ms
+                << ",\"frontend_tex_compute_ms\":" << record.frontend_tex_compute_ms
+                << ",\"frontend_tex_local_ms\":" << record.frontend_tex_local_ms
+                << ",\"frontend_tex_persist_hit_ms\":" << record.frontend_tex_persist_hit_ms
+                << ",\"frontend_tex_persist_reuse_ms\":" << record.frontend_tex_persist_reuse_ms
+                << ",\"frontend_tex_persist_miss_ms\":" << record.frontend_tex_persist_miss_ms
+                << ",\"frontend_tex_other_slowest_ms\":"
+                << record.frontend_tex_other_slowest_ms
+                << ",\"frontend_tex_other_addr\":" << record.frontend_tex_other_addr
+                << ",\"frontend_tex_other_source_bytes\":"
+                << record.frontend_tex_other_source_bytes
+                << ",\"frontend_tex_other_width\":" << record.frontend_tex_other_width
+                << ",\"frontend_tex_other_height\":" << record.frontend_tex_other_height
+                << ",\"frontend_tex_other_depth\":" << record.frontend_tex_other_depth
+                << ",\"frontend_tex_other_format\":" << record.frontend_tex_other_format
+                << ",\"frontend_tex_other_components\":"
+                << record.frontend_tex_other_components
+                << ",\"frontend_tex_other_tile_mode\":"
+                << record.frontend_tex_other_tile_mode
+                << ",\"frontend_tex_other_img_dim\":" << record.frontend_tex_other_img_dim
+                << ",\"frontend_tex_other_class\":" << record.frontend_tex_other_class
+                << ",\"frontend_tex_other_compute_candidate\":"
+                << (record.frontend_tex_other_compute_candidate ? "true" : "false")
+                << ",\"frontend_tex_other_persistent_candidate\":"
+                << (record.frontend_tex_other_persistent_candidate ? "true" : "false")
+                << ",\"frontend_tex_other_compressed\":"
+                << (record.frontend_tex_other_compressed ? "true" : "false")
+                << ",\"frontend_tex_other_depth_compare\":"
+                << (record.frontend_tex_other_depth_compare ? "true" : "false")
+                << ",\"frontend_tex_other_host_backed\":"
+                << (record.frontend_tex_other_host_backed ? "true" : "false")
+                << ",\"frontend_build_draw_ms\":" << record.frontend_build_draw_ms
+                << ",\"frontend_validate_ms\":" << record.frontend_validate_ms
+                << ",\"frontend_poison_ms\":" << record.frontend_poison_ms
+                << ",\"frontend_indices_ms\":" << record.frontend_indices_ms
+                << ",\"frontend_reflect_ms\":" << record.frontend_reflect_ms
                 << ",\"res_texture_ms\":" << record.res_texture_ms
                 << ",\"res_buffer_ms\":" << record.res_buffer_ms
                 << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms
@@ -380,7 +447,19 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             write_optional(out, record.program_addr);
             out << ",\"program_hash\":";
             write_optional(out, record.program_hash);
-            out << ",\"total_ms\":" << record.total_ms << "}\n";
+            out << ",\"total_ms\":" << record.total_ms
+                << ",\"gpu_timestamp_samples\":" << record.gpu_timestamp_samples
+                << ",\"gpu_device_ms\":" << record.gpu_device_ms
+                << ",\"gpu_shader_ms\":" << record.gpu_shader_ms
+                << ",\"gpu_pre_ms\":" << record.gpu_pre_ms
+                << ",\"gpu_storage_copy_ms\":" << record.gpu_storage_copy_ms
+                << ",\"gpu_compare_ms\":" << record.gpu_compare_ms
+                << ",\"gpu_restore_ms\":" << record.gpu_restore_ms
+                << ",\"setup_ms\":" << record.setup_ms
+                << ",\"pipeline_ms\":" << record.pipeline_ms
+                << ",\"dispatch_wait_ms\":" << record.dispatch_wait_ms
+                << ",\"writeback_ms\":" << record.writeback_ms
+                << ",\"cleanup_ms\":" << record.cleanup_ms << "}\n";
         }
         out << "{\"type\":\"footer\",\"complete\":true,\"pre_samples\":"
             << capture->pre_samples.size() << ",\"post_samples\":" << capture->post_samples.size()

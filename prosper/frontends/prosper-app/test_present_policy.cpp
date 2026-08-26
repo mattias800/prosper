@@ -76,6 +76,15 @@ int main() {
     CHECK(rendered_frame_counter(false, 0) == 0);
     CHECK(rendered_frame_counter(false, 73) == 73);
 
+    // A Win32 surface can briefly publish currentExtent=0x0 during a display transition while SDL's
+    // pixel size is already non-zero. Preserve the live swapchain and retry; a variable-extent
+    // surface, on the other hand, takes the SDL size and is immediately usable.
+    CHECK(!swapchain_extent_available({0, 0}, {1920, 1080}));
+    CHECK(swapchain_extent_available({3840, 2160}, {1920, 1080}));
+    const VkExtent2D variable_extent = select_swapchain_extent(
+        {UINT32_MAX, UINT32_MAX}, {1920, 1080});
+    CHECK(variable_extent.width == 1920 && variable_extent.height == 1080);
+
     // Acquire: a usable image (SUCCESS or SUBOPTIMAL) → proceed to blit+present.
     CHECK(classify_acquire(VK_SUCCESS) == AcquireAction::proceed);
     CHECK(classify_acquire(VK_SUBOPTIMAL_KHR) == AcquireAction::proceed);

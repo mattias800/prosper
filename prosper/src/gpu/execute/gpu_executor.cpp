@@ -5724,8 +5724,7 @@ bool shader_resource_allows_zero_mip_specialization(
     const DecodedImageView& view) {
     return use.proven_zero_mip && descriptor.sample_count == 1u &&
         descriptor.base_level == 0u && descriptor.last_level == 0u &&
-        descriptor.max_mip == 0u && !view.in_mip_tail &&
-        !descriptor.compression_enabled;
+        descriptor.max_mip == 0u && !view.in_mip_tail;
 }
 
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
@@ -7237,8 +7236,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 r0.mip_tail_y == view.mip_tail_y &&
                                 r0.layer_stride_bytes == view.layer_stride &&
                                 r0.layer_mip_offset_bytes == view.layer_mip_offset) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                                if (attach_image_use(
+                                        r0, u.use_pc,
+                                        wanted == ResourceClass::Texture && u.has_samp
+                                            ? u.s4.data() : nullptr)) {
+                                    mapped = true;
+                                    break;
+                                }
                             }
                         if (mapped) continue;
                     }
@@ -7288,22 +7292,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     if (wanted == ResourceClass::Texture && u.has_samp) {
                         // Paired S# (same SQ_IMG_SAMP decode as the sharp path). Storage operations do
                         // not consume a sampler even when their SSAMP bits alias known user SGPRs.
-                        const uint32_t* sm = u.s4.data();
-                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
-                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
-                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
-                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
-                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
-                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
-                        r.max_aniso_ratio    = (sm[0] >> 9)  & 0x7u;
-                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
-                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
-                        r.min_lod            = (float)( sm[1]        & 0xFFFu) / 256.0f;
-                        r.max_lod            = (float)((sm[1] >> 12) & 0xFFFu) / 256.0f;
-                        int32_t bias14       = (int32_t)(sm[2] & 0x3FFFu);
-                        if (bias14 & 0x2000) bias14 -= 0x4000;
-                        r.lod_bias           = (float)bias14 / 256.0f;
-                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
+                        apply_sampler_descriptor(r, u.s4.data());
                     }
                     if (log) fprintf(stderr, "[srt] %s %s key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
                                      is_ps ? "PS" : "VS",
@@ -7758,8 +7747,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     const uint32_t img_dim = image_type_to_dim(d.type);
                     // This is deliberately narrower than "the backend currently uploads one mip".
                     // The instruction proof belongs to this exact use, and the descriptor must also
-                    // declare one uncompressed base level. In particular, do not reinterpret a DCC
-                    // allocation as raw texels merely because IMAGE_*_MIP selected level zero.
+                    // declare one base level. Compression is deliberately not part of this marker:
+                    // it proves only that discarding the mip operand is exact. The live backend must
+                    // independently acquire authoritative pixels from a renderer image, an
+                    // all-uncompressed metadata plane, or a supported DCC decode before execution.
                     const bool proven_zero_mip =
                         shader_resource_allows_zero_mip_specialization(u, d, view);
                     {
@@ -7777,8 +7768,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                 r0.mip_tail_y == view.mip_tail_y &&
                                 r0.layer_stride_bytes == view.layer_stride &&
                                 r0.layer_mip_offset_bytes == view.layer_mip_offset) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                                if (attach_image_use(
+                                        r0, u.use_pc,
+                                        wanted == ResourceClass::Texture && u.has_samp
+                                            ? u.s4.data() : nullptr)) {
+                                    mapped = true;
+                                    break;
+                                }
                             }
                         if (mapped) continue;
                     }
@@ -7837,22 +7833,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
                     r.fetch_pc = u.use_pc;               // per-use pc provenance (the image op)
                     if (u.has_samp) {
-                        const uint32_t* sm = u.s4.data();
-                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
-                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
-                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
-                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
-                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
-                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
-                        r.max_aniso_ratio    = (sm[0] >> 9) & 0x7u;
-                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
-                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
-                        r.min_lod            = static_cast<float>(sm[1] & 0xFFFu) / 256.0f;
-                        r.max_lod            = static_cast<float>((sm[1] >> 12) & 0xFFFu) / 256.0f;
-                        int32_t bias14        = static_cast<int32_t>(sm[2] & 0x3FFFu);
-                        if (bias14 & 0x2000) bias14 -= 0x4000;
-                        r.lod_bias           = static_cast<float>(bias14) / 256.0f;
-                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
+                        apply_sampler_descriptor(r, u.s4.data());
                     }
                     table->resources.push_back(r);
                 }
@@ -9657,7 +9638,28 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
     }
     uint32_t args[3] = {};
     std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    const auto log_resolution = [&](const char* outcome, const ComputeLaunchDimensions* launch) {
+        if (!std::getenv("PROSPER_INDIRECTLOG")) return;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) >= 256) return;
+        const uint64_t code_addr = source.state
+            ? compute_dispatch_code_addr(*source.state, source) : 0;
+        std::fprintf(stderr,
+                     "[agc-indirect-resolve] outcome=%s args=0x%llx code=0x%llx "
+                     "dims=%ux%ux%u groups=%ux%ux%u\n",
+                     outcome,
+                     static_cast<unsigned long long>(source.indirect_args_addr),
+                     static_cast<unsigned long long>(code_addr),
+                     args[0], args[1], args[2],
+                     launch ? launch->groups_x : 0u,
+                     launch ? launch->groups_y : 0u,
+                     launch ? launch->groups_z : 0u);
+    };
     if (!args[0] || !args[1] || !args[2]) {
+        // Log at ordered realization, after every preceding compute fence and writeback. The
+        // command-processor's similarly named packet trace runs while the stream is still being
+        // folded and can therefore show the producer's previous-frame contents instead.
+        log_resolution("zero-argument", nullptr);
         census.zero_args.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
     }
@@ -9667,6 +9669,7 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
     resolved.indirect = false;
     const ComputeLaunchDimensions launch = resolve_compute_launch(resolved);
     if (!launch.groups_x || !launch.groups_y || !launch.groups_z) {
+        log_resolution("zero-groups", &launch);
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr,
@@ -9677,19 +9680,7 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
         census.zero_groups.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
     }
-    if (std::getenv("PROSPER_INDIRECTLOG")) {
-        static std::atomic<int> logged{0};
-        const uint64_t code_addr = source.state
-            ? compute_dispatch_code_addr(*source.state, source) : 0;
-        if (logged.fetch_add(1) < 256)
-            std::fprintf(stderr,
-                         "[agc-indirect] dispatch args=0x%llx code=0x%llx "
-                         "dims=%ux%ux%u groups=%ux%ux%u\n",
-                         static_cast<unsigned long long>(source.indirect_args_addr),
-                         static_cast<unsigned long long>(code_addr),
-                         args[0], args[1], args[2], launch.groups_x, launch.groups_y,
-                         launch.groups_z);
-    }
+    log_resolution("ready", &launch);
     census.ready.fetch_add(1, std::memory_order_relaxed);
     return DispatchArgumentResolution::Ready;
 }

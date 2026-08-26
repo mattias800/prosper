@@ -34,6 +34,10 @@ namespace {
 // fails rather than silently invalidating this file.
 bool format_defined(uint32_t raw) { (void)raw; return true; }
 
+uint32_t format_at(const prosper::gpu::DrawItem& draw, uint32_t slot) {
+    return prosper::frontend::mrt_raw_format(draw, slot);
+}
+
 prosper::gpu::DrawItem make_draw() {
     prosper::gpu::DrawItem draw{};
     return draw;
@@ -45,6 +49,8 @@ int main() {
     using prosper::frontend::mrt_active_color;
     using prosper::frontend::mrt_active_color_count;
     using prosper::frontend::mrt_draw_binds_target;
+    using prosper::frontend::mrt_draw_binds_target_view;
+    using prosper::frontend::mrt_same_color_pass;
 
     constexpr uint64_t kMrt0 = 0x2050000000ull;
     constexpr uint64_t kMrt2 = 0x2083e00000ull;
@@ -120,6 +126,38 @@ int main() {
         CHECK(mrt_active_color_count(draw, format_defined) == 1u);
     }
 
+    // A packed mip tail may place two different rendered levels at the same guest address.  They
+    // must form different backend passes: one Vulkan attachment has one extent and cannot represent
+    // both GTA V's 64x32 and 32x16 levels.  Exact peers still group, while an unknown legacy extent
+    // remains non-conflicting rather than inventing evidence.
+    {
+        constexpr uint64_t kTail = 0x209c980000ull;
+        auto mip4 = make_draw();
+        mip4.color_targets[0] = {kTail, 64u, 32u};
+        mip4.ps.color_targets[0].format = 122u;
+        mip4.ps.color_targets[0].write_mask = 0xfu;
+
+        auto peer = mip4;
+        CHECK(mrt_same_color_pass(mip4, peer, format_defined, format_at));
+
+        auto mip5 = mip4;
+        mip5.color_targets[0].width = 32u;
+        mip5.color_targets[0].height = 16u;
+        CHECK(!mrt_same_color_pass(mip4, mip5, format_defined, format_at));
+
+        // The mip-5 draw samples mip 4 by the same guest address. Different known extents prove
+        // that these are different attachment views, so this is not feedback. An exact peer is;
+        // an unknown extent remains conservative because binding the wrong live image is unsafe.
+        CHECK(!mrt_draw_binds_target_view(mip5, kTail, 64u, 32u, format_defined));
+        CHECK(mrt_draw_binds_target_view(mip5, kTail, 32u, 16u, format_defined));
+        CHECK(mrt_draw_binds_target_view(mip5, kTail, 0u, 0u, format_defined));
+
+        auto legacy_unknown = mip4;
+        legacy_unknown.color_targets[0].width = 0u;
+        legacy_unknown.color_targets[0].height = 0u;
+        CHECK(mrt_same_color_pass(mip4, legacy_unknown, format_defined, format_at));
+    }
+
     // The two materialization decisions, at the seams that own their gate. Written against the
     // decisions rather than the helper because the previous round's tests called
     // mrt_draw_binds_target() directly and stayed green when either production site was reverted to
@@ -134,29 +172,38 @@ int main() {
         draw.ps.color_targets[2].write_mask = 0xfu;
 
         // Sampling an unrelated surface: the direct image serves.
-        CHECK(mrt_direct_serves(draw, 0x2099cc0000ull, /*is_storage_image=*/false, /*img_dim=*/1u,
+        CHECK(mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                /*is_storage_image=*/false, /*img_dim=*/1u,
                                 /*extent_compatible=*/true, /*has_persistent_target=*/true,
                                 format_defined));
         // Sampling THIS pass's MRT2: it must not, or the descriptor and the colour attachment
         // become the same image.
-        CHECK(!mrt_direct_serves(draw, kMrt2, false, 1u, true, true, format_defined));
+        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, true, true,
+                                 format_defined));
+        CHECK(mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, true, true,
+                                format_defined, /*feedback_copy_supported=*/true));
         // The non-feedback preconditions still gate it.
-        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, /*is_storage_image=*/true, 1u, true, true,
+        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                 /*is_storage_image=*/true, 1u, true, true,
                                  format_defined));
-        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, false, /*img_dim=*/5u, true, true,
+        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                 false, /*img_dim=*/5u, true, true,
                                  format_defined));
-        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, false, 1u, /*extent_compatible=*/false,
+        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                 false, 1u, /*extent_compatible=*/false,
                                  true, format_defined));
-        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, false, 1u, true,
+        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u, false, 1u, true,
                                  /*has_persistent_target=*/false, format_defined));
 
         // The uniform fast path carries the same gate. It and mrt_direct_serves must agree: if this
         // one said yes on a collision the CPU materialisation would be skipped, and the direct bind
         // would then be refused with no snapshot left to fall back to.
-        CHECK(mrt_uniform_live_serves(draw, 0x2099cc0000ull, /*preconditions=*/true,
+        CHECK(mrt_uniform_live_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                      /*preconditions=*/true,
                                       format_defined));
-        CHECK(!mrt_uniform_live_serves(draw, kMrt2, true, format_defined));
-        CHECK(!mrt_uniform_live_serves(draw, 0x2099cc0000ull, /*preconditions=*/false,
+        CHECK(!mrt_uniform_live_serves(draw, kMrt2, 64u, 32u, true, format_defined));
+        CHECK(!mrt_uniform_live_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                       /*preconditions=*/false,
                                        format_defined));
 
         // A slot that is bound but MASKED OFF is not a target, so sampling it is not feedback and
@@ -166,7 +213,8 @@ int main() {
         masked.color_targets[2].base = kMrt2;
         masked.ps.color_targets[2].format = 37u;
         masked.ps.color_targets[2].write_mask = 0u;
-        CHECK(mrt_direct_serves(masked, kMrt2, false, 1u, true, true, format_defined));
+        CHECK(mrt_direct_serves(masked, kMrt2, 64u, 32u, false, 1u, true, true,
+                                format_defined));
     }
 
     if (failures == 0) std::printf("mrt_binding: OK\n");

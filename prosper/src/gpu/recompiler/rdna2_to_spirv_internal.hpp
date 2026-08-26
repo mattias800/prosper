@@ -253,6 +253,7 @@ enum : uint32_t {
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
     Cap_ImageMSArray=48,                 // MS=1 AND Arrayed=1 image (2D_MSAA_ARRAY)
+    Cap_StorageImageExtendedFormats=49,  // typed formats outside the core R32/RGBA32 set
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
     Cap_ImageGatherExtended=25,          // dynamic (non-const) Offset image operand on OpImageGather
     Cap_ImageQuery=50,                   // OpImageQuerySizeLod (the sample_*_o texel->UV offset fold)
@@ -260,6 +261,9 @@ enum : uint32_t {
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgFmt_R32ui=kSpirvImageFormatR32ui, // exact uint32 storage image format required by image atomics
+    ImgFmt_Rgba8ui=kSpirvImageFormatRgba8ui, // exact four-byte RGBA unsigned storage image
+    ImgFmt_R16ui=kSpirvImageFormatR16ui, // exact halfword-width unsigned storage image
+    ImgFmt_R8ui=kSpirvImageFormatR8ui,   // exact byte-width unsigned storage image
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcquire=0x42, MemSem_UniformRelease=0x44,
@@ -550,6 +554,13 @@ struct SpirvCompute {
     // `required-ops` field scans for Vote/Arithmetic/Shuffle CAPABILITIES and the lane-id path
     // declares none of them -- so the two cases printed identically.
     uint32_t fragment_wave_reasons=0;
+    // SSA provenance for fragment WaveAny results. A vote needs the exact guest-wave width when
+    // that particular bool reaches a guest scalar-data consumer. Tracking result ids avoids the
+    // false whole-module inference "this shader contains both a vote and S_CSELECT".
+    std::unordered_set<uint32_t> fragment_wave_vote_values;
+    std::unordered_set<uint32_t> fragment_wave_vote_scalar_consumers;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> fragment_wave_vote_dependents;
+    std::unordered_map<size_t, uint32_t> fragment_wave_vote_phi_patch_results;
     uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
@@ -747,7 +758,46 @@ struct SpirvCompute {
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
-    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_bool, r, cond, tval, fval}); return r; }  // bool-domain select (wave masks)
+    bool is_fragment_wave_vote_value(uint32_t value) const {
+        return fragment_wave_vote_values.contains(value);
+    }
+    void mark_fragment_wave_vote_value(uint32_t value) {
+        std::vector<uint32_t> pending{value};
+        while (!pending.empty()) {
+            const uint32_t current = pending.back();
+            pending.pop_back();
+            if (!fragment_wave_vote_values.insert(current).second) continue;
+            if (fragment_wave_vote_scalar_consumers.contains(current))
+                fragment_wave_reasons |= kFragmentWaveReasonScalarReduce;
+            const auto dependent = fragment_wave_vote_dependents.find(current);
+            if (dependent != fragment_wave_vote_dependents.end())
+                pending.insert(pending.end(), dependent->second.begin(), dependent->second.end());
+        }
+    }
+    void add_fragment_wave_vote_dependency(uint32_t result, uint32_t source) {
+        fragment_wave_vote_dependents[source].push_back(result);
+        if (is_fragment_wave_vote_value(source)) mark_fragment_wave_vote_value(result);
+    }
+    void propagate_fragment_wave_vote(uint32_t result, uint32_t source) {
+        add_fragment_wave_vote_dependency(result, source);
+    }
+    void propagate_fragment_wave_vote(uint32_t result, uint32_t a, uint32_t b_) {
+        add_fragment_wave_vote_dependency(result, a);
+        add_fragment_wave_vote_dependency(result, b_);
+    }
+    void mark_fragment_wave_scalar_use(uint32_t value) {
+        fragment_wave_vote_scalar_consumers.insert(value);
+        if (is_fragment_wave_vote_value(value))
+            fragment_wave_reasons |= kFragmentWaveReasonScalarReduce;
+    }
+    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) {
+        uint32_t r = id();
+        put(code, Op_Select, {t_bool, r, cond, tval, fval});
+        add_fragment_wave_vote_dependency(r, cond);
+        add_fragment_wave_vote_dependency(r, tval);
+        add_fragment_wave_vote_dependency(r, fval);
+        return r;
+    }  // bool-domain select (wave masks)
 
     // --- Structured control-flow primitives (for counted-loop reconstruction) ---
     uint32_t cur_block = 0;   // label id of the block currently being emitted (predecessor for OpPhi)
@@ -761,9 +811,17 @@ struct SpirvCompute {
         uint32_t r = id();
         put(code, Op_Phi, {type, r, v0, l0, 0u, 0u});
         patch_off = code.size() - 2;   // the trailing {v1, l1} placeholders
+        propagate_fragment_wave_vote(r, v0);
+        fragment_wave_vote_phi_patch_results[patch_off] = r;
         return r;
     }
-    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) { code[patch_off] = v1; code[patch_off + 1] = l1; }
+    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) {
+        code[patch_off] = v1;
+        code[patch_off + 1] = l1;
+        const auto result = fragment_wave_vote_phi_patch_results.find(patch_off);
+        if (result != fragment_wave_vote_phi_patch_results.end())
+            propagate_fragment_wave_vote(result->second, v1);
+    }
     void emit_selmerge(uint32_t m) { put(code, Op_SelectionMerge, {m, 0}); }   // structured if (before condbranch)
     void emit_switch(uint32_t selector, uint32_t fallback,
                      const std::vector<std::pair<uint32_t, uint32_t>>& cases) {
@@ -864,11 +922,22 @@ struct SpirvCompute {
         replace(index + 1u, 0, bits - low_bits, low_bits);
     }
     uint32_t load_function(uint32_t type, uint32_t var) {
-        uint32_t value = id(); put(code, Op_Load, {type, value, var}); return value;
+        uint32_t value = id();
+        put(code, Op_Load, {type, value, var});
+        add_fragment_wave_vote_dependency(value, var);
+        return value;
     }
-    void store_function(uint32_t var, uint32_t value) { put(code, Op_Store, {var, value}); }
+    void store_function(uint32_t var, uint32_t value) {
+        put(code, Op_Store, {var, value});
+        // Function storage can join dynamic paths and loops. Keep an explicit dependency edge so
+        // a vote emitted later can propagate back through loads already generated by a dispatcher.
+        add_fragment_wave_vote_dependency(var, value);
+    }
     uint32_t logical_not(uint32_t value) {
-        uint32_t result = id(); put(code, Op_LogicalNot, {t_bool, result, value}); return result;
+        uint32_t result = id();
+        put(code, Op_LogicalNot, {t_bool, result, value});
+        propagate_fragment_wave_vote(result, value);
+        return result;
     }
     uint32_t subgroup_local_id() {
         if (!declared_subgroup) {
@@ -915,6 +984,7 @@ struct SpirvCompute {
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
+        mark_fragment_wave_vote_value(result);
         return result;
     }
     // Fragment-side ballot (#2412). Same exactness argument as native_wave_ballot_half, but the
@@ -1404,7 +1474,10 @@ struct SpirvCompute {
     }
     // OpPhi with two fully-known predecessors (both edges' values available now) — for an if/merge join.
     uint32_t emit_phi_2way(uint32_t type, uint32_t va, uint32_t la, uint32_t vb, uint32_t lb) {
-        uint32_t r = id(); put(code, Op_Phi, {type, r, va, la, vb, lb}); return r;
+        uint32_t r = id();
+        put(code, Op_Phi, {type, r, va, la, vb, lb});
+        propagate_fragment_wave_vote(r, va, vb);
+        return r;
     }
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
@@ -2079,7 +2152,9 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, bool> stg_img_float;      // binding -> float (rather than uint) texels
     std::unordered_map<uint32_t, uint32_t> stg_img_format; // binding -> SPIR-V Image Format
     std::unordered_map<uint32_t, bool> stg_img_packed_r11; // binding -> R11G11B10 packed in R32ui
-    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
+    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false,
+         declared_storage_extended = false, declared_sampled1d = false,
+         declared_ms = false, declared_msarray = false;
     static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel,
                             uint32_t image_format) {
         return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u) |
@@ -2098,6 +2173,12 @@ struct SpirvCompute {
         }
         if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
         if (ms && arrayed && !declared_msarray) { put(caps, Op_Capability, {Cap_ImageMSArray}); declared_msarray = true; }
+        if ((image_format == ImgFmt_R8ui || image_format == ImgFmt_R16ui ||
+             image_format == ImgFmt_Rgba8ui) &&
+            !declared_storage_extended) {
+            put(caps, Op_Capability, {Cap_StorageImageExtendedFormats});
+            declared_storage_extended = true;
+        }
         uint32_t key = stg_key(dim, arrayed, ms, float_texel, image_format);
         if (!stg_img_type.count(key)) {
             uint32_t ti = id();
@@ -2199,8 +2280,22 @@ struct SpirvCompute {
             put(code, Op_CompositeConstruct,
                 {t_v4f, texel, bcf(vals[0]), bcf(vals[1]), bcf(vals[2]), bcf(vals[3])});
         else
+        {
+            // Vulkan's narrow integer storage conversion may saturate a u32 value that does not fit
+            // the target, while the guest image-store contract discards the high bits. Make that
+            // conversion explicit so typed R8ui/R16ui stay identical to the raw CPU pack fallback
+            // for arbitrary shader values, not only values loaded from another narrow surface.
+            const uint32_t width_mask =
+                (stg_img_format[binding] == ImgFmt_R8ui ||
+                 stg_img_format[binding] == ImgFmt_Rgba8ui) ? 0xffu
+                : stg_img_format[binding] == ImgFmt_R16ui ? 0xffffu : 0u;
+            uint32_t narrowed[4] = {vals[0], vals[1], vals[2], vals[3]};
+            if (width_mask)
+                for (uint32_t c = 0; c < 4; ++c)
+                    narrowed[c] = ibin(Op_BitwiseAnd, vals[c], uconst(width_mask));
             put(code, Op_CompositeConstruct,
-                {t_v4u(), texel, vals[0], vals[1], vals[2], vals[3]});
+                {t_v4u(), texel, narrowed[0], narrowed[1], narrowed[2], narrowed[3]});
+        }
         if (!predicated) { put(code, Op_ImageWrite, {img, coord, texel}); return; }
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
@@ -3237,6 +3332,38 @@ struct SpirvCompute {
         put(code, Op_Load, {t_u32, result, result_ptr_all});
         return ucmp(Op_INotEqual, result, zero);
     }
+    // V_READLANE_B32 at a workgroup-uniform site. Publish every invocation's source value and
+    // address the selected lane within this invocation's own guest wave. This is exact at any
+    // host subgroup width; unlike a native subgroup shuffle it does not require a Wave64 guest
+    // wave to fit inside one Vulkan subgroup. V_READLANE ignores EXEC, so publication is
+    // unconditional. Missing lanes in a partial final wave read as zero.
+    uint32_t guest_wave_readlane(uint32_t source_value, uint32_t selector) {
+        declare_wave_lds();
+        uint32_t source_ptr = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_wg_u32b, source_ptr, lds_wave, linear_localid});
+        put(code, Op_Store, {source_ptr, source_value});
+        barrier();
+
+        const uint32_t wave_shift = wave_size == 32 ? 5u : 6u;
+        const uint32_t wave_base = ibin(
+            Op_ShiftLeftLogical,
+            ibin(Op_ShiftRightLogical, linear_localid, uconst(wave_shift)),
+            uconst(wave_shift));
+        const uint32_t lane = ibin(
+            Op_BitwiseAnd, selector, uconst(wave_size - 1u));
+        const uint32_t index = ibin(Op_IAdd, wave_base, lane);
+        const uint32_t zero = uconst(0);
+        const uint32_t valid = ucmp(Op_ULessThan, index, uconst(local_count));
+        const uint32_t safe_index = sel(valid, index, zero);
+        uint32_t result_ptr = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_wg_u32b, result_ptr, lds_wave, safe_index});
+        uint32_t result = id();
+        put(code, Op_Load, {t_u32, result, result_ptr});
+        barrier();
+        return sel(valid, result, zero);
+    }
     // v_mbcnt_lo/hi: count active lanes below this one. active_bool = this lane's mask bit (EXEC); acc =
     // src1 accumulator (bits); `lo` selects the [0,32) half (lo) or [32,64) half (hi). Combined lo→hi over
     // a wave = the lane's compaction index among active lanes. Populate LDS[lane]=active, barrier, then an
@@ -3498,8 +3625,18 @@ struct SpirvCompute {
         return value;
     }
     // Logical AND / OR of two bools (EXEC narrowing / saveexec).
-    uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
-    uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
+    uint32_t land(uint32_t a, uint32_t b_) {
+        uint32_t r = id();
+        put(code, Op_LogicalAnd, {t_bool, r, a, b_});
+        propagate_fragment_wave_vote(r, a, b_);
+        return r;
+    }
+    uint32_t lor(uint32_t a, uint32_t b_) {
+        uint32_t r = id();
+        put(code, Op_LogicalOr, {t_bool, r, a, b_});
+        propagate_fragment_wave_vote(r, a, b_);
+        return r;
+    }
 
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
@@ -3969,10 +4106,15 @@ struct SpirvCompute {
 
     // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
     // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
-    // extension. Input assembly has already decomposed lists/strips/fans into triangles here.
+    // extension. Input assembly has already decomposed lists/strips/fans into triangles here. A
+    // three-vertex PS5 RectList whose attributes come from a vertex buffer also comes through this
+    // stage: GFX10 synthesizes its fourth corner after vertex shading, while Vulkan has no RectList
+    // topology. The missing post-VS position and every consumed varying are the affine fourth
+    // corner P1 + P2 - P0; emitting P0,P1,P2,P3 as a strip preserves the hardware rectangle.
     std::vector<uint32_t> build_interpolation_geometry(
-            const FragmentInterpolationLayout& layout, bool capture_geometry_position) {
-        if (!layout.requires_geometry || !layout.valid) return {};
+            const FragmentInterpolationLayout& layout, bool capture_geometry_position,
+            bool synthesize_rect = false) {
+        if ((!layout.requires_geometry && !synthesize_rect) || !layout.valid) return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
@@ -3990,7 +4132,8 @@ struct SpirvCompute {
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (!(layout.attribute_mask & (1u << attr))) continue;
             attribute_inputs[attr] = id();
-            if (layout.smooth_mask & (1u << attr)) attribute_outputs[attr] = id();
+            if ((layout.smooth_mask & (1u << attr)) || synthesize_rect)
+                attribute_outputs[attr] = id();
             for (uint32_t selector = 0; selector < 3; ++selector)
                 if (layout.parameter_locations[attr][selector] !=
                     FragmentInterpolationLayout::kUnusedLocation)
@@ -4009,7 +4152,7 @@ struct SpirvCompute {
         exec_model = Exec_Geometry;
         put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
-        put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, 3});
+        put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, synthesize_rect ? 4u : 3u});
         if (capture_geometry_position) put(exec, Op_ExecutionMode, {f_main, EM_Xfb});
 
         put(deco, Op_MemberDecorate, {t_input_per_vertex, 0, Dec_BuiltIn, BI_Position});
@@ -4094,6 +4237,7 @@ struct SpirvCompute {
             }
         }
         std::array<std::array<uint32_t, 3>, 32> parameters{};
+        std::array<uint32_t, 32> rect_attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (!attribute_inputs[attr]) continue;
             parameters[attr][2] = attribute_values[attr][0];
@@ -4108,13 +4252,35 @@ struct SpirvCompute {
                 put(code, Op_FSub, {t_v4f, parameters[attr][1],
                                     attribute_values[attr][2], attribute_values[attr][0]});
             }
+            if (synthesize_rect) {
+                const uint32_t sum = id();
+                put(code, Op_FAdd, {t_v4f, sum,
+                                    attribute_values[attr][1], attribute_values[attr][2]});
+                rect_attribute_values[attr] = id();
+                put(code, Op_FSub, {t_v4f, rect_attribute_values[attr],
+                                    sum, attribute_values[attr][0]});
+            }
         }
 
+        std::array<uint32_t, 3> positions{};
         for (uint32_t vertex = 0; vertex < 3; ++vertex) {
-            uint32_t input_pointer = id();
+            const uint32_t input_pointer = id();
             put(code, Op_AccessChain,
                 {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
-            uint32_t position = id(); put(code, Op_Load, {t_v4f, position, input_pointer});
+            positions[vertex] = id();
+            put(code, Op_Load, {t_v4f, positions[vertex], input_pointer});
+        }
+        uint32_t rect_position = 0;
+        if (synthesize_rect) {
+            const uint32_t sum = id();
+            put(code, Op_FAdd, {t_v4f, sum, positions[1], positions[2]});
+            rect_position = id();
+            put(code, Op_FSub, {t_v4f, rect_position, sum, positions[0]});
+        }
+
+        const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
+        for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
+            const uint32_t position = vertex < 3 ? positions[vertex] : rect_position;
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
                 {ptr_out_v4f, output_pointer, output_position, uconst(0)});
@@ -4123,14 +4289,15 @@ struct SpirvCompute {
             for (uint32_t attr = 0; attr < 32; ++attr) {
                 if (attribute_outputs[attr])
                     put(code, Op_Store,
-                        {attribute_outputs[attr], attribute_values[attr][vertex]});
+                        {attribute_outputs[attr], vertex < 3
+                            ? attribute_values[attr][vertex] : rect_attribute_values[attr]});
                 for (uint32_t selector = 0; selector < 3; ++selector)
                     if (parameter_outputs[attr][selector])
                         put(code, Op_Store,
                             {parameter_outputs[attr][selector], parameters[attr][selector]});
             }
-            const float i = vertex == 1 ? 1.0f : 0.0f;
-            const float j = vertex == 2 ? 1.0f : 0.0f;
+            const float i = vertex == 1 || vertex == 3 ? 1.0f : 0.0f;
+            const float j = vertex == 2 || vertex == 3 ? 1.0f : 0.0f;
             const uint32_t barycentric = id();
             putv(code, Op_CompositeConstruct,
                  {t_v4f, barycentric, fconstf(i), fconstf(j), fconstf(1.0f), fconstf(1.0f)});
@@ -4202,6 +4369,10 @@ struct SpirvCompute {
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
+    // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
+    // that exact value is already scalar and needs no subgroup vote. Tying the proof to the SSA id
+    // makes an overwrite or control-flow merge invalidate it automatically.
+    uint32_t vcc_wave_uniform = 0;
     // Before the first compact structured construct, map presence means that the scalar value
     // reaches this exact linear path. Branch/loop PHIs can synthesize zero for an absent SGPR and
     // clear this marker. The CFG dispatcher likewise allocates Function variables for every
@@ -4722,6 +4893,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 
 // emit_body and the CFG state machine it drives live in rdna2_emit_cfg.cpp. As with emit_alu, the
 // default arguments are stated here and nowhere else.
+bool emit_cfg_state_machine(
+    SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
+    bool allow_exec_update, bool allow_smem,
+    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const uint32_t* code, size_t dwords, uint32_t initial_active,
+    bool synchronize_lds_fminmax);
+
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
                bool allow_exec_update, bool allow_smem,

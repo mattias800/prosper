@@ -173,6 +173,50 @@ int main() {
     run_command_buffer(buffer, 256, st);
     RenderState rs = extract_render_state(st);
 
+    // GFX10 CB_COLORn_BASE names a complete allocation; VIEW.MIP_LEVEL selects the rendered view.
+    // GTA V builds this exact 1024x512 R11G11B10F SW_64KB_R_X chain one draw per level. Pin the
+    // reverse/tail-first addresses here so a regression cannot silently collapse all six passes
+    // back onto allocation base + mip-0 extent.
+    {
+        constexpr uint64_t allocation = 0x209c980000ull;
+        constexpr uint32_t mip0_width = 1024u, mip0_height = 512u, max_mip = 5u;
+        constexpr uint64_t expected_base[] = {
+            allocation + 0xC0000u, allocation + 0x40000u, allocation + 0x20000u,
+            allocation + 0x10000u, allocation, allocation,
+        };
+        constexpr uint32_t expected_width[] = {1024u, 512u, 256u, 128u, 64u, 32u};
+        constexpr uint32_t expected_height[] = {512u, 256u, 128u, 64u, 32u, 16u};
+        bool chain_ok = true;
+        for (uint32_t mip = 0; mip <= max_mip; ++mip) {
+            GpuState mip_state;
+            mip_state.cx[P::CB_COLOR0_BASE] = static_cast<uint32_t>(allocation >> 8);
+            mip_state.cx[P::CB_COLOR0_BASE_EXT] = static_cast<uint32_t>(allocation >> 40);
+            mip_state.cx[P::CB_COLOR0_VIEW] =
+                mip << P::CB_COLOR0_VIEW_MIP_LEVEL_SHIFT;
+            mip_state.cx[P::CB_COLOR0_INFO] =
+                (0x7u << P::CB_COLOR0_INFO_FORMAT_SHIFT) |
+                (0x7u << P::CB_COLOR0_INFO_NUMBER_TYPE_SHIFT);
+            mip_state.cx[P::CB_COLOR0_ATTRIB2] =
+                (max_mip << P::CB_COLOR0_ATTRIB2_MAX_MIP_SHIFT) |
+                ((mip0_width - 1u) << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) |
+                ((mip0_height - 1u) << P::CB_COLOR0_ATTRIB2_MIP0_HEIGHT_SHIFT);
+            mip_state.cx[P::CB_COLOR0_ATTRIB3] =
+                27u << P::CB_COLOR0_ATTRIB3_COLOR_SW_MODE_SHIFT;
+            const RenderState mip_render = extract_render_state(mip_state);
+            const ColorTargetState& target = mip_render.color_targets[0];
+            chain_ok = chain_ok && target.allocation_base == allocation &&
+                target.base == expected_base[mip] && target.width == expected_width[mip] &&
+                target.height == expected_height[mip] && target.mip_level == mip &&
+                target.max_mip == max_mip && target.color_sw_mode == 27u &&
+                target.in_mip_tail == (mip >= 4u) &&
+                mip_render.color0_base == target.base &&
+                mip_render.color0_width == target.width &&
+                mip_render.color0_height == target.height;
+        }
+        CHECK(chain_ok,
+              "CB_COLOR0_VIEW selects distinct reverse/tail-first mip target views");
+    }
+
     CHECK(rs.ps_addr == rdna2_addr(0x00ABCDEFu, 0x12u), "PS shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.es_addr == rdna2_addr(0x00111111u, 0x34u), "ES shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.gs_addr == 0 && rs.hs_addr == 0, "unset GS/HS shader addrs are 0");

@@ -219,6 +219,16 @@ bool gpu_dependency_rtt_seed_matches(const GpuDependencyAccess& access,
             return access.format == DataFormat::Unorm8 && access.num_components == 1;
         case GpuCaptureColorFormat::R32Uint:
             return access.format == DataFormat::Uint32 && access.num_components == 1;
+        case GpuCaptureColorFormat::R32Float:
+            return access.format == DataFormat::Float32 && access.num_components == 1;
+        case GpuCaptureColorFormat::Rg8Unorm:
+            return access.format == DataFormat::Unorm8 && access.num_components == 2;
+        case GpuCaptureColorFormat::Rgba32Float:
+            return access.format == DataFormat::Float32 && access.num_components == 4;
+        case GpuCaptureColorFormat::Rg16Float:
+            return access.format == DataFormat::Float16 && access.num_components == 2;
+        case GpuCaptureColorFormat::R16Float:
+            return access.format == DataFormat::Float16 && access.num_components == 1;
     }
     return false;
 }
@@ -309,7 +319,16 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                 error = "realized dispatch operation has no materialized item";
                 return false;
             }
-            if (!append_compute_accesses(*it->second, reads, writes, error)) return false;
+            const ComputeItem& compute = *it->second;
+            // A zero in any dispatch dimension is an architecturally empty launch. Keep its
+            // semantic node -- command order and the fact that the packet was realized still
+            // matter to diagnostics -- but it cannot read or write a descriptor. Treating the
+            // reflected storage-image bindings as work made an empty GTA V dispatch the producer
+            // of the later bloom history, hiding the real temporal leaf from bundle closure.
+            if (compute.launch.groups_x && compute.launch.groups_y &&
+                compute.launch.groups_z &&
+                !append_compute_accesses(compute, reads, writes, error))
+                return false;
         } else {
             if (operation.source_index >= replay.dma_copies.size()) {
                 error = "realized DMA operation has no materialized copy";

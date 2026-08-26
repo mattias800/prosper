@@ -103,6 +103,20 @@ bool has_glsl_ext_inst(const std::vector<uint32_t>& spv, uint32_t instruction) {
     return false;
 }
 
+uint32_t glsl_ext_inst_count(const std::vector<uint32_t>& spv, uint32_t instruction) {
+    constexpr uint32_t OpExtInst = 12;
+    uint32_t count = 0;
+    if (spv.size() < 5) return count;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return 0;
+        // OpExtInst operands: result type, result, instruction set, instruction, operands...
+        count += op == OpExtInst && wc >= 6 && spv[i + 4] == instruction;
+        i += wc;
+    }
+    return count;
+}
+
 uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
     uint32_t count = 0;
     if (spv.size() < 5) return count;
@@ -1806,7 +1820,7 @@ int main() {
         0xbf880002u,              // s_cbranch_execz +2  (routes through the fragment wave vote)
         0xbe8503f2u, 0x7e020205u,
         0x7e000280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800000fu, 0x03020100u,
+        0xf800180fu, 0x03020100u,
         0xbf810000u,
     };
     const auto execz_vote_spv =
@@ -1821,6 +1835,143 @@ int main() {
         }
         printf("  [ok]   a vote-only fragment module does not claim a ballot\n");
     }
+
+    // A scalar SCC consumer elsewhere in the module says nothing about the WaveAny producer above
+    // it. The scalar compare overwrites SCC before S_CSELECT, so only producer-to-consumer SSA
+    // provenance may attach ScalarReduce.
+    const uint32_t execz_vote_with_unrelated_scalar_select[] = {
+        0x7e020280u,              // v_mov_b32 v1, 0
+        0x7c2200f0u,              // v_cmp_* -> VCC
+        0xbf880002u,              // s_cbranch_execz +2 (WaveAny control-flow vote)
+        0xbe8503f2u, 0x7e020205u,
+        0xbec0037eu,              // s_mov_b32 s64, exec_lo
+        0xbf060000u,              // s_cmp_eq_u32 s0, s0 -> fresh scalar SCC
+        0x856b807eu,              // s_cselect_b32 vcc_hi, exec_lo, 0
+        0x8a406b40u,              // s_andn2_b32 s64, s64, vcc_hi
+        0xbefe0940u,              // s_wqm_b32 exec_lo, s64
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800180fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto unrelated_scalar_select_spv = recompile_fragment_wave32_for_test(
+        execz_vote_with_unrelated_scalar_select,
+        std::size(execz_vote_with_unrelated_scalar_select));
+    const uint32_t unrelated_scalar_select_reasons =
+        fragment_spirv_required_subgroup_reasons(unrelated_scalar_select_spv);
+    if (unrelated_scalar_select_spv.empty() ||
+        unrelated_scalar_select_reasons != kFragmentWaveReasonWaveAny) {
+        printf("  [FAIL] an unrelated scalar SCC consumer tightened a WaveAny vote "
+               "(reasons=0x%x)\n", unrelated_scalar_select_reasons);
+        return 1;
+    }
+    printf("  [ok]   unrelated scalar SCC consumers do not tighten WaveAny votes\n");
+
+    // GTA V's intro compositor compares a scalar-buffer value held in VCC_LO against zero, then
+    // branches on VCCZ before an optional texture sample.  The comparison is identical in every
+    // lane, so voting it with OpGroupNonUniformAny is an identity and must not force the guest's
+    // Wave64 width on a 32-wide host.  The mutation control below builds a genuinely divergent
+    // VGPR comparison by hand; it must retain the vote and its exact-width contract.
+    const uint32_t uniform_vccz_fragment[] = {
+        0xbeea03f2u,              // s_mov_b32 vcc_lo, 1.0 (ordinary scalar-data lifetime)
+        0x7c0900f9u, 0x8686006au, // v_cmp_lg_f32 vcc, vcc_lo, 0 (GTA V compositor packet)
+        0xbf860002u,              // s_cbranch_vccz +2
+        0xbe8503f2u,              // optional arm: scalar value feeding a lane-local result
+        0x7e020205u,
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800180fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!fragment_vcc_branch_is_wave_uniform_for_test(
+            uniform_vccz_fragment, std::size(uniform_vccz_fragment), 3)) {
+        printf("  [FAIL] scalar-uniform VCC producer was not certified at its VCCZ branch\n");
+        return 1;
+    }
+    printf("  [ok]   scalar-uniform VCC producer is certified at its VCCZ branch\n");
+
+    // An ordinary VOP3A MAC has an SDST-shaped decode field but does not write VCC. Keep it
+    // transparent to the uniform-producer walk; a real VOP3B carry packet is the mutation control.
+    const uint32_t uniform_vccz_across_mac_fragment[] = {
+        0xbe9003f2u,              // s_mov_b32 s16, 1.0
+        0x7c0900f9u, 0x86860010u, // v_cmp_lg_f32 vcc, s16, 0
+        0xd51f8011u, 0x40021b08u, // v_mac_f32_e64: VOP3A, no scalar destination
+        0xbf860002u,              // s_cbranch_vccz +2
+        0xbe8503f2u, 0x7e020205u,
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800180fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!fragment_vcc_branch_is_wave_uniform_for_test(
+            uniform_vccz_across_mac_fragment,
+            std::size(uniform_vccz_across_mac_fragment), 5)) {
+        printf("  [FAIL] VOP3A MAC was mistaken for a VCC write between compare and branch\n");
+        return 1;
+    }
+    uint32_t vop3b_vcc_mutation[std::size(uniform_vccz_across_mac_fragment)];
+    std::copy(std::begin(uniform_vccz_across_mac_fragment),
+              std::end(uniform_vccz_across_mac_fragment),
+              std::begin(vop3b_vcc_mutation));
+    vop3b_vcc_mutation[3] = 0xd70f6a11u; // v_add_co_u32_e64 ..., sdst=vcc
+    if (fragment_vcc_branch_is_wave_uniform_for_test(
+            vop3b_vcc_mutation, std::size(vop3b_vcc_mutation), 5)) {
+        printf("  [FAIL] a real VOP3B VCC write was treated as transparent\n");
+        return 1;
+    }
+    printf("  [ok]   VOP3A MAC is VCC-transparent while a VOP3B write is not\n");
+
+    const uint32_t divergent_vccz_fragment[] = {
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1 (unproven lane-local inputs)
+        0xbf860002u,              // s_cbranch_vccz +2
+        0xbe8503f2u,
+        0x7e020205u,
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800180fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (fragment_vcc_branch_is_wave_uniform_for_test(
+            divergent_vccz_fragment, std::size(divergent_vccz_fragment), 1)) {
+        printf("  [FAIL] unproven lane-local VCC producer was certified wave-uniform\n");
+        return 1;
+    }
+    printf("  [ok]   unproven lane-local VCC producer retains its wave-vote requirement\n");
+
+    // RAGE recycles both physical VCC dwords as scalar scratch in the deferred-light epilogue.
+    // Scalar reads may observe those dwords, but no mask-domain consumer may survive the proof.
+    const uint32_t fragment_scalar_vcc_suffix[] = {
+        0xbe840381u,              // s_mov_b32 s4, 1
+        0xbf0d8004u,              // s_cmp_lg_u32 s4, 0
+        0x856b80c0u,              // s_cselect_b32 vcc_hi, 64, 0
+        0xbf0d8104u,              // s_cmp_lg_u32 s4, 1
+        0x856a80ffu, 0x00000080u,// s_cselect_b32 vcc_lo, 128, 0
+        0x886a6a6bu,              // s_or_b32 vcc_lo, vcc_lo, vcc_hi
+        0x7e080c6au,              // v_cvt_f32_u32 v4, vcc_lo
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e060280u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto fragment_scalar_vcc_suffix_spv = recompile_fragment(
+        fragment_scalar_vcc_suffix, std::size(fragment_scalar_vcc_suffix));
+    if (fragment_scalar_vcc_suffix_spv.empty() ||
+        fragment_spirv_required_subgroup_size(fragment_scalar_vcc_suffix_spv) != 0) {
+        printf("  [FAIL] scalar-only fragment VCC suffix retained a subgroup contract "
+               "(words=%zu size=%u)\n",
+               fragment_scalar_vcc_suffix_spv.size(),
+               fragment_spirv_required_subgroup_size(fragment_scalar_vcc_suffix_spv));
+        return 1;
+    }
+    std::vector<uint32_t> fragment_live_vcc_suffix(
+        std::begin(fragment_scalar_vcc_suffix), std::end(fragment_scalar_vcc_suffix));
+    fragment_live_vcc_suffix.insert(fragment_live_vcc_suffix.begin() + 8,
+                                    0x02020100u); // v_cndmask observes implicit VCC
+    const auto fragment_live_vcc_suffix_spv = recompile_fragment(
+        fragment_live_vcc_suffix.data(), fragment_live_vcc_suffix.size());
+    if (fragment_live_vcc_suffix_spv.empty() ||
+        fragment_spirv_required_subgroup_size(fragment_live_vcc_suffix_spv) != 64 ||
+        !(fragment_spirv_required_subgroup_reasons(fragment_live_vcc_suffix_spv) &
+          kFragmentWaveReasonLaneId)) {
+        printf("  [FAIL] live fragment VCC mutation lost its exact lane-id contract\n");
+        return 1;
+    }
+    printf("  [ok]   scalar-only fragment VCC scratch avoids lane identity; mask use retains it\n");
 
     // Astro Bot's Wave32 graphics shaders save/copy/restore active-lane masks through the low
     // halves of EXEC and VCC.  These are the B32 equivalents of the B64 mask moves already modeled
@@ -3126,6 +3277,31 @@ int main() {
     }
     printf("  [ok]   Wave64 VCC branch retains ordinary LDS effects after an exact wave vote\n");
 
+    // GTA V's RCAS/EASU kernels end in an EXECZ early-out followed by ordinary V_READLANE lane-32
+    // broadcasts. A 32-lane NVIDIA subgroup cannot implement that Wave64 read with a shuffle. The
+    // CFG dispatcher must intercept it in its uniform common phase instead of stamping min=64.
+    const uint32_t wave64_compute_exec_readlane[] = {
+        0x7d8a0080u,                         // pc0: v_cmp_eq_u32 vcc,0,v0
+        0xbf860003u,                         // pc1: s_cbranch_vccz -> pc5
+        0xd7600000u, 0x00014100u,            // pc2: v_readlane_b32 s0,v0,32
+        0x7e000200u,                         // pc4: v_mov_b32 v0,s0
+        0xbf810000u,                         // pc5: s_endpgm
+    };
+    const auto wave64_compute_exec_readlane_spv = recompile_compute(
+        wave64_compute_exec_readlane, std::size(wave64_compute_exec_readlane), nullptr,
+        portable_wave64_compute_config);
+    if (wave64_compute_exec_readlane_spv.empty() ||
+        !has_opcode(wave64_compute_exec_readlane_spv, 224) || // OpControlBarrier
+        !has_opcode(wave64_compute_exec_readlane_spv, 251) || // OpSwitch dispatcher
+        has_opcode(wave64_compute_exec_readlane_spv, 345) ||  // no native subgroup shuffle
+        compute_spirv_min_subgroup_size(wave64_compute_exec_readlane_spv) != 0 ||
+        !type_result_ids_are_nonzero(wave64_compute_exec_readlane_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave64_compute_exec_readlane_spv)) {
+        printf("  [FAIL] Wave64 EXECZ readlane retained a native subgroup-width dependency\n");
+        return 1;
+    }
+    printf("  [ok]   Wave64 EXECZ readlane uses the portable CFG common phase\n");
+
     // The acceptance above must not become a blanket escape hatch for operations whose lowering
     // contains a workgroup/subgroup synchronization phase. Those remain fail-visible inside a
     // per-wave arm until a common-phase transformation proves every invocation participates.
@@ -4336,9 +4512,12 @@ int main() {
     };
     auto mask_pair_module_is_exact = [&](const std::vector<uint32_t>& spirv,
                                          uint32_t wave_size, bool inverted) {
+        const uint32_t reasons = fragment_spirv_required_subgroup_reasons(spirv);
         return !spirv.empty() && has_opcode(spirv, 251) &&
             opcode_count(spirv, 335) == 1 &&
             fragment_spirv_required_subgroup_size(spirv) == wave_size &&
+            reasons != UINT32_MAX &&
+            (reasons & kFragmentWaveReasonScalarReduce) != 0 &&
             wave_vote_reaches_later_select(spirv, inverted) &&
             type_result_ids_are_nonzero(spirv, nullptr) &&
             phi_ids_are_nonzero(spirv);
@@ -4973,6 +5152,81 @@ int main() {
         return 1;
     }
     printf("  [ok]   compute-shell image_sample lowers to OpImageSampleExplicitLod (LOD 0)\n");
+
+    // GTA V's FSR1 RCAS pass combines both compact MIMG controls on its scene input: A16 packs
+    // integer x/y into one address VGPR, while D16 packs the four floating-point result components
+    // into two VDATA VGPRs. The old lowering ignored both flags, sampled y from an unrelated VGPR,
+    // and overwrote two registers beyond VDATA; the matching D16 stores then consumed four full
+    // VGPRs and produced the title's exact red/green/black 8x8 checker.
+    const uint32_t gta_rcas_a16_d16_load[] = {
+        0xf0000f08u, 0xc0000c00u,            // IMAGE_LOAD v[12:13], v0, s[0:7] xyzw 2D A16 D16
+        0xbf810000u,
+    };
+    ShaderResourceTable rcas_load_rt;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Float10_11_11; texture.num_components = 3;
+      texture.binding = 4; texture.fetch_pc = 0; texture.sgpr_base = 0; texture.img_dim = 1;
+      texture.width = 2; texture.height = 2; texture.size = 16;
+      rcas_load_rt.resources.push_back(texture); }
+    const std::vector<uint32_t> rcas_load_spv = recompile_valu(
+        gta_rcas_a16_d16_load, std::size(gta_rcas_a16_d16_load), 64, 0, &rcas_load_rt);
+    if (rcas_load_spv.empty() || !has_opcode(rcas_load_spv, 95u) ||
+        opcode_count(rcas_load_spv, 203u) < 2u || !has_glsl_ext_inst(rcas_load_spv, 58u)) {
+        printf("  [FAIL] GTA RCAS A16/D16 load did not unpack x/y and pack fp16 VDATA\n");
+        return 1;
+    }
+
+    const uint32_t gta_rcas_d16_store[] = {
+        0x7e080300u,                         // v4 = x from the compute shell
+        0x7e0a0280u,                         // v5 = y = 0
+        0xf0200f08u, 0x80020004u,            // IMAGE_STORE v[0:1], v[4:5], s[8:15] xyzw 2D D16
+        0xbf810000u,
+    };
+    ShaderResourceTable rcas_store_rt;
+    { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+      image.format = DataFormat::Unorm8; image.num_components = 4;
+      image.binding = 4; image.fetch_pc = 2; image.sgpr_base = 8; image.img_dim = 1;
+      image.width = 2; image.height = 2; image.size = 16;
+      rcas_store_rt.resources.push_back(image); }
+    const std::vector<uint32_t> rcas_store_spv = recompile_valu(
+        gta_rcas_d16_store, std::size(gta_rcas_d16_store), 64, 0, &rcas_store_rt);
+    ShaderResourceTable integer_d16_rt = rcas_load_rt;
+    integer_d16_rt.resources[0].format = DataFormat::Uint8;
+    if (rcas_store_spv.empty() || !has_opcode(rcas_store_spv, 99u) ||
+        !has_glsl_ext_inst(rcas_store_spv, 62u) ||
+        !recompile_valu(gta_rcas_a16_d16_load, std::size(gta_rcas_a16_d16_load),
+                        64, 0, &integer_d16_rt).empty()) {
+        printf("  [FAIL] GTA RCAS D16 store did not unpack fp16 VDATA or admitted integer D16\n");
+        return 1;
+    }
+    printf("  [ok]   GTA RCAS A16/D16 load/store preserves packed address and VDATA contracts\n");
+
+    // The preceding ordinary-load coverage does not exercise gather's distinct result shape: its
+    // single-bit dmask selects a source channel, but all four gathered texels are returned. This is
+    // an exact GTA V FSR1 EASU packet. Under D16 those four fp16 values must occupy two VDATA VGPRs,
+    // rather than the four full-width registers used by the non-D16 gather path.
+    const uint32_t gta_easu_d16_gather[] = {
+        0xf11c010au, 0x80401420u, 0x00000032u, // IMAGE_GATHER4_LZ v[20:21], [v32,v50], D16 NSA
+        0xbf810000u,
+    };
+    ShaderResourceTable easu_gather_rt;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Unorm8; texture.num_components = 4;
+      texture.binding = 4; texture.fetch_pc = 0; texture.sgpr_base = 0; texture.img_dim = 1;
+      texture.width = 2; texture.height = 2; texture.size = 16;
+      easu_gather_rt.resources.push_back(texture); }
+    const std::vector<uint32_t> easu_gather_spv = recompile_valu(
+        gta_easu_d16_gather, std::size(gta_easu_d16_gather), 64, 0, &easu_gather_rt);
+    ShaderResourceTable integer_easu_gather_rt = easu_gather_rt;
+    integer_easu_gather_rt.resources[0].format = DataFormat::Uint8;
+    if (easu_gather_spv.empty() || !has_opcode(easu_gather_spv, 96u) ||
+        glsl_ext_inst_count(easu_gather_spv, 58u) != 2u ||
+        !recompile_valu(gta_easu_d16_gather, std::size(gta_easu_d16_gather),
+                        64, 0, &integer_easu_gather_rt).empty()) {
+        printf("  [FAIL] GTA EASU D16 gather did not pack four fp16 texels into two VDATA VGPRs\n");
+        return 1;
+    }
+    printf("  [ok]   GTA EASU D16 gather preserves its two-VGPR packed result contract\n");
 
     // GTA V gameplay's exact single-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. The resource
     // marker is the independent materialization proof; removing it, changing the descriptor to DCC,

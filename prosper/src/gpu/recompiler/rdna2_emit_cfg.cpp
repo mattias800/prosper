@@ -1500,6 +1500,17 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
     std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
     std::set<int> portable_mask_ffbh_dsts;
+    std::unordered_map<uint32_t, uint32_t> portable_readlane_event_for_pc;
+    std::set<int> portable_readlane_dsts;
+    // A VGPR written by V_WRITELANE is a scalar spill array. Its lane slots must remain in one
+    // dispatcher case so the exact slot lowering can resolve them; only ordinary VGPR lifetimes
+    // use the synchronized generic readlane phase.
+    std::set<int> writelane_spill_arrays;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361)
+            writelane_spill_arrays.insert(in.dst.value);
+    }
     std::unordered_set<uint32_t> synchronized_lds_store_pcs;
     std::unordered_set<uint32_t> lds_fminmax_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
@@ -1575,6 +1586,16 @@ bool emit_cfg_state_machine(
             portable_mask_ffbh_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
             portable_mask_ffbh_dsts.insert(in.dst.value);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (b.is_compute && !b.native_subgroup_size &&
+            in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
+            !writelane_spill_arrays.contains(in.src[0].value)) {
+            portable_readlane_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(portable_readlane_event_for_pc.size() + 1));
+            portable_readlane_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -1957,6 +1978,13 @@ bool emit_cfg_state_machine(
                 }
 
                 int b32_write_reg = writes_b32_mask ? in.dst.value : -1;
+                const bool wave32_b64_vcc_mask_write =
+                    in.fmt == Rdna2Format::SOP2 && in.dst.value == 106 &&
+                    in.opcode >= 0x0f && in.opcode <= 0x1d &&
+                    (in.opcode & 1u) == 1 &&
+                    source_mask(in.src[0]) && source_mask(in.src[1]);
+                if (wave32_b64_vcc_mask_write)
+                    b32_write_reg = 106;
                 if (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 &&
                     in.opcode <= 0x12a && in.sdst.kind == OperandKind::SGPR) {
                     const Operand& carry_in = in.src[2];
@@ -3353,6 +3381,15 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t mask_ffbh_dst_var = has_portable_mask_ffbh
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const bool has_portable_readlane = !portable_readlane_event_for_pc.empty();
+    const uint32_t readlane_pending_var = has_portable_readlane
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t readlane_source_var = has_portable_readlane
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t readlane_selector_var = has_portable_readlane
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t readlane_dst_var = has_portable_readlane
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -3445,6 +3482,11 @@ bool emit_cfg_state_machine(
         b.store_function(mask_ffbh_event_var, zero);
         b.store_function(mask_ffbh_half_var, zero);
         b.store_function(mask_ffbh_dst_var, zero);
+    }
+    if (has_portable_readlane) {
+        b.store_function(readlane_source_var, zero);
+        b.store_function(readlane_selector_var, zero);
+        b.store_function(readlane_dst_var, zero);
     }
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
@@ -3736,6 +3778,8 @@ bool emit_cfg_state_machine(
         b.store_function(mask_ffbh_write_var, no);
         b.store_function(mask_ffbh_event_var, zero);
     }
+    if (has_portable_readlane)
+        b.store_function(readlane_pending_var, no);
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -3794,6 +3838,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* dpp_row_ror8 = nullptr;
         const Rdna2Inst* dpp_add_row_mask = nullptr;
         const Rdna2Inst* mask_ffbh = nullptr;
+        const Rdna2Inst* readlane = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
         const Rdna2Inst* saved_mask_pair_compare = nullptr;
@@ -3818,6 +3863,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_dpp_row_ror8 = nullptr;
             const Rdna2Inst* block_dpp_add_row_mask = nullptr;
             const Rdna2Inst* block_mask_ffbh = nullptr;
+            const Rdna2Inst* block_readlane = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
             const Rdna2Inst* block_saved_mask_pair_compare = nullptr;
@@ -3913,6 +3959,19 @@ bool emit_cfg_state_machine(
                         block_mask_ffbh = &in;
                         break;
                     }
+                }
+                if (portable_readlane_event_for_pc.contains(in.pc) &&
+                    !spill_vgprs.contains(in.src[0].value) &&
+                    !state.vgpr_lane_slots.contains(in.src[0].value) &&
+                    !state.vgpr_lane_mask_slots.contains(in.src[0].value)) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-cfg-portable-readlane] program=0x%llx "
+                                     "pc=%u dst=s%d src=v%d\n",
+                                     (unsigned long long)b.diagnostic.program_address,
+                                     in.pc, in.dst.value, in.src[0].value);
+                    block_readlane = &in;
+                    break;
                 }
                 const int mask_compare_source =
                     mask_zero_compare_candidate_source(in);
@@ -4052,7 +4111,8 @@ bool emit_cfg_state_machine(
                     block_swizzle || block_bpermute ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
-                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_compare ||
+                    block_dpp_add_row_mask || block_mask_ffbh || block_readlane ||
+                    block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
                     block_vopc_mask_compare ||
                     block_b64_mask_scc_vote ||
@@ -4073,6 +4133,7 @@ bool emit_cfg_state_machine(
             dpp_row_ror8 = block_dpp_row_ror8;
             dpp_add_row_mask = block_dpp_add_row_mask;
             mask_ffbh = block_mask_ffbh;
+            readlane = block_readlane;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
             saved_mask_pair_compare = block_saved_mask_pair_compare;
@@ -4101,6 +4162,26 @@ bool emit_cfg_state_machine(
                 b.uconst(static_cast<uint32_t>(source - mask_base)));
             b.store_function(mask_ffbh_dst_var,
                 b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
+        }
+        if (readlane) {
+            if (!portable_readlane_event_for_pc.contains(readlane->pc))
+                return reject_cfg(readlane->pc, "portable-readlane-event");
+            const auto source = state.vreg.find(readlane->src[0].value);
+            if (source == state.vreg.end())
+                return reject_cfg(readlane->pc, "portable-readlane-source");
+            bool selector_ok = true;
+            const uint32_t readlane_selector = operand_bits(
+                b, state, *readlane, readlane->src[1], &selector_ok);
+            if (!selector_ok || !readlane_selector)
+                return reject_cfg(readlane->pc, "portable-readlane-selector");
+            b.store_function(readlane_pending_var, yes);
+            b.store_function(readlane_source_var, source->second);
+            b.store_function(readlane_selector_var, readlane_selector);
+            b.store_function(readlane_dst_var,
+                b.uconst(static_cast<uint32_t>(readlane->dst.value)));
+            state.sreg.erase(readlane->dst.value);
+            state.sreg_input.erase(readlane->dst.value);
+            state.sreg_srt.erase(readlane->dst.value);
         }
         if (mbcnt) {
             if (graphics) {
@@ -4601,6 +4682,9 @@ bool emit_cfg_state_machine(
         if (mask_ffbh) {
             if (!set_next(mask_ffbh->pc + mask_ffbh->len_dwords))
                 return reject_cfg(mask_ffbh->pc, "mask-ffbh-successor");
+        } else if (readlane) {
+            if (!set_next(readlane->pc + readlane->len_dwords))
+                return reject_cfg(readlane->pc, "portable-readlane-successor");
         } else if (mbcnt) {
             if (!set_next(mbcnt->pc + mbcnt->len_dwords))
                 return reject_cfg(mbcnt->pc, "mbcnt-successor");
@@ -5300,6 +5384,74 @@ bool emit_cfg_state_machine(
                    b.uconst(static_cast<uint32_t>(kv.first.first))));
         const uint32_t old = b.load_function(b.t_bool, kv.second);
         b.store_function(kv.second, b.bsel(selected, no, old));
+    }
+    b.barrier();
+    }
+
+    if (has_portable_readlane) {
+    // Every invocation publishes its ordinary VGPR value unconditionally; V_READLANE ignores EXEC.
+    // A pending wave then reads the selected lane from its own guest-wave slice. This common region
+    // is reached uniformly by every dispatcher invocation, so the workgroup barriers are exact even
+    // when the host subgroup is narrower than the guest Wave64.
+    const uint32_t readlane_pending = b.load_function(b.t_bool, readlane_pending_var);
+    const uint32_t readlane_source = b.load_function(b.t_u32, readlane_source_var);
+    b.cfg_scratch_store(b.linear_localid, readlane_source);
+    b.barrier();
+
+    const uint32_t readlane_shift = b.uconst(b.wave_size == 32 ? 5u : 6u);
+    const uint32_t readlane_wave_base = b.ibin(
+        Op_ShiftLeftLogical,
+        b.ibin(Op_ShiftRightLogical, b.linear_localid, readlane_shift),
+        readlane_shift);
+    const uint32_t readlane_lane = b.ibin(
+        Op_BitwiseAnd, b.load_function(b.t_u32, readlane_selector_var),
+        b.uconst(b.wave_size - 1u));
+    const uint32_t readlane_index = b.ibin(
+        Op_IAdd, readlane_wave_base, readlane_lane);
+    const uint32_t readlane_valid = b.ucmp(
+        Op_ULessThan, readlane_index, b.uconst(b.local_count));
+    const uint32_t readlane_result = b.sel(
+        readlane_valid,
+        b.cfg_scratch_load(b.sel(readlane_valid, readlane_index, zero)), zero);
+    const uint32_t readlane_dst = b.load_function(b.t_u32, readlane_dst_var);
+    for (int reg : portable_readlane_dsts) {
+        const auto destination = sv.find(reg);
+        if (destination == sv.end())
+            return reject_cfg(0, "missing-portable-readlane-dst");
+        const uint32_t selected = b.land(
+            readlane_pending,
+            b.ucmp(Op_IEqual, readlane_dst,
+                   b.uconst(static_cast<uint32_t>(reg))));
+        const uint32_t old = b.load_function(b.t_u32, destination->second);
+        b.store_function(destination->second, b.sel(selected, readlane_result, old));
+    }
+    for (const auto& kv : mv) {
+        if (!portable_readlane_dsts.contains(kv.first)) continue;
+        const uint32_t selected = b.land(
+            readlane_pending,
+            b.ucmp(Op_IEqual, readlane_dst,
+                   b.uconst(static_cast<uint32_t>(kv.first))));
+        const uint32_t old = b.load_function(b.t_bool, kv.second);
+        b.store_function(kv.second, b.bsel(selected, no, old));
+    }
+    for (const auto& kv : mhv) {
+        if (!portable_readlane_dsts.contains(kv.first)) continue;
+        const uint32_t selected = b.land(
+            readlane_pending,
+            b.ucmp(Op_IEqual, readlane_dst,
+                   b.uconst(static_cast<uint32_t>(kv.first))));
+        const uint32_t old = b.load_function(b.t_bool, kv.second);
+        b.store_function(kv.second, b.bsel(selected, no, old));
+    }
+    if (portable_readlane_dsts.contains(106)) {
+        const uint32_t selected = b.land(
+            readlane_pending,
+            b.ucmp(Op_IEqual, readlane_dst, b.uconst(106u)));
+        const uint32_t bit = b.ucmp(
+            Op_INotEqual,
+            b.ibin(Op_BitwiseAnd, readlane_result, b.uconst(1u)), zero);
+        const uint32_t old = b.load_function(b.t_bool, vcc_var);
+        b.store_function(vcc_var, b.bsel(selected, bit, old));
     }
     b.barrier();
     }
@@ -6020,7 +6172,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
             if (F.on_vcc && !rs.vcc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
-            if (b.is_fragment && (F.on_exec || F.on_vcc))
+            if (b.is_fragment && (F.on_exec || F.on_vcc) &&
+                !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
+                  vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                 condition = b.fragment_wave_any(condition);
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
@@ -6552,6 +6706,30 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (emitted > 0) return true;
             return false;
         }
+        std::set<int> cfg_writelane_spill_arrays;
+        for (const auto& in : ins) {
+            if (in.is_end) break;
+            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361)
+                cfg_writelane_spill_arrays.insert(in.dst.value);
+        }
+        const bool portable_compute_cfg_readlane = b.is_compute &&
+            !b.native_subgroup_size && (!Fs.empty() || !Ls.empty()) &&
+            std::any_of(ins.begin(), ins.end(), [&](const Rdna2Inst& in) {
+                return !in.is_end && in.fmt == Rdna2Format::VOP3 &&
+                    in.opcode == 0x360 &&
+                    !cfg_writelane_spill_arrays.contains(in.src[0].value);
+            });
+        if (allow_cfg_dispatcher && portable_compute_cfg_readlane) {
+            if (!cfg_dispatch_safe) {
+                log_recompile_diagnostic(
+                    b.diagnostic, "compute-cfg-reject", "terminal",
+                    "reason=portable-readlane-dispatcher-unsafe guest-barrier=1");
+                return false;
+            }
+            const int emitted = try_cfg_dispatcher();
+            if (emitted > 0) return true;
+            return false;
+        }
         if (allow_cfg_dispatcher && complex_compute_cfg && (cf_rejected || Ls.empty())) {
             const int emitted = try_cfg_dispatcher();
             if (emitted > 0) return true;
@@ -6680,7 +6858,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // EXECZ/VCCZ are scalar wave decisions. Keeping every fragment invocation in the loop
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
-            if (b.is_fragment && L.condition != DivLoop::Condition::Scc)
+            if (b.is_fragment && L.condition != DivLoop::Condition::Scc &&
+                !(L.condition == DivLoop::Condition::Vcc &&
+                  rs.vcc == rs.vcc_wave_uniform &&
+                  vcc_exit_is_wave_uniform(ins, L.exit_branch_pc)))
                 loop_cond = b.fragment_wave_any(loop_cond);
             const uint32_t chk_end = b.cur_block;
             b.emit_condbranch(loop_cond, body, merge);         // canonical exit: branch on continue predicate
@@ -6813,7 +6994,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     cond_reg = b.native_subgroup_size
                         ? b.native_wave_any(cond_reg)
                         : b.guest_wave_any(cond_reg);
-                else if (b.is_fragment && (F.on_exec || F.on_vcc))
+                else if (b.is_fragment && (F.on_exec || F.on_vcc) &&
+                         !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
+                           vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                     cond_reg = b.fragment_wave_any(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 if (active_direct_wave_loop && active_direct_wave_continue &&

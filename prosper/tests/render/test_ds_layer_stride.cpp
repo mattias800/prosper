@@ -229,6 +229,41 @@ int main() {
               "...and a stencil-only write leaves the depth aspect valid");
     }
 
+    // ---- 10. A proven byte-preserving HTILE rewrite does not discard live depth ---------------
+    // GTA V runs a read/modify/write kernel over its complete HTILE plane between the G-buffer and
+    // deferred-lighting passes. When the exact GPU comparator proves the result byte-identical,
+    // the metadata describes the same logical surface as before. The ordinary changed-write arm is
+    // kept beside it: this exception must not hide a fast clear or any other real metadata update.
+    {
+        constexpr uint64_t kDepth = 0x20e0000000ull;
+        constexpr uint64_t kStencil = 0x20f0000000ull;
+        constexpr uint64_t kHtile = 0x2100000000ull;
+        constexpr uint32_t kW = 256, kH = 256;
+
+        prosper::gpu::ResolvedPipelineState ps;
+        ps.depth_read_base = ps.depth_write_base = kDepth;
+        ps.stencil_read_base = ps.stencil_write_base = kStencil;
+        const PersistentDsKey key =
+            prosper::test::persistent_ds_key_for(ps, kHtile, kW, kH, /*format=*/7);
+        auto& image = prosper::test::persistent_ds_cache()[key];
+        image.depth_valid = true;
+        image.stencil_valid = true;
+
+        prosper::gpu::set_guest_gpu_write_origin("gpu-preserving");
+        const size_t preserved =
+            prosper::test::invalidate_persistent_ds_guest_write(kHtile, 4096);
+        prosper::gpu::set_guest_gpu_write_origin(nullptr);
+        check(preserved == 0 && image.depth_valid && image.stencil_valid,
+              "a byte-identical HTILE rewrite preserves both retained aspects");
+
+        prosper::gpu::set_guest_gpu_write_origin("compute-writeback(buffer-full)");
+        const size_t changed =
+            prosper::test::invalidate_persistent_ds_guest_write(kHtile, 4096);
+        prosper::gpu::set_guest_gpu_write_origin(nullptr);
+        check(changed == 1 && !image.depth_valid && !image.stencil_valid,
+              "a changed HTILE write still invalidates both aspects");
+    }
+
     if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }
     std::fprintf(stderr, "== PASS ==\n");
     return 0;

@@ -76,6 +76,20 @@ private:
 // What present_frame should do after a BOUNDED vkAcquireNextImageKHR.
 enum class AcquireAction { proceed, skip, recreate, fail };
 
+// Select the extent Vulkan will use for a swapchain. Win32 surfaces normally publish a fixed
+// currentExtent, but can transiently report 0x0 while a minimize/fullscreen/DPI transition is in
+// flight even after SDL has already observed a non-zero pixel size. That is an unavailable surface,
+// not a fatal swapchain-creation failure: keep the old swapchain alive and retry on a later event-loop
+// iteration. Platforms with a variable extent use the requested SDL pixel size instead.
+constexpr VkExtent2D select_swapchain_extent(VkExtent2D current, VkExtent2D requested) {
+    return current.width != UINT32_MAX ? current : requested;
+}
+
+constexpr bool swapchain_extent_available(VkExtent2D current, VkExtent2D requested) {
+    const VkExtent2D selected = select_swapchain_extent(current, requested);
+    return selected.width != 0 && selected.height != 0;
+}
+
 // Classify vkAcquireNextImageKHR under a bounded (non-infinite) timeout.
 //  - VK_SUCCESS / VK_SUBOPTIMAL_KHR: an image was acquired (SUBOPTIMAL still yields a usable image) —
 //    proceed to blit + present. SUBOPTIMAL is handled at present time, matching the pre-#1182 behavior.

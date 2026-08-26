@@ -274,8 +274,8 @@ int main() {
 
     // Exercise the complete compute realization path: user pointer -> s_load T# fold -> per-use zero
     // proof -> descriptor materialization -> cached recompile. This pins the production assignment in
-    // realize_compute_dispatches, while the unsafe arms prove DCC/multilevel descriptors cannot gain
-    // the marker or reuse the safe module.
+    // realize_compute_dispatches. A multilevel descriptor cannot gain the marker; a DCC descriptor
+    // keeps the instruction proof and leaves decompressed-source authority to the live backend.
     {
         auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
         AgcShaderHeader zero_mip_compute_header{};
@@ -361,8 +361,15 @@ int main() {
         };
         CHECK(unsafe_realization_fails(multilevel_tsharp, false, 2),
               "compute realization keeps a multilevel IMAGE_LOAD_MIP fail-visible");
-        CHECK(unsafe_realization_fails(dcc_tsharp, true, 1),
-              "compute realization keeps GTA-shaped DCC IMAGE_LOAD_MIP fail-visible");
+        std::vector<OperationRealizationFailure> dcc_failures;
+        const std::vector<ComputeItem> dcc_items = realize_compute_dispatches(
+            make_zero_mip_submit(dcc_tsharp), 2483, &dcc_failures);
+        const ShaderResource* dcc_texture = dcc_items.size() == 1 && dcc_items[0].resources
+            ? dcc_items[0].resources->by_fetch_pc(4) : nullptr;
+        CHECK(dcc_items.size() == 1 && dcc_failures.empty() && dcc_texture &&
+                  dcc_texture->proven_zero_mip && dcc_texture->compression_enabled &&
+                  dcc_texture->declared_mip_levels == 1,
+              "compute realization carries GTA-shaped DCC IMAGE_LOAD_MIP to source validation");
     }
 
     // #584: graphics and compute are one PM4 timeline. The planner must retain the asymmetric
@@ -778,6 +785,20 @@ int main() {
         CHECK(made_rect && rect_item.vertex_count == 4u &&
               rect_item.ps.topology == static_cast<uint32_t>(VkTopology::TriangleStrip),
               "PS5 procedural RectList expands three vertices to a four-corner Vulkan strip");
+
+        ShaderResourceTable rect_vrt;
+        ShaderResource rect_vb;
+        rect_vb.cls = ResourceClass::VertexBuffer;
+        rect_vb.stride = 12u;
+        rect_vb.size = 3u * rect_vb.stride;
+        rect_vrt.resources.push_back(rect_vb);
+        CHECK(needs_rect_list_synthesis(7u, false, 3u, &rect_vrt) &&
+              needs_rect_list_synthesis(17u, false, 3u, &rect_vrt),
+              "GFX10 and standard VB-backed RectList forms request post-VS fourth-corner synthesis");
+        CHECK(!needs_rect_list_synthesis(7u, true, 3u, &rect_vrt) &&
+              !needs_rect_list_synthesis(7u, false, 6u, &rect_vrt) &&
+              !needs_rect_list_synthesis(6u, false, 3u, &rect_vrt),
+              "RectList synthesis does not alter indexed, non-three-vertex, or ordinary strip draws");
     }
 
     // #1163: a non-indexed DrawIndexAuto count is the AUTHORITATIVE hardware vertex count. The bound VB's
