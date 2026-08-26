@@ -1,0 +1,18 @@
+# PPSA16901: default launch -> Tomb Raider I's opening FMV (SNOW.OGV), headless.
+#
+# The ring item named "Game" IS the New Game entry, not a settings category -- three LEFTs from the
+# default "Lara's Home" lands on it (Lara's Home -> Controls -> Extras -> Game). Cross starts a new
+# game and the opening cutscene plays. The FMV begins at roughly t=137 s on the development host.
+#
+# The cutscene is Theora in the dump's own FMV/HD/SNOW.OGV, and the guest decodes it ITSELF: a run of
+# this route logs zero AvPlayer and zero videodec activity. So its pacing is the title's own clock,
+# not prosper's video backend -- do not go looking in AvPlayer for a defect seen here.
+#
+# Ground truth for timing work: SNOW.OGV is 1528 video packets over 101.968635 s = 14.985 fps.
+6-14:down
+16-18:cross
+42-43:left
+47-48:left
+52-53:left
+58-60:cross
+66-68:cross
