@@ -4870,10 +4870,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const char* path = spec;
             // A colon separates a target only when everything before it parses whole as a number;
             // otherwise it is a drive letter or part of the path.
+            // A colon separates a target only when everything before it parses STRICTLY as an
+            // unsigned number; otherwise it is a drive letter or part of the path. Parsed with
+            // parse_compute_timing_selector_u64 (compute_timing_selector.hpp, already included at
+            // the top of this file) rather than strtoull, and the difference is not cosmetic:
+            // strtoull accepts a sign, leading whitespace and an EMPTY prefix, so `:/tmp/x.spv`
+            // would have armed a target of 0 silently. That is the shape that header exists to
+            // prevent -- its own comment says a mistyped identity must not look armed -- and it is
+            // the parser both selectors this reuses already take. A non-numeric prefix (the `C` in
+            // `C:/x.spv`) is simply not a target.
             if (const char* colon = std::strchr(spec, ':')) {
-                char* end = nullptr;
-                const uint64_t addr = std::strtoull(spec, &end, 0);
-                if (end == colon) { code_addr = addr; targeted = true; path = colon + 1; }
+                const std::string prefix(spec, (size_t)(colon - spec));
+                const auto parsed =
+                    prosper::frontend::parse_compute_timing_selector_u64(prefix.c_str());
+                if (parsed.accepted()) {
+                    code_addr = parsed.value; targeted = true; path = colon + 1;
+                }
             }
             FILE* fh = std::fopen(path, "rb");
             if (!fh) {
@@ -8014,7 +8026,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 char path[512];
                 std::snprintf(path, sizeof path, "%s/%016llx.spv", dump_dir,
                               (unsigned long long)dump_hash);
-                if (FILE* f = fopen(path, "wb")) {
+                FILE* f = fopen(path, "wb");
+                // Reported, not silent. Without this an unwritable or nonexistent <dir>, or a
+                // path truncated by the snprintf above, produced no files AND no output -- an
+                // instrument that says nothing when it fails is indistinguishable from one
+                // reporting there was nothing to dump. The override half already reported its
+                // failures; this half did not.
+                if (!f) {
+                    std::fprintf(stderr, "[compute] SPIR-V dump could not write %s\n", path);
+                } else {
                     fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
                     fclose(f);
                     std::fprintf(stderr, "[compute] dumped SPIR-V %016llx (%zu words) -> %s\n",
