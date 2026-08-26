@@ -21,6 +21,19 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-26
 
+### Grand Theft Auto V renders its world
+
+The prologue bank heist on a default launch, with the game's own Performance graphics mode selected —
+until now the HUD and radar drew over nothing.
+
+![Bank lobby: a hostage face-down with her hands raised, wrapped presents stacked behind her, floor markings and overhead light reflections](assets/screenshots/gta5-prologue-bank-lobby.png)
+
+![Bank interior: the masked gunman in a red plaid shirt, a water cooler, holiday cards pinned to the wall, radar bottom-left](assets/screenshots/gta5-prologue-bank-interior.png)
+
+Gameplay runs at a few frames a second, and the texture path is most of the frame.
+[#1873](https://github.com/mattias800/prosper/issues/1873)
+
+
 ### Tomb Raider's world stopped being a pile of shards
 
 Croft Manor now renders with correct geometry — same route, same scene, same build, before and after.
