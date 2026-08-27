@@ -1932,8 +1932,11 @@ struct SpirvCompute {
                 declared_image_query = true;
             }
             uint32_t img = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
+            // #325: the DECLARATION, not the caller -- the third of three uses in this function,
+            // and the one the first pass missed. Query-size arity is validated exactly, so an
+            // ivec2 against an Arrayed image is invalid SPIR-V.
             uint32_t size = id(); put(code, Op_ImageQuerySizeLod,
-                                      {arrayed ? t_v3i() : t_v2i(), size, img, uconst(0)});
+                                      {coord_arrayed ? t_v3i() : t_v2i(), size, img, uconst(0)});
             uint32_t w_i = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
             uint32_t h_i = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
             const uint32_t w = i2u(w_i), h = i2u(h_i);

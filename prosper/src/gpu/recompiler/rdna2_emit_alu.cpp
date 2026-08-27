@@ -7635,7 +7635,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // entire world from ONE 256-slice array, so every world surface sampled slice 0 and
                 // rendered flat. Measured on a captured Croft Manor frame, zeroing slices 1..255
                 // changed 0.0% of pixels while zeroing all 256 changed 62.9%.
+                // `res_arrayed` and not `img_dim == 5` alone: the uploader arrays a resource only
+                // when it is ALSO multi-layer and block-compressed, so keying on img_dim would
+                // declare Arrayed for this title's depth-1 shadow maps and for Float32 arrays that
+                // get a plain 2D view -- VUID-vkCmdDraw-viewType-07752, the same failure as the
+                // hardcoded flag two branches up, at a different site. Compute keeps its own path:
+                // it picks the view from the SPIR-V reflection, so it is not bound by that.
                 const bool array_sample = in.mimg_dim == 5u &&
+                    (b.is_compute || res_arrayed) &&
                     res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
                 const bool host_array = load_2d_array || mip_load_2d_array ||
                     array_sample || msaa_array_fetch;
