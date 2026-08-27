@@ -21,6 +21,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-27
 
+### Windows audio: the underruns are not a pacing bug
+
+Every title crackles on Windows and only on Windows, and the obvious cause -- the sink hands the
+sound card too little cushion -- is wrong. Blasphemous 2's guest produces **84 audio grains a
+second against the 187 continuous playback needs** -- 45% of real-time audio. The device queue is
+then empty 53% of the time however carefully the sink paces the half it does get.
+
+Holding a deeper cushion, which is the fix everyone reaches for first, measures *worse*: 69%
+empty, identical to the pre-fix pacer it was meant to improve on. The pacer turns out to be
+pulling the guest along rather than holding it back.
+
+No picture -- this one is a number. #3072 has the hunt.
+
+
 ### Tomb Raider's world is textured
 
 Croft Manor's brickwork, stone, leaded windows, dolphin fountain, grass and foliage — the world was
