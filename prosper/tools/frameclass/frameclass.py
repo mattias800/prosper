@@ -43,6 +43,21 @@ check after the fact.
 Also not detected: a smooth gradient with no picture in it classifies CONTENT. prosper's seed-miss
 gradient is exactly that shape, so a frame can score well here and still be a diagnostic fill.
 
+SAMPLING: a 1/16 nearest-neighbour stride (every 4th pixel on both axes) at NATIVE resolution --
+never a resize, which is the distinction the tool rests on. A stride still aliases: a black frame
+ruled with 1px vertical lines at `x % 4 == 1`, covering a quarter of the screen, reports
+`max=0 colours=1 FLAT` and is indistinguishable from a black clear. Contrived, but real; pass
+`step=1` in-process if you need it exact.
+
+The colour count saturates at 4096 and the report marks a saturated count with a trailing `+`, so
+two `4096+` rows are not comparable with each other.
+
+Alpha is discarded rather than composited over black. That sounds like a divergence from
+`capture_manifest.cpp:105-108`, which multiplies RGB by alpha -- measured on a real `screenshot` PNG
+it is not, because `normalize_capture_rgba` forces alpha to 255 for composited and republished
+frames (0 of 8,294,400 pixels differed). `CaptureSource::RawScanout` is the one path that leaves
+alpha untouched, and no sample of it has been checked.
+
 Always exits 0 on classification -- this reports, it does not gate. An unreadable file is reported on
 its own line and does not abort the run or lose the tally.
 """
@@ -51,6 +66,8 @@ try:
     from PIL import Image
 except ImportError:
     sys.exit("frameclass: needs Pillow (python3 -m pip install --user pillow)")
+
+COLOUR_CAP = 4096  # counting stops here; the report suffixes a saturated count with "+"
 
 def classify(path, step=4, noise=8, bright_at=128):
     return classify_image(Image.open(path).convert("RGB"), os.path.basename(path), step, noise, bright_at)
@@ -69,7 +86,7 @@ def classify_image(im, name, step=4, noise=8, bright_at=128):
             if m > mx: mx = m
             if m > noise: nonblack += 1
             if m > bright_at: bright += 1
-            if len(cols) < 4096: cols.add((r, g, b))
+            if len(cols) < COLOUR_CAP: cols.add((r, g, b))
     share = nonblack / n if n else 0.0
     # Coverage is tested before legibility on purpose: a well-covered frame is a picture even when it
     # is too dim for any pixel to count as bright. Testing `bright == 0` first classified
@@ -146,9 +163,15 @@ def main(argv):
                  "       frameclass.py --selftest")
     paths = []
     for a in argv[1:]:
-        paths.extend(sorted(glob.glob(os.path.join(a, "*.png"))) if os.path.isdir(a) else [a])
+        if os.path.isdir(a):
+            # .bmp too: F9 frame grabs write BMP, and CLAUDE.md makes F9 the first loop for a
+            # graphical bug -- a directory of grabs must not report "nothing found".
+            for ext in ("*.png", "*.bmp", "*.PNG", "*.BMP"):
+                paths.extend(sorted(glob.glob(os.path.join(a, ext))))
+        else:
+            paths.append(a)
     if not paths:
-        sys.exit("frameclass: no PNGs found")
+        sys.exit("frameclass: no .png or .bmp found")
     tally = {}
     for p in paths:
         try:
@@ -160,7 +183,8 @@ def main(argv):
         tally[r["kind"]] = tally.get(r["kind"], 0) + 1
         print(f"{r['name'][-28:]:>28}  {r['w']}x{r['h']}  max={r['max']:>3}  "
               f"nonblack={r['share']:6.2f}%  bright={r['bright']:>7}  "
-              f"colours={r['colours']:>5}  {r['kind']}")
+              f"colours={str(r['colours']) + ('+' if r['colours'] >= COLOUR_CAP else ''):>6}  "
+              f"{r['kind']}")
     print("  " + "  ".join(f"{k}={v}" for k, v in sorted(tally.items())) + f"  total={len(paths)}")
 
 if __name__ == "__main__":

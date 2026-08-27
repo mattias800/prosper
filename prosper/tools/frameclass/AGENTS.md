@@ -7,7 +7,7 @@ rung 2", and between rung 2 and rung 3.
 
 What is genuinely new here is narrower than it looks, so it is worth stating precisely.
 `tools/screenshot`'s JSONL manifest **already** carries `distinct_rgb_colors` and
-`nonblack_rgb_pixels`, computed at full resolution, in the same directory as the PNGs
+`nonblack_rgb_pixels`, computed over every pixel, in the same directory as the PNGs
 (`capture_manifest.cpp:100-114`) — if you only need those two, read the manifest and skip this tool.
 What this adds is the brightest channel anywhere, the count of pixels legible enough to read, and the
 classification those two make possible. It also runs over *any* directory of PNGs, including frames
@@ -60,10 +60,28 @@ Two ordering rules are load-bearing, and each is pinned by a selftest case:
 - **A smooth gradient with no picture in it classifies `CONTENT`.** prosper's seed-miss gradient is
   exactly that shape, so a frame can score well here and still be a diagnostic fill.
 
+## How it samples, and the two ways that shows
+
+A **1/16 nearest-neighbour stride** — every 4th pixel on both axes — at **native** resolution. Never
+a resize: that is the distinction the whole tool rests on. A stride still aliases, and the shape of
+the failure is worth knowing: a black frame ruled with 1px vertical lines at `x % 4 == 1`, covering a
+quarter of the screen, reports `max=0 colours=1 FLAT`, indistinguishable from a black clear.
+
+The colour count **saturates at 4096**, and a saturated count is printed with a trailing `+`. Two
+`4096+` rows are not comparable with each other; neither is a `4096+` row against the manifest's
+`distinct_rgb_colors`, which does not cap.
+
+Alpha is discarded rather than composited over black, which looks like a divergence from
+`capture_manifest.cpp:105-108` (it multiplies RGB by alpha). Measured on a real `screenshot` PNG it
+is not: `normalize_capture_rgba` (`capture_manifest.cpp:90-97`) forces alpha to 255 for composited
+and republished frames, and 0 of 8,294,400 pixels differed. `CaptureSource::RawScanout` is the one
+path that leaves alpha untouched, and no sample of it has been checked — recorded so nobody
+re-derives the negative.
+
 ## Running it
 
 ```bash
-python3 prosper/tools/frameclass/frameclass.py ~/work/shots   # a directory, or individual PNGs
+python3 prosper/tools/frameclass/frameclass.py ~/work/shots   # dir of .png/.bmp, or single files
 python3 prosper/tools/frameclass/frameclass.py --selftest     # 9 hand-built frames, one per class
 ```
 
