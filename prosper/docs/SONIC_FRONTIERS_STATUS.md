@@ -39,7 +39,8 @@ a blue header band over a full-width body panel. Measured behaviour, all from li
 | How many pages? | **Twelve.** Confirms 40 flips apart: presses 1-12 each advance one page and press 13 activates a main-menu entry. |
 | What advances it? | **Face buttons only.** A single-button sweep (triangle, square, circle, options, touchpad, l1, r1, right, left, down, up, cross, 60 flips apart) advanced the panel on every face button and on **none** of the four d-pad directions — `right`, `left`, `down` and `up` left the header on "Update Details" for 240 flips, then `cross` advanced it. |
 | Where is the cursor afterwards? | On **"Extras"**, the last of the six main-menu entries, so five `up` reach "New Game" whether or not the list wraps. |
-| Is the queue route-stable? | **Yes, and independently of save state.** This row used to say "only against an isolated save area"; that is withdrawn. A `boot_trace` arm of the committed route reaches `GameModeStage` **with an existing save present**, so twelve confirms consumed twelve pages with that save in place. The page count is the whole of the queue-length story and it is speed-independent — one page per face press (row above) — so this **falsifies** that story rather than leaving it unseparated. ([#2790](https://github.com/mattias800/prosper/issues/2790), PR #3049.) |
+| Is the queue route-stable? | **Yes, and independently of save state.** This row used to say "only against an isolated save area"; that is withdrawn. A `boot_trace` arm of the committed route reaches `GameModeStage` **with an existing save present**, so twelve confirms consumed twelve pages with that save in place. The page count is the whole of the queue-length story and it is speed-independent — one page per face press (row above) — so this **falsifies** that story rather than leaving it unseparated — the page count, not the wider
+question of whether save state matters, which the 2×2 above does not settle. ([#2790](https://github.com/mattias800/prosper/issues/2790), PR #3049.) |
 
 This is why 405 dense confirms (one every 20 flips) got no further than six did: the pages are
 consumed one per press with an animation between them, so spacing, not volume, is what clears the
@@ -136,20 +137,31 @@ The shape:
 | f3300+ | held `cross` | skips the in-engine opening into the stage |
 | f5200+ | `left-stick-up` blocks | forward motion under player control |
 
+**The sampling window has to span the whole run, and the defaults do not.** `--seconds` is the
+*interval between samples*, not a start delay; the loop runs `while (saved < count)`; and `--timeout`
+defaults to a hard **900 s** (`tools/screenshot/screenshot.cpp`). A live arm on this title runs at
+1.5–3.4 flips/s, so `f2900` is 850–1,930 s and the `f5200` gameplay block is 1,530–3,470 s — a
+`--seconds 3 --count 55` plan samples for 165 s and exits before the route's first input is due.
+Sample sparsely across a long timeout instead: 55 samples 70 s apart covers 3,850 s.
+
+**No `--warmup-seconds` on this route.** It suppresses Vulkan rendering, which moves the guest's flip
+rate off wall clock and fires every window at the wrong guest state (see the Ruled out row). It is
+also not a way to skip the wait: there is no capture-delay flag that leaves rendering live, so the
+window has to be long rather than late.
+
 ```bash
 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_PAD_SCRIPT=@prosper/scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad \
 PROSPER_SAVE0=~/frontiers-work/save/run1 \
   ./build/screenshot <DUMP_ROOT>/PPSA03831-app0 \
-  --seconds 3 --count 55 --out ~/frontiers-work/shots/run1
-# NO --warmup-seconds on this route: it suppresses Vulkan rendering, which moves the guest's flip
-# rate off wall clock and fires every window at the wrong guest state. See the Ruled out row.
+  --seconds 70 --count 55 --timeout 4200 --out ~/frontiers-work/shots/run1
 ```
 
 **Reproduction:** the file-oracle result reproduced on four CPU-only `boot_trace` arms and the live
-HUD-with-running-clock result on two `tools/screenshot` arms. The `--warmup-seconds` figure is a
-host-speed convenience, not part of the route — the route itself is flip-anchored and the same
-windows drive a CPU-only arm at ~30 flips/s and a live 3840x2160 arm at ~3 flips/s unchanged.
+HUD-with-running-clock result on two `tools/screenshot` arms. The route itself is flip-anchored, so the same
+windows drive a CPU-only arm at ~30 flips/s and a live 3840x2160 arm at ~3 flips/s unchanged — that
+is why it needs no per-host tuning, and also why `--warmup-seconds` breaks it: moving the flip rate
+relative to wall clock moves every window off the guest state it was authored for.
 
 ## The world is black in the stage — 16 of 32 compute programs never execute (#2790)
 

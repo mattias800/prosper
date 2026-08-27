@@ -16,12 +16,16 @@
 # desync under host load: a confirm activates "Extras", and every later input then navigates inside
 # that submenu. Check `uptime` and re-run before diagnosing anything.
 #
-# SAVE DATA IS NOT THE CAUSE, though it looked like it for a while. A 2x2 settles it: under
-# `boot_trace` the route reaches GameModeStage (`ui_gamemodestage` markers, and 189 log lines
-# naming `w6d01_trr` terrain sectors -- the stage has 100 of them) BOTH
-# with an existing save and against an empty PROSPER_SAVE0 root. Only one renderer arm ever failed,
-# with n=1 against this title's own 1.5-3.4 flips/s spread, so "save present" and "slow arm" were
-# never separated on that frontend.
+# SAVE DATA WAS NEVER SHOWN TO BE THE CAUSE, though it looked like it for a while -- and note the
+# claim is that shape deliberately. Only one renderer arm ever failed, at n=1 against this title's
+# own 1.5-3.4 flips/s spread, so "save present" and "slow arm" were never separated on that
+# frontend: enough to withdraw the precondition, not enough to assert its opposite. Under
+# `boot_trace` the route reaches GameModeStage (`ui_gamemodestage` markers, and 189 log lines naming
+# `w6d01_trr` terrain sectors -- the stage has 100 of them) both with an existing save and against
+# an empty PROSPER_SAVE0 root, but neither of those arms has a recorded arm count, and reaching that
+# marker is not the same as the authored route having run. Do not set an empty save root as a
+# precondition here; do not treat the save as established to be irrelevant either.
+# See docs/SONIC_FRONTIERS_STATUS.md for the 2x2 and both its limits.
 #
 # USE boot_trace AS THE FAST LOOP -- 17-30 flips/s against 1.5-3.4 on a live 4K renderer arm, so
 # f2900 is ~100-200 s instead of 14-32 minutes:
