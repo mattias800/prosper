@@ -286,6 +286,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **`--max-stale-seconds` / `--max-pixel-stale-seconds` disarm the stop outright** (they are maxima
   over the samples taken, so a shortened run would report a smaller one), and every other flag
   assertion is a floor that fewer samples can only push further from being met.
+- **`frameclass/`** — classifies a directory of captured PNGs as `CONTENT` / `UI-ON-BLACK` /
+  `SPARSE` / `FLAT`, at full resolution. It answers the one question the manifest does not: is a
+  frame **a HUD or menu drawn over a world that never rendered**, which is the boundary between rung
+  2 and rung 3. `distinct_rgb_colors` and `nonblack_rgb_pixels` are already in `screenshot`'s
+  manifest — read those directly if they are all you need. Two traps are recorded in
+  `frameclass/AGENTS.md`: **downsampling before counting colours erases thin UI** (a 4K frame at
+  160x90 reported *Stray*'s legible main menu as flat black), and a share-of-non-black test scores a
+  flat **white** clear as a perfect frame. Run `--selftest` after touching a threshold.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
   to print the GOT/PLT relocation slot each import lands in — the step that starts every
