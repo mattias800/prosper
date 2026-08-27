@@ -23,13 +23,29 @@
 //                   polling; the two are different assertions, not one with a platform tweak.
 //   2. ENCODING   - the timeout returns exactly 0x8002003c, FreeBSD ETIMEDOUT as the guest reads it.
 //                   Nothing else in the suite covers this path's encoding.
-//   3. BOUNDS     - a stub/unit/hang guard, and NOT the discriminator. With the fix reverted the
-//                   defect delivered at 14.69, 12.06, 17.75, 10.00 and 15.32 ms -- so a 12 ms
-//                   ceiling would have PASSED the defect, not merely flaked. A quantized wait
-//                   returns at the next tick boundary, so a 5 ms request lands anywhere in
-//                   ~[5, 20.6] ms and the two distributions overlap. The same 12 ms ceiling
-//                   also flaked on macOS/Rosetta at 18.54 ms, where the native call is
-//                   untouched by this change anyway. Arm 1 caught all five.
+//   3. BOUNDS     - a stub/unit guard, and NOT the discriminator. THE canonical figures for this
+//                   file, referenced from CMakeLists.txt rather than restated there:
+//
+//                     defect, Windows, fix reverted:  14.69  12.06  17.75  10.00  15.32 ms
+//                     fix, Windows:                    5.49   5.47   5.39 ms
+//                     macOS/Rosetta, native path:     18.54  23.22  46.46 ms
+//
+//                   A 12 ms ceiling would have PASSED the defect (the 10.00 ms run), not
+//                   merely flaked -- silently, which is worse. And it cannot be repaired by
+//                   moving it, for a reason that needs no measurement at all: a quantized
+//                   wait returns at the next tick BOUNDARY, so its latency is T-p or 2T-p for
+//                   phase p within the tick, and as p approaches T-N from below the defect's
+//                   latency approaches the REQUESTED 5 ms exactly -- below the fix's own
+//                   5.39 ms, for any tick length T. The distributions overlap by
+//                   construction. (Second review of #3066 supplied that argument; the five
+//                   samples are kept because they also discriminate the MODEL -- a
+//                   whole-ticks-from-the-request model predicts clustering at ~15.6/31.2 ms,
+//                   which 10.00 and 12.06 falsify.)
+//
+//                   Arm 1 caught all five reverted runs. On Rosetta the native path is
+//                   untouched by this change, and arm 4's posted acquire measures SUB-
+//                   MILLISECOND there, so the 100 ms bound has over 100x headroom on a
+//                   measured value rather than a guessed one.
 //   4. FAST PATH  - an already-posted semaphore is acquired at once, asserted as a COUNT of 0
 //                   afterwards rather than as a latency. The latency bound is kept as well but
 //                   is Windows-tight / POSIX-loose, and it cannot see the fast path at all:
@@ -160,7 +176,9 @@ int main() {
         printf("         (timeout took %.2f ms via %s)\n", ms, host::sleep_backend_name());
     }
 
-    // ARM 4: an already-posted semaphore is taken by the trywait fast path and never enters the loop.
+    // ARM 4: an already-posted semaphore is acquired at once and its count is consumed.
+    // NOT "never enters the loop" -- that phrase was here and is wrong, see the header and the
+    // note over the count assertion below. There is no loop on POSIX at all.
     {
         CHECK(post(handle, 0, 0, 0, 0, 0) == 0, "post succeeds");
         const auto t0 = clk::now();
@@ -169,10 +187,19 @@ int main() {
         const uint64_t rc = timedwait(handle, 1000000, 0, 0, 0, 0);
         const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         CHECK(rc == 0, "an already-posted semaphore is acquired");
-        // The count is the observable, and it is what "acquired" MEANS. Review found the arm
-        // could not see its own stated purpose: the pre-loop sem_trywait and the first
-        // statement inside the loop are the identical call, so deleting the fast path is
-        // invisible to any timing bound. A count of 0 after the acquire is not.
+        // The count is the observable, and it is what "acquired" MEANS: it catches a path that
+        // returns rc==0 WITHOUT consuming, which no timing bound can see. Mutation-checked
+        // with a peek-and-return in place of the trywait.
+        //
+        // What it does NOT catch, stated because the obvious reading of it is wrong: deleting
+        // the pre-loop sem_trywait entirely. The loop's FIRST statement is the identical
+        // call, so it consumes the count anyway and every assertion here still passes. That
+        // deletion is unobservable at the HLE boundary by construction -- the fast path is a
+        // latency optimisation, not a semantic one -- so it is a fact to record rather than a
+        // gap to close. Second review of #3066.
+        // The lookup is CHECKed rather than merely guarded: an optional lookup that silently
+        // skips means a rename makes both assertions below vanish GREEN.
+        CHECK(getvalue != nullptr, "scePthreadSemGetvalue is registered");
         if (getvalue) {
             int v = -1;
             CHECK(getvalue(handle, (uint64_t)(uintptr_t)&v, 0, 0, 0, 0) == 0,
@@ -184,10 +211,15 @@ int main() {
         // 100 ms still fails a fast path that fell through to waiting out the 1 s timeout, which
         // is the only defect this arm can see.
 #ifdef _WIN32
-        CHECK(ms < 1.0, "...immediately, without entering the poll loop");
+        CHECK(ms < 1.0, "...immediately, on the order of a trywait rather than a wait");
 #else
         CHECK(ms < 100.0, "...immediately, nowhere near the 1 s timeout it was given");
 #endif
+        // Printed for the same reason ARM 3 prints its figure: a green ctest run shows no
+        // per-test output, so a margin that is never printed cannot be quoted from a passing
+        // log -- which is exactly how #3044 came to be merged on a green Rosetta job whose
+        // numbers nobody had seen.
+        printf("         (posted acquire took %.2f ms)\n", ms);
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

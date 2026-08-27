@@ -650,13 +650,14 @@ if(TARGET prosper_core)
   # lucky duration and does not flake under load. Mutation-checked: reverting to the winpthreads
   # delegation reddens the MECHANISM arm and prints "via none".
   #
-  # It used to say "reddens two arms", the second being a wall-clock ceiling, and that ceiling
-  # is gone: measured across five reverted runs the defect delivered at 14.69, 12.06, 17.75,
-  # 10.00 and 15.32 ms, so a 12 ms ceiling PASSES the defect. A quantized wait returns at the
-  # next tick boundary, so the defect's latency distribution overlaps the fix's and no
-  # single-run bound separates them. The same ceiling also flaked on macOS/Rosetta at 18.54 and
-  # 46.46 ms, where the native call is untouched by the fix anyway. The mechanism arm is the
-  # discriminator; the bounds that remain are a stub/unit guard.
+  # It used to say "reddens two arms", the second being a wall-clock ceiling, and that ceiling is
+  # gone: it would have PASSED the defect, and it also flaked on macOS/Rosetta. The mechanism
+  # arm is the discriminator; the bounds that remain are a stub/unit guard.
+  #
+  # The measurements and the argument live in ONE place, the test file's own header. They were
+  # briefly in both, with two different lists -- and a third Rosetta figure existed in neither
+  # (23.22 ms, found in a CI log during review). Two copies of a figure list is one copy too
+  # many, and this is the copy that gets read second.
   add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
   target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
   add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
