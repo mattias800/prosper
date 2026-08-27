@@ -3082,11 +3082,18 @@ HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem
 // up to 2 ms on every wake, which is 37% of the 5.33 ms grain period this exists to serve: it would
 // fix the cadence and blunt the responsiveness in the same change. Short slices for the first few
 // milliseconds keep the wake tight where pacing lives; longer slices afterwards keep a guest parked
-// for seconds from spinning at 5 kHz for no benefit.
+// for seconds from spinning at 2 kHz for no benefit. (An earlier revision of this comment said
+// 5 kHz, which was the 200 us slice that revision used before the floor measurement below
+// replaced it.)
 HLE(k_sem_timedwait) {
     auto* s = ensure_sem(a0);
     if (!s) return prosper::hle::kSceKernelErrorEINVAL;
-    hle::WaitCensusScope c(hle::WaitKind::SemTimedwait, a1 * 1000ull);
+    // Saturating, matching guest_ns_from in hle_kernel_time.cpp (#3022): a1 is guest-controlled,
+    // and a wrap here would turn a very long timeout into a short one. That file states the rule
+    // for the whole family, so this member of it should not be the exception.
+    const uint64_t kNsMax = ~0ull;
+    const uint64_t timeout_ns = a1 > kNsMax / 1000ull ? kNsMax : (uint64_t)a1 * 1000ull;
+    hle::WaitCensusScope c(hle::WaitKind::SemTimedwait, timeout_ns);
 #ifndef _WIN32
     timespec dl = abs_deadline_us(a1);
     int rc = sem_timedwait(s, &dl);
@@ -3096,7 +3103,11 @@ HLE(k_sem_timedwait) {
     if (sem_trywait(s) == 0) return 0;
     const uint64_t start_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now().time_since_epoch()).count();
-    const uint64_t deadline_ns = start_ns + (uint64_t)a1 * 1000ull;
+    // Saturating again on the addition: start_ns + timeout_ns can itself wrap for a huge timeout,
+    // and a wrapped deadline lands in the past, which would turn a long wait into an instant
+    // timeout -- the loud direction, but still wrong.
+    const uint64_t deadline_ns =
+        timeout_ns > kNsMax - start_ns ? kNsMax : start_ns + timeout_ns;
     // 500 us while the wait is young, 2 ms after 8 ms have passed. The crossover is above one grain
     // period so an audio pacing wait never leaves the tight regime.
     //
@@ -3110,6 +3121,11 @@ HLE(k_sem_timedwait) {
     const uint64_t kFineSliceNs = 500000ull, kCoarseSliceNs = 2000000ull, kFineWindowNs = 8000000ull;
     for (;;) {
         if (sem_trywait(s) == 0) return 0;
+        // EAGAIN means "not posted yet", which is the whole point of the loop. Anything else --
+        // EINVAL on a semaphore whose storage was retired, say -- will not become true by waiting,
+        // so report it instead of spinning to the deadline and then reporting a timeout that
+        // misdescribes what happened. EINTR is retried, as a wait should be.
+        if (errno != EAGAIN && errno != EINTR) return sce_pthread_rc(fbsd_errno(errno));
         const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now().time_since_epoch()).count();
         if (now_ns >= deadline_ns) { errno = ETIMEDOUT; return sce_pthread_rc(fbsd_errno(errno)); }

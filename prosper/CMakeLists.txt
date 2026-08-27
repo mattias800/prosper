@@ -626,14 +626,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
   add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
 
-  # The guest semaphore timed wait, on BOTH axes (#3013). Platform-neutral like the nanosleep case
-  # above and for the same reason: the Windows fix is a poll loop and the defect is a Windows one, so
-  # gating it on UNIX would build it everywhere except where it matters. What makes this test worth
-  # having is that the two arms constrain each other -- the Windows fix buys timeout accuracy WITH
-  # wake latency, so pinning only the timeout would let a future change widen the poll slice and stay
-  # green while destroying responsiveness, and pinning only the wake would let it revert to
-  # winpthreads' 15.6 ms timeout. Thresholds are loose enough for a loaded host and still far inside
-  # both failures.
+  # The guest semaphore timed wait (#3013). Platform-neutral like the nanosleep case above and for
+  # the same reason: the fix is Windows-only, so gating on UNIX would build the test everywhere
+  # except where the defect is.
+  #
+  # It asserts the MECHANISM -- which primitive served the wait, via sleep_backend_name() -- rather
+  # than a wall-clock duration, following test_videoout.cpp and what test_kernel_nanosleep.cpp's
+  # header asks for. The first version asserted durations only and review showed NONE of its arms
+  # could redden on the pre-fix code: its 40 ms ceiling sat 2.6x above the 15.57 ms defect, and its
+  # other two arms measured a POSTED semaphore, which unfixed winpthreads serves in 0.01 ms -- better
+  # than the poll loop, so they preferred the defect. A mechanism assertion cannot be satisfied by a
+  # lucky duration and does not flake under load. Mutation-checked: reverting to the winpthreads
+  # delegation reddens two arms and prints "via none".
   add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
   target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
   add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)

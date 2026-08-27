@@ -1,26 +1,44 @@
-// test_kernel_sem_timedwait (#3013) - the guest semaphore timed wait must be accurate on BOTH axes.
+// test_kernel_sem_timedwait (#3013) - the guest semaphore timed wait.
 //
-// The reason this test exists rather than a timing comment: the Windows fix for timeout accuracy is a
-// poll loop, and a poll loop BUYS accuracy WITH wake latency. Pinning only the timeout would let a
-// future change widen the slice to 50 ms and stay green while destroying the responsiveness the call
-// is used for; pinning only the wake would let it revert to winpthreads' 15.6 ms timeout. Both arms
-// together are what make the design claim checkable.
+// THIS TEST'S FIRST VERSION COULD NOT FAIL, which is why the mechanism arm below exists.
 //
-// Thresholds are deliberately loose - a loaded CI host must not turn this red - and they are still far
-// inside the failures they guard: the timeout arm catches 15.6 ms quantization at a 40 ms budget on a
-// 5 ms request, and the wake arm catches a 2 ms flat slice at a 1.5 ms budget. What is NOT asserted is
-// sleep precision, which belongs to host::sleep_until_steady_ns.
+// It asserted wall-clock bounds: a 5 ms timeout under a 40 ms ceiling, and the latency of a POSTED
+// semaphore. Review showed none of the three arms could redden on the pre-fix code. 40 ms sits 2.6x
+// above the 15.57 ms defect it claimed to catch, so the tick passed it comfortably; and a posted
+// semaphore is served by UNFIXED winpthreads in 0.01 ms - better than the poll loop that replaced it -
+// so the wake arms preferred the defect. Meanwhile the file header and two arm comments all stated
+// that the tick was pinned. Confident labels over assertions that could not discriminate.
+//
+// The fix is the pattern this repo already prescribes and uses. test_kernel_nanosleep.cpp says it in
+// words - "precise_sleep exposes sleep_backend() so the MECHANISM can be asserted instead" - and
+// test_videoout.cpp:274/:315 is the worked example: assert WHICH primitive served the wait, not how
+// long it took. A mechanism assertion cannot be satisfied by a lucky duration, and it does not flake
+// on a loaded host.
+//
+// So the arms are:
+//   1. MECHANISM  - the wait was served by the high-resolution timer, not ::Sleep's tick. Reddens on
+//                   the pre-fix code, which never touches precise_sleep at all.
+//   2. ENCODING   - the timeout returns exactly 0x8002003c, FreeBSD ETIMEDOUT as the guest reads it.
+//                   Nothing else in the suite covers this path's encoding.
+//   3. BOUNDS     - a lower bound as well as an upper one. The upper alone cannot catch a wait that
+//                   returns instantly; the lower alone cannot catch the tick.
+//   4. FAST PATH  - an already-posted semaphore never enters the loop.
+//
+// Deliberately NOT asserted: the poll slice length. A short high-resolution sleep on this host has a
+// ~0.52 ms floor, so the adaptive 0.5 ms slice and a flat 2 ms one produce overlapping latency
+// distributions and no honest single-run bound separates them. That measurement lives at the call site.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "hle/kernel/sce_errno.hpp"
+#include "host/platform/precise_sleep.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <semaphore.h>
 #include <thread>
-#include <vector>
 
 using namespace prosper;
 using clk = std::chrono::steady_clock;
@@ -29,10 +47,6 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
-static double ms_since(clk::time_point t) {
-    return std::chrono::duration<double, std::milli>(clk::now() - t).count();
-}
-
 int main() {
     printf("== test_kernel_sem_timedwait ==\n");
     register_builtin_hle();
@@ -40,101 +54,59 @@ int main() {
     HleFn sem_init_fn = Hle::lookup(nid_hash("scePthreadSemInit").c_str());
     HleFn timedwait   = Hle::lookup(nid_hash("scePthreadSemTimedwait").c_str());
     HleFn post        = Hle::lookup(nid_hash("scePthreadSemPost").c_str());
-    if (!timedwait) {
-        // Fall back to the POSIX spellings if the Sony ones are not the registered names here.
-        timedwait = Hle::lookup(nid_hash("sem_timedwait").c_str());
-        post      = Hle::lookup(nid_hash("sem_post").c_str());
-        sem_init_fn = Hle::lookup(nid_hash("sem_init").c_str());
-    }
-    CHECK(timedwait != nullptr, "the guest semaphore timedwait is registered");
-    CHECK(post != nullptr, "the guest semaphore post is registered");
-    if (!timedwait || !post) { printf("== FAIL (unresolved) ==\n"); return 1; }
+    CHECK(sem_init_fn != nullptr, "scePthreadSemInit is registered");
+    CHECK(timedwait != nullptr, "scePthreadSemTimedwait is registered");
+    CHECK(post != nullptr, "scePthreadSemPost is registered");
+    if (!sem_init_fn || !timedwait || !post) { printf("== FAIL (unresolved) ==\n"); return 1; }
 
-    // The HLE takes an opaque guest slot; a real sem_t backs it via ensure_sem.
+    // The guest handle is an opaque slot; ensure_sem backs it with a real sem_t. Initialised through
+    // the HLE and CHECKED - the first version declared a bare `sem_t slot;` and called init with its
+    // result ignored, so an init that silently failed would have left every arm below operating on an
+    // uninitialised object.
     sem_t slot;
     const uint64_t handle = (uint64_t)(uintptr_t)&slot;
-    if (sem_init_fn) sem_init_fn(handle, 0, 0, 0, 0, 0);
+    CHECK(sem_init_fn(handle, 0, 0, 0, 0, 0) == 0, "the semaphore initialises to a count of 0");
 
-    // ARM 1 - TIMEOUT ACCURACY. 5000 us with no poster must return in well under one winpthreads
-    // tick's worth of overshoot. Pre-fix this took ~15.6 ms.
+    // ARM 1 + 2 + 3: one unposted wait, three independent properties.
     {
+        // "none" first, so the mechanism assertion below cannot be satisfied by an accessor that is a
+        // compiled-in constant. test_videoout.cpp uses the same guard for the same reason.
+        CHECK(strcmp(host::sleep_backend_name(), "none") == 0,
+              "no precise wait has run on this thread yet");
+
         const auto t0 = clk::now();
-        const uint64_t rc = timedwait(handle, 5000, 0, 0, 0, 0);
-        const double ms = ms_since(t0);
-        CHECK(rc != 0, "an unposted wait reports a timeout rather than success");
-        CHECK(ms < 40.0, "a 5 ms timeout does NOT resolve on the ~15.6 ms winpthreads tick");
-        printf("         (timeout took %.2f ms)\n", ms);
+        const uint64_t rc = timedwait(handle, 5000, 0, 0, 0, 0);   // 5 ms, nothing will post
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+
+        // ARM 2: the encoding the guest actually compares against.
+        CHECK(rc == prosper::hle::kSceKernelErrorETIMEDOUT,
+              "a timeout returns FreeBSD ETIMEDOUT encoded as the guest reads it (0x8002003c)");
+
+        // ARM 3: bounded on BOTH sides. An upper bound alone passes a wait that returns instantly;
+        // a lower bound alone passes the 15.6 ms tick.
+        CHECK(ms >= 4.0, "it actually waited (a stub returning at once fails this)");
+        CHECK(ms < 12.0, "and returned inside one winpthreads tick of the request, not after it");
+
+        // ARM 1: WHICH primitive served it. This is the arm that reddens on the pre-fix code, which
+        // delegates to winpthreads and never enters precise_sleep, leaving the backend at "none".
+#ifdef _WIN32
+        CHECK(strcmp(host::sleep_backend_name(), "win32-high-resolution-timer") == 0,
+              "the wait was served by the high-resolution timer, NOT ::Sleep's ~15.6 ms tick");
+#else
+        CHECK(strcmp(host::sleep_backend_name(), "posix-sleep-until") == 0,
+              "POSIX keeps the native timed wait; no polling was introduced there");
+#endif
+        printf("         (timeout took %.2f ms via %s)\n", ms, host::sleep_backend_name());
     }
 
-    // ARM 2 - WAKE LATENCY after a post, over twelve posts, judged on the MEDIAN.
-    //
-    // Two things had to be got right here and both were wrong first time round.
-    //
-    // (a) Measure a LATENCY, not a schedule. The obvious form - sleep 5 ms in a poster thread, assert
-    //     the wait returned by ~6.5 ms - failed, because the poster's own std::this_thread::sleep_for
-    //     is subject to the SAME winpthreads tick this fix is about: a "5 ms" post landed at ~12 ms and
-    //     the arm blamed the code under test for its own harness. The poster now records when it
-    //     actually posted, and the assertion is on (wake - post).
-    //
-    // (b) Judge a DISTRIBUTION, not one sample. Single latencies ranged 0.11-1.65 ms across five runs,
-    //     so any single-sample threshold either flakes or is too loose to discriminate - and
-    //     discriminating is the entire point, since the Windows fix buys timeout accuracy WITH wake
-    //     latency and a future change could widen the poll slice. A flat 2 ms slice yields latency
-    //     roughly uniform on [0, 2] ms, median ~1.0; the adaptive 200 us slice gives a median around
-    //     0.3. A median bound of 0.8 ms separates those two designs and tolerates an outlier, which a
-    //     max bound cannot do.
+    // ARM 4: an already-posted semaphore is taken by the trywait fast path and never enters the loop.
     {
-        const int kPosts = 12;
-        std::vector<double> lat;
-        lat.reserve(kPosts);
-        for (int i = 0; i < kPosts; i++) {
-            std::atomic<bool> posted{false};
-            std::atomic<long long> post_ticks{0};
-            std::thread poster([&] {
-                std::this_thread::sleep_for(std::chrono::milliseconds(3));   // WHEN is not asserted
-                post_ticks.store((long long)clk::now().time_since_epoch().count());
-                posted = true;
-                post(handle, 0, 0, 0, 0, 0);
-            });
-            const uint64_t rc = timedwait(handle, 2000000, 0, 0, 0, 0);   // 2 s budget
-            const long long wake = (long long)clk::now().time_since_epoch().count();
-            poster.join();
-            if (rc != 0 || !posted.load()) { CHECK(false, "each post releases its wait"); break; }
-            lat.push_back(std::chrono::duration<double, std::milli>(
-                clk::duration(wake - post_ticks.load())).count());
-        }
-        CHECK((int)lat.size() == kPosts, "every post released its wait rather than timing out");
-        if ((int)lat.size() == kPosts) {
-            std::vector<double> s = lat;
-            std::sort(s.begin(), s.end());
-            const double med = s[s.size() / 2];
-            // 5 ms, and the loose bound is deliberate. What this arm CAN catch is a gross
-            // regression: reverting to winpthreads (15.6 ms) or widening the poll slice to tens
-            // of milliseconds. What it CANNOT do is separate the adaptive 0.5 ms slice from a
-            // flat 2 ms one, and an earlier revision of this arm claimed exactly that with a
-            // 0.8 ms bound - it failed 3 runs in 5. The reason is measured: a short
-            // high-resolution-timer sleep on this host has a ~0.52 ms floor whatever is
-            // requested, so the two designs give median latencies of roughly 0.5 and 1.0 ms and
-            // their run-to-run spread overlaps. Tightening the bound until it passed would have
-            // produced a flaky arm; claiming the discrimination it cannot make would have been
-            // worse. The slice length is documented at the call site instead, with its
-            // measurement.
-            CHECK(med < 5.0,
-                  "median wake latency is milliseconds-not-ticks: no reversion to the 15.6 ms path");
-            printf("         (wake latency: median %.3f ms, min %.3f, max %.3f over %d posts)\n",
-                   med, s.front(), s.back(), kPosts);
-        }
-    }
-
-    // ARM 3 - an ALREADY-posted semaphore costs nothing and never enters the loop.
-    {
-        post(handle, 0, 0, 0, 0, 0);
+        CHECK(post(handle, 0, 0, 0, 0, 0) == 0, "post succeeds");
         const auto t0 = clk::now();
         const uint64_t rc = timedwait(handle, 1000000, 0, 0, 0, 0);
-        const double ms = ms_since(t0);
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         CHECK(rc == 0, "an already-posted semaphore is acquired");
-        CHECK(ms < 1.0, "...immediately, via the trywait fast path");
-        printf("         (fast path took %.3f ms)\n", ms);
+        CHECK(ms < 1.0, "...immediately, without entering the poll loop");
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
