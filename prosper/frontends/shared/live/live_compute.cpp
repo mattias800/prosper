@@ -1151,6 +1151,20 @@ struct VulkanComputeContext {
     uint64_t storage_result_snapshot_bytes = 0;
     uint64_t image_result_snapshot_copies = 0;
     uint64_t image_result_snapshot_bytes = 0;
+    // WHY each snapshot was taken. The total above cannot be acted on: measured on GTA V gameplay
+    // it is 35 GB in one routed run and 48% of all CPU cycles land in the memmove underneath it,
+    // but the adaptive storage-result path already halves the rate (measured: disabling it doubles
+    // snapshots/pool-hit from 0.0715 to 0.1404), so the remaining traffic is whatever that path
+    // never sees. Two branches reach the copy without consulting it -- an early return for
+    // host-data sources, and read/modify/write or partial storage targets, which genuinely need an
+    // exact baseline. Which of those dominates decides whether there is anything left to win here,
+    // and no existing counter separates them. Same reasoning as the res_buffer_* leaves.
+    uint64_t snapshot_reason_host_data_copies = 0;
+    uint64_t snapshot_reason_host_data_bytes = 0;
+    uint64_t snapshot_reason_rmw_copies = 0;
+    uint64_t snapshot_reason_rmw_bytes = 0;
+    uint64_t snapshot_reason_changed_copies = 0;
+    uint64_t snapshot_reason_changed_bytes = 0;
     VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
@@ -1677,9 +1691,12 @@ struct VulkanComputeContext {
                write_watch_promotion_budget.try_consume(source_bytes);
     }
 
+    enum class SnapshotReason { Unattributed, HostData, ReadModifyWrite, ContentChanged };
+
     void remember_image_source_snapshot(CachedComputeImage& cached,
                                         const uint8_t* source, size_t bytes,
-                                        bool storage_result = false) {
+                                        bool storage_result = false,
+                                        SnapshotReason reason = SnapshotReason::Unattributed) {
         if (!source) return;
         cached.source_snapshot.assign(source, source + bytes);
         ++image_source_snapshot_copies;
@@ -1687,6 +1704,15 @@ struct VulkanComputeContext {
         if (storage_result) {
             ++storage_result_snapshot_copies;
             storage_result_snapshot_bytes += bytes;
+        }
+        switch (reason) {
+        case SnapshotReason::HostData:
+            ++snapshot_reason_host_data_copies; snapshot_reason_host_data_bytes += bytes; break;
+        case SnapshotReason::ReadModifyWrite:
+            ++snapshot_reason_rmw_copies; snapshot_reason_rmw_bytes += bytes; break;
+        case SnapshotReason::ContentChanged:
+            ++snapshot_reason_changed_copies; snapshot_reason_changed_bytes += bytes; break;
+        case SnapshotReason::Unattributed: break;
         }
     }
 
@@ -2006,7 +2032,8 @@ struct VulkanComputeContext {
         } else if (!upload_skipped && source && source_snapshot_required) {
             cached.write_watch_stable_validations = 0;
             remember_image_source_snapshot(
-                cached, source, key.guest_bytes, key.storage);
+                cached, source, key.guest_bytes, key.storage,
+                SnapshotReason::ContentChanged);
             // Do not trust the new mirror until the corresponding transfer completes. A failed
             // submit leaves this false, so the next use refreshes instead of skipping stale pixels.
             cached.content_valid = false;
@@ -2369,7 +2396,8 @@ struct VulkanComputeContext {
         if (key.host_data) {
             if (current_source)
                 remember_image_source_snapshot(
-                    cached, current_source, key.guest_bytes, true);
+                    cached, current_source, key.guest_bytes, true,
+                    SnapshotReason::HostData);
             cached.write_watch.reset();
             return;
         }
@@ -2389,7 +2417,8 @@ struct VulkanComputeContext {
             // contract because their prior guest bytes are observable by the next dispatch.
             if (current_source)
                 remember_image_source_snapshot(
-                    cached, current_source, key.guest_bytes, true);
+                    cached, current_source, key.guest_bytes, true,
+                    SnapshotReason::ReadModifyWrite);
             if (cached.write_watch && cached.write_watch.rearm()) return;
             cached.write_watch.reset();
             return;
@@ -10457,6 +10486,27 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                         (1024.0 * 1024.0),
                     (unsigned long long)g_compute_storage_transfer_seeds.load(
                         std::memory_order_relaxed));
+                // WHY those snapshots happened. `other` is the remainder and is printed SIGNED --
+                // a negative value means over-attribution, and clamping it would make a broken
+                // partition look like a complete one (the same rule the res_buffer leaves follow).
+                {
+                    const uint64_t attributed =
+                        context.snapshot_reason_host_data_bytes +
+                        context.snapshot_reason_rmw_bytes +
+                        context.snapshot_reason_changed_bytes;
+                    const double mib = 1024.0 * 1024.0;
+                    std::fprintf(stderr,
+                        "[render-timing] compute_snapshot_reason host_data=%llu %.1f MiB "
+                        "rmw=%llu %.1f MiB changed=%llu %.1f MiB other=%+.1f MiB\n",
+                        (unsigned long long)context.snapshot_reason_host_data_copies,
+                        static_cast<double>(context.snapshot_reason_host_data_bytes) / mib,
+                        (unsigned long long)context.snapshot_reason_rmw_copies,
+                        static_cast<double>(context.snapshot_reason_rmw_bytes) / mib,
+                        (unsigned long long)context.snapshot_reason_changed_copies,
+                        static_cast<double>(context.snapshot_reason_changed_bytes) / mib,
+                        (static_cast<double>(context.image_source_snapshot_bytes) -
+                         static_cast<double>(attributed)) / mib);
+                }
                 std::fprintf(stderr,
                     "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
                     (unsigned long long)window.calls,
