@@ -120,11 +120,17 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
-- **The atlas is only ever ~4.75 MiB populated of its 86 MiB span** — falsified 2026-08-27. The
-  `[occupancy]` reading `filled=18/344` is an observation at one instant, not a steady state. With
-  the write trace armed at bucket 200 (`offset=0x83cc000`, target `0x204c3cc000`) the upper atlas
-  takes **32 events, `selected=yes changed-during-window=yes`**, against a positive control at
-  bucket 0 that also fired 32. Do not restart "the guest never fills the upper atlas". (#2998)
+- **The atlas is only ever ~4.75 MiB populated of its 86 MiB span, for the whole run** — falsified
+  2026-08-27, but **read the scope before using this**. With the write trace armed at bucket 200
+  (`offset=0x83cc000`, target `0x204c3cc000`) that bucket takes **32 events, `selected=yes
+  changed-during-window=yes`**, against a positive control at bucket 0 that also fired 32. So the
+  allocation is filled progressively and `filled=19/344` is one instant, not a steady state.
+  **What this does NOT establish:** bucket 200 is byte 52,428,800, i.e. slice **148.8** at
+  `layer_stride=352256` — it sits *below* the interior's slices 186-248, which are buckets
+  **249.9-333.2**. This probe never touched the region the interior samples, and the separate
+  finding that slice 248 reads zero throughout still stands (re-confirmed 2026-08-27). An earlier
+  version of this row said "do not restart 'the guest never fills the upper atlas'" without that
+  qualification, which overstated a probe taken below the range in question. (#2998)
 - **A stale persistent decode cache holds an early, near-empty snapshot** — falsified 2026-08-27.
   `PROSPER_NO_TEXTURE_DECODE_CACHE=1` over `scripts/tomb-raider-PPSA16901/reach-gameplay.pad`
   changes nothing: the atlas still decodes once. Caveat on the instrument: `[occupancy]` is gated
@@ -138,22 +144,31 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 - **The guest CPU writer of the atlas cannot be observed** — falsified 2026-08-27, and the cause
   was an allocator, not the watchpoint. `PROSPER_DMEM_WRITE_TRACE` could not target this title
   because only `sceKernelAllocateMainDirectMemory` published a caller chain, while the title
-  allocates through `sceKernelAllocateDirectMemory`. With both entry points sharing one attribution
-  helper the writer is named immediately: `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing
-  8x16 B per iteration to offsets computed in `%ymm10`. (#2998, #3054)
+  allocates through `sceKernelAllocateDirectMemory`, which minted none — so no selector could name
+  a byte it owns. With both entry points sharing one attribution helper the writer is named
+  immediately: `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing 8x16 B per iteration to
+  offsets computed in `%ymm10`.
+  **Reproduction needs code that is NOT on master.** `attribute_dmem_allocation` is not in this PR
+  and not in `origin/master`; it is tracked in **#3054**. Until it lands, the recipe below reports
+  `caller-chain=0` for this title and the trace refuses to arm — which is the very failure the row
+  retires, so do not read a failed arm as contradicting it. (#2998, #3054)
 
 - **Nothing maps into the atlas per-slice, and no host/kernel write streams into it** — both with
   controls, both new instruments. `PROSPER_MAPWATCH` sees one 1 GiB `map_dmem` covering the atlas,
   established once, never per-slice (control: watching all of dmem shows two maps).
   `PROSPER_HOSTWRITEWATCH` sees **zero** writes into the atlas while its control — the same watch
   over all of dmem — records **107**. So the ~18 slices that do arrive are written by guest CPU
-  stores, which no instrument in the tree can observe.
+  stores, which no instrument in the tree could observe **when this was written**. Superseded
+  2026-08-27: they are observable now — see the writer row in `## Ruled out` (`eboot+0xebb82..`),
+  which also records why the trace could not previously be aimed at this title.
   That is what makes **#3054** the blocking tool: `PROSPER_HWWATCH` is register-relative and cannot
   arm on a fixed guest address, so the one mechanism that would catch a plain guest store is
   unreachable through its current interface.
 
-- **The atlas allocation contains about 4.75 MB of content and nothing else, measured WITHOUT any
-  stride assumption.** `PROSPER_OCCUPANCY=1` walks the guest allocation in 256 KiB buckets and asks
+- **At the moment prosper decodes it, the atlas allocation holds about 4.75 MB of content and
+  nothing above it, measured WITHOUT any stride assumption.** (Scope corrected 2026-08-27: this is
+  one instant, not the whole run. Bucket 200 is written later — see `## Ruled out`. The interior's
+  own slices 186-248, buckets 249.9-333.2, are a separate question and remain unwritten.) `PROSPER_OCCUPANCY=1` walks the guest allocation in 256 KiB buckets and asks
   only "is there content here", so it cannot be fooled by a wrong per-slice layout — which every
   earlier measurement could, since they all addressed slices through `layer_stride`:
 
@@ -192,11 +207,12 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   receives about eighteen slices' worth. Whatever moves DDS content into this allocation is doing so
   for a small fraction of what the title loads.
 
-- **Everything on prosper's side of the interior defect is measured and correct; the atlas is
-  genuinely unpopulated in guest memory.** Twelve candidates eliminated, each with its control or
+- **Everything on prosper's side of the interior defect is measured and correct; the slices the
+  interior samples are genuinely unpopulated in guest memory.** (Scoped 2026-08-27 — see
+  `## Ruled out`.) Twelve candidates eliminated, each with its control or
   its stated scope: layer index (traced twice to a constant 248), flat interpolation (#3051, the
   title never sets FLAT_SHADE), mixed-slice triangles (constant per draw), stale decode cache (guest
-  memory probed ~138,000 times, never becomes non-zero), per-slice stride and mip offset (both
+  memory at the sampled slice probed ~138,000 times, never becomes non-zero), per-slice stride and mip offset (both
   layouts tested), `depth` mis-decode (raw T# confirms 256 / base_array 0), truncated reads
   (`short_reads=0`), partial residency (one `rw-s` mapping covers the whole span), base-address
   mis-decode (dword0 `<< 8` matches), compute STORE (control fired, no compute binds it), recorded
@@ -205,8 +221,10 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   remaining work is a forward investigation from the title's asset/streaming logic, not from the
   frame. Full evidence on #2998.
 
-- **The interior's wrong textures are not prosper mis-reading the atlas. The atlas is genuinely
-  almost empty in GUEST memory, for the whole run.** Measured, each point with the control that
+- **The interior's wrong textures are not prosper mis-reading the atlas. The slices the interior
+  samples are genuinely empty in GUEST memory for the whole run** — narrowed 2026-08-27 from "the
+  atlas is almost empty for the whole run", which is false: the allocation IS filled progressively
+  below slice ~149. The claim that survives is about the interior's OWN slice range. Measured, each point with the control that
   makes it mean something:
   - `PROSPER_SLICEMAP=1`: the 512x512x256 world atlas decodes with **slices 0-13 populated and
     14-255 empty** — contiguous, from the full 256-character map. **`short_reads=0`**, so every
@@ -214,7 +232,9 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
     scan samples one byte in 61.)
   - `PROSPER_SLICEWATCH=1` samples GUEST memory at slice 248 on the reuse path, which runs about
     138,000 times per route: it reads **zero on the first reference and never becomes non-zero**.
-    So the guest never fills it, at any point — which retires the decode-cache hypothesis properly.
+    So the guest never fills **slice 248**, at any point — which retires the decode-cache
+    hypothesis properly. Note the scope: this is one slice inside the interior's range, and is NOT
+    evidence about the allocation as a whole (`## Ruled out` records a write at bucket 200).
     An earlier attempt to retire it was **void**: the `PROSPER_NO_TEXTURE_DECODE_CACHE` run never
     left the title screen (its colour count sits at the title's ~210k for all 300 s), so its 233
     re-decodes all happened before the level streamed anything.
@@ -224,7 +244,8 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   - The world shader samples slice **248**, traced twice: `vertexIndex*24 + 3` from binding 7, a byte
     constant across all 4,206 vertices, through `OpBitFieldUExtract(dword, 24, 8)` to the fragment
     varying.
-  So the guest samples a slice that nothing ever wrote, and prosper reads that correctly. **The
+  So the guest samples a slice that nothing ever wrote — that slice, not the whole allocation —
+  and prosper reads that correctly. **The
   missing piece is an atlas upload path prosper does not perform**, not the array plumbing, which is
   now measured end to end. Compute is excluded; DMA is untested (a `PROSPER_DMA_WATCH_DST` run was
   silent but had no control, so it is not evidence).
