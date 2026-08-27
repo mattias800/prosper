@@ -476,7 +476,10 @@ namespace {
             for (const auto& o : g_readbytes_opens)
                 if (!g_readbytes.count(o.first)) ++opened_never_read;
             for (const auto& r : g_readbytes) total += r.second.first;
-            fprintf(stderr, "[readbytes] %zu path(s) opened, %zu delivered bytes, "
+            // Every field names its own UNIT. g_readbytes.size() is a count of PATHS that
+            // delivered at least one byte -- it was previously printed as "delivered bytes",
+            // which reads as a byte total on a line whose last field really is one.
+            fprintf(stderr, "[readbytes] %zu path(s) opened, %zu path(s) delivered bytes, "
                             "%llu opened-but-never-read, %llu total bytes\n",
                     g_readbytes_opens.size(), g_readbytes.size(),
                     (unsigned long long)opened_never_read, (unsigned long long)total);
@@ -489,7 +492,10 @@ namespace {
                 if (g_readbytes.count(o.first)) ++by_ext[ext].second;
             }
             for (const auto& e : by_ext)
-                fprintf(stderr, "[readbytes]   %-8s opened=%llu read=%llu\n", e.first.c_str(),
+                // open-events vs paths-read: DIFFERENT units. `first` accumulates o.second,
+                // an open-event count; `second` counts distinct paths that were read. Printing
+                // them as `opened=`/`read=` invited reading them as a matched pair.
+                fprintf(stderr, "[readbytes]   %-8s open-events=%llu paths-read=%llu\n", e.first.c_str(),
                         (unsigned long long)e.second.first,
                         (unsigned long long)e.second.second);
             fflush(stderr);

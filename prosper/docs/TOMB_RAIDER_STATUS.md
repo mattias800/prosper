@@ -120,6 +120,28 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **The atlas is only ever ~4.75 MiB populated of its 86 MiB span** — falsified 2026-08-27. The
+  `[occupancy]` reading `filled=18/344` is an observation at one instant, not a steady state. With
+  the write trace armed at bucket 200 (`offset=0x83cc000`, target `0x204c3cc000`) the upper atlas
+  takes **32 events, `selected=yes changed-during-window=yes`**, against a positive control at
+  bucket 0 that also fired 32. Do not restart "the guest never fills the upper atlas". (#2998)
+- **A stale persistent decode cache holds an early, near-empty snapshot** — falsified 2026-08-27.
+  `PROSPER_NO_TEXTURE_DECODE_CACHE=1` over `scripts/tomb-raider-PPSA16901/reach-gameplay.pad`
+  changes nothing: the atlas still decodes once. Caveat on the instrument: `[occupancy]` is gated
+  on `is_array && depth > 64`, so "one print" is **not** "one decode" — do not quote it as one.
+  (#2998)
+- **`base_array` is dropped between the T# and the uploader** — falsified 2026-08-27. It is
+  applied in `agc_shader_layout.cpp` `image_base_level_view()`:
+  `view.base += (uint64_t)d.base_array * stride;` with `view.layer_stride = stride` set alongside,
+  on the `thin_2d_layered` `depth > 1` path. `live_renderer.cpp` never names `base_array` because
+  the shift is already folded into `gpu_addr`, which is correct, not a gap. (#2998)
+- **The guest CPU writer of the atlas cannot be observed** — falsified 2026-08-27, and the cause
+  was an allocator, not the watchpoint. `PROSPER_DMEM_WRITE_TRACE` could not target this title
+  because only `sceKernelAllocateMainDirectMemory` published a caller chain, while the title
+  allocates through `sceKernelAllocateDirectMemory`. With both entry points sharing one attribution
+  helper the writer is named immediately: `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing
+  8x16 B per iteration to offsets computed in `%ymm10`. (#2998, #3054)
+
 - **Nothing maps into the atlas per-slice, and no host/kernel write streams into it** — both with
   controls, both new instruments. `PROSPER_MAPWATCH` sees one 1 GiB `map_dmem` covering the atlas,
   established once, never per-slice (control: watching all of dmem shows two maps).
@@ -136,16 +158,37 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   earlier measurement could, since they all addressed slices through `layer_stride`:
 
   ```
-  [occupancy] 0x20491cc000 span=86 MiB bucket=256KiB filled=18/344 last_filled_bucket=18
-  .##################...........(325 more)
+  [occupancy] 0x20491cc000 span=86 MiB bucket=256KiB FULL-BUCKET scan filled=19/344 scanned
+              (of 344 total) last_filled_bucket=18 unreadable=0
+  ###################...........(325 more)
   ```
 
-  Content sits in buckets 1-18 and stops. The interior samples slices 186-248, which lie 48-87 MB
-  into the allocation. So the data those draws need is not in this allocation at ANY layout, and the
-  earlier per-slice findings were not artefacts of the stride the probes assumed.
+  Content sits in buckets 0-18 and stops. At `layer_stride=352256` over `depth=256`, the interior's
+  slices 186-248 begin **65.5 MB** into the allocation and end at 87.4 MB. So the data those draws
+  need is not in this allocation *at the moment of decode*, at any layout, and the earlier per-slice
+  findings were not artefacts of the stride the probes assumed.
+
+  **Two corrections to what this box used to say.** The reading was `filled=18/344` with bucket 0
+  shown EMPTY, and the range was given as "48-87 MB". Both were wrong. `[occupancy]` sampled only
+  the first 512 B of each 256 KiB bucket (0.195%) and reported that head sample as a census, so a
+  bucket whose content began past the window read as empty -- which is exactly what happened to
+  bucket 0, and `[slicemap]` contradicted it at the time. It now scans every byte of each bucket and
+  distinguishes unreadable (`?`) from empty (`.`). The lower bound of the slice range was simple
+  arithmetic error. Neither changes the conclusion, and note the scope this box does NOT establish:
+  it is one observation at decode time, not a statement about the whole run -- see the entry below.
+
+- **The allocation is NOT static, and the upper region IS written later in the run.** With the write
+  trace armed at bucket 200 (`PROSPER_DMEM_WRITE_TRACE=2:0x40000000:0x83cc000:128`, target
+  `0x204c3cc000`) the upper atlas takes **32 events, `selected=yes changed-during-window=yes`**,
+  against a positive control at bucket 0 that also fires 32. So "the guest never fills the upper
+  atlas" is false; what the occupancy box above measures is the state at the one moment prosper
+  decodes. The writer is `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing 8x16 B per
+  iteration to offsets computed in `%ymm10`.
 - **The title reads its textures; they simply do not arrive here.** `PROSPER_READBYTES=1` counts
-  bytes delivered per path with no stack walk: **`.DDS opened=299 read=297`** over a route, alongside
-  `.TRM 98/52` and smaller sets. So asset I/O works and 297 texture files are read, while this atlas
+  bytes delivered per path with no stack walk: **`.DDS open-events=299 paths-read=297`** over a
+  route, alongside `.TRM 98/52` and smaller sets. (Those two fields carry DIFFERENT units -- open
+  *events* against distinct *paths* read -- and were previously printed as `opened=`/`read=`, which
+  invited reading them as a matched pair.) So asset I/O works and 297 texture files are read, while this atlas
   receives about eighteen slices' worth. Whatever moves DDS content into this allocation is doing so
   for a small fraction of what the title loads.
 

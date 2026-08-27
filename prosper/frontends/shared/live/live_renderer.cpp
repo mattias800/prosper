@@ -4352,25 +4352,56 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     const uint64_t span = (uint64_t)r.layer_stride_bytes * r.depth;
                                     const uint64_t bucket = 256u * 1024u;
                                     const uint64_t n = span / bucket;
+                                    if (!n) {
+                                        // filled=0/0 read as "scanned and empty". It is neither.
+                                        fprintf(stderr,
+                                                "[occupancy] 0x%llx span=%llu bytes -- NO complete "
+                                                "256KiB bucket (layer_stride=%u depth=%u); "
+                                                "NOTHING SCANNED\n",
+                                                (unsigned long long)r.gpu_addr,
+                                                (unsigned long long)span,
+                                                r.layer_stride_bytes, r.depth);
+                                        fflush(stderr);
+                                    } else {
+                                    // Scan every byte of each bucket, not a head sample. This probed
+                                    // only the first 512 B of each 256 KiB bucket (0.195%), so a
+                                    // bucket whose content began past that window read as EMPTY --
+                                    // a false negative that reached TOMB_RAIDER_STATUS.md as
+                                    // "not in this allocation at ANY layout".
+                                    const uint64_t scan_n = n < 512u ? n : 512u;
+                                    std::vector<uint8_t> probe(64u * 1024u);
                                     std::string map;
-                                    uint64_t filled = 0, last_filled = 0;
-                                    for (uint64_t i = 0; i < n && i < 512; ++i) {
-                                        uint8_t probe[512] = {0};
-                                        const size_t got = copy_resource(
-                                            probe, r.gpu_addr + i * bucket, sizeof probe);
-                                        bool any = false;
-                                        for (size_t k = 0; k < got && !any; ++k) any = probe[k] != 0;
+                                    uint64_t filled = 0, last_filled = 0, unreadable = 0;
+                                    for (uint64_t i = 0; i < scan_n; ++i) {
+                                        bool any = false, short_read = false;
+                                        for (uint64_t off = 0; off < bucket && !any; off += probe.size()) {
+                                            const size_t want = (size_t)std::min<uint64_t>(
+                                                probe.size(), bucket - off);
+                                            const size_t got = copy_resource(
+                                                probe.data(), r.gpu_addr + i * bucket + off, want);
+                                            for (size_t k = 0; k < got && !any; ++k)
+                                                any = probe[k] != 0;
+                                            if (got < want) { short_read = true; break; }
+                                        }
                                         if (any) { ++filled; last_filled = i; }
-                                        map += any ? '#' : '.';
+                                        else if (short_read) ++unreadable;
+                                        // '?' is NOT '.': prosper could not read it, so it is
+                                        // unknown, not known-empty.
+                                        map += any ? '#' : (short_read ? '?' : '.');
                                     }
                                     fprintf(stderr,
                                             "[occupancy] 0x%llx span=%llu MiB bucket=256KiB "
-                                            "filled=%llu/%llu last_filled_bucket=%llu\n%s\n",
+                                            "FULL-BUCKET scan filled=%llu/%llu scanned "
+                                            "(of %llu total) last_filled_bucket=%llu "
+                                            "unreadable=%llu ('?' = unreadable, NOT empty)\n%s\n",
                                             (unsigned long long)r.gpu_addr,
                                             (unsigned long long)(span >> 20),
-                                            (unsigned long long)filled, (unsigned long long)n,
-                                            (unsigned long long)last_filled, map.c_str());
+                                            (unsigned long long)filled,
+                                            (unsigned long long)scan_n, (unsigned long long)n,
+                                            (unsigned long long)last_filled,
+                                            (unsigned long long)unreadable, map.c_str());
                                     fflush(stderr);
+                                    }
                                 }
                             }
                             if (is_array && r.depth > 64u && PROSPER_ENV_ON("PROSPER_SLICEWATCH")) {
@@ -4391,18 +4422,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ++watched;
                                 if (!nz && said_zero.insert(r.gpu_addr).second) {
                                     fprintf(stderr, "[slicewatch] slice %llu of 0x%llx reads ZERO "
-                                                    "(got=%zu) on reference %llu\n",
+                                                    "(got=%zu of %zu) on reference %llu%s\n",
                                             (unsigned long long)probe_slice,
-                                            (unsigned long long)r.gpu_addr, got,
-                                            (unsigned long long)watched);
+                                            (unsigned long long)r.gpu_addr, got, sizeof buf,
+                                            (unsigned long long)watched,
+                                            r.layer_stride_bytes ? "" : " [probe used the tw*th "
+                                                                        "stride FALLBACK, not a "
+                                                                        "guest-declared stride]");
                                 }
                                 if (nz && said_nz.insert(r.gpu_addr).second) {
-                                    fprintf(stderr, "[slicewatch] slice %llu of 0x%llx BECAME "
-                                                    "NON-ZERO on reference %llu -- the guest filled "
-                                                    "it after our decode\n",
+                                    // A transition needs a PRIOR zero reading for this address.
+                                    // Without one this is just the first observation, and saying
+                                    // "the guest filled it after our decode" would assert an
+                                    // ordering nothing here measured.
+                                    const bool saw_zero_first = said_zero.count(r.gpu_addr) != 0;
+                                    fprintf(stderr,
+                                            saw_zero_first
+                                              ? "[slicewatch] slice %llu of 0x%llx BECAME NON-ZERO "
+                                                "on reference %llu -- it read ZERO earlier, so the "
+                                                "guest filled it after that reading%s\n"
+                                              : "[slicewatch] slice %llu of 0x%llx reads NON-ZERO on "
+                                                "reference %llu -- FIRST observation, no prior ZERO "
+                                                "reading, so this is NOT an observed transition%s\n",
                                             (unsigned long long)probe_slice,
                                             (unsigned long long)r.gpu_addr,
-                                            (unsigned long long)watched);
+                                            (unsigned long long)watched,
+                                            r.layer_stride_bytes ? "" : " [probe used the tw*th "
+                                                                        "stride FALLBACK, not a "
+                                                                        "guest-declared stride]");
                                 }
                             }
                             fr.td = is_volume ? r.depth : 1u;
