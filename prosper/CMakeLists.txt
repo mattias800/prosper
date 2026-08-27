@@ -648,7 +648,15 @@ if(TARGET prosper_core)
   # other two arms measured a POSTED semaphore, which unfixed winpthreads serves in 0.01 ms -- better
   # than the poll loop, so they preferred the defect. A mechanism assertion cannot be satisfied by a
   # lucky duration and does not flake under load. Mutation-checked: reverting to the winpthreads
-  # delegation reddens two arms and prints "via none".
+  # delegation reddens the MECHANISM arm and prints "via none".
+  #
+  # It used to say "reddens two arms", the second being a wall-clock ceiling, and that ceiling
+  # is gone: measured across five reverted runs the defect delivered at 14.69, 12.06, 17.75,
+  # 10.00 and 15.32 ms, so a 12 ms ceiling PASSES the defect. A quantized wait returns at the
+  # next tick boundary, so the defect's latency distribution overlaps the fix's and no
+  # single-run bound separates them. The same ceiling also flaked on macOS/Rosetta at 18.54 and
+  # 46.46 ms, where the native call is untouched by the fix anyway. The mechanism arm is the
+  # discriminator; the bounds that remain are a stub/unit guard.
   add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
   target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
   add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)

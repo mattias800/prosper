@@ -16,8 +16,11 @@
 // on a loaded host.
 //
 // So the arms are:
-//   1. MECHANISM  - the wait was served by the high-resolution timer, not ::Sleep's tick. Reddens on
-//                   the pre-fix code, which never touches precise_sleep at all.
+//   1. MECHANISM  - WHICH primitive served the wait. On Windows: the high-resolution timer, not
+//                   ::Sleep's tick -- reddens on the pre-fix code, which never touches
+//                   precise_sleep at all. On POSIX the assertion is the OPPOSITE value,
+//                   "none", because the native sem_timedwait is kept there and must not start
+//                   polling; the two are different assertions, not one with a platform tweak.
 //   2. ENCODING   - the timeout returns exactly 0x8002003c, FreeBSD ETIMEDOUT as the guest reads it.
 //                   Nothing else in the suite covers this path's encoding.
 //   3. BOUNDS     - a stub/unit/hang guard, and NOT the discriminator. With the fix reverted the
@@ -27,7 +30,12 @@
 //                   ~[5, 20.6] ms and the two distributions overlap. The same 12 ms ceiling
 //                   also flaked on macOS/Rosetta at 18.54 ms, where the native call is
 //                   untouched by this change anyway. Arm 1 caught all five.
-//   4. FAST PATH  - an already-posted semaphore never enters the loop.
+//   4. FAST PATH  - an already-posted semaphore is acquired at once, asserted as a COUNT of 0
+//                   afterwards rather than as a latency. The latency bound is kept as well but
+//                   is Windows-tight / POSIX-loose, and it cannot see the fast path at all:
+//                   the pre-loop trywait and the first call inside the loop are identical, so
+//                   deleting the fast path changes no duration. "Never enters the loop" is
+//                   therefore NOT what this arm asserts, and there is no loop on POSIX.
 //
 // The header being right about the arms is part of the test. Its first version was wrong about
 // them in the same breath as the arms were wrong, and the confident label is what stopped anyone
@@ -61,20 +69,34 @@ int main() {
     HleFn sem_init_fn = Hle::lookup(nid_hash("scePthreadSemInit").c_str());
     HleFn timedwait   = Hle::lookup(nid_hash("scePthreadSemTimedwait").c_str());
     HleFn post        = Hle::lookup(nid_hash("scePthreadSemPost").c_str());
+    // Optional: used only to make ARM 4 assert the COUNT rather than a duration. Guarded so a
+    // build where it is unregistered loses one assertion instead of the whole test.
+    HleFn getvalue    = Hle::lookup(nid_hash("scePthreadSemGetvalue").c_str());
     CHECK(sem_init_fn != nullptr, "scePthreadSemInit is registered");
     CHECK(timedwait != nullptr, "scePthreadSemTimedwait is registered");
     CHECK(post != nullptr, "scePthreadSemPost is registered");
     if (!sem_init_fn || !timedwait || !post) { printf("== FAIL (unresolved) ==\n"); return 1; }
 
-    // The guest handle is an opaque slot; ensure_sem backs it with a real sem_t. Initialised through
-    // the HLE and CHECKED - the first version declared a bare `sem_t slot;` and called init with its
-    // result ignored, so an init that silently failed would have left every arm below operating on an
-    // uninitialised object.
-    sem_t slot;
+    // The guest handle is a POINTER CELL, not a semaphore. k_sem_init does
+    //     `*(void**)(uintptr_t)a0 = s;`
+    // i.e. it heap-allocates the sem_t and writes the POINTER through the handle, and every
+    // other member of the family reads it back with an 8-byte load (`ensure_sem`). So the slot
+    // must be pointer-sized.
+    //
+    // This was `sem_t slot;`, which is a latent stack overwrite that happens to be invisible
+    // on two of three platforms: winpthreads' sem_t is a pointer (8 bytes) and glibc's is 32,
+    // but **Darwin's is `int`** -- so on macOS the 8-byte write ran four bytes past a 4-byte
+    // automatic. Found in review of the very PR whose purpose was to green the macOS job.
+    void* slot = nullptr;
     const uint64_t handle = (uint64_t)(uintptr_t)&slot;
     // Asserts that init REPORTS success, not that the count is observably 0 -- the count is then
-    // established by arm 1 timing out rather than being acquired. The earlier message claimed the
-    // stronger thing.
+    // established by arm 1 timing out rather than being acquired.
+    //
+    // Weaker still than that, and named rather than left implied: k_sem_init DISCARDS
+    // sem_init's return and returns 0 unconditionally, so this CHECK cannot fail as the code
+    // stands. It is kept as a tripwire for the day that is fixed, and the fix is #3068 --
+    // which matters on macOS, where unnamed POSIX semaphores are ENOSYS and this family may
+    // therefore be operating on an uninitialised object while reporting success.
     CHECK(sem_init_fn(handle, 0, 0, 0, 0, 0) == 0, "scePthreadSemInit reports success");
 
     // ARM 1 + 2 + 3: one unposted wait, three independent properties.
@@ -147,6 +169,16 @@ int main() {
         const uint64_t rc = timedwait(handle, 1000000, 0, 0, 0, 0);
         const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         CHECK(rc == 0, "an already-posted semaphore is acquired");
+        // The count is the observable, and it is what "acquired" MEANS. Review found the arm
+        // could not see its own stated purpose: the pre-loop sem_trywait and the first
+        // statement inside the loop are the identical call, so deleting the fast path is
+        // invisible to any timing bound. A count of 0 after the acquire is not.
+        if (getvalue) {
+            int v = -1;
+            CHECK(getvalue(handle, (uint64_t)(uintptr_t)&v, 0, 0, 0, 0) == 0,
+                  "getvalue succeeds after the acquire");
+            CHECK(v == 0, "...and the count really was consumed, not merely reported as taken");
+        }
         // Same asymmetry as ARM 3, and the same reasoning: 1 ms is a fair bound on a real x86
         // host, and on an emulated-x86 CI VM it is a latent flake that happened not to fire yet.
         // 100 ms still fails a fast path that fell through to waiting out the 1 s timeout, which
