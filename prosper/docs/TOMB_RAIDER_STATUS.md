@@ -127,6 +127,15 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **"The world is textured" (2026-08-27 blog entry / #3050 progression evidence)** — RETRACTED the
+  same day. The capture was the game blitting its own pre-rendered loading picture,
+  `2/PIX/HD/MANSION.DDS`: pixel-compared against the published screenshot it scores **mean abs diff
+  0.02/255, 100.00% of pixels within 8/255**, while the next closest asset scores 52.77. Blitting a
+  full-screen 2D image requires no world rendering, so the frame never evidenced what it was
+  captioned as. Recorded as **instrument trap 230**. Before publishing an unusually good frame from
+  this title, decode every same-size `PIX/**/*.DDS` in the dump and diff against it — the check is
+  seconds and the real match is unambiguous. (#2990, #2998)
+
 - **The atlas is only ever ~4.75 MiB populated of its 86 MiB span, for the whole run** — falsified
   2026-08-27, but **read the scope before using this**. With the write trace armed at bucket 200
   (`offset=0x83cc000`, target `0x204c3cc000`) that bucket takes **32 events, `selected=yes

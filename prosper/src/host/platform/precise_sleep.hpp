@@ -27,4 +27,35 @@ SleepBackend sleep_backend();
 // A stable spelling of sleep_backend() for assertions and logs. Never null.
 const char* sleep_backend_name();
 
+// The next boundary of a fixed periodic grid strictly after `now_ns`, where the grid is every
+// `origin_ns + k * period_ns`. Intended to be called after a wait on the previous boundary has
+// completed, as the WHOLE of a pacing loop's per-iteration work: because the answer depends only
+// on (origin, now, period) and not on the deadline just waited, one expression covers the
+// ordinary case, an early return, and a stall of any length.
+//
+// Phase-exact by construction, which is the property that motivated it. The obvious alternative
+// -- carry a deadline and advance it by one period, re-anchoring to `now + period` when it falls
+// behind -- keeps the PERIOD but loses the PHASE at every re-anchor, and then holds the wrong
+// phase forever. Two ways in, neither exotic: a loop whose first deadline is already stale
+// because the grid was anchored earlier by someone else, and any wait that overruns by more than
+// a period (which the Win32SleepFallback path does by 14-30 ms whenever the high-resolution timer
+// is unavailable). Snapping to the grid instead cannot drift in phase or period, however late it
+// is called. Caught in review of the #3024 vblank pump, where the consumers of two vblank clocks
+// can compare them and phase agreement is the point.
+//
+// Returns ONE boundary, never a backlog: a caller that has missed several abandons them. Pacing
+// consumers respond to events arriving, so replaying missed slots back to back hands them a burst
+// they read as several periods of progress in one instant.
+constexpr uint64_t next_grid_deadline_ns(uint64_t origin_ns, uint64_t now_ns,
+                                        uint64_t period_ns) {
+    // A zero period has no boundaries; yielding `now_ns` makes the caller's wait a no-op rather
+    // than dividing by zero. It still spins, and deliberately so -- silently substituting some
+    // period would invent a rate nobody asked for.
+    if (period_ns == 0) return now_ns;
+    // A grid anchored in the future: the first boundary IS the origin. Reachable through the
+    // videoout test seam, which can anchor the epoch to a fake time.
+    if (now_ns < origin_ns) return origin_ns;
+    return origin_ns + ((now_ns - origin_ns) / period_ns + 1) * period_ns;
+}
+
 }  // namespace prosper::host
