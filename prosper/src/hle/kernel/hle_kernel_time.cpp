@@ -1142,6 +1142,15 @@ namespace {
         // the obvious hand-rolled spelling -- advance by a period, re-anchor to now+period when
         // behind -- silently loses the phase, and an earlier draft of this loop also halved the
         // rate. See its comment in precise_sleep.hpp.
+        //
+        // One composition caveat, recorded because the helper alone does not cover it (#3074):
+        // this loop assumes the wait cannot return EARLY. If it does, the next `now` is still
+        // below the same boundary, the helper correctly returns that boundary again, and this
+        // thread posts two kevents for one vblank. Reachable only on the Win32SleepFallback
+        // path, which does not re-check the clock the way the high-resolution timer path does;
+        // bounded (one extra event, and vblank posts coalesce) so it is filed rather than
+        // worked around here. The fix belongs in precise_sleep, which already documents the
+        // post-condition it fails to enforce on that one path.
         const uint64_t origin_ns = prosper_vo_vblank_grid_origin_ns();
         const uint64_t period_ns = prosper_vo_vblank_period_ns();
         for (;;) {

@@ -738,8 +738,19 @@ HLE(g_vo_resstatus)   {
 // pump computes from, not a hope about two constants matching.
 // Internal linkage on purpose: the "epoch before now" ordering invariant below is only
 // enforceable by reading this one file, so nothing outside it may reach these DIRECTLY. The
-// two `extern "C"` accessors further down publish the origin and the period as values, which
-// cannot break that invariant -- a caller can schedule on the grid but cannot move it.
+// two `extern "C"` accessors further down publish the origin and the period as VALUES, so no
+// caller can retarget the grid.
+//
+// But the FIRST caller does set where it starts, and after #3024 that caller is usually the
+// kevent pump. `vblank_epoch_ns()` is a first-use-anchored static, and the pump's read at
+// hle_kernel_time.cpp reaches it as soon as a title registers a vblank event -- typically
+// before the title's first GetVblankStatus or WaitVblank call. So the epoch is now normally
+// anchored at vblank-event registration rather than at the first guest status query, which
+// moves GetVblankStatus's first `count` and processTime's baseline, and shifts WaitVblank's
+// wake instants in PHASE with them (they derive from the same t0). That is a deliberate
+// consequence on every platform, not only Windows, and it is more faithful -- the epoch now
+// tracks when the title started caring about vblanks rather than when it first asked -- but
+// it is a change, and a comment claiming callers cannot move the grid would have hidden it.
 namespace {
 constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
 // Deterministic clock used only by test_videoout's phase-integration check. Zero leaves the
