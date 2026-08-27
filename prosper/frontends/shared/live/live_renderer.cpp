@@ -5357,6 +5357,35 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // The loop above filled `slice_count` slices. A cube publishes them through
                             // HEIGHT (fr.th = th*6) and an array through LAYERS (fr.sample_count), so the
                             // two completion flags must stay distinct.
+                            if (getenv("PROSPER_SLICEMAP") && !is_cube && slice_count > 1) {
+                                // #2998: which decoded slices actually hold content, across the
+                                // WHOLE range rather than a prefix. Written because a prefix cannot
+                                // answer the question that matters -- an array whose first slices
+                                // decode and whose later ones are empty looks identical, in every
+                                // per-layer checksum of the first eight, to one that decoded
+                                // completely. The SHAPE of the map is the measurement: content
+                                // concentrated at the start means the addressing walks off the
+                                // populated data (or the guest has not written it), while gaps
+                                // spread through the range mean something else.
+                                //
+                                // It found the fact that matters for Tomb Raider: 14 of 256.
+                                const size_t lsz = (size_t)tw * th * 4u;
+                                std::string map;
+                                uint32_t nonempty = 0;
+                                for (uint32_t L = 0; L < slice_count; ++L) {
+                                    if ((size_t)(L + 1) * lsz > texture_pixels.size()) break;
+                                    const uint8_t* q = texture_pixels.data() + (size_t)L * lsz;
+                                    bool any = false;
+                                    for (size_t i = 0; i < lsz && !any; i += 61u)
+                                        any = (q[i] != 0);
+                                    nonempty += any;
+                                    if ((L % 8u) == 0u) map += any ? '#' : '.';
+                                }
+                                fprintf(stderr, "[slicemap] addr=0x%llx %ux%u slices=%u nonempty=%u "
+                                                "map(every 8th)=%s\n",
+                                        (unsigned long long)r.gpu_addr, tw, th, slice_count,
+                                        nonempty, map.c_str());
+                            }
                             if (is_cube) cube_done = true; else array_done = true;
                             if (resource_compute_depth_hybrid && !decoded_reuse) {
                                 std::array<std::vector<float>, 6> overlay_faces;

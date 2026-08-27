@@ -1856,8 +1856,25 @@ struct SpirvCompute {
     void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                uint32_t layer_bits, uint32_t out[4]) {
         uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        // #2998: PROSPER_FORCE_LAYER=<n> substitutes a constant array layer, and SAYS SO, which is
+        // the point -- it separates "the shader is given the wrong slice" from "the slice it asks
+        // for holds the wrong content", two failures that look identical on screen. A probe that
+        // could not show its own lever moved would leave a null meaning nothing.
+        //
+        // This forces guest-visible state, so its output illustrates an investigation and is never
+        // acceptance evidence for a rendered frame.
+        static const int forced_layer = [] {
+            const char* e = getenv("PROSPER_FORCE_LAYER"); return e ? atoi(e) : -1; }();
+        uint32_t layer_use = bcf(layer_bits);
+        if (forced_layer >= 0) {
+            layer_use = fconstf((float)forced_layer);
+            static uint32_t said = 0;
+            if (said++ < 4u)
+                fprintf(stderr, "[force-layer] binding=%u substituted constant layer %d\n",
+                        binding, forced_layer);
+        }
         uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), layer_use});
         uint32_t res = id();
         if (is_fragment)
             put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});

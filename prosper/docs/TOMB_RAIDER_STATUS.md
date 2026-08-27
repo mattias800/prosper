@@ -120,6 +120,25 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **The interior's wrong textures are NOT the layer index arriving wrong, NOT stale cache, NOT
+  interpolation, and NOT the stride.** What they are is still open, but the search space is much
+  smaller. Measured, in order:
+  - `PROSPER_SLICEMAP=1` (new): the 512x512x256 world atlas decodes with **14 of 256 slices holding
+    content**, all at the start of the range. The 2048x2048x29 array decodes **29 of 29**.
+  - The atlas is decoded **once** per run. With `PROSPER_NO_TEXTURE_DECODE_CACHE=1` it re-decodes
+    **233 times and reports 14 every time**, so a stale cache is not hiding later-streamed slices.
+  - The world shader asks for slice **248**: `vertexIndex*24 + 3` from binding 7, a byte that is
+    constant across all 4,206 vertices of the draw. Traced through
+    `OpBitFieldUExtract(dword, 24, 8)` to the fragment varying at Location 1.
+  - `PROSPER_FORCE_LAYER=248` produces a **completely different frame** from the unforced run
+    (262 colours vs 122,087), so the unforced draws are not all sampling 248 -- different draws use
+    different slices.
+  - `PROSPER_FORCE_LAYER=10` gives full-screen content (184,541 colours); **200 gives 262 colours,
+    almost entirely black**. Slices above the populated range are empty.
+  So the guest indexes a slice our decoded array does not have content for. The leading remaining
+  question is whether `r.depth = 256` describes the guest array's real layer count at all -- if the
+  true array is ~16 layers, an index of 248 means something other than a layer.
+
 - **Missing SPIR-V `Flat` on the varying that carries the array slice is NOT why interiors sample
   the wrong layers.** The gap is real — `is_flat_shaded()` is decoded, used to build the guest's PS
   input control word, and never reaches the SPIR-V (#3051) — but this title never asks for it. A
