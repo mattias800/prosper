@@ -52,7 +52,8 @@ Derive it rather than quoting it — it was first published here as 63.75, which
 pixels' own contribution (a pixel counted as matching may differ by up to 8 per channel, not 0;
 0.75 × 8 = 6.00 is exactly the gap), and a hand-built frame reaches mean 69.67 at overlap 75.00%,
 above the figure the same paragraph called unreachable. A companion claim that the worst case was
-partial coverage was backwards too: at f = 0.25 the bound is only 28.69. Measured alongside it, **100 of 233** structured assets (42.9%) carrying a bright
+partial coverage was backwards too: at f = 0.25 the bound is only 28.69. Measured alongside it,
+**100 of 233** structured assets (42.9%) carrying a bright
 caption panel reach mean 40.5–59.25 while still exceeding the bar, so a ceiling of 40 silently
 dropped nearly half. The case that motivated the ceiling was already rejected by the bar anyway.
 
@@ -60,8 +61,13 @@ The count was first published here as "4 of 13", from a probe that filtered to 1
 excluded every 4K asset — where the worst means live. A structured-asset sample runs roughly 6
 such 1080p assets to 79 4K ones, so that probe saw about 7% of its own population and could not
 express the case it was measuring. The observed worst mean, 59.25, sits under the analytic bound of
-69.75 — a consistency check rather than an agreement, since real assets cannot saturate a bound that
-requires every matching pixel to differ by exactly 8.
+69.75 — a consistency check rather than an agreement. Real assets *approach* the bound without being
+observed to reach it: saturating it needs every matching pixel to differ by exactly 8 *and* the
+non-matching quarter to be pure black. But do not read that as "cannot". An ordinary defect gets
+close — a blit with slightly wrong colour conversion shifts every pixel by a small constant, which
+keeps them inside the 8/255 match window while adding up to 6.00 to the mean. Measured on a real
+asset (`PPSA03001` `sce_sys/pic0.dds`, 24% caption panel): overlap 75.47% at mean 59.36, and with a
+uniform +8 shift overlap 75.97% at mean **65.43** — 94% of the bound, from real content.
 
 **And the two statistics need different gates**, which conflating them hid: `mean` is a whole-frame
 average that darkness cannot corrupt, so two structured images at mean 0.00 are the same image
