@@ -65,6 +65,41 @@ def main():
     out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
     expect(out, "arrivals with an EMPTY queue:         200", "case 0: an empty queue is reported empty")
 
+    # 0b. The (grain=N) field must actually be USED, and this arm exists because review showed the
+    #     headline change of this commit had no arm that would redden if reverted: every other fixture
+    #     logs a grain equal to frames * bpf * channels, so honouring the field and inferring it give
+    #     identical answers, and deleting the parse left the whole suite green.
+    #
+    #     A first attempt used an atypical FIRST record. That stopped discriminating the moment the
+    #     inference fallback became a median, which is robust to exactly that -- good for the tool,
+    #     vacuous for the arm. So this uses the case review actually named: an s16 title read with the
+    #     default f32 flags. Every record is 256 frames and the emitter logs the truth,
+    #     256 * 2 * 2 = 1024 B, while inferring with bpf=4 gives 2048 B. Queues sit at 1500 B -- ABOVE
+    #     the real grain, BELOW the inferred one -- so honouring the field reports 0 thin-cushion
+    #     arrivals and inferring reports 200. Note the direction: inferring invents a cushion problem
+    #     that is not there.
+    log = "".join(dbg(frames=256, queued=1500, bpf=2, channels=2) for _ in range(200))
+    out, _ = run(log)
+    expect(out, "arrivals with under 1 grain buffered: 0",
+           "case 0b: the logged grain is honoured over the flag-derived inference")
+    expect(out, "grain=256 frames",
+           "case 0b: and the header reports the same grain the rows used")
+
+    # 0c. The cadence grain is the MEDIAN frame count, not the first record's.
+    #
+    #     One atypical first arrival otherwise rescales every gap-beyond-N-grains row. Here the first
+    #     record is 64 frames (1.33 ms at 48 kHz) and the rest are 256 (5.33 ms), with gaps at a
+    #     steady 5.33 ms. Taking frames[0] makes the reference grain 1.33 ms, so every one of those
+    #     normal gaps counts as "beyond 2 grains" and the verdict flips to a quantized mixer wake --
+    #     review measured exactly that, 100.0%, on a healthy log. The median reads 256 and the rows
+    #     stay at 0.
+    log = dbg(frames=64, gap=5.33, queued=3072) + "".join(
+        dbg(frames=256, gap=5.33, queued=3072) for _ in range(200))
+    out, _ = run(log)
+    expect(out, "gaps beyond 2 grains:             0",
+           "case 0c: an atypical first record does not rescale the cadence rows")
+    expect(out, "grain=256 frames", "case 0c: the header reports the typical grain")
+
     # 1. Real-time delivery, deep queue: no defect. The verdict must NOT name a clock
     #    deficit (a plausible wrong call: an average at the device rate with jitter).
     log = "".join(dbg(gap=5.33, queued=3072) for _ in range(200))

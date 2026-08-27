@@ -99,7 +99,23 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame):
     frames_total = sum(slot["frames"])
     calls = len(slot["gaps"])
     span_s = sum(gaps) / 1000.0
-    grain_frames = slot["frames"][0] if slot["frames"] else 0
+    # The emitter logs TWO independent facts per record -- frames=N and (grain=B) -- so each is used
+    # for what it is, and neither needs the CLI flags to be right:
+    #
+    #   * grain_frames, for grain_ms and the gap-beyond-N-grains rows, is the MEDIAN frame count. The
+    #     median rather than frames[0] because one atypical first arrival otherwise rescales every
+    #     cadence row -- review measured that fabricating "gaps beyond 2 grains: 100.0%" and a false
+    #     quantized-mixer verdict.
+    #   * grain_bytes, for the queue rows, is the LOGGED byte size.
+    #
+    # An earlier revision derived grain_frames FROM grain_bytes, which reintroduced the flag
+    # dependency it was meant to remove: an s16 title read with the default f32 flags reported
+    # grain=128 frames from a correct 1024 B. Two logged facts, used directly, have no such coupling.
+    if slot["frames"]:
+        ordered = sorted(slot["frames"])
+        grain_frames = ordered[len(ordered) // 2]
+    else:
+        grain_frames = 0
     grain_ms = grain_frames / device_hz * 1000.0 if device_hz else 0.0
 
     print(f"port {port}: calls={calls} span={span_s:.1f}s grain={grain_frames} frames"
@@ -130,6 +146,11 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame):
         # "below a quarter grain" was in fact 1.1% COMPLETELY DRY. grain_frames is computed twenty
         # lines above and was simply not used here.
         # Logged grain first; the frames[0] inference is the fallback for logs without the field.
+        # The SAME grain the header printed. Previously these could disagree: the header showed the
+        # inferred frame count while the rows used the logged byte size, so a log could advertise
+        # "grain=0 frames" beside rows correctly computed from 2048 B (review measured exactly that).
+        # The LOGGED byte size, which needs no flags to be correct. The inference is the fallback
+        # for logs predating the field, and is the only place bytes_per_frame/channels are used.
         grain_bytes = slot.get("grain_bytes") or (grain_frames * bytes_per_frame * channels)
         under_one = sum(1 for q in queued if q < grain_bytes) if grain_bytes else 0
         under_quarter = sum(1 for q in queued if q < grain_bytes // 4) if grain_bytes else 0
