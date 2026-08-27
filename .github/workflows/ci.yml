@@ -184,13 +184,13 @@ jobs:
   docs:
     name: Docs
     runs-on: ubuntu-latest
-    # `issues: read` is what the PROGRESS_TRACKER.md staleness check needs, and it is declared
-    # explicitly rather than inherited: a repository whose default workflow permission is later
-    # tightened would otherwise turn that step from a check into a 403, and the step is written
-    # to fail rather than skip -- so the permission is part of the contract, not an accident.
+    # No `issues: read` here any more, and that is deliberate rather than an oversight: it existed
+    # solely for the PROGRESS_TRACKER.md staleness check, which now lives in `progress-tracker`.
+    # Every remaining step in this job is local and offline, so the grant would be dead -- and a
+    # permission justified by a comment describing a step that no longer exists is exactly the kind
+    # of stale claim these gates are here to prevent.
     permissions:
       contents: read
-      issues: read
     steps:
       - name: Checkout
         # fetch-depth: 2 is LOAD-BEARING, not tidiness. The numbering gate's deleted-row check
@@ -346,18 +346,12 @@ jobs:
       - name: Verify the progress-tracker generator still discriminates
         run: python3 prosper/tools/docs/gen_progress_tracker.py --selftest
 
-      # The live half used to follow here and now runs in the `progress-tracker` job on master --
-      # so this job needs no network at all. It re-read the
-      # trackers through `gh` and fails if the committed file no longer matches them.
+      # The live half used to follow here. It re-read the trackers through `gh` and failed the build
+      # if the committed file no longer matched them; it now runs in the `progress-tracker` job on
+      # master, which regenerates rather than fails. So THIS job is entirely local and offline, and
+      # needs no token at all.
       #
-      # It really can run here, and that was checked rather than assumed: `gh` is preinstalled on
-      # GitHub-hosted ubuntu runners, `github.token` is the same mechanism the `release` job in
-      # this file already drives `gh` with, and the token carries `issues: read` for a public
-      # repository on both push and pull_request -- including pull_request from a fork, where the
-      # token is read-only but public issues are still readable. Two API calls total: one issue
-      # list, one batched GraphQL for the cited blockers' states.
-      #
-      # The PROGRESS_TRACKER.md staleness GATE used to live here and has been removed. Its
+      # Its rationale is kept here because the reasoning is what matters, not the step. Its
       # rationale was that the author can always repair a stale file in one command -- true for the
       # case it was written for (someone edits a tracker mid-flight), and false for the case that
       # actually broke master most often: the staleness is caused by THE MERGE ITSELF. A PR that
@@ -382,6 +376,7 @@ jobs:
     permissions:
       contents: write
       issues: read
+      pull-requests: read
 
     steps:
       - name: Checkout
@@ -390,11 +385,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
       # Never fails the build. A derived file being one commit behind is not worth a red master --
       # that is precisely the defect this job removes. A push made with GITHUB_TOKEN does not trigger
@@ -407,22 +397,39 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for attempt in 1 2 3; do
+            # A GENERATOR failure is NOT contention and must not be swallowed. The tool hard-fails on
+            # an unparseable tracker body, a zero-issue fetch, and an unresolvable citation, writing
+            # NO file in each case -- and the first of those is author-fixable, which is the exact
+            # criterion used to keep --selftest a hard gate. Swallowing it would freeze the file
+            # indefinitely behind an always-green job, which is a worse version of the drift this
+            # whole job exists to stop. --selftest cannot cover these: it is offline and fixture-fed.
             python3 prosper/tools/docs/gen_progress_tracker.py || {
-              echo "::warning::generator failed; leaving PROGRESS_TRACKER.md for the next push"
-              exit 0
+              echo "::error::gen_progress_tracker.py failed -- this is a generator or tracker error,"
+              echo "::error::not push contention, and it leaves PROGRESS_TRACKER.md frozen. Fix the"
+              echo "::error::tracker it names, or the generator, and push again."
+              exit 1
             }
             if git diff --quiet -- PROGRESS_TRACKER.md; then
               echo "PROGRESS_TRACKER.md already matches the trackers."
               exit 0
             fi
             git add PROGRESS_TRACKER.md
-            git commit -m "docs: regenerate PROGRESS_TRACKER.md from the trackers"
+            # Checked: an unexpectedly empty commit would otherwise make the push a silent no-op
+            # that still reports success below.
+            git commit -m "docs: regenerate PROGRESS_TRACKER.md from the trackers" || {
+              echo "::error::commit failed with a staged change present"
+              exit 1
+            }
             if git push origin HEAD:master; then
               echo "regenerated and pushed."
               exit 0
             fi
             # Another lane landed while we were generating. Rebuild on top of it and try again --
             # regenerating rather than replaying our commit, so the result reflects the new master.
+            #
+            # The reset is LOAD-BEARING, not tidiness: without it `pull --rebase` carries the local
+            # commit forward, the next regeneration then finds no diff, and the loop takes the
+            # "already matches" exit 0 having committed locally and never pushed. Do not simplify.
             echo "push rejected (attempt ${attempt}); rebasing onto the current master"
             git reset --hard HEAD~1
             git pull --rebase --quiet origin master || break
