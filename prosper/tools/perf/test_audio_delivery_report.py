@@ -16,8 +16,14 @@ from pathlib import Path
 TOOL = Path(__file__).resolve().parent / "audio_delivery_report.py"
 
 
-def dbg(port=17, gap=5.33, frames=256, queued=1024):
-    return f"[audio-dbg] port={port} gap={gap:.2f}ms frames={frames} queued_before={queued} (grain=1024)\n"
+def dbg(port=17, gap=5.33, frames=256, queued=1024, bpf=4, channels=2):
+    # grain DERIVED from frames rather than hardcoded. It was a literal (grain=1024) while every
+    # case used 256 frames of f32 stereo -- a real grain of 2048 B -- so the fixture contradicted its
+    # own arithmetic. Invisible while the parser discarded the field, and it inverted the
+    # half-a-grain arm the moment the parser started reading it. Derived, it cannot drift again.
+    grain = frames * bpf * channels
+    return (f"[audio-dbg] port={port} gap={gap:.2f}ms frames={frames}"
+            f" queued_before={queued} (grain={grain})\n")
 
 
 def run(log_text, extra=None):
@@ -51,13 +57,13 @@ def main():
     #    thresholds, so this arm fails on the bug and passes on the fix.
     log = "".join(dbg(gap=5.33, frames=256, queued=1024) for _ in range(200))
     out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
-    expect(out, "arrivals below 1 grain of buffer:  200", "case 0: half a grain is below one grain")
+    expect(out, "arrivals with under 1 grain buffered: 200", "case 0: half a grain is below one grain")
     expect(out, "arrivals below 1/4 grain:          0", "case 0: half a grain is NOT below a quarter")
 
     #    And an empty queue must register as empty, on its own row rather than only as "below".
     log = "".join(dbg(gap=5.33, frames=256, queued=0) for _ in range(200))
     out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
-    expect(out, "arrivals with an EMPTY queue:      200", "case 0: an empty queue is reported empty")
+    expect(out, "arrivals with an EMPTY queue:         200", "case 0: an empty queue is reported empty")
 
     # 1. Real-time delivery, deep queue: no defect. The verdict must NOT name a clock
     #    deficit (a plausible wrong call: an average at the device rate with jitter).
@@ -70,7 +76,13 @@ def main():
     log = "".join(dbg(gap=15.7, queued=64) for _ in range(300))
     out, _ = run(log)
     expect(out, "clock deficit", "case 2 verdict")
-    expect(out, "the device starved between deliveries", "case 2 starvation row")
+    # A NUMBER, not the row label. This assertion used to be `expect(out, "the device starved
+    # between deliveries")` -- a string printed on every run regardless of the count, so review
+    # confirmed that hardwiring under_one = 0 left it green. queued=64 is under one 2048 B grain
+    # but not empty, so this pins the thin-cushion count AND that it is not miscounted as
+    # starvation, which is the distinction the label fix in this change is about.
+    expect(out, "arrivals with under 1 grain buffered: 300", "case 2: all 300 are a thin cushion")
+    expect(out, "arrivals with an EMPTY queue:         0", "case 2: a thin cushion is NOT starvation")
 
     # 3. Quantized mixer wake: the combined delivery averages real-time (256 frames per
     #    5.33 ms) but the arrivals cluster -- 1 ms after a tick, then 9.66 ms of silence.

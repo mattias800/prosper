@@ -11,8 +11,9 @@ that log into the numbers that name the failure mode, offline, without listening
   * delivery cadence -- mean/median/p99/max inter-arrival gap per port, and the fraction of
     gaps beyond one and two grain periods;
   * queue health -- mean/min queued bytes, and the share of arrivals that found the queue
-    below one grain (the device starved between deliveries) and below a quarter grain
-    (audible underrun territory);
+    below one grain and below a quarter grain -- a THIN CUSHION, which for a pacer that hands
+    over one grain at a time is the normal steady state rather than a fault -- plus the share
+    that arrived to a COMPLETELY EMPTY queue, which is the starvation case;
   * effective delivery rate vs the device rate -- a persistent deficit is a CLOCK DRIFT
     between the guest's budgeted audio clock and the device crystal; no cushion survives it,
     and the fix is drift compensation, not deeper buffering;
@@ -36,7 +37,8 @@ import sys
 from collections import defaultdict
 
 RECORD = re.compile(
-    r"\[audio-dbg\] port=(\d+) gap=([0-9.]+)ms frames=(\d+) queued_before=(\d+)")
+    r"\[audio-dbg\] port=(\d+) gap=([0-9.]+)ms frames=(\d+) queued_before=(\d+)"
+    r"(?: \(grain=(\d+)\))?")
 
 # The device consumes `device_hz * channels * bytes_per_frame` bytes per second. The guest's
 # delivery rate against THAT number is the clock-drift measurement; a persistent deficit
@@ -66,9 +68,18 @@ def analyze(paths, port_filter, device_hz, channels, bytes_per_frame):
         gap_ms = float(m.group(2))
         frames = int(m.group(3))
         queued = int(m.group(4))
+        # The emitter states the grain size in BYTES on every line. Prefer it over inferring the
+        # grain from a frame count: frames[0] takes the FIRST record, so one atypical arrival at
+        # the start of a log silently rescales every queue threshold below -- and it fails in the
+        # reassuring direction, zeroing the thin-cushion and starvation rows rather than
+        # inflating them. Optional in the regex so older logs still parse.
+        grain_bytes_logged = int(m.group(5)) if m.group(5) else 0
         slot = per_port.setdefault(port, {
             "gaps": [], "frames": [], "queued": [], "sources": defaultdict(int),
+            "grain_bytes": 0,
         })
+        if grain_bytes_logged:
+            slot["grain_bytes"] = grain_bytes_logged
         slot["gaps"].append(gap_ms)
         slot["frames"].append(frames)
         slot["queued"].append(queued)
@@ -118,18 +129,24 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame):
         # promising something far weaker, which is the direction that gets quoted: a run showing 1.1%
         # "below a quarter grain" was in fact 1.1% COMPLETELY DRY. grain_frames is computed twenty
         # lines above and was simply not used here.
-        grain_bytes = grain_frames * bytes_per_frame * channels
+        # Logged grain first; the frames[0] inference is the fallback for logs without the field.
+        grain_bytes = slot.get("grain_bytes") or (grain_frames * bytes_per_frame * channels)
         under_one = sum(1 for q in queued if q < grain_bytes) if grain_bytes else 0
         under_quarter = sum(1 for q in queued if q < grain_bytes // 4) if grain_bytes else 0
         empty = sum(1 for q in queued if q == 0)
         print(f"  queue at arrival: mean {mean_q:.0f} B  min {queued[0]} B")
-        print(f"  arrivals below 1 grain of buffer:  {under_one}"
-              f" ({100 * under_one / len(queued):.1f}%) -- the device starved between"
-              f" deliveries")
+        # NOT labelled starvation. One grain of cushion is the normal steady state for a pacer
+        # handing over a grain at a time, so "below one grain" describes most healthy arrivals --
+        # the fixture added with this change prints 100% of them beside 0% empty. The old wording,
+        # "the device starved between deliveries", was true only while the threshold was
+        # accidentally testing queued == 0; widening it 256x to a real grain left the words
+        # describing a condition they no longer match. Starvation is the EMPTY row.
+        print(f"  arrivals with under 1 grain buffered: {under_one}"
+              f" ({100 * under_one / len(queued):.1f}%) -- thin cushion")
         print(f"  arrivals below 1/4 grain:          {under_quarter}"
-              f" ({100 * under_quarter / len(queued):.1f}%) -- audible underrun territory")
-        print(f"  arrivals with an EMPTY queue:      {empty}"
-              f" ({100 * empty / len(queued):.1f}%) -- the device had nothing left to play")
+              f" ({100 * under_quarter / len(queued):.1f}%) -- very thin")
+        print(f"  arrivals with an EMPTY queue:         {empty}"
+              f" ({100 * empty / len(queued):.1f}%) -- STARVED: nothing left to play")
 
     if span_s > 0 and device_hz:
         delivered_hz = frames_total / span_s
@@ -168,7 +185,7 @@ def main():
                         help="the playback device's sample rate (default 48000)")
     parser.add_argument("--channels", type=int, default=2, help="output channels (default 2)")
     parser.add_argument("--bytes-per-frame", type=int, default=4,
-                        help="bytes per frame per channel-set as delivered (default 4)")
+                        help="bytes per SAMPLE per channel as delivered (4 = f32, 2 = s16; default 4). Only used when a log predates the emitter's (grain=N) field"
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
