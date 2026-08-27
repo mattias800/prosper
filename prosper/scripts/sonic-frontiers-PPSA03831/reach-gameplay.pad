@@ -58,7 +58,7 @@
 # blind and counted; the cursor bar itself does render and was used to verify the five moves.
 #
 # Fresh-save arms and inherited-save arms are NOT the same route: pass an isolated
-# PROSPER_SAVE0=<private dir> so the notice queue is the measured twelve pages.
+# PROSPER_SAVE0=<private dir> so the run starts from a known save state.
 
 # --- boot notice queue: twelve confirms -------------------------------------------------------
 f1100-1103:cross

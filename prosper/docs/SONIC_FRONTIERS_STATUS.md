@@ -39,7 +39,7 @@ a blue header band over a full-width body panel. Measured behaviour, all from li
 | How many pages? | **Twelve.** Confirms 40 flips apart: presses 1-12 each advance one page and press 13 activates a main-menu entry. |
 | What advances it? | **Face buttons only.** A single-button sweep (triangle, square, circle, options, touchpad, l1, r1, right, left, down, up, cross, 60 flips apart) advanced the panel on every face button and on **none** of the four d-pad directions — `right`, `left`, `down` and `up` left the header on "Update Details" for 240 flips, then `cross` advanced it. |
 | Where is the cursor afterwards? | On **"Extras"**, the last of the six main-menu entries, so five `up` reach "New Game" whether or not the list wraps. |
-| Is the queue route-stable? | Only against an isolated save area. `PROSPER_SAVE0` selects it, as it selects the rest of this title's route. |
+| Is the queue route-stable? | **Yes, and independently of save state.** This row used to say "only against an isolated save area"; that is withdrawn. A `boot_trace` arm of the committed route reaches `GameModeStage` **with an existing save present**, so twelve confirms consumed twelve pages with that save in place. The page count is the whole of the queue-length story and it is speed-independent — one page per face press (row above) — so this **falsifies** that story rather than leaving it unseparated. |
 
 This is why 405 dense confirms (one every 20 flips) got no further than six did: the pages are
 consumed one per press with an animation between them, so spacing, not volume, is what clears the
@@ -54,22 +54,27 @@ every window.
 **If a run parks in the "Extras" menu it desynced — that is not a render or input wall.** Measured
 2026-08-27: one live-renderer arm sat there for its whole length (24/24 frames with content,
 `pixel-distinct=24`, guest healthy) and never reached the stage. It is the same end state the
-Ruled-out row below records for flip/wall-clock desync under host load. Check `uptime` and re-run.
+Ruled-out rows below record for **two** distinct causes, both ending in a confirm activating
+"Extras": a `--warmup-seconds` window, and flip/wall-clock desync under host load. My failing arm used
+**no** `--warmup-seconds`, so that cause is excluded there and host load is the remaining candidate.
+Check `uptime` and which of the two applies before diagnosing anything.
 
-**Save data is not the cause**, although one arm made it look that way. The 2×2:
+**Save data does not explain this**, although one arm made it look that way — and the queue-length
+mechanism is positively falsified, not merely unsupported (see the notice-queue table above). The 2×2:
 
 | frontend | save state | reaches `GameModeStage` |
 | --- | --- | --- |
-| `boot_trace` | existing save present | **yes** — `ui_gamemodestage`, 189 `w6d01_trr` sectors |
+| `boot_trace` | existing save present | **yes** — `ui_gamemodestage` markers, and 189 log lines naming `w6d01_trr` terrain sectors |
 | `boot_trace` | empty `PROSPER_SAVE0` root | **yes** |
-| live renderer | existing save present | no — parked in Extras (**n=1**) |
+| live renderer | existing save present | no — parked in Extras (**n=1**, no `--warmup-seconds`) |
 | live renderer | save moved aside, and `PROSPER_SAVE0` | yes (two arms) |
 
 Since the save changes nothing on `boot_trace`, and the single renderer failure sits against this
 title's own 1.5–3.4 flips/s spread, "save present" and "slow arm" were never separated on that
 frontend. Do not treat an empty save root as a precondition of this route.
 
-**`boot_trace` is the fast loop** — ~17 flips/s against ~3, so `f2900` is ~200 s rather than 17–31
+**`boot_trace` is the fast loop** — ~17 flips/s measured here against the ~30 recorded elsewhere in
+this document, so treat it as **17–30** and `f2900` as ~100–200 s, against the live arm's 17–31
 minutes:
 
 ```bash
@@ -78,10 +83,22 @@ PROSPER_PAD_SCRIPT_LOG=1 PROSPER_FILELOG=1 \
   timeout --foreground -s TERM -k 5s 220 ./build-linux/boot_trace <DUMP_ROOT>/PPSA03831-app0
 ```
 
-Both switches are required: `PROSPER_PAD_SCRIPT_LOG` prints `[pad-script] … frame=<flips since first
-poll>` (the route's own anchor units) and `PROSPER_FILELOG` prints the `.pac` opens that name the
-mode. With only the first, the modes are invisible and the run reads as "never got there" — which is
-how the retracted row below came to be written.
+Both switches are required, and omitting either fails in a different direction. Measured across five
+arms of this route:
+
+| switches | `.pac` lines | route position | mode markers |
+| --- | --- | --- | --- |
+| neither | 48 | — | — |
+| `PROSPER_PAD_SCRIPT_LOG` only | 52 | present | **absent** |
+| both | **1140** | present | **present** |
+
+`PROSPER_FILELOG` is what makes the mode markers appear; note a bare arm still logs ~48 `.pac` lines
+from other paths, which is enough to look like file logging is already on. `PROSPER_PAD_SCRIPT_LOG`
+is what gives the route's position in its own anchor units. **Both of this document's `boot_trace`
+errors came from missing one of them:** the row retracted below was written from an arm with
+*neither*, whose absent flip counter became "boot_trace has no flip counter"; and a later arm with
+`PAD_SCRIPT_LOG` but no `FILELOG` showed no mode markers and nearly became "the stage was never
+reached".
 
 **On a live renderer arm, budget generously:** single-run rates of 1.5, 2.8 and 3.4 flips/s across
 three arms of this route, so `f2900` landed between ~14 and ~32 minutes and one arm missed it inside
