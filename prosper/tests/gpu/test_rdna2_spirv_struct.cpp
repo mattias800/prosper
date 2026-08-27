@@ -6135,9 +6135,12 @@ int main() {
     }
     printf("  [ok]   mixed compute SAMPLE/SAMPLE_L shares one 2D-array image contract\n");
 
-    // The graphics renderer still exposes DIM=5 textures through its established base-slice 2D
-    // view. Keep that descriptor non-arrayed, but consume SAMPLE_L's fourth address as the LOD
-    // rather than mistaking the discarded third (slice) address for the LOD.
+    // #325: graphics DIM=5 textures used to be exposed through a base-slice 2D view, and this arm
+    // pinned that. The uploader can now create matching array views, so the descriptor is ARRAYED
+    // in graphics exactly as it already was in compute -- and it must be, because the view type is
+    // chosen from the resource's img_dim: a non-arrayed declaration against it is a descriptor
+    // mismatch. What has NOT changed, and is still pinned below, is that SAMPLE_L consumes its
+    // FOURTH address as the LOD rather than mistaking the third (slice) address for it.
     const uint32_t ps_sample_array_l[] = {
         0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
         0x7e0402ffu, 0x3f800000u, 0x7e060280u,
@@ -6155,12 +6158,13 @@ int main() {
             descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
             graphics_array_l_descriptor = &descriptor;
     if (graphics_array_l_spv.empty() || !graphics_array_l_descriptor ||
-        graphics_array_l_descriptor->image_arrayed ||
+        !graphics_array_l_descriptor->image_arrayed ||
         !has_explicit_lod_constant(graphics_array_l_spv, 0u)) {
-        printf("  [FAIL] graphics DIM=5 image_sample_l violated its base-slice 2D contract\n");
+        printf("  [FAIL] graphics DIM=5 image_sample_l did not produce an arrayed image with its "
+               "fourth-address LOD\n");
         return 1;
     }
-    printf("  [ok]   graphics DIM=5 image_sample_l keeps a 2D view and its fourth-address LOD\n");
+    printf("  [ok]   graphics DIM=5 image_sample_l is arrayed and keeps its fourth-address LOD\n");
 
     // The visibility half of the same kernel comparison-samples a sixteen-layer shadow array.
     // Compute keeps its slice and performs the compare manually over a color-sampled array image.

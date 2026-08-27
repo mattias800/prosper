@@ -753,12 +753,24 @@ struct DecodedTexture {
     // portable UINT storage image to the FrameResource default RGBA8_UNORM.
     VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
     bool storage_image_contract_valid = true;
+    // Decoded array layers behind `pixels`. 1 for every non-array texture, which is why this can
+    // sit last and default: the positional initializers below stay correct without naming it.
+    uint32_t layers = 1;
+    // Readable bytes behind `pixels`. The backend's multi-layer span contract REQUIRES this -- it
+    // refuses to build a layered image without proof that every layer is readable -- and the
+    // renderer had exactly one assignment to fr.tex_byte_size in the whole file, on the MSAA path.
+    // So every array served from cache arrived claiming zero readable bytes and was rejected.
+    size_t pixels_bytes = 0;
 };
 
 // Always-on identity-scope accounting; see TextureDecodeScopeStats in the header.
 thread_local TextureDecodeScopeStats g_texture_decode_scope{};
 
 struct PersistentDecodedTexture {
+    // Decoded array layers behind `pixels`; 1 for every non-array texture. The persistent cache is
+    // the one that actually serves a world-texture atlas -- a submit-local entry is rebuilt from it
+    // -- so a layer count that stops here is a layer count the shader never sees (#325).
+    uint32_t layers = 1;
     uint64_t source_addr = 0;
     size_t source_size = 0;
     size_t source_prefix_size = 0;
@@ -3244,6 +3256,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
+                        // #325: a guest 2D_ARRAY. Cubes stack their six faces into height because
+                        // six is small; an array cannot -- this title's level atlas is 256 slices,
+                        // and 512x131072 exceeds every device's maxImageDimension2D. So arrays ride
+                        // the backend's real layer channel (`sample_count`) instead, which
+                        // image creation and the view already follow.
+                        const bool is_array_shape = r.img_dim == 5u && r.cls == RC::Texture;
+                        // prosper decodes BC to RGBA8 on the CPU, so a compressed array inflates 4x
+                        // and is then held in BOTH host RAM (the persistent cache) and VRAM. This
+                        // title's world atlas is 512x512x256 Bc7 = 256 MiB decoded, and another
+                        // resource reaches 464 MiB. Above a budget, decode the base slice only --
+                        // the pre-#325 behaviour -- rather than failing: an allocation failure here
+                        // is silent, because vkCreateImage's result is discarded and the null handle
+                        // is used anyway (#3045).
+                        static const uint64_t array_budget_bytes = [] {
+                            const char* e = getenv("PROSPER_ARRAY_DECODE_BUDGET_MIB");
+                            return (uint64_t)(e ? atoll(e) : 1024) << 20; }();
+                        const uint64_t array_footprint =
+                            (uint64_t)tw * th * 4ull * (r.depth ? r.depth : 1u);
+                        const bool is_array =
+                            prosper::gpu::guest_texture_is_uploaded_array(r.img_dim, r.depth,
+                                                                          r.format) &&
+                            r.cls == RC::Texture && array_footprint <= array_budget_bytes;
+                        if (is_array_shape && r.depth > 1u && array_footprint > array_budget_bytes) {
+                            static uint32_t over_budget_reports = 0;
+                            if (over_budget_reports++ < 16u)
+                                fprintf(stderr,
+                                        "[array-budget] binding=%u %ux%u x%u layers = %llu MiB "
+                                        "decoded exceeds %llu MiB; sampling the base slice only\n",
+                                        r.binding, tw, th, r.depth,
+                                        (unsigned long long)(array_footprint >> 20),
+                                        (unsigned long long)(array_budget_bytes >> 20));
+                        }
+                        const uint32_t decoded_layers =
+                            is_array ? (r.depth ? r.depth : 1u) : 1u;
                         // GTA V retains each shadow-cube face as a renderer-owned D32 image, then
                         // samples the cube through a UNORM16 descriptor. Guest memory is not the
                         // authority for these pixels. Select the complete six-face generation now
@@ -4012,6 +4058,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         cached->second.texture_format;
                                     persistent_reuse.storage_image_contract_valid =
                                         cached->second.storage_image_contract_valid;
+                                    persistent_reuse.layers = cached->second.layers;
+                                    persistent_reuse.pixels_bytes = cached->second.pixels.size();
                                     decoded_reuse = &persistent_reuse;
                                     resource_persistent_hit = true;
                                     if (timing_enabled) pending_timing.persistent_hits++;
@@ -4221,6 +4269,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.tex_rgba = decoded_reuse->pixels;
                             fr.tw = tw;
                             fr.th = decoded_reuse->output_height;
+                            // #325: the layer count travels with the decoded pixels. Without this
+                            // the hot path -- a cache hit, which is how a world-texture atlas is
+                            // served on all but its first reference -- published a single-layer view
+                            // over a buffer holding every slice, so the shader could only ever read
+                            // slice 0 however correct the decode and the SPIR-V were.
+                            // Guarded on `is_array` so this cannot touch the MSAA plane-array
+                            // resources that share the channel: for those, sample_count is already
+                            // established by the resource setup, and republishing a cached value
+                            // would be a behaviour change nobody asked for.
+                            if (is_array) {
+                                fr.sample_count = decoded_reuse->layers;
+                                fr.tex_byte_size = decoded_reuse->pixels_bytes;
+                            }
                             fr.td = is_volume ? r.depth : 1u;
                             fr.img_dim = r.img_dim;
                             fr.texture_format = decoded_reuse->texture_format;
@@ -4297,7 +4358,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_source_addr,
                                     cross_span_source_size, SIZE_MAX, nullptr,
                                                    fr.texture_format,
-                                                   fr.storage_image_contract_valid});
+                                                   fr.storage_image_contract_valid,
+                                                   fr.sample_count, fr.tex_byte_size});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
@@ -4511,7 +4573,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         fr.texture_format = decoded_texture_format;
                         const uint32_t output_bpp =
                             prosper::test::backend_color_bytes_per_pixel(decoded_texture_format);
-                        size_t nb = volume_texels * output_bpp * (is_cube ? 6u : 1u);
+                        size_t nb = volume_texels * output_bpp *
+                            (is_cube ? 6u : (is_array ? decoded_layers : 1u));
                         size_t linear_source_prefix_size = 0;
                         ++g_texture_decode_scope.decodes;
                         const size_t texture_slot = acquire_texstore_slot();
@@ -4530,6 +4593,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 const size_t got = copy_resource(
                                     drow, sampled_source_addr + (uint64_t)y * linear_src_row,
                                     dst_row);
+                                total += got;
+                                if (got < dst_row) std::fill(drow + got, drow + dst_row, 0);
+                            }
+                            return total;
+                        };
+                        // #325: the same padded-row read, but from an arbitrary base, so an ARRAY
+                        // slice can use it. A linear array's rows are pitch-padded exactly as a
+                        // single linear surface's are -- `linear_padded_read` already names
+                        // img_dim 5 -- and the slice loop was reading them flat, which is what made
+                        // slice 0 of a linear BC array decode differently than it used to.
+                        auto copy_linear_padded_rows_from = [&](uint8_t* dst, uint64_t base,
+                                                                size_t dst_row, uint32_t rows) {
+                            size_t total = 0;
+                            for (uint32_t y = 0; y < rows; ++y) {
+                                uint8_t* drow = dst + (size_t)y * dst_row;
+                                const size_t got = copy_resource(
+                                    drow, base + (uint64_t)y * linear_src_row, dst_row);
                                 total += got;
                                 if (got < dst_row) std::fill(drow + got, drow + dst_row, 0);
                             }
@@ -4975,6 +5055,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             resource_rtt_hit = true;
                         }
                         bool cube_done = dcc_fast_clear_done && is_cube;
+                        // Deliberately NOT folded into cube_done: the two publish through different
+                        // channels, and reusing one flag would multiply an array's height by six.
+                        bool array_done = false;
                         // CUBE DEPTH BRIDGE. A guest depth cube is ONE six-layer allocation whose
                         // faces prosper retains as separate DS images (each keyed by its
                         // DB_DEPTH_VIEW slice). The recompiler lowers a cube sample onto a single
@@ -5094,7 +5177,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cube_done = true;
                             }
                         }
-                        if (is_cube && !rtt_hit && !dcc_fast_clear_done && !cube_depth_bridged) {
+                        if ((is_cube || is_array) && !rtt_hit && !dcc_fast_clear_done &&
+                            !cube_depth_bridged) {
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
@@ -5103,7 +5187,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     ? r.layer_stride_bytes : selected_span;
                                 return r.gpu_addr + static_cast<uint64_t>(face) * stride;
                             };
-                            for (uint32_t fface = 0; fface < 6; fface++) {
+                            const uint32_t slice_count = is_cube ? 6u : decoded_layers;
+                            if (!is_cube && getenv("PROSPER_SLICESTRIDE")) {
+                                static std::unordered_set<uint64_t> reported;
+                                if (reported.insert(r.gpu_addr).second)
+                                    fprintf(stderr,
+                                            "[slicestride] addr=0x%llx %ux%u layers=%u fmt=%u "
+                                            "layer_stride=%u mip_off=%u in_mip_tail=%d "
+                                            "mip_tail_bytes=%u declared_mips=%u size=%u\n",
+                                            (unsigned long long)r.gpu_addr, tw, th, slice_count,
+                                            (unsigned)r.format, r.layer_stride_bytes,
+                                            r.layer_mip_offset_bytes, (int)r.in_mip_tail,
+                                            r.mip_tail_bytes, r.declared_mip_levels, r.size);
+                            }
+                            for (uint32_t fface = 0; fface < slice_count; fface++) {
                                 uint8_t* slice = texture_pixels.data() + (size_t)fface * tw * th * 4;
                                 if (cb) {
                                     uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
@@ -5129,6 +5226,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             prosper::gpu::detile_elements(
                                                 lin.data(), traw.data(), traw.size(), bw, bh, cb,
                                                 r.tile_mode);
+                                    } else if (linear_padded_read) {
+                                        copy_linear_padded_rows_from(
+                                            lin.data(), selected_addr,
+                                            static_cast<size_t>(bw) * cb, bh);
                                     } else {
                                         copy_resource(lin.data(), selected_addr, comp);
                                     }
@@ -5165,6 +5266,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 linear.data(), traw.data(), tw, th,
                                                 r.tile_mode, 0, source_bpt);
                                         }
+                                    } else if (linear_padded_read) {
+                                        // #325: use the SAME pitch the single-surface path uses
+                                        // (`linear_src_row`), not one recomputed from tw/bpt here.
+                                        // They can differ -- the single-surface figure honours a
+                                        // registered pitch and its own row width -- and slice 0 of
+                                        // an array must decode byte-identically to the way that
+                                        // same surface decoded before it was treated as an array.
+                                        copy_linear_padded_rows_from(
+                                            linear.data(), selected_addr,
+                                            static_cast<size_t>(tw) * source_bpt, th);
                                     } else if (r.layer_stride_bytes) {
                                         const size_t row_pitch = r.linear_row_pitch_bytes
                                             ? r.linear_row_pitch_bytes
@@ -5224,7 +5335,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                 }
                             }
-                            cube_done = true;
+                            // The loop above filled `slice_count` slices. A cube publishes them through
+                            // HEIGHT (fr.th = th*6) and an array through LAYERS (fr.sample_count), so the
+                            // two completion flags must stay distinct.
+                            if (is_cube) cube_done = true; else array_done = true;
                             if (resource_compute_depth_hybrid && !decoded_reuse) {
                                 std::array<std::vector<float>, 6> overlay_faces;
                                 uint32_t overlay_mask = 0, known_mask = 0;
@@ -5288,9 +5402,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
                         // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
                         // 16 bytes -> SW_4KB_S 16x16-block micro-tiles). #121.
-                        const uint32_t bcb = (rtt_hit || cube_done || dcc_fast_clear_done)
+                        const uint32_t bcb = (rtt_hit || cube_done || array_done || dcc_fast_clear_done)
                             ? 0u : prosper::gpu::bc_block_bytes(r.format);
-                        if (rtt_hit || cube_done || dcc_fast_clear_done) { /* pixels already materialized */ }
+                        if (rtt_hit || cube_done || array_done || dcc_fast_clear_done) { /* pixels already materialized */ }
                         else if (portable_raw_uvec4_storage) {
                             // Storage-image tiling describes the compact guest texels, not the expanded
                             // 16-byte Vulkan representation. Detile at the real guest width first, then
@@ -5581,7 +5695,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = PROSPER_ENV_VALUE("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_decode_done &&
+                        if (!rtt_hit && !cube_done && !array_done && !dcc_fast_clear_done && !bcb &&
+                            !narrow_decode_done &&
                             !f16_done && !f32_done && !portable_raw_uvec4_storage &&
                             !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
                             (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
@@ -5628,7 +5743,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             !native_r11_sampled &&
                             r.format == prosper::gpu::DataFormat::Float10_11_11) {
                             uint8_t* tp = texture_pixels.data();
-                            const size_t decoded_texels = volume_texels * (cube_done ? 6u : 1u);
+                            const size_t decoded_texels =
+                                volume_texels * (cube_done ? 6u : (array_done ? decoded_layers : 1u));
                             for (size_t t = 0; t < decoded_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 const float fc[3] = { prosper::gpu::f11_to_float((uint16_t)(v & 0x7FFu)),
@@ -5646,7 +5762,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (!rtt_hit && !dcc_fast_clear_done && !portable_raw_uvec4_storage &&
                             r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
                             uint8_t* tp = texture_pixels.data();
-                            const size_t decoded_texels = volume_texels * (cube_done ? 6u : 1u);
+                            const size_t decoded_texels =
+                                volume_texels * (cube_done ? 6u : (array_done ? decoded_layers : 1u));
                             for (size_t t = 0; t < decoded_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 prosper::gpu::unorm2_10_10_10_to_rgba8(v, tp + t * 4);
@@ -5878,6 +5995,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             decoded_pixels_in_texstore = true;
                         }
                         fr.tw = tw; fr.th = cube_done ? th * 6u : th;
+                        // #325: `sample_count` IS the backend's array-layer channel -- its own field
+                        // comment says so for MSAA-as-array -- and the view already selects
+                        // VK_IMAGE_VIEW_TYPE_2D_ARRAY whenever it exceeds 1. Set it only once the
+                        // slices are actually decoded: claiming layers we did not fill would upload
+                        // uninitialized memory, and the backend's span contract would reject it
+                        // anyway.
+                        if (array_done) {
+                            fr.sample_count = decoded_layers;
+                            fr.tex_byte_size = texture_pixels.size();
+                        }
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
                         // #1272: see the reuse path — plain 2D guest textures only.
@@ -5959,6 +6086,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 // process-wide cache and a reusable scratch slot.
                                 cached.pixels = std::move(texture_pixels);
                                 cached.output_height = fr.th;
+                                // Set from fr.sample_count, which the publish seam above has
+                                // already given the decoded layer count. Reading it any earlier
+                                // captures 1 and the layers die here.
+                                cached.layers = fr.sample_count;
                                 cached.narrow = narrow_done;
                                 cached.last_use = decode_generation;
                                 cached.persistent_id = inherited_persistent_id;
@@ -6022,7 +6153,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                           persistent_source_addr,
                                                           cross_span_source_size, pinned_slot,
                                                           nullptr, fr.texture_format,
-                                                          fr.storage_image_contract_valid});
+                                                          fr.storage_image_contract_valid,
+                                                          fr.sample_count, fr.tex_byte_size});
                         }
                         }
                         if (native_r32ui_storage && writable_storage_image) {
