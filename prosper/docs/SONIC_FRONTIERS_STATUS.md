@@ -51,31 +51,41 @@ incomplete — see below.
 `scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`, flip-anchored, with a header explaining
 every window.
 
-**Run it against an EMPTY SAVE ROOT** — `PROSPER_SAVE0=$(mktemp -d -p ~/prosper-run) ...` (a fresh directory under
-`$HOME`, not `/tmp`: `save_paths.hpp` records that the defaults were deliberately moved off tmpfs).
+**If a run parks in the "Extras" menu it desynced — that is not a render or input wall.** Measured
+2026-08-27: one live-renderer arm sat there for its whole length (24/24 frames with content,
+`pixel-distinct=24`, guest healthy) and never reached the stage. It is the same end state the
+Ruled-out row below records for flip/wall-clock desync under host load. Check `uptime` and re-run.
 
-**What is measured** (2026-08-27, `d2b2e4d3`, three arms, same build and route): with
-`savedata0/PPSA03831/` present the run sits in the **Extras** menu for its entire length — 24/24
-frames with content, `pixel-distinct=24`, guest healthy — and never reaches the stage. With that
-directory moved aside, and again with `PROSPER_SAVE0` pointed at an empty root, the same route
-reaches `GameModeStage`. So **save state present ⇒ this route fails** is established.
+**Save data is not the cause**, although one arm made it look that way. The 2×2:
 
-**What is NOT established is the mechanism.** The plausible story is that the twelve confirms assume
-the twelve-page queue a *first* boot shows, so a shorter queue lets the surplus confirms fall through
-and activate the entry under the cursor ("Extras"). Nobody has counted the notice pages with a save
-present, which is the load-bearing step. And the Ruled-out row below records the **same end state —
-"activated 'Extras' with the f2100 confirm" — arising from flip/wall-clock desync under host load**,
-not from a shorter queue. The two are not discriminated here, so treat the queue-length account as a
-hypothesis and check `uptime` before assuming a save caused it. It presents exactly like an input or
-render wall either way (#2790).
+| frontend | save state | reaches `GameModeStage` |
+| --- | --- | --- |
+| `boot_trace` | existing save present | **yes** — `ui_gamemodestage`, 189 `w6d01_trr` sectors |
+| `boot_trace` | empty `PROSPER_SAVE0` root | **yes** |
+| live renderer | existing save present | no — parked in Extras (**n=1**) |
+| live renderer | save moved aside, and `PROSPER_SAVE0` | yes (two arms) |
 
-**Budget the wall clock generously.** Single-run figures from 2026-08-27, quoted as the spread they
-are rather than as a rate: **1.5, 2.8 and 3.4 flips/s** across three arms of the identical route, so
-`f2900` landed anywhere between ~14 and ~32 minutes and one arm missed the stage inside a 1400 s
-timeout. Elsewhere this document quotes ~3 and 3.2–3.5 from other sessions; nothing here contradicts
-those, the variance is simply wide. `--render-every 6` moves it 2.84 → 4.27 flips/s in a matched
-pair — a real ~1.5x, but not the order of magnitude that would make iteration cheap, and it is one
-pair, not a characterisation.
+Since the save changes nothing on `boot_trace`, and the single renderer failure sits against this
+title's own 1.5–3.4 flips/s spread, "save present" and "slow arm" were never separated on that
+frontend. Do not treat an empty save root as a precondition of this route.
+
+**`boot_trace` is the fast loop** — ~17 flips/s against ~3, so `f2900` is ~200 s rather than 17–31
+minutes:
+
+```bash
+PROSPER_PAD_SCRIPT=@scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad \
+PROSPER_PAD_SCRIPT_LOG=1 PROSPER_FILELOG=1 \
+  timeout --foreground -s TERM -k 5s 220 ./build-linux/boot_trace <DUMP_ROOT>/PPSA03831-app0
+```
+
+Both switches are required: `PROSPER_PAD_SCRIPT_LOG` prints `[pad-script] … frame=<flips since first
+poll>` (the route's own anchor units) and `PROSPER_FILELOG` prints the `.pac` opens that name the
+mode. With only the first, the modes are invisible and the run reads as "never got there" — which is
+how the retracted row below came to be written.
+
+**On a live renderer arm, budget generously:** single-run rates of 1.5, 2.8 and 3.4 flips/s across
+three arms of this route, so `f2900` landed between ~14 and ~32 minutes and one arm missed it inside
+a 1400 s timeout. `--render-every 6` moves it ~1.5x (2.84 → 4.27) in one matched pair.
 
 The shape:
 
