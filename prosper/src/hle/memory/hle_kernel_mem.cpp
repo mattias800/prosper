@@ -1700,6 +1700,29 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
     void* p = map_phys_at(hint, len, host_prot(prot), phys, align, fixed);
+    // PROSPER_MAPWATCH=0xADDR[:SIZE] (#2998): report every direct-memory map whose RESULT overlaps
+    // one guest range, with the physical offset and whether the placement was fixed. The question it
+    // answers is "does the title map physical memory INTO this allocation later?" -- the shape a
+    // sparse or per-slice-committed texture would have. Nothing else could answer it: the dmem
+    // caller log attributes ALLOCATIONS, and the write watches see stores, so a mapping that changes
+    // what an address resolves to is invisible to both.
+    if (const char* w = getenv("PROSPER_MAPWATCH")) {
+        char* end = nullptr;
+        const uint64_t lo = strtoull(w, &end, 0);
+        const uint64_t size = (end && *end == ':') ? strtoull(end + 1, nullptr, 0) : (64ull << 20);
+        const uint64_t got = (uint64_t)(uintptr_t)p;
+        if (lo && got && got < lo + size && got + len > lo) {
+            static uint32_t said = 0;
+            if (said++ < 32u) {
+                fprintf(stderr, "[mapwatch] map_dmem -> 0x%llx..0x%llx phys=0x%llx fixed=%d "
+                                "overlaps watch 0x%llx+0x%llx\n",
+                        (unsigned long long)got, (unsigned long long)(got + len),
+                        (unsigned long long)phys, (int)fixed,
+                        (unsigned long long)lo, (unsigned long long)size);
+                fflush(stderr);
+            }
+        }
+    }
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx flags=0x%llx phys=0x%llx align=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)len,
                    (unsigned long long)flags, (unsigned long long)phys,
