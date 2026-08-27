@@ -81,16 +81,31 @@ Two further details cost time and are worth keeping:
 
 ## Open defects
 
-1. **Every world and character surface is untextured** and the scene is over-bright
-   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The atlas is bound, nothing is
-   rejected, and the menus are fully textured.
-   **The "84 MB non-zero" this line used to carry is withdrawn (2026-08-27).** A full-byte census
-   of the guest allocation reads `filled=19/344` 256 KiB buckets -- about **4.75 MB of 86 MiB** --
-   with `unreadable=0`, which the old figure cannot be reconciled with. It arrived in `227f5fbe`
-   (#3006) without a recorded method, and **what it actually measured is not established** -- so it
-   is withdrawn rather than reinterpreted. Do not repair it by guessing a plausible source (the
-   decoded host image is the obvious guess, and guessing is how the head-sample figure survived);
-   re-derive it or leave it out. See `## Ruled out`.
+1. ~~**Every world and character surface is untextured**~~ — **RESOLVED 2026-08-27**
+   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The world renders correctly
+   textured; see the `## Ruled out` entry for the cause and its control. **The scene being
+   over-bright has not been re-assessed since the fix** — the corrected frame looks naturally lit,
+   but nobody has measured it, so treat that half as open-and-unverified rather than fixed.
+
+   **The "84 MB non-zero" this entry used to carry was WITHDRAWN ON 2026-08-27, AND THAT WITHDRAWAL
+   WAS WRONG.** The figure is correct. A `.prgbundle` captured during gameplay records
+   `nz=84070204` of `footprint=90177536` for this atlas — 93% — which agrees with the withdrawn
+   figure to three significant figures. **That evidences the NUMBER, not the method**: the original's
+   method was never recorded and is still not established, so what is established is that a correct
+   measurement of guest memory at gameplay time yields it. Read this as "the figure was right and
+   withdrawing it was wrong", not as "we now know how it was obtained" — this correction RAISES a
+   claim, which is the direction that gets checked least. It was withdrawn because a full-byte census read
+   `filled=19/344` buckets (~4.75 MB), and the two looked irreconcilable. They are not: the census
+   ran at **decode** time and the bundle at **gameplay** time, and the gap between them *is* the
+   defect this title had — the atlas fills progressively and prosper was reading it once, early.
+
+   Recorded at length because the failure was mine and it is instructive: the two numbers disagreed,
+   I could not derive the older one's method, and I withdrew it. Withdrawal felt like the
+   conservative move and was not — it deleted the one measurement that would have pointed straight
+   at the cause. **When two measurements of "the same thing" disagree by 20x, the first question is
+   what each one measured, not which to discard**; here the answer was "different moments", and that
+   answer was the bug.
+
 2. **Text is intermittently garbled** ([#2999](https://github.com/mattias800/prosper/issues/2999)) —
    the EULA body and the title-screen game selector draw the wrong glyphs while the same font
    renders headings, numerals and every ring label correctly.
@@ -126,6 +141,21 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 `PROSPER_SLICESTRIDE=1` prints it, once per texture address.
 
 ## Ruled out
+
+- **RESOLVED 2026-08-27 — the interior wrong-texture defect (#2998) was the decode cache's
+  validation span.** `persistent_base_source_size` returned ONE surface for a layered array, so the
+  cache proved reuse against **262144 of 90177536 bytes (0.29%)** of the 256-layer world atlas.
+  The title fills that atlas progressively: prosper decoded it once at roughly 5% populated, the
+  guest reached 93% by gameplay (measured from a `.prgbundle`: `nz=84070204` of `footprint=90177536`),
+  and the cache served the early decode for the rest of the run — so interiors sampled layers still
+  holding the previous occupants of that memory. Fixed by `layered_array_source_size`, mirroring
+  `layered_cube_source_size`, whose comment already stated the invariant: *"cache reuse can never be
+  proved against less memory than the layer-aware decoder reads."* Control: toggling the fix with one
+  `false &&` on the same route flips `source_size` 90087424 ↔ 262144 and the frame between the
+  correct scene (245141 colours) and passports on the walls (124916), mean difference 51.48/255.
+  **The hypotheses this retires as symptoms rather than causes:** layer indexing, `base_array`,
+  per-slice stride, and "the atlas is unpopulated" — the guest memory was right all along; prosper
+  was reading a stale copy of it. (#2998, #2990)
 
 - **"The world is textured" (2026-08-27 blog entry / #3050 progression evidence)** — RETRACTED the
   same day. The capture was the game blitting its own pre-rendered loading picture,
@@ -184,7 +214,9 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 - **At the moment prosper decodes it, the atlas allocation holds about 4.75 MB of content and
   nothing above it, measured WITHOUT any stride assumption.** (Scope corrected 2026-08-27: this is
   one instant, not the whole run. Bucket 200 is written later — see `## Ruled out`. The interior's
-  own slices 186-248, buckets 249.9-333.2, are a separate question and remain unwritten.) `PROSPER_OCCUPANCY=1` walks the guest allocation in 256 KiB buckets and asks
+  own slices 186-248, buckets 249.9-333.2, are a separate question. Slice 248 specifically stays
+  unwritten all run; the range as a whole is not, and by gameplay the allocation reaches 93%
+  non-zero — see the resolution entry.) `PROSPER_OCCUPANCY=1` walks the guest allocation in 256 KiB buckets and asks
   only "is there content here", so it cannot be fooled by a wrong per-slice layout — which every
   earlier measurement could, since they all addressed slices through `layer_stride`:
 
@@ -243,10 +275,16 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   remaining work is a forward investigation from the title's asset/streaming logic, not from the
   frame. Full evidence on #2998.
 
-- **The interior's wrong textures are not prosper mis-reading the atlas. The slices the interior
-  samples are genuinely empty in GUEST memory for the whole run** — narrowed 2026-08-27 from "the
-  atlas is almost empty for the whole run", which is false: the allocation IS filled progressively
-  below slice ~149. The claim that survives is about the interior's OWN slice range. Measured, each point with the control that
+- ~~**The interior's wrong textures are not prosper mis-reading the atlas.**~~ **FALSIFIED
+  2026-08-27 by #2998's fix — prosper WAS mis-reading the atlas**, by validating one surface of a
+  256-layer array and serving a decode taken while it was ~5% populated. The measurement under this
+  heading stands; the conclusion drawn from it does not. **Slice 248 specifically is
+  empty in GUEST memory for the whole run** remains TRUE and is not in conflict with the 93% figure:
+  it begins at bucket 333.2 of 344, inside the ~7% that stays zero. The PLURAL form of this claim --
+  "the slices the interior samples" -- does NOT survive: at 93% of 344 buckets the written region
+  reaches slice ~238, so slices 186-238 are written and only the tail of the interior's range is
+  not. Only slice 248 was ever measured. What was
+  wrong was inferring from an empty slice 248 that prosper's own read path was innocent. Measured, each point with the control that
   makes it mean something:
   - `PROSPER_SLICEMAP=1`: the 512x512x256 world atlas decodes with **slices 0-13 populated and
     14-255 empty** — contiguous, from the full 256-character map. **`short_reads=0`**, so every
@@ -254,9 +292,11 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
     scan samples one byte in 61.)
   - `PROSPER_SLICEWATCH=1` samples GUEST memory at slice 248 on the reuse path, which runs about
     138,000 times per route: it reads **zero on the first reference and never becomes non-zero**.
-    So the guest never fills **slice 248**, at any point — which retires the decode-cache
-    hypothesis properly. Note the scope: this is one slice inside the interior's range, and is NOT
-    evidence about the allocation as a whole (`## Ruled out` records a write at bucket 200).
+    So the guest never fills **slice 248**, at any point. That observation is sound and still
+    holds. **It did NOT retire the decode-cache hypothesis, though this line claimed it did** — a
+    slice the guest never writes says nothing about whether prosper re-reads the slices it DOES
+    write, and the decode cache was in fact serving a stale copy of those (#2998). Note the scope
+    too: one slice inside the interior's range, not evidence about the allocation as a whole.
     An earlier attempt to retire it was **void**: the `PROSPER_NO_TEXTURE_DECODE_CACHE` run never
     left the title screen (its colour count sits at the title's ~210k for all 300 s), so its 233
     re-decodes all happened before the level streamed anything.
@@ -267,9 +307,11 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
     constant across all 4,206 vertices, through `OpBitFieldUExtract(dword, 24, 8)` to the fragment
     varying.
   So the guest samples a slice that nothing ever wrote — that slice, not the whole allocation —
-  and prosper reads that correctly. **The
-  missing piece is an atlas upload path prosper does not perform**, not the array plumbing, which is
-  now measured end to end. Compute is excluded; DMA is untested (a `PROSPER_DMA_WATCH_DST` run was
+  and prosper reads that slice correctly. ~~**The missing piece is an atlas upload path prosper does
+  not perform**~~ — **FALSIFIED 2026-08-27**: no upload path was missing. The guest filled the atlas
+  itself with ordinary CPU stores, and prosper simply never re-read it, because the decode cache
+  validated 0.29% of it (#2998). The array plumbing was indeed measured end to end and was indeed
+  correct; the defect was one layer above it, in what the cache proved reuse against. Compute is excluded; DMA is untested (a `PROSPER_DMA_WATCH_DST` run was
   silent but had no control, so it is not evidence).
 
 - **`r.depth = 256` is NOT a mis-decode.** The raw descriptor (`PROSPER_TDUMP=512x512`) reads
