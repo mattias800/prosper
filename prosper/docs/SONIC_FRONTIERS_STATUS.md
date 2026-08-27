@@ -39,7 +39,7 @@ a blue header band over a full-width body panel. Measured behaviour, all from li
 | How many pages? | **Twelve.** Confirms 40 flips apart: presses 1-12 each advance one page and press 13 activates a main-menu entry. |
 | What advances it? | **Face buttons only.** A single-button sweep (triangle, square, circle, options, touchpad, l1, r1, right, left, down, up, cross, 60 flips apart) advanced the panel on every face button and on **none** of the four d-pad directions — `right`, `left`, `down` and `up` left the header on "Update Details" for 240 flips, then `cross` advanced it. |
 | Where is the cursor afterwards? | On **"Extras"**, the last of the six main-menu entries, so five `up` reach "New Game" whether or not the list wraps. |
-| Is the queue route-stable? | **Yes, and independently of save state.** This row used to say "only against an isolated save area"; that is withdrawn. A `boot_trace` arm of the committed route reaches `GameModeStage` **with an existing save present**, so twelve confirms consumed twelve pages with that save in place. The page count is the whole of the queue-length story and it is speed-independent — one page per face press (row above) — so this **falsifies** that story rather than leaving it unseparated. |
+| Is the queue route-stable? | **Yes, and independently of save state.** This row used to say "only against an isolated save area"; that is withdrawn. A `boot_trace` arm of the committed route reaches `GameModeStage` **with an existing save present**, so twelve confirms consumed twelve pages with that save in place. The page count is the whole of the queue-length story and it is speed-independent — one page per face press (row above) — so this **falsifies** that story rather than leaving it unseparated. ([#2790](https://github.com/mattias800/prosper/issues/2790), PR #3049.) |
 
 This is why 405 dense confirms (one every 20 flips) got no further than six did: the pages are
 consumed one per press with an animation between them, so spacing, not volume, is what clears the
@@ -59,24 +59,40 @@ Ruled-out rows below record for **two** distinct causes, both ending in a confir
 **no** `--warmup-seconds`, so that cause is excluded there and host load is the remaining candidate.
 Check `uptime` and which of the two applies before diagnosing anything.
 
-**Save data does not explain this**, although one arm made it look that way — and the queue-length
-mechanism is positively falsified, not merely unsupported (see the notice-queue table above). The 2×2:
+**Save data was never shown to explain this**, although one arm made it look that way. The
+queue-length *mechanism* is separately falsified (see the notice-queue table above); that is a
+statement about the mechanism, not about whether the save matters. The 2×2, with arm counts, because
+the asymmetry is the whole point:
 
 | frontend | save state | reaches `GameModeStage` |
 | --- | --- | --- |
-| `boot_trace` | existing save present | **yes** — `ui_gamemodestage` markers, and 189 log lines naming `w6d01_trr` terrain sectors |
-| `boot_trace` | empty `PROSPER_SAVE0` root | **yes** |
+| `boot_trace` | existing save present | **yes** — `ui_gamemodestage` markers, and 189 log lines naming `w6d01_trr` terrain sectors (arm count not recorded) |
+| `boot_trace` | empty `PROSPER_SAVE0` root | **yes** (arm count not recorded) |
 | live renderer | existing save present | no — parked in Extras (**n=1**, no `--warmup-seconds`) |
 | live renderer | save moved aside, and `PROSPER_SAVE0` | yes (two arms) |
 
-Since the save changes nothing on `boot_trace`, and the single renderer failure sits against this
-title's own 1.5–3.4 flips/s spread, "save present" and "slow arm" were never separated on that
-frontend. Do not treat an empty save root as a precondition of this route.
+Two limits on what that table can carry. The cells that do the overturning have **no recorded arm
+count**, so a table whose only counted cell is the `n=1` it overturns is weak evidence for a positive
+claim. And `boot_trace` reaching `GameModeStage` is not the same as *the authored route* having run —
+this document's own step table has the path passing `GameModeOpening` and `raw/event/scene/ev0020*`
+at f2600, and neither arm was checked for those markers. A `PROSPER_FILELOG` arm with
+`PROSPER_PAD_SCRIPT_LOG=1` would settle it by grep and has not been run.
+
+What the table does support is the **negative**: the single renderer failure sits inside this title's
+own 1.5–3.4 flips/s spread, so "save present" and "slow arm" were never separated on that frontend.
+That is enough to withdraw the precondition and not enough to assert its opposite — **do not treat an
+empty save root as a precondition of this route, and do not treat it as established that the save is
+irrelevant.**
 
 **`boot_trace` is the fast loop** — **17–30 flips/s**, against the live arm's 1.5–3.4, so `f2900` is
-~100–200 s rather than 14–32 minutes. Not a single-run figure: today's ~17 is corroborated by the
-Ruled-out row below, whose nine routed arms give 6,994 flips / 420 s = 16.7/s and 1,669 / 90 s =
-18.5/s.
+~100–200 s rather than 14–32 minutes. Today's arm measured ~17 and ~30 is recorded elsewhere in this
+document, so treat the range as 17–30 rather than either endpoint. The nearest independent figures
+are **two `tools/screenshot` arms with Vulkan rendering suppressed** (the `--warmup-seconds` row
+below): 6,994 flips / 420 s = 16.7/s and 1,669 / 90 s = 18.5/s. Those land in the same band, but they
+are a *different frontend* and n=2 — corroboration that a non-rendering arm runs at roughly this
+rate, not a second measurement of `boot_trace`. The nine-arm row below is about `boot_trace`
+desynchronising under host load and publishes no flip rate at all; do not read it as supporting this
+number.
 
 ```bash
 PROSPER_PAD_SCRIPT=@scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad \
@@ -125,7 +141,9 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_PAD_SCRIPT=@prosper/scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad \
 PROSPER_SAVE0=~/frontiers-work/save/run1 \
   ./build/screenshot <DUMP_ROOT>/PPSA03831-app0 \
-  --warmup-seconds 420 --seconds 3 --count 55 --out ~/frontiers-work/shots/run1
+  --seconds 3 --count 55 --out ~/frontiers-work/shots/run1
+# NO --warmup-seconds on this route: it suppresses Vulkan rendering, which moves the guest's flip
+# rate off wall clock and fires every window at the wrong guest state. See the Ruled out row.
 ```
 
 **Reproduction:** the file-oracle result reproduced on four CPU-only `boot_trace` arms and the live
@@ -503,7 +521,7 @@ to remember to update it. The last one did not (review of #2820).
 | Hypothesis | Verdict and evidence |
 | --- | --- |
 | All three scene-target-width kernels are blocked by `s_cbranch_execz` — a stronger claim than #2790's census, which records it for two of the three | **Partly falsified — two of the three moved, one never did.** The `V_LSHL_ADD_U32` allowlist entry the census predates has landed, and re-measuring on `d2b2e4d3` shows `0x2005717e00` and `0x200571bd00` no longer rejecting on `s_cbranch_execz` at pc=28 but on `image_load_mip` at **pc=81** — "a reject PC names where a fact was consumed, not where it was lost", exactly as that commit predicted. `0x2005714000` did **not** move: the census already recorded it at pc=33 `image_load_mip`, byte-identical. So all three of THESE THREE kernels now stop on the SAME instruction — which narrows this particular group to one unimplemented operation, and is **not** a claim that the title's world needs only that: `image_load_mip` is the first blocker of at least two (see the section above, and #2859 for the `s_getpc_b64` half that has since landed). Their `[mimg-mip]` profiles are identical too — `img_dim=5/1 mips=12 addr=0x2026900000 2048x2048`. Note `image_get_resinfo` at pc=73 belongs to `0x2005a13f00` / `0x2006e24000`, **not** to any of these three; an earlier revision of this row mis-attributed it by pairing separately-collected program and reject lists. #2790, #3048 |
-| `boot_trace` cannot position a flip-anchored route because it prints no flip counter | **NOT a falsification — this row was wrong and is retracted.** It was written from a 180 s arm that produced 155 lines with no flip marker, but the arm simply had no counter switch enabled. Two exist, both in `src/hle` and so linked into `boot_trace`: `PROSPER_PAD_SCRIPT_LOG=1` prints `[pad-script] elapsed=… frame=<flips since first poll> read=… buttons=…`, i.e. the route's own flip position per input (`hle_pad.cpp`, `docs/INPUT_REPLAY.md`), and `PROSPER_PROGRESS=<secs>` prints `flips=` from `prosper_vo_flip_count()`. Structurally it could not have been true either: `fN` anchors are resolved by `pad_frame_now()` reading that same counter in every frontend. Kept as a row because the mistake is the reusable part — **a null from an instrument whose switch was never thrown is not evidence**, and this document already says four times over that the CPU-only `boot_trace` arm IS the fast loop and does reach the stage. The operational note I attached to it does **not** stand either: I saw one `boot_trace` survive a plain `timeout`, but the tree says the opposite (`hle_agc.cpp` — "a `timeout`-bounded diagnostic run dies on SIGTERM") and this document's own recipe uses `timeout --foreground -s TERM -k 5s`. I first attributed that to the missing `--foreground` flag; **that explanation is backwards** — GNU `timeout` *without* `--foreground` signals the whole process group, which is the more lethal configuration, so omitting it cannot explain a survivor. The observation stands unexplained; do not build on it. Use the established recipe; my one observation is unexplained and is not a reason to change it. |
+| `boot_trace` cannot position a flip-anchored route because it prints no flip counter | **NOT a falsification — this row was wrong and is retracted.** It was written from a 180 s arm that produced 155 lines with no flip marker, but the arm simply had no counter switch enabled. Two exist, both in `src/hle` and so linked into `boot_trace`: `PROSPER_PAD_SCRIPT_LOG=1` prints `[pad-script] elapsed=… frame=<flips since first poll> read=… buttons=…`, i.e. the route's own flip position per input (`hle_pad.cpp`, `docs/INPUT_REPLAY.md`), and `PROSPER_PROGRESS=<secs>` prints `flips=` from `prosper_vo_flip_count()`. Structurally it could not have been true either: `fN` anchors are resolved by `pad_frame_now()` reading that same counter in every frontend. Kept as a row because the mistake is the reusable part — **a null from an instrument whose switch was never thrown is not evidence**, and this document already says four times over that the CPU-only `boot_trace` arm IS the fast loop and does reach the stage. The operational note I attached to it does **not** stand either: I saw one `boot_trace` survive a plain `timeout`, but the tree says the opposite (`hle_agc.cpp` — "a `timeout`-bounded diagnostic run dies on SIGTERM") and this document's own recipe uses `timeout --foreground -s TERM -k 5s`. I first attributed that to the missing `--foreground` flag; **that explanation is backwards** — GNU `timeout` *without* `--foreground` signals the whole process group, which is the more lethal configuration, so omitting it cannot explain a survivor. The observation stands unexplained; use the established recipe and do not build on it. ([#2790](https://github.com/mattias800/prosper/issues/2790), and PR #3049 which retracted this row.) |
 | The unregistered `libSceFont` surface is why some of this title's text or UI fails to draw | **Falsified, by counting.** This dump names `libSceFont` and `libSceFontFt` only as `_stub_weak` entries in its dynamic library table, and its eboot and every `sce_module/*.prx` import **zero** of the 156 NIDs those two libraries export. Positive control on the same sweep in the same run: *Metaphor* 25, *Astro Bot* 54. Confirmed by the authoritative instrument too — `self_dump --import-slots` reports 0 import slots here against 25 / 54 there. A library named in a binary is not a library called from it. #2951 |
 | The stall after `ui_gamemodeinitialize.pac` is a rendering, present or publish defect | **Falsified.** It was one unregistered Sony import. With `RjMlsR8EXrw` registered and nothing else changed, the same binary reaches the title screen and the main menu — while the renderer, present path and publish gate are byte-identical. (This PR.) |
 | The guest stops submitting GPU work after the opening logo | **Falsified.** A same-process A/B across the freeze recorded 11 `agc_driver_submit_dcb`, 4 draws, 7 dispatches and 1 flip per frame *after* it, against 15/1/3/1 during the intro. (#1968.) |
