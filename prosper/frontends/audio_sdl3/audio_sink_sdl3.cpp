@@ -61,6 +61,49 @@ bool queue_trace() {
     static const bool on = getenv("PROSPER_AUDIO_QUEUE_TRACE") != nullptr;
     return on;
 }
+// PROSPER_AUDIO_CUSHION_GRAINS=N -- a FALSIFICATION LEVER, not a tuning knob. It exists so the A/B
+// that rejected the deeper-cushion hypothesis stays reproducible, exactly as PROSPER_UD_TAIL_ALIGN
+// does for the user-data-tail hypothesis. **Do not set it to fix anything.**
+//
+// The hypothesis (#2984, and it is a persuasive one): the pacer holds the device queue at about one
+// grain, so any guest-side lateness longer than a grain drains it and underruns audibly; hold three
+// grains instead and scheduler jitter stops reaching the speaker.
+//
+// Measured on Blasphemous 2 (PPSA13579), Windows/RTX 4090, 150 s from launch per arm, underrun
+// episodes from tools/perf/audio_queue_timeline_report.py, two runs per arm (#3033):
+//
+//     N=1 (this default)                53.03% / 53.43% dry   arrivals every 11.38 ms
+//     N=3                               69.20% / 69.05% dry   arrivals every 15.57 ms
+//     PROSPER_GUEST_SLEEP_LEGACY=1      69.01%          dry   arrivals every 15.59 ms
+//
+// Within-arm spread is 0.4 pp and the gap is 15.7 pp, so the deeper cushion is decisively WORSE --
+// and it lands on the PRE-FIX pacer to within 0.2 pp and 0.1 ms. That is the mechanism: priming the
+// queue deeper does not buy jitter tolerance, it removes the pacing, and the guest then falls back
+// to whatever it waits on by itself, which is the ~15.6 ms winpthreads tick. The arrival histogram
+// shows it directly -- at N=1, 29.5% of arrivals land on the 5.33 ms grain point; at N=3, almost
+// none land below 10 ms. The pacer is actively PULLING the guest to a finer cadence.
+//
+// The reason no cushion can help is upstream and is now its own issue (#3072): the guest supplies
+// 84 grains/s against the 187 continuous playback needs, so a cushion cannot be filled by a source
+// producing half the samples. #2984 predicted the spacing would come "from the drain rate once the
+// cushion is full"; the cushion does not stay full.
+//
+// How the lever works: N=1 primes the grid at `now`, which is byte-for-byte the shipped behaviour.
+// N>1 primes it N-1 grains in the PAST, so the first N-1 calls find their deadline already passed
+// and return at once. Kept clamped because a deep cushion is also N * ~5.33 ms of added latency.
+int cushion_grains() {
+    static const int n = [] {
+        const char* v = getenv("PROSPER_AUDIO_CUSHION_GRAINS");
+        if (!v || !*v) return 1;
+        char* end = nullptr;
+        const long parsed = strtol(v, &end, 10);
+        // A malformed value keeps the default instead of picking some other depth: a typo must
+        // cost the experiment, never silently run a third arm nobody chose.
+        if (end == v || (end && *end) || parsed < 1 || parsed > 16) return 1;
+        return (int)parsed;
+    }();
+    return n;
+}
 
 
 // 16 public sceAudioOut ports plus four host-only streams for concurrent AudioOut2 contexts.
@@ -243,7 +286,11 @@ public:
                 // Same resync-if-behind model as the core's RealtimeSilentSink.
                 auto dur = std::chrono::nanoseconds((int64_t)frames * 1000000000LL / freq);
                 auto now = std::chrono::steady_clock::now();
-                if (s.next.time_since_epoch().count() == 0 || s.next < now - dur * 4) s.next = now;
+                // Prime the grid cushion_grains()-1 periods in the past on first use and after a
+                // resync, so the device queue runs that far ahead of the guest. At the default of
+                // 1 this is `s.next = now`, byte-for-byte the merged behaviour.
+                if (s.next.time_since_epoch().count() == 0 || s.next < now - dur * 4)
+                    s.next = now - dur * (cushion_grains() - 1);
                 s.next += dur;
                 target = s.next;
             }
