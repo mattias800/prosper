@@ -161,19 +161,28 @@ The standing warnings that are **not** title-specific:
   hypotheses without contradictory new evidence.** Each is falsified with evidence in
   `docs/MESSENGER_BLACK_RENDER.md` § Ruled out. The real cause was a missing recompiler instruction
   plus loss of per-target dimensions (#526/#527, fixed by #528), with #534 and #541 behind it.
-- **Do not resume Messenger-specific renderer cache work toward 60 FPS** — and note the figure that
-  used to justify this line was measured wrong. It said the July pass "stopped at roughly 12 → 24 FPS
-  on the first level". That pass measured through `tools/screenshot`, which **never calls
-  `set_gpu_present_active`**, so GPU present is inactive and the renderer is forced to copy every
-  scanout frame back to the CPU — a path a windowed run does not take. Re-measured 2026-08-27 through
-  `prosper-app` with `[app] GPU present: adopted` in the log, the same first level holds **100-160
-  FPS** (#3076). The advice stands for a different reason: the title is already fast, so there is
-  nothing to win there. The remaining synchronous graphics/compute boundaries must still be evaluated
-  against a **3D** workload — those are genuinely slow (GTA V 3.6 FPS, Bendy 9 FPS, both measured
-  windowed). `docs/RENDERER_PERFORMANCE_2026_07.md`.
-  **Before quoting ANY FPS number from this project, check the harness.** A figure from
-  `tools/screenshot` or any `SDL_VIDEODRIVER=offscreen` run describes the forced-readback
-  architecture, not the shipped one.
+- **Do not resume Messenger-specific renderer cache work toward 60 FPS.** The July pass deliberately
+  stopped at roughly 12 → 24 FPS on the first level; the remaining synchronous graphics/compute
+  boundaries must be evaluated against a **3D** workload first (*Summer Sports Games* `PPSA03416` is
+  the first clean candidate). `docs/RENDERER_PERFORMANCE_2026_07.md`.
+  **That 24 FPS is stale, and the reason matters more than the number.** It was measured correctly,
+  with `prosper-app`, on 2026-07-14 — and #1270 changed the present architecture ten days later
+  (2026-07-24), so it describes a renderer that no longer exists. Re-run windowed on 2026-08-27, the
+  same first level holds the host display's **180 Hz refresh rate** for most of the route, with one
+  dip to 76.5. That run was `fifo`, so 180 is a **cap, not a throughput**: the true rate is somewhere
+  at or above it and has not been measured (#3083). The advice above survives either way — whatever
+  the ceiling is, this title is nowhere near being the thing to optimise.
+- **Before quoting an FPS number from this project, check which harness produced it — and when.**
+  Two independent ways to get a wrong one, and they do not overlap:
+  - **`tools/screenshot` never calls `set_gpu_present_active`** (the sole call site is
+    `frontends/prosper-app/main.cpp:590`), so in that harness the renderer copies every scanout frame
+    back to the CPU. Its rate describes the forced-readback path, not the shipped one. **This applies
+    only to figures measured after 2026-07-24** — before #1270 there was no GPU-present path, so
+    every harness took the readback and the old figures are honest measurements of what then shipped.
+  - **A `fifo` run measures the display.** Pass `--present-mode immediate` before quoting a rate as a
+    throughput, and say which mode the run used. Quote `distinct` rather than `presented`
+    (`tools/screenshot`) — and note the interactive app could not report a distinct rate under GPU
+    present at all until #3019 (2026-08-26).
 - **Start Windows work from `docs/WINDOWS_PORT_HANDOFF.md`**, not the solved pre-render fence
   investigation; Windows *release* users start from `docs/WINDOWS_RELEASE.md`.
 - **A historical capture hash is not a current renderer oracle**, and neither is a target extent or a
