@@ -20,6 +20,7 @@
 #include "host/platform/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
 #include "hle/sync/pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
 #include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS (#3013)
+#include "host/platform/precise_sleep.hpp"   // guest sem timedwait must not inherit the tick (#3013)
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "gpu/execute/mb3_freelist.hpp"
@@ -3058,7 +3059,82 @@ HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog
 HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : fbsd_errno(errno); }   // EAGAIN (would block) is 11 here, 35 on the PS5
 // scePthreadSemTimedwait is the one member of the family with no POSIX spelling registered on its
 // body, so it encodes in place; the other six go through SCE_PTHREAD_ALIAS below (#2178).
-HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return prosper::hle::kSceKernelErrorEINVAL; hle::WaitCensusScope c(hle::WaitKind::SemTimedwait, a1 * 1000ull); timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : sce_pthread_rc(fbsd_errno(errno)); }
+// scePthreadSemTimedwait / sem_timedwait: acquire with a RELATIVE microsecond timeout.
+//
+// #3013 fixed the guest SLEEP primitives; this is the TIMED WAIT half, recovered from #2984's
+// c45debbf and reshaped. On Windows sem_timedwait is winpthreads', whose timed waits resolve on its
+// own master tick regardless of timeBeginPeriod -- measured on this toolchain at 15.57 ms for a
+// 5.33 ms request. FMOD's mixer paces 256-frame blocks on exactly this call, so a guest asking for
+// one grain was released once per tick instead: audio delivered at roughly a third of real time
+// (Blasphemous 2, #2985).
+//
+// Two deliberate departures from the recovered form, both measured rather than assumed.
+//
+// FIRST, the POSIX path is left alone. That commit polled on every platform, which is a needless
+// regression on Linux and macOS where sem_timedwait already honours the deadline: polling there
+// replaces one exact wait with a loop that is strictly worse on both latency and CPU. The tick is a
+// Windows property, so the workaround is Windows-only and POSIX keeps the native call and its exact
+// semantics.
+//
+// SECOND, the poll interval is adaptive rather than a flat 2 ms. The whole reason this call needs care
+// is that a POSTED semaphore returns in 0.01 ms natively (measured, #3013's probe, and its control
+// arm) -- so any poll loop TRADES AWAY wake latency to buy timeout accuracy. A flat 2 ms slice costs
+// up to 2 ms on every wake, which is 37% of the 5.33 ms grain period this exists to serve: it would
+// fix the cadence and blunt the responsiveness in the same change. Short slices for the first few
+// milliseconds keep the wake tight where pacing lives; longer slices afterwards keep a guest parked
+// for seconds from spinning at 2 kHz for no benefit. (An earlier revision of this comment said
+// 5 kHz, which was the 200 us slice that revision used before the floor measurement below
+// replaced it.)
+HLE(k_sem_timedwait) {
+    auto* s = ensure_sem(a0);
+    if (!s) return prosper::hle::kSceKernelErrorEINVAL;
+    // Saturating, matching guest_ns_from in hle_kernel_time.cpp (#3022): a1 is guest-controlled,
+    // and a wrap here would turn a very long timeout into a short one. That file states the rule
+    // for the whole family, so this member of it should not be the exception.
+    const uint64_t kNsMax = ~0ull;
+    const uint64_t timeout_ns = a1 > kNsMax / 1000ull ? kNsMax : (uint64_t)a1 * 1000ull;
+    hle::WaitCensusScope c(hle::WaitKind::SemTimedwait, timeout_ns);
+#ifndef _WIN32
+    timespec dl = abs_deadline_us(a1);
+    int rc = sem_timedwait(s, &dl);
+    return rc == 0 ? 0 : sce_pthread_rc(fbsd_errno(errno));
+#else
+    // trywait first: an already-posted semaphore costs nothing and never reaches the loop.
+    if (sem_trywait(s) == 0) return 0;
+    const uint64_t start_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Saturating again on the addition: start_ns + timeout_ns can itself wrap for a huge timeout,
+    // and a wrapped deadline lands in the past, which would turn a long wait into an instant
+    // timeout -- the loud direction, but still wrong.
+    const uint64_t deadline_ns =
+        timeout_ns > kNsMax - start_ns ? kNsMax : start_ns + timeout_ns;
+    // 500 us while the wait is young, 2 ms after 8 ms have passed. The crossover is above one grain
+    // period so an audio pacing wait never leaves the tight regime.
+    //
+    // 500 us and not less, because that is the FLOOR of a short high-resolution-timer sleep on
+    // this host, measured rather than assumed: requests of 0.05, 0.10 and 0.20 ms all cost a
+    // median of 0.52 ms (200 samples each; 0.50 ms -> 1.02, 1.00 -> 1.51, 2.00 -> 2.07). An
+    // earlier revision asked for 200 us, which reads as a tighter loop than the machine can
+    // actually run and would mislead the next person tuning it. What the fine window buys is a
+    // poll interval about 4x shorter than the coarse one (0.52 ms against 2.07), not the 10x the
+    // constants implied.
+    const uint64_t kFineSliceNs = 500000ull, kCoarseSliceNs = 2000000ull, kFineWindowNs = 8000000ull;
+    for (;;) {
+        if (sem_trywait(s) == 0) return 0;
+        // EAGAIN means "not posted yet", which is the whole point of the loop. Anything else --
+        // EINVAL on a semaphore whose storage was retired, say -- will not become true by waiting,
+        // so report it instead of spinning to the deadline and then reporting a timeout that
+        // misdescribes what happened. EINTR is retried, as a wait should be.
+        if (errno != EAGAIN && errno != EINTR) return sce_pthread_rc(fbsd_errno(errno));
+        const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ns >= deadline_ns) { errno = ETIMEDOUT; return sce_pthread_rc(fbsd_errno(errno)); }
+        const uint64_t slice = (now_ns - start_ns) < kFineWindowNs ? kFineSliceNs : kCoarseSliceNs;
+        const uint64_t remaining = deadline_ns - now_ns;
+        prosper::host::sleep_until_steady_ns(now_ns + (remaining < slice ? remaining : slice));
+    }
+#endif
+}
 HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 // Quarantined, not freed, and `sem_destroy` deferred to reclaim — a thread parked in `sem_wait` is
