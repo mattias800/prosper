@@ -82,8 +82,15 @@ Two further details cost time and are worth keeping:
 ## Open defects
 
 1. **Every world and character surface is untextured** and the scene is over-bright
-   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The atlas is bound and holds real
-   data (84 MB non-zero), nothing is rejected, and the menus are fully textured.
+   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The atlas is bound, nothing is
+   rejected, and the menus are fully textured.
+   **The "84 MB non-zero" this line used to carry is withdrawn (2026-08-27).** A full-byte census
+   of the guest allocation reads `filled=19/344` 256 KiB buckets -- about **4.75 MB of 86 MiB** --
+   with `unreadable=0`, which the old figure cannot be reconciled with. It arrived in `227f5fbe`
+   (#3006) without a recorded method, and **what it actually measured is not established** -- so it
+   is withdrawn rather than reinterpreted. Do not repair it by guessing a plausible source (the
+   decoded host image is the obvious guess, and guessing is how the head-sample figure survived);
+   re-derive it or leave it out. See `## Ruled out`.
 2. **Text is intermittently garbled** ([#2999](https://github.com/mattias800/prosper/issues/2999)) —
    the EULA body and the title-screen game selector draw the wrong glyphs while the same font
    renders headings, numerals and every ring label correctly.
@@ -192,13 +199,19 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   arithmetic error. Neither changes the conclusion, and note the scope this box does NOT establish:
   it is one observation at decode time, not a statement about the whole run -- see the entry below.
 
-- **The allocation is NOT static, and the upper region IS written later in the run.** With the write
-  trace armed at bucket 200 (`PROSPER_DMEM_WRITE_TRACE=2:0x40000000:0x83cc000:128`, target
-  `0x204c3cc000`) the upper atlas takes **32 events, `selected=yes changed-during-window=yes`**,
-  against a positive control at bucket 0 that also fires 32. So "the guest never fills the upper
-  atlas" is false; what the occupancy box above measures is the state at the one moment prosper
-  decodes. The writer is `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing 8x16 B per
-  iteration to offsets computed in `%ymm10`.
+- **The allocation is NOT static: it is filled progressively, and a region ABOVE the decode-time
+  content is written later in the run.** With the write trace armed at bucket 200
+  (`PROSPER_DMEM_WRITE_TRACE=2:0x40000000:0x83cc000:128`, target `0x204c3cc000`) that bucket takes
+  **32 events, `selected=yes changed-during-window=yes`**, against a positive control at bucket 0
+  that also fires 32. So the occupancy box above measures the state at the one moment prosper
+  decodes, not the whole run.
+  **Read the scope.** Bucket 200 is byte 52,428,800 = slice **148.8** at `layer_stride=352256`,
+  which sits *below* the interior's slices 186-248 (buckets **249.9-333.2**). This probe says
+  nothing about the interior's own slices, and the finding that slice 248 reads zero throughout
+  stands. An earlier version of this bullet concluded "so 'the guest never fills the upper atlas'
+  is false" without that qualification; that conclusion is retracted -- see `## Ruled out`.
+  The writer is `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing 8x16 B per iteration to
+  offsets computed in `%ymm10`.
 - **The title reads its textures; they simply do not arrive here.** `PROSPER_READBYTES=1` counts
   bytes delivered per path with no stack walk: **`.DDS open-events=299 paths-read=297`** over a
   route, alongside `.TRM 98/52` and smaller sets. (Those two fields carry DIFFERENT units -- open
@@ -258,11 +271,15 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 - **Nor is it the slice LAYOUT.** With the array treated as fully tight -- stride = one selected-mip
   surface AND no per-slice mip offset, the combination an earlier test got wrong by changing only the
   stride -- the populated count moves 14 -> 19 of 256 and the interior is still wrong. Every layout
-  tried leaves the same invariant: **only about 5 MB of the atlas's 67 MB is non-zero**, whichever
-  way the slices are addressed.
-  So the remaining question is not how prosper reads the atlas but **why most of it was never
-  written**: the guest declares 256 slices at `0x20491cc000` and samples slice 248, while the memory
-  there is zero. That points at a content path prosper does not observe (a DMA or compute upload
+  tried leaves the same invariant **at decode time**: only about 5 MB of the atlas's 67 MB is
+  non-zero, whichever way the slices are addressed. (67 MB here is the mip-0-only footprint,
+  256 x 262,144; the 86 MiB used elsewhere in this doc is the full `layer_stride=352256` span. Both
+  are correct for what they measure -- name which one you mean.) That figure is a decode-time
+  observation: the allocation IS filled progressively above it, though not, as far as anything has
+  measured, in the interior's own slice range.
+  So the remaining question is not how prosper reads the atlas but **why the slices the interior
+  samples were never written**: the guest declares 256 slices at `0x20491cc000` and samples slice
+  248, while the memory there is zero. That points at a content path prosper does not observe (a DMA or compute upload
   into the atlas) rather than at the array plumbing, which is now measured end to end.
 
 - **Missing SPIR-V `Flat` on the varying that carries the array slice is NOT why interiors sample
