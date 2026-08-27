@@ -127,6 +127,21 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **RESOLVED 2026-08-27 — the interior wrong-texture defect (#2998) was the decode cache's
+  validation span.** `persistent_base_source_size` returned ONE surface for a layered array, so the
+  cache proved reuse against **262144 of 90177536 bytes (0.29%)** of the 256-layer world atlas.
+  The title fills that atlas progressively: prosper decoded it once at roughly 5% populated, the
+  guest reached 93% by gameplay (measured from a `.prgbundle`: `nz=84070204` of `footprint=90177536`),
+  and the cache served the early decode for the rest of the run — so interiors sampled layers still
+  holding the previous occupants of that memory. Fixed by `layered_array_source_size`, mirroring
+  `layered_cube_source_size`, whose comment already stated the invariant: *"cache reuse can never be
+  proved against less memory than the layer-aware decoder reads."* Control: toggling the fix with one
+  `false &&` on the same route flips `source_size` 90087424 ↔ 262144 and the frame between the
+  correct scene (245141 colours) and passports on the walls (124916), mean difference 51.48/255.
+  **The hypotheses this retires as symptoms rather than causes:** layer indexing, `base_array`,
+  per-slice stride, and "the atlas is unpopulated" — the guest memory was right all along; prosper
+  was reading a stale copy of it. (#2998, #2990)
+
 - **"The world is textured" (2026-08-27 blog entry / #3050 progression evidence)** — RETRACTED the
   same day. The capture was the game blitting its own pre-rendered loading picture,
   `2/PIX/HD/MANSION.DDS`: pixel-compared against the published screenshot it scores **mean abs diff
