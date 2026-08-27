@@ -83,14 +83,22 @@ bool queue_trace() {
 //     PROSPER_GUEST_SLEEP_LEGACY=1      69.01%          dry   arrivals every 15.59 ms
 //
 // Within-arm spread is 0.4 pp against a 15.7 pp gap, so the deeper cushion is decisively WORSE. The
-// mechanism, traced in the code rather than inferred from the coincidence: at N=1 the guest drifts
-// past the grid and trips the `s.next < now - dur * 4` resync every few calls, and ONLY a resync
-// call then sleeps a full grain -- which predicts arrivals quantised to grain multiples with about
-// a quarter of them one grain apart, and the histogram measures 29.5% at the 5.33 ms point. At N=3
-// every target the lever can produce is already in the past, so the sink never sleeps at all --
-// predicting almost nothing at one grain, and the histogram measures one sample, 0.0%. So the code
-// predicts both distributions; the numeric agreement with the legacy arm is corroboration, not the
-// argument.
+// mechanism, traced in the code rather than inferred from the coincidence -- and SCOPED, because
+// both halves hold in the MEASURED regime, in which the guest is behind, rather than in general:
+//
+//   * at N=1 the guest drifts past the grid and trips the `s.next < now - dur * 4` resync every few
+//     calls, and while it is behind ONLY a resync call then sleeps a full grain -- which predicts
+//     arrivals quantised to grain multiples with about a quarter of them one grain apart, and the
+//     histogram measures 29.5% at the 5.33 ms point. With a guest that keeps up, an ordinary call
+//     sleeps the grain REMAINDER; that is the default pacer doing its job, and it is what #3016
+//     fixed.
+//   * at N=3, again because the guest is behind, every target the lever produces is already in the
+//     past and the sink never sleeps at all -- predicting almost nothing at one grain, and the
+//     histogram measures one sample, 0.0%. With a guest that keeps up, pacing resumes after about
+//     N-1 calls, which is what the note further down says.
+//
+// So the code predicts both distributions; the numeric agreement with the legacy arm is
+// corroboration, not the argument.
 //
 // Note the two 69% arms reach that number by DIFFERENT mechanisms -- N=3 by the sink not sleeping,
 // the legacy arm by `std::this_thread::sleep_until` quantising -- so their agreement to 0.2 pp is a

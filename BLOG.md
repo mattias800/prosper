@@ -23,17 +23,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Windows audio: the underruns are not a pacing bug
 
-Every title crackles on Windows and only on Windows, and the obvious cause -- the sink hands the
-sound card too little cushion -- is wrong. Blasphemous 2's guest produces **84 audio grains a
-second against the 187 continuous playback needs** -- 45% of real-time audio. The device queue is
-then empty 53% of the time however carefully the sink paces the half it does get.
+Every title crackles on Windows and only on Windows, and the obvious cause — the sink hands the
+sound card too little cushion — is wrong. Blasphemous 2's guest produces **84 audio grains a
+second against the 187 that continuous playback needs**, so the device queue is empty 53% of
+the time however carefully the sink paces the half it does get.
 
 Holding a deeper cushion, which is the fix everyone reaches for first, measures *worse*: 69%
-empty, identical to the pre-fix pacer it was meant to improve on. The pacer turns out to be
-pulling the guest along rather than holding it back.
+empty, matching the pre-fix pacer it was meant to improve on. Removing the pacing makes the
+guest deliver less often, not more.
 
-No picture -- this one is a number. #3072 has the hunt.
-
+No picture — this one is a number. #3072 has the hunt.
 
 ### Tomb Raider's world is textured
 
@@ -49,7 +48,6 @@ read slice 0.
 
 Interiors still put textures on the wrong surfaces.
 [#325](https://github.com/mattias800/prosper/issues/325)
-
 
 ### What "the wrong surfaces" actually looks like
 
@@ -75,7 +73,6 @@ until now the HUD and radar drew over nothing.
 
 Gameplay runs at a few frames a second, and the texture path is most of the frame.
 [#1873](https://github.com/mattias800/prosper/issues/1873)
-
 
 ### Tomb Raider's world stopped being a pile of shards
 
@@ -438,7 +435,6 @@ yesterday and was not true yesterday. And we know what it has to read: the guest
 write each one, plus one whole-chain view to read the finished thing back. The levels are sitting in
 guest memory the whole time, at offsets prosper already computes correctly for each of those twelve
 single-level descriptors. It just has never been able to look at them together.
-
 
 ### The Messenger's title screen runs at 206 fps and 0 fps at the same time
 
