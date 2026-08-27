@@ -37,6 +37,17 @@ Interiors still put textures on the wrong surfaces.
 [#325](https://github.com/mattias800/prosper/issues/325)
 
 
+### What "the wrong surfaces" actually looks like
+
+Lara's Home, and every wall and floor is wearing something real from elsewhere in the game — her
+passport, the Game Boy collectibles, an inventory document page.
+
+![Croft Manor interior: walls tiled with Game Boy console artwork and a UK passport page, the floor covered in a document reading THIS PAGE IS RESERVED FOR OFFICIAL OBSERVATIONS, Lara silhouetted in the centre](assets/screenshots/tomb-raider-croft-manor-interior-wrong-textures.png)
+
+The textures decode correctly and the geometry is right; the wrong content is being selected.
+[#2998](https://github.com/mattias800/prosper/issues/2998)
+
+
 ## 2026-08-26
 
 ### Grand Theft Auto V renders its world
