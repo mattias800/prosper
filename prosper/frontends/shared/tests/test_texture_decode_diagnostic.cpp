@@ -115,10 +115,14 @@ int main() {
                     352256u * 255u + 262144u);
     CHECK_NAMED("tomb_raider_atlas_span_is_not_one_surface",
                 layered_array_source_size(262144u, 352256u, 256u) != 262144u);
-    // A single layer, or a descriptor with no declared stride, leaves the surface size alone --
-    // the span must never be invented where the layout does not state one.
+    // A single layer leaves the surface size alone.
     CHECK(layered_array_source_size(262144u, 352256u, 1u) == 262144u);
-    CHECK(layered_array_source_size(262144u, 0u, 256u) == 262144u);
+    // A descriptor with NO declared stride is still read as `layers` back-to-back surfaces by the
+    // decoder's own fallback (`face_base`: stride = layer_stride ? layer_stride : selected_span),
+    // so the span must follow it. An earlier version of this test pinned the single-surface answer
+    // here, which documented the very defect the rest of this file exists to catch.
+    CHECK_NAMED("zero_stride_array_spans_every_layer_the_decoder_reads",
+                layered_array_source_size(262144u, 0u, 256u) == 262144ull * 256ull);
     // Fail closed, exactly as the cube form does: "do not cache" must not be widened into a
     // cacheable span, and an overflowing span must not truncate to a range shorter than the
     // decoder reads -- a short span IS the defect this guards.

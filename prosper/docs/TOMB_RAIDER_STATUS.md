@@ -81,16 +81,27 @@ Two further details cost time and are worth keeping:
 
 ## Open defects
 
-1. **Every world and character surface is untextured** and the scene is over-bright
-   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The atlas is bound, nothing is
-   rejected, and the menus are fully textured.
-   **The "84 MB non-zero" this line used to carry is withdrawn (2026-08-27).** A full-byte census
-   of the guest allocation reads `filled=19/344` 256 KiB buckets -- about **4.75 MB of 86 MiB** --
-   with `unreadable=0`, which the old figure cannot be reconciled with. It arrived in `227f5fbe`
-   (#3006) without a recorded method, and **what it actually measured is not established** -- so it
-   is withdrawn rather than reinterpreted. Do not repair it by guessing a plausible source (the
-   decoded host image is the obvious guess, and guessing is how the head-sample figure survived);
-   re-derive it or leave it out. See `## Ruled out`.
+1. ~~**Every world and character surface is untextured**~~ — **RESOLVED 2026-08-27**
+   ([#2998](https://github.com/mattias800/prosper/issues/2998)). The world renders correctly
+   textured; see the `## Ruled out` entry for the cause and its control. **The scene being
+   over-bright has not been re-assessed since the fix** — the corrected frame looks naturally lit,
+   but nobody has measured it, so treat that half as open-and-unverified rather than fixed.
+
+   **The "84 MB non-zero" this entry used to carry was WITHDRAWN ON 2026-08-27, AND THAT WITHDRAWAL
+   WAS WRONG.** The figure is correct. A `.prgbundle` captured during gameplay records
+   `nz=84070204` of `footprint=90177536` for this atlas — 93% — which is what that number always
+   measured: **guest memory at gameplay time**. It was withdrawn because a full-byte census read
+   `filled=19/344` buckets (~4.75 MB), and the two looked irreconcilable. They are not: the census
+   ran at **decode** time and the bundle at **gameplay** time, and the gap between them *is* the
+   defect this title had — the atlas fills progressively and prosper was reading it once, early.
+
+   Recorded at length because the failure was mine and it is instructive: the two numbers disagreed,
+   I could not derive the older one's method, and I withdrew it. Withdrawal felt like the
+   conservative move and was not — it deleted the one measurement that would have pointed straight
+   at the cause. **When two measurements of "the same thing" disagree by 20x, the first question is
+   what each one measured, not which to discard**; here the answer was "different moments", and that
+   answer was the bug.
+
 2. **Text is intermittently garbled** ([#2999](https://github.com/mattias800/prosper/issues/2999)) —
    the EULA body and the title-screen game selector draw the wrong glyphs while the same font
    renders headings, numerals and every ring label correctly.
