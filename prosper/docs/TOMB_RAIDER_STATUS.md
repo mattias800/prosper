@@ -93,7 +93,42 @@ Two further details cost time and are worth keeping:
    appears across a full boot, and the five-item ring carries no New Game or Load Game. Whether
    those are one defect or two is unestablished.
 
+## Guest 2D_ARRAY textures (#325)
+
+This title textures its whole world from one 512x512x**256** BC7 array, so until #325 the world was
+untextured. What makes an array work is that **three** places agree on the same question, and the
+predicate is written once — `guest_texture_is_uploaded_array()` in `gpu/texture/bc_decode.hpp`:
+
+| side | follows |
+| --- | --- |
+| uploader | decodes `depth` slices, publishes the count through `sample_count` |
+| view | `VK_IMAGE_VIEW_TYPE_2D_ARRAY` iff `sample_count > 1` |
+| recompiler | `OpTypeImage` `Arrayed` at **every** declaration site for such a resource; non-array instructions get layer 0 |
+
+**Arrayed-ness is a property of the RESOURCE, not of the instruction.** The uploader picks the view
+type from the guest T# and cannot see which opcode will sample it, so a declaration keyed on the
+instruction produces a descriptor mismatch for any DIM=1 sample of an array texture.
+
+The predicate is **block-compressed only**, and that is a real limit rather than caution: the
+per-slice decoder carries tiled and linear BC, plain byte-per-texel surfaces, fp16 and unorm16 — but
+not fp32 or the 4-byte narrow formats the single-surface decoder converts, so a Float32 array decodes
+to **black** (measured). Widening it means teaching the slice loop those two cases first.
+
+Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x512 BC7 atlas —
+262144 for mip 0 plus a 6-level chain — with `layer_mip_offset = 90112` selecting the level.
+`PROSPER_SLICESTRIDE=1` prints it, once per texture address.
+
 ## Ruled out
+
+- **Missing SPIR-V `Flat` on the varying that carries the array slice is NOT why interiors sample
+  the wrong layers.** The gap is real — `is_flat_shaded()` is decoded, used to build the guest's PS
+  input control word, and never reaches the SPIR-V (#3051) — but this title never asks for it. A
+  live `PROSPER_INTERPLOG=1` route (224,363 `[interp]` lines) shows Location 1, the slot carrying the
+  slice, with control words `0x1` / `0x0` / `0x4` and **no control word anywhere in the run setting
+  the `0x400` FLAT_SHADE bit**. #3051 stays open as a latent defect with no observed instance.
+- **This question cannot be answered offline.** `gpu_replay` on a `.prgcap` emits **zero**
+  `[interp]` lines: a capture replays pre-decoded draws, so recompile-time diagnostics never fire
+  (instrument trap 229). The falsification above had to be measured on a live route.
 
 > The `PROSPER_*` probes cited below are **not on master**. They live on the unmerged WIP branch
 > `wip/issue-325-texture-arrays` (`e1b0fbb2` and later), which exists so these measurements stay

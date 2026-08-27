@@ -21,6 +21,21 @@ namespace prosper::gpu {
 // not block-compressed).
 uint32_t bc_block_bytes(DataFormat f);
 
+// #325: is this sampled T# one prosper uploads as a real Vulkan array, with the shader indexing its
+// layers? THE UPLOADER AND THE RECOMPILER MUST ANSWER THIS IDENTICALLY -- the uploader picks the
+// image view type from it and the recompiler picks OpTypeImage's Arrayed flag from it, and a
+// disagreement between the two is a descriptor mismatch rather than a wrong pixel. That is why it
+// is written once here instead of being spelled out at each site.
+//
+// Block-compressed only, deliberately. The per-slice decoder handles tiled and linear BC, plain
+// byte-per-texel surfaces, fp16 and unorm16 -- but NOT fp32 or the 4-byte narrow formats the
+// single-surface decoder converts, so a Float32 array decodes to black (measured). Widening this
+// predicate therefore means teaching the slice loop those two cases first, not merely relaxing the
+// condition here.
+inline bool guest_texture_is_uploaded_array(uint32_t img_dim, uint32_t depth, DataFormat format) {
+    return img_dim == 5u && depth > 1u && bc_block_bytes(format) != 0u;
+}
+
 // Decode a block-compressed surface `src` (bc_block_bytes(fmt) per 4x4 block, blocks row-major over a
 // ceil(w/4) x ceil(h/4) grid) into `dst` as W*H*4 RGBA8. `dst` must hold width*height*4 bytes.
 // `src_bytes` bounds the read (a short/absent source leaves the unreachable texels transparent-black).
