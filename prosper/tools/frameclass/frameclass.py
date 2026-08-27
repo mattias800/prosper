@@ -18,9 +18,11 @@ Two ways of answering this by hand are wrong, and both were made here:
   FLAT          nothing rendered, or a uniform fill: peak <= noise, or <= 8 colours covering >= 50%
                 (a black clear, a white clear, a two-tone letterbox).
   SPARSE        nothing rises above near-black (peak < 48), whatever the coverage.
-  UI-ON-BLACK   legible content covering under 2% -- a HUD, notice or small logo over a world that
-                did not draw. THE diagnostic class: it means the guest is drawing and the WORLD is
-                what is missing.
+  UI-ON-BLACK   legible content covering under 2% -- a HUD, notice, or small logo on black. THE
+                class to look for when a title is suspected of not rendering: on a GAMEPLAY frame it
+                means the guest is drawing and the world is not. It is not a defect on its own --
+                a studio splash is an ordinary member -- so read it together with where in the boot
+                the frame was taken.
   LIT           something legible is drawn over more than 2% of the frame.
 
 **`LIT` is not a promise that the frame is a game scene, and no threshold here can make it one.**
@@ -29,7 +31,7 @@ every statistic this tool computes:
 
     crisis-core-title.png            10.13% cover  4096+ colours   text + a glow on black
     stray-brightness-calibration.png 10.13% cover    228 colours   a settings menu on black
-    messenger-title.png              12.41% cover     37 colours   real pixel art
+    messenger-title.png              12.41% cover     36 colours   real pixel art
     oregon-trail-gameloft-splash.png 16.03% cover   2159 colours   a flat logo on black
     blue-prince-title.png            21.83% cover  4096+ colours   real rendered 3D art
 
@@ -61,6 +63,16 @@ need it exact.
 The colour count saturates at 4096 and the report marks a saturated count with a trailing `+`, so
 two `4096+` rows are not comparable with each other.
 
+`bright` (pixels above 128) is reported but decides NOTHING -- it used to gate SPARSE, and keying
+that on a fixed brightness is what called a 93%-covered picture at peak 127 empty. It is kept because
+"how much of this is properly legible" is worth seeing next to the peak, not because the classifier
+consults it.
+
+`dim_at=48` and the 0.50 `uniform_fill` bound are chosen, not derived: the corpus has nothing between
+peak 15 and peak 127, so it cannot pin the first, and lowering the second from 0.90 buys the
+letterbox case at a cost worth knowing -- a real frame quantized to 8 colours at 50-90% coverage now
+reads FLAT, where at 0.90 it read LIT. Both are cheap to move; move them with a selftest case.
+
 Alpha is discarded rather than composited over black. That sounds like a divergence from
 `capture_manifest.cpp`, which multiplies RGB by alpha -- measured on a real `screenshot` PNG it is
 not, because `normalize_capture_rgba` forces alpha to 255 for composited and republished frames
@@ -75,6 +87,16 @@ try:
     from PIL import Image
 except ImportError:
     sys.exit("frameclass: needs Pillow (python3 -m pip install --user pillow)")
+
+def shorten(name, width=44):
+    """Left-elide a long filename, marked with a leading ellipsis.
+
+    Plain truncation is worse than it looks: `beast-of-reincarnation-game-freak-logo.png` cut to its
+    last 28 characters reads as `reincarnation-game-freak-logo.png`, which is a DIFFERENT plausible
+    filename rather than an obviously cut one. That name was copied out of this tool's output into a
+    review-facing table and named a file that does not exist.
+    """
+    return name if len(name) <= width else "\u2026" + name[-(width - 1):]
 
 COLOUR_CAP = 4096  # counting stops here; the report suffixes a saturated count with "+"
 
@@ -204,11 +226,11 @@ def main(argv):
         try:
             r = classify(p)
         except Exception as e:  # truncated PNG, not an image, unreadable -- report and continue
-            print(f"{os.path.basename(p)[-28:]:>28}  UNREADABLE: {type(e).__name__}: {e}")
+            print(f"{shorten(os.path.basename(p)):>44}  UNREADABLE: {type(e).__name__}: {e}")
             tally["UNREADABLE"] = tally.get("UNREADABLE", 0) + 1
             continue
         tally[r["kind"]] = tally.get(r["kind"], 0) + 1
-        print(f"{r['name'][-28:]:>28}  {r['w']}x{r['h']}  max={r['max']:>3}  "
+        print(f"{shorten(r['name']):>44}  {r['w']}x{r['h']}  max={r['max']:>3}  "
               f"nonblack={r['share']:6.2f}%  bright={r['bright']:>7}  "
               f"colours={str(r['colours']) + ('+' if r['colours'] >= COLOUR_CAP else ''):>6}  "
               f"{r['kind']}")

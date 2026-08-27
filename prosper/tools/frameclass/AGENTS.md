@@ -29,8 +29,9 @@ Both obvious hand-rolled versions of the classification are wrong in ways that r
 | `UI-ON-BLACK` | legible content covering **under 2%** — a HUD, notice or logo over an absent world |
 | `LIT` | something legible is drawn over more than 2% of the frame |
 
-Corpus split over the 129 committed frames in `assets/screenshots/`: **LIT=124, UI-ON-BLACK=4,
-SPARSE=1, FLAT=0**.
+Corpus split over the 129 committed frames in `assets/screenshots/` **as of 2026-08-27**: LIT=124,
+UI-ON-BLACK=4, SPARSE=1, FLAT=0. That corpus grows, so re-run rather than quoting the figure; what is
+worth remembering is which frames are *not* LIT, since that set is small enough to check by eye.
 
 ## `LIT` does not mean "a game scene", and no threshold can make it mean that
 
@@ -41,7 +42,7 @@ statistic this tool computes**:
 | --- | --- | --- | --- |
 | `crisis-core-title.png` | 10.13% | 4096+ | text and a glow on black (key art missing, #2057) |
 | `stray-brightness-calibration.png` | 10.13% | 228 | a settings menu on black |
-| `messenger-title.png` | 12.41% | 37 | real pixel art |
+| `messenger-title.png` | 12.41% | 36 | real pixel art |
 | `oregon-trail-gameloft-splash.png` | 16.03% | 2159 | a flat logo on black |
 | `blue-prince-title.png` | 21.83% | 4096+ | real rendered 3D art |
 
