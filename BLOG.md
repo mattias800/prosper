@@ -19,6 +19,24 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-27
+
+### Tomb Raider's world is textured
+
+Croft Manor's brickwork, stone, leaded windows, dolphin fountain, grass and foliage — the world was
+untextured until now because the whole level is drawn from one 256-slice array and prosper only ever
+read slice 0.
+
+![Croft Manor through a brick arch: red brickwork and stone quoins, leaded windows, the dolphin fountain on a lawn, gravel path and foliage](assets/screenshots/tomb-raider-croft-manor-textured.png)
+
+![The same view before: geometry correct but every surface a flat cream colour](assets/screenshots/tomb-raider-croft-manor-untextured.png)
+
+![Tomb Raider II title screen: Lara's model, the logo, game-select thumbnails and the Lara's Home menu entry](assets/screenshots/tomb-raider-title-screen-tr2.png)
+
+Interiors still put textures on the wrong surfaces.
+[#325](https://github.com/mattias800/prosper/issues/325)
+
+
 ## 2026-08-26
 
 ### Grand Theft Auto V renders its world

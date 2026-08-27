@@ -7333,14 +7333,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
-            // Most 2D_ARRAY forms retain the historical base-slice fallback (#325). Explicit-LOD
-            // SAMPLE_L/LZ is different: Astro Bot's world-map kernel selects both layers of a wide
-            // texture atlas, so dropping cvg(2) destroys the lookup. Those forms use a real array below.
+            // #325: 2D_ARRAY resources are now uploaded and declared as real arrays -- see
+            // res_arrayed above. The historical base-slice fallback this comment used to describe is
+            // gone; what remains of it is that a non-array INSTRUCTION reaching an array resource
+            // reads layer 0, which is the same slice it used to get.
             const bool dim2d = (in.mimg_dim == 1u || in.mimg_dim == 5u), dim3d = (in.mimg_dim == 2u);
             const bool dim_msaa = in.mimg_dim == 6u;
             const bool dimcube = (in.mimg_dim == 3u);   // CUBE: stacked-face 2D lowering (#273, below)
             if (in.mimg_dim == 5u && getenv("PROSPER_GFXLOG"))
-                fprintf(stderr, "[recompile] 2D_ARRAY image_sample -> sampled as base slice 0 (array index dropped; #325)\n");
+                fprintf(stderr, "[recompile] 2D_ARRAY image op: resource %s an uploaded array (#325)\n",
+                        res_arrayed ? "IS" : "is NOT");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
                  !is_sample_c_lz && !is_gather_lz &&
                  !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||

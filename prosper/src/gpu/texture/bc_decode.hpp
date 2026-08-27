@@ -27,10 +27,11 @@ uint32_t bc_block_bytes(DataFormat f);
 // disagreement between the two is a descriptor mismatch rather than a wrong pixel. That is why it
 // is written once here instead of being spelled out at each site.
 //
-// Block-compressed only, deliberately. The per-slice decoder handles tiled and linear BC and plain
-// byte-per-texel surfaces; it does NOT carry the fp16/fp32/unorm16 narrowing that the single-surface
-// decoder does, so a Float32 array decodes to black (measured). Widening this predicate therefore
-// means teaching the slice loop those conversions first -- not merely relaxing the condition.
+// Block-compressed only, deliberately. The per-slice decoder handles tiled and linear BC, plain
+// byte-per-texel surfaces, fp16 and unorm16 -- but NOT fp32 or the 4-byte narrow formats the
+// single-surface decoder converts, so a Float32 array decodes to black (measured). Widening this
+// predicate therefore means teaching the slice loop those two cases first, not merely relaxing the
+// condition here.
 inline bool guest_texture_is_uploaded_array(uint32_t img_dim, uint32_t depth, DataFormat format) {
     return img_dim == 5u && depth > 1u && bc_block_bytes(format) != 0u;
 }

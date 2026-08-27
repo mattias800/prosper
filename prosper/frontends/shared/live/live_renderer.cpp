@@ -3272,7 +3272,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // and 512x131072 exceeds every device's maxImageDimension2D. So arrays ride
                         // the backend's real layer channel (`sample_count`) instead, which
                         // image creation and the view already follow.
-                        const bool is_array_shape = r.img_dim == 5u && r.cls == RC::Texture;
                         // prosper decodes BC to RGBA8 on the CPU, so a compressed array inflates 4x
                         // and is then held in BOTH host RAM (the persistent cache) and VRAM. This
                         // title's world atlas is 512x512x256 Bc7 = 256 MiB decoded, and another
@@ -3283,11 +3282,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint64_t array_budget_bytes = array_decode_budget_bytes();
                         const uint64_t array_footprint =
                             (uint64_t)tw * th * 4ull * (r.depth ? r.depth : 1u);
-                        const bool is_array =
+                        // The SHAPE question -- is this a layered array? -- is what the
+                        // recompiler also answers, so it must not depend on anything the recompiler
+                        // cannot see. The budget below decides only how many layers we DECODE.
+                        const bool guest_array =
                             prosper::gpu::guest_texture_is_uploaded_array(r.img_dim, r.depth,
                                                                           r.format) &&
-                            r.cls == RC::Texture && array_footprint <= array_budget_bytes;
-                        if (is_array_shape && r.depth > 1u && array_footprint > array_budget_bytes) {
+                            r.cls == RC::Texture;
+                        fr.guest_array = guest_array;
+                        const bool is_array = guest_array &&
+                            array_footprint <= array_budget_bytes;
+                        if (guest_array && array_footprint > array_budget_bytes) {
                             static uint32_t over_budget_reports = 0;
                             if (over_budget_reports++ < 16u)
                                 fprintf(stderr,

@@ -110,9 +110,9 @@ type from the guest T# and cannot see which opcode will sample it, so a declarat
 instruction produces a descriptor mismatch for any DIM=1 sample of an array texture.
 
 The predicate is **block-compressed only**, and that is a real limit rather than caution: the
-per-slice decoder carries tiled and linear BC and plain byte-per-texel surfaces, but not the
-fp16/fp32/unorm16 narrowing the single-surface decoder does, so a Float32 array decodes to **black**
-(measured). Widening it means teaching the slice loop those conversions first.
+per-slice decoder carries tiled and linear BC, plain byte-per-texel surfaces, fp16 and unorm16 — but
+not fp32 or the 4-byte narrow formats the single-surface decoder converts, so a Float32 array decodes
+to **black** (measured). Widening it means teaching the slice loop those two cases first.
 
 Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x512 BC7 atlas —
 262144 for mip 0 plus a 6-level chain — with `layer_mip_offset = 90112` selecting the level.
