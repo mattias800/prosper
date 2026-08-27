@@ -743,9 +743,10 @@ HLE(g_vo_resstatus)   {
 //
 // But the FIRST caller does set where it starts, and after #3024 that caller is usually the
 // kevent pump. `vblank_epoch_ns()` is a first-use-anchored static, and the pump's read at
-// hle_kernel_time.cpp reaches it as soon as a title registers a vblank event -- typically
-// before the title's first GetVblankStatus or WaitVblank call. So the epoch is now normally
-// anchored at vblank-event registration rather than at the first guest status query, which
+// hle_kernel_time.cpp reaches it as soon as a title registers a vblank OR A FLIP event (both
+// call the same ensure_pump) -- typically before the title's first GetVblankStatus or
+// WaitVblank call. So the epoch is now normally anchored at event registration rather than at
+// the first guest status query, which
 // moves GetVblankStatus's first `count` and processTime's baseline, and shifts WaitVblank's
 // wake instants in PHASE with them (they derive from the same t0). That is a deliberate
 // consequence on every platform, not only Windows, and it is more faithful -- the epoch now

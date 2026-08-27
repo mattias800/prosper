@@ -1132,9 +1132,18 @@ namespace {
         //     is why that file already says "NOT std::this_thread::sleep_until" over its wait.
         //   * A relative sleep also drifts against the status grid. hle_graphics.cpp records
         //     that as an open follow-up in as many words -- the two clocks "drift by roughly one
-        //     tick per second and their boundaries do not coincide", and a title that
-        //     cross-checks the kevent count against the status count would see it. Deriving both
-        //     from one origin and one period closes it by construction rather than by tuning.
+        //     tick per second and their boundaries do not coincide". Deriving both from one
+        //     origin and one period fixes the BOUNDARIES: a kevent now lands on an instant the
+        //     status grid also calls a boundary.
+        //
+        //     It does NOT make the two COUNTS equal, and the earlier wording here claimed it
+        //     did. `e.data` below is `frame`, which counts posts; GetVblankStatus's `count` is
+        //     the grid INDEX. They agree only while no boundary is skipped -- and skipping is
+        //     what this design does deliberately when a tick is missed, rather than bursting.
+        //     A title cross-checking the two would still see a divergence after any stall.
+        //     Making the payload the grid ordinal would close that too, but `data = frame`
+        //     predates this change and nothing here establishes what real hardware puts in
+        //     that field, so it is left alone and named instead of quietly overclaimed.
         //
         // One call carries the whole schedule: host::next_grid_deadline_ns returns the next
         // boundary strictly after now, so the ordinary case and a stall of any length are the
@@ -1142,6 +1151,12 @@ namespace {
         // the obvious hand-rolled spelling -- advance by a period, re-anchor to now+period when
         // behind -- silently loses the phase, and an earlier draft of this loop also halved the
         // rate. See its comment in precise_sleep.hpp.
+        //
+        // The cost of that property, named because it is real: phase stays exact however
+        // many boundaries were skipped, so a pump running at HALF rate has perfect phase
+        // and no symptom. The relative sleep this replaces at least drifted visibly, which
+        // is how #3024 was noticed. A dropped-boundary counter would restore the symptom
+        // without giving back the drift -- #3075.
         //
         // One composition caveat, recorded because the helper alone does not cover it (#3074):
         // this loop assumes the wait cannot return EARLY. If it does, the next `now` is still
@@ -1151,6 +1166,13 @@ namespace {
         // bounded (one extra event, and vblank posts coalesce) so it is filed rather than
         // worked around here. The fix belongs in precise_sleep, which already documents the
         // post-condition it fails to enforce on that one path.
+        // Reading the origin here is what usually ANCHORS it -- see the note in
+        // hle_graphics.cpp. Two qualifications, because the obvious statement of that is not
+        // quite true: ensure_pump() detaches this thread, so a guest status or wait call
+        // arriving inside the thread-start window anchors the grid instead, which makes the
+        // epoch's wall-clock phase nondeterministic by thread-start latency; and the pump is
+        // started by prosper_eq_add_flip as well as prosper_eq_add_vblank, so a title that
+        // registers only a FLIP event still anchors it here.
         const uint64_t origin_ns = prosper_vo_vblank_grid_origin_ns();
         const uint64_t period_ns = prosper_vo_vblank_period_ns();
         for (;;) {
