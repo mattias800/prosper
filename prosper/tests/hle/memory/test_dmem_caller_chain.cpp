@@ -78,7 +78,8 @@ int main() {
         {"eboot", 0x1b2454f}, {"libSceFoo", 0x7d0a00},
     };
     check(format_dmem_caller_chain_definition(
-              17, 0x1000000, format_frames, std::size(format_frames), 23, 160) ==
+              17, 0x1000000, format_frames, std::size(format_frames), 23, 160,
+              "alloc_main_dmem") ==
               "[dmem-caller] caller-chain=17 alloc_main_dmem len=0x1000000 from"
               " eboot+0x1b2454f libSceFoo+0x7d0a00"
               " [scan clamped to 23/160 slots by stack top]\n",
@@ -124,7 +125,8 @@ int main() {
             }
             expected_lines[chain] = format_dmem_caller_chain_definition(
                 static_cast<uint32_t>(chain + 1), 0x1000000 + chain,
-                frame_sets[chain].data(), frame_sets[chain].size(), 160, 160);
+                frame_sets[chain].data(), frame_sets[chain].size(), 160, 160,
+                "alloc_main_dmem");
         }
 
         std::atomic<size_t> ready{0};
@@ -136,7 +138,8 @@ int main() {
                 while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
                 write_dmem_caller_chain_definition(
                     definitions, static_cast<uint32_t>(chain + 1), 0x1000000 + chain,
-                    frame_sets[chain].data(), frame_sets[chain].size(), 160, 160);
+                    frame_sets[chain].data(), frame_sets[chain].size(), 160, 160,
+                    "alloc_main_dmem");
             });
         }
         while (ready.load(std::memory_order_acquire) != kDistinctChains)

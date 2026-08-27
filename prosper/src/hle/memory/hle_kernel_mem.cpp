@@ -794,7 +794,7 @@ namespace {
             fprintf(stderr,
                     "[dmem-caller] caller-chain=unknown %s len=0x%llx"
                     " from <no guest return addresses>\n",
-                    api, (unsigned long long)len);
+                    (api && *api) ? api : "<unknown-allocator>", (unsigned long long)len);
             return correlation;
         }
         DmemCallerChainFrame frames[kWant] = {};
@@ -3763,7 +3763,7 @@ namespace {
             fprintf(stderr,
                     "[dmem-caller] caller-chain=unknown %s len=0x%llx"
                     " from <no guest return addresses>\n",
-                    api, (unsigned long long)len);
+                    (api && *api) ? api : "<unknown-allocator>", (unsigned long long)len);
             return correlation;
         }
         DmemCallerChainFrame frames[kWant] = {};

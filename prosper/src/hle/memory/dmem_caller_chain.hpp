@@ -44,9 +44,13 @@ inline void append_dmem_caller_chain_number(std::string& line, uint64_t value, i
 // sceKernelAllocateDirectMemory publishes them too, a hardcoded label makes the record state the
 // wrong source for its own allocation -- and a diagnostic that misreports where it came from is
 // worse than one that says nothing.
+//
+// Deliberately NOT defaulted. A default is the same silent borrowing the empty-string guard below
+// exists to prevent, just moved to the call site: a third allocator that omitted the argument
+// would mislabel every record it produced, and nothing would say so.
 inline std::string format_dmem_caller_chain_definition(
         uint32_t id, uint64_t len, const DmemCallerChainFrame* frames, size_t frame_count,
-        int scanned_slots, int requested_slots, const char* api = "alloc_main_dmem") {
+        int scanned_slots, int requested_slots, const char* api) {
     std::string line;
     line.reserve(256);
     line += "[dmem-caller] caller-chain=";
@@ -85,8 +89,7 @@ inline void write_dmem_caller_chain_line(FILE* stream, std::string_view line) {
 
 inline void write_dmem_caller_chain_definition(
         FILE* stream, uint32_t id, uint64_t len, const DmemCallerChainFrame* frames,
-        size_t frame_count, int scanned_slots, int requested_slots,
-        const char* api = "alloc_main_dmem") {
+        size_t frame_count, int scanned_slots, int requested_slots, const char* api) {
     const std::string line = format_dmem_caller_chain_definition(
         id, len, frames, frame_count, scanned_slots, requested_slots, api);
     write_dmem_caller_chain_line(stream, line);
