@@ -188,9 +188,16 @@ case("a table carrying em dashes and typographic quotes still validates",
      want_rc=0, expect_text="the merge RESULT passes the gate")
 
 # And a non-ASCII table whose merge RESULT is defective must still be CAUGHT, not merely
-# not-crash: a decode fix that silently truncated the document would make this pass by finding no
-# duplicate. Shaped on the duplicate arm above -- master takes 4, the lane takes 4 a few lines
-# away, so the merge is textually CLEAN and the duplicate exists only in the result.
+# not-crash. This is the arm that catches a decode fix which silently TRUNCATED the document:
+# truncation drops the duplicate, so this arm goes red while the clean-merge arm above stays
+# green -- which is why both are needed and why this one carries the load.
+#
+# (That sentence read "would make this pass by finding no duplicate", which is backwards, and
+# review of #3071 caught it. A comment inverting its own arm's logic is worse than none: it
+# tells the next reader the arm is vacuous when it is the opposite.)
+#
+# Shaped on the duplicate arm above -- master takes 4, the lane takes 4 a few lines away, so
+# the merge is textually CLEAN and the duplicate exists only in the result.
 #
 # The first version of this arm was VACUOUS and I nearly shipped it: it produced a merge conflict
 # rather than a clean merge, its rc=1 matched want_rc for the wrong reason, and its expect_text of

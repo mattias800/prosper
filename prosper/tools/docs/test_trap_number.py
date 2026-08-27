@@ -65,7 +65,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from check_numbered_table import Table, parse_tables  # noqa: E402
-from trap_number import added_rows_from_patch, highest, run, table_numbers  # noqa: E402
+from trap_number import (ScanError, added_rows_from_diff, added_rows_from_patch, highest, run,
+                         table_numbers)  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -570,7 +571,11 @@ with tempfile.TemporaryDirectory() as _d:
     _git = ["git", "-C", str(_repo)]
     for _args in (["init", "--quiet"],
                   ["config", "user.email", "t@example.com"],
-                  ["config", "user.name", "t"]):
+                  ["config", "user.name", "t"],
+                  # commit.gpgsign false: the lesson this file already records elsewhere. On a
+                  # host that signs globally the commit fails and the arm reddens with a
+                  # misleading message about decoding. Review of #3071.
+                  ["config", "commit.gpgsign", "false"]):
         subprocess.run([*_git, *_args], capture_output=True)
     (_repo / "doc.md").write_text(NON_ASCII, encoding="utf-8")
     subprocess.run([*_git, "add", "doc.md"], capture_output=True)
@@ -604,6 +609,32 @@ finally:
     subprocess.run = _orig_sprun
 case("run() passes an explicit encoding, not the host locale default",
      seen_kwargs.get("encoding"), "utf-8")
+
+# added_rows_from_diff has its OWN None guard, added because the first version of this change
+# guarded run() and left this site to die on `patch.split` with the identical misleading
+# traceback. Driven directly rather than through the gh stub: what matters is that a zero-rc
+# None stdout becomes a ScanError, and a fake CompletedProcess says exactly that with no
+# dependence on the host locale. Review of #3071 noted the guard had no arm at all.
+_orig_for_guard = subprocess.run
+
+
+def _none_stdout(*a, **kw):
+    return subprocess.CompletedProcess(args=a[0] if a else [], returncode=0,
+                                       stdout=None, stderr=None)
+
+
+subprocess.run = _none_stdout
+try:
+    added_rows_from_diff("owner/repo", 1, "doc.md")
+    FAILURES.append("added_rows_from_diff accepted a None stdout instead of refusing")
+except ScanError as exc:
+    case("added_rows_from_diff refuses an undecodable patch",
+         "could not decode" in str(exc), True)
+except AttributeError:
+    FAILURES.append("added_rows_from_diff died on None.split -- the guard is missing")
+finally:
+    subprocess.run = _orig_for_guard
+
 
 
 DOC = HERE.parent.parent / "docs" / "GAME_COMPAT_ORCHESTRATION.md"

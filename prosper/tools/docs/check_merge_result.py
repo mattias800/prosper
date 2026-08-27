@@ -103,8 +103,12 @@ def main() -> int:
     # the conflicted paths follow, so the message can name them.
     merged = git("merge-tree", "--write-tree", base, head, check=False)
     if merged.returncode not in (0, 1):
-        print(f"error: git merge-tree failed: {merged.stderr.strip()}", file=sys.stderr)
-        if "--write-tree" in merged.stderr or "usage:" in merged.stderr.lower():
+        # (merged.stderr or ""): a check=False caller reads .stderr where git()'s own guard
+        # cannot reach it, and under strict decoding that is None. Same shape as the guard in
+        # trap_number.run; review of #3071 flagged both.
+        err = merged.stderr or ""
+        print(f"error: git merge-tree failed: {err.strip()}", file=sys.stderr)
+        if "--write-tree" in err or "usage:" in err.lower():
             # git 2.38 introduced this mode. Named explicitly because the fallback (`git merge` in a
             # scratch worktree) is the thing this tool deliberately avoids, so "just use git merge"
             # is the wrong lesson to draw from a usage message.
@@ -129,7 +133,8 @@ def main() -> int:
         base_copy = Path(d) / "base.md"
         show = git("show", f"{tree}:{args.file}", check=False)
         if show.returncode != 0:
-            print(f"error: {args.file} is not in the merge result: {show.stderr.strip()}", file=sys.stderr)
+            print(f"error: {args.file} is not in the merge result: "
+                  f"{(show.stderr or '').strip()}", file=sys.stderr)
             return 2
         merged_copy.write_text(show.stdout, encoding="utf-8")
         base_copy.write_text(git("show", f"{base}:{args.file}").stdout, encoding="utf-8")

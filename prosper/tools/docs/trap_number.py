@@ -103,7 +103,13 @@ def run(cmd: list[str]) -> str:
         # trap_number.py was therefore unusable on Windows, and unusable in a way that pointed
         # the reader at the wrong file.
         proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, encoding="utf-8")
-    except OSError as exc:  # pragma: no cover - permissions, exec format, a full disk
+    except (OSError, UnicodeDecodeError) as exc:
+        # OSError: permissions, exec format, a full disk.
+        # UnicodeDecodeError: on POSIX subprocess decodes in the CALLER's thread rather than a
+        # reader thread, so a decode failure propagates here instead of yielding a None stdout.
+        # Without this the docstring's "never lets an exception escape as a traceback" was still
+        # false off Windows -- the guard below only covers the thread-swallowed shape. Review of
+        # #3071.
         raise ScanError(f"{' '.join(cmd[:3])}... could not be run: {exc}") from exc
     if proc.returncode != 0:
         # (proc.stderr or ""): strict UTF-8 makes a cp1252 git/gh error message decode to None, and
