@@ -48,6 +48,20 @@ The textures decode correctly and the geometry is right; the wrong content is be
 [#2998](https://github.com/mattias800/prosper/issues/2998)
 
 
+## 2026-08-27
+
+### The Messenger runs at 100-160 fps, not 24 — the old figure was measured headless
+
+Its first level, on current master, in a normal window.
+
+![The Messenger's opening: an 8-bit sunset over the ocean, the great tree, the Messenger on a plank platform, and a dialogue box reading "Demon army this and magic scroll that, nothing's happened in centuries, so why are we still hiding?"](assets/screenshots/messenger-first-level-windowed-2026-08-27.png)
+
+The charter has long said the July performance pass "deliberately stopped at roughly 12 -> 24 FPS on
+the first level". That number came from `tools/screenshot`, which never enables GPU present — so the
+renderer is forced to copy every scanout frame back to the CPU, a path a real windowed run does not
+take. Run the same route through `prosper-app` and it holds **100-160 fps**.
+[#3076](https://github.com/mattias800/prosper/issues/3076)
+
 ## 2026-08-26
 
 ### Grand Theft Auto V renders its world
