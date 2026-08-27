@@ -65,7 +65,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from check_numbered_table import Table, parse_tables  # noqa: E402
-from trap_number import added_rows_from_patch, highest, table_numbers  # noqa: E402
+from trap_number import (ScanError, added_rows_from_diff, added_rows_from_patch, highest, run,
+                         table_numbers)  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -550,6 +551,103 @@ run_main("no matching table in the base is an error, not an allocation from noth
          absent="next free number", extra=["--table-header", "Nonexistent"])
 
 print("agreement with the gate, on the repository's real table:")
+
+# ---------------------------------------------------------------------------------------------
+# run() must decode subprocess output as UTF-8 regardless of the host locale.
+#
+# Not hygiene. text=True alone decodes with the LOCALE default, which on a Windows host is
+# cp1252 -- and this tool's whole job is to pipe a UTF-8 Markdown document through a subprocess.
+# The decode raised inside subprocess's reader THREAD, so proc.stdout became None while
+# returncode stayed 0, and the tool then crashed 150 lines away in the table parser with
+# "'NoneType' object has no attribute 'split'". trap_number.py was unusable on Windows, and
+# unusable in a way that pointed the reader at the wrong file.
+#
+# Driven through `git show` of a real blob rather than a synthetic echo, so the arm exercises the
+# same call the tool uses to read the base document.
+# ---------------------------------------------------------------------------------------------
+NON_ASCII = "trap row with an em dash \u2014 and typographic \u201cquotes\u201d\n"
+with tempfile.TemporaryDirectory() as _d:
+    _repo = Path(_d)
+    _git = ["git", "-C", str(_repo)]
+    for _args in (["init", "--quiet"],
+                  ["config", "user.email", "t@example.com"],
+                  ["config", "user.name", "t"],
+                  # commit.gpgsign false: the lesson this file already records elsewhere. On a
+                  # host that signs globally the commit fails and the arm reddens with a
+                  # misleading message about decoding. Review of #3071.
+                  ["config", "commit.gpgsign", "false"]):
+        subprocess.run([*_git, *_args], capture_output=True)
+    (_repo / "doc.md").write_text(NON_ASCII, encoding="utf-8")
+    subprocess.run([*_git, "add", "doc.md"], capture_output=True)
+    subprocess.run([*_git, "commit", "--quiet", "-m", "x"],
+                   capture_output=True)
+    try:
+        _got = run(["git", "-C", str(_repo), "show", "HEAD:doc.md"])
+        case("run() decodes non-ASCII UTF-8 subprocess output", _got, NON_ASCII)
+        case("...and returns a str, not the None that crashed the parser later",
+             isinstance(_got, str), True)
+    except Exception as exc:      # noqa: BLE001 - the point is that nothing escapes
+        FAILURES.append(f"run() raised on non-ASCII UTF-8 output: {exc!r}")
+
+# The behavioural arm above only reddens on a host whose LOCALE default cannot decode UTF-8 --
+# i.e. this Windows box. On a UTF-8-locale host it passes with or without the fix, so it could not
+# catch a regression to bare text=True in CI. This arm can, on every host: it observes the keyword
+# actually handed to subprocess.run.
+seen_kwargs: dict = {}
+_orig_sprun = subprocess.run
+
+
+def _spy(*a, **kw):
+    seen_kwargs.update(kw)
+    return _orig_sprun(*a, **kw)
+
+
+subprocess.run = _spy
+try:
+    run(["git", "--version"])
+except Exception as exc:      # noqa: BLE001 - a git-less host must get a FAIL line, not a traceback
+    FAILURES.append(f"the encoding spy arm could not run git: {exc!r}")
+finally:
+    subprocess.run = _orig_sprun
+case("run() passes an explicit encoding, not the host locale default",
+     seen_kwargs.get("encoding"), "utf-8")
+
+# added_rows_from_diff has its OWN None guard, added because the first version of this change
+# guarded run() and left this site to die on `patch.split` with the identical misleading
+# traceback. Driven directly rather than through the gh stub: what matters is that a zero-rc
+# None stdout becomes a ScanError, and a fake CompletedProcess says exactly that with no
+# dependence on the host locale. Review of #3071 noted the guard had no arm at all.
+#
+# shutil.which is stubbed as well, and that is not tidiness: the function resolves `gh` FIRST and
+# raises a DIFFERENT ScanError when it is absent. Without this the arm asserts the wrong message
+# on any host without gh installed -- passing here, where gh happens to be on PATH, and failing
+# in CI. An arm whose verdict depends on an unstated precondition of the machine.
+_orig_for_guard = subprocess.run
+_orig_which = shutil.which
+
+
+def _none_stdout(*a, **kw):
+    return subprocess.CompletedProcess(args=a[0] if a else [], returncode=0,
+                                       stdout=None, stderr=None)
+
+
+subprocess.run = _none_stdout
+# *a/**k: shutil.which takes (cmd, mode, path), and a one-arg lambda would TypeError on any
+# caller that passes them. Costs nothing and removes a way for this stub to fail confusingly.
+shutil.which = lambda name, *a, **k: "/usr/bin/" + name       # pretend gh resolves
+try:
+    added_rows_from_diff("owner/repo", 1, "doc.md")
+    FAILURES.append("added_rows_from_diff accepted a None stdout instead of refusing")
+except ScanError as exc:
+    case("added_rows_from_diff refuses an undecodable patch",
+         "could not decode" in str(exc), True)
+except AttributeError:
+    FAILURES.append("added_rows_from_diff died on None.split -- the guard is missing")
+finally:
+    subprocess.run = _orig_for_guard
+    shutil.which = _orig_which
+
+
 
 DOC = HERE.parent.parent / "docs" / "GAME_COMPAT_ORCHESTRATION.md"
 if not DOC.exists():  # fail closed: a moved document must not silently skip the only real-data arm

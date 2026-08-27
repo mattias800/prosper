@@ -7,6 +7,7 @@
 using prosper::frontend::should_report_texture_decode_miss;
 using prosper::frontend::should_report_texture_decode_hit;
 using prosper::frontend::block_compressed_cube_source_size;
+using prosper::frontend::layered_array_source_size;
 using prosper::frontend::texture_decode_cache_candidate;
 using prosper::frontend::texture_decode_miss_reason;
 using prosper::frontend::texture_decode_miss_is_expensive_block;
@@ -101,6 +102,34 @@ int main() {
     CHECK(!should_report_texture_decode_hit(2, 1, false));
     CHECK(should_report_texture_decode_hit(64, 1, true));
     CHECK(!should_report_texture_decode_hit(65, 1, true));
+
+    // #2998: a layered array's validation span must reach the LAST layer. Returning one surface
+    // let the persistent decode cache prove reuse against 0.29% of Tomb Raider's 256-layer world
+    // atlas, so a decode taken while the atlas was nearly empty was reused for the whole run and
+    // interiors sampled slices holding the previous occupants of that memory.
+    //
+    // These are the title's real numbers: 512x512 BC7 = 262144 B per surface, layer_stride 352256,
+    // 256 layers. The arm fails if the helper ever returns the single-surface size again.
+    CHECK_NAMED("tomb_raider_atlas_span_reaches_the_last_layer",
+                layered_array_source_size(262144u, 352256u, 256u) ==
+                    352256u * 255u + 262144u);
+    CHECK_NAMED("tomb_raider_atlas_span_is_not_one_surface",
+                layered_array_source_size(262144u, 352256u, 256u) != 262144u);
+    // A single layer leaves the surface size alone.
+    CHECK(layered_array_source_size(262144u, 352256u, 1u) == 262144u);
+    // A descriptor with NO declared stride is still read as `layers` back-to-back surfaces by the
+    // decoder's own fallback (`face_base`: stride = layer_stride ? layer_stride : selected_span),
+    // so the span must follow it. An earlier version of this test pinned the single-surface answer
+    // here, which documented the very defect the rest of this file exists to catch.
+    CHECK_NAMED("zero_stride_array_spans_every_layer_the_decoder_reads",
+                layered_array_source_size(262144u, 0u, 256u) == 262144ull * 256ull);
+    // Fail closed, exactly as the cube form does: "do not cache" must not be widened into a
+    // cacheable span, and an overflowing span must not truncate to a range shorter than the
+    // decoder reads -- a short span IS the defect this guards.
+    CHECK_NAMED("array_span_never_widens_a_do_not_cache_signal",
+                layered_array_source_size(0u, 352256u, 256u) == 0u);
+    CHECK_NAMED("array_span_fails_closed_on_overflow",
+                layered_array_source_size(4096u, UINT64_MAX / 2u, 8u) == 0u);
 
     if (!failures) std::printf("texture_decode_diagnostic: OK\n");
     return failures ? 1 : 0;
