@@ -36,10 +36,11 @@
 // ONE change.
 // 3.0 is a true average of a bimodal signal and describes neither mode. It also contradicts the
 // July performance pass, which measured this title's first level at 12-24 fps; a reader would
-// reasonably conclude a regression that never happened. That July figure is itself stale, for a
-// third reason: it predates #1270, which removed the CPU readback from the app's present path on
-// 2026-07-24. Uncapped windowed, the same level now reports a median 156 presented fps -- see
-// CLAUDE.md's harness bullet and #3083 before comparing any two rates from this project.
+// reasonably conclude a regression that never happened. Both of those figures are readback-path
+// measurements, so they remain comparable WITH EACH OTHER -- what neither describes is the shipped
+// renderer. The July figure predates #1270, which removed the CPU readback from the app's present
+// path on 2026-07-24; uncapped windowed, the same level now reports a median 156 presented fps.
+// See CLAUDE.md's harness bullet and #3083 before comparing any two rates from this project.
 //
 // THE REAL FIX IS THE WINDOW, NOT THE STATISTIC. No single scalar can describe a bimodal sample;
 // every candidate misleads somewhere, so arguing about which one to use is choosing which way to be

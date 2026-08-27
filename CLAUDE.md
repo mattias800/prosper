@@ -169,23 +169,31 @@ The standing warnings that are **not** title-specific:
   with `prosper-app`, on 2026-07-14 — and #1270 changed the present architecture ten days later
   (2026-07-24), so it describes a renderer that no longer exists. Re-run windowed and uncapped
   (`--present-mode immediate`) on 2026-08-27, the same first level reports a **median 156 fps**, with
-  two thirds of samples between 100 and 160 (n=468; min 42.9, p25 130.9, p75 165.7). That is a
-  **presented** rate with no `distinct` companion, so read it as an upper bound on the rate of new
-  frames rather than as the frame rate — #3083 records the A/B that pins it. Whichever way that
-  lands, the advice above survives: this title is nowhere near being the thing to optimise.
+  two thirds of samples between 100 and 160 (n=468; p25 130.9, p75 165.7, and only 2 samples below
+  100). Two caveats on that median. It is a **presented** rate with no `distinct` companion, so read
+  it as an upper bound on the rate of new frames rather than as the frame rate — #3083 records the
+  A/B that pins it. And the run is **not stationary**: ~185 fps for the first 29 s, ~120 for the
+  final 76 s after `Media/level2`/`level6` stream in, so 156 is the median of a declining sample.
+  Every regime survives the comparison — the slowest third is still several times the July figure —
+  and the advice above survives with it: this title is nowhere near being the thing to optimise.
 - **Before quoting an FPS number from this project, check which harness produced it — and when.**
-  Two independent ways to get a wrong one, and they do not overlap:
+  Three ways to get a wrong one, and a single run can hit all three:
   - **`tools/screenshot` never calls `set_gpu_present_active`** (the sole call site is
     `frontends/prosper-app/main.cpp:668`), so in that harness the renderer copies every scanout frame
     back to the CPU. Its rate describes the forced-readback path, not the shipped one. **This applies
     only to figures measured after 2026-07-24** — before #1270 there was no GPU-present path, so
     every harness took the readback and the old figures are honest measurements of what then shipped.
   - **A `fifo` run measures the display, not the renderer.** A vsync-locked run of this same title
-    pinned 123 of 238 samples at exactly `180.0` — the host refresh rate. Pass `--present-mode
+    on 2026-08-26 pinned 123 of 238 samples at exactly `180.0` — the host refresh rate. Pass `--present-mode
     immediate` before quoting a rate as a throughput, and say which mode the run used. Quote
     `distinct` rather than `presented` — and note the interactive app could not report a distinct
     rate under GPU present at all until #3019 (2026-08-26), so an interactive rate from before that
     date is a publication count.
+  - **The capture is part of the measurement.** The uncapped run above has a `42.9` sample sitting
+    directly after `[grab] screenshot written`, followed by a compensating `195.3`. That is the frame
+    grab, not the title — and quoting it as the run's minimum is the same error as quoting a
+    screenshot-harness rate as the renderer's. Drop the samples either side of a capture before
+    taking a minimum.
 - **Start Windows work from `docs/WINDOWS_PORT_HANDOFF.md`**, not the solved pre-render fence
   investigation; Windows *release* users start from `docs/WINDOWS_RELEASE.md`.
 - **A historical capture hash is not a current renderer oracle**, and neither is a target extent or a
