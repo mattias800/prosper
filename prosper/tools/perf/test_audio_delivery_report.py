@@ -100,6 +100,17 @@ def main():
            "case 0c: an atypical first record does not rescale the cadence rows")
     expect(out, "grain=256 frames", "case 0c: the header reports the typical grain")
 
+    # 0d. The LEGACY path -- a log with no (grain=N) field -- must still compute a grain from the
+    #     flags. Review found that deleting the inference branch left the whole suite green, which is
+    #     the same shape as R1 one level down, and on the path the --bytes-per-frame help text points
+    #     users at. So: an old-format log, and the thresholds must still be grain-relative.
+    log = "".join(
+        "[audio-dbg] port=17 gap=5.33ms frames=256 queued_before=1024\n" for _ in range(200))
+    out, _ = run(log)
+    expect(out, "grain=256 frames", "case 0d: a log without the grain field still reports a grain")
+    expect(out, "arrivals with under 1 grain buffered: 200",
+           "case 0d: and the inference is grain-relative, not frame-relative")
+
     # 1. Real-time delivery, deep queue: no defect. The verdict must NOT name a clock
     #    deficit (a plausible wrong call: an average at the device rate with jitter).
     log = "".join(dbg(gap=5.33, queued=3072) for _ in range(200))
