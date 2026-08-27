@@ -120,6 +120,16 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **Nothing maps into the atlas per-slice, and no host/kernel write streams into it** — both with
+  controls, both new instruments. `PROSPER_MAPWATCH` sees one 1 GiB `map_dmem` covering the atlas,
+  established once, never per-slice (control: watching all of dmem shows two maps).
+  `PROSPER_HOSTWRITEWATCH` sees **zero** writes into the atlas while its control — the same watch
+  over all of dmem — records **107**. So the ~18 slices that do arrive are written by guest CPU
+  stores, which no instrument in the tree can observe.
+  That is what makes **#3054** the blocking tool: `PROSPER_HWWATCH` is register-relative and cannot
+  arm on a fixed guest address, so the one mechanism that would catch a plain guest store is
+  unreachable through its current interface.
+
 - **The atlas allocation contains about 4.75 MB of content and nothing else, measured WITHOUT any
   stride assumption.** `PROSPER_OCCUPANCY=1` walks the guest allocation in 256 KiB buckets and asks
   only "is there content here", so it cannot be fooled by a wrong per-slice layout — which every

@@ -1692,7 +1692,33 @@ void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {
     invalidate_phys_range_locked(w, phys, phys + size);
 }
 
+// PROSPER_HOSTWRITEWATCH=0xADDR[:SIZE] (#2998): report every HOST write -- a read()/pread() that
+// streams bytes straight into a guest buffer -- landing in one guest range, with the offset within
+// it. This is the path a title uses to load file bytes directly into a texture allocation, and it is
+// invisible to every GPU-side instrument: the PM4 recorders see prosper's own stores, the compute
+// watch sees dispatch tables, and a kernel write into guest memory is neither.
+//
+// Its null has a real scope: only writes the HLE routes through this notification are seen. A guest
+// that reads into a staging buffer and memcpys from there in guest code writes with plain stores,
+// which nothing here can observe.
 void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
+    if (const char* w = getenv("PROSPER_HOSTWRITEWATCH")) {
+        char* end = nullptr;
+        const uint64_t lo = strtoull(w, &end, 0);
+        const uint64_t span = (end && *end == ':') ? strtoull(end + 1, nullptr, 0) : (64ull << 20);
+        if (lo && addr < lo + span && addr + size > lo) {
+            static std::atomic<uint32_t> said{0};
+            static std::atomic<uint64_t> bytes{0};
+            const uint64_t total = bytes.fetch_add(size, std::memory_order_relaxed) + size;
+            const uint32_t n = said.fetch_add(1, std::memory_order_relaxed);
+            if (n < 24u || (n % 256u) == 0u)
+                fprintf(stderr, "[hostwrite] 0x%llx +0x%llx (offset 0x%llx in watch) "
+                                "hit=%u total=%llu KiB\n",
+                        (unsigned long long)addr, (unsigned long long)size,
+                        (unsigned long long)(addr - lo), n + 1,
+                        (unsigned long long)(total >> 10));
+        }
+    }
     if (!addr || !size || addr > UINT64_MAX - size) return;
     WatchState& w = state();
     // Hot path: the HLE calls this before EVERY read()/pread(), mostly into non-dmem heap buffers. When
