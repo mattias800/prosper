@@ -251,28 +251,38 @@ were confirmed as legitimate frustum culls.
 `97ecc58a` is a squash; `refs/pull/2996/head` still holds its 8 original commits and was bisected
 again to reach `1b5b9471` (+1386/−141, 29 files).
 
-### The decisive measurement — where the failure actually is
+### RETRACTED: "the culprit skips the colour readback"
 
-Instrumenting the live pass (`rendered_pixels` at the `render_draws_rgba` call site):
+**This section previously reported that the culprit reads back pixels for only 3 passes against the
+parent's 26, and named that as where the failure is. That was WRONG and is withdrawn.**
 
-| | passes reading back pixels | best content |
-| --- | --- | --- |
-| parent `c110fcea` | **26** | 4 passes at **21.09% non-black** |
-| culprit `1b5b9471` | **3** | all **0.00%** |
+It came from a probe sampling `seen[base]++ % 400` — *per render target*. The two builds reach
+different pass counts per target, so two 60-line windows covered different populations and the
+counts were not comparable. Re-measured with identical probes on both builds, at the same call site:
 
-**The culprit skips the colour readback for almost every pass**, so the rendered content never
-reaches the RTT surface and the scanout shows nothing. `render_draws_rgba` returns an EMPTY buffer
-(`rendered_pixels.size() == 0`) where the parent returns 8,294,400 bytes.
+```
+parent  c110fcea:  23 x gpx=0,  7 x gpx=8294400
+culprit 1b5b9471:  23 x gpx=0,  7 x gpx=8294400
+```
 
-**And the documented inputs to that call are IDENTICAL in both builds** — verified by instrumenting
-them directly: `any_slot_bound=1`, `live_gpu_targets=1`, `mrt_count=1`, same `pass_bases`, same
-`format0`, same `backend_target.load_existing`, same `defer_readback=1`, same draw counts, same
-`persistent_id` shape. Pass grouping is also identical (draws-per-pass 33/16/7/2/2 vs 33/15/8/2/2).
+Instrumenting the backend's own decision (`readback_color0`) agrees: **7 readbacks of 30 passes in
+both**, identical `ct_readback` distribution, identical `persistent_color`. **Readback is not the
+difference.** Do not pursue it.
 
-So the divergence is **inside `render_draws_rgba`'s view of the draws' resources**, not in the gate
-that calls it. `tests/fixtures/render_runner.h` (the backend) is NOT in this commit, so its inputs
-must differ — most likely the `FrameResource` fields this commit adds
-(`persistent_render_target_mip_ids/_count`, `declared_mip_levels`).
+The lesson is worth more than the datum: a per-target sampling stride produces counts that look
+comparable across two runs and are not, and the resulting number was confident, specific, and
+false. Compare with an identical, run-independent sampling rule, or compare totals.
+
+### What IS established about the failure point
+
+- The live pass output is black while the SAME commands replay correctly offline (below).
+- Pass grouping is identical: draws-per-pass 33/16/7/2/2 vs 33/15/8/2/2.
+- The documented inputs to `render_draws_rgba` are identical in both builds: `any_slot_bound=1`,
+  `live_gpu_targets=1`, `mrt_count=1`, same `pass_bases`, same `format0`, same
+  `backend_target.load_existing`, same `defer_readback`, same `persistent_color`, same draw counts.
+- The backend (`tests/fixtures/render_runner.h`) is not in this commit.
+
+So the divergence is somewhere the above does not cover, and **it has not been located.**
 
 ### It is NOT a rendering bug
 
