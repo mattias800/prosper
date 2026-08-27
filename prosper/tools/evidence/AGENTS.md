@@ -42,18 +42,26 @@ matches nothing at any brightness, and is not progression evidence in the first 
 
 **A mean ceiling was tried here and removed, which is worth knowing before adding one back.** It
 looked reasonable — "a high matching fraction alone is not domination" — but an overlap bar of 75%
-already bounds the mean at ≤ 63.75/255, so any ceiling below that can only discard frames the bar
-would have flagged. It cannot prevent a false positive and can only manufacture false negatives.
-That bound is the argument, and it is worth preferring to any count: it is derivable, so it belongs
-to nobody's sample. Measured alongside it, **100 of 233** structured assets (42.9%) carrying a bright
+already bounds the mean, so any ceiling below that can only discard frames the bar would have
+flagged. It cannot prevent a false positive and can only manufacture false negatives. The bound is
+
+    mean ≤ 0.75·f·8 + 0.25·f·255 + (1−f)·15  =  f·69.75 + (1−f)·15
+
+for informative fraction `f`. It increases in `f`, so it maximises at **full** coverage: **69.75**.
+Derive it rather than quoting it — it was first published here as 63.75, which dropped the matching
+pixels' own contribution (a pixel counted as matching may differ by up to 8 per channel, not 0;
+0.75 × 8 = 6.00 is exactly the gap), and a hand-built frame reaches mean 69.67 at overlap 75.00%,
+above the figure the same paragraph called unreachable. A companion claim that the worst case was
+partial coverage was backwards too: at f = 0.25 the bound is only 28.69. Measured alongside it, **100 of 233** structured assets (42.9%) carrying a bright
 caption panel reach mean 40.5–59.25 while still exceeding the bar, so a ceiling of 40 silently
 dropped nearly half. The case that motivated the ceiling was already rejected by the bar anyway.
 
 The count was first published here as "4 of 13", from a probe that filtered to 1920×1080 and so
 excluded every 4K asset — where the worst means live. A structured-asset sample runs roughly 6
 such 1080p assets to 79 4K ones, so that probe saw about 7% of its own population and could not
-express the case it was measuring. The observed worst mean, 59.25, sits just under the analytic
-bound of 63.75, which is the reassuring part: two independent routes agree at the boundary.
+express the case it was measuring. The observed worst mean, 59.25, sits under the analytic bound of
+69.75 — a consistency check rather than an agreement, since real assets cannot saturate a bound that
+requires every matching pixel to differ by exactly 8.
 
 **And the two statistics need different gates**, which conflating them hid: `mean` is a whole-frame
 average that darkness cannot corrupt, so two structured images at mean 0.00 are the same image

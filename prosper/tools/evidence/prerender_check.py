@@ -198,10 +198,17 @@ def main(argv):
         return 1
 
     # There is deliberately NO separate mean ceiling here. One was added and removed: an overlap of
-    # >= 75% already bounds the mean at <= 63.75/255 (and <= 75.75 in the worst coverage case), so
+    # >= 75% already bounds the mean at <= 69.75/255, so
     # any ceiling below that can only discard frames the bar would have flagged -- it cannot prevent
-    # a false positive, only manufacture false negatives. The BOUND is what settles this -- it is
-    # derivable and belongs to nobody's sample. Measured alongside it, 100 of 233 structured assets
+    # a false positive, only manufacture false negatives. The bound is
+    #     mean <= 0.75*f*8 + 0.25*f*255 + (1-f)*15  =  f*69.75 + (1-f)*15
+    # for informative fraction f -- increasing in f, so it maximises at FULL coverage, at 69.75. It
+    # was first written here as 63.75, which dropped the matching pixels' own contribution: a pixel
+    # counted as matching may differ by up to 8 per channel, not 0, and 0.75*8 = 6.00 is exactly the
+    # gap. A hand-built frame (75% of pixels differing by exactly 8, 25% by 255) reaches mean 69.67
+    # at overlap 75.00% -- above the figure the earlier comment said could not be reached, so the
+    # tool refuted its own comment. Derive it rather than quoting it. Measured alongside it, 100 of
+    # 233 structured assets
     # (42.9%) carrying a bright caption panel reach mean 40.5-59.25 while still exceeding the bar,
     # so a ceiling of 40 silently dropped nearly half of them. (An earlier "4 of 13" here came from
     # a probe that filtered to 1920x1080 and so excluded every 4K asset -- which is exactly where the
