@@ -990,6 +990,12 @@ namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; retur
 // --- Real event-queue backend (kqueue/kevent model). Registered flip/vblank sources post events into
 // their equeue; WaitEqueue blocks until an event is ready (or timeout) and returns it. A single ~60 Hz
 // pump thread drives vblank + flip-completion events so Unity's render/timing threads pace frames. ---
+// The shared 59.94 Hz vblank grid, defined in hle/graphics/hle_graphics.cpp. Declared here
+// rather than in a header because that file deliberately keeps the grid internal, and these
+// two accessors are the whole of what it publishes (#3024).
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();
+extern "C" uint64_t prosper_vo_vblank_period_ns();
+
 namespace {
     // SceKernelEvent (FreeBSD kevent layout, 0x20 bytes): ident@0, filter@8(i16), flags@0xA(u16),
     // fflags@0xC(u32), data@0x10, udata@0x18. The game reads udata (its flip context) + data.
@@ -1108,8 +1114,72 @@ namespace {
     }
     void vblank_pump() {
         uint64_t frame = 0;
+        // Absolute schedule on the SHARED 59.94 Hz grid that hle_graphics.cpp uses for the
+        // vblank status and wait paths, waited with host::sleep_until_steady_ns. Two defects
+        // this replaces (#3024):
+        //
+        //   * A relative nanosleep(16.67 ms) resolves on the winpthreads tick on Windows. A
+        //     standalone microbenchmark of that nanosleep on this toolchain (MinGW-w64/UCRT,
+        //     GCC 16.1) returns every 29.95 ms, so the pump was posting vblank kevents at
+        //     roughly 33 Hz rather than 60, and every consumer pacing on this event stream
+        //     inherited it. Provenance stated because it matters: that is the sleep primitive
+        //     measured in isolation, NOT an instrumented measurement of this pump, and the
+        //     figure is quoted here only to size the defect. Same microbenchmark under
+        //     timeBeginPeriod(1) gives 24.78 ms -- still not 16.67 -- and that arm is
+        //     hypothetical for prosper, which calls timeBeginPeriod nowhere (see
+        //     precise_sleep.cpp's own note). So the unrescued 29.95 ms is what ran.
+        //     It is the same defect #1765 fixed for the status/wait grid one file away, which
+        //     is why that file already says "NOT std::this_thread::sleep_until" over its wait.
+        //   * A relative sleep also drifts against the status grid. hle_graphics.cpp records
+        //     that as an open follow-up in as many words -- the two clocks "drift by roughly one
+        //     tick per second and their boundaries do not coincide". Deriving both from one
+        //     origin and one period fixes the BOUNDARIES: a kevent now lands on an instant the
+        //     status grid also calls a boundary.
+        //
+        //     It does NOT make the two COUNTS equal, and the earlier wording here claimed it
+        //     did. `e.data` below is `frame`, which counts posts; GetVblankStatus's `count` is
+        //     the grid INDEX. They agree only while no boundary is skipped -- and skipping is
+        //     what this design does deliberately when a tick is missed, rather than bursting.
+        //     A title cross-checking the two would still see a divergence after any stall.
+        //     Making the payload the grid ordinal would close that too, but `data = frame`
+        //     predates this change and nothing here establishes what real hardware puts in
+        //     that field, so it is left alone and named instead of quietly overclaimed.
+        //
+        // One call carries the whole schedule: host::next_grid_deadline_ns returns the next
+        // boundary strictly after now, so the ordinary case and a stall of any length are the
+        // same expression and the phase cannot drift. It is a separate tested function because
+        // the obvious hand-rolled spelling -- advance by a period, re-anchor to now+period when
+        // behind -- silently loses the phase, and an earlier draft of this loop also halved the
+        // rate. See its comment in precise_sleep.hpp.
+        //
+        // The cost of that property, named because it is real: phase stays exact however
+        // many boundaries were skipped, so a pump running at HALF rate has perfect phase
+        // and no symptom. The relative sleep this replaces at least drifted visibly, which
+        // is how #3024 was noticed. A dropped-boundary counter would restore the symptom
+        // without giving back the drift -- #3075.
+        //
+        // One composition caveat, recorded because the helper alone does not cover it (#3074):
+        // this loop assumes the wait cannot return EARLY. If it does, the next `now` is still
+        // below the same boundary, the helper correctly returns that boundary again, and this
+        // thread posts two kevents for one vblank. Reachable only on the Win32SleepFallback
+        // path, which does not re-check the clock the way the high-resolution timer path does;
+        // bounded (one extra event, and vblank posts coalesce) so it is filed rather than
+        // worked around here. The fix belongs in precise_sleep, which already documents the
+        // post-condition it fails to enforce on that one path.
+        // Reading the origin here is what usually ANCHORS it -- see the note in
+        // hle_graphics.cpp. Two qualifications, because the obvious statement of that is not
+        // quite true: ensure_pump() detaches this thread, so a guest status or wait call
+        // arriving inside the thread-start window anchors the grid instead, which makes the
+        // epoch's wall-clock phase nondeterministic by thread-start latency; and the pump is
+        // started by prosper_eq_add_flip as well as prosper_eq_add_vblank, so a title that
+        // registers only a FLIP event still anchors it here.
+        const uint64_t origin_ns = prosper_vo_vblank_grid_origin_ns();
+        const uint64_t period_ns = prosper_vo_vblank_period_ns();
         for (;;) {
-            struct timespec ts{ 0, 16666667 }; nanosleep(&ts, nullptr);   // ~60 Hz
+            const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clk::now().time_since_epoch()).count();
+            prosper::host::sleep_until_steady_ns(
+                prosper::host::next_grid_deadline_ns(origin_ns, now_ns, period_ns));
             frame++;
             std::vector<FlipReg> vr;
             { std::lock_guard lk(g_eq_mx); vr = g_vblank_regs; }
