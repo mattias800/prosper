@@ -3,6 +3,13 @@
 Developer/agent tooling. These are debugging and verification aids, not part of
 the shipped runtime. Build them from `build-linux/` like everything else.
 
+- **`evidence/prerender_check.py`** - **run this before publishing a progression screenshot.** It
+  answers whether the frame is the game's own PRE-RENDERED picture rather than something prosper
+  rendered: a full-screen loading blit is the most convincing false evidence this project has
+  produced, and one reached a merged PR, `BLOG.md` and `COMPATIBILITY.md` before a human recognised
+  the artwork (instrument trap 230). `python3 tools/evidence/prerender_check.py <shot> <DUMP_ROOT>`;
+  exit 2 = the frame IS game artwork and is not progression evidence, exit 1 = the check could not
+  run and must not be read as a pass.
 - **`verify-pr.ps1`** - author-owned PR verification orchestrator for the Windows+WSL development
   environment. Run it only from a clean, pushed PR head: `docs` records the diff check, `core` adds
   Linux and Windows build+ctest, and `renderer -Snapshot NAME` also runs the selected real-game guard
@@ -40,12 +47,18 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     / map with its size, which answers *how much* but never *who* — and the same guest allocator
     serves every subsystem, so a title whose heap grows without bound looks identical to one that is
     legitimately loading. Add **`PROSPER_DMEM_CALLER=1`** to print, once per distinct call chain, the
-    guest return addresses above each `sceKernelAllocateMainDirectMemory`. The first two return
+    guest return addresses above each `sceKernelAllocateMainDirectMemory` **and each
+    `sceKernelAllocateDirectMemory`** (#3054 — before that, only the Main variant published a chain,
+    so a title allocating through the other entry point produced no records at all and
+    `PROSPER_DMEM_WRITE_TRACE` could not name any byte it owned). The record names the allocator it
+    came from, so `alloc_dmem` and `alloc_main_dmem` lines are told apart. The first two return
     addresses are interned as a bounded run-local `caller-chain=N`; the full bounded chain prints
     once, while every allocation in the `PROSPER_MEMLOG=1` census carries the same correlation ID:
     ```text
     [memhle] alloc_main_dmem len=0x1000000 -> phys=0x21500000 caller-chain=1
     [dmem-caller] caller-chain=1 alloc_main_dmem len=0x1000000 from eboot+0x1b2454f eboot+0x7d0a00 eboot+0x22b1e80 …
+    [memhle] alloc_dmem range=[0x0,0x400000000) len=0x40000000 align=0x0 type=0xc -> phys=0x40010000
+    [dmem-caller] caller-chain=2 alloc_dmem len=0x40000000 from eboot+0xccb3 eboot+0x20c7c8 eboot+0x7677 …
     ```
     Feed the first address to `tools/re/edis.py` / `tools/re/xref.py` to name the caller. The walk is
     a heuristic stack scan (a stale spill slot looks exactly like a return address), so treat the

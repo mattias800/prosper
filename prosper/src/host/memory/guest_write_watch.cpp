@@ -1692,8 +1692,50 @@ void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {
     invalidate_phys_range_locked(w, phys, phys + size);
 }
 
+// PROSPER_HOSTWRITEWATCH=0xADDR[:SIZE] (#2998): report every HOST write -- a read()/pread() that
+// streams bytes straight into a guest buffer -- landing in one guest range, with the offset within
+// it. This is the path a title uses to load file bytes directly into a texture allocation, and it is
+// invisible to every GPU-side instrument: the PM4 recorders see prosper's own stores, the compute
+// watch sees dispatch tables, and a kernel write into guest memory is neither.
+//
+// Its null has a real scope: only writes the HLE routes through this notification are seen. A guest
+// that reads into a staging buffer and memcpys from there in guest code writes with plain stores,
+// which nothing here can observe.
 void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     if (!addr || !size || addr > UINT64_MAX - size) return;
+    // The watch spec is parsed ONCE. This function runs before every read()/pread() and once per
+    // iovec element of readv()/preadv(), so an uncached getenv() here would be a production cost
+    // paid on the hot path with the switch unset -- and the guard above must come first, or a
+    // malformed (addr, size) is formatted before it is rejected.
+    struct HostWriteWatchSpec { uint64_t lo = 0, span = 0; };
+    static const HostWriteWatchSpec hww = [] {
+        HostWriteWatchSpec h;
+        const char* w = getenv("PROSPER_HOSTWRITEWATCH");
+        if (!w || !*w) return h;
+        char* end = nullptr;
+        const uint64_t lo = strtoull(w, &end, 0);
+        const uint64_t span = (end && *end == ':') ? strtoull(end + 1, nullptr, 0) : (64ull << 20);
+        // A malformed or overflowing spec DISABLES the watch rather than arming a different one.
+        if (!lo || !span || lo > UINT64_MAX - span) return h;
+        h.lo = lo;
+        h.span = span;
+        return h;
+    }();
+    if (hww.lo && addr < hww.lo + hww.span && addr + size > hww.lo) {
+        static std::atomic<uint32_t> said{0};
+        static std::atomic<uint64_t> bytes{0};
+        const uint64_t total = bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        const uint32_t n = said.fetch_add(1, std::memory_order_relaxed);
+        // A write may START below the watch base and overlap into it. Report the offset of the
+        // OVERLAP, never addr-lo, which underflows to a nonsense offset in exactly that case.
+        const uint64_t overlap_lo = addr >= hww.lo ? addr : hww.lo;
+        if (n < 24u || (n % 256u) == 0u)
+            fprintf(stderr, "[hostwrite] 0x%llx +0x%llx (overlap at offset 0x%llx in watch) "
+                            "hit=%u total=%llu KiB\n",
+                    (unsigned long long)addr, (unsigned long long)size,
+                    (unsigned long long)(overlap_lo - hww.lo), n + 1,
+                    (unsigned long long)(total >> 10));
+    }
     WatchState& w = state();
     // Hot path: the HLE calls this before EVERY read()/pread(), mostly into non-dmem heap buffers. When
     // the feature is off (the default) nothing is ever armed, so skip without even taking the lock.

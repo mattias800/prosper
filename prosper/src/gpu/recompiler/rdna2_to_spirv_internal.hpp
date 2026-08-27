@@ -1726,6 +1726,7 @@ struct SpirvCompute {
     // return float bits, while UINT T#s return raw integer channel values. Each texture is still a
     // COMBINED_IMAGE_SAMPLER UniformConstant at its binding.
     std::unordered_map<uint32_t, uint32_t> tex_var;       // binding -> combined-sampler OpVariable id
+    std::unordered_map<uint32_t, bool> tex_binding_arrayed;  // binding -> declared with Arrayed=1
     std::unordered_map<uint32_t, uint32_t> tex_simg_type; // (Dim | UINT flag) -> OpTypeSampledImage id
     std::unordered_map<uint32_t, uint32_t> tex_img_type;  // same key -> its OpTypeImage id
     std::unordered_map<uint32_t, uint32_t> tex_binding_simg;
@@ -1765,7 +1766,27 @@ struct SpirvCompute {
         tex_binding_img[binding] = tex_img_type[key];
         tex_binding_uint[binding] = is_uint;
         tex_binding_key[binding] = key;
+        tex_binding_arrayed[binding] = arrayed;
         return true;
+    }
+    // The sampling coordinate for `binding`, with the array layer appended when the binding was
+    // DECLARED arrayed. #325: arrayed-ness is a property of the RESOURCE (a guest 2D_ARRAY T#), not
+    // of the instruction, because the uploader chooses the view type from the resource and cannot
+    // see which opcode will sample it. So a non-array instruction reaching an array texture must
+    // still produce a three-component coordinate -- and layer 0 is exactly the base slice it used
+    // to get from the old base-slice 2D view, so behaviour is preserved where it was already right.
+    bool tex_is_arrayed(uint32_t binding) {
+        auto it = tex_binding_arrayed.find(binding);
+        return it != tex_binding_arrayed.end() && it->second;
+    }
+    uint32_t tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits) {
+        uint32_t c = id();
+        if (tex_binding_arrayed.count(binding) && tex_binding_arrayed[binding])
+            put(code, Op_CompositeConstruct,
+                {t_v3f(), c, bcf(u_bits), bcf(v_bits), fconstf(0.0f)});
+        else
+            put(code, Op_CompositeConstruct, {t_v2f(), c, bcf(u_bits), bcf(v_bits)});
+        return c;
     }
     uint32_t texture_vec4(uint32_t binding) {
         return tex_binding_uint[binding] ? t_v4u() : t_v4f;
@@ -1784,7 +1805,7 @@ struct SpirvCompute {
     // sample at explicit LOD 0 (what a non-pixel-shader image_sample resolves to without gradients).
     void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         uint32_t res   = id();
         if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
         else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
@@ -1797,8 +1818,7 @@ struct SpirvCompute {
                               uint32_t dsdx_bits, uint32_t dtdx_bits,
                               uint32_t dsdy_bits, uint32_t dtdy_bits, uint32_t out[4]) {
         uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         uint32_t grad_x = id(); put(code, Op_CompositeConstruct,
                                     {t_v2f(), grad_x, bcf(dsdx_bits), bcf(dtdx_bits)});
         uint32_t grad_y = id(); put(code, Op_CompositeConstruct,
@@ -1822,17 +1842,82 @@ struct SpirvCompute {
     // image_sample_l / _lz: sample with an EXPLICIT LOD (lod_bits float). Stage-agnostic (no derivatives).
     void image_sample_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t lod_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
         unpack_texture_result(binding, res, out);
     }
     // A real 2D-array explicit-LOD sample. The layer is the third float coordinate; keeping it in
     // SPIR-V makes reflection require a matching 2D-array view instead of silently sampling layer 0.
+    // IMAGE_SAMPLE from a 2D_ARRAY texture. The implicit-LOD sibling of the _lod_ form below, and
+    // the distinction is not cosmetic: in a fragment stage the LOD comes from quad derivatives, so
+    // lowering a plain SAMPLE through the explicit-LOD helper would pin every textured surface to
+    // the base level. Outside a fragment stage there are no derivatives, so LOD 0 is the only
+    // legal choice -- which is exactly what image_sample_2d already does for the non-array case.
+    // PROSPER_FORCE_LAYER=<n>: the constant array layer to substitute, or -1 for off. A malformed
+    // or empty value DISABLES the probe rather than forcing layer 0 -- a typo must cost a
+    // measurement, never produce a wrong one silently.
+    // Announce a substitution, from whichever sampler performed it. Both must announce or the
+    // probe produces exactly the null it exists to prevent: a title that samples only through the
+    // explicit-LOD helper would otherwise get full substitution with no output at all.
+    static void announce_forced_layer(uint32_t binding, int layer) {
+        static std::atomic<uint32_t> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 4u) {
+            fprintf(stderr, "[force-layer] binding=%u substituted constant layer %d\n",
+                    binding, layer);
+            fflush(stderr);
+        }
+    }
+    static int forced_array_layer() {
+        static const int v = [] {
+            const char* e = getenv("PROSPER_FORCE_LAYER");
+            if (!e || !*e) return -1;
+            char* end = nullptr;
+            const long n = strtol(e, &end, 10);
+            if (!end || *end || n < 0 || n > 65535) return -1;
+            return (int)n;
+        }();
+        return v;
+    }
+    void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                               uint32_t layer_bits, uint32_t out[4]) {
+        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        // #2998: PROSPER_FORCE_LAYER=<n> substitutes a constant array layer, and SAYS SO, which is
+        // the point -- it separates "the shader is given the wrong slice" from "the slice it asks
+        // for holds the wrong content", two failures that look identical on screen. A probe that
+        // could not show its own lever moved would leave a null meaning nothing.
+        //
+        // This forces guest-visible state, so its output illustrates an investigation and is never
+        // acceptance evidence for a rendered frame.
+        const int forced_layer = forced_array_layer();
+        uint32_t layer_use = bcf(layer_bits);
+        if (forced_layer >= 0) {
+            layer_use = fconstf((float)forced_layer);
+            announce_forced_layer(binding, forced_layer);
+        }
+        uint32_t coord = id(); put(code, Op_CompositeConstruct,
+                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), layer_use});
+        uint32_t res = id();
+        if (is_fragment)
+            put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
+        else
+            put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord,
+                                                  ImgOp_Lod, fconstf(0.0f)});
+        unpack_texture_result(binding, res, out);
+    }
     void image_sample_lod_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                    uint32_t layer_bits, uint32_t lod_bits, uint32_t out[4]) {
         uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        // #2998: PROSPER_FORCE_LAYER applies HERE TOO. Covering only the implicit-LOD sampler is
+        // the scope error this session already made once and had to withdraw: the census puts most
+        // of this title's array events on other opcodes, so a probe on one helper produces a null
+        // that means nothing about the rest.
+        uint32_t lod_layer = bcf(layer_bits);
+        if (forced_array_layer() >= 0) {
+            lod_layer = fconstf((float)forced_array_layer());
+            announce_forced_layer(binding, forced_array_layer());
+        }
         uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), lod_layer});
         uint32_t res = id(); put(code, Op_ImageSampleExplicitLod,
                                  {texture_vec4(binding), res, si, coord,
                                   ImgOp_Lod, bcf(lod_bits)});
@@ -1880,6 +1965,13 @@ struct SpirvCompute {
                                      bool linear_filter, uint32_t addr_u, uint32_t addr_v,
                                      uint32_t border_color_type, uint32_t out[4],
                                      bool arrayed = false, uint32_t layer_bits = 0) {
+        // Consult the DECLARATION, not just the caller: a binding declared arrayed needs
+        // three components whatever opcode reached it, and a caller that did not supply a
+        // slice reads the base one (#325). Hoisted so BOTH the sampled and the manual-fetch
+        // branches below use it -- they disagreed, and only one was fixed.
+        const bool coord_arrayed =
+            arrayed || (tex_binding_arrayed.count(binding) && tex_binding_arrayed[binding]);
+
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         if (linear_filter) {
             if (!declared_image_query) {
@@ -1887,8 +1979,11 @@ struct SpirvCompute {
                 declared_image_query = true;
             }
             uint32_t img = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
+            // #325: the DECLARATION, not the caller -- the third of three uses in this function,
+            // and the one the first pass missed. Query-size arity is validated exactly, so an
+            // ivec2 against an Arrayed image is invalid SPIR-V.
             uint32_t size = id(); put(code, Op_ImageQuerySizeLod,
-                                      {arrayed ? t_v3i() : t_v2i(), size, img, uconst(0)});
+                                      {coord_arrayed ? t_v3i() : t_v2i(), size, img, uconst(0)});
             uint32_t w_i = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
             uint32_t h_i = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
             const uint32_t w = i2u(w_i), h = i2u(h_i);
@@ -1942,10 +2037,14 @@ struct SpirvCompute {
             }
 
             auto compare_fetch = [&](uint32_t tx, uint32_t ty, uint32_t outside_border) {
+                // #325: follow the DECLARATION, as the sampled branch above does. A caller that
+                // reached an arrayed binding without supplying a slice still needs three
+                // components, and reads the base one.
                 uint32_t coord = id();
-                if (arrayed)
+                if (coord_arrayed)
                     put(code, Op_CompositeConstruct,
-                        {t_v3u_fetch(), coord, tx, ty, i2u(cvt_f2i(bcf(layer_bits)))});
+                        {t_v3u_fetch(), coord, tx, ty,
+                         arrayed ? i2u(cvt_f2i(bcf(layer_bits))) : uconst(0)});
                 else
                     put(code, Op_CompositeConstruct, {t_v2u(), coord, tx, ty});
                 uint32_t texel = id();
@@ -1973,9 +2072,10 @@ struct SpirvCompute {
         }
 
         uint32_t coord = id();
-        if (arrayed)
+        if (coord_arrayed)
             put(code, Op_CompositeConstruct,
-                {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+                {t_v3f(), coord, bcf(u_bits), bcf(v_bits),
+                 arrayed ? bcf(layer_bits) : fconstf(0.0f)});
         else
             put(code, Op_CompositeConstruct,
                 {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
@@ -1990,7 +2090,7 @@ struct SpirvCompute {
     // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
     void image_sample_bias_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t bias_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         uint32_t res   = id();
         if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Bias, bcf(bias_bits)});
         else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
@@ -2002,7 +2102,7 @@ struct SpirvCompute {
     // the four gathered values as raw bits.
     void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         uint32_t res   = id(); put(code, Op_ImageGather, {texture_vec4(binding), res, si, coord, uconst(comp)});
         unpack_texture_result(binding, res, out);
     }
@@ -2018,7 +2118,7 @@ struct SpirvCompute {
                                 uint32_t off_bits, uint32_t out[4]) {
         if (!declared_gather_ext) { put(caps, Op_Capability, {Cap_ImageGatherExtended}); declared_gather_ext = true; }
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         // signed 6-bit texel offsets. NOTE: bfe_s takes SPIR-V IDs — raw integers here (the #296
         // original) emitted OpBitFieldSExtract with invalid operand IDs; never caught live because
         // the only gather4_lz_o user (DOLL's FXAA PS) still rejected upstream on its execz region.
@@ -2039,7 +2139,10 @@ struct SpirvCompute {
         if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
         uint32_t si   = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t img  = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-        uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_v2i(), size, img, uconst(0)});
+        // #325: OpImageQuerySizeLod on an Arrayed 2D image yields ivec3 (w, h, layers). Asking
+        // for ivec2 is invalid SPIR-V; the width and height are still components 0 and 1.
+        const uint32_t q_type = tex_is_arrayed(binding) ? t_v3i() : t_v2i();
+        uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {q_type, size, img, uconst(0)});
         uint32_t w_i  = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
         uint32_t h_i  = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
         uint32_t ox = bfe_s(off_bits, uconst(0), uconst(6)), oy = bfe_s(off_bits, uconst(8), uconst(6));   // signed 6-bit texel offsets
@@ -2061,9 +2164,13 @@ struct SpirvCompute {
             uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_i32, size, img, bcs(lod_bits)});
             out[0] = i2u(size);
         } else {
-            const uint32_t size_type = dim == Dim_2D ? t_v2i() : t_v3i();
+            // #325: an Arrayed 2D image queries as ivec3, its third component being the layer
+            // COUNT -- which is exactly what GET_RESINFO's third result means for a 2D_ARRAY T#, so
+            // reporting it is right rather than merely legal.
+            const bool arrayed_2d = dim == Dim_2D && tex_is_arrayed(binding);
+            const uint32_t size_type = (dim == Dim_2D && !arrayed_2d) ? t_v2i() : t_v3i();
             uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {size_type, size, img, bcs(lod_bits)});
-            const uint32_t components = dim == Dim_2D ? 2u : 3u;
+            const uint32_t components = (dim == Dim_2D && !arrayed_2d) ? 2u : 3u;
             for (uint32_t c = 0; c < components; c++) {
                 uint32_t value = id(); put(code, Op_CompositeExtract, {t_i32, value, size, c});
                 out[c] = i2u(value);
@@ -2080,8 +2187,7 @@ struct SpirvCompute {
         if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
         const uint32_t simg = tex_binding_simg[binding];
         uint32_t si = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
         uint32_t lod = id(); put(code, Op_ImageQueryLod, {t_v2f(), lod, si, coord});
         for (uint32_t component = 0; component < 2; ++component) {
             uint32_t value = id();
@@ -2103,7 +2209,14 @@ struct SpirvCompute {
     void image_fetch_2d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
+        // #325: an Arrayed image needs a three-component fetch coordinate whatever opcode got
+        // here. Layer 0 is the base slice a graphics IMAGE_LOAD used to read through the old
+        // base-slice 2D view, so this preserves that behaviour rather than inventing one.
+        uint32_t coord = id();
+        if (tex_is_arrayed(binding))
+            put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, uconst(0)});
+        else
+            put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
         uint32_t res   = id(); put(code, Op_ImageFetch, {texture_vec4(binding), res, img, coord, ImgOp_Lod, uconst(0)});
         unpack_texture_result(binding, res, out);
     }

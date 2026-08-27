@@ -141,3 +141,55 @@ to that class of error, costs nothing to run, and needs no maintenance from us.
 
 Reach for these first. Build a `PROSPER_*` switch only for something the guest-facing layer knows and
 the GPU vendor cannot see.
+
+## Vulkan validation (`PROSPER_VK_VALIDATION=1`)
+
+`vk_validation_scan.py` (#1704) runs the whole ctest suite under the validation layer and diffs
+against `tools/vkval/allowlist.txt`, and is registered with ctest as `vkval_scan_logic`. **Four
+VUIDs have been fixed off the back of it** (#1713, #1714, #1717, #1726). **That is the project's
+validation guard, and it works without any messenger**, because VVL's default `debug_action` writes
+to stdout/stderr on its own.
+
+**Do not quote id or message counts from anywhere — including `allowlist.txt`'s own header.** Run
+`vk_validation_scan.py` and read what it computes (`[vkval] N distinct message ID(s), M message(s)
+total`). The header records a baseline and is amended *sometimes*: #1726, #1717 and #1713 each
+amended it, but #1714 deleted its entry without doing so, which leaves the header's last stated
+ledger one id high in both columns, and the lavapipe figure at the top has never been amended at
+all. This paragraph twice carried a stale figure of its own before saying that — the file's rule is
+that an unexplained drop in the id count reads as *"the scan broke"*, so a quoted count is a false
+alarm waiting to happen, wherever it is quoted from.
+
+`PROSPER_VK_VALIDATION=1` is for the other case: validating **one interactive or routed run** of a
+title, in-process. It enables the layer and registers a `VkDebugUtilsMessenger`, which adds over the
+default action:
+
+- **rate limiting** — 8 reports per message id. One violated VUID in a per-draw path otherwise fills
+  the disk, and on this machine a large run log takes the shared tmpfs (and every agent's shell)
+  with it.
+- **a run that says whether it is armed**, so a clean result is falsifiable rather than merely quiet.
+- **coverage when the default action is off**, which any `VK_LAYER_*` settings file can arrange.
+
+```bash
+PROSPER_VK_VALIDATION=1 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+    ./prosper/build-linux/screenshot --out ~/work --seconds 2 --count 30 <DUMP_ROOT>/<TITLE_ID>-app0
+```
+
+It announces which state it is in — the point of the switch:
+
+| line | meaning |
+| --- | --- |
+| `[vk-validation] active (warnings and errors, 8 per message id)` | armed; a clean run is a real result |
+| `... is not installed; NO validation is running` | the layer is absent — do not read the silence |
+| `... VK_EXT_debug_utils is not advertised; the layer will run with its DEFAULT ... action` | the layer still validates, but this process does not rate-limit or tag it |
+| `... the validation layer was DROPPED and NO validation is running` | instance creation fell back to a bare create info; a clean result is void |
+| `... layer loaded but the debug messenger could NOT be registered` | output discarded; a clean result is void |
+
+Off by default: the layer costs real time per draw.
+
+**Coverage caveat.** This covers the shared render-runner instance only. `prosper-app` creates its
+own instance, and `live_compute` has a private fallback instance; neither is affected by this
+variable.
+
+Worked example (#2998, 2026-08-27): a change that made Tomb Raider's gameplay render as a uniform
+single-colour fill produced **zero** VUIDs with the messenger armed, which moved the question from
+"is this a Vulkan misuse?" to "it is not, so look at the logic".

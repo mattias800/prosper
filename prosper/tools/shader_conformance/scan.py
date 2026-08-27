@@ -32,20 +32,57 @@ DIM_3D = {2}
 MIMG_ENCODING = 0b111100          # dword0[31:26]
 
 
-def decode_mimg(raw: bytes):
-    """Every MIMG instruction in a raw RDNA2 shader, as (opcode, dim)."""
+def decode_mimg_sites(raw: bytes):
+    """(dword_index, opcode, dim) for every dword matching the MIMG encoding."""
     n = len(raw) // 4
     if not n:
         return []
     words = struct.unpack(f"<{n}I", raw[:n * 4])
     out = []
-    for w in words:
+    for i, w in enumerate(words):
         if (w >> 26) != MIMG_ENCODING:
             continue
         # opcode spans a split field, exactly as rdna2_decode.cpp reconstructs it.
-        opcode = ((w & 1) << 7) | ((w >> 18) & 0x7F)
-        out.append((opcode, (w >> 3) & 0x7))
+        out.append((i, ((w & 1) << 7) | ((w >> 18) & 0x7F), (w >> 3) & 0x7))
     return out
+
+
+def decode_mimg(raw: bytes):
+    """Every MIMG instruction in a raw RDNA2 shader, as (opcode, dim).
+
+    This is an OVER-APPROXIMATION and the direction of the error is the whole basis for trusting a
+    clean result. A correct walk needs per-instruction lengths (prosper's own `rdna2_decode.cpp`
+    has them, and records what mis-sizing costs: "the extra dword is mis-decoded as a phantom
+    instruction, derailing the stream walk"). Without them, a literal constant whose top six bits
+    read as the MIMG encoding looks like an instruction start.
+
+    So: this finder can invent an MIMG that is not there, and CANNOT hide one that is. A finding is
+    a candidate to confirm; a clean result IS sound for the classes checked.
+
+    **Every dword is tested, including the one after a match.** An earlier revision skipped it, on
+    the reasoning that MIMG is at minimum two dwords so its dword1 cannot start an instruction.
+    That is true of a REAL MIMG and false of a phantom -- and it broke the property above, which is
+    the only reason a clean result means anything. Review of #3039 demonstrated it end to end: a
+    `v_mov_b32 v0, 0xF0000000` whose literal aliases the encoding, immediately followed by a genuine
+    `image_sample dim:2D_ARRAY` against a non-arrayed image -- the literal #325 defect -- scanned
+    CLEAN, because the phantom consumed the real instruction. The skip also bought almost nothing:
+    the false positives it removed need a real MIMG dword1 with the reserved bits 28/29 set, which
+    prosper's own decoder rejects (`rdna2_decode.cpp:901`), and `classify()` already collapses
+    repeated hits of one class into a single finding.
+    """
+    return [(op, dim) for _, op, dim in decode_mimg_sites(raw)]
+
+
+def phantom_risk(raw: bytes):
+    """Candidates sitting immediately after another candidate.
+
+    Real MIMG instructions are at minimum two dwords, so back-to-back matches mean at least one of
+    them is an operand or literal misreading as an instruction. This does not identify WHICH, and a
+    zero here does not certify the rest -- it is a "this shader's findings deserve extra suspicion"
+    signal, reported per shader in --json and never used to suppress a finding.
+    """
+    idx = [i for i, _, _ in decode_mimg_sites(raw)]
+    return sum(1 for a, b in zip(idx, idx[1:]) if b - a == 1)
 
 
 def parse_spirv_images(dis: str):
@@ -72,15 +109,79 @@ def parse_spirv_images(dis: str):
     return types, arities
 
 
+def classify(mimg, types, arities):
+    """The product claim: guest sampled a shape the emitted SPIR-V cannot address.
+
+    `types` is every OpTypeImage in the module, so `any()` here is deliberately permissive -- a
+    module that declares one arrayed image clears every arrayed sample in it. That is the honest
+    bound for a module-wide parse: without per-binding attribution we cannot say WHICH image a
+    given MIMG resolved to, and claiming otherwise would report a shader that is actually correct.
+    It costs recall, never soundness of a clean result.
+    """
+    emitted_arrayed = any(a for _, a in types)
+    emitted_3d = any(d == "3D" for d, _ in types)
+    arity = max(arities) if arities else 0
+    out, seen = [], set()
+    for opcode, dim in mimg:
+        if dim in DIM_ARRAYED and not emitted_arrayed:
+            key = ("array", dim)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(opcode=f"0x{opcode:02x}", guest_dim=DIM_NAMES[dim],
+                            emitted="no arrayed image type", klass="array-layer-dropped",
+                            detail="#325", max_coord_arity=arity))
+        elif dim in DIM_3D and not emitted_3d:
+            key = ("3d", dim)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(opcode=f"0x{opcode:02x}", guest_dim=DIM_NAMES[dim],
+                            emitted="no 3D image type", klass="volume-coordinate-dropped",
+                            detail="", max_coord_arity=arity))
+    return out
+
+
+def spirv_dis_cmd():
+    """The disassembler, as an argv prefix.
+
+    `PROSPER_SPIRV_DIS` overrides it, and a `.py` value is run with this interpreter. That override
+    is what lets --self-test be hermetic ON EVERY PLATFORM: the first version shipped a `/bin/sh`
+    shim on PATH, which is unrunnable on Windows/MinGW, so the suite went red there while passing
+    locally. A PATH shim also cannot be made portable -- Windows resolves executables by extension.
+    """
+    override = os.environ.get("PROSPER_SPIRV_DIS")
+    if override:
+        return [sys.executable, override] if override.endswith(".py") else [override]
+    return ["spirv-dis"]
+
+
+def replay_cmd(replay):
+    """gpu_replay, as an argv prefix.
+
+    A `.py` value is run with this interpreter. In production `replay` is a real executable and this
+    is the identity; the `.py` arm exists so --self-test can drive a stub. Windows `CreateProcess`
+    cannot execute a `.py` by path the way a POSIX shebang can, and getting this wrong is not merely
+    a red CI square: the ten `rc == 2` arms would still PASS, because a stub that cannot start looks
+    exactly like a capture that could not be scanned. Half the suite would be vacuously green on
+    Windows.
+    """
+    return [sys.executable, replay] if str(replay).endswith(".py") else [replay]
+
+
 def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    """Every child gets a timeout. A hung gpu_replay on a shared GPU otherwise hangs the scan
+    silently, and the reflex is to kill the scanner -- which loses the partial result too."""
+    kw.setdefault("timeout", 300)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {kw['timeout']}s")
 
 
 def enumerate_shaders(replay, capture):
     """Unique (draw, stage, hash) triples, so one shader compiled into many draws is dumped once."""
-    r = run([replay, "--inspect-only", capture])
-    if r.returncode == 0 and not r.stdout.strip():
-        r = subprocess.run([replay, "--inspect-only", capture], capture_output=True, text=True)
+    r = run(replay_cmd(replay) + ["--inspect-only", capture])
     if r.returncode != 0:
         return None, f"gpu_replay --inspect-only failed ({r.returncode}): {r.stderr.strip()[:200]}"
     seen, out = set(), []
@@ -123,12 +224,12 @@ def materialize(replay, path, tmp):
     """
     if not path.endswith(".prgbundle"):
         return path, None
-    r = run([replay, "--bundle", path, os.path.join(tmp, "b.bmp")])
+    r = run(replay_cmd(replay) + ["--bundle", path, os.path.join(tmp, "b.bmp")])
     subs = re.findall(r"bundle-submit=(\d+)", r.stdout + r.stderr)
     if not subs:
         return None, f"no submits found in bundle ({r.returncode}): {r.stderr.strip()[:160]}"
     out = os.path.join(tmp, os.path.basename(path) + ".prgcap")
-    e = run([replay, "--bundle", path, "--bundle-extract-submit", subs[-1], out])
+    e = run(replay_cmd(replay) + ["--bundle", path, "--bundle-extract-submit", subs[-1], out])
     if not os.path.exists(out):
         return None, f"could not extract submit {subs[-1]}: {e.stderr.strip()[:160]}"
     return out, None
@@ -136,6 +237,7 @@ def materialize(replay, path, tmp):
 
 def scan_capture(replay, capture, tmp):
     findings, examined, skipped = [], 0, 0
+    skip_reasons = []
     capture, err = materialize(replay, capture, tmp)
     if capture is None:
         return None, err
@@ -147,46 +249,119 @@ def scan_capture(replay, capture, tmp):
         raw_p = os.path.join(tmp, f"{sh}.raw")
         spv_p = os.path.join(tmp, f"{sh}.spv")
         if stage == "cs":
-            run([replay, "--dump-compute-raw", str(draw), raw_p, capture, bmp])
-            run([replay, "--dump-compute", str(draw), spv_p, capture, bmp])
+            a = run(replay_cmd(replay) + ["--dump-compute-raw", str(draw), raw_p, capture, bmp])
+            b = run(replay_cmd(replay) + ["--dump-compute", str(draw), spv_p, capture, bmp])
         else:
-            run([replay, "--dump-realized-shader", f"{draw}:{stage}", raw_p, capture, bmp])
-            run([replay, "--dump-shader", f"{draw}:{stage}", spv_p, capture, bmp])
-        if not (os.path.exists(raw_p) and os.path.exists(spv_p)):
+            a = run(replay_cmd(replay) + ["--dump-realized-shader", f"{draw}:{stage}", raw_p, capture, bmp])
+            b = run(replay_cmd(replay) + ["--dump-shader", f"{draw}:{stage}", spv_p, capture, bmp])
+        # The child's exit code, not the file's existence. `tmp` is per-capture now, but within one
+        # capture two draws can share a shader hash, so a failed dump could still find the previous
+        # draw's file sitting there and be scored as a successful read of the wrong shader.
+        if a.returncode != 0 or b.returncode != 0 or \
+                not (os.path.exists(raw_p) and os.path.exists(spv_p)):
             skipped += 1
+            skip_reasons.append(f"draw[{draw}] {stage}: dump exit {a.returncode}/{b.returncode}")
             continue
-        dis = run(["spirv-dis", spv_p])
+        dis = run(spirv_dis_cmd() + [spv_p])
         if dis.returncode != 0:
             skipped += 1
+            skip_reasons.append(f"draw[{draw}] {stage}: spirv-dis exit {dis.returncode}")
             continue
-        mimg = decode_mimg(open(raw_p, "rb").read())
+        raw = open(raw_p, "rb").read()
+        if not raw:
+            # An empty ISA dump is a shader we did NOT read. Counting it as examined is how a
+            # capture that yielded nothing still reports a clean scan.
+            skipped += 1
+            skip_reasons.append(f"draw[{draw}] {stage}: empty ISA dump")
+            continue
+        mimg = decode_mimg(raw)
         if not mimg:
             examined += 1
             continue
         types, arities = parse_spirv_images(dis.stdout)
-        emitted_arrayed = any(a for _, a in types)
-        emitted_3d = any(d == "3D" for d, _ in types)
         examined += 1
-        for opcode, dim in mimg:
-            if dim in DIM_ARRAYED and not emitted_arrayed:
-                findings.append(dict(capture=os.path.basename(capture), draw=draw, stage=stage,
-                                     shader=sh, opcode=f"0x{opcode:02x}",
-                                     guest_dim=DIM_NAMES[dim], emitted="no arrayed image type",
-                                     klass="array-layer-dropped", detail="#325",
-                                     max_coord_arity=max(arities) if arities else 0))
-                break
-            if dim in DIM_3D and not emitted_3d:
-                findings.append(dict(capture=os.path.basename(capture), draw=draw, stage=stage,
-                                     shader=sh, opcode=f"0x{opcode:02x}",
-                                     guest_dim=DIM_NAMES[dim], emitted="no 3D image type",
-                                     klass="volume-coordinate-dropped", detail="",
-                                     max_coord_arity=max(arities) if arities else 0))
-                break
-    return dict(examined=examined, skipped=skipped, findings=findings), None
+        risk = phantom_risk(raw)
+        for f in classify(mimg, types, arities):
+            f.update(capture=os.path.basename(capture), draw=draw, stage=stage, shader=sh,
+                     phantom_risk=risk)
+            findings.append(f)
+    return dict(examined=examined, skipped=skipped, findings=findings,
+                skip_reasons=skip_reasons), None
+
+
+SELF_TEST_STUB = r"""#!/usr/bin/env python3
+# Stand-in for gpu_replay: enough surface for scan.py's end-to-end arms, with per-capture
+# behaviour driven by the capture's own filename so one run can exercise good and barren captures.
+import sys, os, struct
+a = sys.argv[1:]
+cap = next((x for x in a if x.endswith(".prgcap")), "")
+tag = os.path.basename(cap).split(".")[0]
+if "--inspect-only" in a:
+    if tag == "empty":
+        sys.exit(0)
+    if tag == "broken":
+        sys.stderr.write("inspect failed\n"); sys.exit(3)
+    print("draw[0] vs=1/aaaa fs=2/bbbb")
+    sys.exit(0)
+for flag in ("--dump-realized-shader", "--dump-shader"):
+    if flag in a:
+        out = a[a.index(flag) + 2]
+        if tag == "nodump":
+            sys.exit(2)                       # writes nothing, and SAYS so
+        if tag == "partial":
+            open(out, "wb").write(b"\x00\x00\x00\x00")
+            sys.exit(2)                       # writes a file AND fails: only the exit code tells
+        if tag == "silentzero":
+            sys.exit(0)                       # writes nothing and claims success
+        if flag == "--dump-realized-shader":
+            if tag == "emptyisa":
+                open(out, "wb").write(b"")    # exits 0 having written nothing readable
+                sys.exit(0)
+            # one MIMG: 2D_ARRAY sample, plus its operand dword
+            open(out, "wb").write(struct.pack("<II", 0xF0800028, 0x00000000))
+        else:
+            arrayed = "1" if tag == "good" else "0"
+            open(out, "w").write("; SPIR-V\n%1 = OpTypeImage %float 2D 0 " + arrayed + " 0 1 Unknown\n")
+        sys.exit(0)
+sys.exit(0)
+"""
+
+
+def _run_self_test_case(tmp, script, captures):
+    """Drive scan.py end-to-end against the stub. Returns (returncode, stdout, stderr)."""
+    stub = os.path.join(tmp, "stub_replay.py")
+    with open(stub, "w") as f:
+        f.write(SELF_TEST_STUB)
+    os.chmod(stub, 0o755)
+    # A `spirv-dis` shim, so the suite is hermetic: it runs identically on a host without the
+    # Vulkan toolchain, and cannot be quietly reduced to "spirv-dis missing -> exit 2" -- which is
+    # what made four of these arms pass for the wrong reason the first time they were written.
+    # Named through PROSPER_SPIRV_DIS rather than dropped on PATH, because a PATH shim is inherently
+    # POSIX-only and turned the Windows/MinGW job red.
+    shim = os.path.join(tmp, "spirv_dis_shim.py")
+    with open(shim, "w") as f:
+        f.write("import sys\nsys.stdout.write(open(sys.argv[1]).read())\n")
+    env = dict(os.environ, PROSPER_SPIRV_DIS=shim)
+    paths = []
+    for name in captures:
+        q = os.path.join(tmp, f"{name}.prgcap")
+        open(q, "wb").write(b"\0")
+        paths.append(q)
+    r = subprocess.run([sys.executable, script, "--gpu-replay", stub] + paths,
+                       capture_output=True, text=True, env=env)
+    return r.returncode, r.stdout, r.stderr
 
 
 def self_test():
-    """Prove each decoder fires and each can also say NO -- a matcher that only ever agrees is void."""
+    """Every check below is written to FAIL under a mutation of the thing it claims to cover.
+
+    The previous suite did not. It built its MIMG fixture out of `MIMG_ENCODING`, so mutating that
+    constant mutated the fixture too and the check passed either way -- a same-source positive
+    control, which tests the discriminator and never the domain. It also never touched the
+    classifier, the exit contract, or either parser's caller, so nine separate mutations (including
+    `DIM_ARRAYED = {4, 7}`, which drops the entire #325 class this tool exists to find) all still
+    printed PASSED.
+    """
     ok = True
 
     def check(cond, label):
@@ -194,10 +369,30 @@ def self_test():
         print(f"  [{'ok' if cond else 'FAIL'}]   {label}")
         ok = ok and cond
 
-    # A hand-built MIMG word: encoding 0b111100, opcode 0x20 (image_sample), DIM=5 (2D_ARRAY).
-    w = (MIMG_ENCODING << 26) | ((0x20 & 0x7F) << 18) | (5 << 3)
-    check(decode_mimg(struct.pack("<I", w)) == [(0x20, 5)], "MIMG decode recovers opcode 0x20 / DIM 5")
+    # --- MIMG decode. Literal words, computed by hand, NOT built from the constants under test.
+    # 0xF0800028: encoding 0b111100, opcode 0x20, DIM 5. 0xF0800029 sets the opcode MSB -> 0xa0.
+    # 0xF4800028 is encoding 0b111101 and must decode to nothing.
+    mimg2 = struct.pack("<II", 0xF0800028, 0)
+    check(decode_mimg(mimg2) == [(0x20, 5)], "literal 0xF0800028 decodes as opcode 0x20 / DIM 5")
+    check(decode_mimg(struct.pack("<II", 0xF0800029, 0)) == [(0xa0, 5)],
+          "opcode MSB (bit 0) is reconstructed -- 0xF0800029 is opcode 0xa0, not 0x20")
+    check(decode_mimg(struct.pack("<II", 0xF4800028, 0)) == [],
+          "encoding 0b111101 is NOT MIMG (pins MIMG_ENCODING against an off-by-one)")
     check(decode_mimg(struct.pack("<I", 0x12345678)) == [], "a non-MIMG word decodes to nothing")
+    check(decode_mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5), (0x20, 5)],
+          "EVERY dword is tested, including the one after a match -- skipping it lets a phantom "
+          "swallow a real MIMG, which is what makes a clean result unsound")
+    check(phantom_risk(struct.pack("<II", 0xF0800028, 0xF0800028)) == 1
+          and phantom_risk(struct.pack("<II", 0xF0800028, 0)) == 0,
+          "phantom_risk counts back-to-back candidates and is 0 for an isolated one")
+    # The exact sequence review of #3039 used: a literal aliasing the encoding, then a REAL
+    # 2D_ARRAY sample. The real one must survive the phantom.
+    swallow = struct.pack("<III", 0x7E0002FF, 0xF0000000, 0xF0800028)
+    check((0x20, 5) in decode_mimg(swallow),
+          "a real MIMG immediately after an aliasing literal is still found")
+    check(decode_mimg(b"") == [] and decode_mimg(b"\x01\x02") == [], "short/empty input is safe")
+
+    # --- SPIR-V parse, both directions.
     arrayed = "%1 = OpTypeImage %float 2D 0 1 0 1 Unknown"
     plain = "%1 = OpTypeImage %float 2D 0 0 0 1 Unknown"
     check(parse_spirv_images(arrayed)[0] == [("2D", 1)], "OpTypeImage arrayed flag read as 1")
@@ -206,6 +401,77 @@ def self_test():
            "%c = OpCompositeConstruct %v3 %a %b %d\n"
            "%r = OpImageSampleImplicitLod %v4float %s %c")
     check(parse_spirv_images(dis)[1] == [3], "sample coordinate arity read from its vector type")
+
+    # --- The classifier: the actual product claim, in BOTH directions.
+    A = [("2D", 1)]        # an arrayed image was declared
+    P = [("2D", 0)]        # only a plain 2D image was declared
+    check(len(classify([(0x20, 5)], P, [])) == 1,
+          "DIM 5 against a non-arrayed module IS reported (the #325 class)")
+    check(classify([(0x20, 5)], A, []) == [],
+          "DIM 5 against an arrayed module is NOT reported")
+    check(len(classify([(0x20, 4)], P, [])) == 1 and len(classify([(0x20, 7)], P, [])) == 1,
+          "DIM 4 and DIM 7 are arrayed too")
+    check(classify([(0x20, 1)], P, []) == [], "plain 2D against a 2D module is not a finding")
+    check(len(classify([(0x00, 2)], P, [])) == 1 and classify([(0x00, 2)], [("3D", 0)], []) == [],
+          "the 3D class fires and can also say no")
+    check(len(classify([(0x20, 5), (0x21, 5), (0x22, 5)], P, [])) == 1,
+          "repeated hits of one class collapse to a single finding per shader")
+    check(classify([], P, []) == [], "a shader with no MIMG yields nothing")
+
+    # --- The exit contract, end to end. These are what make a clean result mean anything.
+    script = os.path.abspath(__file__)
+    with tempfile.TemporaryDirectory() as tmp:
+        rc, out, err = _run_self_test_case(tmp, script, ["good"])
+        # The positive count matters as much as the exit code. Every `rc == 2` arm below would pass
+        # if the stub could not START -- a stub that never runs is indistinguishable from a capture
+        # that could not be scanned -- so at least one arm has to assert that the stub really
+        # enumerated shaders. Without this, half the suite is vacuously green on any platform where
+        # launching the stub fails, which is exactly what happened on Windows/MinGW.
+        check(rc == 0 and "examined=2" in out,
+              "a capture whose module IS arrayed exits 0 AND reports its 2 examined shaders")
+
+        rc, out, err = _run_self_test_case(tmp, script, ["bad"])
+        check(rc == 1 and "array-layer-dropped" in out, "a real mismatch exits 1 and is printed")
+
+        rc, out, err = _run_self_test_case(tmp, script, ["empty"])
+        check(rc == 2, "a capture with no shaders exits 2, not 0")
+
+        rc, out, err = _run_self_test_case(tmp, script, ["broken"])
+        check(rc == 2, "a capture gpu_replay could not inspect exits 2")
+
+        rc, out, err = _run_self_test_case(tmp, script, ["nodump"])
+        check(rc == 2 and "zero examined" in err,
+              "dumps that exit non-zero are NOT counted as examined")
+
+        rc, out, err = _run_self_test_case(tmp, script, ["emptyisa"])
+        check(rc == 2, "a zero-byte ISA dump is NOT an examined shader (it exits 0, so only its "
+                       "emptiness distinguishes it)")
+
+        # The finding that made the old exit contract unsound: one good capture certifying a run.
+        rc, out, err = _run_self_test_case(tmp, script, ["good", "empty"])
+        check(rc == 2, "one readable capture does NOT certify a barren one alongside it")
+
+        rc, out, err = _run_self_test_case(tmp, script, ["bad", "nodump"])
+        check(rc == 2, "a barren capture outranks findings elsewhere (2 beats 1)")
+
+        # Cross-capture contamination: `nodump` writes nothing, so it must contribute no findings
+        # even when a previous capture in the SAME run wrote files under the same shader hashes.
+        _, alone, _ = _run_self_test_case(tmp, script, ["bad"])
+        finding_lines = lambda out: [ln for ln in out.splitlines() if "guest " in ln]
+        for bad_tag in ("nodump", "partial", "silentzero"):
+            _, pair, _ = _run_self_test_case(tmp, script, ["bad", bad_tag])
+            attributed = [ln for ln in finding_lines(pair) if ln.startswith(bad_tag)]
+            check(len(finding_lines(pair)) == len(finding_lines(alone)) and not attributed,
+                  f"'{bad_tag}' contributes no findings of its own")
+        # These three pin the two halves of the contamination fix INDEPENDENTLY, which the first
+        # version did not: `partial` writes a file and exits non-zero, so ONLY the return-code check
+        # rejects it; `silentzero` exits 0 having written nothing, so ONLY the per-capture temp
+        # directory stops it inheriting the previous capture's file under the same shader hash.
+        rc, _, err = _run_self_test_case(tmp, script, ["partial"])
+        check(rc == 2, "a dump that writes a file but exits non-zero is not an examined shader")
+        rc, _, err = _run_self_test_case(tmp, script, ["silentzero"])
+        check(rc == 2, "a dump that exits 0 having written nothing is not an examined shader")
+
     print("== self-test PASSED ==" if ok else "== self-test FAILED ==")
     return 0 if ok else 1
 
@@ -223,7 +489,7 @@ def main():
         return self_test()
     if not a.captures:
         ap.error("give at least one capture, or --self-test")
-    if not shutil.which("spirv-dis"):
+    if not os.environ.get("PROSPER_SPIRV_DIS") and not shutil.which("spirv-dis"):
         print("scan: spirv-dis not on PATH -- cannot read emitted shaders, so a clean result would\n"
               "      be meaningless. Run inside the toolchain container.", file=sys.stderr)
         return 2
@@ -231,19 +497,33 @@ def main():
         print(f"scan: no gpu_replay at {a.gpu_replay} (--gpu-replay to point elsewhere)", file=sys.stderr)
         return 2
 
-    all_f, total_examined, total_skipped, failed = [], 0, 0, []
-    with tempfile.TemporaryDirectory() as tmp:
-        for cap in a.captures:
-            res, err = scan_capture(a.gpu_replay, cap, tmp)
-            if res is None:
-                failed.append((cap, err))
-                continue
-            total_examined += res["examined"]
-            total_skipped += res["skipped"]
-            all_f += res["findings"]
+    all_f, total_examined, total_skipped, failed, per_capture = [], 0, 0, [], []
+    for cap in a.captures:
+        # One temp dir PER CAPTURE. Sharing one dir keyed only on shader hash let a capture whose
+        # dumps all failed be scored against the PREVIOUS capture's files -- findings reported
+        # against bytes the tool never read.
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                res, err = scan_capture(a.gpu_replay, cap, tmp)
+            except Exception as e:                       # noqa: BLE001 -- must not exit 1
+                res, err = None, f"{type(e).__name__}: {e}"
+        if res is None:
+            failed.append((cap, err))
+            per_capture.append(dict(capture=cap, examined=0, skipped=0, error=err))
+            continue
+        total_examined += res["examined"]
+        total_skipped += res["skipped"]
+        all_f += res["findings"]
+        per_capture.append(dict(capture=cap, examined=res["examined"], skipped=res["skipped"],
+                                findings=len(res["findings"]), skip_reasons=res["skip_reasons"]))
+
+    # A capture that yielded no examined shader was NOT scanned, whatever the other captures did.
+    # The old global `total_examined == 0` guard let one readable capture certify a whole run.
+    barren = [c["capture"] for c in per_capture if c["examined"] == 0]
 
     if a.json:
         print(json.dumps(dict(examined=total_examined, skipped=total_skipped,
+                              captures=per_capture, barren=barren,
                               failed=[{"capture": c, "error": e} for c, e in failed],
                               findings=all_f), indent=2))
     else:
@@ -253,14 +533,26 @@ def main():
             print(f"{f['capture']}  draw[{f['draw']}] {f['stage']}  guest {f['guest_dim']} "
                   f"op={f['opcode']} -> {f['emitted']}  [{f['klass']} {f['detail']}] "
                   f"coord_arity={f['max_coord_arity']}")
+        print()
+        for c in per_capture:
+            note = f"  ERROR {c['error']}" if c.get("error") else ""
+            print(f"  {os.path.basename(c['capture'])}: examined={c['examined']} "
+                  f"not-readable={c['skipped']} findings={c.get('findings', 0)}{note}")
         print(f"\nshaders examined: {total_examined}   not readable: {total_skipped}   "
               f"captures unscannable: {len(failed)}")
-        print(f"mismatches: {len(all_f)}")
-        if total_examined == 0:
-            print("\nNOTHING WAS EXAMINED -- this is not a clean result. Check the paths above.",
+        print(f"shaders with a mismatch: {len(all_f)}")
+        if all_f:
+            print("\nFindings are an OVER-APPROXIMATION -- the ISA walk is not length-aware, so a\n"
+                  "literal dword can read as an instruction. Confirm each before acting on it.\n"
+                  "A CLEAN result is sound for these classes: a superset that found nothing means\n"
+                  "there was nothing to find.")
+        if barren:
+            print(f"\nNOT A CLEAN RESULT -- {len(barren)} capture(s) yielded zero examined shaders:",
                   file=sys.stderr)
+            for b in barren:
+                print(f"  {b}", file=sys.stderr)
 
-    if total_examined == 0:
+    if failed or barren:
         return 2
     return 1 if all_f else 0
 

@@ -390,6 +390,17 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # The shader-conformance scanner (#3036), registered because its whole value is a CLEAN result
+  # and its original failure mode was manufacturing one: a capture that yielded zero examined
+  # shaders exited 0, and findings could be attributed to a capture whose dumps had all failed.
+  # The suite is hermetic -- it drives the scanner end to end against a stub gpu_replay and a
+  # `spirv-dis` shim, so it needs neither a GPU nor the Vulkan toolchain, and it pins the exit
+  # contract (0 clean / 1 mismatch / 2 could-not-scan) rather than only the two parsers. Ten
+  # mutations of the logic it covers, including `DIM_ARRAYED` dropping the 2D_ARRAY case that is
+  # the tool's entire reason to exist, each turn it red.
+  add_test(NAME shader_conformance_scan_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/shader_conformance/scan.py" "--self-test")
   # stack_profile's frame classifier, against RECORDED gdb output. Deliberately needs no gdb and no
   # ptrace: an end-to-end variant would skip silently wherever ptrace is unavailable, and a silently
   # skipped test is indistinguishable from a passing one. What it pins is the case that already
@@ -625,6 +636,35 @@ if(TARGET prosper_core)
   add_executable(test_kernel_nanosleep tests/hle/kernel/test_kernel_nanosleep.cpp)
   target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
   add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
+
+  # The guest semaphore timed wait (#3013). Platform-neutral like the nanosleep case above and for
+  # the same reason: the fix is Windows-only, so gating on UNIX would build the test everywhere
+  # except where the defect is.
+  #
+  # It asserts the MECHANISM -- which primitive served the wait, via sleep_backend_name() -- rather
+  # than a wall-clock duration, following test_videoout.cpp and what test_kernel_nanosleep.cpp's
+  # header asks for. The first version asserted durations only and review showed NONE of its arms
+  # could redden on the pre-fix code: its 40 ms ceiling sat 2.6x above the 15.57 ms defect, and its
+  # other two arms measured a POSTED semaphore, which unfixed winpthreads serves in 0.01 ms -- better
+  # than the poll loop, so they preferred the defect. A mechanism assertion cannot be satisfied by a
+  # lucky duration and does not flake under load. Mutation-checked: reverting to the winpthreads
+  # delegation reddens the MECHANISM arm and prints "via none".
+  #
+  # It used to say "reddens two arms", the second being a wall-clock ceiling, and that ceiling is
+  # gone: it would have PASSED the defect, and it also flaked on macOS/Rosetta. The mechanism
+  # arm is the discriminator; the bounds that remain are a stub/unit guard.
+  #
+  # The measurements and the argument live in ONE place, the test file's own header. They were
+  # briefly in both, with two different lists -- and a third Rosetta figure existed in neither
+  # (23.22 ms, found in a CI log during review). Two copies of a figure list is one copy too
+  # many, and this is the copy that gets read second.
+  add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
+  target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
+  add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
+  # Bounded for the same reason as the nanosleep case: the fixed path returns in ~5 ms, so a
+  # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
+  # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.
+  set_tests_properties(kernel_sem_timedwait PROPERTIES TIMEOUT 60)
   # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
   # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
   # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
