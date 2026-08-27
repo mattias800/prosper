@@ -68,7 +68,7 @@ def main():
     #    decided a pacer A/B on whichever arm happened to idle more.
     log = "".join(sample(i * 1000, 0) for i in range(2000))
     out, _ = run(log)
-    expect(out, "IDLE (port open, not being fed): 2000 samples",
+    expect(out, "NOT COUNTED (idle, or unobservable): 2000 samples",
            "confound: a never-fed port is IDLE for every sample")
     expect(out, "UNDERRUN (dry while streaming): 0 episodes",
            "confound: ...and reports ZERO underruns, not 2000")
@@ -85,7 +85,7 @@ def main():
            "burst: 8 contiguous dry samples bracketed by audio are ONE underrun")
     expect(out, "8.0 ms total", "burst: charged one sampling interval per dry sample")
     expect(out, "longest 8000 us at t=500000 us", "burst: the longest episode is located")
-    expect(out, "IDLE (port open, not being fed): 0 samples",
+    expect(out, "NOT COUNTED (idle, or unobservable): 0 samples",
            "burst: a bracketed dip is not idle")
 
     # 5. A LONG silence BETWEEN two fed stretches -- bracketed by audio on both sides, and still
@@ -96,9 +96,10 @@ def main():
     out, _ = run(log)
     expect(out, "UNDERRUN (dry while streaming): 0 episodes",
            "long silence: a 5 s bracketed gap is not an underrun")
-    expect(out, "IDLE (port open, not being fed): 5000 samples",
+    expect(out, "NOT COUNTED (idle, or unobservable): 5000 samples",
            "long silence: ...it is idle, all 5000 samples of it")
-    expect(out, "the queue never emptied", "long silence: and the verdict says so")
+    expect(out, "no underrun -- every dry stretch was idle",
+           "long silence: the verdict says no underrun, not \"never emptied\"")
 
     # 6. --active-window-ms is the max-dip boundary, and must be shown to bite in BOTH directions
     #    on the SAME input. An 8 ms dip is an underrun at the 200 ms default and idleness at 2 ms.
@@ -110,7 +111,7 @@ def main():
     out_small, _ = run(log8, "--active-window-ms=2")
     expect(out_small, "UNDERRUN (dry while streaming): 0 episodes",
            "max dip: the same 8 ms dip is idleness at a 2 ms bound")
-    expect(out_small, "IDLE (port open, not being fed): 8 samples",
+    expect(out_small, "NOT COUNTED (idle, or unobservable): 8 samples",
            "max dip: ...and the eight samples are accounted for, not dropped")
     expect(out_small, "max dip 2 ms", "max dip: the bound in force is stated in the output")
 
@@ -123,7 +124,7 @@ def main():
     out, _ = run(log_lead)
     expect(out, "UNDERRUN (dry while streaming): 0 episodes",
            "leading dry: a port dry before its first audio is not an underrun")
-    expect(out, "IDLE (port open, not being fed): 60 samples",
+    expect(out, "NOT COUNTED (idle, or unobservable): 60 samples",
            "leading dry: ...it is start-up idleness")
 
     # 6c. TRAILING dry: the port stops being fed and stays dry to the end of the log. Symmetric to
@@ -134,8 +135,66 @@ def main():
     out, _ = run(log_tail)
     expect(out, "UNDERRUN (dry while streaming): 0 episodes",
            "trailing dry: a port that stops feeding is not underrunning")
-    expect(out, "IDLE (port open, not being fed): 60 samples",
+    expect(out, "NOT COUNTED (idle, or unobservable): 60 samples",
            "trailing dry: ...it is shutdown idleness")
+
+    # 6d. THE WELDING CASE, and the reason episodes() takes a gap threshold. The sampler emits
+    #     nothing for a closed port, and a port is normally dry on BOTH sides of its own lifecycle
+    #     boundary. Without a discontinuity split these two 20-sample dry stretches, 30 s apart in
+    #     wall clock, merge into one "underrun" of 40 ms that is bracketed by audio and passes the
+    #     duration bound -- so 6b's start-up idleness and 6c's shutdown idleness, which those arms
+    #     verify at the two ENDS of the log, are defeated at every interior open/close. Constructed
+    #     by review of #3070, which measured exactly this: 1 episode, 40 ms, 0 idle.
+    log_weld = ("".join(sample(i * 1000, 6144) for i in range(100)) +
+                "".join(sample((100 + i) * 1000, 0) for i in range(20)) +
+                "".join(sample(30_120_000 + i * 1000, 0) for i in range(20)) +
+                "".join(sample(30_140_000 + i * 1000, 6144) for i in range(100)))
+    out, _ = run(log_weld)
+    expect(out, "UNDERRUN (dry while streaming): 0 episodes",
+           "welding: two dry stretches across a sampling gap are NOT one underrun")
+    expect(out, "NOT COUNTED (idle, or unobservable): 40 samples",
+           "welding: both stretches are accounted for as unobservable, not dropped")
+
+    # 6e. And the gap must be VISIBLE, not merely handled. Coverage -- samples x interval against
+    #     the wall-clock span -- is what turns a silent hole into a number a reader can act on.
+    #     Without it the report above would look like a clean 30 s window.
+    expect(out, "coverage 1%", "welding: the sampling gap shows as a coverage shortfall")
+    out_full, _ = run("".join(sample(i * 1000, 6144) for i in range(2000)))
+    expect(out_full, "coverage 100%", "coverage reads ~100% on a gapless run")
+
+    # 6f. The split must fire on a DISCONTINUITY, not on ordinary jitter. A single missed sample
+    #     inside a dry stretch is still one underrun -- a threshold that split on any irregularity
+    #     would inflate the episode count, which is the quantity an A/B compares.
+    # Samples at 0..99 ms fed, 100..104 dry, a 3 ms hole (under the 4 ms threshold), 107..111
+    # dry, then fed again at 112 ms with NO further hole -- the first draft of this fixture
+    # left a second 9 ms hole before the audio resumed, which legitimately split the episode
+    # and made the arm fail for a reason that had nothing to do with what it tests.
+    log_jitter = ("".join(sample(i * 1000, 6144) for i in range(100)) +
+                  "".join(sample((100 + i) * 1000, 0) for i in range(5)) +
+                  "".join(sample(107_000 + i * 1000, 0) for i in range(5)) +
+                  "".join(sample(112_000 + i * 1000, 6144) for i in range(100)))
+    out_j, _ = run(log_jitter)
+    expect(out_j, "UNDERRUN (dry while streaming): 1 episodes",
+           "jitter: a 2 ms hiccup inside a dry stretch does not split the episode")
+
+    # 6g. Argument parsing is STRICT, and both spellings work. The usage line documented
+    #     `--min-episode-us N` while main() read only the `=N` form, so the documented spelling
+    #     was accepted and silently ignored -- and an unknown `--flag` was dropped without a word.
+    #     The emitter this reads from states the opposite rule for its own variables (a malformed
+    #     value disables the trigger rather than firing at an unintended moment).
+    log_sp = "".join(sample(i * 1000, 0 if 500 <= i < 508 else 6144) for i in range(2000))
+    out_sp, rc_sp = run(log_sp, "--active-window-ms", "2")
+    expect(out_sp, "max dip 2 ms", "args: the SPACE-separated form is honoured, not ignored")
+    expect(out_sp, "UNDERRUN (dry while streaming): 0 episodes",
+           "args: ...and it actually changes the answer")
+    out_eq, _ = run(log_sp, "--active-window-ms=2")
+    expect(out_eq, "max dip 2 ms", "args: the = form still works")
+    _, rc_bad = run(log_sp, "--activ-window-ms=2")
+    if rc_bad == 0:
+        print(" [FAIL] args: an unknown option exits 0, so a typo silently runs the default arm")
+    _, rc_nonint = run(log_sp, "--active-window-ms", "soon")
+    if rc_nonint == 0:
+        print(" [FAIL] args: a non-integer value exits 0")
 
     # 7. Separated bursts are separate episodes -- the count is what an A/B compares.
     log = "".join(sample(i * 1000, 0 if i in (100, 101, 300, 700, 701, 702) else 6144)
@@ -171,7 +230,8 @@ def main():
     out, _ = run(log)
     expect(out, "UNDERRUN (dry while streaming): 0 episodes", "half a grain is not an underrun")
     expect(out, "THIN (under one grain, ungated): 1 episodes", "...but it is thin, as one episode")
-    expect(out, "the queue never emptied", "and the verdict keys on dry, not thin")
+    expect(out, "verdict: the queue never emptied",
+           "and the verdict keys on dry, not thin -- with nothing excluded, it may say so")
 
     # 11. Two ports are reported independently. Blasphemous 2 plays through two, and interleaving
     #     them into one series would fabricate episodes neither port had.
@@ -180,7 +240,7 @@ def main():
     out, _ = run(log)
     expect(out, "port 17:", "two ports: the first is reported")
     expect(out, "port 18:", "two ports: the second is reported")
-    expect(out, "IDLE (port open, not being fed): 300 samples",
+    expect(out, "NOT COUNTED (idle, or unobservable): 300 samples",
            "two ports: the never-fed one is idle, not merged into the fed one")
 
     # 12. [audio-dbg] context is parsed and LABELLED as context. The docstring explains why it
