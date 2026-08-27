@@ -918,6 +918,8 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // Give compute an explicit release-before-teardown handshake before adding a destructor here.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
+    // Non-null only under PROSPER_VK_VALIDATION; without it the layer has no output sink.
+    VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     VkDeviceSize storage_buffer_alignment = 1;
     double timestamp_period_ns = 0.0;
@@ -976,6 +978,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         // SDL_Vulkan_GetInstanceExtensions; instead enable every platform surface extension present and
         // let the app fall back to its own device if SDL still needs one we didn't get (#1270 R4).
         std::vector<const char*> inst_exts;
+        // Hoisted so the validation block below can consult it: pushing an unadvertised extension
+        // fails the WHOLE vkCreateInstance, which would also drop every WSI extension and turn off
+        // present_surface_capable (#1270) -- a debugging switch must not degrade the present path.
+        std::vector<VkExtensionProperties> avail;
         {
             static const char* const kWsiExts[] = {
                 "VK_KHR_surface",
@@ -988,7 +994,7 @@ inline const RenderVkCtx& render_vk_ctx() {
 #endif
             };
             uint32_t nie = 0; vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
-            std::vector<VkExtensionProperties> avail(nie);
+            avail.resize(nie);
             if (nie) vkEnumerateInstanceExtensionProperties(nullptr, &nie, avail.data());
             auto has = [&](const char* name) {
                 for (const auto& e : avail) if (!strcmp(e.extensionName, name)) return true;
@@ -1009,6 +1015,65 @@ inline const RenderVkCtx& render_vk_ctx() {
                 ici.ppEnabledExtensionNames = inst_exts.data();
             }
         }
+        // PROSPER_VK_VALIDATION=1: enable the Khronos validation layer and register a messenger.
+        //
+        // This does NOT make validation newly possible -- `tools/vkval/vk_validation_scan.py`
+        // (#1704, ctest `vkval_scan_logic`) has been scanning the suite for a long time and carries
+        // its own baseline, because VVL's default debug_action writes to stdout/stderr by itself.
+        // Four VUIDs were fixed off the back of it (#1713, #1714, #1717, #1726). Counts are
+        // deliberately not quoted here, and should not be quoted from allowlist.txt's header
+        // either -- that header is amended only SOMETIMES (#1714 deleted its entry without
+        // amending it, leaving the stated ledger one id high). Run the scan and read the count it
+        // computes. An earlier revision of this comment claimed validation "had never once been a
+        // measurement in this project", which was simply false and would have retired a working
+        // guard as unmeasured.
+        //
+        // What a messenger adds over the default action: in-process capture, so output can be
+        // rate-limited (one violated VUID in a per-draw path otherwise fills the disk) and tagged;
+        // a run that says whether it is armed; and coverage when the default action is off, which
+        // is how some SDK builds and any VK_LAYER_* settings file can configure it.
+        // Off by default; the layer costs real time per draw.
+        const bool want_validation = [] {
+            const char* e = getenv("PROSPER_VK_VALIDATION");
+            return e && *e && strcmp(e, "0");
+        }();
+        static const char* const kValidationLayer = "VK_LAYER_KHRONOS_validation";
+        constexpr uint32_t kMessengerPerIdLimit = 8;
+        bool validation_enabled = false;
+        bool messenger_wanted = true;
+        std::vector<const char*> inst_layers;
+        if (want_validation) {
+            uint32_t nl = 0; vkEnumerateInstanceLayerProperties(&nl, nullptr);
+            std::vector<VkLayerProperties> layers(nl);
+            if (nl) vkEnumerateInstanceLayerProperties(&nl, layers.data());
+            for (const auto& l : layers)
+                if (!strcmp(l.layerName, kValidationLayer)) validation_enabled = true;
+            if (validation_enabled) {
+                inst_layers.push_back(kValidationLayer);
+                ici.enabledLayerCount = (uint32_t)inst_layers.size();
+                ici.ppEnabledLayerNames = inst_layers.data();
+                bool have_debug_utils = false;
+                for (const auto& e : avail)
+                    if (!strcmp(e.extensionName, "VK_EXT_debug_utils")) have_debug_utils = true;
+                if (have_debug_utils) {
+                    inst_exts.push_back("VK_EXT_debug_utils");
+                    ici.enabledExtensionCount = (uint32_t)inst_exts.size();
+                    ici.ppEnabledExtensionNames = inst_exts.data();
+                } else {
+                    fprintf(stderr, "[vk-validation] VK_EXT_debug_utils is not advertised; the layer "
+                                    "will run with its DEFAULT stdout/stderr action and this process "
+                                    "will not rate-limit or tag its output\n");
+                    fflush(stderr);
+                    messenger_wanted = false;
+                }
+            } else {
+                // Say so. A requested-but-absent layer is the silent-instrument case again.
+                fprintf(stderr, "[vk-validation] PROSPER_VK_VALIDATION set but %s is not installed; "
+                                "NO validation is running\n", kValidationLayer);
+                fflush(stderr);
+            }
+        }
+
         // If the driver rejects the surface set (should not happen since each was advertised), retry with
         // no instance extensions so the headless render path never regresses on an unexpected loader.
         if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS || !r.inst) {
@@ -1016,10 +1081,66 @@ inline const RenderVkCtx& render_vk_ctx() {
                 r.present_surface_capable = false;
                 VkInstanceCreateInfo bare{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; bare.pApplicationInfo = &app;
                 if (vkCreateInstance(&bare, nullptr, &r.inst) != VK_SUCCESS || !r.inst) return r;
+                // The retry carries no layers and no extensions, so validation is GONE on this
+                // instance. Announcing "active" here would be the exact laundered null this switch
+                // exists to prevent -- a fourth silent state, and the worst of them.
+                if (validation_enabled) {
+                    fprintf(stderr, "[vk-validation] instance creation fell back to a bare create "
+                                    "info; the validation layer was DROPPED and NO validation is "
+                                    "running -- treat any clean result from this run as void\n");
+                    fflush(stderr);
+                    validation_enabled = false;
+                }
             } else {
                 return r;
             }
         }
+        if (validation_enabled && messenger_wanted) {
+            auto create = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+                r.inst, "vkCreateDebugUtilsMessengerEXT");
+            VkDebugUtilsMessengerCreateInfoEXT dci{
+                VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            dci.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT sev,
+                                     VkDebugUtilsMessageTypeFlagsEXT,
+                                     const VkDebugUtilsMessengerCallbackDataEXT* d,
+                                     void*) -> VkBool32 {
+                // Rate-limited per message id: one violated VUID in a per-draw path otherwise
+                // produces gigabytes, and this project's guidance is explicit that a run log on the
+                // tmpfs takes the machine down with it.
+                // The spec requires this callback to be thread-safe, and prosper submits from more
+                // than one thread (see present_queue_shared), so the rate-limit map needs a lock.
+                static std::mutex seen_mu;
+                static std::unordered_map<int32_t, uint32_t> seen;
+                constexpr uint32_t kPerIdLimit = kMessengerPerIdLimit;
+                uint32_t n;
+                {
+                    std::lock_guard<std::mutex> lk(seen_mu);
+                    n = ++seen[d ? d->messageIdNumber : 0];
+                }
+                if (n > kPerIdLimit) return VK_FALSE;
+                fprintf(stderr, "[vk-validation] %s %s%s\n",
+                        sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "ERROR" : "WARN",
+                        d && d->pMessage ? d->pMessage : "(no message)",
+                        n == kPerIdLimit ? "  [further reports of this id suppressed]" : "");
+                fflush(stderr);
+                return VK_FALSE;
+            };
+            if (!create || create(r.inst, &dci, nullptr, &r.debug_messenger) != VK_SUCCESS) {
+                fprintf(stderr, "[vk-validation] layer loaded but the debug messenger could NOT be "
+                                "registered; its output would be discarded, so treat any clean "
+                                "result from this run as void\n");
+                fflush(stderr);
+            } else {
+                fprintf(stderr, "[vk-validation] active (warnings and errors, %u per message id)\n",
+                        kMessengerPerIdLimit);
+                fflush(stderr);
+            }
+        }
+
         uint32_t nd = 0; vkEnumeratePhysicalDevices(r.inst, &nd, nullptr);
         if (!nd) return r;
         std::vector<VkPhysicalDevice> devs(nd); vkEnumeratePhysicalDevices(r.inst, &nd, devs.data());
