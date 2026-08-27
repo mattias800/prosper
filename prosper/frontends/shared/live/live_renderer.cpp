@@ -766,6 +766,17 @@ struct DecodedTexture {
 // Always-on identity-scope accounting; see TextureDecodeScopeStats in the header.
 thread_local TextureDecodeScopeStats g_texture_decode_scope{};
 
+// #325: the decoded-array footprint budget. Read once at file scope rather than inside the decode,
+// because it is CONFIGURATION, not a diagnostic gate -- a getenv lexically enclosing a report makes
+// that report depend on two switches, which check_diag_gates.py rightly rejects (TWO-GATE).
+inline uint64_t array_decode_budget_bytes() {
+    static const uint64_t bytes = [] {
+        const char* e = getenv("PROSPER_ARRAY_DECODE_BUDGET_MIB");
+        return static_cast<uint64_t>(e ? atoll(e) : 1024) << 20;
+    }();
+    return bytes;
+}
+
 struct PersistentDecodedTexture {
     // Decoded array layers behind `pixels`; 1 for every non-array texture. The persistent cache is
     // the one that actually serves a world-texture atlas -- a submit-local entry is rebuilt from it
@@ -3269,9 +3280,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // the pre-#325 behaviour -- rather than failing: an allocation failure here
                         // is silent, because vkCreateImage's result is discarded and the null handle
                         // is used anyway (#3045).
-                        static const uint64_t array_budget_bytes = [] {
-                            const char* e = getenv("PROSPER_ARRAY_DECODE_BUDGET_MIB");
-                            return (uint64_t)(e ? atoll(e) : 1024) << 20; }();
+                        const uint64_t array_budget_bytes = array_decode_budget_bytes();
                         const uint64_t array_footprint =
                             (uint64_t)tw * th * 4ull * (r.depth ? r.depth : 1u);
                         const bool is_array =
@@ -5188,14 +5197,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 return r.gpu_addr + static_cast<uint64_t>(face) * stride;
                             };
                             const uint32_t slice_count = is_cube ? 6u : decoded_layers;
+                            // Reports the GUEST's declared layout only. Deliberately not the
+                            // decoded slice count: that is what PROSPER_ARRAY_DECODE_BUDGET_MIB
+                            // measures, and a diagnostic that prints a field a different switch
+                            // decided is one whose output cannot be trusted on its own -- which
+                            // check_diag_gates.py enforces (TWO-GATE).
                             if (!is_cube && getenv("PROSPER_SLICESTRIDE")) {
                                 static std::unordered_set<uint64_t> reported;
                                 if (reported.insert(r.gpu_addr).second)
                                     fprintf(stderr,
-                                            "[slicestride] addr=0x%llx %ux%u layers=%u fmt=%u "
+                                            "[slicestride] addr=0x%llx %ux%u guest_depth=%u fmt=%u "
                                             "layer_stride=%u mip_off=%u in_mip_tail=%d "
                                             "mip_tail_bytes=%u declared_mips=%u size=%u\n",
-                                            (unsigned long long)r.gpu_addr, tw, th, slice_count,
+                                            (unsigned long long)r.gpu_addr, tw, th, r.depth,
                                             (unsigned)r.format, r.layer_stride_bytes,
                                             r.layer_mip_offset_bytes, (int)r.in_mip_tail,
                                             r.mip_tail_bytes, r.declared_mip_levels, r.size);

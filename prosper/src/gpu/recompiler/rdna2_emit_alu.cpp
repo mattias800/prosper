@@ -7547,11 +7547,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     } else {
                         // #325: the graphics fallback used to declare a base-slice 2D image here,
                         // "until its resource uploader can create matching array views". It now
-                        // does, and leaving the fallback in place became actively wrong: the
-                        // uploader binds a 2D_ARRAY view for every img_dim==5 resource, so a 2D
-                        // declaration against it is a descriptor mismatch. This title's shadow pass
-                        // samples the 256-slice atlas with exactly this opcode.
-                        if (!b.declare_texture(res->binding, Dim_2D, false, true)) {
+                        // does -- but ONLY for resources the uploader actually uploads as arrays,
+                        // which is what res_arrayed answers. A DIM=5 instruction is not sufficient:
+                        // this title's shadow maps are declared img_dim 5 with **depth 1**, so they
+                        // are uploaded as plain 2D, and declaring them Arrayed produced
+                        // VUID-vkCmdDraw-viewType-07752 (caught by tools/vkval, not by ctest --
+                        // validation errors do not fail a test).
+                        if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
                             ok = false; return true;
                         }
                         b.image_sample_dref_manual_2d(
@@ -7561,7 +7563,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
                             res->addr_uvw[0], res->addr_uvw[1], res->border_color_type,
-                            out, true, vread(cvg(3)));
+                            out, res_arrayed, vread(cvg(3)));
                     }
                 } else if (in.mimg_dim == 1u) {
                     // Plain 2D form (Blue Prince's lit-material PSes, #1271: 436 rejects/run, all
