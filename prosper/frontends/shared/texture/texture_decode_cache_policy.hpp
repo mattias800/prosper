@@ -48,9 +48,10 @@ constexpr size_t layered_cube_source_size(bool exact_layered_cube,
 // whole run (#2998). Cubes have always spanned their six faces; arrays were added later without this.
 //
 // Fails closed exactly as the cube form does. A `surface_bytes` of 0 is the caller's "do not cache"
-// signal and must never be widened into a cacheable span; a missing stride or a single layer leaves
-// the surface size unchanged; an overflowing span yields 0 rather than a truncated range, because a
-// span shorter than the decoder reads is precisely the defect this exists to prevent.
+// signal and must never be widened into a cacheable span; a single layer leaves the surface size
+// unchanged; a MISSING stride does not -- the decoder synthesizes one, so the span follows it (see
+// below); an overflowing span yields 0 rather than a truncated range, because a span shorter than
+// the decoder reads is precisely the defect this exists to prevent.
 constexpr size_t layered_array_source_size(size_t surface_bytes,
                                            uint64_t layer_stride_bytes,
                                            uint32_t layers) {
