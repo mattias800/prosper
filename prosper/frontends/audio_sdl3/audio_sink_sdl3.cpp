@@ -76,7 +76,14 @@ bool queue_trace() {
 // arm is the property, not the diff.
 //
 // Measured on Blasphemous 2 (PPSA13579), Windows/RTX 4090, 150 s from launch per arm, underrun
-// episodes from tools/perf/audio_queue_timeline_report.py (#3070), two runs per arm (#3033):
+// episodes from tools/perf/audio_queue_timeline_report.py (#3070), two runs per arm (#3033).
+//
+// "dry" here means the percentage of 1 ms SAMPLES at which the device queue held ZERO bytes while
+// the port was being fed -- pinned because the word became ambiguous on 2026-08-27: #3046 found
+// audio_delivery_report.py's "below one grain" thresholds were computed in FRAMES, so that tool
+// was reporting "completely empty" under a much weaker label, and a figure from it had already
+// been misquoted onto #3016. These figures come from the other reader and are unaffected, but two
+// tools now say "dry" and only one of them ever meant this.
 //
 //     N=1 (this default)                53.03% / 53.43% dry   arrivals every 11.38 ms
 //     N=3                               69.20% / 69.05% dry   arrivals every 15.57 ms
