@@ -348,7 +348,8 @@ jobs:
 
       # The live half used to follow here. It re-read the trackers through `gh` and failed the build
       # if the committed file no longer matched them; it now runs in the `progress-tracker` job on
-      # master, which regenerates rather than fails. So THIS job is entirely local and offline, and
+      # master, which regenerates rather than failing FOR STALENESS -- it still fails on a generator
+      # or tracker error. So THIS job is entirely local and offline, and
       # needs no token at all.
       #
       # Its rationale is kept here because the reasoning is what matters, not the step. Its
@@ -387,11 +388,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Fails ONLY on causes an author can act on, which is the whole rule this job is built
-      # around. Push contention is soft -- a derived file one commit behind is not worth a red
-      # master, and that is precisely the defect this job removes -- but a GENERATOR or TRACKER
-      # error is hard, because it writes no file and would otherwise freeze PROGRESS_TRACKER.md
-      # behind a permanently green job. See the split at the two `exit 1`s below.
+      # Push contention is SOFT -- a derived file one commit behind is not worth a red master, and
+      # that is precisely the defect this job removes. A GENERATOR or TRACKER error is HARD, because
+      # it writes no file and would otherwise freeze PROGRESS_TRACKER.md behind a permanently green
+      # job; that one is author-fixable, which is the same criterion that keeps --selftest a gate.
+      #
+      # The second `exit 1` below is neither: it is a defensive assert on a state that should be
+      # unreachable (a commit failing with a change staged). An earlier version of this comment
+      # called both "causes an author can act on", which over-generalised the rule to cover it.
       #
       # A push made with GITHUB_TOKEN does not trigger workflows, so committing here cannot loop.
       - name: Regenerate PROGRESS_TRACKER.md from the trackers
