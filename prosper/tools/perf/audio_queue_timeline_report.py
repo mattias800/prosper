@@ -112,7 +112,11 @@ def classify_dry_episodes(samples, dry_eps, interval_us, max_dip_us):
         not a dip in a stream. This is the condition that matters, and the reason the first two
         are not sufficient: a 5000 ms gap between two songs IS bracketed by audio on both sides,
         so bracketing alone would call it one enormous underrun;
-      * it does not abut a DISCONTINUITY in the sample series. The bracketing samples are then
+      * it does not abut a DISCONTINUITY in the sample series. This condition is DEFLATIONARY by
+        design -- a real dip that happens to follow a lost-sample hole is not counted either, and
+        that is the intended trade: the coverage figure in the header is what tells a reader the
+        window was not fully observed, and under-reporting a defect we cannot substantiate is
+        preferable to attributing unobserved time to one. The bracketing samples are then
         on the far side of an interval nobody observed, so "the port was being fed across this"
         is exactly what the data cannot say. Counting it would attribute unobserved time to a
         defect -- and the common case, a port closing and reopening, is idleness.
@@ -219,7 +223,9 @@ def report(ports, gaps=None, min_episode_us=0, active_window_us=200000):
         # closed and reopened, or a run that lost output, shows up here as a shortfall instead
         # of as a mysteriously long episode. Well over 100% means the sampler ran faster than
         # its own median, which is ordinary jitter.
-        coverage = (len(samples) * iv / (samples[-1][0] - samples[0][0]) * 100.0
+        # (n - 1) intervals span n samples, not n. With n the figure is off by one interval,
+        # which is invisible on a long run and reads 200% on a two-sample port. Review of #3070.
+        coverage = ((len(samples) - 1) * iv / (samples[-1][0] - samples[0][0]) * 100.0
                     if len(samples) > 1 and samples[-1][0] > samples[0][0] else 0.0)
         print(f"port {port}: {len(samples)} samples over {span_s:.1f} s"
               f"  sampling interval {iv} us (median)"
@@ -305,6 +311,13 @@ def main(argv):
             return 2
         if n < 0:
             print(f"error: {name} cannot be negative", file=sys.stderr)
+            return 2
+        if name == "--active-window-ms" and n == 0:
+            # 0 makes every dry episode longer than the bound, i.e. it disables underrun
+            # detection while still printing a report. That is the one value whose effect a
+            # reader would not predict from the name, so it is refused rather than echoed.
+            print("error: --active-window-ms 0 would classify every dry stretch as idle, "
+                  "disabling underrun detection entirely", file=sys.stderr)
             return 2
         if name == "--min-episode-us":
             min_ep = n

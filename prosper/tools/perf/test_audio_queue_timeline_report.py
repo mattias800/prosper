@@ -40,6 +40,21 @@ def expect(out, needle, what):
         print("        got:\n" + "\n".join("        " + l for l in out.splitlines()))
 
 
+def expect_rc(rc, want, what):
+    """Exit-code assertion that actually COUNTS.
+
+    Several arms in this file printed a [FAIL] line without touching `fails`, so the suite printed
+    the failure and then exited 0 -- and ctest reads only the exit code. Review of #3070 measured
+    it: with strict argument parsing removed from the tool entirely, the self-test printed both
+    FAIL lines and still reported all cases pass. A helper rather than scattered `fails += 1`
+    lines, so the next exit-code arm cannot reintroduce it.
+    """
+    global fails
+    if rc != want:
+        fails += 1
+        print(f" [FAIL] {what}: expected exit {want}, got {rc}")
+
+
 def expect_not(out, needle, what):
     global fails
     if needle in out:
@@ -59,8 +74,7 @@ def main():
     expect(out, "= 3.00 grains", "healthy: the cushion is reported in grains")
     expect(out, "the queue never emptied", "healthy: no starvation claimed")
     expect(out, "UNDERRUN (dry while streaming): 0 episodes", "healthy: zero underruns")
-    if rc != 0:
-        print(f" [FAIL] healthy: exit {rc}, expected 0")
+    expect_rc(rc, 0, "healthy: a clean log exits 0")
 
     # 2. THE CONFOUND ARM, and the reason the gate exists. A port that is OPEN but never fed reads
     #    queued=0 for its whole life. Before the gate this tool called that STARVED, and on a real
@@ -190,11 +204,44 @@ def main():
     out_eq, _ = run(log_sp, "--active-window-ms=2")
     expect(out_eq, "max dip 2 ms", "args: the = form still works")
     _, rc_bad = run(log_sp, "--activ-window-ms=2")
-    if rc_bad == 0:
-        print(" [FAIL] args: an unknown option exits 0, so a typo silently runs the default arm")
+    expect_rc(rc_bad, 2,
+              "args: an unknown option must exit non-zero, else a typo runs the default arm")
     _, rc_nonint = run(log_sp, "--active-window-ms", "soon")
-    if rc_nonint == 0:
-        print(" [FAIL] args: a non-integer value exits 0")
+    expect_rc(rc_nonint, 2, "args: a non-integer value must exit non-zero")
+
+    # 6h. The interval is the MEDIAN, not the mean, and this arm exists because the fix above
+    #      raised its stakes: `iv` now sets the segmentation threshold (gap_us = iv * 4), so a
+    #      mean would change the episode COUNT and not merely the reported milliseconds. No other
+    #      arm feeds a non-uniform interval. Review of #3070 asked for exactly this one.
+    #
+    #      1 ms for 400 samples, then one 300 ms stall, then 1 ms again. Median = 1000 us; mean is
+    #      dragged to ~1374 us, which is above gap_us/4 and would resegment the series.
+    log_mm = ("".join(sample(i * 1000, 6144) for i in range(400)) +
+              sample(700_000, 6144) +
+              "".join(sample(701_000 + i * 1000, 6144) for i in range(400)))
+    out_mm, _ = run(log_mm)
+    expect(out_mm, "sampling interval 1000 us",
+           "interval: one long stall does not drag the interval off the median")
+
+    # 6i. grain=0. The emitter can log it before a port's format is known, and the header divides
+    #      by it to report the cushion in grains. The branch must survive and must still measure
+    #      dryness, which is independent of the grain.
+    log_g0 = "".join(f"[audio-queue] t_us={i * 1000} port=17 queued=0 grain=0\n" for i in range(300))
+    out_g0, rc_g0 = run(log_g0)
+    expect(out_g0, "grain UNKNOWN (0)", "grain 0: reported as unknown rather than dividing by it")
+    expect_rc(rc_g0, 0, "grain 0: still produces a report")
+    expect(out_g0, "NOT COUNTED", "grain 0: dryness is still classified without a grain")
+
+    # 6j. Coverage counts INTERVALS, not samples: n samples span (n-1) intervals. A two-sample
+    #      port read 200% before this was fixed, which is the kind of figure that discredits the
+    #      whole header.
+    out_cov, _ = run(sample(0, 6144) + sample(1000, 6144))
+    expect(out_cov, "coverage 100%", "coverage: two samples one interval apart read 100%, not 200%")
+
+    # 6k. --active-window-ms 0 would classify every dry stretch as idle -- i.e. silently disable
+    #      the thing the tool measures -- so it is refused rather than echoed back.
+    _, rc_zero = run("".join(sample(i * 1000, 0) for i in range(10)), "--active-window-ms", "0")
+    expect_rc(rc_zero, 2, "a zero active window is refused, not silently accepted")
 
     # 7. Separated bursts are separate episodes -- the count is what an A/B compares.
     log = "".join(sample(i * 1000, 0 if i in (100, 101, 300, 700, 701, 702) else 6144)
@@ -256,9 +303,7 @@ def main():
     #     reads as "no underruns".
     out, rc = run("some other log entirely\n")
     expect(out, "no [audio-queue] samples found", "an unrelated log is reported as no data")
-    if rc == 0:
-        print(" [FAIL] empty log: exit 0, which reads as a clean run")
-        return 1
+    expect_rc(rc, 1, "empty log: must exit non-zero, since exit 0 reads as a clean run")
 
     if fails:
         print(f"audio_queue_timeline_report self-test: {fails} FAILURES")
