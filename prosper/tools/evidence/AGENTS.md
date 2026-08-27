@@ -43,10 +43,17 @@ matches nothing at any brightness, and is not progression evidence in the first 
 **A mean ceiling was tried here and removed, which is worth knowing before adding one back.** It
 looked reasonable — "a high matching fraction alone is not domination" — but an overlap bar of 75%
 already bounds the mean at ≤ 63.75/255, so any ceiling below that can only discard frames the bar
-would have flagged. It cannot prevent a false positive and can only manufacture false negatives:
-4 of 13 real assets carrying a bright caption panel reach mean 40.5–54.3 while still exceeding the
-bar, and a ceiling of 40 silently dropped every one. The case that motivated it was already rejected
-by the bar.
+would have flagged. It cannot prevent a false positive and can only manufacture false negatives.
+That bound is the argument, and it is worth preferring to any count: it is derivable, so it belongs
+to nobody's sample. Measured alongside it, **100 of 233** structured assets (42.9%) carrying a bright
+caption panel reach mean 40.5–59.25 while still exceeding the bar, so a ceiling of 40 silently
+dropped nearly half. The case that motivated the ceiling was already rejected by the bar anyway.
+
+The count was first published here as "4 of 13", from a probe that filtered to 1920×1080 and so
+excluded every 4K asset — where the worst means live. A structured-asset sample runs roughly 6
+such 1080p assets to 79 4K ones, so that probe saw about 7% of its own population and could not
+express the case it was measuring. The observed worst mean, 59.25, sits just under the analytic
+bound of 63.75, which is the reassuring part: two independent routes agree at the boundary.
 
 **And the two statistics need different gates**, which conflating them hid: `mean` is a whole-frame
 average that darkness cannot corrupt, so two structured images at mean 0.00 are the same image

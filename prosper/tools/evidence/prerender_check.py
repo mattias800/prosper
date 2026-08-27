@@ -200,9 +200,12 @@ def main(argv):
     # There is deliberately NO separate mean ceiling here. One was added and removed: an overlap of
     # >= 75% already bounds the mean at <= 63.75/255 (and <= 75.75 in the worst coverage case), so
     # any ceiling below that can only discard frames the bar would have flagged -- it cannot prevent
-    # a false positive, only manufacture false negatives. Measured: 4 of 13 real assets with a bright
-    # caption panel reach mean 40.5-54.3 while still exceeding the bar, and a 40 ceiling silently
-    # dropped every one of them.
+    # a false positive, only manufacture false negatives. The BOUND is what settles this -- it is
+    # derivable and belongs to nobody's sample. Measured alongside it, 100 of 233 structured assets
+    # (42.9%) carrying a bright caption panel reach mean 40.5-59.25 while still exceeding the bar,
+    # so a ceiling of 40 silently dropped nearly half of them. (An earlier "4 of 13" here came from
+    # a probe that filtered to 1920x1080 and so excluded every 4K asset -- which is exactly where the
+    # worst means live. Cite the bound; a count is a property of whoever's sample.)
     dominant = max(usable, key=lambda row: row[1])
     if dominant[1] >= overlap:
         print("\nDOMINATED: %.2f%% of this frame's INFORMATIVE pixels are within 8/255 of the\n"
