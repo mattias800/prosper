@@ -78,6 +78,16 @@ The textures decode correctly and the geometry is right; the wrong content is be
 [#2998](https://github.com/mattias800/prosper/issues/2998)
 
 
+### The Messenger's first level runs at about 156 fps, not 24
+
+Windowed and uncapped on current master — the charter's long-standing "roughly 24 FPS" predates a
+change to how frames reach the screen and has not described this title since July.
+
+![The Messenger's opening: an 8-bit sunset over the ocean, the great tree, the Messenger on a plank platform, and a dialogue box reading "Demon army this and magic scroll that, nothing's happened in centuries, so why are we still hiding?"](assets/screenshots/messenger-first-level-windowed-2026-08-27.png)
+
+That is a presented rate rather than a count of new frames, so treat it as an upper bound.
+[#3083](https://github.com/mattias800/prosper/issues/3083)
+
 ## 2026-08-26
 
 ### Grand Theft Auto V renders its world

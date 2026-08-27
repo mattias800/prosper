@@ -17,6 +17,17 @@ The representative heavy frame has four compute dispatches interleaved with four
 
 The current build runs that scene at roughly 24 FPS on the measured host, up from approximately
 12 FPS at the start of this pass. Further Messenger-only work toward 60 FPS is deliberately paused.
+
+> **These figures are stale, and not because they were measured badly.** They were taken on
+> 2026-07-14 with `prosper-app` (see *Measurement method* below), which was the shipped path at the
+> time. #1270 replaced it ten days later, on 2026-07-24: the app now blits the renderer's front-buffer
+> image straight to the swapchain and the renderer skips the CPU readback entirely, so every number
+> above describes a renderer that no longer exists. A windowed, uncapped run of the same title on
+> 2026-08-27 (`--present-mode immediate`) reports a median of **156 fps** over 468 samples, two
+> thirds of them between 100 and 160 — a *presented* rate, so an upper bound on new frames rather
+> than the frame rate itself (#3083). The *conclusion* of this pass is unaffected: the stop decision
+> was about where the remaining cost is structural, not about the absolute rate.
+
 The remaining cost is structural, and the next renderer changes must be tested against a 3D title
 before choosing a resource-lifetime or scheduling architecture.
 
