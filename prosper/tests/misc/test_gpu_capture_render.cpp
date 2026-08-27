@@ -887,6 +887,19 @@ int main() {
             bc_array_resource.layer_mip_offset_bytes = 0x400;
             bc_array_resource.linear_row_pitch_bytes = 0;
             bc_array_draw.prt = std::move(bc_array_table);
+            // #325: recompile the upper-row draw against the ARRAY table too. It used to inherit
+            // the replayed capture's fragment shader, which was compiled for a plain 2D resource --
+            // harmless while a 2D_ARRAY T# was lowered to a base-slice 2D view, and a descriptor
+            // mismatch now that it is uploaded as a real array (VUID-vkCmdDraw-viewType-07752:
+            // "VkImageViewType is VK_IMAGE_VIEW_TYPE_2D_ARRAY but the OpTypeImage has Arrayed = 0").
+            // Same ISA as the lower-row shader below with v moved to the upper block row.
+            const uint32_t ps_rdna_upper[] = {
+                0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u,
+                0xf0800f08u, 0x00820000u, 0xf800000fu, 0x03020100u,
+                0xbf810000u,
+            };
+            bc_array_draw.fs = recompile_fragment(
+                ps_rdna_upper, std::size(ps_rdna_upper), bc_array_draw.prt.get());
             const uint32_t ps_rdna_lower[] = {
                 0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3f400000u,
                 0xf0800f08u, 0x00820000u, 0xf800000fu, 0x03020100u,

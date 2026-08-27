@@ -134,6 +134,15 @@ struct FrameResource {
     // for plain-2D RGBA8 sampled textures, so minification stops point-sampling through dense art.
     uint32_t declared_mip_levels = 1;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
+    // #325: the guest T# is one prosper treats as a layered array, as decided by
+    // guest_texture_is_uploaded_array(). The view type keys on this IN ADDITION to
+    // `sample_count > 1`, which stays for the MSAA plane array -- that shape has no guest_array flag
+    // and must keep its own arm. What this adds is the case the count cannot express: the
+    // recompiler declares OpTypeImage Arrayed from the same predicate and cannot see how many layers
+    // the uploader actually decoded -- a footprint cap, an RTT hit or a DCC fast-clear can all leave
+    // the count at 1 -- so a view keyed on the count ALONE would silently become 2D under an Arrayed
+    // declaration. A one-layer 2D_ARRAY view is legal and samples layer 0.
+    bool guest_array = false;
     // Renderer-owned RTTs keep their native format between producer and consumer. Guest-backed
     // textures still arrive through the existing RGBA8 decoder unless explicitly tagged otherwise.
     VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -6952,9 +6961,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // correct sRGB fix is a coordinated linear-working-space + output-encode change (see the
                     // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
                     tvci.image = upload.image;
+                    // #325: a guest 2D_ARRAY takes an ARRAY view even at one layer. The view type
+                    // has to agree with what the consuming SPIR-V declared, and the recompiler
+                    // decides that from the T# (`res->img_dim == 5`) -- which it can do without
+                    // knowing how many layers the uploader managed to decode. Keying the view on
+                    // the layer COUNT instead would silently disagree whenever an array resolved to
+                    // a single layer, binding a 2D view under an `Arrayed=1` OpTypeImage. A
+                    // one-layer 2D_ARRAY view is perfectly legal and samples layer 0.
                     tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D
-                        : r.sample_count > 1u ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                                             : VK_IMAGE_VIEW_TYPE_2D;
+                        : (r.guest_array || r.sample_count > 1u) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                                                 : VK_IMAGE_VIEW_TYPE_2D;
                     tvci.format = backend_color_format(r.texture_format);
                     // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
                     // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
