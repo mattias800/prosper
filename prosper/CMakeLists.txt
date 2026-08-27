@@ -390,6 +390,14 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # The queue-depth timeline reader (#3033). Registered for a reason specific to this one: its
+  # verdict is a DISCRIMINATOR that a pacer A/B rests on, and its first version could not tell a
+  # port that was starved from a port that was merely silent -- both read queued=0. It reported a
+  # 600 s Blasphemous 2 run as 53% dry before that gate existed. The arms pin all three conditions
+  # of the gate, each of which was found untested by mutating it away.
+  add_test(NAME audio_queue_timeline_report_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_audio_queue_timeline_report.py")
   # The shader-conformance scanner (#3036), registered because its whole value is a CLEAN result
   # and its original failure mode was manufacturing one: a capture that yielded zero examined
   # shaders exited 0, and findings could be attributed to a capture whose dumps had all failed.
