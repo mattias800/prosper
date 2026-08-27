@@ -4340,6 +4340,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 (unsigned long long)lo, (unsigned long long)hi);
                                 }
                             }
+                            // #2998: a coarse occupancy map of the GUEST allocation itself, in
+                            // 256 KiB buckets, independent of any stride assumption. Every previous
+                            // measurement addressed slices with layer_stride, so a wrong stride made
+                            // "slice N is zero" trivially true by probing outside the data. This
+                            // asks the only question that needs no layout at all: WHERE in this
+                            // allocation is there content?
+                            if (is_array && r.depth > 64u && PROSPER_ENV_ON("PROSPER_OCCUPANCY")) {
+                                static std::set<uint64_t> done;
+                                if (done.insert(r.gpu_addr).second) {
+                                    const uint64_t span = (uint64_t)r.layer_stride_bytes * r.depth;
+                                    const uint64_t bucket = 256u * 1024u;
+                                    const uint64_t n = span / bucket;
+                                    std::string map;
+                                    uint64_t filled = 0, last_filled = 0;
+                                    for (uint64_t i = 0; i < n && i < 512; ++i) {
+                                        uint8_t probe[512] = {0};
+                                        const size_t got = copy_resource(
+                                            probe, r.gpu_addr + i * bucket, sizeof probe);
+                                        bool any = false;
+                                        for (size_t k = 0; k < got && !any; ++k) any = probe[k] != 0;
+                                        if (any) { ++filled; last_filled = i; }
+                                        map += any ? '#' : '.';
+                                    }
+                                    fprintf(stderr,
+                                            "[occupancy] 0x%llx span=%llu MiB bucket=256KiB "
+                                            "filled=%llu/%llu last_filled_bucket=%llu\n%s\n",
+                                            (unsigned long long)r.gpu_addr,
+                                            (unsigned long long)(span >> 20),
+                                            (unsigned long long)filled, (unsigned long long)n,
+                                            (unsigned long long)last_filled, map.c_str());
+                                    fflush(stderr);
+                                }
+                            }
                             if (is_array && r.depth > 64u && PROSPER_ENV_ON("PROSPER_SLICEWATCH")) {
                                 // Per-address, not global: with two arrays in flight a global flag
                                 // lets the first silence the second's report entirely.

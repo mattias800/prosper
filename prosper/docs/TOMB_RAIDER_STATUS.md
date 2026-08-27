@@ -120,6 +120,25 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **The atlas allocation contains about 4.75 MB of content and nothing else, measured WITHOUT any
+  stride assumption.** `PROSPER_OCCUPANCY=1` walks the guest allocation in 256 KiB buckets and asks
+  only "is there content here", so it cannot be fooled by a wrong per-slice layout — which every
+  earlier measurement could, since they all addressed slices through `layer_stride`:
+
+  ```
+  [occupancy] 0x20491cc000 span=86 MiB bucket=256KiB filled=18/344 last_filled_bucket=18
+  .##################...........(325 more)
+  ```
+
+  Content sits in buckets 1-18 and stops. The interior samples slices 186-248, which lie 48-87 MB
+  into the allocation. So the data those draws need is not in this allocation at ANY layout, and the
+  earlier per-slice findings were not artefacts of the stride the probes assumed.
+- **The title reads its textures; they simply do not arrive here.** `PROSPER_READBYTES=1` counts
+  bytes delivered per path with no stack walk: **`.DDS opened=299 read=297`** over a route, alongside
+  `.TRM 98/52` and smaller sets. So asset I/O works and 297 texture files are read, while this atlas
+  receives about eighteen slices' worth. Whatever moves DDS content into this allocation is doing so
+  for a small fraction of what the title loads.
+
 - **Everything on prosper's side of the interior defect is measured and correct; the atlas is
   genuinely unpopulated in guest memory.** Twelve candidates eliminated, each with its control or
   its stated scope: layer index (traced twice to a constant 248), flat interpolation (#3051, the
