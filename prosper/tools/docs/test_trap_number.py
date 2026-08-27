@@ -584,6 +584,28 @@ with tempfile.TemporaryDirectory() as _d:
     except Exception as exc:      # noqa: BLE001 - the point is that nothing escapes
         FAILURES.append(f"run() raised on non-ASCII UTF-8 output: {exc!r}")
 
+# The behavioural arm above only reddens on a host whose LOCALE default cannot decode UTF-8 --
+# i.e. this Windows box. On a UTF-8-locale host it passes with or without the fix, so it could not
+# catch a regression to bare text=True in CI. This arm can, on every host: it observes the keyword
+# actually handed to subprocess.run.
+seen_kwargs: dict = {}
+_orig_sprun = subprocess.run
+
+
+def _spy(*a, **kw):
+    seen_kwargs.update(kw)
+    return _orig_sprun(*a, **kw)
+
+
+subprocess.run = _spy
+try:
+    run(["git", "--version"])
+finally:
+    subprocess.run = _orig_sprun
+case("run() passes an explicit encoding, not the host locale default",
+     seen_kwargs.get("encoding"), "utf-8")
+
+
 DOC = HERE.parent.parent / "docs" / "GAME_COMPAT_ORCHESTRATION.md"
 if not DOC.exists():  # fail closed: a moved document must not silently skip the only real-data arm
     FAILURES.append(f"the orchestration document is not at {DOC} -- this arm cannot run")

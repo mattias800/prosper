@@ -165,6 +165,46 @@ case("a head already in the base says so",
      BASE, table("1:a", "2:b", "3:c", "4:d"), BASE,
      want_rc=0, expect_text="already contained in the base")
 
+
+# NON-ASCII rows. This file contained no non-ASCII byte at all, so CI could not express the case
+# that broke the tool on Windows: `git()` piped the UTF-8 document through subprocess with
+# text=True and no encoding, the locale default (cp1252) failed to decode it, and stdout came back
+# None with returncode 0 -- dying 36 lines later on write_text(None). The real document is full of
+# em dashes and typographic quotes, so every real invocation hit it while every test passed.
+#
+# The probe that reported the tool as unaffected ran it with no arguments and took the
+# already-contained-in-the-base early return above, 36 lines before the affected code: a control
+# that could not reach the case it was validating. Found in review of #3071.
+#
+# Shaped like the clean-merge arm at the top (base == ours, the lane appends) so the only variable
+# is the non-ASCII content. Both `git show` calls are covered: the lane's row is read from the
+# merge result and the base copy is read separately, and the base carries non-ASCII too.
+NON_ASCII_BASE = table("1:an instrument that lied \u2014 and its \u201ccontrol\u201d",
+                       "2:b", "3:c")
+case("a table carrying em dashes and typographic quotes still validates",
+     NON_ASCII_BASE, NON_ASCII_BASE,
+     table("1:an instrument that lied \u2014 and its \u201ccontrol\u201d",
+           "2:b", "3:c", "4:a lane row, also with an em dash \u2014"),
+     want_rc=0, expect_text="the merge RESULT passes the gate")
+
+# And a non-ASCII table whose merge RESULT is defective must still be CAUGHT, not merely
+# not-crash: a decode fix that silently truncated the document would make this pass by finding no
+# duplicate. Shaped on the duplicate arm above -- master takes 4, the lane takes 4 a few lines
+# away, so the merge is textually CLEAN and the duplicate exists only in the result.
+#
+# The first version of this arm was VACUOUS and I nearly shipped it: it produced a merge conflict
+# rather than a clean merge, its rc=1 matched want_rc for the wrong reason, and its expect_text of
+# "\"4\"" matched the substring inside "100644" in the conflict listing. It passed with the
+# decode bug present. Asserting the full message is what makes it real.
+NON_ASCII_MASTER = table("1:an instrument that lied \u2014 and its \u201ccontrol\u201d",
+                         "2:b", "3:c", "4:master's row \u2014")
+NON_ASCII_LANE = table("1:an instrument that lied \u2014 and its \u201ccontrol\u201d",
+                       "4:the lane's row \u2014", "2:b", "3:c")
+case("a duplicate in a non-ASCII table's merge result is still caught",
+     NON_ASCII_BASE, NON_ASCII_MASTER, NON_ASCII_LANE,
+     want_rc=1, expect_text="duplicate row number 4")
+
+
 print()
 if FAILURES:
     for f in FAILURES:

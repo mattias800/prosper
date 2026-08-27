@@ -106,7 +106,10 @@ def run(cmd: list[str]) -> str:
     except OSError as exc:  # pragma: no cover - permissions, exec format, a full disk
         raise ScanError(f"{' '.join(cmd[:3])}... could not be run: {exc}") from exc
     if proc.returncode != 0:
-        raise ScanError(f"{' '.join(cmd[:3])}... failed (rc={proc.returncode}): {proc.stderr.strip()}")
+        # (proc.stderr or ""): strict UTF-8 makes a cp1252 git/gh error message decode to None, and
+        # a None.strip() here would replace the real diagnosis with an AttributeError.
+        raise ScanError(
+            f"{' '.join(cmd[:3])}... failed (rc={proc.returncode}): {(proc.stderr or '').strip()}")
     # The backstop for the same class, and it is the half that matters: ANY future decode
     # failure in that reader thread yields None here with a zero returncode. Without this the
     # tool violates its own docstring -- "Never lets an exception escape as a traceback" -- by
@@ -210,10 +213,20 @@ def added_rows_from_diff(repo: str, number: int, path: str) -> list[int]:
                           capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
         raise ScanError(
-            f"`gh pr diff {number}` failed (rc={proc.returncode}): {proc.stderr.strip()}. Without "
+            f"`gh pr diff {number}` failed (rc={proc.returncode}): {(proc.stderr or '').strip()}. Without "
             f"the patch this PR's claim cannot be distinguished from an amended row, and falling "
             f"back to comparing file contents would silently miss a duplicate already on "
             f"{repo}'s base."
+        )
+    # The same guard run() carries, for the same reason and it was missed here: on a decode
+    # failure this is None with a zero returncode, and added_rows_from_patch would then die on
+    # `patch.split` with the identical misleading traceback this whole change exists to remove.
+    # Review of #3071 found it -- the claim that part 2 "fails closed" was false in one of the
+    # two places the change edited.
+    if proc.stdout is None:
+        raise ScanError(
+            f"`gh pr diff {number}` produced output this tool could not decode as UTF-8, so "
+            f"this PR's claim cannot be read. Refusing to guess a number from a partial read."
         )
     return added_rows_from_patch(proc.stdout, path)
 

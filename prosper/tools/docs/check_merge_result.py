@@ -48,9 +48,29 @@ CHECKER = Path(__file__).resolve().parent / "check_numbered_table.py"
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", *args], capture_output=True, text=True)
+    # encoding="utf-8" EXPLICITLY, not text=True alone. text=True decodes with the locale
+    # default, which on a Windows host is cp1252, and this tool pipes a UTF-8 Markdown document
+    # through `git show`. The decode raised inside subprocess's reader THREAD, so stdout came
+    # back None with returncode 0 and the tool died 36 lines later on
+    # `write_text(None)` -- "TypeError: data must be str, not NoneType".
+    #
+    # So the check the charter tells you to run before merging a numbered-table PR could not be
+    # run on Windows at all. It was reported as unaffected by #3071 because the obvious probe --
+    # running it with no arguments -- takes the "already contained in the base" early return
+    # below, 36 lines before the affected code. A control that cannot reach the case it is
+    # validating; found in review of #3071.
+    proc = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8")
     if check and proc.returncode != 0:
-        print(f"error: git {' '.join(args[:3])}... failed: {proc.stderr.strip()}", file=sys.stderr)
+        # (proc.stderr or ""): under strict decoding a cp1252 git error message is None here,
+        # and None.strip() would replace the real diagnosis with an AttributeError.
+        print(f"error: git {' '.join(args[:3])}... failed: {(proc.stderr or '').strip()}",
+              file=sys.stderr)
+        raise SystemExit(2)
+    # Fail closed on an undecodable read rather than handing None to a caller. Every caller here
+    # treats .stdout as a str, so this is the one place that can say what actually went wrong.
+    if proc.stdout is None:
+        print(f"error: git {' '.join(args[:3])}... produced output that could not be decoded as "
+              f"UTF-8; refusing to check a merge result from a partial read.", file=sys.stderr)
         raise SystemExit(2)
     return proc
 
