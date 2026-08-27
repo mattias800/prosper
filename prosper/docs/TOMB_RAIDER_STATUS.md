@@ -278,9 +278,12 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 - ~~**The interior's wrong textures are not prosper mis-reading the atlas.**~~ **FALSIFIED
   2026-08-27 by #2998's fix — prosper WAS mis-reading the atlas**, by validating one surface of a
   256-layer array and serving a decode taken while it was ~5% populated. The measurement under this
-  heading stands; the conclusion drawn from it does not. **The slices the interior samples are
-  genuinely empty in GUEST memory for the whole run** remains TRUE and is not in conflict with the
-  93% figure: slice 248 begins at bucket 333.2 of 344, inside the ~7% that stays zero. What was
+  heading stands; the conclusion drawn from it does not. **Slice 248 specifically is
+  empty in GUEST memory for the whole run** remains TRUE and is not in conflict with the 93% figure:
+  it begins at bucket 333.2 of 344, inside the ~7% that stays zero. The PLURAL form of this claim --
+  "the slices the interior samples" -- does NOT survive: at 93% of 344 buckets the written region
+  reaches slice ~238, so slices 186-238 are written and only the tail of the interior's range is
+  not. Only slice 248 was ever measured. What was
   wrong was inferring from an empty slice 248 that prosper's own read path was innocent. Measured, each point with the control that
   makes it mean something:
   - `PROSPER_SLICEMAP=1`: the 512x512x256 world atlas decodes with **slices 0-13 populated and

@@ -52,6 +52,12 @@ constexpr size_t layered_cube_source_size(bool exact_layered_cube,
 // unchanged; a MISSING stride does not -- the decoder synthesizes one, so the span follows it (see
 // below); an overflowing span yields 0 rather than a truncated range, because a span shorter than
 // the decoder reads is precisely the defect this exists to prevent.
+//
+// The span deliberately OVER-covers by the per-layer mip chains (~23 MiB for the atlas above), and
+// that should stay. Tightening it means writing a second model of the layout here, which can drift
+// from the decoder's -- and two models disagreeing about one layout is exactly how this defect
+// happened. An over-approximation sharing the decoder's own stride errs toward re-decoding, which
+// is the safe direction; a tighter one that drifts errs toward serving stale pixels.
 constexpr size_t layered_array_source_size(size_t surface_bytes,
                                            uint64_t layer_stride_bytes,
                                            uint32_t layers) {
