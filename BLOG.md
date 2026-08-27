@@ -88,6 +88,24 @@ change to how frames reach the screen and has not described this title since Jul
 That is a presented rate rather than a count of new frames, so treat it as an upper bound.
 [#3083](https://github.com/mattias800/prosper/issues/3083)
 
+
+### A frame checker that would have called Stray's working menu "nothing rendered"
+
+No picture in this one, because the finding *is* the picture we nearly got wrong. A classifier we
+were about to rely on downsamples frames before counting colours — and at 160x90 a 4K frame loses
+white menu text on black entirely. It reported Stray's main menu, with START GAME / SETTINGS /
+CREDITS and a legible build stamp on it, as flat black with 61 colours. One edit away from writing
+that title up as not rendering.
+
+The replacement checks frames at full size, and the thing it looks for is a HUD or notice drawn over
+a world that never appeared — which is what separates "this title renders nothing" from "this title
+is at rung 2". Pointed at every screenshot in the repo it finds four, three of them the Sonic
+Frontiers and Metaphor frames already on record as exactly that.
+
+It also refuses to guess above that line. Coverage and colour count cannot tell a logo from a scene:
+in our own screenshots a flat Gameloft splash covers more of the frame than The Messenger's title
+art, and that title art uses 36 colours against the splash's 2,159.
+[#3059](https://github.com/mattias800/prosper/pull/3059)
 ## 2026-08-26
 
 ### Grand Theft Auto V renders its world

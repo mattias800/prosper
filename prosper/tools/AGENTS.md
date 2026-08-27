@@ -299,6 +299,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **`--max-stale-seconds` / `--max-pixel-stale-seconds` disarm the stop outright** (they are maxima
   over the samples taken, so a shortened run would report a smaller one), and every other flag
   assertion is a floor that fewer samples can only push further from being met.
+- **`frameclass/`** — classifies a directory of captured PNGs/BMPs as `LIT` / `UI-ON-BLACK` /
+  `SPARSE` / `FLAT`, at native resolution on a 1/16 stride. The class worth having is
+  **`UI-ON-BLACK`**: legible content covering under 2%, i.e. a HUD or notice over a world that never
+  drew. `distinct_rgb_colors` and `nonblack_rgb_pixels` are already in `screenshot`'s manifest — read
+  those directly if they are all you need. **`LIT` is not a promise of a game scene**, and
+  `frameclass/AGENTS.md` shows why with five corpus frames on which UI and real scenes interleave on
+  both coverage and colour count. Two traps are recorded there: **downsampling before counting
+  colours erases thin UI** (a 4K frame at 160x90 reported *Stray*'s legible main menu as flat black),
+  and a share-of-non-black test scores a flat **white** clear as a perfect frame. Run `--selftest`
+  after touching a threshold.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
   to print the GOT/PLT relocation slot each import lands in — the step that starts every
