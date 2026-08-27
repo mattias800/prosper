@@ -32,13 +32,11 @@
 #include "hle/kernel/sce_errno.hpp"
 #include "host/platform/precise_sleep.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <semaphore.h>
-#include <thread>
 
 using namespace prosper;
 using clk = std::chrono::steady_clock;
@@ -65,7 +63,10 @@ int main() {
     // uninitialised object.
     sem_t slot;
     const uint64_t handle = (uint64_t)(uintptr_t)&slot;
-    CHECK(sem_init_fn(handle, 0, 0, 0, 0, 0) == 0, "the semaphore initialises to a count of 0");
+    // Asserts that init REPORTS success, not that the count is observably 0 -- the count is then
+    // established by arm 1 timing out rather than being acquired. The earlier message claimed the
+    // stronger thing.
+    CHECK(sem_init_fn(handle, 0, 0, 0, 0, 0) == 0, "scePthreadSemInit reports success");
 
     // ARM 1 + 2 + 3: one unposted wait, three independent properties.
     {
@@ -93,7 +94,17 @@ int main() {
         CHECK(strcmp(host::sleep_backend_name(), "win32-high-resolution-timer") == 0,
               "the wait was served by the high-resolution timer, NOT ::Sleep's ~15.6 ms tick");
 #else
-        CHECK(strcmp(host::sleep_backend_name(), "posix-sleep-until") == 0,
+        // STILL "none" on POSIX, and that is the assertion. The POSIX branch is the native
+        // sem_timedwait and never enters sleep_until_steady_ns, so the backend is unchanged by the
+        // wait. An earlier revision asserted "posix-sleep-until" here -- which, with the "none"
+        // pre-check above, asserted two different values for one unchanged state, so ONE of the two
+        // arms failed on every POSIX host regardless of the starting value. A Windows-only run
+        // cannot see that, and Linux/macOS CI had not yet built this file.
+        //
+        // Asserting "none" is not a weaker check for being the unchanged value: it is a real guard
+        // against someone later unifying both platforms onto the poll loop, which would enter
+        // precise_sleep here and redden this line.
+        CHECK(strcmp(host::sleep_backend_name(), "none") == 0,
               "POSIX keeps the native timed wait; no polling was introduced there");
 #endif
         printf("         (timeout took %.2f ms via %s)\n", ms, host::sleep_backend_name());

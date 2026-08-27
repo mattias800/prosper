@@ -641,6 +641,9 @@ if(TARGET prosper_core)
   add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
   target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
   add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
+  # Bounded for the same reason as the nanosleep case: the fixed path returns in ~5 ms, so a
+  # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
+  # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.
   set_tests_properties(kernel_sem_timedwait PROPERTIES TIMEOUT 60)
   # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
   # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
