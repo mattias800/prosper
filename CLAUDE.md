@@ -763,6 +763,13 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       the same authority-transfer described above, now pointed at the thing the author hoped was true.
       **So trace a citation in proportion to how much you want it to be true, and treat "this supports
       raising confidence" as a trigger for verification rather than a reason to skip it.**
+    - **Which claims get questioned is not a matter of care, and instrument trap 231 measures it.**
+      Over one review, two of a reviewer's phrases reached the author's tree underived and were
+      caught only because they sat inside a paragraph being rewritten for an *unrelated* reason. No
+      question was ever aimed at the reviewer's numbers. The defence that does not depend on
+      somebody suspecting something is to **compute any load-bearing quantity twice, by independent
+      routes** — in the same review that is what caught a third wrong figure before it propagated at
+      all.
     - The general shape all of these share is worth naming, because it is not "someone was wrong": it is
       **a true statement reached by a route that does not establish it.** The claim survives casual
       checking precisely because it is defensible; what fails is the derivation, and nobody re-runs a

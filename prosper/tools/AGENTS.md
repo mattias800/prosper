@@ -3,6 +3,13 @@
 Developer/agent tooling. These are debugging and verification aids, not part of
 the shipped runtime. Build them from `build-linux/` like everything else.
 
+- **`evidence/prerender_check.py`** - **run this before publishing a progression screenshot.** It
+  answers whether the frame is the game's own PRE-RENDERED picture rather than something prosper
+  rendered: a full-screen loading blit is the most convincing false evidence this project has
+  produced, and one reached a merged PR, `BLOG.md` and `COMPATIBILITY.md` before a human recognised
+  the artwork (instrument trap 230). `python3 tools/evidence/prerender_check.py <shot> <DUMP_ROOT>`;
+  exit 2 = the frame IS game artwork and is not progression evidence, exit 1 = the check could not
+  run and must not be read as a pass.
 - **`verify-pr.ps1`** - author-owned PR verification orchestrator for the Windows+WSL development
   environment. Run it only from a clean, pushed PR head: `docs` records the diff check, `core` adds
   Linux and Windows build+ctest, and `renderer -Snapshot NAME` also runs the selected real-game guard
