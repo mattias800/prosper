@@ -636,6 +636,26 @@ if(TARGET prosper_core)
   add_executable(test_kernel_nanosleep tests/hle/kernel/test_kernel_nanosleep.cpp)
   target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
   add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
+
+  # The guest semaphore timed wait (#3013). Platform-neutral like the nanosleep case above and for
+  # the same reason: the fix is Windows-only, so gating on UNIX would build the test everywhere
+  # except where the defect is.
+  #
+  # It asserts the MECHANISM -- which primitive served the wait, via sleep_backend_name() -- rather
+  # than a wall-clock duration, following test_videoout.cpp and what test_kernel_nanosleep.cpp's
+  # header asks for. The first version asserted durations only and review showed NONE of its arms
+  # could redden on the pre-fix code: its 40 ms ceiling sat 2.6x above the 15.57 ms defect, and its
+  # other two arms measured a POSTED semaphore, which unfixed winpthreads serves in 0.01 ms -- better
+  # than the poll loop, so they preferred the defect. A mechanism assertion cannot be satisfied by a
+  # lucky duration and does not flake under load. Mutation-checked: reverting to the winpthreads
+  # delegation reddens two arms and prints "via none".
+  add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
+  target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
+  add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
+  # Bounded for the same reason as the nanosleep case: the fixed path returns in ~5 ms, so a
+  # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
+  # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.
+  set_tests_properties(kernel_sem_timedwait PROPERTIES TIMEOUT 60)
   # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
   # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
   # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
