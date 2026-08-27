@@ -135,9 +135,20 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
     different slices.
   - `PROSPER_FORCE_LAYER=10` gives full-screen content (184,541 colours); **200 gives 262 colours,
     almost entirely black**. Slices above the populated range are empty.
-  So the guest indexes a slice our decoded array does not have content for. The leading remaining
-  question is whether `r.depth = 256` describes the guest array's real layer count at all -- if the
-  true array is ~16 layers, an index of 248 means something other than a layer.
+- **`r.depth = 256` is NOT a mis-decode.** The raw descriptor (`PROSPER_TDUMP=512x512`) reads
+  `t = 20491cc0 cb600000 007fc07f d0550fac 000000ff 00700050 00000000 00000000` ->
+  `512x512 fmt=182 type=13 tile=5 mips=0..5 depth=256 base_array=0`. The layer count, the base slice
+  and the mip range are exactly what the decode reports, so the layer mapping is faithful and the
+  question is not "how many layers".
+- **Nor is it the slice LAYOUT.** With the array treated as fully tight -- stride = one selected-mip
+  surface AND no per-slice mip offset, the combination an earlier test got wrong by changing only the
+  stride -- the populated count moves 14 -> 19 of 256 and the interior is still wrong. Every layout
+  tried leaves the same invariant: **only about 5 MB of the atlas's 67 MB is non-zero**, whichever
+  way the slices are addressed.
+  So the remaining question is not how prosper reads the atlas but **why most of it was never
+  written**: the guest declares 256 slices at `0x20491cc000` and samples slice 248, while the memory
+  there is zero. That points at a content path prosper does not observe (a DMA or compute upload
+  into the atlas) rather than at the array plumbing, which is now measured end to end.
 
 - **Missing SPIR-V `Flat` on the varying that carries the array slice is NOT why interiors sample
   the wrong layers.** The gap is real — `is_flat_shaded()` is decoded, used to build the guest's PS
