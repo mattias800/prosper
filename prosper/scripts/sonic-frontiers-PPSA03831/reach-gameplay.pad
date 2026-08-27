@@ -1,11 +1,45 @@
 # Sonic Frontiers (PPSA03831) -- title screen to gameplay (Cyber Space stage w6d01).
 #
 # Anchors are DISPLAY FLIPS ('f'), not seconds: the guest's own presented-frame counter is
-# boot-speed invariant, and this title runs ~30 flips/s on a CPU-only boot_trace arm against
-# ~3 flips/s on a live 3840x2160 renderer arm, so a wall-clock route cannot serve both.
+# boot-speed invariant, and this title runs 17-30 flips/s on a CPU-only boot_trace arm against
+# 1.5-3.4 flips/s on a live 3840x2160 renderer arm, so a wall-clock route cannot serve both.
+# (Both are spreads across several arms, not single readings -- see the budget note below.)
 #
 # Route shape, and why each step exists (every claim below is measured, see
 # docs/SONIC_FRONTIERS_STATUS.md):
+#
+# IF THIS ROUTE PARKS IN THE "EXTRAS" MENU, IT DESYNCED -- IT IS NOT A RENDER OR INPUT WALL.
+#
+# Measured 2026-08-27. One live-renderer arm sat in Extras for its whole length -- 24/24 frames with
+# content, `pixel-distinct=24`, guest healthy -- and never reached the stage. It looks exactly like a
+# wall. It is the end state docs/SONIC_FRONTIERS_STATUS.md already records for flip/wall-clock
+# desync under host load: a confirm activates "Extras", and every later input then navigates inside
+# that submenu. Check `uptime` and re-run before diagnosing anything.
+#
+# SAVE DATA WAS NEVER SHOWN TO BE THE CAUSE, though it looked like it for a while -- and note the
+# claim is that shape deliberately. Only one renderer arm ever failed, at n=1 against this title's
+# own 1.5-3.4 flips/s spread, so "save present" and "slow arm" were never separated on that
+# frontend: enough to withdraw the precondition, not enough to assert its opposite. Under
+# `boot_trace` the route reaches GameModeStage (`ui_gamemodestage` markers, and 189 log lines naming
+# `w6d01_trr` terrain sectors -- the stage has 100 of them) both with an existing save and against
+# an empty PROSPER_SAVE0 root, but neither of those arms has a recorded arm count, and reaching that
+# marker is not the same as the authored route having run. Do not set an empty save root as a
+# precondition here; do not treat the save as established to be irrelevant either.
+# See docs/SONIC_FRONTIERS_STATUS.md for the 2x2 and both its limits.
+#
+# USE boot_trace AS THE FAST LOOP -- 17-30 flips/s against 1.5-3.4 on a live 4K renderer arm, so
+# f2900 is ~100-200 s instead of 14-32 minutes:
+#
+#     PROSPER_PAD_SCRIPT=@<this file> PROSPER_PAD_SCRIPT_LOG=1 PROSPER_FILELOG=1 \
+#       timeout --foreground -s TERM -k 5s 220 ./build-linux/boot_trace <DUMP>/PPSA03831-app0
+#
+# PROSPER_PAD_SCRIPT_LOG prints `[pad-script] ... frame=<flips since first poll>`, which is the
+# route's own anchor units, and PROSPER_FILELOG prints the .pac opens that name the game mode. BOTH
+# are needed: without the second the modes are simply invisible and a run reads as "never got there".
+#
+# On a live renderer arm budget generously: single-run rates of 1.5, 2.8 and 3.4 flips/s were seen
+# across three arms of this route, so f2900 landed between ~14 and ~32 minutes and one arm missed it
+# inside a 1400 s timeout. `--render-every 6` moves it ~1.5x (2.84 -> 4.27), not enough to matter.
 #
 #   f1100-f1540   Twelve confirms, 40 flips apart, clear the twelve-page boot notice queue
 #                 ("Extras", "Update notification", "Game update", "Update Details", "Update",
@@ -30,7 +64,7 @@
 # blind and counted; the cursor bar itself does render and was used to verify the five moves.
 #
 # Fresh-save arms and inherited-save arms are NOT the same route: pass an isolated
-# PROSPER_SAVE0=<private dir> so the notice queue is the measured twelve pages.
+# PROSPER_SAVE0=<private dir> so the run starts from a known save state.
 
 # --- boot notice queue: twelve confirms -------------------------------------------------------
 f1100-1103:cross
