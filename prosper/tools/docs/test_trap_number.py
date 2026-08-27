@@ -605,6 +605,8 @@ def _spy(*a, **kw):
 subprocess.run = _spy
 try:
     run(["git", "--version"])
+except Exception as exc:      # noqa: BLE001 - a git-less host must get a FAIL line, not a traceback
+    FAILURES.append(f"the encoding spy arm could not run git: {exc!r}")
 finally:
     subprocess.run = _orig_sprun
 case("run() passes an explicit encoding, not the host locale default",
@@ -630,7 +632,9 @@ def _none_stdout(*a, **kw):
 
 
 subprocess.run = _none_stdout
-shutil.which = lambda name: "/usr/bin/" + name       # pretend gh resolves
+# *a/**k: shutil.which takes (cmd, mode, path), and a one-arg lambda would TypeError on any
+# caller that passes them. Costs nothing and removes a way for this stub to fail confusingly.
+shutil.which = lambda name, *a, **k: "/usr/bin/" + name       # pretend gh resolves
 try:
     added_rows_from_diff("owner/repo", 1, "doc.md")
     FAILURES.append("added_rows_from_diff accepted a None stdout instead of refusing")

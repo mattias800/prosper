@@ -215,8 +215,21 @@ def added_rows_from_diff(repo: str, number: int, path: str) -> list[int]:
         raise ScanError("'gh' is not on PATH, so this PR's patch cannot be read.")
     # Same explicit encoding as run(); a PR body or patch is as likely to carry non-ASCII as
     # the document itself.
-    proc = subprocess.run([exe, "pr", "diff", str(number), "--repo", repo],
-                          capture_output=True, text=True, encoding="utf-8")
+    #
+    # And the same except clause. Three consecutive review rounds on #3071 produced the finding
+    # "the guard is at one of two sites" -- first the None check, then the stderr reads, then
+    # this. The two functions run subprocesses for the same reason and need the same two
+    # guards, so they now have both rather than converging one round at a time. On POSIX the
+    # decode happens in the CALLER's thread, so a UnicodeDecodeError propagates from here
+    # instead of yielding a None stdout, and without this it escaped as the traceback this
+    # whole change exists to remove.
+    try:
+        proc = subprocess.run([exe, "pr", "diff", str(number), "--repo", repo],
+                              capture_output=True, text=True, encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ScanError(
+            f"`gh pr diff {number}` could not be run or decoded: {exc}. Without the patch this "
+            f"PR's claim cannot be distinguished from an amended row.") from exc
     if proc.returncode != 0:
         raise ScanError(
             f"`gh pr diff {number}` failed (rc={proc.returncode}): {(proc.stderr or '').strip()}. Without "
