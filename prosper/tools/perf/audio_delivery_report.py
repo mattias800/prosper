@@ -148,10 +148,6 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame):
         # The logged byte size needs no flags to be correct. The MEDIAN-frame inference above is the
         # fallback for logs predating the (grain=N) field, and is the only place bytes_per_frame and
         # channels are consulted.
-        #
-        # (Three paragraphs had accumulated here across successive fixes, one of which still called
-        # frames[0] the fallback after the median replaced it. Collapsed -- a stale comment carrying a
-        # file:line is the most citable error this project produces.)
         grain_bytes = slot.get("grain_bytes") or (grain_frames * bytes_per_frame * channels)
         under_one = sum(1 for q in queued if q < grain_bytes) if grain_bytes else 0
         under_quarter = sum(1 for q in queued if q < grain_bytes // 4) if grain_bytes else 0
