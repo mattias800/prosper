@@ -217,39 +217,49 @@ rather than decoration:**
    flagged module twice, once where its exports collide and once where a single export NID differs; a
    guard that skipped every flagged module would pass the first arm exactly as well as a correct one.
 
-## The PROGRESS_TRACKER.md staleness gate, and the two ways it goes red on YOUR PR
+## PROGRESS_TRACKER.md regenerates itself on master — it is no longer a gate
 
-`PROGRESS_TRACKER.md` is **generated** from the `tracker:game` issues, and CI re-reads those issues
-live on every PR and fails if the committed file no longer matches
-(`tools/docs/gen_progress_tracker.py --check`). The gate is deliberately unconditional — it does not
-check only when the diff touches the file — because "the file drifted and nobody noticed" is the
-whole thing it exists to prevent. Documented here because the gate's own rationale lives in a CI
-workflow comment, which is not where anyone looks when it fails.
+`PROGRESS_TRACKER.md` is **generated** from the `tracker:game` issues. It used to be gated on every
+PR (`gen_progress_tracker.py --check`), and **that gate was removed on 2026-08-27** because one of
+its two triggers was unfixable by the person it failed.
 
-The repair is always the same and always the author's, whoever the author is:
+**You no longer have to do anything.** A `progress-tracker` job regenerates the file on every master
+push and commits it if it changed. If your PR closes a cited blocker, master repairs itself.
 
-```bash
-python3 prosper/tools/docs/gen_progress_tracker.py     # regenerate
-git add PROGRESS_TRACKER.md && git commit              # and commit it
-```
-
-**Two triggers, and only one of them involves a person.**
+The reasoning is kept because it is the useful part:
 
 1. **A tracker was edited mid-flight.** Someone ticked a rung or changed an FPS record while your PR
-   was open. This is the one the CI comment names.
-2. **A PR merged that CLOSED an issue this file cites as a blocker** — and this one is automatic, so
-   looking for an edit finds nothing. The generator drops a blocker from a title's row once that
-   issue closes, so a PR whose body says `Fixes #NN` makes master stale **the instant it merges**.
-   Nobody touches a tracker; the author who caused it has already merged and moved on; the next
-   unrelated PR eats the red.
+   was open. This one a person could fix — regenerate, commit, done.
+2. **A PR merged that CLOSED an issue this file cites as a blocker.** This one is automatic, and
+   **no commit could satisfy it**: the generator drops a blocker from a title's row once that issue
+   closes, so a PR whose body says `Fixes #NN` makes master stale *the instant it merges*. The
+   correct content does not exist until after the merge. Nobody touches a tracker; the author has
+   already merged and moved on; the next unrelated PR ate the red.
 
 Trigger 2 measured on 2026-08-23 rather than reasoned: #2956 merged at 07:41:59Z, its `Fixes #2951`
 closed that issue at **07:42:00Z**, and the `Docs` job on an unrelated documentation PR failed at
-07:48 against a file neither PR had touched since. One second between a green merge and a file that
-was wrong.
+07:48 against a file neither PR had touched. One second between a green merge and a file that was
+wrong. It recurred on 2026-08-27 with #3081/#3085, which is what finally removed the gate: measured
+over the preceding 60 master runs, **5 of the 7 Docs failures were this step**.
 
-So if your PR closes an issue cited as a blocker here, expect to regenerate **after** the merge —
-or accept that you have handed the bill to whoever opens the next PR.
+**What still fails, and should.** The `docs` job keeps `gen_progress_tracker.py --selftest` as a hard
+gate — a generator whose regexes quietly widened would emit a plausible wrong file, and that IS
+author-fixable. The regeneration job also fails hard when the generator itself errors: an unparseable
+tracker body, a zero-issue fetch, or an unresolvable citation writes no file, and swallowing that
+would freeze the tracker behind a permanently green job. Only *push contention* is soft, and it
+retries three times before warning.
+
+**What was given up**, stated plainly because nothing else now catches it: there is no longer any
+signal that the committed file has drifted from the trackers by some route the generator does not
+error on. That was judged the right trade against an unfixable gate firing on most Docs failures, and
+it is trivially reversible.
+
+`--check` remains in the tool for local use:
+
+```bash
+python3 prosper/tools/docs/gen_progress_tracker.py --check    # does the committed file match?
+python3 prosper/tools/docs/gen_progress_tracker.py            # regenerate it
+```
 
 ## Sentinels: assert on the bits, not the decoded value
 
