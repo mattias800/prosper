@@ -230,6 +230,107 @@ were confirmed as legitimate frustum culls.
 - The #1352-era scissor three-stage traces are parked on branch
   `fix/issue-1335-regindirect-tags`.
 
+## BLACK SCREEN on master since 2026-08-26 (#3089) — measured state, do not re-derive
+
+**Blue Prince renders a pure black frame on current master.** 1 distinct colour, mean luma 0.0,
+0.00% non-black, confirmed by the project owner by eye and by pixel measurement of an automatic
+60 s frame grab. Both guards (`blue-prince-title`, `blue-prince-hall`) fail with
+`qualifying frames 0` — that is "no usable frames were produced", NOT "the picture changed", so
+**re-baselining the guards would be wrong** and would permanently destroy them.
+
+### Bisected twice; all four endpoints measured, not inferred
+
+| commit | | non-black |
+| --- | --- | --- |
+| `f5624cf6` (23 Aug) | outer-bisect good end | 21.06% |
+| `81ea1abf` | parent of the squash | 21.04% |
+| `97ecc58a` | **the squash** (`gpu: GTA V world rendering series`) | **0.00%** |
+| `c110fcea` | parent of the sub-commit | 21.03-21.06% (4 runs) |
+| **`1b5b9471`** | **`gpu: GTA V deferred-mip rendering`** | **0.00% (3/3 runs)** |
+
+`97ecc58a` is a squash; `refs/pull/2996/head` still holds its 8 original commits and was bisected
+again to reach `1b5b9471` (+1386/−141, 29 files).
+
+### The decisive measurement — where the failure actually is
+
+Instrumenting the live pass (`rendered_pixels` at the `render_draws_rgba` call site):
+
+| | passes reading back pixels | best content |
+| --- | --- | --- |
+| parent `c110fcea` | **26** | 4 passes at **21.09% non-black** |
+| culprit `1b5b9471` | **3** | all **0.00%** |
+
+**The culprit skips the colour readback for almost every pass**, so the rendered content never
+reaches the RTT surface and the scanout shows nothing. `render_draws_rgba` returns an EMPTY buffer
+(`rendered_pixels.size() == 0`) where the parent returns 8,294,400 bytes.
+
+**And the documented inputs to that call are IDENTICAL in both builds** — verified by instrumenting
+them directly: `any_slot_bound=1`, `live_gpu_targets=1`, `mrt_count=1`, same `pass_bases`, same
+`format0`, same `backend_target.load_existing`, same `defer_readback=1`, same draw counts, same
+`persistent_id` shape. Pass grouping is also identical (draws-per-pass 33/16/7/2/2 vs 33/15/8/2/2).
+
+So the divergence is **inside `render_draws_rgba`'s view of the draws' resources**, not in the gate
+that calls it. `tests/fixtures/render_runner.h` (the backend) is NOT in this commit, so its inputs
+must differ — most likely the `FrameResource` fields this commit adds
+(`persistent_render_target_mip_ids/_count`, `declared_mip_levels`).
+
+### It is NOT a rendering bug
+
+The bad build's OWN captured frame replays offline to a **pixel-identical correct image** — same
+output hash `1d0166a1ca6816a8` as the good build, 21.09% non-black. Commands, shaders, targets and
+textures are all correct. Note the replay reports `raw-shaders=14`: it uses captured shader
+binaries, so it would also mask a recompiler fault — but see below, the recompiler is eliminated.
+
+### Eliminated — do not re-test these
+
+By experiment, each neutralised inside the real commit and re-run:
+
+- mip-target submit retention (`renderer_mip_target_requires_submit_retention` → false)
+- MRT view-feedback (`mrt_target_view_feedback` extent test)
+- `mrt_draw_binds_target_view` reverted to the address-only answer
+- extent-based pass splitting in `mrt_same_color_pass`
+- the new RectList synthesis (`needs_rect_list_synthesis` → false)
+- render-target mip exposure (`persistent_render_target_mip_count` / `declared_mip_levels`)
+- persistent GPU colour targets (`PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1`)
+- empty textures — live textures have content (`first64k-nonzero` non-zero)
+
+By reading, which was cheaper and should have come first:
+
+- **`gpu_dependency_graph.cpp` cannot be the cause**: `build_gpu_dependency_graph` and
+  `gpu_dependency_rtt_seed_matches` are called ONLY from `gpu_timeline.cpp` and `gpu_replay.cpp`,
+  both offline tools, never the live path.
+- `seed_target()` / `rtt_no_seed_target_selector` are no-ops unless `PROSPER_RTT_NOSEED_TARGET` is
+  set, so the `seed_rtt` → `seed_rtt0` rename changes nothing by default.
+- `render_state.cpp`'s change is purely additive (a new `color_format_bytes_per_texel`).
+
+### Method warning — file-level bisection inside this commit does NOT work
+
+Reverting individual files from the culprit (or applying them onto the parent) produces
+**contradictory, non-reproducible results**: a configuration measured as rendering was black on a
+clean rebuild of the identical tree. Mixed old/new file states compile but are not semantically
+coherent, so they can be black for their own reasons. **Only whole-commit measurements are
+trustworthy here.** Several hours went into this; do not repeat it.
+
+### Reproduction (~90 s, deterministic)
+
+```bash
+SDL_VIDEODRIVER=offscreen PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_CAPTURE_DIR=$HOME/work PROSPER_GRAB_BUNDLE_AFTER_MS=60000 \
+    ./prosper/build-linux/prosper-app <DUMP_ROOT>/PPSA25009-app0
+```
+
+Measure the `.bmp`: >1% non-black passes, 0.00% is this bug. **No pad input is needed** —
+`blue-prince-title` runs with no pad script at all, which is what makes it a clean test.
+
+**Reap after every run.** `timeout` kills the distrobox wrapper, not `prosper-app`, and exit 124
+reads as a clean stop; unattended bisecting left 46 orphans holding 69 GiB and drove the machine
+into swap. Kill by explicit PID (never `pkill`).
+
+### Constraint on any fix
+
+`97ecc58a` is what made **GTA V** render its world. A revert is not acceptable — the fix must keep
+both titles working.
+
 ## Ruled out (do-not-redo list)
 
 **Persistent-texture revalidation, 2026-08-07 (Windows / NVIDIA RTX 4090, #2289 / #2290 / #2295).**
