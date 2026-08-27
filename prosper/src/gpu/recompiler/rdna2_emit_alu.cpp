@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -7236,6 +7237,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // DOLL UE4 volume initializer uses dim:3D, dmask:xyz to bounds-check its 8x8x8 dispatch
             // before loading and writing the volume. Array/cube queries remain deferred with their
             // corresponding sampled-image representations.
+            // #325: arrayed-ness is a property of the RESOURCE, not of the instruction. The
+            // uploader picks the Vulkan view type from the guest T# and cannot see which opcode will
+            // sample it, so every declaration of this binding must agree with the T# or the
+            // descriptor is a mismatch. Non-array instructions reaching an array texture get a
+            // three-component coordinate with layer 0 -- the same base slice the old base-slice 2D
+            // view gave them. The predicate is guest_texture_is_uploaded_array(): img_dim 5 AND
+            // more than one layer AND block-compressed. `img_dim == 5` alone is NOT it -- a depth-1
+            // or non-BC array is a plain 2D image on both sides, and keying on img_dim is exactly
+            // the mistake this comment used to describe.
+            const bool res_arrayed = res && prosper::gpu::guest_texture_is_uploaded_array(
+                                                res->img_dim, res->depth, res->format);
             if (in.opcode == 0x0e) {
                 uint32_t dim;
                 if (in.mimg_dim == 0u) dim = Dim_1D;
@@ -7243,7 +7255,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else if (in.mimg_dim == 2u) dim = Dim_3D;
                 else { ok = false; return true; }
                 if (res->cls != ResourceClass::Texture) { ok = false; return true; }
-                if (!b.declare_texture(res->binding, dim, uint_texture)) {
+                if (!b.declare_texture(res->binding, dim, uint_texture, res_arrayed)) {
                     ok = false; return true;
                 }
                 uint32_t out[4]; b.image_get_resinfo(res->binding, dim, vread(in.src[0].value), out);
@@ -7323,14 +7335,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
-            // Most 2D_ARRAY forms retain the historical base-slice fallback (#325). Explicit-LOD
-            // SAMPLE_L/LZ is different: Astro Bot's world-map kernel selects both layers of a wide
-            // texture atlas, so dropping cvg(2) destroys the lookup. Those forms use a real array below.
+            // #325: 2D_ARRAY resources are now uploaded and declared as real arrays -- see
+            // res_arrayed above. The historical base-slice fallback this comment used to describe is
+            // gone; what remains of it is that a non-array INSTRUCTION reaching an array resource
+            // reads layer 0, which is the same slice it used to get.
             const bool dim2d = (in.mimg_dim == 1u || in.mimg_dim == 5u), dim3d = (in.mimg_dim == 2u);
             const bool dim_msaa = in.mimg_dim == 6u;
             const bool dimcube = (in.mimg_dim == 3u);   // CUBE: stacked-face 2D lowering (#273, below)
             if (in.mimg_dim == 5u && getenv("PROSPER_GFXLOG"))
-                fprintf(stderr, "[recompile] 2D_ARRAY image_sample -> sampled as base slice 0 (array index dropped; #325)\n");
+                fprintf(stderr, "[recompile] 2D_ARRAY image op: resource %s an uploaded array (#325)\n",
+                        res_arrayed ? "IS" : "is NOT");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
                  !is_sample_c_lz && !is_gather_lz &&
                  !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
@@ -7468,7 +7482,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // faces as one vertical 2D stack, so compare the transformed face coordinate
                     // manually through its ordinary non-compare sampler (#1167/#1169).
                     if (uint_texture || !res->depth_compare) { ok = false; return true; }
-                    if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                    if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
                         ok = false; return true;
                     }
                     b.image_sample_dref_manual_2d(res->binding, uf, v6, vread(cvg(0)),
@@ -7476,7 +7490,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                   res->mag_filter != 0u, res->addr_uvw[0],
                                                   res->addr_uvw[1], res->border_color_type, out);
                 } else {
-                    if (!b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                    if (!b.declare_texture(res->binding, Dim_2D, uint_texture, res_arrayed)) {
                         ok = false; return true;
                     }
                     b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
@@ -7535,10 +7549,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             res->addr_uvw[0], res->addr_uvw[1], res->border_color_type,
                             out, true, vread(cvg(3)));
                     } else {
-                        // The shared graphics backend currently exposes 2D_ARRAY textures as its
-                        // documented base-slice 2D view (#325). Keep that established fallback for
-                        // graphics until its resource uploader can create matching array views.
-                        if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                        // #325: the graphics fallback used to declare a base-slice 2D image here,
+                        // "until its resource uploader can create matching array views". It now
+                        // does -- but ONLY for resources the uploader actually uploads as arrays,
+                        // which is what res_arrayed answers. A DIM=5 instruction is not sufficient:
+                        // this title's shadow maps are declared img_dim 5 with **depth 1**, so they
+                        // are uploaded as plain 2D, and declaring them Arrayed produced
+                        // VUID-vkCmdDraw-viewType-07752 (caught by tools/vkval, not by ctest --
+                        // validation errors do not fail a test).
+                        if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
                             ok = false; return true;
                         }
                         b.image_sample_dref_manual_2d(
@@ -7547,7 +7566,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             normalized_spatial(vread(cvg(2)), res->height),
                             vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
-                            res->addr_uvw[0], res->addr_uvw[1], res->border_color_type, out);
+                            res->addr_uvw[0], res->addr_uvw[1], res->border_color_type,
+                            out, res_arrayed, vread(cvg(3)));
                     }
                 } else if (in.mimg_dim == 1u) {
                     // Plain 2D form (Blue Prince's lit-material PSes, #1271: 436 rejects/run, all
@@ -7555,7 +7575,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // scene rendered unattenuated/blown-out). Same 8.2.5 vaddr order with no array
                     // slice: [dref, u, v]. Lowered as a manual compare against the color-sampled
                     // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
-                    if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                    if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
                         ok = false; return true;
                     }
                     b.image_sample_dref_manual_2d(
@@ -7575,7 +7595,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
-                if (!b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, res_arrayed)) {
                     ok = false; return true;
                 }
                 if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
@@ -7611,25 +7631,46 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     in.mimg_dim == 5u && res->img_dim == 5u;
                 const bool mip_load_2d_array = b.is_compute && is_zero_mip_load &&
                     in.mimg_dim == 5u && res->img_dim == 5u;
-                const bool array_sample = b.is_compute && in.mimg_dim == 5u &&
+                // #325: array SAMPLE was restricted to compute. Nothing about an array slice is
+                // compute-specific -- the restriction recorded where it was first needed, not a
+                // constraint -- and graphics paid for it: Tomb Raider I-III Remastered textures its
+                // entire world from ONE 256-slice array, so every world surface sampled slice 0 and
+                // rendered flat. Measured on a captured Croft Manor frame, zeroing slices 1..255
+                // changed 0.0% of pixels while zeroing all 256 changed 62.9%.
+                // `res_arrayed` and not `img_dim == 5` alone: the uploader arrays a resource only
+                // when it is ALSO multi-layer and block-compressed, so keying on img_dim would
+                // declare Arrayed for this title's depth-1 shadow maps and for Float32 arrays that
+                // get a plain 2D view -- VUID-vkCmdDraw-viewType-07752, the same failure as the
+                // hardcoded flag two branches up, at a different site. Compute keeps its own path:
+                // it picks the view from the SPIR-V reflection, so it is not bound by that.
+                const bool array_sample = in.mimg_dim == 5u &&
+                    (b.is_compute || res_arrayed) &&
                     res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
                 const bool host_array = load_2d_array || mip_load_2d_array ||
                     array_sample || msaa_array_fetch;
-                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, host_array)) {
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, host_array || res_arrayed)) {
                     ok = false; return true;
                 }
                 if (msaa_array_fetch || load_2d_array || mip_load_2d_array) {
                     b.image_fetch_2d_array(
                         res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 } else if (array_sample) {
-                    // Compute SAMPLE and SAMPLE_LZ both resolve level zero; SAMPLE_L supplies its
-                    // explicit LOD. All retain the 2D-array slice in the SPIR-V coordinate.
-                    b.image_sample_lod_2d_array(
-                        res->binding,
-                        normalized_spatial(vread(cvg(0)), res->width),
-                        normalized_spatial(vread(cvg(1)), res->height),
-                        vread(cvg(2)),
-                        is_sample_l ? vread(cvg(3)) : b.uconst(fbits(0.0f)), out);
+                    // All three retain the 2D-array slice in the SPIR-V coordinate. SAMPLE_LZ
+                    // resolves level zero and SAMPLE_L carries its own LOD, so both take the
+                    // explicit-LOD form. Plain SAMPLE must NOT: in a fragment stage its LOD comes
+                    // from quad derivatives, and forcing level zero there would sample the base mip
+                    // across every textured surface -- correct in compute, wrong on a wall.
+                    // image_sample_2d_array picks implicit or explicit by stage exactly as the
+                    // non-array image_sample_2d does, so compute behaviour is preserved bit for bit.
+                    const uint32_t au = normalized_spatial(vread(cvg(0)), res->width);
+                    const uint32_t av = normalized_spatial(vread(cvg(1)), res->height);
+                    const uint32_t layer = vread(cvg(2));
+                    if (is_sample)
+                        b.image_sample_2d_array(res->binding, au, av, layer, out);
+                    else
+                        b.image_sample_lod_2d_array(
+                            res->binding, au, av, layer,
+                            is_sample_l ? vread(cvg(3)) : b.uconst(fbits(0.0f)), out);
                 } else if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
                     b.image_sample_bias_2d(
                         res->binding,

@@ -6135,9 +6135,13 @@ int main() {
     }
     printf("  [ok]   mixed compute SAMPLE/SAMPLE_L shares one 2D-array image contract\n");
 
-    // The graphics renderer still exposes DIM=5 textures through its established base-slice 2D
-    // view. Keep that descriptor non-arrayed, but consume SAMPLE_L's fourth address as the LOD
-    // rather than mistaking the discarded third (slice) address for the LOD.
+    // #325: graphics DIM=5 textures used to be exposed through a base-slice 2D view, and this arm
+    // pinned that. The uploader can now create matching array views, so the descriptor is ARRAYED
+    // in graphics exactly as it already was in compute -- and it must be, because the view type is
+    // chosen from guest_texture_is_uploaded_array() (img_dim 5 AND multi-layer AND
+    // block-compressed, NOT img_dim alone): a non-arrayed declaration against it is a descriptor
+    // mismatch. The negative arm below pins the other half of that predicate. What has NOT changed, and is still pinned below, is that SAMPLE_L consumes its
+    // FOURTH address as the LOD rather than mistaking the third (slice) address for it.
     const uint32_t ps_sample_array_l[] = {
         0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
         0x7e0402ffu, 0x3f800000u, 0x7e060280u,
@@ -6155,12 +6159,55 @@ int main() {
             descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
             graphics_array_l_descriptor = &descriptor;
     if (graphics_array_l_spv.empty() || !graphics_array_l_descriptor ||
-        graphics_array_l_descriptor->image_arrayed ||
+        !graphics_array_l_descriptor->image_arrayed ||
         !has_explicit_lod_constant(graphics_array_l_spv, 0u)) {
-        printf("  [FAIL] graphics DIM=5 image_sample_l violated its base-slice 2D contract\n");
+        printf("  [FAIL] graphics DIM=5 image_sample_l did not produce an arrayed image with its "
+               "fourth-address LOD\n");
         return 1;
     }
-    printf("  [ok]   graphics DIM=5 image_sample_l keeps a 2D view and its fourth-address LOD\n");
+    printf("  [ok]   graphics DIM=5 image_sample_l is arrayed and keeps its fourth-address LOD\n");
+
+    // #325: the NEGATIVE arm, and it exists because the positive one above could not see the
+    // defect. A DIM=5 instruction is not sufficient to declare Arrayed -- the uploader arrays a
+    // resource only when it is ALSO multi-layer and block-compressed, and gives everything else a
+    // plain 2D view. Declaring Arrayed against that is VUID-vkCmdDraw-viewType-07752.
+    //
+    // Worth stating why this is not redundant: the whole suite passed 311/311 AND the Vulkan
+    // validation scan passed while this defect was live, because the only graphics draw in the
+    // corpus that hits a DIM=5/non-arrayed resource goes through the SAMPLE_C_LZ branch rather than
+    // the plain-SAMPLE branch the bug lived in. Both arms below fail without the res_arrayed term.
+    for (const auto& shape : {std::pair<uint32_t, DataFormat>{1u, DataFormat::Bc6},      // depth 1
+                              std::pair<uint32_t, DataFormat>{4u, DataFormat::Unorm8}}) { // not BC
+        ShaderResourceTable rt_plain = rt_array;
+        rt_plain.resources[0].depth = shape.first;
+        rt_plain.resources[0].format = shape.second;
+        const std::vector<uint32_t> plain_spv = recompile_fragment(
+            ps_sample_array_l, std::size(ps_sample_array_l), &rt_plain);
+        const DescriptorValidationReport plain_report =
+            validate_spirv_descriptor_interface(plain_spv, &rt_plain, 0, SpirvShaderStage::Fragment);
+        const SpirvDescriptorBinding* plain_descriptor = nullptr;
+        for (const auto& descriptor : plain_report.descriptors)
+            if (descriptor.binding == 4u &&
+                descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+                plain_descriptor = &descriptor;
+        if (plain_spv.empty()) {
+            printf("  [FAIL] graphics DIM=5 was REJECTED for depth=%u fmt=%u (empty SPIR-V)\n",
+                   shape.first, static_cast<unsigned>(shape.second));
+            return 1;
+        }
+        if (!plain_descriptor) {
+            printf("  [FAIL] graphics DIM=5 emitted no binding-4 sampler for depth=%u fmt=%u\n",
+                   shape.first, static_cast<unsigned>(shape.second));
+            return 1;
+        }
+        if (plain_descriptor->image_arrayed) {
+            printf("  [FAIL] graphics DIM=5 declared Arrayed for a resource the uploader gives a "
+                   "plain 2D view (depth=%u fmt=%u)\n",
+                   shape.first, static_cast<unsigned>(shape.second));
+            return 1;
+        }
+    }
+    printf("  [ok]   graphics DIM=5 stays 2D for depth-1 and non-block-compressed resources\n");
 
     // The visibility half of the same kernel comparison-samples a sixteen-layer shadow array.
     // Compute keeps its slice and performs the compare manually over a color-sampled array image.

@@ -1151,6 +1151,20 @@ struct VulkanComputeContext {
     uint64_t storage_result_snapshot_bytes = 0;
     uint64_t image_result_snapshot_copies = 0;
     uint64_t image_result_snapshot_bytes = 0;
+    // WHY each snapshot was taken. The total above cannot be acted on: measured on GTA V gameplay
+    // it is 35 GB in one routed run and 48% of all CPU cycles land in the memmove underneath it,
+    // but the adaptive storage-result path already halves the rate (measured: disabling it doubles
+    // snapshots/pool-hit from 0.0715 to 0.1404), so the remaining traffic is whatever that path
+    // never sees. Two branches reach the copy without consulting it -- an early return for
+    // host-data sources, and read/modify/write or partial storage targets, which genuinely need an
+    // exact baseline. Which of those dominates decides whether there is anything left to win here,
+    // and no existing counter separates them. Same reasoning as the res_buffer_* leaves.
+    uint64_t snapshot_reason_host_data_copies = 0;
+    uint64_t snapshot_reason_host_data_bytes = 0;
+    uint64_t snapshot_reason_rmw_copies = 0;
+    uint64_t snapshot_reason_rmw_bytes = 0;
+    uint64_t snapshot_reason_changed_copies = 0;
+    uint64_t snapshot_reason_changed_bytes = 0;
     VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
@@ -1677,9 +1691,12 @@ struct VulkanComputeContext {
                write_watch_promotion_budget.try_consume(source_bytes);
     }
 
+    enum class SnapshotReason { Unattributed, HostData, ReadModifyWrite, ContentChanged };
+
     void remember_image_source_snapshot(CachedComputeImage& cached,
                                         const uint8_t* source, size_t bytes,
-                                        bool storage_result = false) {
+                                        bool storage_result = false,
+                                        SnapshotReason reason = SnapshotReason::Unattributed) {
         if (!source) return;
         cached.source_snapshot.assign(source, source + bytes);
         ++image_source_snapshot_copies;
@@ -1687,6 +1704,15 @@ struct VulkanComputeContext {
         if (storage_result) {
             ++storage_result_snapshot_copies;
             storage_result_snapshot_bytes += bytes;
+        }
+        switch (reason) {
+        case SnapshotReason::HostData:
+            ++snapshot_reason_host_data_copies; snapshot_reason_host_data_bytes += bytes; break;
+        case SnapshotReason::ReadModifyWrite:
+            ++snapshot_reason_rmw_copies; snapshot_reason_rmw_bytes += bytes; break;
+        case SnapshotReason::ContentChanged:
+            ++snapshot_reason_changed_copies; snapshot_reason_changed_bytes += bytes; break;
+        case SnapshotReason::Unattributed: break;
         }
     }
 
@@ -2006,7 +2032,8 @@ struct VulkanComputeContext {
         } else if (!upload_skipped && source && source_snapshot_required) {
             cached.write_watch_stable_validations = 0;
             remember_image_source_snapshot(
-                cached, source, key.guest_bytes, key.storage);
+                cached, source, key.guest_bytes, key.storage,
+                SnapshotReason::ContentChanged);
             // Do not trust the new mirror until the corresponding transfer completes. A failed
             // submit leaves this false, so the next use refreshes instead of skipping stale pixels.
             cached.content_valid = false;
@@ -2369,7 +2396,8 @@ struct VulkanComputeContext {
         if (key.host_data) {
             if (current_source)
                 remember_image_source_snapshot(
-                    cached, current_source, key.guest_bytes, true);
+                    cached, current_source, key.guest_bytes, true,
+                    SnapshotReason::HostData);
             cached.write_watch.reset();
             return;
         }
@@ -2389,7 +2417,8 @@ struct VulkanComputeContext {
             // contract because their prior guest bytes are observable by the next dispatch.
             if (current_source)
                 remember_image_source_snapshot(
-                    cached, current_source, key.guest_bytes, true);
+                    cached, current_source, key.guest_bytes, true,
+                    SnapshotReason::ReadModifyWrite);
             if (cached.write_watch && cached.write_watch.rearm()) return;
             cached.write_watch.reset();
             return;
@@ -4838,7 +4867,81 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double image_watch_ms = 0.0;
     double image_notify_ms = 0.0;
     double image_cache_ms = 0.0;
-    const std::vector<uint32_t>& spirv = item.spirv;
+    // PROSPER_LOAD_COMPUTE_SPIRV=[<code_addr>:]<file>: replace a recompiled module with the file's
+    // contents before pipeline creation -- A/B a hand-written shader against the live game with
+    // bindings and layouts exactly as the title realizes them (#2985; recovered from #2984 via
+    // #3033). The descriptor layout still reflects the ORIGINAL module, so an override has to keep
+    // the same interface or pipeline creation fails.
+    //
+    // Two changes from the form this arrived in, both because execute_item runs PER DISPATCH:
+    //
+    //   * The file is read ONCE. As recovered it called getenv and re-read the file from disk inside
+    //     this function, so a title dispatching a few hundred times a second re-read it that often --
+    //     and the instrument's own I/O would then be inside whatever it was used to measure.
+    //   * The optional <code_addr>: prefix targets ONE program. Without it the override replaces
+    //     EVERY compute module in the process, which is rarely what an A/B wants and silently breaks
+    //     every other shader in the title. The address is the same selector PROSPER_COMPUTELOG_CODE
+    //     and PROSPER_COMPUTE_TIMING_CODE already take, so a program identified with one of those can
+    //     be overridden with this.
+    //
+    // Setting the targeted form from an MSYS/Git-Bash shell needs care, because <addr>:<path> looks
+    // like a colon-separated PATH list and the shell rewrites the elements: the value arrives as
+    // `/c/Users/...` instead of `C:/Users/...` and the open fails on a path that looks correct in the
+    // error message. Use a Windows-style path and MSYS2_ARG_CONV_EXCL='*', or set the variable from
+    // PowerShell. The untargeted form has no colon and is not affected.
+    struct SpirvOverride {
+        std::vector<uint32_t> words;
+        uint64_t              code_addr = 0;
+        bool                  targeted  = false;
+        SpirvOverride() {
+            const char* spec = std::getenv("PROSPER_LOAD_COMPUTE_SPIRV");
+            if (!spec || !*spec) return;
+            const char* path = spec;
+            // A colon separates a target only when everything before it parses whole as a number;
+            // otherwise it is a drive letter or part of the path.
+            // A colon separates a target only when everything before it parses STRICTLY as an
+            // unsigned number; otherwise it is a drive letter or part of the path. Parsed with
+            // parse_compute_timing_selector_u64 (compute_timing_selector.hpp, already included at
+            // the top of this file) rather than strtoull, and the difference is not cosmetic:
+            // strtoull accepts a sign, leading whitespace and an EMPTY prefix, so `:/tmp/x.spv`
+            // would have armed a target of 0 silently. That is the shape that header exists to
+            // prevent -- its own comment says a mistyped identity must not look armed -- and it is
+            // the parser both selectors this reuses already take. A non-numeric prefix (the `C` in
+            // `C:/x.spv`) is simply not a target.
+            if (const char* colon = std::strchr(spec, ':')) {
+                const std::string prefix(spec, (size_t)(colon - spec));
+                const auto parsed =
+                    prosper::frontend::parse_compute_timing_selector_u64(prefix.c_str());
+                if (parsed.accepted()) {
+                    code_addr = parsed.value; targeted = true; path = colon + 1;
+                }
+            }
+            FILE* fh = std::fopen(path, "rb");
+            if (!fh) {
+                std::fprintf(stderr, "[compute] SPIR-V override %s could not be opened\n", path);
+                return;
+            }
+            uint32_t word;
+            while (std::fread(&word, sizeof word, 1, fh) == 1) words.push_back(word);
+            std::fclose(fh);
+            if (words.empty()) {
+                std::fprintf(stderr, "[compute] SPIR-V override %s is empty; ignored\n", path);
+                return;
+            }
+            if (targeted)
+                std::fprintf(stderr, "[compute] SPIR-V override: %zu words from %s, code=0x%llx only\n",
+                             words.size(), path, (unsigned long long)code_addr);
+            else
+                std::fprintf(stderr, "[compute] SPIR-V override: %zu words from %s, EVERY module "
+                                     "(prefix with <code_addr>: to target one)\n",
+                             words.size(), path);
+        }
+    };
+    static const SpirvOverride spirv_override;
+    const bool override_applies =
+        !spirv_override.words.empty() &&
+        (!spirv_override.targeted || spirv_override.code_addr == item.code_addr);
+    const std::vector<uint32_t>& spirv = override_applies ? spirv_override.words : item.spirv;
     const bool trace = trace_compute_item(item);
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();
@@ -7942,6 +8045,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             smci.codeSize = spirv.size() * sizeof(uint32_t);
             smci.pCode = spirv.data();
+            // PROSPER_DUMP_COMPUTE_SPIRV=<dir>: write each newly compiled compute module's
+            // SPIR-V as <dir>/<hash>.spv for offline ISA/occupancy analysis (#2985).
+            static const char* const dump_dir = std::getenv("PROSPER_DUMP_COMPUTE_SPIRV");
+            if (dump_dir && *dump_dir) {
+                const uint64_t dump_hash = gpu_capture_hash(
+                    reinterpret_cast<const uint8_t*>(spirv.data()),
+                    spirv.size() * sizeof(uint32_t));
+                char path[512];
+                std::snprintf(path, sizeof path, "%s/%016llx.spv", dump_dir,
+                              (unsigned long long)dump_hash);
+                FILE* f = fopen(path, "wb");
+                // Reported, not silent. Without this an unwritable or nonexistent <dir>, or a
+                // path truncated by the snprintf above, produced no files AND no output -- an
+                // instrument that says nothing when it fails is indistinguishable from one
+                // reporting there was nothing to dump. The override half already reported its
+                // failures; this half did not.
+                if (!f) {
+                    std::fprintf(stderr, "[compute] SPIR-V dump could not write %s\n", path);
+                } else {
+                    fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+                    fclose(f);
+                    std::fprintf(stderr, "[compute] dumped SPIR-V %016llx (%zu words) -> %s\n",
+                                 (unsigned long long)dump_hash, spirv.size(), path);
+                }
+            }
             if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module"))
                 break;
             VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -10358,6 +10486,27 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                         (1024.0 * 1024.0),
                     (unsigned long long)g_compute_storage_transfer_seeds.load(
                         std::memory_order_relaxed));
+                // WHY those snapshots happened. `other` is the remainder and is printed SIGNED --
+                // a negative value means over-attribution, and clamping it would make a broken
+                // partition look like a complete one (the same rule the res_buffer leaves follow).
+                {
+                    const uint64_t attributed =
+                        context.snapshot_reason_host_data_bytes +
+                        context.snapshot_reason_rmw_bytes +
+                        context.snapshot_reason_changed_bytes;
+                    const double mib = 1024.0 * 1024.0;
+                    std::fprintf(stderr,
+                        "[render-timing] compute_snapshot_reason host_data=%llu %.1f MiB "
+                        "rmw=%llu %.1f MiB changed=%llu %.1f MiB other=%+.1f MiB\n",
+                        (unsigned long long)context.snapshot_reason_host_data_copies,
+                        static_cast<double>(context.snapshot_reason_host_data_bytes) / mib,
+                        (unsigned long long)context.snapshot_reason_rmw_copies,
+                        static_cast<double>(context.snapshot_reason_rmw_bytes) / mib,
+                        (unsigned long long)context.snapshot_reason_changed_copies,
+                        static_cast<double>(context.snapshot_reason_changed_bytes) / mib,
+                        (static_cast<double>(context.image_source_snapshot_bytes) -
+                         static_cast<double>(attributed)) / mib);
+                }
                 std::fprintf(stderr,
                     "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
                     (unsigned long long)window.calls,

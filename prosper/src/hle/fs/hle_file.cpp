@@ -393,21 +393,117 @@ namespace {
     }
 #endif
 
+    bool readbytes_on();   // fwd: the fd->path map below is shared with it
+
     void filelog_remember_fd(int fd, const std::string& path) {
-        if (!filelog() || fd < 0) return;
+        if ((!filelog() && !readbytes_on()) || fd < 0) return;
         std::lock_guard<std::mutex> lk(g_filelog_fd_mx);
         g_filelog_fd_paths[fd] = path;
     }
 
     std::string filelog_fd_path(int fd) {
-        if (!filelog()) return {};
+        if (!filelog() && !readbytes_on()) return {};
         std::lock_guard<std::mutex> lk(g_filelog_fd_mx);
         auto it = g_filelog_fd_paths.find(fd);
         return it == g_filelog_fd_paths.end() ? std::string() : it->second;
     }
 
+    // PROSPER_READBYTES=1 -- how many bytes each file actually DELIVERS, against how many times it
+    // was opened. Written because the question "does the title read what it opens?" had no cheap
+    // answer: PROSPER_FILELOG sees opens and PROSPER_PREADLOG sees reads, but the latter walks the
+    // guest stack on every fd operation to recover a call chain, and enabling both together slows a
+    // load past the point a routed run survives -- a measurement that reports "one file read"
+    // because the run never got further. This keeps a counter per path and nothing else, so it costs
+    // an addition and a map lookup per read, and it prints once at exit.
+    //
+    // What its null does NOT cover: reads that never reach this layer. It counts what these HLE
+    // entry points deliver, so a title using a path prosper services elsewhere is invisible to it.
+    std::mutex g_readbytes_mx;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> g_readbytes;   // path -> {bytes, reads}
+    std::map<std::string, uint64_t> g_readbytes_opens;                  // path -> opens
+
+    bool readbytes_on() {
+        static const int on = [] {
+            const char* e = getenv("PROSPER_READBYTES");
+            return e && *e && strcmp(e, "0") ? 1 : 0;
+        }();
+        return on != 0;
+    }
+
+    void readbytes_note_open(const std::string& path) {
+        if (!readbytes_on() || path.empty()) return;
+        std::lock_guard<std::mutex> lk(g_readbytes_mx);
+        ++g_readbytes_opens[path];
+    }
+
+    void readbytes_note_read(int fd, int64_t bytes) {
+        if (!readbytes_on() || bytes <= 0) return;
+        const std::string path = filelog_fd_path(fd);
+        if (path.empty()) return;
+        std::lock_guard<std::mutex> lk(g_readbytes_mx);
+        auto& e = g_readbytes[path];
+        e.first += (uint64_t)bytes;
+        ++e.second;
+    }
+
+    // Reported DURING the run, every N opens, rather than only at exit: this frontend does not
+    // unwind static destructors, so an exit-time report printed nothing at all -- an instrument that
+    // silently produces no output is the failure mode this whole investigation kept hitting.
+    void readbytes_report_locked();
+
+    void readbytes_maybe_report() {
+        if (!readbytes_on()) return;
+        static uint64_t last = 0;
+        std::lock_guard<std::mutex> lk(g_readbytes_mx);
+        if (g_readbytes_opens.size() < last + 100u) return;
+        last = g_readbytes_opens.size();
+        readbytes_report_locked();
+    }
+
+    struct ReadBytesReport {
+        ~ReadBytesReport() {
+            if (!readbytes_on()) return;
+            std::lock_guard<std::mutex> lk(g_readbytes_mx);
+            readbytes_report_locked();
+        }
+    };
+    ReadBytesReport g_readbytes_report;
+
+    // Caller holds g_readbytes_mx.
+    void readbytes_report_locked() {
+        {
+            uint64_t total = 0, opened_never_read = 0;
+            for (const auto& o : g_readbytes_opens)
+                if (!g_readbytes.count(o.first)) ++opened_never_read;
+            for (const auto& r : g_readbytes) total += r.second.first;
+            // Every field names its own UNIT. g_readbytes.size() is a count of PATHS that
+            // delivered at least one byte -- it was previously printed as "delivered bytes",
+            // which reads as a byte total on a line whose last field really is one.
+            fprintf(stderr, "[readbytes] %zu path(s) opened, %zu path(s) delivered bytes, "
+                            "%llu opened-but-never-read, %llu total bytes\n",
+                    g_readbytes_opens.size(), g_readbytes.size(),
+                    (unsigned long long)opened_never_read, (unsigned long long)total);
+            // The extensions matter more than individual files for an asset question.
+            std::map<std::string, std::pair<uint64_t, uint64_t>> by_ext;   // ext -> {opened, read}
+            for (const auto& o : g_readbytes_opens) {
+                const size_t dot = o.first.rfind('.');
+                std::string ext = dot == std::string::npos ? "(none)" : o.first.substr(dot);
+                by_ext[ext].first += o.second;
+                if (g_readbytes.count(o.first)) ++by_ext[ext].second;
+            }
+            for (const auto& e : by_ext)
+                // open-events vs paths-read: DIFFERENT units. `first` accumulates o.second,
+                // an open-event count; `second` counts distinct paths that were read. Printing
+                // them as `opened=`/`read=` invited reading them as a matched pair.
+                fprintf(stderr, "[readbytes]   %-8s open-events=%llu paths-read=%llu\n", e.first.c_str(),
+                        (unsigned long long)e.second.first,
+                        (unsigned long long)e.second.second);
+            fflush(stderr);
+        }
+    }
+
     void filelog_forget_fd(int fd) {
-        if (!filelog()) return;
+        if (!filelog() && !readbytes_on()) return;
         std::lock_guard<std::mutex> lk(g_filelog_fd_mx);
         g_filelog_fd_paths.erase(fd);
     }
@@ -1105,6 +1201,8 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
 #endif
                int err = fd < 0 ? errno : 0;
                filelog_remember_fd(fd, h);
+               readbytes_note_open(h);
+               readbytes_maybe_report();
                if (filelog()) fprintf(stderr,
                    "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
                    h.c_str(), (unsigned long long)a1, host_flags, fd, err);
@@ -1408,6 +1506,7 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
                if (filelog() || fdlog_on()) off = (int64_t)::lseek(fd, 0, SEEK_CUR);
                if (fdlog_on()) preadlog("read", a0, (uint64_t)off, a2);
                auto logged_return = [&](int64_t r) -> uint64_t {
+                   readbytes_note_read(fd, r);
                    const int error = r < 0 ? errno : 0;
                    filelog_fd_io("read", fd, off, a2, r, error);
                    if (r < 0) errno = error;
@@ -1478,6 +1577,7 @@ HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lse
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); int64_t r = read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3);
+                readbytes_note_read((int)a0, r);
                 const int error = r < 0 ? errno : 0;
                 filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, error);
                 if (r < 0) errno = error;

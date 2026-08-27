@@ -94,11 +94,39 @@ def run(cmd: list[str]) -> str:
             f"from `git` and `gh` and refuses to guess without them."
         )
     try:
-        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True)
-    except OSError as exc:  # pragma: no cover - permissions, exec format, a full disk
+        # encoding="utf-8" EXPLICITLY, not text=True alone. text=True decodes with the locale
+        # default, which on a Windows host is cp1252 -- and this tool's whole job is to pipe a
+        # UTF-8 Markdown document through a subprocess. The doc contains typographic quotes and
+        # em dashes, so the decode raised UnicodeDecodeError inside subprocess's reader THREAD,
+        # which left proc.stdout as None while returncode stayed 0. The tool then crashed 150
+        # lines away in the table parser with "'NoneType' object has no attribute 'split'".
+        # trap_number.py was therefore unusable on Windows, and unusable in a way that pointed
+        # the reader at the wrong file.
+        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        # OSError: permissions, exec format, a full disk.
+        # UnicodeDecodeError: on POSIX subprocess decodes in the CALLER's thread rather than a
+        # reader thread, so a decode failure propagates here instead of yielding a None stdout.
+        # Without this the docstring's "never lets an exception escape as a traceback" was still
+        # false off Windows -- the guard below only covers the thread-swallowed shape. Review of
+        # #3071.
         raise ScanError(f"{' '.join(cmd[:3])}... could not be run: {exc}") from exc
     if proc.returncode != 0:
-        raise ScanError(f"{' '.join(cmd[:3])}... failed (rc={proc.returncode}): {proc.stderr.strip()}")
+        # (proc.stderr or ""): strict UTF-8 makes a cp1252 git/gh error message decode to None, and
+        # a None.strip() here would replace the real diagnosis with an AttributeError.
+        raise ScanError(
+            f"{' '.join(cmd[:3])}... failed (rc={proc.returncode}): {(proc.stderr or '').strip()}")
+    # The backstop for the same class, and it is the half that matters: ANY future decode
+    # failure in that reader thread yields None here with a zero returncode. Without this the
+    # tool violates its own docstring -- "Never lets an exception escape as a traceback" -- by
+    # crashing somewhere else entirely, which reads as a bug in the table rather than in the
+    # read. Whoever is holding a number they are about to write needs to be able to tell those
+    # two apart.
+    if proc.stdout is None:
+        raise ScanError(
+            f"{' '.join(cmd[:3])}... produced output this tool could not decode as UTF-8, so "
+            f"the table cannot be read. This tool refuses to guess a number from a partial read."
+        )
     return proc.stdout
 
 
@@ -185,14 +213,39 @@ def added_rows_from_diff(repo: str, number: int, path: str) -> list[int]:
     exe = shutil.which("gh")
     if exe is None:
         raise ScanError("'gh' is not on PATH, so this PR's patch cannot be read.")
-    proc = subprocess.run([exe, "pr", "diff", str(number), "--repo", repo],
-                          capture_output=True, text=True)
+    # Same explicit encoding as run(); a PR body or patch is as likely to carry non-ASCII as
+    # the document itself.
+    #
+    # And the same except clause. Three consecutive review rounds on #3071 produced the finding
+    # "the guard is at one of two sites" -- first the None check, then the stderr reads, then
+    # this. The two functions run subprocesses for the same reason and need the same two
+    # guards, so they now have both rather than converging one round at a time. On POSIX the
+    # decode happens in the CALLER's thread, so a UnicodeDecodeError propagates from here
+    # instead of yielding a None stdout, and without this it escaped as the traceback this
+    # whole change exists to remove.
+    try:
+        proc = subprocess.run([exe, "pr", "diff", str(number), "--repo", repo],
+                              capture_output=True, text=True, encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ScanError(
+            f"`gh pr diff {number}` could not be run or decoded: {exc}. Without the patch this "
+            f"PR's claim cannot be distinguished from an amended row.") from exc
     if proc.returncode != 0:
         raise ScanError(
-            f"`gh pr diff {number}` failed (rc={proc.returncode}): {proc.stderr.strip()}. Without "
+            f"`gh pr diff {number}` failed (rc={proc.returncode}): {(proc.stderr or '').strip()}. Without "
             f"the patch this PR's claim cannot be distinguished from an amended row, and falling "
             f"back to comparing file contents would silently miss a duplicate already on "
             f"{repo}'s base."
+        )
+    # The same guard run() carries, for the same reason and it was missed here: on a decode
+    # failure this is None with a zero returncode, and added_rows_from_patch would then die on
+    # `patch.split` with the identical misleading traceback this whole change exists to remove.
+    # Review of #3071 found it -- the claim that part 2 "fails closed" was false in one of the
+    # two places the change edited.
+    if proc.stdout is None:
+        raise ScanError(
+            f"`gh pr diff {number}` produced output this tool could not decode as UTF-8, so "
+            f"this PR's claim cannot be read. Refusing to guess a number from a partial read."
         )
     return added_rows_from_patch(proc.stdout, path)
 

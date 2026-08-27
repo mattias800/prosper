@@ -19,6 +19,65 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-27
+
+### Tomb Raider's world really is textured now
+
+Croft Manor's assault course — brickwork, sandstone, mossy wooden platforms, gravel, ivy, Lara, and
+Winston bringing the tea.
+
+![Croft Manor assault course: Lara on wooden platforms with moss, red brick and sandstone walls, gravel ground, ivy and trees under a bright sky, Winston carrying a tea tray at the left](assets/screenshots/tomb-raider-croft-manor-assault-course.png)
+
+The decode cache was validating 262144 of 90177536 bytes — 0.29% — of the 256-layer world atlas, so
+a decode taken while the atlas was nearly empty was reused all run and the walls wore whatever had
+been in that memory earlier.
+[#2998](https://github.com/mattias800/prosper/issues/2998)
+
+
+### Windows audio: the underruns are not a pacing bug
+
+Every title crackles on Windows and only on Windows, and the obvious cause — the sink hands the
+sound card too little cushion — is wrong. Blasphemous 2's guest produces **84 audio grains a
+second against the 187 that continuous playback needs**, so the device queue holds zero bytes at
+53% of the moments it is sampled, however carefully the sink paces the half it does get.
+
+Holding a deeper cushion, which is the fix everyone reaches for first, measures *worse*: 69%
+empty, matching the pre-fix pacer it was meant to improve on. Removing the pacing makes the
+guest deliver less often, not more.
+
+No picture — this one is a number. #3072 has the hunt.
+
+
+### ~~Tomb Raider's world is textured~~ — RETRACTED, that was a loading screen
+
+**This entry was wrong and its picture is withdrawn.** The image published as Croft Manor's textured
+brickwork was the game blitting its own pre-rendered loading picture, `2/PIX/HD/MANSION.DDS` —
+pixel-identical to the checked-in capture (mean abs diff 0.02/255, 100% of pixels within 8/255).
+Displaying a full-screen 2D image requires no world rendering at all, so it never showed what it was
+captioned as showing. The project owner spotted it; no automated check did, and none could have.
+
+It is left here rather than deleted because the blog's own rule is that it records what was claimed
+and when. Recorded as instrument trap 230 — it looked *better* than the emulator could plausibly
+render, and that is the tell.
+
+![The genuine render of the same level: geometry correct but every surface a flat cream colour](assets/screenshots/tomb-raider-croft-manor-untextured.png)
+
+![Tomb Raider II title screen: Lara's model, the logo, game-select thumbnails and the Lara's Home menu entry](assets/screenshots/tomb-raider-title-screen-tr2.png)
+
+[#325](https://github.com/mattias800/prosper/issues/325) · [#2998](https://github.com/mattias800/prosper/issues/2998)
+
+
+### What "the wrong surfaces" actually looks like
+
+Lara's Home, and every wall and floor is wearing something real from elsewhere in the game — her
+passport, the Game Boy collectibles, an inventory document page.
+
+![Croft Manor interior: walls tiled with Game Boy console artwork and a UK passport page, the floor covered in a document reading THIS PAGE IS RESERVED FOR OFFICIAL OBSERVATIONS, Lara silhouetted in the centre](assets/screenshots/tomb-raider-croft-manor-interior-wrong-textures.png)
+
+The textures decode correctly and the geometry is right; the wrong content is being selected.
+[#2998](https://github.com/mattias800/prosper/issues/2998)
+
+
 ## 2026-08-26
 
 ### Grand Theft Auto V renders its world
