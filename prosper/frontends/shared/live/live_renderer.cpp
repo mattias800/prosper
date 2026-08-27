@@ -3605,6 +3605,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_bc_block_bytes != 0 || exact_unorm16_cube,
                                     sampled_source_addr,
                                     prosper::gpu::gpu_capture_resource_footprint(r));
+                            // One SURFACE's bytes. For a layered array the decode reads many of
+                            // these, so the layered span is applied below -- see #2998.
+                            const size_t surface_bytes = [&] {
                             if (persistent_bc_block_bytes) {
                                 const uint32_t bw = (tw + 3) / 4;
                                 const uint32_t bh = (th + 3) / 4;
@@ -3645,6 +3648,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (linear_padded_read) return linear_src_row * th;
                             return static_cast<size_t>(tw) * th *
                                 (is_volume ? r.depth : 1u) * source_bpt;
+                            }();
+                            // An uploaded ARRAY's decode reads EVERY layer, so the range the
+                            // persistent cache validates has to span them all. Returning one
+                            // surface made it compare 262144 of 90177536 bytes -- 0.29% -- of Tomb
+                            // Raider's 256-layer world atlas: every layer above the first then
+                            // changed invisibly, and a decode taken while the atlas was about 5%
+                            // filled was reused for the rest of the run, which is why interiors
+                            // sampled slices that held the previous occupants of that memory
+                            // (#2998). The `is_cube` branch above has always spanned its six faces;
+                            // the array path was added later without the matching change.
+                            //
+                            // A surface_bytes of 0 is a deliberate "do not cache this" signal from
+                            // the branches above, so it must not be turned into a nonzero span.
+                            if (guest_array)
+                                return prosper::frontend::layered_array_source_size(
+                                    surface_bytes, r.layer_stride_bytes, decoded_layers);
+                            return surface_bytes;
                         }();
                         // DCC code 0xff means the base allocation contains ordinary uncompressed
                         // texels.  Such an image is just as cacheable as a descriptor with DCC disabled,

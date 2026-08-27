@@ -21,6 +21,19 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-27
 
+### Tomb Raider's world really is textured now
+
+Croft Manor's assault course — brickwork, sandstone, mossy wooden platforms, gravel, ivy, Lara, and
+Winston bringing the tea.
+
+![Croft Manor assault course: Lara on wooden platforms with moss, red brick and sandstone walls, gravel ground, ivy and trees under a bright sky, Winston carrying a tea tray at the left](assets/screenshots/tomb-raider-croft-manor-assault-course.png)
+
+The decode cache was validating 262144 of 90177536 bytes — 0.29% — of the 256-layer world atlas, so
+a decode taken while the atlas was nearly empty was reused all run and the walls wore whatever had
+been in that memory earlier.
+[#2998](https://github.com/mattias800/prosper/issues/2998)
+
+
 ### Windows audio: the underruns are not a pacing bug
 
 Every title crackles on Windows and only on Windows, and the obvious cause — the sink hands the
@@ -33,6 +46,7 @@ empty, matching the pre-fix pacer it was meant to improve on. Removing the pacin
 guest deliver less often, not more.
 
 No picture — this one is a number. #3072 has the hunt.
+
 
 ### ~~Tomb Raider's world is textured~~ — RETRACTED, that was a loading screen
 
