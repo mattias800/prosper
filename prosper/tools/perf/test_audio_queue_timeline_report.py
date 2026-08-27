@@ -223,6 +223,21 @@ def main():
     expect(out_mm, "sampling interval 1000 us",
            "interval: one long stall does not drag the interval off the median")
 
+    # 6h-bis. The estimator arm above pins the MEDIAN; this pins the CONSEQUENCE its comment
+    #          claims -- that a mean would resegment the series. A dry stretch broken by one ~5 ms
+    #          hole discriminates: 5000 us is above 4x1000 (the median threshold, so it splits and
+    #          the episode is not counted) and below 4x1376 (a mean threshold, which would NOT
+    #          split and would report one underrun). Review of #3070 supplied the construction.
+    log_reseg = ("".join(sample(i * 1000, 6144) for i in range(400)) +
+                 sample(700_000, 6144) +                              # the stall that moves a mean
+                 "".join(sample(701_000 + i * 1000, 6144) for i in range(100)) +
+                 "".join(sample(801_000 + i * 1000, 0) for i in range(5)) +
+                 "".join(sample(811_000 + i * 1000, 0) for i in range(5)) +   # 5 ms hole
+                 "".join(sample(816_000 + i * 1000, 6144) for i in range(100)))
+    out_rs, _ = run(log_reseg)
+    expect(out_rs, "UNDERRUN (dry while streaming): 0 episodes",
+           "resegmentation: a 5 ms hole splits under the median threshold, so neither half counts")
+
     # 6i. grain=0. The emitter can log it before a port's format is known, and the header divides
     #      by it to report the cushion in grains. The branch must survive and must still measure
     #      dryness, which is independent of the grain.

@@ -2,8 +2,8 @@
 """Read a PROSPER_AUDIO_QUEUE_TIMELINE log and report how close each audio port came to dry.
 
 The metric this exists for is the ZERO-CROSSING EPISODE, not the mean and not the sample
-percentage. A device queue that empties for 3 ms and refills is an audible underrun, and it is
-invisible to both of the obvious summaries: the one-second delivery average stays at ~100% of real
+percentage. A device queue that empties for 3 ms and refills is the condition an underrun is made
+of, and it is invisible to both of the obvious summaries: the one-second delivery average stays at ~100% of real
 time (that is exactly how #3016 hid), and a percentage-of-samples figure buries a burst of
 contiguous dry samples in a large denominator. So an episode -- a maximal run of consecutive
 samples at zero on one port -- is counted once, and its duration is reported.
