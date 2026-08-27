@@ -4308,7 +4308,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // mapping explains an allocation whose tail reads zero far better than
                             // "the game never wrote it". Printed once per address, from the host
                             // process's own map, because the guest VA is mapped into it.
-                            if (is_array && r.depth > 64u && getenv("PROSPER_SLICEMAPS")) {
+                            if (is_array && r.depth > 64u && PROSPER_ENV_ON("PROSPER_SLICEMAPS")) {
                                 static std::set<uint64_t> shown;
                                 if (shown.insert(r.gpu_addr).second) {
                                     const uint64_t lo = r.gpu_addr;
@@ -4316,15 +4316,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         (uint64_t)r.layer_stride_bytes * r.depth;
                                     FILE* m = fopen("/proc/self/maps", "r");
                                     char line[512];
-                                    uint32_t printed = 0;
-                                    while (m && fgets(line, sizeof line, m) && printed < 8) {
+                                    uint32_t printed = 0, overlapping = 0;
+                                    while (m && fgets(line, sizeof line, m)) {
                                         unsigned long long a = 0, b = 0;
                                         if (sscanf(line, "%llx-%llx", &a, &b) != 2) continue;
                                         if (b <= lo || a >= hi) continue;
+                                        ++overlapping;
+                                        if (printed >= 8u) continue;   // counted below, never hidden
                                         fprintf(stderr, "[slicemaps] 0x%llx..0x%llx overlaps: %s",
                                                 (unsigned long long)lo, (unsigned long long)hi, line);
                                         ++printed;
                                     }
+                                    // The COUNT is the measurement -- a span split across many
+                                    // mappings is precisely the partial-residency case, and a
+                                    // silently truncated list would read as "one clean mapping".
+                                    if (overlapping > printed)
+                                        fprintf(stderr, "[slicemaps]   ... %u overlapping mapping(s) "
+                                                        "total, %u shown\n", overlapping, printed);
                                     if (m) fclose(m);
                                     if (!printed)
                                         fprintf(stderr, "[slicemaps] 0x%llx..0x%llx has NO mapping "
@@ -4332,9 +4340,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 (unsigned long long)lo, (unsigned long long)hi);
                                 }
                             }
-                            if (is_array && r.depth > 64u && getenv("PROSPER_SLICEWATCH")) {
-                                static uint64_t watched = 0;
-                                static bool announced_zero = false, announced_nz = false;
+                            if (is_array && r.depth > 64u && PROSPER_ENV_ON("PROSPER_SLICEWATCH")) {
+                                // Per-address, not global: with two arrays in flight a global flag
+                                // lets the first silence the second's report entirely.
+                                static std::map<uint64_t, uint64_t> watched_by_addr;
+                                static std::set<uint64_t> said_zero, said_nz;
+                                uint64_t& watched = watched_by_addr[r.gpu_addr];
                                 const uint64_t stride = r.layer_stride_bytes
                                     ? r.layer_stride_bytes
                                     : (uint64_t)tw * th;  // conservative
@@ -4345,16 +4356,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 bool nz = false;
                                 for (size_t k = 0; k < got && !nz; ++k) nz = buf[k] != 0;
                                 ++watched;
-                                if (!nz && !announced_zero) {
-                                    announced_zero = true;
+                                if (!nz && said_zero.insert(r.gpu_addr).second) {
                                     fprintf(stderr, "[slicewatch] slice %llu of 0x%llx reads ZERO "
                                                     "(got=%zu) on reference %llu\n",
                                             (unsigned long long)probe_slice,
                                             (unsigned long long)r.gpu_addr, got,
                                             (unsigned long long)watched);
                                 }
-                                if (nz && !announced_nz) {
-                                    announced_nz = true;
+                                if (nz && said_nz.insert(r.gpu_addr).second) {
                                     fprintf(stderr, "[slicewatch] slice %llu of 0x%llx BECAME "
                                                     "NON-ZERO on reference %llu -- the guest filled "
                                                     "it after our decode\n",
@@ -5347,10 +5356,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     const uint64_t selected_addr = face_base(fface, selected_span) +
                                         (r.in_mip_tail ? 0u : r.layer_mip_offset_bytes);
                                     std::vector<uint8_t> linear(linear_bytes, 0);
+                                    size_t nbc_got = 0, nbc_want = 0;
                                     if (ctiled) {
                                         std::vector<uint8_t> traw(selected_span, 0);
                                         const size_t got = copy_resource(
                                             traw.data(), selected_addr, selected_span);
+                                        nbc_got = got; nbc_want = selected_span;
                                         if (got < linear.size()) {
                                             copy_resource(
                                                 linear.data(), selected_addr, linear.size());
@@ -5365,13 +5376,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 r.tile_mode, 0, source_bpt);
                                         }
                                     } else if (linear_padded_read) {
+                                        nbc_want = static_cast<size_t>(tw) * source_bpt * th;
                                         // #325: use the SAME pitch the single-surface path uses
                                         // (`linear_src_row`), not one recomputed from tw/bpt here.
                                         // They can differ -- the single-surface figure honours a
                                         // registered pitch and its own row width -- and slice 0 of
                                         // an array must decode byte-identically to the way that
                                         // same surface decoded before it was treated as an array.
-                                        copy_linear_padded_rows_from(
+                                        nbc_got = copy_linear_padded_rows_from(
                                             linear.data(), selected_addr,
                                             static_cast<size_t>(tw) * source_bpt, th);
                                     } else if (r.layer_stride_bytes) {
@@ -5380,13 +5392,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             : prosper::gpu::linear_sampled_row_pitch(
                                                   tw, source_bpt);
                                         for (uint32_t y = 0; y < th; ++y)
-                                            copy_resource(
+                                            nbc_got += copy_resource(
                                                 linear.data() + static_cast<size_t>(y) * tw * source_bpt,
                                                 selected_addr + static_cast<uint64_t>(y) * row_pitch,
                                                 static_cast<size_t>(tw) * source_bpt);
+                                        nbc_want = static_cast<size_t>(tw) * source_bpt * th;
                                     } else {
-                                        copy_resource(linear.data(), selected_addr, linear.size());
+                                        nbc_got = copy_resource(linear.data(), selected_addr,
+                                                                linear.size());
+                                        nbc_want = linear.size();
                                     }
+                                    // Measured, not assumed: this branch left slice_short_count
+                                    // untouched, so an uncompressed array printed short_reads=0
+                                    // having counted nothing -- a clean result the instrument had
+                                    // not earned, which is the exact failure it exists to prevent.
+                                    if (slice_short_count < slice_count &&
+                                        nbc_want && nbc_got < nbc_want)
+                                        slice_short[slice_short_count++] = fface;
                                     if (f16) {
                                         const uint32_t nc = source_bpt / 2;
                                         for (size_t texel = 0; texel < (size_t)tw * th; ++texel) {
@@ -5436,7 +5458,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // The loop above filled `slice_count` slices. A cube publishes them through
                             // HEIGHT (fr.th = th*6) and an array through LAYERS (fr.sample_count), so the
                             // two completion flags must stay distinct.
-                            if (getenv("PROSPER_SLICEMAP") && !is_cube && slice_count > 1) {
+                            if (PROSPER_ENV_ON("PROSPER_SLICEMAP") && !is_cube && slice_count > 1) {
                                 // #2998: which decoded slices hold content, across the WHOLE range.
                                 // A prefix cannot answer the question -- an array whose first slices
                                 // decode and whose later ones are empty is identical, in every
