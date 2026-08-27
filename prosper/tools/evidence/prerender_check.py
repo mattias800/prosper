@@ -20,11 +20,15 @@ Exit 1 = the check could not run (missing Pillow, unreadable candidate, no compa
 
 Two verdicts share exit 2 on purpose, because they need the same care:
   EXACT      mean abs diff below --threshold (default 1.0/255): the frame IS the stored picture.
-  DOMINATED  at least --overlap percent of the INFORMATIVE pixels (default 90) within 8/255 of a
+  DOMINATED  at least --overlap percent of the INFORMATIVE pixels (default 75) within 8/255 of a
              stored picture. This is the case a mean-only test misses: a real loading screen usually
              has something drawn ON it -- a progress bar, a hint caption -- and a 2%-of-height bar
              is enough to lift the mean past any sane threshold while 98% of the frame is still the
-             asset.
+             asset. DOMINATED also requires the mean to stay under --dominated-mean-max, because a
+             high matching fraction alone is not "mostly the same picture": a real capture scored
+             50.00% overlap at mean 103.88/255 -- half its pixels coincided while the average
+             difference was enormous. Both conditions together separate the measured true positives
+             (means 2.40-10.36) from that case with clear room on each side.
 
 "Informative" is load-bearing and was added after review. Scoring every pixel makes the overlap
 measure DARKNESS rather than identity: a black frame against a black asset scores 100%, and this
@@ -70,7 +74,8 @@ def main(argv):
 
     top = opt('--top', 5, int)
     threshold = opt('--threshold', 1.0, float)
-    overlap = opt('--overlap', 90.0, float)
+    overlap = opt('--overlap', 75.0, float)
+    dominated_mean_max = opt('--dominated-mean-max', 40.0, float)
     floor = opt('--floor', 16, int)
     min_coverage = opt('--min-coverage', 25.0, float)
     structure_floor = opt('--structure-floor', 3.0, float)
@@ -152,22 +157,34 @@ def main(argv):
     print("compared %d same-size asset(s) (%d wrong-size, %d undecodable, %d featureless)"
           % (len(scored), skipped_size, undecodable, featureless_assets))
     for mean, within8, rel, cov in scored[:top]:
-        print("  mean=%7.2f/255  within8=%6.2f%%  coverage=%6.2f%%  %s"
-              % (mean, within8, cov, rel))
+        # Flag rows whose overlap the verdict must ignore, so a reader never sees a strong-looking
+        # within8 sitting above a pass without knowing it was excluded.
+        mark = '' if cov >= min_coverage else '  [overlap unusable: coverage < %.0f%%]' % min_coverage
+        print("  mean=%7.2f/255  within8=%6.2f%%  coverage=%6.2f%%  %s%s"
+              % (mean, within8, cov, rel, mark))
 
     # Every verdict is drawn ONLY from comparisons that carry information. Gating on the best
     # coverage anywhere in the dump is not enough -- an unrelated asset with content would license a
     # verdict about a black-vs-black pair, which is how the first attempt at this gate still reported
     # a pure-black frame as an EXACT MATCH.
     usable = [row for row in scored if row[3] >= min_coverage]
-    if not usable:
-        print("\nno asset carries enough content to compare (best coverage %.2f%%, below the %.2f%%\n"
-              "bar). A near-empty frame and a near-empty asset agree on darkness, not identity, so\n"
-              "NOTHING INFORMATIVE WAS COMPARED -- this is not a pass, and not a match either."
-              % (max(row[3] for row in scored), min_coverage))
-        return 1
 
-    exact = min(usable, key=lambda row: row[0])
+    # The two statistics need DIFFERENT gates, and conflating them hid a match.
+    #
+    # `mean` is a whole-frame average: darkness cannot corrupt it, because a dark region contributes
+    # its (small) real difference rather than being scored as agreement. Two STRUCTURED images at
+    # mean 0.00 are the same image whatever fraction of them is bright. So the exact verdict needs
+    # only the structure gate.
+    #
+    # `within8` is a fraction over a SUBSET, so it is exactly the statistic a small or dark subset
+    # can mislead -- hence the coverage floor, but on that verdict alone.
+    #
+    # Applying the coverage floor to both let the tool PASS a frame byte-identical to the game's own
+    # artwork: `1/PIX/LEGAL_2.DDS` is white text on black, structured (luma sd 49.61) but only 4.09%
+    # above the content floor, so at mean 0.00 it never reached `usable` and the tool reported "no
+    # asset explains this frame". That class -- full-screen pre-rendered pictures on dark
+    # backgrounds: legal notices, credits, title cards, dark loading art -- is precisely trap 230's.
+    exact = min(scored, key=lambda row: row[0])
     if exact[0] < threshold:
         print("\nEXACT MATCH: this frame IS the game's own picture asset %s\n"
               "  mean abs diff %.2f/255, %.2f%% of informative pixels within 8/255 "
@@ -177,8 +194,19 @@ def main(argv):
               % (exact[2], exact[0], exact[1], exact[3]))
         return 2
 
-    dominant = max(usable, key=lambda row: row[1])
-    if dominant[1] >= overlap:
+    if not usable:
+        print("\nno asset carries enough content for an OVERLAP comparison (best coverage %.2f%%,\n"
+              "below the %.2f%% bar), and none is an exact match. A near-empty frame and a\n"
+              "near-empty asset agree on darkness, not identity -- this is not a pass."
+              % (max(row[3] for row in scored), min_coverage))
+        return 1
+
+    # "Mostly the same picture" needs BOTH a high matching fraction and a mean that has not blown
+    # up. Overlap alone admitted a genuine render at 50.00%/mean 103.88 -- half the pixels happened
+    # to coincide while the average difference was enormous, which is not domination by any reading.
+    dominant_pool = [row for row in usable if row[0] <= dominated_mean_max]
+    dominant = max(dominant_pool, key=lambda row: row[1]) if dominant_pool else None
+    if dominant is not None and dominant[1] >= overlap:
         print("\nDOMINATED: %.2f%% of this frame's INFORMATIVE pixels are within 8/255 of the\n"
               "  stored asset %s (coverage %.2f%%, mean abs diff %.2f/255 -- an overlay or caption\n"
               "  lifts the mean, which is why a mean-only test would have passed this).\n"
@@ -188,10 +216,15 @@ def main(argv):
               % (dominant[1], dominant[2], dominant[3], dominant[0]))
         return 2
 
-    print("\nno asset explains this frame (closest informative comparison %.2f/255; highest overlap\n"
-          "%.2f%% with %s at %.2f%% coverage, under the %.2f%% dominance bar). That is not the same\n"
-          "as proving it is rendered 3D; see this tool's scope note."
-          % (exact[0], dominant[1], dominant[2], dominant[3], overlap))
+    if dominant is not None:
+        print("\nno asset explains this frame (closest comparison %.2f/255; highest overlap %.2f%%\n"
+              "with %s at %.2f%% coverage, under the %.2f%% dominance bar). That is not the same as\n"
+              "proving it is rendered 3D; see this tool's scope note."
+              % (exact[0], dominant[1], dominant[2], dominant[3], overlap))
+    else:
+        print("\nno asset explains this frame (closest comparison %.2f/255; no asset combines a\n"
+              "usable overlap with a mean under %.2f/255). That is not the same as proving it is\n"
+              "rendered 3D; see this tool's scope note." % (exact[0], dominated_mean_max))
     return 0
 
 

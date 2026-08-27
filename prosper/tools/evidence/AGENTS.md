@@ -40,9 +40,28 @@ matches at mean 0.00 exactly as a black pair does. So the gate is on **luma stan
 the candidate and of every asset, plus a coverage floor over informative pixels. A featureless frame
 matches nothing at any brightness, and is not progression evidence in the first place.
 
-Measured after the fix: synthetic flat frames (black, near-black, dark, white; 1080p and 4K) against
-all 55 dumps give **0 false matches in 440 comparisons**, down from 17, while every true positive
-still fires.
+**A high matching fraction alone is not domination either.** A real capture scored 50.00% overlap at
+mean 103.88/255 — half its pixels coincided with an asset while the average difference was enormous.
+So DOMINATED requires both a high overlap and a bounded mean.
+
+**And the two statistics need different gates**, which conflating them hid: `mean` is a whole-frame
+average that darkness cannot corrupt, so two structured images at mean 0.00 are the same image
+whatever fraction is bright. Applying the coverage floor to the mean as well made the tool *pass*
+`LEGAL_2.DDS` — white text on black, structured but only 4.09% above the content floor — handed back
+as its own candidate. Exact matching is therefore gated on structure only; the overlap fraction, the
+statistic a small subset really can mislead, keeps the coverage floor.
+
+Measured on the current thresholds, all positive instances constructed by hand outside the tool:
+
+| check | result |
+| --- | --- |
+| synthetic flat frames (black/near-black/dark/white, 1080p+4K) x 55 dumps | **0 false matches / 440** |
+| true positives (retracted frame, overlays to 20%, both title screens, `LEGAL_1..4`) | all caught |
+| worst genuine render clearing the mean ceiling | **2.87%** overlap, against a 75% bar |
+| featureless assets, of 1490 large assets across all dumps | 18 (1.2%), all sd <= 1.134; next real asset sd 4.653 |
+
+The last row is why the structure floor is 3.0 rather than a number picked by eye: it sits in an
+empty band with clean margin on both sides.
 
 **The rule these tools follow, and the reason they exit the way they do:** *could not check* must
 never be reportable as *checked and clean*. `prerender_check.py` exits 0 only when it actually
