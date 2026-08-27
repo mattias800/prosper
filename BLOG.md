@@ -34,20 +34,24 @@ guest deliver less often, not more.
 
 No picture — this one is a number. #3072 has the hunt.
 
-### Tomb Raider's world is textured
+### ~~Tomb Raider's world is textured~~ — RETRACTED, that was a loading screen
 
-Croft Manor's brickwork, stone, leaded windows, dolphin fountain, grass and foliage — the world was
-untextured until now because the whole level is drawn from one 256-slice array and prosper only ever
-read slice 0.
+**This entry was wrong and its picture is withdrawn.** The image published as Croft Manor's textured
+brickwork was the game blitting its own pre-rendered loading picture, `2/PIX/HD/MANSION.DDS` —
+pixel-identical to the checked-in capture (mean abs diff 0.02/255, 100% of pixels within 8/255).
+Displaying a full-screen 2D image requires no world rendering at all, so it never showed what it was
+captioned as showing. The project owner spotted it; no automated check did, and none could have.
 
-![Croft Manor through a brick arch: red brickwork and stone quoins, leaded windows, the dolphin fountain on a lawn, gravel path and foliage](assets/screenshots/tomb-raider-croft-manor-textured.png)
+It is left here rather than deleted because the blog's own rule is that it records what was claimed
+and when. Recorded as instrument trap 230 — it looked *better* than the emulator could plausibly
+render, and that is the tell.
 
-![The same view before: geometry correct but every surface a flat cream colour](assets/screenshots/tomb-raider-croft-manor-untextured.png)
+![The genuine render of the same level: geometry correct but every surface a flat cream colour](assets/screenshots/tomb-raider-croft-manor-untextured.png)
 
 ![Tomb Raider II title screen: Lara's model, the logo, game-select thumbnails and the Lara's Home menu entry](assets/screenshots/tomb-raider-title-screen-tr2.png)
 
-Interiors still put textures on the wrong surfaces.
-[#325](https://github.com/mattias800/prosper/issues/325)
+[#325](https://github.com/mattias800/prosper/issues/325) · [#2998](https://github.com/mattias800/prosper/issues/2998)
+
 
 ### What "the wrong surfaces" actually looks like
 
@@ -73,6 +77,7 @@ until now the HUD and radar drew over nothing.
 
 Gameplay runs at a few frames a second, and the texture path is most of the frame.
 [#1873](https://github.com/mattias800/prosper/issues/1873)
+
 
 ### Tomb Raider's world stopped being a pile of shards
 
@@ -435,6 +440,7 @@ yesterday and was not true yesterday. And we know what it has to read: the guest
 write each one, plus one whole-chain view to read the finished thing back. The levels are sitting in
 guest memory the whole time, at offsets prosper already computes correctly for each of those twelve
 single-level descriptors. It just has never been able to look at them together.
+
 
 ### The Messenger's title screen runs at 206 fps and 0 fps at the same time
 

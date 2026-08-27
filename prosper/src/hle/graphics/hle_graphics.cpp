@@ -729,14 +729,29 @@ HLE(g_vo_resstatus)   {
 // which is a statement about where the boundaries fall, not about how far apart they are. Anchored
 // on first use so both are process-relative, exactly as the previous status-only anchor was.
 //
-// It is NOT the only vblank clock in the process, and this comment previously claimed it was.
-// hle_kernel_time.cpp's `vblank_pump` (:731) posts the VideoOut vblank kevent from its own
-// `nanosleep(16666667)` loop — 60.000 Hz, its own phase, started when the first equeue source is
-// registered. So the kevent stream and this grid drift by roughly one tick per second and their
-// boundaries do not coincide. Aligning them is a real follow-up; asserting they are aligned is
-// wrong, and a title that cross-checks the two would see the disagreement.
+// It is no longer a second clock. hle_kernel_time.cpp's `vblank_pump` -- the thread that posts the
+// VideoOut vblank kevent to registered equeues -- used to run its own `nanosleep(16666667)` loop
+// at 60.000 Hz and its own phase, so the kevent stream and this grid disagreed in BOTH period and
+// phase, and this comment recorded aligning them as an open follow-up. #3024 closed it: the pump
+// now derives its schedule from the two accessors published just below, so there is one origin and
+// one period in the process. The alignment is therefore asserted here on purpose -- it is what the
+// pump computes from, not a hope about two constants matching.
 // Internal linkage on purpose: the "epoch before now" ordering invariant below is only
-// enforceable by reading this one file, so nothing outside it may reach these.
+// enforceable by reading this one file, so nothing outside it may reach these DIRECTLY. The
+// two `extern "C"` accessors further down publish the origin and the period as VALUES, so no
+// caller can retarget the grid.
+//
+// But the FIRST caller does set where it starts, and after #3024 that caller is usually the
+// kevent pump. `vblank_epoch_ns()` is a first-use-anchored static, and the pump's read at
+// hle_kernel_time.cpp reaches it as soon as a title registers a vblank OR A FLIP event (both
+// call the same ensure_pump) -- typically before the title's first GetVblankStatus or
+// WaitVblank call. So the epoch is now normally anchored at event registration rather than at
+// the first guest status query, which
+// moves GetVblankStatus's first `count` and processTime's baseline, and shifts WaitVblank's
+// wake instants in PHASE with them (they derive from the same t0). That is a deliberate
+// consequence on every platform, not only Windows, and it is more faithful -- the epoch now
+// tracks when the title started caring about vblanks rather than when it first asked -- but
+// it is a change, and a comment claiming callers cannot move the grid would have hidden it.
 namespace {
 constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
 // Deterministic clock used only by test_videoout's phase-integration check. Zero leaves the
@@ -763,6 +778,14 @@ void vblank_sleep_until_ns(uint64_t deadline_ns) {
     host::sleep_until_steady_ns(deadline_ns);
 }
 }  // namespace
+
+// The kernel equeue vblank pump (hle_kernel_time.cpp) schedules on THIS grid, so the kevent
+// stream and the vblank status/wait paths above become one clock in both phase and period.
+// They were two drifting clocks before -- the follow-up this file records at its own timebase
+// comment ("aligning them is a real follow-up; asserting they are aligned is wrong"). Sharing
+// the origin and the period here is what closes it (#3024).
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns() { return vblank_epoch_ns(); }
+extern "C" uint64_t prosper_vo_vblank_period_ns() { return kVblankNs; }
 
 extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns) {
     g_vblank_test_now_ns.store(now_ns, std::memory_order_relaxed);
