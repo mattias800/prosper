@@ -745,15 +745,22 @@ namespace {
         const uintptr_t slots = (hi - base) / sizeof(uint64_t);
         return slots < (uintptr_t)want ? (int)slots : want;
     }
-    void log_main_dmem_allocation(uint64_t len, uint64_t phys,
-                                  const volatile uint64_t* frame) {
-        // Preserve the unarmed path: no stack query, interner construction, or extra formatting unless
-        // PROSPER_DMEM_CALLER was explicitly requested. MEMLOG alone keeps its historical line byte-for-byte.
-        if (!dmem_caller_log()) {
-            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
-                 (unsigned long long)len, (unsigned long long)phys);
-            return;
-        }
+    // #2998: allocation attribution, shared by every direct-memory entry point.
+    //
+    // Only sceKernelAllocateMainDirectMemory used to build a caller chain. A title that allocates
+    // through sceKernelAllocateDirectMemory instead therefore produced no chain id at all, which
+    // made PROSPER_DMEM_WRITE_TRACE structurally unable to name a single byte it owns -- the
+    // selector is keyed on caller-chain plus allocation size, and neither was ever published for
+    // that API. Tomb Raider I-III takes exactly this path (two 1 GiB allocations), so the trace
+    // could not be pointed at its texture atlas however it was configured. That read as "the
+    // instrument cannot target a sub-allocation" when the truth was "this allocator never reports".
+    //
+    // The interner is one shared static on purpose: a second interner would issue ids from its own
+    // sequence, so one id would mean two different call sites depending on which API allocated, and
+    // a configured trace would silently arm on the wrong memory rather than fail to arm.
+    DmemCallerChainResult attribute_dmem_allocation(uint64_t len, uint64_t phys,
+                                                    const volatile uint64_t* frame,
+                                                    const char* api) {
         constexpr int kWant = 6;          // return addresses to report
         constexpr int kScan = 160;        // stack slots to walk
         // Never read past the mapped end of this stack (#1755).
@@ -775,8 +782,45 @@ namespace {
             phys, len,
             correlation.state == DmemCallerChainState::Known ? correlation.id : 0);
 
+        if (!correlation.first) return correlation;
+        if (correlation.state == DmemCallerChainState::Overflow) {
+            // The cap is a state, not a population: every later MEMLOG record says `overflow`.
+            fprintf(stderr, "[dmem-caller] caller-chain=overflow: chain limit %zu reached;"
+                            " further distinct call chains are NOT retained\n",
+                    DmemCallerChainInterner<>::capacity());
+            return correlation;
+        }
+        if (correlation.state == DmemCallerChainState::Unknown) {
+            fprintf(stderr,
+                    "[dmem-caller] caller-chain=unknown %s len=0x%llx"
+                    " from <no guest return addresses>\n",
+                    api, (unsigned long long)len);
+            return correlation;
+        }
+        DmemCallerChainFrame frames[kWant] = {};
+        for (int i = 0; i < n; ++i) {
+            frames[i].module = guest_module_name(ra[i]);
+            frames[i].offset = guest_module_offset(ra[i]);
+        }
+        write_dmem_caller_chain_definition(
+            stderr, correlation.id, len, frames, static_cast<size_t>(n), scan, kScan, api);
+        return correlation;
+    }
+
+    void log_main_dmem_allocation(uint64_t len, uint64_t phys,
+                                  const volatile uint64_t* frame) {
+        // Preserve the unarmed path: no stack query, interner construction, or extra formatting unless
+        // PROSPER_DMEM_CALLER was explicitly requested. MEMLOG alone keeps its historical line byte-for-byte.
+        if (!dmem_caller_log()) {
+            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
+                 (unsigned long long)len, (unsigned long long)phys);
+            return;
+        }
+        const DmemCallerChainResult correlation =
+            attribute_dmem_allocation(len, phys, frame, "alloc_main_dmem");
+
         // MEMLOG is the per-allocation census. Give every one of its allocation records a correlation
-        // token; the full stack remains one line per distinct bounded ID below.
+        // token; the full stack remains one line per distinct bounded ID, printed by the helper above.
         if (!dmem_caller_chain_correlates_allocation(correlation)) {
             MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
                  (unsigned long long)len, (unsigned long long)phys);
@@ -798,29 +842,6 @@ namespace {
                 break;
             }
         }
-
-        if (!correlation.first) return;
-        if (correlation.state == DmemCallerChainState::Overflow) {
-            // The cap is a state, not a population: every later MEMLOG record says `overflow`.
-            fprintf(stderr, "[dmem-caller] caller-chain=overflow: chain limit %zu reached;"
-                            " further distinct call chains are NOT retained\n",
-                    DmemCallerChainInterner<>::capacity());
-            return;
-        }
-        if (correlation.state == DmemCallerChainState::Unknown) {
-            fprintf(stderr,
-                    "[dmem-caller] caller-chain=unknown alloc_main_dmem len=0x%llx"
-                    " from <no guest return addresses>\n",
-                    (unsigned long long)len);
-            return;
-        }
-        DmemCallerChainFrame frames[kWant] = {};
-        for (int i = 0; i < n; ++i) {
-            frames[i].module = guest_module_name(ra[i]);
-            frames[i].offset = guest_module_offset(ra[i]);
-        }
-        write_dmem_caller_chain_definition(
-            stderr, correlation.id, len, frames, static_cast<size_t>(n), scan, kScan);
     }
 
     constexpr uint32_t kVirtualQueryFlexible = 0x01;
@@ -1645,6 +1666,12 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
     MLOG("alloc_dmem range=[0x%llx,0x%llx) len=0x%llx align=0x%llx type=0x%llx -> phys=0x%llx\n",
          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
          (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)off);
+    // #2998: publish the caller chain for THIS allocator too. Without it PROSPER_DMEM_WRITE_TRACE
+    // can never select memory obtained here, because its selector is keyed on a chain id that was
+    // only ever minted for sceKernelAllocateMainDirectMemory.
+    if (dmem_caller_log())
+        attribute_dmem_allocation(sz, off, (const volatile uint64_t*)__builtin_frame_address(0),
+                                  "alloc_dmem");
     return 0;
 }
 
@@ -3687,15 +3714,22 @@ namespace {
         const uintptr_t slots = (hi - base) / sizeof(uint64_t);
         return slots < (uintptr_t)want ? (int)slots : want;
     }
-    void log_main_dmem_allocation(uint64_t len, uint64_t phys,
-                                  const volatile uint64_t* frame) {
-        // Preserve the unarmed path: no stack query, interner construction, or extra formatting unless
-        // PROSPER_DMEM_CALLER was explicitly requested. MEMLOG alone keeps its historical line byte-for-byte.
-        if (!dmem_caller_log()) {
-            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
-                 (unsigned long long)len, (unsigned long long)phys);
-            return;
-        }
+    // #2998: allocation attribution, shared by every direct-memory entry point.
+    //
+    // Only sceKernelAllocateMainDirectMemory used to build a caller chain. A title that allocates
+    // through sceKernelAllocateDirectMemory instead therefore produced no chain id at all, which
+    // made PROSPER_DMEM_WRITE_TRACE structurally unable to name a single byte it owns -- the
+    // selector is keyed on caller-chain plus allocation size, and neither was ever published for
+    // that API. Tomb Raider I-III takes exactly this path (two 1 GiB allocations), so the trace
+    // could not be pointed at its texture atlas however it was configured. That read as "the
+    // instrument cannot target a sub-allocation" when the truth was "this allocator never reports".
+    //
+    // The interner is one shared static on purpose: a second interner would issue ids from its own
+    // sequence, so one id would mean two different call sites depending on which API allocated, and
+    // a configured trace would silently arm on the wrong memory rather than fail to arm.
+    DmemCallerChainResult attribute_dmem_allocation(uint64_t len, uint64_t phys,
+                                                    const volatile uint64_t* frame,
+                                                    const char* api) {
         constexpr int kWant = 6;          // return addresses to report
         constexpr int kScan = 160;        // stack slots to walk
         // Never read past the mapped end of this stack (#1755).
@@ -3717,8 +3751,45 @@ namespace {
             phys, len,
             correlation.state == DmemCallerChainState::Known ? correlation.id : 0);
 
+        if (!correlation.first) return correlation;
+        if (correlation.state == DmemCallerChainState::Overflow) {
+            // The cap is a state, not a population: every later MEMLOG record says `overflow`.
+            fprintf(stderr, "[dmem-caller] caller-chain=overflow: chain limit %zu reached;"
+                            " further distinct call chains are NOT retained\n",
+                    DmemCallerChainInterner<>::capacity());
+            return correlation;
+        }
+        if (correlation.state == DmemCallerChainState::Unknown) {
+            fprintf(stderr,
+                    "[dmem-caller] caller-chain=unknown %s len=0x%llx"
+                    " from <no guest return addresses>\n",
+                    api, (unsigned long long)len);
+            return correlation;
+        }
+        DmemCallerChainFrame frames[kWant] = {};
+        for (int i = 0; i < n; ++i) {
+            frames[i].module = guest_module_name(ra[i]);
+            frames[i].offset = guest_module_offset(ra[i]);
+        }
+        write_dmem_caller_chain_definition(
+            stderr, correlation.id, len, frames, static_cast<size_t>(n), scan, kScan, api);
+        return correlation;
+    }
+
+    void log_main_dmem_allocation(uint64_t len, uint64_t phys,
+                                  const volatile uint64_t* frame) {
+        // Preserve the unarmed path: no stack query, interner construction, or extra formatting unless
+        // PROSPER_DMEM_CALLER was explicitly requested. MEMLOG alone keeps its historical line byte-for-byte.
+        if (!dmem_caller_log()) {
+            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
+                 (unsigned long long)len, (unsigned long long)phys);
+            return;
+        }
+        const DmemCallerChainResult correlation =
+            attribute_dmem_allocation(len, phys, frame, "alloc_main_dmem");
+
         // MEMLOG is the per-allocation census. Give every one of its allocation records a correlation
-        // token; the full stack remains one line per distinct bounded ID below.
+        // token; the full stack remains one line per distinct bounded ID, printed by the helper above.
         if (!dmem_caller_chain_correlates_allocation(correlation)) {
             MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
                  (unsigned long long)len, (unsigned long long)phys);
@@ -3740,29 +3811,6 @@ namespace {
                 break;
             }
         }
-
-        if (!correlation.first) return;
-        if (correlation.state == DmemCallerChainState::Overflow) {
-            // The cap is a state, not a population: every later MEMLOG record says `overflow`.
-            fprintf(stderr, "[dmem-caller] caller-chain=overflow: chain limit %zu reached;"
-                            " further distinct call chains are NOT retained\n",
-                    DmemCallerChainInterner<>::capacity());
-            return;
-        }
-        if (correlation.state == DmemCallerChainState::Unknown) {
-            fprintf(stderr,
-                    "[dmem-caller] caller-chain=unknown alloc_main_dmem len=0x%llx"
-                    " from <no guest return addresses>\n",
-                    (unsigned long long)len);
-            return;
-        }
-        DmemCallerChainFrame frames[kWant] = {};
-        for (int i = 0; i < n; ++i) {
-            frames[i].module = guest_module_name(ra[i]);
-            frames[i].offset = guest_module_offset(ra[i]);
-        }
-        write_dmem_caller_chain_definition(
-            stderr, correlation.id, len, frames, static_cast<size_t>(n), scan, kScan);
     }
 
     // --- VA tracker + direct-memory pool: PURE logic, copied verbatim from the Linux path -----
@@ -6324,6 +6372,10 @@ HLE(k_alloc_dmem) {
     dmem_prepare_allocation(off, sz);
     *(uint64_t*)a5 = off;
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
+    // #2998: publish the caller chain for THIS allocator too -- see the Linux path.
+    if (dmem_caller_log())
+        attribute_dmem_allocation(sz, off, (const volatile uint64_t*)__builtin_frame_address(0),
+                                  "alloc_dmem");
     return 0;
 }
 // sceKernelAllocateMainDirectMemory(len, align, memType, off_t* physOut) — physOut at arg3.
