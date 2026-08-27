@@ -185,7 +185,8 @@ def main():
                         help="the playback device's sample rate (default 48000)")
     parser.add_argument("--channels", type=int, default=2, help="output channels (default 2)")
     parser.add_argument("--bytes-per-frame", type=int, default=4,
-                        help="bytes per SAMPLE per channel as delivered (4 = f32, 2 = s16; default 4). Only used when a log predates the emitter's (grain=N) field"
+                        help="bytes per sample per channel as delivered (4 = f32, 2 = s16; default 4);"
+                             " only consulted for logs predating the emitter (grain=N) field")
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
