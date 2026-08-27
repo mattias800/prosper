@@ -120,21 +120,30 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
-- **The interior's wrong textures are NOT the layer index arriving wrong, NOT stale cache, NOT
-  interpolation, and NOT the stride.** What they are is still open, but the search space is much
-  smaller. Measured, in order:
-  - `PROSPER_SLICEMAP=1` (new): the 512x512x256 world atlas decodes with **14 of 256 slices holding
-    content**, all at the start of the range. The 2048x2048x29 array decodes **29 of 29**.
-  - The atlas is decoded **once** per run. With `PROSPER_NO_TEXTURE_DECODE_CACHE=1` it re-decodes
-    **233 times and reports 14 every time**, so a stale cache is not hiding later-streamed slices.
-  - The world shader asks for slice **248**: `vertexIndex*24 + 3` from binding 7, a byte that is
-    constant across all 4,206 vertices of the draw. Traced through
-    `OpBitFieldUExtract(dword, 24, 8)` to the fragment varying at Location 1.
-  - `PROSPER_FORCE_LAYER=248` produces a **completely different frame** from the unforced run
-    (262 colours vs 122,087), so the unforced draws are not all sampling 248 -- different draws use
-    different slices.
-  - `PROSPER_FORCE_LAYER=10` gives full-screen content (184,541 colours); **200 gives 262 colours,
-    almost entirely black**. Slices above the populated range are empty.
+- **The interior's wrong textures are not prosper mis-reading the atlas. The atlas is genuinely
+  almost empty in GUEST memory, for the whole run.** Measured, each point with the control that
+  makes it mean something:
+  - `PROSPER_SLICEMAP=1`: the 512x512x256 world atlas decodes with **slices 0-13 populated and
+    14-255 empty** — contiguous, from the full 256-character map. **`short_reads=0`**, so every
+    slice was read completely; "empty" here is not "unreadable". (The count is a lower bound: the
+    scan samples one byte in 61.)
+  - `PROSPER_SLICEWATCH=1` samples GUEST memory at slice 248 on the reuse path, which runs about
+    138,000 times per route: it reads **zero on the first reference and never becomes non-zero**.
+    So the guest never fills it, at any point — which retires the decode-cache hypothesis properly.
+    An earlier attempt to retire it was **void**: the `PROSPER_NO_TEXTURE_DECODE_CACHE` run never
+    left the title screen (its colour count sits at the title's ~210k for all 300 s), so its 233
+    re-decodes all happened before the level streamed anything.
+  - `PROSPER_COMPUTE_BINDS` over the atlas plus three controls: the one line printed is a **control**
+    — the compute program binds a different 4 MiB buffer and executes — so no compute STORE produces
+    this atlas.
+  - The world shader samples slice **248**, traced twice: `vertexIndex*24 + 3` from binding 7, a byte
+    constant across all 4,206 vertices, through `OpBitFieldUExtract(dword, 24, 8)` to the fragment
+    varying.
+  So the guest samples a slice that nothing ever wrote, and prosper reads that correctly. **The
+  missing piece is an atlas upload path prosper does not perform**, not the array plumbing, which is
+  now measured end to end. Compute is excluded; DMA is untested (a `PROSPER_DMA_WATCH_DST` run was
+  silent but had no control, so it is not evidence).
+
 - **`r.depth = 256` is NOT a mis-decode.** The raw descriptor (`PROSPER_TDUMP=512x512`) reads
   `t = 20491cc0 cb600000 007fc07f d0550fac 000000ff 00700050 00000000 00000000` ->
   `512x512 fmt=182 type=13 tile=5 mips=0..5 depth=256 base_array=0`. The layer count, the base slice

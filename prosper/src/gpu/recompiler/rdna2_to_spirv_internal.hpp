@@ -1853,6 +1853,20 @@ struct SpirvCompute {
     // lowering a plain SAMPLE through the explicit-LOD helper would pin every textured surface to
     // the base level. Outside a fragment stage there are no derivatives, so LOD 0 is the only
     // legal choice -- which is exactly what image_sample_2d already does for the non-array case.
+    // PROSPER_FORCE_LAYER=<n>: the constant array layer to substitute, or -1 for off. A malformed
+    // or empty value DISABLES the probe rather than forcing layer 0 -- a typo must cost a
+    // measurement, never produce a wrong one silently.
+    static int forced_array_layer() {
+        static const int v = [] {
+            const char* e = getenv("PROSPER_FORCE_LAYER");
+            if (!e || !*e) return -1;
+            char* end = nullptr;
+            const long n = strtol(e, &end, 10);
+            if (!end || *end || n < 0 || n > 65535) return -1;
+            return (int)n;
+        }();
+        return v;
+    }
     void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                uint32_t layer_bits, uint32_t out[4]) {
         uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
@@ -1863,8 +1877,7 @@ struct SpirvCompute {
         //
         // This forces guest-visible state, so its output illustrates an investigation and is never
         // acceptance evidence for a rendered frame.
-        static const int forced_layer = [] {
-            const char* e = getenv("PROSPER_FORCE_LAYER"); return e ? atoi(e) : -1; }();
+        const int forced_layer = forced_array_layer();
         uint32_t layer_use = bcf(layer_bits);
         if (forced_layer >= 0) {
             layer_use = fconstf((float)forced_layer);
@@ -1886,8 +1899,14 @@ struct SpirvCompute {
     void image_sample_lod_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                    uint32_t layer_bits, uint32_t lod_bits, uint32_t out[4]) {
         uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        // #2998: PROSPER_FORCE_LAYER applies HERE TOO. Covering only the implicit-LOD sampler is
+        // the scope error this session already made once and had to withdraw: the census puts most
+        // of this title's array events on other opcodes, so a probe on one helper produces a null
+        // that means nothing about the rest.
+        uint32_t lod_layer = forced_array_layer() >= 0
+            ? fconstf((float)forced_array_layer()) : bcf(layer_bits);
         uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), lod_layer});
         uint32_t res = id(); put(code, Op_ImageSampleExplicitLod,
                                  {texture_vec4(binding), res, si, coord,
                                   ImgOp_Lod, bcf(lod_bits)});

@@ -4296,6 +4296,44 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 fr.sample_count = decoded_reuse->layers;
                                 fr.tex_byte_size = decoded_reuse->pixels_bytes;
                             }
+                            // #2998: does the GUEST fill high slices after we decoded the atlas?
+                            // The decode happens once and is then served from cache, so a guest that
+                            // streams slices in later is invisible to every instrument that samples
+                            // the DECODE. This samples guest memory directly on the reuse path,
+                            // which runs on every reference, and reports the first time a high slice
+                            // becomes non-zero. If that ever fires, the cache is serving stale
+                            // pixels and the decode simply happened too early.
+                            if (is_array && r.depth > 64u && getenv("PROSPER_SLICEWATCH")) {
+                                static uint64_t watched = 0;
+                                static bool announced_zero = false, announced_nz = false;
+                                const uint64_t stride = r.layer_stride_bytes
+                                    ? r.layer_stride_bytes
+                                    : (uint64_t)tw * th;  // conservative
+                                const uint64_t probe_slice = r.depth - 8u;
+                                const uint64_t addr = r.gpu_addr + probe_slice * stride;
+                                uint8_t buf[256] = {0};
+                                const size_t got = copy_resource(buf, addr, sizeof buf);
+                                bool nz = false;
+                                for (size_t k = 0; k < got && !nz; ++k) nz = buf[k] != 0;
+                                ++watched;
+                                if (!nz && !announced_zero) {
+                                    announced_zero = true;
+                                    fprintf(stderr, "[slicewatch] slice %llu of 0x%llx reads ZERO "
+                                                    "(got=%zu) on reference %llu\n",
+                                            (unsigned long long)probe_slice,
+                                            (unsigned long long)r.gpu_addr, got,
+                                            (unsigned long long)watched);
+                                }
+                                if (nz && !announced_nz) {
+                                    announced_nz = true;
+                                    fprintf(stderr, "[slicewatch] slice %llu of 0x%llx BECAME "
+                                                    "NON-ZERO on reference %llu -- the guest filled "
+                                                    "it after our decode\n",
+                                            (unsigned long long)probe_slice,
+                                            (unsigned long long)r.gpu_addr,
+                                            (unsigned long long)watched);
+                                }
+                            }
                             fr.td = is_volume ? r.depth : 1u;
                             fr.img_dim = r.img_dim;
                             fr.texture_format = decoded_reuse->texture_format;
@@ -5202,6 +5240,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 return r.gpu_addr + static_cast<uint64_t>(face) * stride;
                             };
                             const uint32_t slice_count = is_cube ? 6u : decoded_layers;
+                            std::vector<uint32_t> slice_short(slice_count, 0);
+                            uint32_t slice_short_count = 0;
                             // Reports the GUEST's declared layout only. Deliberately not the
                             // decoded slice count: that is what PROSPER_ARRAY_DECODE_BUDGET_MIB
                             // measures, and a diagnostic that prints a field a different switch
@@ -5233,9 +5273,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     const uint64_t selected_addr = face_base(fface, selected_span) +
                                         (r.in_mip_tail ? 0u : r.layer_mip_offset_bytes);
                                     std::vector<uint8_t> lin(comp, 0);
+                                    // #2998: keep the byte count. safe_copy stops at the first
+                                    // uncommitted 64 KiB page and leaves the tail zero-filled, so a
+                                    // slice prosper could not READ is byte-identical to one the
+                                    // guest never WROTE -- and every "the atlas is mostly empty"
+                                    // conclusion turns on telling those apart. The non-BC branch
+                                    // below already checks its `got`; this one discarded it.
+                                    size_t slice_got = 0;
                                     if (ctiled) {
                                         std::vector<uint8_t> traw(selected_span, 0);
-                                        copy_resource(
+                                        slice_got = copy_resource(
                                             traw.data(), selected_addr, selected_span);
                                         if (r.in_mip_tail)
                                             prosper::gpu::detile_elements_level(
@@ -5246,12 +5293,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 lin.data(), traw.data(), traw.size(), bw, bh, cb,
                                                 r.tile_mode);
                                     } else if (linear_padded_read) {
-                                        copy_linear_padded_rows_from(
+                                        slice_got = copy_linear_padded_rows_from(
                                             lin.data(), selected_addr,
                                             static_cast<size_t>(bw) * cb, bh);
                                     } else {
-                                        copy_resource(lin.data(), selected_addr, comp);
+                                        slice_got = copy_resource(lin.data(), selected_addr, comp);
                                     }
+                                    if (slice_short_count < slice_count &&
+                                        slice_got < (ctiled ? selected_span : comp))
+                                        slice_short[slice_short_count++] = fface;
                                     std::vector<uint8_t> face((size_t)tw * th * 4, 0);
                                     prosper::gpu::bc_decode_surface(face.data(), lin.data(), lin.size(), tw, th, r.format);
                                     std::memcpy(slice, face.data(), face.size());
@@ -5358,33 +5408,44 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // HEIGHT (fr.th = th*6) and an array through LAYERS (fr.sample_count), so the
                             // two completion flags must stay distinct.
                             if (getenv("PROSPER_SLICEMAP") && !is_cube && slice_count > 1) {
-                                // #2998: which decoded slices actually hold content, across the
-                                // WHOLE range rather than a prefix. Written because a prefix cannot
-                                // answer the question that matters -- an array whose first slices
-                                // decode and whose later ones are empty looks identical, in every
-                                // per-layer checksum of the first eight, to one that decoded
-                                // completely. The SHAPE of the map is the measurement: content
-                                // concentrated at the start means the addressing walks off the
-                                // populated data (or the guest has not written it), while gaps
-                                // spread through the range mean something else.
+                                // #2998: which decoded slices hold content, across the WHOLE range.
+                                // A prefix cannot answer the question -- an array whose first slices
+                                // decode and whose later ones are empty is identical, in every
+                                // per-layer checksum of the first eight, to one that decoded fully.
                                 //
-                                // It found the fact that matters for Tomb Raider: 14 of 256.
+                                // Two things this MUST report alongside the map, because without
+                                // them its output is not interpretable:
+                                //  - the sample rate. "empty" here means "no non-zero byte at a
+                                //    sampled offset", and the sample is sparse, so a slice with
+                                //    little content can read empty. It is a lower bound on content,
+                                //    never an exact count.
+                                //  - the SHORT READS. safe_copy stops at the first uncommitted page
+                                //    and zero-fills the rest, so a slice prosper could not READ is
+                                //    byte-identical to one the guest never WROTE. Reporting empties
+                                //    without this invites exactly the wrong conclusion, which is the
+                                //    one it invited from me.
                                 const size_t lsz = (size_t)tw * th * 4u;
+                                const size_t step = 61u;
                                 std::string map;
                                 uint32_t nonempty = 0;
                                 for (uint32_t L = 0; L < slice_count; ++L) {
                                     if ((size_t)(L + 1) * lsz > texture_pixels.size()) break;
                                     const uint8_t* q = texture_pixels.data() + (size_t)L * lsz;
                                     bool any = false;
-                                    for (size_t i = 0; i < lsz && !any; i += 61u)
-                                        any = (q[i] != 0);
+                                    for (size_t k = 0; k < lsz && !any; k += step) any = (q[k] != 0);
                                     nonempty += any;
-                                    if ((L % 8u) == 0u) map += any ? '#' : '.';
+                                    map += any ? '#' : '.';
                                 }
-                                fprintf(stderr, "[slicemap] addr=0x%llx %ux%u slices=%u nonempty=%u "
-                                                "map(every 8th)=%s\n",
+                                fprintf(stderr,
+                                        "[slicemap] addr=0x%llx %ux%u slices=%u nonempty>=%u "
+                                        "(1 byte in %zu sampled) short_reads=%u%s map=%s\n",
                                         (unsigned long long)r.gpu_addr, tw, th, slice_count,
-                                        nonempty, map.c_str());
+                                        nonempty, step, slice_short_count,
+                                        slice_short_count ? " <- EMPTY MAY MEAN UNREADABLE" : "",
+                                        map.c_str());
+                                if (slice_short_count)
+                                    fprintf(stderr, "[slicemap]   first short slice=%u\n",
+                                            slice_short[0]);
                             }
                             if (is_cube) cube_done = true; else array_done = true;
                             if (resource_compute_depth_hybrid && !decoded_reuse) {
