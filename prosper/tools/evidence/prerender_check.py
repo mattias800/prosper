@@ -20,10 +20,21 @@ Exit 1 = the check could not run (missing Pillow, unreadable candidate, no compa
 
 Two verdicts share exit 2 on purpose, because they need the same care:
   EXACT      mean abs diff below --threshold (default 1.0/255): the frame IS the stored picture.
-  DOMINATED  at least --overlap percent of pixels (default 90) within 8/255 of a stored picture.
-             This is the case a mean-only test misses: a real loading screen usually has something
-             drawn ON it -- a progress bar, a hint caption -- and a 2%-of-height bar is enough to
-             lift the mean past any sane threshold while 98% of the frame is still the asset.
+  DOMINATED  at least --overlap percent of the INFORMATIVE pixels (default 90) within 8/255 of a
+             stored picture. This is the case a mean-only test misses: a real loading screen usually
+             has something drawn ON it -- a progress bar, a hint caption -- and a 2%-of-height bar
+             is enough to lift the mean past any sane threshold while 98% of the frame is still the
+             asset.
+
+"Informative" is load-bearing and was added after review. Scoring every pixel makes the overlap
+measure DARKNESS rather than identity: a black frame against a black asset scores 100%, and this
+project renders plenty of near-black frames. A repo screenshot scored 88.77% against an unrelated
+`pic1.dds` purely on shared blackness, and synthetic flat frames reach 100.00% against real assets.
+So a pixel counts only when at least one of the two images has content there (`--floor`, default
+16/255), and the fraction that qualifies is reported as COVERAGE. Below --min-coverage (default 25%)
+the comparison carries no information and the asset is not scored at all -- a black frame matching a
+black asset is "nothing was compared" wearing a verdict, which is the exact failure this whole tool
+exists to prevent.
 
 Scope, stated because a clean pass is easy to over-read: this finds assets stored as ordinary
 images. It cannot see a pre-rendered movie frame or an asset in a container it cannot decode. A pass
@@ -60,22 +71,45 @@ def main(argv):
     top = opt('--top', 5, int)
     threshold = opt('--threshold', 1.0, float)
     overlap = opt('--overlap', 90.0, float)
+    floor = opt('--floor', 16, int)
+    min_coverage = opt('--min-coverage', 25.0, float)
+    structure_floor = opt('--structure-floor', 3.0, float)
 
     try:
-        from PIL import Image, ImageChops
+        from PIL import Image
     except ImportError:
         print("prerender_check: Pillow is required (pip install pillow)", file=sys.stderr)
+        return 1
+    try:
+        import numpy as np
+    except ImportError:
+        print("prerender_check: numpy is required (pip install numpy)", file=sys.stderr)
         return 1
     if not os.path.isdir(dump_root):
         print("prerender_check: not a directory: %s" % dump_root, file=sys.stderr)
         return 1
     try:
         want = Image.open(candidate).convert('RGB')
+        wv = np.asarray(want, dtype=np.int16)
     except Exception as exc:                                    # noqa: BLE001
         print("prerender_check: cannot read %s: %s" % (candidate, exc), file=sys.stderr)
         return 1
 
-    scored, skipped_size, undecodable = [], 0, 0
+    # A FEATURELESS frame identifies nothing, and this is the general form of the defect review
+    # found at the dark end. Brightness is not information: an all-white frame against an all-white
+    # `pic2.dds` scores mean 0.00 exactly as an all-black pair does, and many dumps ship both. What
+    # a comparison needs is STRUCTURE. A capture with none is also not progression evidence in the
+    # first place ("black or diagnostic-only captures are not progression evidence" -- CLAUDE.md).
+    candidate_structure = float(np.asarray(want.convert('L'), dtype=np.float64).std())
+    if candidate_structure < structure_floor:
+        print("candidate is FEATURELESS (luma sd %.2f, below %.2f) -- a flat or near-flat frame.\n"
+              "It cannot be matched against anything, at any brightness: an all-white frame matches\n"
+              "an all-white asset exactly as an all-black pair does. An empty capture is also not\n"
+              "progression evidence whatever any asset says. Not a pass."
+              % (candidate_structure, structure_floor))
+        return 1
+
+    scored, skipped_size, undecodable, featureless_assets = [], 0, 0, 0
     for path in iter_assets(dump_root):
         try:
             asset = Image.open(path)
@@ -86,56 +120,78 @@ def main(argv):
             skipped_size += 1
             continue
         try:
-            asset = asset.convert('RGB')
-            hist = ImageChops.difference(asset, want).convert('L').histogram()
+            av = np.asarray(asset.convert('RGB'), dtype=np.int16)
         except Exception:                                       # noqa: BLE001
             undecodable += 1
             continue
-        total = sum(hist) or 1
-        mean = sum(i * c for i, c in enumerate(hist)) / total
-        within8 = sum(hist[:8]) / total * 100.0
-        scored.append((mean, within8, os.path.relpath(path, dump_root)))
+        # A featureless ASSET matches any frame of the same flat colour, so it can never support a
+        # verdict either. Excluded here rather than filtered later, so it cannot reach any report.
+        if float(np.asarray(asset.convert('L'), dtype=np.float64).std()) < structure_floor:
+            featureless_assets += 1
+            continue
+        delta = np.abs(av - wv)                       # int16: no wraparound on a 0..255 difference
+        per_pixel = delta.max(axis=2)
+        mean = float(delta.mean())
+        # A pixel is informative only if at least one side has content there. Without this the
+        # overlap measures shared darkness and reports identity.
+        informative = (av.max(axis=2) >= floor) | (wv.max(axis=2) >= floor)
+        n_inf = int(informative.sum())
+        coverage = n_inf / per_pixel.size * 100.0
+        within8 = float((per_pixel[informative] <= 8).mean() * 100.0) if n_inf else 0.0
+        scored.append((mean, within8, os.path.relpath(path, dump_root), coverage))
 
     if not scored:
         # No comparable asset is NOT a pass: nothing was actually compared.
-        print("prerender_check: no asset matched this resolution (%dx%d); "
-              "%d wrong-size, %d undecodable -- NOTHING WAS COMPARED" %
-              (want.size[0], want.size[1], skipped_size, undecodable), file=sys.stderr)
+        print("prerender_check: no comparable asset at this resolution (%dx%d); "
+              "%d wrong-size, %d undecodable, %d featureless -- NOTHING WAS COMPARED" %
+              (want.size[0], want.size[1], skipped_size, undecodable, featureless_assets),
+              file=sys.stderr)
         return 1
 
     scored.sort()
-    print("compared %d same-size asset(s) (%d wrong-size, %d undecodable)"
-          % (len(scored), skipped_size, undecodable))
-    for mean, within8, rel in scored[:top]:
-        print("  mean=%7.2f/255  within8=%6.2f%%  %s" % (mean, within8, rel))
+    print("compared %d same-size asset(s) (%d wrong-size, %d undecodable, %d featureless)"
+          % (len(scored), skipped_size, undecodable, featureless_assets))
+    for mean, within8, rel, cov in scored[:top]:
+        print("  mean=%7.2f/255  within8=%6.2f%%  coverage=%6.2f%%  %s"
+              % (mean, within8, cov, rel))
 
-    best_mean, best_within8, best_rel = scored[0]
-    if best_mean < threshold:
+    # Every verdict is drawn ONLY from comparisons that carry information. Gating on the best
+    # coverage anywhere in the dump is not enough -- an unrelated asset with content would license a
+    # verdict about a black-vs-black pair, which is how the first attempt at this gate still reported
+    # a pure-black frame as an EXACT MATCH.
+    usable = [row for row in scored if row[3] >= min_coverage]
+    if not usable:
+        print("\nno asset carries enough content to compare (best coverage %.2f%%, below the %.2f%%\n"
+              "bar). A near-empty frame and a near-empty asset agree on darkness, not identity, so\n"
+              "NOTHING INFORMATIVE WAS COMPARED -- this is not a pass, and not a match either."
+              % (max(row[3] for row in scored), min_coverage))
+        return 1
+
+    exact = min(usable, key=lambda row: row[0])
+    if exact[0] < threshold:
         print("\nEXACT MATCH: this frame IS the game's own picture asset %s\n"
-              "  mean abs diff %.2f/255, %.2f%% of pixels within 8/255.\n"
+              "  mean abs diff %.2f/255, %.2f%% of informative pixels within 8/255 "
+              "(coverage %.2f%%).\n"
               "  NOT progression evidence -- displaying a stored image needs no world rendering.\n"
               "  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
-              % (best_rel, best_mean, best_within8))
+              % (exact[2], exact[0], exact[1], exact[3]))
         return 2
 
-    # The mean alone is not enough, and this is the case the tool exists for. A real loading screen
-    # usually has something drawn ON it, and a small bright overlay moves the mean a long way while
-    # leaving almost every pixel identical to the asset. Rank by the robust statistic too.
-    dominant = max(scored, key=lambda row: row[1])
+    dominant = max(usable, key=lambda row: row[1])
     if dominant[1] >= overlap:
-        print("\nDOMINATED: %.2f%% of this frame's pixels are within 8/255 of the stored asset %s\n"
-              "  (mean abs diff %.2f/255 -- an overlay or caption lifts the mean, which is exactly\n"
-              "  why a mean-only test would have passed this).\n"
+        print("\nDOMINATED: %.2f%% of this frame's INFORMATIVE pixels are within 8/255 of the\n"
+              "  stored asset %s (coverage %.2f%%, mean abs diff %.2f/255 -- an overlay or caption\n"
+              "  lifts the mean, which is why a mean-only test would have passed this).\n"
               "  The frame is mostly stored artwork. It is not progression evidence on its own:\n"
               "  say what prosper actually rendered here.\n"
               "  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
-              % (dominant[1], dominant[2], dominant[0]))
+              % (dominant[1], dominant[2], dominant[3], dominant[0]))
         return 2
 
-    print("\nno asset explains this frame (closest %.2f/255; highest pixel overlap %.2f%% with %s,\n"
-          "under the %.2f%% dominance bar). That is not the same as proving it is rendered 3D;\n"
-          "see this tool's scope note."
-          % (best_mean, dominant[1], dominant[2], overlap))
+    print("\nno asset explains this frame (closest informative comparison %.2f/255; highest overlap\n"
+          "%.2f%% with %s at %.2f%% coverage, under the %.2f%% dominance bar). That is not the same\n"
+          "as proving it is rendered 3D; see this tool's scope note."
+          % (exact[0], dominant[1], dominant[2], dominant[3], overlap))
     return 0
 
 

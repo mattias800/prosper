@@ -31,6 +31,19 @@ was found in review: a 2%-of-height "LOADING..." bar drawn on the retracted fram
 "caught" to "no stored picture explains this frame" — the tool confidently clearing the exact image
 it exists to catch.
 
+**A comparison needs STRUCTURE, and brightness is not structure.** This was found in two review
+rounds and the second half is the general case. Scoring every pixel makes an overlap measure
+darkness: a black frame against a black asset scores 100%, and a repo screenshot scored 88.77%
+against an unrelated `pic1.dds` purely on shared blackness. Gating on "has content" fixed the dark
+end and left the bright one — many dumps ship an all-white `pic2.dds`, which an all-white frame
+matches at mean 0.00 exactly as a black pair does. So the gate is on **luma standard deviation**, of
+the candidate and of every asset, plus a coverage floor over informative pixels. A featureless frame
+matches nothing at any brightness, and is not progression evidence in the first place.
+
+Measured after the fix: synthetic flat frames (black, near-black, dark, white; 1080p and 4K) against
+all 55 dumps give **0 false matches in 440 comparisons**, down from 17, while every true positive
+still fires.
+
 **The rule these tools follow, and the reason they exit the way they do:** *could not check* must
 never be reportable as *checked and clean*. `prerender_check.py` exits 0 only when it actually
 compared something and nothing matched; when it finds no comparable asset it exits 1, distinct from
