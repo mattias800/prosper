@@ -103,6 +103,10 @@ It is a reporting tool, not a gate: **it always exits 0 on a completed classific
 unreadable or truncated PNG is reported on its own line and counted rather than aborting the run.
 Non-zero is reserved for the tool failing — bad usage, no input, or a `--selftest` regression.
 
+**`--selftest` is deliberately not registered in ctest**, though the repo has that pattern (see
+`tools/colorstate/`). It needs Pillow, which is not a build dependency, and making it one for a
+reporting tool that gates nothing is the wrong trade. Run it by hand.
+
 **Re-run `--selftest` if you touch a threshold.** Its cases are built pixel by pixel rather than
 sampled from `assets/screenshots/`, deliberately: the thresholds were tuned against that corpus, so a
 control drawn from it would confirm the tuning rather than the classifier — which is exactly how the
