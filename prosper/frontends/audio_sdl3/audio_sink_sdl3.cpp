@@ -131,9 +131,16 @@ int cushion_grains() {
                     "1..16 -- ignoring it and running the default 1-grain cushion", v);
             return 1;
         }
-        SDL_Log("prosper-audio: cushion depth %ld grain(s) (PROSPER_AUDIO_CUSHION_GRAINS) -- a \n"
-                "  falsification lever; the measured verdict is that >1 is WORSE, see #3033",
-                parsed);
+        // One record per line: SDL_Log newline-terminates already, and the line-oriented perf
+        // readers assume it -- an embedded newline split this mid-sentence and left a trailing
+        // space. N>=6 is reported as saturated so the artifact self-identifies: past that point
+        // the resync re-fires every call and the depths are indistinguishable. Preferred over
+        // narrowing the clamp, which would hard-code a number derived from `dur * 4` where
+        // nobody would re-derive it, and would silently hand N=8 the N=1 arm -- re-creating the
+        // very failure the rejection log two lines up exists to fix. Review of #3073.
+        SDL_Log("prosper-audio: cushion depth %ld grain(s) (PROSPER_AUDIO_CUSHION_GRAINS)%s"
+                " -- a falsification lever; the measured verdict is that >1 is WORSE, see #3033",
+                parsed, parsed >= 6 ? " [saturated: N>=6 all behave identically]" : "");
         return (int)parsed;
     }();
     return n;
