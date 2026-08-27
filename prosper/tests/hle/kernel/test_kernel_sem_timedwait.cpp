@@ -20,9 +20,18 @@
 //                   the pre-fix code, which never touches precise_sleep at all.
 //   2. ENCODING   - the timeout returns exactly 0x8002003c, FreeBSD ETIMEDOUT as the guest reads it.
 //                   Nothing else in the suite covers this path's encoding.
-//   3. BOUNDS     - a lower bound as well as an upper one. The upper alone cannot catch a wait that
-//                   returns instantly; the lower alone cannot catch the tick.
+//   3. BOUNDS     - a stub/unit/hang guard, and NOT the discriminator. With the fix reverted the
+//                   defect delivered at 14.69, 12.06, 17.75, 10.00 and 15.32 ms -- so a 12 ms
+//                   ceiling would have PASSED the defect, not merely flaked. A quantized wait
+//                   returns at the next tick boundary, so a 5 ms request lands anywhere in
+//                   ~[5, 20.6] ms and the two distributions overlap. The same 12 ms ceiling
+//                   also flaked on macOS/Rosetta at 18.54 ms, where the native call is
+//                   untouched by this change anyway. Arm 1 caught all five.
 //   4. FAST PATH  - an already-posted semaphore never enters the loop.
+//
+// The header being right about the arms is part of the test. Its first version was wrong about
+// them in the same breath as the arms were wrong, and the confident label is what stopped anyone
+// re-deriving it -- so a bound that changes changes this list too.
 //
 // Deliberately NOT asserted: the poll slice length. A short high-resolution sleep on this host has a
 // ~0.52 ms floor, so the adaptive 0.5 ms slice and a flat 2 ms one produce overlapping latency
@@ -83,10 +92,29 @@ int main() {
         CHECK(rc == prosper::hle::kSceKernelErrorETIMEDOUT,
               "a timeout returns FreeBSD ETIMEDOUT encoded as the guest reads it (0x8002003c)");
 
-        // ARM 3: bounded on BOTH sides. An upper bound alone passes a wait that returns instantly;
-        // a lower bound alone passes the 15.6 ms tick.
+        // ARM 3: BOUNDS, and they are deliberately NOT the discriminator. This is the second
+        // correction to this arm and the reasoning is measured rather than argued.
+        //
+        // The first version used a 40 ms ceiling, 2.6x above the defect, so it could not fail.
+        // The second used 12 ms, which reddened -- and then flaked on macOS/Rosetta at 18.54 ms,
+        // because on POSIX the native call is untouched by this change and the ceiling was purely
+        // an assertion about the host's scheduler.
+        //
+        // Tightening it per-platform was the obvious next move, and it is wrong in the direction
+        // that matters: it lets the defect THROUGH. Measured by reverting the fix and running
+        // five times -- 14.69, 12.06, 17.75, 10.00, 15.32 ms. The 10.00 ms run passes a 12 ms
+        // ceiling, so that bound was not merely fragile, it was unsound. It has to be: a
+        // quantized wait returns at the next tick BOUNDARY, so a 5 ms request lands anywhere in
+        // roughly [5, 20.6] ms depending on where it falls within the ~15.6 ms tick. The
+        // defect's timing distribution OVERLAPS the fix's, so no single-run wall-clock bound
+        // separates them on any platform. The mechanism arm caught all five.
+        //
+        // So the bounds are a stub/unit/hang guard on both platforms, and the MECHANISM arm below
+        // is the discriminator -- which is what this file's header has said from the start, and
+        // what the repo's own guidance says: assert which primitive served the wait, because that
+        // reads a state variable instead of a clock and cannot flake.
         CHECK(ms >= 4.0, "it actually waited (a stub returning at once fails this)");
-        CHECK(ms < 12.0, "and returned inside one winpthreads tick of the request, not after it");
+        CHECK(ms < 500.0, "and on the right order of magnitude (a wrong unit or a hang fails this)");
 
         // ARM 1: WHICH primitive served it. This is the arm that reddens on the pre-fix code, which
         // delegates to winpthreads and never enters precise_sleep, leaving the backend at "none".
@@ -114,10 +142,20 @@ int main() {
     {
         CHECK(post(handle, 0, 0, 0, 0, 0) == 0, "post succeeds");
         const auto t0 = clk::now();
+        // A ONE SECOND timeout, deliberately: the assertion is that the wait returned nowhere near
+        // it, so the gap between the bound and the timeout is the whole strength of the arm.
         const uint64_t rc = timedwait(handle, 1000000, 0, 0, 0, 0);
         const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         CHECK(rc == 0, "an already-posted semaphore is acquired");
+        // Same asymmetry as ARM 3, and the same reasoning: 1 ms is a fair bound on a real x86
+        // host, and on an emulated-x86 CI VM it is a latent flake that happened not to fire yet.
+        // 100 ms still fails a fast path that fell through to waiting out the 1 s timeout, which
+        // is the only defect this arm can see.
+#ifdef _WIN32
         CHECK(ms < 1.0, "...immediately, without entering the poll loop");
+#else
+        CHECK(ms < 100.0, "...immediately, nowhere near the 1 s timeout it was given");
+#endif
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
