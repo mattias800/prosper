@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Classify captured frames: is this picture CONTENT, UI over an absent world, or a flat clear?
+"""Classify captured frames: is anything drawn, is any of it legible, and is it only a HUD?
 
 Why this exists. `tools/screenshot` already writes `distinct_rgb_colors` and `nonblack_rgb_pixels`
-to its JSONL manifest, at full resolution, in the same directory as the PNGs -- so "how many colours"
-and "how much is lit" are NOT new here. What is new is `max` (the brightest channel anywhere),
-`bright` (how much of it is actually legible), and the classification those two make possible:
-separating **a HUD or menu drawn over a world that never rendered** from **a real scene**. That
-distinction is the difference between rung 2 and rung 3, and no existing tool reports it.
+to its JSONL manifest, over every pixel, in the same directory as the PNGs -- so "how many colours"
+and "how much is lit" are NOT new here. What is new is `max` (the brightest channel anywhere), the
+classification below, and running over any directory of frames including ones with no manifest.
 
-Two ways of answering it by hand are wrong, and both were made here:
+Two ways of answering this by hand are wrong, and both were made here:
 
 - **Downsampling before counting colours destroys thin UI.** A 4K frame resized to 160x90 loses white
   menu text on black entirely. Measured on Stray (`PPSA02101`), 2026-08-27: a frame containing START
@@ -17,46 +15,57 @@ Two ways of answering it by hand are wrong, and both were made here:
 - **"Fraction of non-black pixels" scores a flat WHITE clear as a perfect frame** -- 100% non-black,
   and every is-it-black test passes it.
 
-The thresholds are tuned against the 128 committed frames in `assets/screenshots/`, which are
-human-reviewed milestone evidence and therefore the closest thing to ground truth this repo has. That
-corpus puts a clean gap where the boundary belongs: title screens, logos and EULAs cover 0.15-8.62%
-of the frame, while the least-covered real scene covers 10.13%. An earlier revision of this tool drew
-CONTENT at 10% and UI-ON-BLACK at 2%, which dropped all fourteen lit title screens into a 2-10% dead
-band -- including five cited in COMPATIBILITY.md and BLOG.md as their title's milestone. That is the
-same failure the tool exists to prevent, one threshold along.
+  FLAT          nothing rendered, or a uniform fill: peak <= noise, or <= 8 colours covering >= 50%
+                (a black clear, a white clear, a two-tone letterbox).
+  SPARSE        nothing rises above near-black (peak < 48), whatever the coverage.
+  UI-ON-BLACK   legible content covering under 2% -- a HUD, notice or small logo over a world that
+                did not draw. THE diagnostic class: it means the guest is drawing and the WORLD is
+                what is missing.
+  LIT           something legible is drawn over more than 2% of the frame.
 
-  FLAT          nothing rendered, or a uniform fill: max <= noise, or <= 8 colours covering
-                >= 90% of the frame (black clear, white clear, two-tone letterbox).
-  UI-ON-BLACK   bright pixels exist and cover under 10% -- a HUD, menu, logo or title over a world
-                that did not draw. THE class worth looking for: it means the guest is drawing and
-                the WORLD is what is missing.
-  SPARSE        some non-black content but nothing legible (bright == 0) -- a fade, or a frame so
-                dark nothing in it can be read.
-  CONTENT       a real picture.
+**`LIT` is not a promise that the frame is a game scene, and no threshold here can make it one.**
+That is a measured limitation, not caution. On the committed corpus, UI and real scenes INTERLEAVE on
+every statistic this tool computes:
+
+    crisis-core-title.png            10.13% cover  4096+ colours   text + a glow on black
+    stray-brightness-calibration.png 10.13% cover    228 colours   a settings menu on black
+    messenger-title.png              12.41% cover     37 colours   real pixel art
+    oregon-trail-gameloft-splash.png 16.03% cover   2159 colours   a flat logo on black
+    blue-prince-title.png            21.83% cover  4096+ colours   real rendered 3D art
+
+Coverage puts a logo above a scene; colour count puts pixel art below a logo. An earlier revision of
+this tool drew the boundary at 10% coverage and claimed a "clean gap" in the corpus supported it --
+the gap was an artifact of taking the minimum over frames a PREVIOUS revision had labelled as scenes,
+which is the assumption under test. Deciding "is the world rendering?" above 2% needs eyes on the
+frame; this tool narrows which frames need them.
+
+The 2% bound on `UI-ON-BLACK` is where the class was independently validated, on evidence chosen by
+someone other than its author: `sonic-frontiers-cyberspace-hud` (0.81%), `sonic-frontiers-autosave-
+notice` (1.05%) and `metaphor-loading-mascot` (1.49%) are exactly the titles recorded as "world black
+behind the HUD" (#2790) and "the background does not draw" (#2952).
 
 CAVEAT, and it is not detectable from pixels: `--fps-overlay` burns prosper's OWN counter into the
-PNG (opaque white on a translucent box). A black frame carrying only that overlay classifies
-UI-ON-BLACK, which reads as "the guest is drawing its menu" when nothing of the sort happened. Do not
-classify overlay runs; `screenshot`'s manifest records `run.assertions.fps_overlay` if you need to
-check after the fact.
+PNG. A black frame carrying only that overlay classifies UI-ON-BLACK, which reads as "the guest is
+drawing" when nothing of the sort happened. Do not classify overlay runs; `screenshot`'s manifest
+records `run.assertions.fps_overlay` if you need to check after the fact.
 
-Also not detected: a smooth gradient with no picture in it classifies CONTENT. prosper's seed-miss
+Also not detected: a smooth gradient with no picture in it classifies LIT. prosper's seed-miss
 gradient is exactly that shape, so a frame can score well here and still be a diagnostic fill.
 
 SAMPLING: a 1/16 nearest-neighbour stride (every 4th pixel on both axes) at NATIVE resolution --
 never a resize, which is the distinction the tool rests on. A stride still aliases: a black frame
 ruled with 1px vertical lines at `x % 4 == 1`, covering a quarter of the screen, reports
-`max=0 colours=1 FLAT` and is indistinguishable from a black clear. Contrived, but real; pass
-`step=1` in-process if you need it exact.
+`max=0 colours=1 FLAT` and is indistinguishable from a black clear. Pass `step=1` in-process if you
+need it exact.
 
 The colour count saturates at 4096 and the report marks a saturated count with a trailing `+`, so
 two `4096+` rows are not comparable with each other.
 
 Alpha is discarded rather than composited over black. That sounds like a divergence from
-`capture_manifest.cpp:105-108`, which multiplies RGB by alpha -- measured on a real `screenshot` PNG
-it is not, because `normalize_capture_rgba` forces alpha to 255 for composited and republished
-frames (0 of 8,294,400 pixels differed). `CaptureSource::RawScanout` is the one path that leaves
-alpha untouched, and no sample of it has been checked.
+`capture_manifest.cpp`, which multiplies RGB by alpha -- measured on a real `screenshot` PNG it is
+not, because `normalize_capture_rgba` forces alpha to 255 for composited and republished frames
+(0 of 8,294,400 pixels differed). `CaptureSource::RawScanout` is the one path that leaves alpha
+untouched, and no sample of it has been checked.
 
 Always exits 0 on classification -- this reports, it does not gate. An unreadable file is reported on
 its own line and does not abort the run or lose the tally.
@@ -69,10 +78,11 @@ except ImportError:
 
 COLOUR_CAP = 4096  # counting stops here; the report suffixes a saturated count with "+"
 
-def classify(path, step=4, noise=8, bright_at=128):
-    return classify_image(Image.open(path).convert("RGB"), os.path.basename(path), step, noise, bright_at)
+def classify(path, step=4, noise=8, bright_at=128, dim_at=48):
+    return classify_image(Image.open(path).convert("RGB"), os.path.basename(path),
+                          step, noise, bright_at, dim_at)
 
-def classify_image(im, name, step=4, noise=8, bright_at=128):
+def classify_image(im, name, step=4, noise=8, bright_at=128, dim_at=48):
     w, h = im.size
     px = im.load()
     n = nonblack = bright = mx = 0
@@ -88,17 +98,20 @@ def classify_image(im, name, step=4, noise=8, bright_at=128):
             if m > bright_at: bright += 1
             if len(cols) < COLOUR_CAP: cols.add((r, g, b))
     share = nonblack / n if n else 0.0
-    # Coverage is tested before legibility on purpose: a well-covered frame is a picture even when it
-    # is too dim for any pixel to count as bright. Testing `bright == 0` first classified
-    # `bendy-title.png` -- 93.33% covered, 2,899 colours, max=127 -- as SPARSE.
-    # A few colours only means "flat" when they COVER the frame. Gating on the colour count alone
-    # made a black frame carrying prosper's two-colour fps overlay report FLAT despite 6,120 bright
-    # pixels, because the colour test short-circuited ahead of UI-ON-BLACK.
-    uniform_fill = len(cols) <= 8 and share >= 0.90
+    # A few colours only means "flat" when they COVER the frame -- but a letterbox is black bars plus
+    # a uniform fill, which lands at 75-83%, so the bound cannot be 0.90. Gating on the colour count
+    # alone instead swallowed a black frame carrying prosper's two-colour fps overlay and 6,120 bright
+    # pixels, which is the opposite error.
+    uniform_fill = len(cols) <= 8 and share >= 0.50
     if mx <= noise or uniform_fill:        kind = "FLAT"
-    elif share >= 0.10:                    kind = "CONTENT"
-    elif bright > 0:                       kind = "UI-ON-BLACK"
-    else:                                  kind = "SPARSE"
+    # Nothing in the frame rises above near-black. Keyed on the PEAK, not on a count above a fixed
+    # brightness: `bendy-title.png` peaks at 127 over 93% of the frame and is a perfectly visible
+    # picture, so a "pixels brighter than 128" test called it empty.
+    elif mx < dim_at:                      kind = "SPARSE"
+    # Legible content over almost nothing. This is the one diagnostic class, and 2% is where it was
+    # independently validated -- see the module docstring.
+    elif share < 0.02:                     kind = "UI-ON-BLACK"
+    else:                                  kind = "LIT"
     return dict(name=name, max=mx, share=100 * share,
                 bright=bright, colours=len(cols), kind=kind, w=w, h=h)
 
@@ -123,28 +136,33 @@ def selftest():
     cases.append(("black clear", frame(), "FLAT"))
     cases.append(("white clear", frame((255, 255, 255)), "FLAT"))
     cases.append(("two-tone split", box(frame((20, 20, 20)), 0, 0, 1, .5, (200, 200, 200)), "FLAT"))
-    # A HUD or menu over a world that never drew -- the class the tool exists to find.
-    cases.append(("menu text on black", box(frame(), .1, .4, .3, .04, (255, 255, 255)), "UI-ON-BLACK"))
-    # 8% coverage: a lit title screen. Drawing UI-ON-BLACK at 2% put fourteen of these in a dead
-    # band and reported them SPARSE, five of them cited as their title's milestone.
-    cases.append(("lit title screen", box(frame(), 0, 0, 1, .08, (255, 240, 200)), "UI-ON-BLACK"))
-    # prosper's own fps overlay is two colours on black. Gating FLAT on the colour count alone
-    # swallowed it, and this frame reads UI-ON-BLACK by design -- see the caveat in the module
-    # docstring. The assertion pins the documented false positive so it cannot change silently.
+    # A 2.39:1 letterbox is black bars plus a uniform fill, which covers ~75% -- not the ~100% a
+    # naive "few colours must cover the frame" bound assumes. Gating uniform_fill at 0.90 classified
+    # this as a picture.
+    cases.append(("letterbox bars", box(frame(), 0, .126, 1, .748, (140, 140, 140)), "FLAT"))
+    # Legible content over almost nothing: the one diagnostic class.
+    cases.append(("hud over black", box(frame(), .1, .4, .12, .04, (255, 255, 255)), "UI-ON-BLACK"))
+    # prosper's own fps overlay is two colours on black and lands here by design -- see the caveat in
+    # the module docstring. Asserted so the documented false positive cannot drift silently.
     cases.append(("fps overlay only", box(frame(), .01, .01, .07, .03, (255, 255, 255)), "UI-ON-BLACK"))
-    # Covered but too dim for any pixel to count as bright: still a picture.
+    # 8% coverage: a lit title screen. NOT the diagnostic class -- see the docstring on why coverage
+    # cannot tell a title screen from a scene.
+    cases.append(("lit title screen", box(frame(), 0, 0, 1, .08, (255, 240, 200)), "LIT"))
+    # Peaks at 119, below any "bright pixel" bar, over the whole frame: still a picture.
     dim = frame()
     for y in range(H):
         for x in range(W):
             dim.putpixel((x, y), (x % 120, y % 120, (x + y) % 120))
-    cases.append(("dim full-frame picture", dim, "CONTENT"))
+    cases.append(("dim full-frame picture", dim, "LIT"))
     scene = frame()
     for y in range(H):
         for x in range(W):
             scene.putpixel((x, y), (x % 256, y % 256, (x * y) % 256))
-    cases.append(("bright full-frame scene", scene, "CONTENT"))
-    # Non-black but nothing legible anywhere.
-    cases.append(("near-black fade", box(frame(), 0, 0, 1, .05, (15, 15, 15)), "SPARSE"))
+    cases.append(("bright full-frame scene", scene, "LIT"))
+    # Nothing rises above near-black. Coverage must NOT rescue these: a fifth of the frame at peak 15
+    # is still nothing anyone can see, and a coverage-first ordering called it a picture.
+    cases.append(("near-black fade, 5%", box(frame(), 0, 0, 1, .05, (15, 15, 15)), "SPARSE"))
+    cases.append(("near-black fade, 20%", box(frame(), 0, 0, 1, .20, (15, 15, 15)), "SPARSE"))
 
     bad = 0
     for name, im, want in cases:
@@ -166,8 +184,17 @@ def main(argv):
         if os.path.isdir(a):
             # .bmp too: F9 frame grabs write BMP, and CLAUDE.md makes F9 the first loop for a
             # graphical bug -- a directory of grabs must not report "nothing found".
+            # Deduped by real path, NOT by globbing both cases: fnmatch normcases on Windows, so
+            # "*.png" and "*.PNG" each match every file there and the tally silently doubles.
+            found = []
             for ext in ("*.png", "*.bmp", "*.PNG", "*.BMP"):
-                paths.extend(sorted(glob.glob(os.path.join(a, ext))))
+                found.extend(glob.glob(os.path.join(a, ext)))
+            seen = set()
+            for f in sorted(found):
+                key = os.path.normcase(os.path.realpath(f))
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(f)
         else:
             paths.append(a)
     if not paths:
