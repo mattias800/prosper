@@ -16,8 +16,14 @@ from pathlib import Path
 TOOL = Path(__file__).resolve().parent / "audio_delivery_report.py"
 
 
-def dbg(port=17, gap=5.33, frames=256, queued=1024):
-    return f"[audio-dbg] port={port} gap={gap:.2f}ms frames={frames} queued_before={queued} (grain=1024)\n"
+def dbg(port=17, gap=5.33, frames=256, queued=1024, bpf=4, channels=2):
+    # grain DERIVED from frames rather than hardcoded. It was a literal (grain=1024) while every
+    # case used 256 frames of f32 stereo -- a real grain of 2048 B -- so the fixture contradicted its
+    # own arithmetic. Invisible while the parser discarded the field, and it inverted the
+    # half-a-grain arm the moment the parser started reading it. Derived, it cannot drift again.
+    grain = frames * bpf * channels
+    return (f"[audio-dbg] port={port} gap={gap:.2f}ms frames={frames}"
+            f" queued_before={queued} (grain={grain})\n")
 
 
 def run(log_text, extra=None):
@@ -38,6 +44,73 @@ def main():
         if needle in text:
             failures.append(f"{what}: expected {needle!r} to be absent")
 
+    # 0. The queue thresholds mean GRAINS, and this arm exists because they did not.
+    #
+    #    They were bytes_per_frame * channels -- one FRAME, 8 bytes for f32 stereo -- so "below 1
+    #    grain" tested q < 8 and "below 1/4 grain" tested q < 2. Every case below passed anyway,
+    #    because they only ever assert that a LABEL is present, never that the number under it is
+    #    right. A run reporting "1.1% below a quarter grain" was really 1.1% completely dry, and that
+    #    figure was quoted into an issue before anyone noticed.
+    #
+    #    grain here is 256 frames * 4 bytes * 2 channels = 2048 B. A queue of 1024 B is half a
+    #    grain: below one grain, above a quarter. Under the old arithmetic it was above BOTH
+    #    thresholds, so this arm fails on the bug and passes on the fix.
+    log = "".join(dbg(gap=5.33, frames=256, queued=1024) for _ in range(200))
+    out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
+    expect(out, "arrivals with under 1 grain buffered: 200", "case 0: half a grain is below one grain")
+    expect(out, "arrivals below 1/4 grain:          0", "case 0: half a grain is NOT below a quarter")
+
+    #    And an empty queue must register as empty, on its own row rather than only as "below".
+    log = "".join(dbg(gap=5.33, frames=256, queued=0) for _ in range(200))
+    out, _ = run(log, ["--bytes-per-frame", "4", "--channels", "2"])
+    expect(out, "arrivals with an EMPTY queue:         200", "case 0: an empty queue is reported empty")
+
+    # 0b. The (grain=N) field must actually be USED, and this arm exists because review showed the
+    #     headline change of this commit had no arm that would redden if reverted: every other fixture
+    #     logs a grain equal to frames * bpf * channels, so honouring the field and inferring it give
+    #     identical answers, and deleting the parse left the whole suite green.
+    #
+    #     A first attempt used an atypical FIRST record. That stopped discriminating the moment the
+    #     inference fallback became a median, which is robust to exactly that -- good for the tool,
+    #     vacuous for the arm. So this uses the case review actually named: an s16 title read with the
+    #     default f32 flags. Every record is 256 frames and the emitter logs the truth,
+    #     256 * 2 * 2 = 1024 B, while inferring with bpf=4 gives 2048 B. Queues sit at 1500 B -- ABOVE
+    #     the real grain, BELOW the inferred one -- so honouring the field reports 0 thin-cushion
+    #     arrivals and inferring reports 200. Note the direction: inferring invents a cushion problem
+    #     that is not there.
+    log = "".join(dbg(frames=256, queued=1500, bpf=2, channels=2) for _ in range(200))
+    out, _ = run(log)
+    expect(out, "arrivals with under 1 grain buffered: 0",
+           "case 0b: the logged grain is honoured over the flag-derived inference")
+    expect(out, "grain=256 frames",
+           "case 0b: and the header reports the same grain the rows used")
+
+    # 0c. The cadence grain is the MEDIAN frame count, not the first record's.
+    #
+    #     One atypical first arrival otherwise rescales every gap-beyond-N-grains row. Here the first
+    #     record is 64 frames (1.33 ms at 48 kHz) and the rest are 256 (5.33 ms), with gaps at a
+    #     steady 5.33 ms. Taking frames[0] makes the reference grain 1.33 ms, so every one of those
+    #     normal gaps counts as "beyond 2 grains" and the verdict flips to a quantized mixer wake --
+    #     review measured exactly that, 100.0%, on a healthy log. The median reads 256 and the rows
+    #     stay at 0.
+    log = dbg(frames=64, gap=5.33, queued=3072) + "".join(
+        dbg(frames=256, gap=5.33, queued=3072) for _ in range(200))
+    out, _ = run(log)
+    expect(out, "gaps beyond 2 grains:             0",
+           "case 0c: an atypical first record does not rescale the cadence rows")
+    expect(out, "grain=256 frames", "case 0c: the header reports the typical grain")
+
+    # 0d. The LEGACY path -- a log with no (grain=N) field -- must still compute a grain from the
+    #     flags. Review found that deleting the inference branch left the whole suite green, which is
+    #     the same shape as R1 one level down, and on the path the --bytes-per-frame help text points
+    #     users at. So: an old-format log, and the thresholds must still be grain-relative.
+    log = "".join(
+        "[audio-dbg] port=17 gap=5.33ms frames=256 queued_before=1024\n" for _ in range(200))
+    out, _ = run(log)
+    expect(out, "grain=256 frames", "case 0d: a log without the grain field still reports a grain")
+    expect(out, "arrivals with under 1 grain buffered: 200",
+           "case 0d: and the inference is grain-relative, not frame-relative")
+
     # 1. Real-time delivery, deep queue: no defect. The verdict must NOT name a clock
     #    deficit (a plausible wrong call: an average at the device rate with jitter).
     log = "".join(dbg(gap=5.33, queued=3072) for _ in range(200))
@@ -49,7 +122,13 @@ def main():
     log = "".join(dbg(gap=15.7, queued=64) for _ in range(300))
     out, _ = run(log)
     expect(out, "clock deficit", "case 2 verdict")
-    expect(out, "the device starved between deliveries", "case 2 starvation row")
+    # A NUMBER, not the row label. This assertion used to be `expect(out, "the device starved
+    # between deliveries")` -- a string printed on every run regardless of the count, so review
+    # confirmed that hardwiring under_one = 0 left it green. queued=64 is under one 2048 B grain
+    # but not empty, so this pins the thin-cushion count AND that it is not miscounted as
+    # starvation, which is the distinction the label fix in this change is about.
+    expect(out, "arrivals with under 1 grain buffered: 300", "case 2: all 300 are a thin cushion")
+    expect(out, "arrivals with an EMPTY queue:         0", "case 2: a thin cushion is NOT starvation")
 
     # 3. Quantized mixer wake: the combined delivery averages real-time (256 frames per
     #    5.33 ms) but the arrivals cluster -- 1 ms after a tick, then 9.66 ms of silence.
