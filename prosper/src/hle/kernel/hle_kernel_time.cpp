@@ -7,8 +7,6 @@
 #include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include "host/platform/precise_sleep.hpp"   // guest sleeps must not inherit the winpthreads tick (#3013)
 #include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS: which primitive a title paces on
-extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();   // the shared 59.94 Hz grid (hle_graphics.cpp)
-extern "C" uint64_t prosper_vo_vblank_period_ns();
 #include "host/image/runtime_module_load.hpp"   // #639: real runtime PRX loading
 #include "host/memory/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
 #include "hle/dispatch/callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
@@ -992,6 +990,12 @@ namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; retur
 // --- Real event-queue backend (kqueue/kevent model). Registered flip/vblank sources post events into
 // their equeue; WaitEqueue blocks until an event is ready (or timeout) and returns it. A single ~60 Hz
 // pump thread drives vblank + flip-completion events so Unity's render/timing threads pace frames. ---
+// The shared 59.94 Hz vblank grid, defined in hle/graphics/hle_graphics.cpp. Declared here
+// rather than in a header because that file deliberately keeps the grid internal, and these
+// two accessors are the whole of what it publishes (#3024).
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();
+extern "C" uint64_t prosper_vo_vblank_period_ns();
+
 namespace {
     // SceKernelEvent (FreeBSD kevent layout, 0x20 bytes): ident@0, filter@8(i16), flags@0xA(u16),
     // fflags@0xC(u32), data@0x10, udata@0x18. The game reads udata (its flip context) + data.
@@ -1132,17 +1136,19 @@ namespace {
         //     cross-checks the kevent count against the status count would see it. Deriving both
         //     from one origin and one period closes it by construction rather than by tuning.
         //
-        // host::next_periodic_deadline_ns carries the advance, including the resync after a
-        // wholly missed tick. It is a separate tested function because the obvious inline
-        // spelling of that resync is wrong in a way that still looks like 60 Hz -- see its
-        // comment in precise_sleep.hpp.
+        // One call carries the whole schedule: host::next_grid_deadline_ns returns the next
+        // boundary strictly after now, so the ordinary case and a stall of any length are the
+        // same expression and the phase cannot drift. It is a separate tested function because
+        // the obvious hand-rolled spelling -- advance by a period, re-anchor to now+period when
+        // behind -- silently loses the phase, and an earlier draft of this loop also halved the
+        // rate. See its comment in precise_sleep.hpp.
+        const uint64_t origin_ns = prosper_vo_vblank_grid_origin_ns();
         const uint64_t period_ns = prosper_vo_vblank_period_ns();
-        uint64_t next_ns = prosper_vo_vblank_grid_origin_ns() + period_ns;
         for (;;) {
-            prosper::host::sleep_until_steady_ns(next_ns);
             const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 clk::now().time_since_epoch()).count();
-            next_ns = prosper::host::next_periodic_deadline_ns(next_ns, now_ns, period_ns);
+            prosper::host::sleep_until_steady_ns(
+                prosper::host::next_grid_deadline_ns(origin_ns, now_ns, period_ns));
             frame++;
             std::vector<FlipReg> vr;
             { std::lock_guard lk(g_eq_mx); vr = g_vblank_regs; }

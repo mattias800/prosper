@@ -27,25 +27,35 @@ SleepBackend sleep_backend();
 // A stable spelling of sleep_backend() for assertions and logs. Never null.
 const char* sleep_backend_name();
 
-// Advance an absolute periodic deadline after a wait on it has completed. `now_ns` is the time
-// the wait actually returned; the result is the next deadline on the SAME grid, so overshoot
-// does not accumulate the way it does when each iteration sleeps for a relative period.
+// The next boundary of a fixed periodic grid strictly after `now_ns`, where the grid is every
+// `origin_ns + k * period_ns`. Intended to be called after a wait on the previous boundary has
+// completed, as the WHOLE of a pacing loop's per-iteration work: because the answer depends only
+// on (origin, now, period) and not on the deadline just waited, one expression covers the
+// ordinary case, an early return, and a stall of any length.
 //
-// This is a free function with its own tests because of one subtlety that reads as correct and
-// is not: after sleep_until_steady_ns(deadline_ns) returns, `now_ns` is normally ALREADY past
-// deadline_ns by the wait's own small overshoot. So a "have we fallen behind?" test written
-// against the OLD deadline is true on every ordinary iteration, and re-anchoring there silently
-// costs one extra period per iteration -- halving the rate, while the surrounding code still
-// says 60 Hz. The comparison has to be against the ADVANCED deadline. Caught in review of the
-// #3024 vblank pump, where it would have turned a 33 Hz defect into a 30 Hz one.
-constexpr uint64_t next_periodic_deadline_ns(uint64_t deadline_ns, uint64_t now_ns,
-                                            uint64_t period_ns) {
-    if (period_ns == 0) return now_ns;   // a zero period would busy-spin on a fixed deadline
-    const uint64_t advanced = deadline_ns + period_ns;
-    // A whole period late: abandon the missed slots and re-anchor to now. Deliberately NOT a
-    // catch-up loop -- consumers pace on events ARRIVING, so replaying the missed ones back to
-    // back hands them a burst they read as several periods of progress in one instant.
-    return advanced < now_ns ? now_ns + period_ns : advanced;
+// Phase-exact by construction, which is the property that motivated it. The obvious alternative
+// -- carry a deadline and advance it by one period, re-anchoring to `now + period` when it falls
+// behind -- keeps the PERIOD but loses the PHASE at every re-anchor, and then holds the wrong
+// phase forever. Two ways in, neither exotic: a loop whose first deadline is already stale
+// because the grid was anchored earlier by someone else, and any wait that overruns by more than
+// a period (which the Win32SleepFallback path does by 14-30 ms whenever the high-resolution timer
+// is unavailable). Snapping to the grid instead cannot drift in phase or period, however late it
+// is called. Caught in review of the #3024 vblank pump, where the consumers of two vblank clocks
+// can compare them and phase agreement is the point.
+//
+// Returns ONE boundary, never a backlog: a caller that has missed several abandons them. Pacing
+// consumers respond to events arriving, so replaying missed slots back to back hands them a burst
+// they read as several periods of progress in one instant.
+constexpr uint64_t next_grid_deadline_ns(uint64_t origin_ns, uint64_t now_ns,
+                                        uint64_t period_ns) {
+    // A zero period has no boundaries; yielding `now_ns` makes the caller's wait a no-op rather
+    // than dividing by zero. It still spins, and deliberately so -- silently substituting some
+    // period would invent a rate nobody asked for.
+    if (period_ns == 0) return now_ns;
+    // A grid anchored in the future: the first boundary IS the origin. Reachable through the
+    // videoout test seam, which can anchor the epoch to a fake time.
+    if (now_ns < origin_ns) return origin_ns;
+    return origin_ns + ((now_ns - origin_ns) / period_ns + 1) * period_ns;
 }
 
 }  // namespace prosper::host

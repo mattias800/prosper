@@ -729,14 +729,17 @@ HLE(g_vo_resstatus)   {
 // which is a statement about where the boundaries fall, not about how far apart they are. Anchored
 // on first use so both are process-relative, exactly as the previous status-only anchor was.
 //
-// It is NOT the only vblank clock in the process, and this comment previously claimed it was.
-// hle_kernel_time.cpp's `vblank_pump` (:731) posts the VideoOut vblank kevent from its own
-// `nanosleep(16666667)` loop — 60.000 Hz, its own phase, started when the first equeue source is
-// registered. So the kevent stream and this grid drift by roughly one tick per second and their
-// boundaries do not coincide. Aligning them is a real follow-up; asserting they are aligned is
-// wrong, and a title that cross-checks the two would see the disagreement.
+// It is no longer a second clock. hle_kernel_time.cpp's `vblank_pump` -- the thread that posts the
+// VideoOut vblank kevent to registered equeues -- used to run its own `nanosleep(16666667)` loop
+// at 60.000 Hz and its own phase, so the kevent stream and this grid disagreed in BOTH period and
+// phase, and this comment recorded aligning them as an open follow-up. #3024 closed it: the pump
+// now derives its schedule from the two accessors published just below, so there is one origin and
+// one period in the process. The alignment is therefore asserted here on purpose -- it is what the
+// pump computes from, not a hope about two constants matching.
 // Internal linkage on purpose: the "epoch before now" ordering invariant below is only
-// enforceable by reading this one file, so nothing outside it may reach these.
+// enforceable by reading this one file, so nothing outside it may reach these DIRECTLY. The
+// two `extern "C"` accessors further down publish the origin and the period as values, which
+// cannot break that invariant -- a caller can schedule on the grid but cannot move it.
 namespace {
 constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
 // Deterministic clock used only by test_videoout's phase-integration check. Zero leaves the

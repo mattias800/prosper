@@ -836,60 +836,101 @@ int main() {
     for (uint8_t byte: closed_status) closed_status_untouched &= byte == 0xEE;
     CHECK(closed_status_untouched, "closed-handle status query leaves output untouched");
 
-    // ---- the vblank kevent pump's deadline arithmetic (#3024) -------------------------------
-    // The pump itself is a detached thread in hle_kernel_time.cpp, so what is testable is the
-    // arithmetic it advances its deadline with. These arms exist because the WRONG spelling of
-    // it is not distinguishable from the right one by reading either the code or the rate it
-    // claims: a resync test written against the pre-advance deadline fires on every ordinary
-    // iteration, because sleep_until returns a little PAST its deadline by nature. The result
-    // is one extra period per tick -- a 30 Hz pump under a comment saying 60.
+    // ---- the vblank kevent pump's schedule (#3024) -------------------------------------------
+    // The pump is a detached thread in hle_kernel_time.cpp, so what is testable here is the two
+    // things it is built from: the grid it schedules on, and the grid VALUES this file exports to
+    // it. Stated plainly because a reviewer asked and the answer is a real limit: reverting the
+    // pump's own loop to a relative nanosleep would NOT redden these arms. What they pin is that
+    // the schedule it computes is right, and that the grid it is handed is this file's own.
     {
-        using prosper::host::next_periodic_deadline_ns;
-        const uint64_t P = 16683350;   // the shared 59.94 Hz period
+        using prosper::host::next_grid_deadline_ns;
+        const uint64_t P  = 16683350;      // the shared 59.94 Hz period
+        const uint64_t T0 = 1000000000;    // an arbitrary grid origin
 
-        // The arm that catches the halving. Ordinary overshoot must advance exactly ONE period.
-        CHECK(next_periodic_deadline_ns(1000000, 1000000 + 120000, P) == 1000000 + P,
-              "an ordinary late wake advances the deadline by exactly one period");
-        // ...and the same, iterated: 60 ticks of ordinary overshoot must cover exactly 60
-        // periods, not 120. A rate assertion, which is what the defect actually broke.
-        uint64_t d = 1000000;
-        for (int i = 0; i < 60; i++) d = next_periodic_deadline_ns(d, d + 120000, P);
-        CHECK(d == 1000000 + 60 * P,
-              "60 iterations of ordinary overshoot advance exactly 60 periods (not 120)");
+        // An ordinary late wake -- 120 us past the boundary -- advances exactly ONE period. The
+        // arm that catches a halved rate: an earlier draft advanced then re-anchored, and since a
+        // wait always returns a little PAST its deadline, its re-anchor fired every iteration and
+        // cost an extra period each time.
+        CHECK(next_grid_deadline_ns(T0, T0 + 10 * P + 120000, P) == T0 + 11 * P,
+              "an ordinary late wake yields the next boundary, exactly one period on");
+        // The same iterated, as a RATE: 60 ticks of ordinary overshoot must cover exactly 60
+        // periods. A single-step arm cannot distinguish 60 Hz from 30 Hz.
+        uint64_t d = T0;
+        for (int i = 0; i < 60; i++) d = next_grid_deadline_ns(T0, d + 120000, P);
+        CHECK(d == T0 + 60 * P,
+              "60 iterations of ordinary overshoot advance exactly 60 periods, not 120");
+        CHECK((d - T0) % P == 0,
+              "...and land on the grid, so overshoot never accumulates into it");
 
-        // Overshoot must not accumulate into the grid: waking 120 us late 60 times in a row
-        // leaves the grid where it started, which a relative sleep would not.
-        CHECK(d - 1000000 == 60 * P && (d - 1000000) % P == 0,
-              "the grid absorbs overshoot instead of accumulating it");
+        // PHASE is the point, and it is what the advance-and-re-anchor spelling silently lost.
+        // Every one of these inputs must return a boundary of the ORIGINAL grid: an arbitrary
+        // stall, a stall of exactly a whole period, and a wake a hair before a boundary.
+        const uint64_t probes[] = { 1, P / 3, P - 1, P, P + 1, 4 * P + P / 2, 997 * P + 12345 };
+        bool all_on_grid = true, all_future = true, all_within_one = true;
+        for (uint64_t off : probes) {
+            const uint64_t now = T0 + off;
+            const uint64_t nxt = next_grid_deadline_ns(T0, now, P);
+            all_on_grid    &= (nxt - T0) % P == 0;
+            all_future     &= nxt > now;              // never in the past: the pump would spin
+            all_within_one &= nxt - now <= P;         // never a whole period of dead air
+        }
+        CHECK(all_on_grid,
+              "every result is a boundary of the SAME grid -- phase cannot drift");
+        CHECK(all_future, "every result is strictly in the future, so the pump cannot spin");
+        CHECK(all_within_one,
+              "every result is within one period, so no tick is silently skipped");
 
-        // A wake exactly ON the deadline still advances one period (boundary, not a resync).
-        CHECK(next_periodic_deadline_ns(1000000, 1000000, P) == 1000000 + P,
-              "a wake exactly on the deadline advances one period");
-        // An EARLY return (deadline still in the future) also advances one period.
-        CHECK(next_periodic_deadline_ns(1000000, 999000, P) == 1000000 + P,
-              "an early return advances one period rather than re-anchoring");
+        // A stall of five periods yields ONE boundary, not a backlog of five.
+        CHECK(next_grid_deadline_ns(T0, T0 + 5 * P + 1000, P) == T0 + 6 * P,
+              "a five-period stall yields one boundary, not a catch-up burst");
 
-        // A wholly missed tick re-anchors to now, and posts ONE event rather than bursting the
-        // missed ones -- the deadline lands one period after now, never before it.
-        const uint64_t stalled = next_periodic_deadline_ns(1000000, 1000000 + 5 * P, P);
-        CHECK(stalled == 1000000 + 5 * P + P,
-              "a five-period stall re-anchors to now + one period (no catch-up burst)");
-        CHECK(stalled > 1000000 + 5 * P,
-              "the re-anchored deadline is in the future, so the pump cannot spin");
+        // A first deadline that is ALREADY stale because the grid was anchored earlier by someone
+        // else. This is the case the advance-and-re-anchor spelling got wrong in the direction
+        // that hides: it returned now+period, off-grid, and then held that wrong phase forever.
+        const uint64_t late = next_grid_deadline_ns(T0, T0 + 3000 * P + P / 2, P);
+        CHECK((late - T0) % P == 0 && late == T0 + 3001 * P,
+              "a start 3000 periods after the origin is still phase-exact");
 
-        // A zero period would spin forever on a fixed deadline; it must not return the past.
-        CHECK(next_periodic_deadline_ns(1000000, 2000000, 0) == 2000000,
-              "a zero period degrades to now rather than to a past deadline");
+        // A wake exactly ON a boundary still advances a full period: 'the NEXT vblank' means the
+        // next one, matching what WaitVblank does above.
+        CHECK(next_grid_deadline_ns(T0, T0 + 7 * P, P) == T0 + 8 * P,
+              "a wake exactly on a boundary advances to the next one");
+        // A grid anchored in the FUTURE (reachable through the fake-clock seam) yields the origin.
+        CHECK(next_grid_deadline_ns(T0, T0 - 5 * P, P) == T0,
+              "a grid anchored in the future yields the origin as its first boundary");
+        // A zero period has no boundaries; it must not divide by zero or return the past.
+        CHECK(next_grid_deadline_ns(T0, T0 + 12345, 0) == T0 + 12345,
+              "a zero period degrades to now rather than dividing by zero");
 
-        // The pump and the status/wait grid must agree in PERIOD by construction, not by two
-        // constants that happen to match -- that agreement is the second half of #3024.
+        // ---- the grid VALUES the pump is handed are this file's own --------------------------
         CHECK(prosper_vo_vblank_period_ns() == P,
-              "the exported grid period is the 59.94 Hz vblank period");
-        CHECK(prosper_vo_vblank_period_ns() != 16666667,
-              "...and is NOT the pump's old hardcoded 60.000 Hz constant");
-        CHECK(prosper_vo_vblank_grid_origin_ns() != 0 &&
-                  prosper_vo_vblank_grid_origin_ns() == prosper_vo_vblank_grid_origin_ns(),
-              "the exported grid origin is live and stable across calls");
+              "the exported period is the 59.94 Hz vblank period the status grid uses");
+        // The exported ORIGIN, against an oracle rather than a liveness check: GetVblankStatus
+        // publishes now at +0x10 and (now - epoch) in whole microseconds at +0x08, so the epoch is
+        // recoverable from a status read. Without this, an export returning an origin shifted half
+        // a period -- precisely the defect the WaitVblank phase arm above exists to catch -- would
+        // satisfy every other arm here.
+        prosper_vo_set_vblank_now_for_test(0);          // back to the real clock for the oracle
+        // A FRESH handle: `handle` was retired by the Close arms above, and a status query on a
+        // closed handle correctly returns INVALID_HANDLE and leaves the buffer untouched. Reading
+        // the zeroed buffer as an epoch is how this arm first failed -- which is the arm doing its
+        // job, but the oracle needs a live handle to be about the export at all.
+        const uint64_t ohandle = open(0, 0, 0, 0, 0, 0);
+        CHECK(ohandle != kInvalidHandle && ohandle != 0,
+              "a fresh VideoOut handle opens for the grid-origin oracle");
+        uint8_t ovb[0x40]; memset(ovb, 0, sizeof ovb);
+        CHECK((uint32_t)vbl(ohandle, (uint64_t)(uintptr_t)ovb, 0, 0, 0, 0) == 0,
+              "the oracle status query succeeds (so a zeroed buffer cannot pass as an epoch)");
+        const uint64_t o_now_ns     = *(uint64_t*)(ovb + 0x10);
+        const uint64_t o_process_ns = *(uint64_t*)(ovb + 0x08) * 1000ull;
+        const uint64_t o_epoch_ns   = o_now_ns - o_process_ns;
+        const uint64_t exported     = prosper_vo_vblank_grid_origin_ns();
+        const uint64_t skew = exported > o_epoch_ns ? exported - o_epoch_ns
+                                                    : o_epoch_ns - exported;
+        // 1 us: processTime is published in whole microseconds, so that quantisation is the whole
+        // of the tolerance. A half-period error would be 8341 us.
+        CHECK(skew < 1000,
+              "the exported origin IS the status grid's epoch (within ABI us quantisation)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
