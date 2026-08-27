@@ -155,10 +155,10 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   a byte it owns. With both entry points sharing one attribution helper the writer is named
   immediately: `eboot+0xebb82..0xebbfa`, an unrolled AVX scatter storing 8x16 B per iteration to
   offsets computed in `%ymm10`.
-  **Reproduction needs code that is NOT on master.** `attribute_dmem_allocation` is not in this PR
-  and not in `origin/master`; it is tracked in **#3054**. Until it lands, the recipe below reports
-  `caller-chain=0` for this title and the trace refuses to arm — which is the very failure the row
-  retires, so do not read a failed arm as contradicting it. (#2998, #3054)
+  **Reproduction needs #3054**, which made `sceKernelAllocateDirectMemory` publish a caller chain.
+  Before it, this title produced no `[dmem-caller]` records at all and the trace refused to arm for
+  any configuration — which is the very failure this row retires, so on an older tree do not read a
+  failed arm as contradicting it. (#2998, #3054)
 
 - **Nothing maps into the atlas per-slice, and no host/kernel write streams into it** — both with
   controls, both new instruments. `PROSPER_MAPWATCH` sees one 1 GiB `map_dmem` covering the atlas,
