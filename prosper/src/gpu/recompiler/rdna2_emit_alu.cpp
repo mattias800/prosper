@@ -7242,8 +7242,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // sample it, so every declaration of this binding must agree with the T# or the
             // descriptor is a mismatch. Non-array instructions reaching an array texture get a
             // three-component coordinate with layer 0 -- the same base slice the old base-slice 2D
-            // view gave them. Mirrors the uploader's own predicate (img_dim 5 AND more than one
-            // layer); a depth-1 array is left as a plain 2D image on both sides.
+            // view gave them. The predicate is guest_texture_is_uploaded_array(): img_dim 5 AND
+            // more than one layer AND block-compressed. `img_dim == 5` alone is NOT it -- a depth-1
+            // or non-BC array is a plain 2D image on both sides, and keying on img_dim is exactly
+            // the mistake this comment used to describe.
             const bool res_arrayed = res && prosper::gpu::guest_texture_is_uploaded_array(
                                                 res->img_dim, res->depth, res->format);
             if (in.opcode == 0x0e) {

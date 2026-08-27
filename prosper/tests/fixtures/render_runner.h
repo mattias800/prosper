@@ -135,11 +135,13 @@ struct FrameResource {
     uint32_t declared_mip_levels = 1;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
     // #325: the guest T# is one prosper treats as a layered array, as decided by
-    // guest_texture_is_uploaded_array(). The view type must key on THIS, not on `sample_count > 1`.
-    // The recompiler declares OpTypeImage Arrayed from the same predicate and cannot see how many
-    // layers the uploader actually managed to decode -- a footprint cap, an RTT hit or a DCC
-    // fast-clear can all leave the count at 1 -- so a view keyed on the count would silently become
-    // 2D under an Arrayed declaration. A one-layer 2D_ARRAY view is legal and samples layer 0.
+    // guest_texture_is_uploaded_array(). The view type keys on this IN ADDITION to
+    // `sample_count > 1`, which stays for the MSAA plane array -- that shape has no guest_array flag
+    // and must keep its own arm. What this adds is the case the count cannot express: the
+    // recompiler declares OpTypeImage Arrayed from the same predicate and cannot see how many layers
+    // the uploader actually decoded -- a footprint cap, an RTT hit or a DCC fast-clear can all leave
+    // the count at 1 -- so a view keyed on the count ALONE would silently become 2D under an Arrayed
+    // declaration. A one-layer 2D_ARRAY view is legal and samples layer 0.
     bool guest_array = false;
     // Renderer-owned RTTs keep their native format between producer and consumer. Guest-backed
     // textures still arrive through the existing RGBA8 decoder unless explicitly tagged otherwise.
