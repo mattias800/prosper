@@ -69,28 +69,51 @@ bool queue_trace() {
 // grain, so any guest-side lateness longer than a grain drains it and underruns audibly; hold three
 // grains instead and scheduler jitter stops reaching the speaker.
 //
+// This lever is a PROXY for that patch, not a reproduction of it. #2984 deleted the deadline grid
+// and waited on `SDL_GetAudioStreamAvailable > 3 grains` in a bounded spin; this keeps the grid and
+// starts it further back. Both make the sink stop releasing the guest on a per-grain deadline while
+// the queue is below the target, which is the property under test -- but a reader should know the
+// arm is the property, not the diff.
+//
 // Measured on Blasphemous 2 (PPSA13579), Windows/RTX 4090, 150 s from launch per arm, underrun
-// episodes from tools/perf/audio_queue_timeline_report.py, two runs per arm (#3033):
+// episodes from tools/perf/audio_queue_timeline_report.py (#3070), two runs per arm (#3033):
 //
 //     N=1 (this default)                53.03% / 53.43% dry   arrivals every 11.38 ms
 //     N=3                               69.20% / 69.05% dry   arrivals every 15.57 ms
 //     PROSPER_GUEST_SLEEP_LEGACY=1      69.01%          dry   arrivals every 15.59 ms
 //
-// Within-arm spread is 0.4 pp and the gap is 15.7 pp, so the deeper cushion is decisively WORSE --
-// and it lands on the PRE-FIX pacer to within 0.2 pp and 0.1 ms. That is the mechanism: priming the
-// queue deeper does not buy jitter tolerance, it removes the pacing, and the guest then falls back
-// to whatever it waits on by itself, which is the ~15.6 ms winpthreads tick. The arrival histogram
-// shows it directly -- at N=1, 29.5% of arrivals land on the 5.33 ms grain point; at N=3, almost
-// none land below 10 ms. The pacer is actively PULLING the guest to a finer cadence.
+// Within-arm spread is 0.4 pp against a 15.7 pp gap, so the deeper cushion is decisively WORSE. The
+// mechanism, traced in the code rather than inferred from the coincidence: at N=1 the guest drifts
+// past the grid and trips the `s.next < now - dur * 4` resync every few calls, and ONLY a resync
+// call then sleeps a full grain -- which predicts arrivals quantised to grain multiples with about
+// a quarter of them one grain apart, and the histogram measures 29.5% at the 5.33 ms point. At N=3
+// every target the lever can produce is already in the past, so the sink never sleeps at all --
+// predicting almost nothing at one grain, and the histogram measures one sample, 0.0%. So the code
+// predicts both distributions; the numeric agreement with the legacy arm is corroboration, not the
+// argument.
+//
+// Note the two 69% arms reach that number by DIFFERENT mechanisms -- N=3 by the sink not sleeping,
+// the legacy arm by `std::this_thread::sleep_until` quantising -- so their agreement to 0.2 pp is a
+// coincidence of magnitude, not evidence that they are the same defect. What the guest then paces on
+// is left unnamed: the ~15.6 ms figure looks like the winpthreads tick, but this title's own
+// timedwait census shows accurate 20 ms `usleep` calls after #3022, which would predict ~20.5 ms.
+// That is unresolved and it does not need resolving to reject the hypothesis.
 //
 // The reason no cushion can help is upstream and is now its own issue (#3072): the guest supplies
 // 84 grains/s against the 187 continuous playback needs, so a cushion cannot be filled by a source
 // producing half the samples. #2984 predicted the spacing would come "from the drain rate once the
 // cushion is full"; the cushion does not stay full.
 //
-// How the lever works: N=1 primes the grid at `now`, which is byte-for-byte the shipped behaviour.
-// N>1 primes it N-1 grains in the PAST, so the first N-1 calls find their deadline already passed
-// and return at once. Kept clamped because a deep cushion is also N * ~5.33 ms of added latency.
+// How the lever works: N=1 primes the grid at `now` -- byte-for-byte the shipped behaviour, since
+// the offset is (N-1) grains. N>1 primes it N-1 grains in the PAST, so early calls find their
+// deadline already passed and return at once. Two limits worth knowing before quoting a run:
+//
+//   * "the first N-1 calls return at once" holds only for small N. After a resync the grid sits at
+//     `now - (N-2) * dur`, so from N=6 upward the resync re-fires on every call and N=6..16 are one
+//     behaviour, not eleven. The clamp's upper bound advertises a range the lever cannot express.
+//   * the added latency is (N-1) grains, ~5.33 ms each, and that is an UPPER bound rather than a
+//     cost actually paid -- on this title the cushion never fills, so at N=3 the audio delay does
+//     not grow by 10.7 ms. At the N=1 default it is exactly zero.
 int cushion_grains() {
     static const int n = [] {
         const char* v = getenv("PROSPER_AUDIO_CUSHION_GRAINS");
@@ -99,7 +122,18 @@ int cushion_grains() {
         const long parsed = strtol(v, &end, 10);
         // A malformed value keeps the default instead of picking some other depth: a typo must
         // cost the experiment, never silently run a third arm nobody chose.
-        if (end == v || (end && *end) || parsed < 1 || parsed > 16) return 1;
+        if (end == v || (end && *end) || parsed < 1 || parsed > 16) {
+            // LOUD, matching queue_timeline_ms above. A silent rejection here runs the N=1
+            // arm and reports ~53%, which is indistinguishable from a clean replication of
+            // the OTHER arm -- so a typo would not cost the experiment, it would silently
+            // substitute the wrong one, with nothing in the log saying which ran.
+            SDL_Log("prosper-audio: PROSPER_AUDIO_CUSHION_GRAINS=%s is not an integer in "
+                    "1..16 -- ignoring it and running the default 1-grain cushion", v);
+            return 1;
+        }
+        SDL_Log("prosper-audio: cushion depth %ld grain(s) (PROSPER_AUDIO_CUSHION_GRAINS) -- a \n"
+                "  falsification lever; the measured verdict is that >1 is WORSE, see #3033",
+                parsed);
         return (int)parsed;
     }();
     return n;
