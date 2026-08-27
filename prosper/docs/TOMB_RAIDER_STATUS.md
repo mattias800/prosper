@@ -120,6 +120,19 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **Everything on prosper's side of the interior defect is measured and correct; the atlas is
+  genuinely unpopulated in guest memory.** Twelve candidates eliminated, each with its control or
+  its stated scope: layer index (traced twice to a constant 248), flat interpolation (#3051, the
+  title never sets FLAT_SHADE), mixed-slice triangles (constant per draw), stale decode cache (guest
+  memory probed ~138,000 times, never becomes non-zero), per-slice stride and mip offset (both
+  layouts tested), `depth` mis-decode (raw T# confirms 256 / base_array 0), truncated reads
+  (`short_reads=0`), partial residency (one `rw-s` mapping covers the whole span), base-address
+  mis-decode (dword0 `<< 8` matches), compute STORE (control fired, no compute binds it), recorded
+  PM4 write paths (all four recorders armed, zero hits), and an unimplemented
+  `sceAgcDriverInitResourceRegistration` (its family is profiler labelling, not memory). The
+  remaining work is a forward investigation from the title's asset/streaming logic, not from the
+  frame. Full evidence on #2998.
+
 - **The interior's wrong textures are not prosper mis-reading the atlas. The atlas is genuinely
   almost empty in GUEST memory, for the whole run.** Measured, each point with the control that
   makes it mean something:

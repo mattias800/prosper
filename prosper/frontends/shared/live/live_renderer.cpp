@@ -4303,6 +4303,35 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // which runs on every reference, and reports the first time a high slice
                             // becomes non-zero. If that ever fires, the cache is serving stale
                             // pixels and the decode simply happened too early.
+                            // #2998: what BACKS this atlas? If the guest maps texture data in
+                            // (a file mapping, or several separate mappings), a short or partial
+                            // mapping explains an allocation whose tail reads zero far better than
+                            // "the game never wrote it". Printed once per address, from the host
+                            // process's own map, because the guest VA is mapped into it.
+                            if (is_array && r.depth > 64u && getenv("PROSPER_SLICEMAPS")) {
+                                static std::set<uint64_t> shown;
+                                if (shown.insert(r.gpu_addr).second) {
+                                    const uint64_t lo = r.gpu_addr;
+                                    const uint64_t hi = r.gpu_addr +
+                                        (uint64_t)r.layer_stride_bytes * r.depth;
+                                    FILE* m = fopen("/proc/self/maps", "r");
+                                    char line[512];
+                                    uint32_t printed = 0;
+                                    while (m && fgets(line, sizeof line, m) && printed < 8) {
+                                        unsigned long long a = 0, b = 0;
+                                        if (sscanf(line, "%llx-%llx", &a, &b) != 2) continue;
+                                        if (b <= lo || a >= hi) continue;
+                                        fprintf(stderr, "[slicemaps] 0x%llx..0x%llx overlaps: %s",
+                                                (unsigned long long)lo, (unsigned long long)hi, line);
+                                        ++printed;
+                                    }
+                                    if (m) fclose(m);
+                                    if (!printed)
+                                        fprintf(stderr, "[slicemaps] 0x%llx..0x%llx has NO mapping "
+                                                        "in /proc/self/maps\n",
+                                                (unsigned long long)lo, (unsigned long long)hi);
+                                }
+                            }
                             if (is_array && r.depth > 64u && getenv("PROSPER_SLICEWATCH")) {
                                 static uint64_t watched = 0;
                                 static bool announced_zero = false, announced_nz = false;
