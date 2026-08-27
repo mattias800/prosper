@@ -615,7 +615,13 @@ case("run() passes an explicit encoding, not the host locale default",
 # traceback. Driven directly rather than through the gh stub: what matters is that a zero-rc
 # None stdout becomes a ScanError, and a fake CompletedProcess says exactly that with no
 # dependence on the host locale. Review of #3071 noted the guard had no arm at all.
+#
+# shutil.which is stubbed as well, and that is not tidiness: the function resolves `gh` FIRST and
+# raises a DIFFERENT ScanError when it is absent. Without this the arm asserts the wrong message
+# on any host without gh installed -- passing here, where gh happens to be on PATH, and failing
+# in CI. An arm whose verdict depends on an unstated precondition of the machine.
 _orig_for_guard = subprocess.run
+_orig_which = shutil.which
 
 
 def _none_stdout(*a, **kw):
@@ -624,6 +630,7 @@ def _none_stdout(*a, **kw):
 
 
 subprocess.run = _none_stdout
+shutil.which = lambda name: "/usr/bin/" + name       # pretend gh resolves
 try:
     added_rows_from_diff("owner/repo", 1, "doc.md")
     FAILURES.append("added_rows_from_diff accepted a None stdout instead of refusing")
@@ -634,6 +641,7 @@ except AttributeError:
     FAILURES.append("added_rows_from_diff died on None.split -- the guard is missing")
 finally:
     subprocess.run = _orig_for_guard
+    shutil.which = _orig_which
 
 
 
