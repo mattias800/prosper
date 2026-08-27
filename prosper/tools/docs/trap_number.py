@@ -94,11 +94,30 @@ def run(cmd: list[str]) -> str:
             f"from `git` and `gh` and refuses to guess without them."
         )
     try:
-        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True)
+        # encoding="utf-8" EXPLICITLY, not text=True alone. text=True decodes with the locale
+        # default, which on a Windows host is cp1252 -- and this tool's whole job is to pipe a
+        # UTF-8 Markdown document through a subprocess. The doc contains typographic quotes and
+        # em dashes, so the decode raised UnicodeDecodeError inside subprocess's reader THREAD,
+        # which left proc.stdout as None while returncode stayed 0. The tool then crashed 150
+        # lines away in the table parser with "'NoneType' object has no attribute 'split'".
+        # trap_number.py was therefore unusable on Windows, and unusable in a way that pointed
+        # the reader at the wrong file.
+        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, encoding="utf-8")
     except OSError as exc:  # pragma: no cover - permissions, exec format, a full disk
         raise ScanError(f"{' '.join(cmd[:3])}... could not be run: {exc}") from exc
     if proc.returncode != 0:
         raise ScanError(f"{' '.join(cmd[:3])}... failed (rc={proc.returncode}): {proc.stderr.strip()}")
+    # The backstop for the same class, and it is the half that matters: ANY future decode
+    # failure in that reader thread yields None here with a zero returncode. Without this the
+    # tool violates its own docstring -- "Never lets an exception escape as a traceback" -- by
+    # crashing somewhere else entirely, which reads as a bug in the table rather than in the
+    # read. Whoever is holding a number they are about to write needs to be able to tell those
+    # two apart.
+    if proc.stdout is None:
+        raise ScanError(
+            f"{' '.join(cmd[:3])}... produced output this tool could not decode as UTF-8, so "
+            f"the table cannot be read. This tool refuses to guess a number from a partial read."
+        )
     return proc.stdout
 
 
@@ -185,8 +204,10 @@ def added_rows_from_diff(repo: str, number: int, path: str) -> list[int]:
     exe = shutil.which("gh")
     if exe is None:
         raise ScanError("'gh' is not on PATH, so this PR's patch cannot be read.")
+    # Same explicit encoding as run(); a PR body or patch is as likely to carry non-ASCII as
+    # the document itself.
     proc = subprocess.run([exe, "pr", "diff", str(number), "--repo", repo],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
         raise ScanError(
             f"`gh pr diff {number}` failed (rc={proc.returncode}): {proc.stderr.strip()}. Without "

@@ -65,7 +65,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from check_numbered_table import Table, parse_tables  # noqa: E402
-from trap_number import added_rows_from_patch, highest, table_numbers  # noqa: E402
+from trap_number import added_rows_from_patch, highest, run, table_numbers  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -550,6 +550,39 @@ run_main("no matching table in the base is an error, not an allocation from noth
          absent="next free number", extra=["--table-header", "Nonexistent"])
 
 print("agreement with the gate, on the repository's real table:")
+
+# ---------------------------------------------------------------------------------------------
+# run() must decode subprocess output as UTF-8 regardless of the host locale.
+#
+# Not hygiene. text=True alone decodes with the LOCALE default, which on a Windows host is
+# cp1252 -- and this tool's whole job is to pipe a UTF-8 Markdown document through a subprocess.
+# The decode raised inside subprocess's reader THREAD, so proc.stdout became None while
+# returncode stayed 0, and the tool then crashed 150 lines away in the table parser with
+# "'NoneType' object has no attribute 'split'". trap_number.py was unusable on Windows, and
+# unusable in a way that pointed the reader at the wrong file.
+#
+# Driven through `git show` of a real blob rather than a synthetic echo, so the arm exercises the
+# same call the tool uses to read the base document.
+# ---------------------------------------------------------------------------------------------
+NON_ASCII = "trap row with an em dash \u2014 and typographic \u201cquotes\u201d\n"
+with tempfile.TemporaryDirectory() as _d:
+    _repo = Path(_d)
+    _git = ["git", "-C", str(_repo)]
+    for _args in (["init", "--quiet"],
+                  ["config", "user.email", "t@example.com"],
+                  ["config", "user.name", "t"]):
+        subprocess.run([*_git, *_args], capture_output=True)
+    (_repo / "doc.md").write_text(NON_ASCII, encoding="utf-8")
+    subprocess.run([*_git, "add", "doc.md"], capture_output=True)
+    subprocess.run([*_git, "commit", "--quiet", "-m", "x"],
+                   capture_output=True)
+    try:
+        _got = run(["git", "-C", str(_repo), "show", "HEAD:doc.md"])
+        case("run() decodes non-ASCII UTF-8 subprocess output", _got, NON_ASCII)
+        case("...and returns a str, not the None that crashed the parser later",
+             isinstance(_got, str), True)
+    except Exception as exc:      # noqa: BLE001 - the point is that nothing escapes
+        FAILURES.append(f"run() raised on non-ASCII UTF-8 output: {exc!r}")
 
 DOC = HERE.parent.parent / "docs" / "GAME_COMPAT_ORCHESTRATION.md"
 if not DOC.exists():  # fail closed: a moved document must not silently skip the only real-data arm
