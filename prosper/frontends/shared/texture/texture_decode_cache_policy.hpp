@@ -41,6 +41,48 @@ constexpr size_t layered_cube_source_size(bool exact_layered_cube,
     return static_cast<size_t>(descriptor_footprint);
 }
 
+// The array equivalent, and the same invariant: a LAYERED array's decoder reads every layer, so the
+// validation span must reach the last one. Returning a single surface let the persistent cache prove
+// reuse against 262144 of 90177536 bytes -- 0.29% -- of a 256-layer world atlas, so every layer above
+// the first changed invisibly and a decode taken while the atlas was nearly empty was reused for the
+// whole run (#2998). Cubes have always spanned their six faces; arrays were added later without this.
+//
+// Fails closed exactly as the cube form does. A `surface_bytes` of 0 is the caller's "do not cache"
+// signal and must never be widened into a cacheable span; a single layer leaves the surface size
+// unchanged; a MISSING stride does not -- the decoder synthesizes one, so the span follows it (see
+// below); an overflowing span yields 0 rather than a truncated range, because a span shorter than
+// the decoder reads is precisely the defect this exists to prevent.
+//
+// The span deliberately OVER-covers by the per-layer mip chains (~23 MiB for the atlas above), and
+// that should stay. Tightening it means writing a second model of the layout here, which can drift
+// from the decoder's -- and two models disagreeing about one layout is exactly how this defect
+// happened. An over-approximation sharing the decoder's own stride errs toward re-decoding, which
+// is the safe direction; a tighter one that drifts errs toward serving stale pixels.
+constexpr size_t layered_array_source_size(size_t surface_bytes,
+                                           uint64_t layer_stride_bytes,
+                                           uint32_t layers) {
+    if (!surface_bytes) return 0;
+    if (layers <= 1u) return surface_bytes;
+    // Mirror the decoder's own fallback. `face_base` uses
+    //     stride = layer_stride_bytes ? layer_stride_bytes : selected_span
+    // so a descriptor that declares NO stride is still read as `layers` back-to-back surfaces --
+    // and returning one surface here would validate 1/layers of what is read, which is the very
+    // defect this function exists to prevent. Reachable: a BC 2D_ARRAY whose tile mode falls
+    // outside the modelled set leaves `image_base_level_view` supported with layer_stride == 0.
+    // (Scope: `selected_span` is `mip_tail_bytes` when the view sits in the mip tail, which this
+    // cannot see. The zero-stride path is reached only with `in_mip_tail` false, where
+    // `selected_span == surface_bytes`; a future tail-plus-zero-stride case would need the tail
+    // size passed in rather than assumed.)
+    const uint64_t stride = layer_stride_bytes ? layer_stride_bytes
+                                               : static_cast<uint64_t>(surface_bytes);
+    const uint64_t last_layer_start = stride * static_cast<uint64_t>(layers - 1u);
+    if (last_layer_start / stride != (layers - 1u)) return 0;
+    if (last_layer_start > UINT64_MAX - surface_bytes) return 0;
+    const uint64_t span = last_layer_start + surface_bytes;
+    if (span > SIZE_MAX) return 0;
+    return static_cast<size_t>(span);
+}
+
 constexpr size_t block_compressed_cube_source_size(bool block_compressed_cube,
                                                     uint64_t gpu_address,
                                                     uint64_t descriptor_footprint) {

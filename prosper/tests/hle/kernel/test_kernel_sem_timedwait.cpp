@@ -16,13 +16,46 @@
 // on a loaded host.
 //
 // So the arms are:
-//   1. MECHANISM  - the wait was served by the high-resolution timer, not ::Sleep's tick. Reddens on
-//                   the pre-fix code, which never touches precise_sleep at all.
+//   1. MECHANISM  - WHICH primitive served the wait. On Windows: the high-resolution timer, not
+//                   ::Sleep's tick -- reddens on the pre-fix code, which never touches
+//                   precise_sleep at all. On POSIX the assertion is the OPPOSITE value,
+//                   "none", because the native sem_timedwait is kept there and must not start
+//                   polling; the two are different assertions, not one with a platform tweak.
 //   2. ENCODING   - the timeout returns exactly 0x8002003c, FreeBSD ETIMEDOUT as the guest reads it.
 //                   Nothing else in the suite covers this path's encoding.
-//   3. BOUNDS     - a lower bound as well as an upper one. The upper alone cannot catch a wait that
-//                   returns instantly; the lower alone cannot catch the tick.
-//   4. FAST PATH  - an already-posted semaphore never enters the loop.
+//   3. BOUNDS     - a stub/unit guard, and NOT the discriminator. THE canonical figures for this
+//                   file, referenced from CMakeLists.txt rather than restated there:
+//
+//                     defect, Windows, fix reverted:  14.69  12.06  17.75  10.00  15.32 ms
+//                     fix, Windows:                    5.49   5.47   5.39 ms
+//                     macOS/Rosetta, native path:     18.54  23.22  46.46 ms
+//
+//                   A 12 ms ceiling would have PASSED the defect (the 10.00 ms run), not
+//                   merely flaked -- silently, which is worse. And it cannot be repaired by
+//                   moving it, for a reason that needs no measurement at all: a quantized
+//                   wait returns at the next tick BOUNDARY, so its latency is T-p or 2T-p for
+//                   phase p within the tick, and as p approaches T-N from below the defect's
+//                   latency approaches the REQUESTED 5 ms exactly -- below the fix's own
+//                   5.39 ms, for any tick length T. The distributions overlap by
+//                   construction. (Second review of #3066 supplied that argument; the five
+//                   samples are kept because they also discriminate the MODEL -- a
+//                   whole-ticks-from-the-request model predicts clustering at ~15.6/31.2 ms,
+//                   which 10.00 and 12.06 falsify.)
+//
+//                   Arm 1 caught all five reverted runs. On Rosetta the native path is
+//                   untouched by this change, and arm 4's posted acquire measures SUB-
+//                   MILLISECOND there, so the 100 ms bound has over 100x headroom on a
+//                   measured value rather than a guessed one.
+//   4. FAST PATH  - an already-posted semaphore is acquired at once, asserted as a COUNT of 0
+//                   afterwards rather than as a latency. The latency bound is kept as well but
+//                   is Windows-tight / POSIX-loose, and it cannot see the fast path at all:
+//                   the pre-loop trywait and the first call inside the loop are identical, so
+//                   deleting the fast path changes no duration. "Never enters the loop" is
+//                   therefore NOT what this arm asserts, and there is no loop on POSIX.
+//
+// The header being right about the arms is part of the test. Its first version was wrong about
+// them in the same breath as the arms were wrong, and the confident label is what stopped anyone
+// re-deriving it -- so a bound that changes changes this list too.
 //
 // Deliberately NOT asserted: the poll slice length. A short high-resolution sleep on this host has a
 // ~0.52 ms floor, so the adaptive 0.5 ms slice and a flat 2 ms one produce overlapping latency
@@ -52,20 +85,34 @@ int main() {
     HleFn sem_init_fn = Hle::lookup(nid_hash("scePthreadSemInit").c_str());
     HleFn timedwait   = Hle::lookup(nid_hash("scePthreadSemTimedwait").c_str());
     HleFn post        = Hle::lookup(nid_hash("scePthreadSemPost").c_str());
+    // Optional: used only to make ARM 4 assert the COUNT rather than a duration. Guarded so a
+    // build where it is unregistered loses one assertion instead of the whole test.
+    HleFn getvalue    = Hle::lookup(nid_hash("scePthreadSemGetvalue").c_str());
     CHECK(sem_init_fn != nullptr, "scePthreadSemInit is registered");
     CHECK(timedwait != nullptr, "scePthreadSemTimedwait is registered");
     CHECK(post != nullptr, "scePthreadSemPost is registered");
     if (!sem_init_fn || !timedwait || !post) { printf("== FAIL (unresolved) ==\n"); return 1; }
 
-    // The guest handle is an opaque slot; ensure_sem backs it with a real sem_t. Initialised through
-    // the HLE and CHECKED - the first version declared a bare `sem_t slot;` and called init with its
-    // result ignored, so an init that silently failed would have left every arm below operating on an
-    // uninitialised object.
-    sem_t slot;
+    // The guest handle is a POINTER CELL, not a semaphore. k_sem_init does
+    //     `*(void**)(uintptr_t)a0 = s;`
+    // i.e. it heap-allocates the sem_t and writes the POINTER through the handle, and every
+    // other member of the family reads it back with an 8-byte load (`ensure_sem`). So the slot
+    // must be pointer-sized.
+    //
+    // This was `sem_t slot;`, which is a latent stack overwrite that happens to be invisible
+    // on two of three platforms: winpthreads' sem_t is a pointer (8 bytes) and glibc's is 32,
+    // but **Darwin's is `int`** -- so on macOS the 8-byte write ran four bytes past a 4-byte
+    // automatic. Found in review of the very PR whose purpose was to green the macOS job.
+    void* slot = nullptr;
     const uint64_t handle = (uint64_t)(uintptr_t)&slot;
     // Asserts that init REPORTS success, not that the count is observably 0 -- the count is then
-    // established by arm 1 timing out rather than being acquired. The earlier message claimed the
-    // stronger thing.
+    // established by arm 1 timing out rather than being acquired.
+    //
+    // Weaker still than that, and named rather than left implied: k_sem_init DISCARDS
+    // sem_init's return and returns 0 unconditionally, so this CHECK cannot fail as the code
+    // stands. It is kept as a tripwire for the day that is fixed, and the fix is #3068 --
+    // which matters on macOS, where unnamed POSIX semaphores are ENOSYS and this family may
+    // therefore be operating on an uninitialised object while reporting success.
     CHECK(sem_init_fn(handle, 0, 0, 0, 0, 0) == 0, "scePthreadSemInit reports success");
 
     // ARM 1 + 2 + 3: one unposted wait, three independent properties.
@@ -83,10 +130,29 @@ int main() {
         CHECK(rc == prosper::hle::kSceKernelErrorETIMEDOUT,
               "a timeout returns FreeBSD ETIMEDOUT encoded as the guest reads it (0x8002003c)");
 
-        // ARM 3: bounded on BOTH sides. An upper bound alone passes a wait that returns instantly;
-        // a lower bound alone passes the 15.6 ms tick.
+        // ARM 3: BOUNDS, and they are deliberately NOT the discriminator. This is the second
+        // correction to this arm and the reasoning is measured rather than argued.
+        //
+        // The first version used a 40 ms ceiling, 2.6x above the defect, so it could not fail.
+        // The second used 12 ms, which reddened -- and then flaked on macOS/Rosetta at 18.54 ms,
+        // because on POSIX the native call is untouched by this change and the ceiling was purely
+        // an assertion about the host's scheduler.
+        //
+        // Tightening it per-platform was the obvious next move, and it is wrong in the direction
+        // that matters: it lets the defect THROUGH. Measured by reverting the fix and running
+        // five times -- 14.69, 12.06, 17.75, 10.00, 15.32 ms. The 10.00 ms run passes a 12 ms
+        // ceiling, so that bound was not merely fragile, it was unsound. It has to be: a
+        // quantized wait returns at the next tick BOUNDARY, so a 5 ms request lands anywhere in
+        // roughly [5, 20.6] ms depending on where it falls within the ~15.6 ms tick. The
+        // defect's timing distribution OVERLAPS the fix's, so no single-run wall-clock bound
+        // separates them on any platform. The mechanism arm caught all five.
+        //
+        // So the bounds are a stub/unit/hang guard on both platforms, and the MECHANISM arm below
+        // is the discriminator -- which is what this file's header has said from the start, and
+        // what the repo's own guidance says: assert which primitive served the wait, because that
+        // reads a state variable instead of a clock and cannot flake.
         CHECK(ms >= 4.0, "it actually waited (a stub returning at once fails this)");
-        CHECK(ms < 12.0, "and returned inside one winpthreads tick of the request, not after it");
+        CHECK(ms < 500.0, "and on the right order of magnitude (a wrong unit or a hang fails this)");
 
         // ARM 1: WHICH primitive served it. This is the arm that reddens on the pre-fix code, which
         // delegates to winpthreads and never enters precise_sleep, leaving the backend at "none".
@@ -110,14 +176,50 @@ int main() {
         printf("         (timeout took %.2f ms via %s)\n", ms, host::sleep_backend_name());
     }
 
-    // ARM 4: an already-posted semaphore is taken by the trywait fast path and never enters the loop.
+    // ARM 4: an already-posted semaphore is acquired at once and its count is consumed.
+    // NOT "never enters the loop" -- that phrase was here and is wrong, see the header and the
+    // note over the count assertion below. There is no loop on POSIX at all.
     {
         CHECK(post(handle, 0, 0, 0, 0, 0) == 0, "post succeeds");
         const auto t0 = clk::now();
+        // A ONE SECOND timeout, deliberately: the assertion is that the wait returned nowhere near
+        // it, so the gap between the bound and the timeout is the whole strength of the arm.
         const uint64_t rc = timedwait(handle, 1000000, 0, 0, 0, 0);
         const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         CHECK(rc == 0, "an already-posted semaphore is acquired");
-        CHECK(ms < 1.0, "...immediately, without entering the poll loop");
+        // The count is the observable, and it is what "acquired" MEANS: it catches a path that
+        // returns rc==0 WITHOUT consuming, which no timing bound can see. Mutation-checked
+        // with a peek-and-return in place of the trywait.
+        //
+        // What it does NOT catch, stated because the obvious reading of it is wrong: deleting
+        // the pre-loop sem_trywait entirely. The loop's FIRST statement is the identical
+        // call, so it consumes the count anyway and every assertion here still passes. That
+        // deletion is unobservable at the HLE boundary by construction -- the fast path is a
+        // latency optimisation, not a semantic one -- so it is a fact to record rather than a
+        // gap to close. Second review of #3066.
+        // The lookup is CHECKed rather than merely guarded: an optional lookup that silently
+        // skips means a rename makes both assertions below vanish GREEN.
+        CHECK(getvalue != nullptr, "scePthreadSemGetvalue is registered");
+        if (getvalue) {
+            int v = -1;
+            CHECK(getvalue(handle, (uint64_t)(uintptr_t)&v, 0, 0, 0, 0) == 0,
+                  "getvalue succeeds after the acquire");
+            CHECK(v == 0, "...and the count really was consumed, not merely reported as taken");
+        }
+        // Same asymmetry as ARM 3, and the same reasoning: 1 ms is a fair bound on a real x86
+        // host, and on an emulated-x86 CI VM it is a latent flake that happened not to fire yet.
+        // 100 ms still fails a fast path that fell through to waiting out the 1 s timeout, which
+        // is the only defect this arm can see.
+#ifdef _WIN32
+        CHECK(ms < 1.0, "...immediately, on the order of a trywait rather than a wait");
+#else
+        CHECK(ms < 100.0, "...immediately, nowhere near the 1 s timeout it was given");
+#endif
+        // Printed for the same reason ARM 3 prints its figure: a green ctest run shows no
+        // per-test output, so a margin that is never printed cannot be quoted from a passing
+        // log -- which is exactly how #3044 came to be merged on a green Rosetta job whose
+        // numbers nobody had seen.
+        printf("         (posted acquire took %.2f ms)\n", ms);
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

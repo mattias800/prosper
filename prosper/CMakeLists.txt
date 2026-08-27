@@ -390,6 +390,14 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # The queue-depth timeline reader (#3033). Registered for a reason specific to this one: its
+  # verdict is a DISCRIMINATOR that a pacer A/B rests on, and its first version could not tell a
+  # port that was starved from a port that was merely silent -- both read queued=0. It reported a
+  # 600 s Blasphemous 2 run as 53% dry before that gate existed. The arms pin all three conditions
+  # of the gate, each of which was found untested by mutating it away.
+  add_test(NAME audio_queue_timeline_report_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_audio_queue_timeline_report.py")
   # The shader-conformance scanner (#3036), registered because its whole value is a CLEAN result
   # and its original failure mode was manufacturing one: a capture that yielded zero examined
   # shaders exited 0, and findings could be attributed to a capture whose dumps had all failed.
@@ -648,7 +656,16 @@ if(TARGET prosper_core)
   # other two arms measured a POSTED semaphore, which unfixed winpthreads serves in 0.01 ms -- better
   # than the poll loop, so they preferred the defect. A mechanism assertion cannot be satisfied by a
   # lucky duration and does not flake under load. Mutation-checked: reverting to the winpthreads
-  # delegation reddens two arms and prints "via none".
+  # delegation reddens the MECHANISM arm and prints "via none".
+  #
+  # It used to say "reddens two arms", the second being a wall-clock ceiling, and that ceiling is
+  # gone: it would have PASSED the defect, and it also flaked on macOS/Rosetta. The mechanism
+  # arm is the discriminator; the bounds that remain are a stub/unit guard.
+  #
+  # The measurements and the argument live in ONE place, the test file's own header. They were
+  # briefly in both, with two different lists -- and a third Rosetta figure existed in neither
+  # (23.22 ms, found in a CI log during review). Two copies of a figure list is one copy too
+  # many, and this is the copy that gets read second.
   add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
   target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
   add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
