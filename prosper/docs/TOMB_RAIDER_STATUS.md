@@ -120,6 +120,16 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **Missing SPIR-V `Flat` on the varying that carries the array slice is NOT why interiors sample
+  the wrong layers.** The gap is real — `is_flat_shaded()` is decoded, used to build the guest's PS
+  input control word, and never reaches the SPIR-V (#3051) — but this title never asks for it. A
+  live `PROSPER_INTERPLOG=1` route (224,363 `[interp]` lines) shows Location 1, the slot carrying the
+  slice, with control words `0x1` / `0x0` / `0x4` and **no control word anywhere in the run setting
+  the `0x400` FLAT_SHADE bit**. #3051 stays open as a latent defect with no observed instance.
+- **This question cannot be answered offline.** `gpu_replay` on a `.prgcap` emits **zero**
+  `[interp]` lines: a capture replays pre-decoded draws, so recompile-time diagnostics never fire
+  (instrument trap 229). The falsification above had to be measured on a live route.
+
 > The `PROSPER_*` probes cited below are **not on master**. They live on the unmerged WIP branch
 > `wip/issue-325-texture-arrays` (`e1b0fbb2` and later), which exists so these measurements stay
 > reproducible. Check that branch out before trying to re-run one.
