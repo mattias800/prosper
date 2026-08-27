@@ -24,11 +24,8 @@ Two verdicts share exit 2 on purpose, because they need the same care:
              stored picture. This is the case a mean-only test misses: a real loading screen usually
              has something drawn ON it -- a progress bar, a hint caption -- and a 2%-of-height bar
              is enough to lift the mean past any sane threshold while 98% of the frame is still the
-             asset. DOMINATED also requires the mean to stay under --dominated-mean-max, because a
-             high matching fraction alone is not "mostly the same picture": a real capture scored
-             50.00% overlap at mean 103.88/255 -- half its pixels coincided while the average
-             difference was enormous. Both conditions together separate the measured true positives
-             (means 2.40-10.36) from that case with clear room on each side.
+             asset. There is deliberately no separate mean ceiling: an overlap
+             this high already bounds the mean, so a ceiling could only add false negatives.
 
 "Informative" is load-bearing and was added after review. Scoring every pixel makes the overlap
 measure DARKNESS rather than identity: a black frame against a black asset scores 100%, and this
@@ -75,7 +72,6 @@ def main(argv):
     top = opt('--top', 5, int)
     threshold = opt('--threshold', 1.0, float)
     overlap = opt('--overlap', 75.0, float)
-    dominated_mean_max = opt('--dominated-mean-max', 40.0, float)
     floor = opt('--floor', 16, int)
     min_coverage = opt('--min-coverage', 25.0, float)
     structure_floor = opt('--structure-floor', 3.0, float)
@@ -201,12 +197,14 @@ def main(argv):
               % (max(row[3] for row in scored), min_coverage))
         return 1
 
-    # "Mostly the same picture" needs BOTH a high matching fraction and a mean that has not blown
-    # up. Overlap alone admitted a genuine render at 50.00%/mean 103.88 -- half the pixels happened
-    # to coincide while the average difference was enormous, which is not domination by any reading.
-    dominant_pool = [row for row in usable if row[0] <= dominated_mean_max]
-    dominant = max(dominant_pool, key=lambda row: row[1]) if dominant_pool else None
-    if dominant is not None and dominant[1] >= overlap:
+    # There is deliberately NO separate mean ceiling here. One was added and removed: an overlap of
+    # >= 75% already bounds the mean at <= 63.75/255 (and <= 75.75 in the worst coverage case), so
+    # any ceiling below that can only discard frames the bar would have flagged -- it cannot prevent
+    # a false positive, only manufacture false negatives. Measured: 4 of 13 real assets with a bright
+    # caption panel reach mean 40.5-54.3 while still exceeding the bar, and a 40 ceiling silently
+    # dropped every one of them.
+    dominant = max(usable, key=lambda row: row[1])
+    if dominant[1] >= overlap:
         print("\nDOMINATED: %.2f%% of this frame's INFORMATIVE pixels are within 8/255 of the\n"
               "  stored asset %s (coverage %.2f%%, mean abs diff %.2f/255 -- an overlay or caption\n"
               "  lifts the mean, which is why a mean-only test would have passed this).\n"
@@ -216,15 +214,10 @@ def main(argv):
               % (dominant[1], dominant[2], dominant[3], dominant[0]))
         return 2
 
-    if dominant is not None:
-        print("\nno asset explains this frame (closest comparison %.2f/255; highest overlap %.2f%%\n"
-              "with %s at %.2f%% coverage, under the %.2f%% dominance bar). That is not the same as\n"
-              "proving it is rendered 3D; see this tool's scope note."
-              % (exact[0], dominant[1], dominant[2], dominant[3], overlap))
-    else:
-        print("\nno asset explains this frame (closest comparison %.2f/255; no asset combines a\n"
-              "usable overlap with a mean under %.2f/255). That is not the same as proving it is\n"
-              "rendered 3D; see this tool's scope note." % (exact[0], dominated_mean_max))
+    print("\nno asset explains this frame (closest comparison %.2f/255; highest overlap %.2f%%\n"
+          "with %s at %.2f%% coverage, under the %.2f%% dominance bar). That is not the same as\n"
+          "proving it is rendered 3D; see this tool's scope note."
+          % (exact[0], dominant[1], dominant[2], dominant[3], overlap))
     return 0
 
 

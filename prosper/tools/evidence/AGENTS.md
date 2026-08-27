@@ -40,9 +40,13 @@ matches at mean 0.00 exactly as a black pair does. So the gate is on **luma stan
 the candidate and of every asset, plus a coverage floor over informative pixels. A featureless frame
 matches nothing at any brightness, and is not progression evidence in the first place.
 
-**A high matching fraction alone is not domination either.** A real capture scored 50.00% overlap at
-mean 103.88/255 — half its pixels coincided with an asset while the average difference was enormous.
-So DOMINATED requires both a high overlap and a bounded mean.
+**A mean ceiling was tried here and removed, which is worth knowing before adding one back.** It
+looked reasonable — "a high matching fraction alone is not domination" — but an overlap bar of 75%
+already bounds the mean at ≤ 63.75/255, so any ceiling below that can only discard frames the bar
+would have flagged. It cannot prevent a false positive and can only manufacture false negatives:
+4 of 13 real assets carrying a bright caption panel reach mean 40.5–54.3 while still exceeding the
+bar, and a ceiling of 40 silently dropped every one. The case that motivated it was already rejected
+by the bar.
 
 **And the two statistics need different gates**, which conflating them hid: `mean` is a whole-frame
 average that darkness cannot corrupt, so two structured images at mean 0.00 are the same image
