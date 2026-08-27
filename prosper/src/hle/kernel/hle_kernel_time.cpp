@@ -7,6 +7,8 @@
 #include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include "host/platform/precise_sleep.hpp"   // guest sleeps must not inherit the winpthreads tick (#3013)
 #include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS: which primitive a title paces on
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();   // the shared 59.94 Hz grid (hle_graphics.cpp)
+extern "C" uint64_t prosper_vo_vblank_period_ns();
 #include "host/image/runtime_module_load.hpp"   // #639: real runtime PRX loading
 #include "host/memory/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
 #include "hle/dispatch/callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
@@ -1108,8 +1110,39 @@ namespace {
     }
     void vblank_pump() {
         uint64_t frame = 0;
+        // Absolute schedule on the SHARED 59.94 Hz grid that hle_graphics.cpp uses for the
+        // vblank status and wait paths, waited with host::sleep_until_steady_ns. Two defects
+        // this replaces (#3024):
+        //
+        //   * A relative nanosleep(16.67 ms) resolves on the winpthreads tick on Windows. A
+        //     standalone microbenchmark of that nanosleep on this toolchain (MinGW-w64/UCRT,
+        //     GCC 16.1) returns every 29.95 ms, so the pump was posting vblank kevents at
+        //     roughly 33 Hz rather than 60, and every consumer pacing on this event stream
+        //     inherited it. Provenance stated because it matters: that is the sleep primitive
+        //     measured in isolation, NOT an instrumented measurement of this pump, and the
+        //     figure is quoted here only to size the defect. Same microbenchmark under
+        //     timeBeginPeriod(1) gives 24.78 ms -- still not 16.67 -- and that arm is
+        //     hypothetical for prosper, which calls timeBeginPeriod nowhere (see
+        //     precise_sleep.cpp's own note). So the unrescued 29.95 ms is what ran.
+        //     It is the same defect #1765 fixed for the status/wait grid one file away, which
+        //     is why that file already says "NOT std::this_thread::sleep_until" over its wait.
+        //   * A relative sleep also drifts against the status grid. hle_graphics.cpp records
+        //     that as an open follow-up in as many words -- the two clocks "drift by roughly one
+        //     tick per second and their boundaries do not coincide", and a title that
+        //     cross-checks the kevent count against the status count would see it. Deriving both
+        //     from one origin and one period closes it by construction rather than by tuning.
+        //
+        // host::next_periodic_deadline_ns carries the advance, including the resync after a
+        // wholly missed tick. It is a separate tested function because the obvious inline
+        // spelling of that resync is wrong in a way that still looks like 60 Hz -- see its
+        // comment in precise_sleep.hpp.
+        const uint64_t period_ns = prosper_vo_vblank_period_ns();
+        uint64_t next_ns = prosper_vo_vblank_grid_origin_ns() + period_ns;
         for (;;) {
-            struct timespec ts{ 0, 16666667 }; nanosleep(&ts, nullptr);   // ~60 Hz
+            prosper::host::sleep_until_steady_ns(next_ns);
+            const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clk::now().time_since_epoch()).count();
+            next_ns = prosper::host::next_periodic_deadline_ns(next_ns, now_ns, period_ns);
             frame++;
             std::vector<FlipReg> vr;
             { std::lock_guard lk(g_eq_mx); vr = g_vblank_regs; }

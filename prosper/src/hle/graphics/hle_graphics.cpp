@@ -764,6 +764,14 @@ void vblank_sleep_until_ns(uint64_t deadline_ns) {
 }
 }  // namespace
 
+// The kernel equeue vblank pump (hle_kernel_time.cpp) schedules on THIS grid, so the kevent
+// stream and the vblank status/wait paths above become one clock in both phase and period.
+// They were two drifting clocks before -- the follow-up this file records at its own timebase
+// comment ("aligning them is a real follow-up; asserting they are aligned is wrong"). Sharing
+// the origin and the period here is what closes it (#3024).
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns() { return vblank_epoch_ns(); }
+extern "C" uint64_t prosper_vo_vblank_period_ns() { return kVblankNs; }
+
 extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns) {
     g_vblank_test_now_ns.store(now_ns, std::memory_order_relaxed);
 }

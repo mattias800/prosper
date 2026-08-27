@@ -26,6 +26,8 @@ extern "C" uint64_t prosper_vo_buffer_addr(int i);
 extern "C" uint64_t prosper_vo_flip_count();
 extern "C" int prosper_vo_flip_rate();
 extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns);
+extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();   // #3024: the shared grid the
+extern "C" uint64_t prosper_vo_vblank_period_ns();        // kevent pump now schedules on
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                            uint32_t flip_mode, int64_t flip_arg);
 
@@ -833,6 +835,62 @@ int main() {
     bool closed_status_untouched = true;
     for (uint8_t byte: closed_status) closed_status_untouched &= byte == 0xEE;
     CHECK(closed_status_untouched, "closed-handle status query leaves output untouched");
+
+    // ---- the vblank kevent pump's deadline arithmetic (#3024) -------------------------------
+    // The pump itself is a detached thread in hle_kernel_time.cpp, so what is testable is the
+    // arithmetic it advances its deadline with. These arms exist because the WRONG spelling of
+    // it is not distinguishable from the right one by reading either the code or the rate it
+    // claims: a resync test written against the pre-advance deadline fires on every ordinary
+    // iteration, because sleep_until returns a little PAST its deadline by nature. The result
+    // is one extra period per tick -- a 30 Hz pump under a comment saying 60.
+    {
+        using prosper::host::next_periodic_deadline_ns;
+        const uint64_t P = 16683350;   // the shared 59.94 Hz period
+
+        // The arm that catches the halving. Ordinary overshoot must advance exactly ONE period.
+        CHECK(next_periodic_deadline_ns(1000000, 1000000 + 120000, P) == 1000000 + P,
+              "an ordinary late wake advances the deadline by exactly one period");
+        // ...and the same, iterated: 60 ticks of ordinary overshoot must cover exactly 60
+        // periods, not 120. A rate assertion, which is what the defect actually broke.
+        uint64_t d = 1000000;
+        for (int i = 0; i < 60; i++) d = next_periodic_deadline_ns(d, d + 120000, P);
+        CHECK(d == 1000000 + 60 * P,
+              "60 iterations of ordinary overshoot advance exactly 60 periods (not 120)");
+
+        // Overshoot must not accumulate into the grid: waking 120 us late 60 times in a row
+        // leaves the grid where it started, which a relative sleep would not.
+        CHECK(d - 1000000 == 60 * P && (d - 1000000) % P == 0,
+              "the grid absorbs overshoot instead of accumulating it");
+
+        // A wake exactly ON the deadline still advances one period (boundary, not a resync).
+        CHECK(next_periodic_deadline_ns(1000000, 1000000, P) == 1000000 + P,
+              "a wake exactly on the deadline advances one period");
+        // An EARLY return (deadline still in the future) also advances one period.
+        CHECK(next_periodic_deadline_ns(1000000, 999000, P) == 1000000 + P,
+              "an early return advances one period rather than re-anchoring");
+
+        // A wholly missed tick re-anchors to now, and posts ONE event rather than bursting the
+        // missed ones -- the deadline lands one period after now, never before it.
+        const uint64_t stalled = next_periodic_deadline_ns(1000000, 1000000 + 5 * P, P);
+        CHECK(stalled == 1000000 + 5 * P + P,
+              "a five-period stall re-anchors to now + one period (no catch-up burst)");
+        CHECK(stalled > 1000000 + 5 * P,
+              "the re-anchored deadline is in the future, so the pump cannot spin");
+
+        // A zero period would spin forever on a fixed deadline; it must not return the past.
+        CHECK(next_periodic_deadline_ns(1000000, 2000000, 0) == 2000000,
+              "a zero period degrades to now rather than to a past deadline");
+
+        // The pump and the status/wait grid must agree in PERIOD by construction, not by two
+        // constants that happen to match -- that agreement is the second half of #3024.
+        CHECK(prosper_vo_vblank_period_ns() == P,
+              "the exported grid period is the 59.94 Hz vblank period");
+        CHECK(prosper_vo_vblank_period_ns() != 16666667,
+              "...and is NOT the pump's old hardcoded 60.000 Hz constant");
+        CHECK(prosper_vo_vblank_grid_origin_ns() != 0 &&
+                  prosper_vo_vblank_grid_origin_ns() == prosper_vo_vblank_grid_origin_ns(),
+              "the exported grid origin is live and stable across calls");
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
