@@ -10,17 +10,24 @@ This decodes every same-resolution image asset in a dump and diffs it against th
 match is unambiguous -- the true asset scored 0.02/255 while the next closest scored 52.77 -- so the
 answer is not a judgement call.
 
-    python3 prerender_check.py <screenshot> <dump-root> [--top N] [--threshold F]
+    python3 prerender_check.py <screenshot> <dump-root> [--top N] [--threshold F] [--overlap P]
 
-Exit 0 = no asset matches (the frame is a genuine render, as far as THIS check can tell).
-Exit 2 = an asset matches: the frame is the game's own artwork and is not progression evidence.
+Exit 0 = no asset explains this frame (as far as THIS check can tell).
+Exit 2 = an asset matches, either EXACTLY or well enough to dominate the frame. Not progression
+         evidence without an explanation of what prosper actually rendered.
 Exit 1 = the check could not run (missing Pillow, unreadable candidate, no comparable assets) --
          deliberately distinct from 0, because "could not check" must never read as "verified".
 
-Scope, stated because a clean pass is easy to over-read: this finds FULL-SCREEN blits of assets
-stored as ordinary images. It cannot see a pre-rendered movie frame, an asset stored in a container
-it cannot decode, or artwork composited with other elements. A pass means "no stored picture
-explains this frame", not "this frame is rendered 3D".
+Two verdicts share exit 2 on purpose, because they need the same care:
+  EXACT      mean abs diff below --threshold (default 1.0/255): the frame IS the stored picture.
+  DOMINATED  at least --overlap percent of pixels (default 90) within 8/255 of a stored picture.
+             This is the case a mean-only test misses: a real loading screen usually has something
+             drawn ON it -- a progress bar, a hint caption -- and a 2%-of-height bar is enough to
+             lift the mean past any sane threshold while 98% of the frame is still the asset.
+
+Scope, stated because a clean pass is easy to over-read: this finds assets stored as ordinary
+images. It cannot see a pre-rendered movie frame or an asset in a container it cannot decode. A pass
+means "no stored picture explains this frame", not "this frame is rendered 3D".
 """
 import os
 import sys
@@ -52,6 +59,7 @@ def main(argv):
 
     top = opt('--top', 5, int)
     threshold = opt('--threshold', 1.0, float)
+    overlap = opt('--overlap', 90.0, float)
 
     try:
         from PIL import Image, ImageChops
@@ -103,15 +111,31 @@ def main(argv):
 
     best_mean, best_within8, best_rel = scored[0]
     if best_mean < threshold:
-        print("\nMATCH: this frame is the game's own picture asset %s\n"
+        print("\nEXACT MATCH: this frame IS the game's own picture asset %s\n"
               "  mean abs diff %.2f/255, %.2f%% of pixels within 8/255.\n"
-              "  It is NOT progression evidence -- displaying a stored image needs no world "
-              "rendering.\n  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
+              "  NOT progression evidence -- displaying a stored image needs no world rendering.\n"
+              "  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
               % (best_rel, best_mean, best_within8))
         return 2
-    print("\nno asset matches (closest %.2f/255, threshold %.2f) -- no STORED PICTURE explains this\n"
-          "frame. That is not the same as proving it is rendered 3D; see this tool's scope note."
-          % (best_mean, threshold))
+
+    # The mean alone is not enough, and this is the case the tool exists for. A real loading screen
+    # usually has something drawn ON it, and a small bright overlay moves the mean a long way while
+    # leaving almost every pixel identical to the asset. Rank by the robust statistic too.
+    dominant = max(scored, key=lambda row: row[1])
+    if dominant[1] >= overlap:
+        print("\nDOMINATED: %.2f%% of this frame's pixels are within 8/255 of the stored asset %s\n"
+              "  (mean abs diff %.2f/255 -- an overlay or caption lifts the mean, which is exactly\n"
+              "  why a mean-only test would have passed this).\n"
+              "  The frame is mostly stored artwork. It is not progression evidence on its own:\n"
+              "  say what prosper actually rendered here.\n"
+              "  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
+              % (dominant[1], dominant[2], dominant[0]))
+        return 2
+
+    print("\nno asset explains this frame (closest %.2f/255; highest pixel overlap %.2f%% with %s,\n"
+          "under the %.2f%% dominance bar). That is not the same as proving it is rendered 3D;\n"
+          "see this tool's scope note."
+          % (best_mean, dominant[1], dominant[2], overlap))
     return 0
 
 

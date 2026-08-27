@@ -22,6 +22,15 @@ should be cheap enough that nobody skips them before publishing.
 **What does not:** anything that measures prosper's behaviour. A diagnostic that answers "what did
 the renderer do" is a `PROSPER_*` switch or a `tools/gpu_*` tool, even when its output is an image.
 
+**Two ways a frame can be the game's own artwork, and the second is the one that bites.** An EXACT
+match is easy to catch on a mean difference. But a real loading screen usually has something drawn
+on it — a progress bar, a hint caption — and a small bright overlay moves the mean a long way while
+leaving almost every pixel identical to the stored asset. `prerender_check.py` therefore also gates
+on the fraction of pixels within 8/255 (`--overlap`, default 90%), which the mean cannot see. This
+was found in review: a 2%-of-height "LOADING..." bar drawn on the retracted frame flipped it from
+"caught" to "no stored picture explains this frame" — the tool confidently clearing the exact image
+it exists to catch.
+
 **The rule these tools follow, and the reason they exit the way they do:** *could not check* must
 never be reportable as *checked and clean*. `prerender_check.py` exits 0 only when it actually
 compared something and nothing matched; when it finds no comparable asset it exits 1, distinct from
