@@ -1,8 +1,9 @@
 # Sonic Frontiers (PPSA03831) -- title screen to gameplay (Cyber Space stage w6d01).
 #
 # Anchors are DISPLAY FLIPS ('f'), not seconds: the guest's own presented-frame counter is
-# boot-speed invariant, and this title runs ~30 flips/s on a CPU-only boot_trace arm against
-# ~3 flips/s on a live 3840x2160 renderer arm, so a wall-clock route cannot serve both.
+# boot-speed invariant, and this title runs 17-30 flips/s on a CPU-only boot_trace arm against
+# 1.5-3.4 flips/s on a live 3840x2160 renderer arm, so a wall-clock route cannot serve both.
+# (Both are spreads across several arms, not single readings -- see the budget note below.)
 #
 # Route shape, and why each step exists (every claim below is measured, see
 # docs/SONIC_FRONTIERS_STATUS.md):
@@ -16,13 +17,14 @@
 # that submenu. Check `uptime` and re-run before diagnosing anything.
 #
 # SAVE DATA IS NOT THE CAUSE, though it looked like it for a while. A 2x2 settles it: under
-# `boot_trace` the route reaches GameModeStage (`ui_gamemodestage`, 189 `w6d01_trr` sectors) BOTH
+# `boot_trace` the route reaches GameModeStage (`ui_gamemodestage` markers, and 189 log lines
+# naming `w6d01_trr` terrain sectors -- the stage has 100 of them) BOTH
 # with an existing save and against an empty PROSPER_SAVE0 root. Only one renderer arm ever failed,
 # with n=1 against this title's own 1.5-3.4 flips/s spread, so "save present" and "slow arm" were
 # never separated on that frontend.
 #
-# USE boot_trace AS THE FAST LOOP -- ~17 flips/s against ~3 on a live 4K renderer arm, so f2900 is
-# ~200 s instead of 17-31 minutes:
+# USE boot_trace AS THE FAST LOOP -- 17-30 flips/s against 1.5-3.4 on a live 4K renderer arm, so
+# f2900 is ~100-200 s instead of 14-32 minutes:
 #
 #     PROSPER_PAD_SCRIPT=@<this file> PROSPER_PAD_SCRIPT_LOG=1 PROSPER_FILELOG=1 \
 #       timeout --foreground -s TERM -k 5s 220 ./build-linux/boot_trace <DUMP>/PPSA03831-app0
