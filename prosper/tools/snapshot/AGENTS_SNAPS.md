@@ -226,6 +226,31 @@ The dead zone (48 of 128) is generous on purpose: a resting stick drifts, and a 
 an interval on every wobble produces a route full of one-flip noise entries that replay as real
 input.
 
+### The clock is not universally safe — GRIS is the counterexample
+
+`--det-clock off` exists because the pinned clock **breaks some titles outright**, and this was found
+by a person trying to author one.
+
+GRIS, with a New Game route reaching its opening FMV, measured over 150 s:
+
+| | frames | `Forcing submitDone` stalls |
+| --- | --- | --- |
+| clock **off** | **42,000** | 0 |
+| clock **on** | **1,680** | **47** |
+
+A 25x collapse and a frozen white screen where the movie should play. Booting to its title screen is
+unaffected — the FMV is the trigger, and the mechanism is obvious in hindsight: video playback is
+A/V-sync sensitive, and a clock advancing per *flip* rather than per *second* makes the decoder wait
+for a presentation time that never arrives at the rate it expects. `PROSPER_DET_CLOCK` is marked
+`CONFIDENCE: MED` in `hle_kernel_time.cpp`, and this is what that caveat looks like in practice.
+
+**If a title freezes or an FMV stops during authoring, re-author with `--det-clock off`.** The
+symptom is unmistakable and appears while you are sitting there. With the clock off the anchors are
+frame-rate dependent again, which is what the search window absorbs — such a set may need a wider
+`--flip-window`.
+
+The setting is recorded per title, so the check reproduces how the session was authored.
+
 ## Save state: fresh by default, and why that is not optional
 
 Both halves run with **both** save roots redirected to empty per-run directories:
