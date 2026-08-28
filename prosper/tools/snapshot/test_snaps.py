@@ -287,6 +287,27 @@ def main():
         check(paced.get("PROSPER_DET_CLOCK") == "1",
               "...and a legacy entry with no det_clock key still replays with the clock pinned")
 
+        # The CHECK half must isolate saves too, and nothing observed it: every replay_env arm
+        # passed savedata "none". A check running against the developer's real saves replays a
+        # route recorded on a fresh one -- "Continue" sits above "New Game", the same inputs pick a
+        # different item, and every snap fails for a title rendering perfectly.
+        for save in ("fresh", "none"):
+            r_root = os.path.join(tmp, f"replay-{save}")
+            renv = snaps.replay_env({"det_fps": 60, "det_clock": "off", "route": "r.pad",
+                                     "snaps": [], "savedata": save}, r_root, base={})
+            iso = "PROSPER_SAVEDATA_DIR" in renv and "PROSPER_SAVE0" in renv
+            check(iso == (save == "fresh"),
+                  f"replay_env isolates BOTH save roots iff savedata=fresh (savedata={save})")
+            if save == "fresh":
+                check(renv.get("PROSPER_SAVEDATA_DIR", "").startswith(r_root)
+                      and renv.get("PROSPER_SAVE0", "").startswith(r_root),
+                      "...under the run's own directory, not the developer's saves")
+        # And the DEFAULT for an entry with no savedata key must be fresh, matching cmd_author's.
+        implicit_save = snaps.replay_env({"det_fps": 60, "route": "r.pad", "snaps": []},
+                                         os.path.join(tmp, "replay-implicit"), base={})
+        check("PROSPER_SAVEDATA_DIR" in implicit_save,
+              "an entry with no savedata key still replays with isolated saves")
+
         modern = snaps.replay_env({"det_fps": 60, "det_clock": "off", "route": "r.pad",
                                    "snaps": [], "savedata": "none"}, tmp, base={})
         check(modern.get("PROSPER_FLIP_PACE_FPS") == "60",
@@ -697,6 +718,80 @@ def main():
         check(snaps.replay_env(forced, tmp, base={}).get("PROSPER_FLIP_PACE_FPS") == "30",
               "...so the check is paced at what the person asked for, not what was stored")
 
+        # ---- 6a1b-iii-g. SCAN MODE survives from the manifest to the search window ----------
+        # This is the PR's headline feature, and both of its plumbing steps could be neutered in
+        # silence: cmd_import could store "anchor" for a scan snap, and either caller of
+        # window_offsets could drop the snap argument. Each degrades a 12,000-flip forward sweep to
+        # a +/-900 anchor window, so a frame behind an FMV reports NOT REACHED -- a FAILURE, for a
+        # title rendering perfectly. The person pressed SHIFT+F6 and the console confirmed "(scan)".
+        scan_cap = os.path.join(tmp, "scancap")
+        os.makedirs(scan_cap, exist_ok=True)
+        write_bmp(os.path.join(scan_cap, "snap_0000_correct_f5000.bmp"), 64, 36,
+                  lambda x, y: (x % 256, 200, y % 256))
+        with open(os.path.join(scan_cap, "snaps.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "index": 0, "verdict": "correct", "mode": "scan", "pad_flip": 5000,
+                "guest_present": 5000, "width": 64, "height": 36,
+                "file": "snap_0000_correct_f5000.bmp", "title_id": "PPSATEST"}) + "\n")
+        open(os.path.join(scan_cap, "route.pad"), "w", encoding="utf-8").write("f5000:cross\n")
+
+        class ScanArgs(Args):
+            capture_dir = scan_cap
+            name = "scanset"
+
+        snaps.cmd_import(ScanArgs())
+        scan_entry = snaps.load_entry("scanset")
+        check(scan_entry["snaps"][0].get("mode") == "scan",
+              "a scan snap is IMPORTED as a scan, not silently demoted to an anchor")
+
+        # ...and the stored mode must actually reach the search. This is the half that matters:
+        # storing "scan" and then searching a +/-900 window helps nobody.
+        scan_flips = snaps.candidate_flips(scan_entry)
+        check(max(scan_flips) > 5000 + snaps.DEFAULT_FLIP_WINDOW * 2,
+              "the replay captures far beyond the anchor window for a scan snap")
+        check(max(scan_flips) >= 5000 + snaps.DEFAULT_SCAN_FORWARD - 10,
+              "...out to the configured scan_forward, which is the point of the mode")
+        check(len(scan_flips) > snaps.DEFAULT_WINDOW_SAMPLES,
+              "...with more samples than an anchor window would take")
+
+        # The same entry with the mode removed must NOT produce that window -- otherwise the arms
+        # above pass for a reason unrelated to the mode.
+        demoted = json.loads(json.dumps(scan_entry))
+        demoted["snaps"][0]["mode"] = "anchor"
+        demoted_flips = snaps.candidate_flips(demoted)
+        check(max(demoted_flips) < max(scan_flips),
+              "...and an anchor snap at the same flip searches a strictly narrower span")
+
+        # best_match must ask the same question: it drives its own offsets off the snap.
+        offsets_used = snaps.window_offsets(scan_entry, scan_entry["snaps"][0])
+        check(max(offsets_used) >= snaps.DEFAULT_SCAN_FORWARD - 10,
+              "window_offsets for a scan snap spans the scan range, not the anchor window")
+
+        # ...and best_match must actually ASK for that span. The arm above tests the helper; this
+        # one tests the caller, by putting the only matching frame far beyond the anchor window.
+        # A best_match that narrowed to +/-900 finds nothing and the snap reports NOT REACHED.
+        far_dir = os.path.join(tmp, "far")
+        os.makedirs(far_dir, exist_ok=True)
+        scan_snap = scan_entry["snaps"][0]
+        far_offset = max(o for o in snaps.window_offsets(scan_entry, scan_snap))
+        shutil.copyfile(os.path.join(scan_cap, "snap_0000_correct_f5000.bmp"),
+                        os.path.join(far_dir, "far.bmp"))
+        far_flip = scan_snap["pad_flip"] + far_offset
+        far_actuals = {far_flip: {"target_flip": far_flip, "actual_flip": far_flip,
+                                  "file": "far.bmp"}}
+        far_found = snaps.best_match(scan_snap, scan_entry, far_actuals, far_dir)
+        check(far_found is not None,
+              "best_match finds a scan frame sitting far past the anchor window -- the caller "
+              "passes the snap, not just the entry")
+        check(far_found is not None and far_found[3] == far_offset,
+              "...and reports the offset it was actually found at")
+        # The control: an ANCHOR snap at the same flip must NOT reach that frame, or the arm above
+        # would pass for a reason unrelated to scan mode.
+        anchor_snap = json.loads(json.dumps(scan_snap))
+        anchor_snap["mode"] = "anchor"
+        check(snaps.best_match(anchor_snap, scan_entry, far_actuals, far_dir) is None,
+              "...while an anchor snap at the same flip does not reach it")
+
         # ---- 6a1b-iv. A check does not write its frames into the shared tmpfs ----------------
         # /tmp here is RAM-backed with a per-user quota shared by every concurrent agent, and
         # exhausting it takes the machine's RAM rather than merely failing the write. Scan mode
@@ -786,6 +881,60 @@ def main():
               "an append carries through keys the tool does not understand")
         check(kept.get("savedata") == "fresh",
               "...while still completing the ones it does")
+
+        # ---- 6a1b-iv-b. cmd_check USES the safe scratch directory ---------------------------
+        # default_check_out_dir was asserted directly; nothing asserted cmd_check calls it, so the
+        # call site could be reverted to /tmp in silence. A scan-mode check writes 34 BMPs per snap
+        # (24 MB each at 4K) -- into a RAM-backed tmpfs with a per-user quota shared by every
+        # concurrent agent, that does not merely fail this run, it takes the machine's RAM with it.
+        got_out = {}
+
+        def spy_replay(entry_, out_dir_):
+            got_out["dir"] = out_dir_
+            return {}, os.path.join(out_dir_, "run.log")
+
+        saved_replay = snaps.run_replay
+        saved_env_out = os.environ.pop("PROSPER_SNAP_OUT", None)
+        try:
+            snaps.run_replay = spy_replay
+
+            class CheckArgs:
+                names = ["scanset"]
+            buf_c = io.StringIO()
+            saved_out_c, sys.stdout = sys.stdout, buf_c
+            try:
+                snaps.cmd_check(CheckArgs())
+            finally:
+                sys.stdout = saved_out_c
+        finally:
+            snaps.run_replay = saved_replay
+            if saved_env_out is not None:
+                os.environ["PROSPER_SNAP_OUT"] = saved_env_out
+
+        check("dir" in got_out, "cmd_check actually ran a replay")
+        check(got_out.get("dir") == snaps.default_check_out_dir("scanset"),
+              "cmd_check writes its frames to the safe scratch directory, not wherever it likes")
+        check(not got_out.get("dir", "").startswith(tempfile.gettempdir() + os.sep),
+              "...which is not the shared RAM-backed tmpfs")
+
+        # ---- 6a1b-v-b. The CLI defaults ARE the behaviour change -----------------------------
+        # --det-clock defaulting to off is this PR's headline change, and reverting either default
+        # was silent. With it back on, every new session re-pins the guest clock -- which freezes
+        # GRIS's opening FMV (1,680 frames against 42,000) and records guards under a clock nobody
+        # plays on.
+        parser = snaps.build_parser()
+        for sub in ("author", "import"):
+            base_argv = (["author", "--name", "n", "--dump", "d"] if sub == "author"
+                         else ["import", "somedir", "--name", "n"])
+            defaults = parser.parse_args(base_argv)
+            check(defaults.det_clock == "off",
+                  f"`{sub}` defaults to the REAL guest clock, not the pinned one")
+            check(defaults.det_fps == snaps.DEFAULT_DET_FPS,
+                  f"`{sub}` defaults to the documented pace rate")
+            check(defaults.savedata == "fresh",
+                  f"`{sub}` defaults to isolated saves, so a run cannot touch real ones by default")
+            forced = parser.parse_args(base_argv + ["--det-clock", "on"])
+            check(forced.det_clock == "on", f"`{sub}` still accepts --det-clock on explicitly")
 
         # ---- 6a1b-vi. _flag_was_passed sees argparse ABBREVIATIONS -----------------------------
         # argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps. An exact-match
@@ -902,6 +1051,32 @@ def main():
               "the windowed sample wins over a black frame sitting exactly on the anchor")
         check(score >= snaps.DEFAULT_MIN_SSIM,
               "...and it scores as a pass, where exact-anchor matching would have failed")
+
+        # best_match must take the BEST score in the span, not the first frame that exists.
+        # The arm above cannot show that: `off` is the most negative offset, so it is iterated
+        # FIRST and a first-match-wins implementation picks it too. Put a decoy at the earliest
+        # offset and the real match at a LATER one, so the two strategies disagree.
+        offs = snaps.window_offsets(entry)
+        early, late = offs[0], offs[-1]
+        check(early < 0 < late, "the fixture needs offsets on both sides to discriminate")
+        write_bmp(os.path.join(win_dir, "decoy.bmp"), 64, 36,
+                  lambda x, y: (255 if (x // 8 + y // 8) % 2 else 0,) * 3)
+        ordered = {
+            anchor + early: {"target_flip": anchor + early, "actual_flip": anchor + early,
+                             "file": "decoy.bmp"},
+            anchor + late: {"target_flip": anchor + late, "actual_flip": anchor + late,
+                            "file": "off.bmp"},
+        }
+        best = snaps.best_match(target, entry, ordered, win_dir)
+        check(best is not None, "best_match finds something when both samples exist")
+        best_score, best_record, _, best_offset = best
+        check(best_offset == late and best_record["file"] == "off.bmp",
+              "best_match takes the BEST match in the span, not the earliest frame present")
+        decoy_score = snaps.structural_similarity(
+            snaps.decode_luma(target["luma16x9"]),
+            snaps.decode_luma(snaps.signature_of(os.path.join(win_dir, "decoy.bmp"))["luma16x9"]))
+        check(decoy_score < best_score,
+              "...and the decoy really was the worse of the two, so the choice was not arbitrary")
 
         # ---- 6c2. Sampling is DENSE near the anchor, because that is where the match is ------
         # Measured: two identical runs through Blue Prince's intro cutscene reached the same page of
