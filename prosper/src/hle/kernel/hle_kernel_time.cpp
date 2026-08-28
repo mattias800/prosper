@@ -1224,6 +1224,8 @@ void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
     { std::lock_guard lk(g_eq_mx); g_vblank_regs.push_back({ eq, ident, udata }); }
     ensure_pump();
 }
+void prosper_eq_start_eop_watchdog();   // TEMPORARY diagnostic, defined below
+
 // Exposed to the AGC submit path (hle_agc.cpp). Register a GPU EOP event source (sceGnmAddEqEvent).
 void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
     size_t registration_count = 0;
@@ -1236,6 +1238,7 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
         zero_consumer_count = g_eop_zero_consumer_count;
         registration_ns = real_ns();
     }
+    prosper_eq_start_eop_watchdog();
     if (eoplog())
         fprintf(stderr, "[eoprace] t_ns=%llu EOP source registered eq=0x%llx id=%lld "
                         "(regs=%zu zero-consumer-completions=%llu)\n",
@@ -1278,9 +1281,24 @@ namespace {
             fprintf(stderr, "[eoprace] t_ns=%llu EOP completion snapshot had 0 registered "
                             "queues (zero-consumer ordinal=%llu)\n",
                     (unsigned long long)snapshot_ns, (unsigned long long)zero_consumer_ordinal);
+        // TEMPORARY: post N events per completion, to test whether the guest needs more than one.
+        // Counted so the lever can PROVE it moved -- a null from an unverified lever is void.
+        static const int repeat = [] {
+            const char* v = getenv("PROSPER_EOP_REPEAT");
+            const int n = v ? atoi(v) : 1;
+            return n > 0 ? n : 1;
+        }();
+        static std::atomic<uint64_t> posted{0};
         for (auto& r : regs) {
-            SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
-            eq_post(r.eq, e, coalesce);
+            for (int i = 0; i < repeat; ++i) {
+                SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE;
+                e.data = r.ident; e.udata = r.udata;
+                eq_post(r.eq, e, coalesce);
+                const uint64_t n = ++posted;
+                if (getenv("PROSPER_EOP_TRACE") && (n % 2000) == 0)
+                    fprintf(stderr, "[eop-post] posted=%llu (repeat=%d)\n",
+                            (unsigned long long)n, repeat);
+            }
         }
     }
     // Deferred, ORDERED EOP delivery worker. On real hardware the EOP interrupt can only fire AFTER
@@ -1329,6 +1347,31 @@ namespace {
         }
     }
 }
+// TEMPORARY: an independent EOP pulse, started at REGISTRATION rather than at the first trigger, so
+// it keeps posting after the guest stops submitting. That is the only way to break a circular wait:
+// events driven by submits cannot arrive when the guest is blocked and therefore not submitting.
+void prosper_eq_start_eop_watchdog() {
+    static std::atomic<bool> started{false};
+    const char* ms_env = getenv("PROSPER_EOP_WATCHDOG_MS");
+    if (!ms_env || !*ms_env) return;
+    const long ms = atol(ms_env);
+    if (ms <= 0) return;
+    if (started.exchange(true)) return;
+    fprintf(stderr, "[eop-wd] watchdog armed at %ld ms\n", ms);
+    fflush(stderr);
+    std::thread([ms] {
+        uint64_t n = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            eop_post_now();
+            if ((++n % 500) == 0) {
+                fprintf(stderr, "[eop-wd] fired=%llu\n", (unsigned long long)n);
+                fflush(stderr);
+            }
+        }
+    }).detach();
+}
+
 void prosper_eq_trigger_eop() {
     static const bool sync = getenv("PROSPER_EOP_SYNC") != nullptr;
     const bool submit_active = prosper_gpu_submit_scope_active && prosper_gpu_submit_scope_active();
