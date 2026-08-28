@@ -82,6 +82,20 @@ DEFAULT_MIN_SSIM = 0.85
 DEFAULT_FLIP_WINDOW = 900
 DEFAULT_WINDOW_SAMPLES = 7
 
+# A SCAN snap searches a wide span forward of its anchor instead of a tight window.
+#
+# This is what makes the whole scheme robust without touching the guest's clock: drift stops being
+# something to eliminate and becomes something to search past. It covers slow test runners, variable
+# loading, FMVs and frame-rate differences with one mechanism.
+#
+# Scanning is FORWARD-BIASED and anchored rather than unbounded, deliberately. A scene can recur --
+# return to a menu twice and an unbounded search would happily lock onto the first occurrence, which
+# is the wrong frame and would then be "accepted" into the store. Keeping the anchor as the ordering
+# hint means a snap authored after a loading screen matches the occurrence after that loading screen.
+DEFAULT_SCAN_FORWARD = 12000
+DEFAULT_SCAN_BACK = 900
+DEFAULT_SCAN_SAMPLES = 33
+
 
 # ---------------------------------------------------------------------------------------------
 # Image reading and the signature
@@ -242,6 +256,22 @@ def list_names():
 # PROSPER_DET_CLOCK makes the guest see exactly 1/DET_FPS seconds per flip, so a three-second logo
 # always costs the same number of flips however fast the host renders. That turns "the same flip" into
 # "the same guest time", which is the property flip anchoring assumes and otherwise does not have.
+# The deterministic clock is now OFF by default, and the pacer with it.
+#
+# Both existed to stop anchors drifting when the host renders at a different rate than it did during
+# authoring. They bought that at a real cost: PROSPER_DET_CLOCK replaces EVERY time source the guest
+# has -- sceKernelReadTsc, GetProcessTime, and the wall-clock anchor behind CLOCK_REALTIME,
+# gettimeofday, time() and sceRtc* -- with anchor + flips*(1/DET_FPS). A guard recorded under that
+# clock tests a machine nobody plays on, and GRIS proves the divergence is not theoretical: its
+# opening FMV freezes with the clock on (1,680 frames and 47 forced-submit stalls against 42,000 and
+# 0 without it).
+#
+# Drift is now handled where it belongs -- in the MATCHER, by scanning for the frame rather than
+# demanding it appear at a fixed offset. That is robust to slow test runners, loading times, FMVs and
+# frame-rate differences at once, and it needs no lie about time. Normal play is untouched: real
+# clock, uncapped, 120 Hz fine.
+#
+# Both knobs remain available per title for a set that genuinely needs them.
 DEFAULT_DET_FPS = 60
 
 
@@ -340,14 +370,17 @@ def cmd_author(args):
     # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
     # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
     if args.det_clock == "on":
+        # Pacing is only needed to COMPENSATE for the pinned clock: with it on, guest time runs at
+        # host_fps/DET_FPS, so the game plays fast or slow unless the flip rate matches. With the
+        # clock off the game is deltaTime driven and already runs at real speed, so pacing would only
+        # cap the frame rate for no benefit.
         env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
-        print(f"  guest clock: deterministic at {args.det_fps} fps, flips paced to match "
-              f"(real-time feel, and anchors that do not depend on this machine's speed)")
+        print(f"  guest clock: PINNED at {args.det_fps} fps, flips paced to match. This replaces "
+              f"every guest time source; some titles break (GRIS).")
     else:
-        print("  guest clock: REAL time (--det-clock off). Anchors will depend on this machine's\n"
-              "              speed, so this set may need a wider --flip-window. Use this for titles\n"
-              "              the deterministic clock breaks -- GRIS freezes on its opening FMV with\n"
-              "              it on.")
+        print("  guest clock: REAL (the title runs exactly as it does in normal play, uncapped).\n"
+              "              Anchors are matched by SCANNING for the frame, so host speed does not\n"
+              "              have to agree between authoring and checking.")
     if args.savedata == "fresh":
         apply_fresh_savedata(env, out_dir)
         print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
@@ -433,10 +466,12 @@ def cmd_import(args):
         snaps.append({
             "index": record["index"],
             "verdict": record["verdict"],
+            "mode": record.get("mode", "anchor"),
             "pad_flip": record["pad_flip"],
             **signature,
         })
-        print(f"  snap {record['index']:>3} {record['verdict']:<9} flip {record['pad_flip']:>6}  "
+        print(f"  snap {record['index']:>3} {record['verdict']:<9} "
+              f"{record.get('mode','anchor'):<6} flip {record['pad_flip']:>6}  "
               f"{signature['distinct_colors']:>6} colors  "
               f"nonblack {signature['nonblack_ratio']:.3f}")
 
@@ -471,7 +506,30 @@ def cmd_import(args):
 # check
 # ---------------------------------------------------------------------------------------------
 
-def window_offsets(entry):
+def window_offsets(entry, snap=None):
+    """Offsets for one snap. A snap marked `scan` searches a wide forward span instead."""
+    if snap is not None and snap.get("mode") == "scan":
+        return scan_offsets(entry)
+    return _anchor_offsets(entry)
+
+
+def scan_offsets(entry):
+    """A wide, forward-biased sweep: a little before the anchor, a long way after.
+
+    Sampling is uniform here rather than geometric. The anchor-window case knows the match is
+    probably near the anchor; a scan is used precisely when it is NOT, so weighting toward the anchor
+    would spend the samples in the least likely place.
+    """
+    forward = entry.get("scan_forward", DEFAULT_SCAN_FORWARD)
+    back = entry.get("scan_back", DEFAULT_SCAN_BACK)
+    samples = max(2, entry.get("scan_samples", DEFAULT_SCAN_SAMPLES))
+    span = forward + back
+    step = max(1, span // (samples - 1))
+    offsets = sorted({-back + i * step for i in range(samples)} | {0})
+    return [o for o in offsets if o >= -back]
+
+
+def _anchor_offsets(entry):
     """Flip offsets sampled either side of each anchor, always including 0 (the exact anchor).
 
     Spacing is GEOMETRIC, not uniform: dense near the anchor and sparse at the edges. Measured
@@ -501,7 +559,7 @@ def candidate_flips(entry):
     a flip before the origin does not exist."""
     out = set()
     for snap in entry["snaps"]:
-        for offset in window_offsets(entry):
+        for offset in window_offsets(entry, snap):
             flip = snap["pad_flip"] + offset
             if flip >= 0:
                 out.add(flip)
@@ -517,7 +575,7 @@ def best_match(snap, entry, actuals, out_dir):
     """
     best = None
     reference = decode_luma(snap["luma16x9"])
-    for offset in window_offsets(entry):
+    for offset in window_offsets(entry, snap):
         flip = snap["pad_flip"] + offset
         record = actuals.get(flip)
         if not record:
@@ -543,7 +601,7 @@ def run_replay(entry, out_dir):
     flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
     env = dict(os.environ)
     apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS),
-                              entry.get("det_clock", "on") == "on")
+                              entry.get("det_clock", "off") == "on")
     if entry.get("savedata", "fresh") == "fresh":
         apply_fresh_savedata(env, out_dir)
     env.update({
@@ -624,7 +682,8 @@ def cmd_check(args):
 
         for snap in entry["snaps"]:
             flip = snap["pad_flip"]
-            label = f"  snap {snap['index']:>3} {snap['verdict']:<9} flip {flip:>6}"
+            label = (f"  snap {snap['index']:>3} {snap['verdict']:<9} "
+                     f"{snap.get('mode','anchor'):<6} flip {flip:>6}")
             found = best_match(snap, entry, actuals, out_dir)
             if not found:
                 # Never silently pass a snap that was not reached: that is the failure mode the
@@ -640,7 +699,7 @@ def cmd_check(args):
             # the title screen ~600-1100 flips later under machine load, and the edge match was the
             # only visible tell.
             span = entry.get("flip_window", DEFAULT_FLIP_WINDOW)
-            at_edge = span > 0 and abs(offset) >= span
+            at_edge = (snap.get("mode") != "scan") and span > 0 and abs(offset) >= span
             actual_image = os.path.join(out_dir, record["file"])
             matched = ssim >= threshold
             # Report where in the window the best match came from. A snap that only matches at the
@@ -747,8 +806,9 @@ def main():
     aut.add_argument("--name", required=True)
     aut.add_argument("--dump", required=True, help="e.g. PPSA25009-app0")
     aut.add_argument("--out", help="capture directory (default ~/snaps/<name>)")
-    aut.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="on",
-                     help="off for titles the pinned clock breaks (GRIS freezes on its FMV)")
+    aut.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="off",
+                     help="pin the guest clock; OFF by default -- it replaces every guest time "
+                          "source and breaks some titles (GRIS freezes on its FMV)")
     aut.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
                      help="guest clock rate; must match at check time")
     aut.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",
@@ -766,8 +826,8 @@ def main():
                      help="safety net only; the run normally ends when the last "
                           "anchor is captured")
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
-    imp.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="on",
-                     help="off for titles the pinned clock breaks (GRIS freezes on its FMV)")
+    imp.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="off",
+                     help="must match how the session was authored")
     imp.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
                      help="must match how the session was authored")
     imp.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",

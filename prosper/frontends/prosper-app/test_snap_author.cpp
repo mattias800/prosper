@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <string>
 
+using prosper::frontend::SnapMode;
+using prosper::frontend::snap_mode_token;
 using prosper::frontend::SnapVerdict;
 using prosper::frontend::kSnapFlipUnanchored;
 using prosper::frontend::snap_author_line;
@@ -62,8 +64,7 @@ int main() {
 
     // ---- 4. The manifest record carries everything the import step needs -----------------------
     {
-        const std::string line = snap_record_line(
-            /*index=*/7, SnapVerdict::correct, /*flip=*/12345, /*guest_present=*/9876,
+        const std::string line = snap_record_line(7, SnapVerdict::correct, SnapMode::anchor, /*flip=*/12345, /*guest_present=*/9876,
             /*width=*/1920, /*height=*/1080, "snap_0007_correct_f12345.bmp", "PPSA25009");
         check(contains(line, "\"index\":7"), "record carries the index");
         check(contains(line, "\"verdict\":\"correct\""), "record carries the verdict");
@@ -81,8 +82,7 @@ int main() {
     // The import step rejects on this value, so it has to arrive intact rather than as 0 or as a
     // huge unsigned number from a careless cast.
     {
-        const std::string line = snap_record_line(
-            0, SnapVerdict::incorrect, kSnapFlipUnanchored, 0, 640, 360,
+        const std::string line = snap_record_line(0, SnapVerdict::incorrect, SnapMode::anchor, kSnapFlipUnanchored, 0, 640, 360,
             "snap_0000_incorrect_unanchored.bmp", "PPSA25009");
         check(contains(line, "\"pad_flip\":-1"),
               "an unanchored snap records -1, not 0 and not a wrapped unsigned");
@@ -97,8 +97,7 @@ int main() {
         check(snap_json_escape(std::string("a\x01" "b")) == "a\\u0001b", "a control byte is escaped");
 
         // The whole point: a hostile-ish value must not be able to terminate the record early.
-        const std::string line = snap_record_line(
-            1, SnapVerdict::correct, 5, 5, 1, 1, "we\"ird\nname.bmp", "PPSA\\25009");
+        const std::string line = snap_record_line(1, SnapVerdict::correct, SnapMode::anchor, 5, 5, 1, 1, "we\"ird\nname.bmp", "PPSA\\25009");
         check(!contains(line, "\n"), "an embedded newline cannot split one record into two");
         check(contains(line, "we\\\"ird"), "an embedded quote is escaped rather than closing the string");
     }
@@ -107,14 +106,14 @@ int main() {
     // Including, loudly, the case where their keypress produced an unusable snap -- while they are
     // still sitting at the keyboard and can take another one.
     {
-        const std::string good = snap_author_line(4, SnapVerdict::correct, 2000,
+        const std::string good = snap_author_line(4, SnapVerdict::correct, SnapMode::anchor, 2000,
                                                   "snap_0004_correct_f2000.bmp");
         check(contains(good, "correct") && contains(good, "2000") &&
                   contains(good, "snap_0004_correct_f2000.bmp"),
               "an anchored snap reports verdict, anchor and file");
         check(!contains(good, "NOT ANCHORED"), "an anchored snap does not warn");
 
-        const std::string bad = snap_author_line(0, SnapVerdict::correct, kSnapFlipUnanchored,
+        const std::string bad = snap_author_line(0, SnapVerdict::correct, SnapMode::anchor, kSnapFlipUnanchored,
                                                  "snap_0000_correct_unanchored.bmp");
         check(contains(bad, "NOT ANCHORED"), "an unanchored snap warns at the moment it is taken");
         check(contains(bad, "rejected at import"),
@@ -162,6 +161,35 @@ int main() {
         const std::string line = snap_actual_record_line(1200, 1204, 1920, 1080, overshot);
         check(contains(line, "\"target_flip\":1200") && contains(line, "\"actual_flip\":1204"),
               "the actual record carries the requested and reached anchors separately");
+    }
+
+    // ---- 11. Scan mode is carried, and distinguishable -----------------------------------
+    // A frame sitting after a loading screen or an FMV cannot be found at a fixed offset, because
+    // the length of what precedes it depends on the machine. The person authoring is the only one
+    // who knows which frames those are, and they know it at the moment they press the key.
+    {
+        check(std::string(snap_mode_token(SnapMode::anchor)) == "anchor", "anchor mode names itself");
+        check(std::string(snap_mode_token(SnapMode::scan)) == "scan", "scan mode names itself");
+
+        const std::string anchored = snap_record_line(
+            0, SnapVerdict::correct, SnapMode::anchor, 900, 0, 1920, 1080, "a.bmp", "PPSATEST");
+        const std::string scanned = snap_record_line(
+            1, SnapVerdict::correct, SnapMode::scan, 900, 0, 1920, 1080, "b.bmp", "PPSATEST");
+        check(contains(anchored, "\"mode\":\"anchor\""), "an anchored snap records its mode");
+        check(contains(scanned, "\"mode\":\"scan\""), "a scan snap records its mode");
+        check(contains(scanned, "\"verdict\":\"correct\""),
+              "...without disturbing the verdict beside it");
+        check(contains(scanned, "\"pad_flip\":900"),
+              "...or the anchor, which a scan still uses as its ordering hint");
+
+        // The console line has to say which kind was taken, or a person cannot tell whether the key
+        // they pressed registered as the one they meant.
+        check(contains(snap_author_line(2, SnapVerdict::correct, SnapMode::scan, 900, "b.bmp"),
+                       "scan"),
+              "the console line reports a scan snap as such");
+        check(!contains(snap_author_line(2, SnapVerdict::correct, SnapMode::anchor, 900, "a.bmp"),
+                        "scan"),
+              "...and does not label an ordinary snap that way");
     }
 
     if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }

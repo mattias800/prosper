@@ -294,6 +294,26 @@ def main():
         check(geo == [-o for o in reversed(geo)], "the window is symmetric about the anchor")
         check(len(set(geo)) == len(geo), "no two samples collapse onto the same offset")
 
+        # ---- 6c3. A scan snap sweeps forward instead of hugging the anchor ------------------
+        # This is what replaces the deterministic clock. Drift stops being something to eliminate by
+        # lying to the guest about time, and becomes something to search past.
+        scan_entry = {"scan_forward": 12000, "scan_back": 900, "scan_samples": 33}
+        sc = snaps.window_offsets(scan_entry, {"mode": "scan"})
+        an = snaps.window_offsets(scan_entry, {"mode": "anchor"})
+        check(max(sc) > max(an) * 5, "a scan reaches far beyond the anchor window")
+        check(0 in sc, "a scan still samples the anchor itself")
+        check(min(sc) >= -scan_entry["scan_back"],
+              "a scan looks only a little way BACK -- it is forward-biased on purpose")
+        check(len(sc) > len(an), "a scan takes more samples than a tight window")
+        # Uniform, not geometric: a scan is used precisely when the match is NOT near the anchor, so
+        # weighting toward the anchor would spend samples in the least likely place.
+        pos = sorted(o for o in sc if o > 0)
+        gaps = [b - a for a, b in zip(pos, pos[1:])]
+        check(max(gaps) - min(gaps) <= 2, "scan sampling is uniform across the span")
+        # And an unbounded scan is NOT what this is: a recurring scene would otherwise match its
+        # first occurrence anywhere in the run.
+        check(max(sc) <= scan_entry["scan_forward"] + 1, "a scan is bounded by its forward span")
+
         # ---- 6d. An edge match is detectable, because that is how "the window is too narrow"
         # is told apart from "the picture changed" ----------------------------------------------
         edge_entry = {"flip_window": 600, "window_samples": 7}

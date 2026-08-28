@@ -178,10 +178,18 @@ drift is small: with `--window-samples 9` over ±900 the offsets are `0, ±43, �
 rather than uniform ±225 steps. That resolves a short fade far better than even spacing, but it
 cannot rescue a snap taken in the middle of one.
 
-## The guest clock is deterministic in both halves, and it must be
+## The guest clock: OFF by default (and why it used to be on)
 
-Both authoring and checking run with `PROSPER_DET_CLOCK=1` and the same `PROSPER_DET_FPS`
-(default 60). The guest then sees exactly 1/60 s per flip regardless of how fast the host renders.
+**Both halves now run with the guest's REAL clock.** `--det-clock on` remains available per title and
+is off by default, because pinning the clock is a genuine correctness compromise: `PROSPER_DET_CLOCK`
+replaces *every* time source the guest has — `sceKernelReadTsc`, `GetProcessTime`, and the wall-clock
+anchor behind `CLOCK_REALTIME`, `gettimeofday`, `time()` and `sceRtc*` — with
+`anchor + flips × (1/DET_FPS)`.
+
+A guard recorded under that clock tests a machine nobody plays on. GRIS shows the divergence is not
+theoretical (below). Drift is handled by scanning for the frame instead; see SHIFT+F6 above.
+
+The history is kept because the measurement behind it is still true and still instructive:
 
 Without it the anchors are frame-rate dependent and simply cannot correspond. Measured on the first
 real authoring session: authoring windowed ran at **60.4 fps**, the headless check at **77.1 fps**,
@@ -225,6 +233,29 @@ replayed as **standing still** — silent, total, and indistinguishable from the
 The dead zone (48 of 128) is generous on purpose: a resting stick drifts, and a recorder that emits
 an interval on every wobble produces a route full of one-flip noise entries that replay as real
 input.
+
+### SHIFT+F6 / SHIFT+F7 — a snap to SCAN for
+
+Some frames cannot be found at a fixed offset, because what precedes them takes a different length of
+time on a different machine: a loading screen, an FMV, a streaming pause. Mark those with **shift**
+held, and the check sweeps a wide span forward of the anchor instead of hugging it.
+
+You are the only one who knows which frames those are, and you know it at the moment you press the
+key — which is why it is a modifier rather than a setting decided later.
+
+Scanning is **bounded and forward-biased**, not unbounded. A scene can recur — return to a menu twice
+and an unbounded search would happily lock onto the first occurrence, accept it, and store the wrong
+frame. Keeping the anchor as the ordering hint means a snap authored after a loading screen matches
+the occurrence *after that loading screen*.
+
+Sampling across a scan is uniform, unlike the tight window's geometric spacing: a scan is used
+precisely when the match is *not* near the anchor, so weighting toward the anchor would spend the
+samples in the least likely place.
+
+**This is what replaced the deterministic clock.** Drift stopped being something to eliminate by
+lying to the guest about time, and became something to search past — which covers slow test runners,
+variable loading, FMVs and frame-rate differences with one mechanism, and leaves normal play
+untouched at whatever frame rate the machine can manage.
 
 ### The clock is not universally safe — GRIS is the counterexample
 

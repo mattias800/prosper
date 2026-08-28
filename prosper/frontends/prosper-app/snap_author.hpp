@@ -33,6 +33,22 @@ enum class SnapVerdict {
     incorrect,  // F7 — "the game does NOT look right here"
 };
 
+// How the check should LOOK for this frame again.
+//
+// `anchor` searches a tight window around the recorded flip and is right for a frame whose position
+// is stable. `scan` sweeps a wide span forward and is for a frame that sits after something of
+// variable length -- a loading screen, an FMV, anything whose duration depends on the machine. It is
+// the person authoring who knows which is which, at the moment they press the key, so the choice is
+// theirs: F6/F7 anchor, SHIFT+F6/F7 scan.
+enum class SnapMode {
+    anchor,
+    scan,
+};
+
+inline const char* snap_mode_token(SnapMode mode) {
+    return mode == SnapMode::scan ? "scan" : "anchor";
+}
+
 inline const char* snap_verdict_token(SnapVerdict verdict) {
     return verdict == SnapVerdict::correct ? "correct" : "incorrect";
 }
@@ -89,6 +105,7 @@ inline std::string snap_json_escape(const std::string& value) {
 // that point readable, instead of a truncated array that parses as nothing.
 inline std::string snap_record_line(uint32_t index,
                                     SnapVerdict verdict,
+                                    SnapMode mode,
                                     int64_t flip,
                                     uint64_t guest_present,
                                     uint32_t width,
@@ -99,6 +116,8 @@ inline std::string snap_record_line(uint32_t index,
     out += std::to_string(index);
     out += ",\"verdict\":\"";
     out += snap_verdict_token(verdict);
+    out += "\",\"mode\":\"";
+    out += snap_mode_token(mode);
     out += "\",\"pad_flip\":";
     out += std::to_string(flip);
     out += ",\"guest_present\":";
@@ -120,10 +139,12 @@ inline std::string snap_record_line(uint32_t index,
 // something about it.
 inline std::string snap_author_line(uint32_t index,
                                     SnapVerdict verdict,
+                                    SnapMode mode,
                                     int64_t flip,
                                     const std::string& file) {
     std::string out = "[snap] ";
     out += snap_verdict_token(verdict);
+    if (mode == SnapMode::scan) out += " (scan)";
     out += " #";
     out += std::to_string(index);
     if (flip < 0) {
