@@ -341,7 +341,7 @@ def _coerce_like(stored, wanted):
     explicit --det-fps 30, and the run is then refused over settings that in fact agree. Returns the
     value unchanged when it cannot be converted, so a genuinely different value still conflicts.
     """
-    if isinstance(wanted, bool) or not isinstance(wanted, int) or isinstance(stored, int):
+    if not isinstance(wanted, int) or isinstance(stored, int):
         return stored
     try:
         return int(str(stored).strip())
@@ -394,7 +394,8 @@ def session_record(args, existing=None):
     """
     record = dict(existing) if isinstance(existing, dict) else {}
     record.update({key: getattr(args, key) for key in SESSION_KEYS})
-    record["name"] = args.name
+    # Deliberately no "name": cmd_import reads only SESSION_KEYS, and a stored name that disagreed
+    # with --name would be a second source of truth nobody consults.
     return record
 
 

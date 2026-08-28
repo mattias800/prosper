@@ -917,6 +917,248 @@ def main():
         check(not got_out.get("dir", "").startswith(tempfile.gettempdir() + os.sep),
               "...which is not the shared RAM-backed tmpfs")
 
+        # ---- 6a1b-iv-c. cmd_check's VERDICT LOGIC -- the whole point of the tool -------------
+        # An AST sweep of cmd_check found 29 of its 39 statements deletable with the suite green,
+        # including `matched = ssim >= threshold` and the correct/incorrect asymmetry. That
+        # asymmetry IS the design: a correct snap that stops matching is a FAILURE; an incorrect one
+        # that stops matching is INFO, because a known-bad frame may have been fixed and this is the
+        # only signal that would ever say so. None of it was asserted.
+        def check_run(verdict, ref_pixel, actual_pixel, mode="anchor", flip=900):
+            """Run cmd_check over one snap with a controlled reference/actual pair.
+
+            Returns (exit_code, output). The reference is what was approved; the actual is what the
+            stubbed replay produced, so the two pixels decide whether it matches.
+            """
+            nm = f"vc{abs(hash((verdict, ref_pixel, actual_pixel, mode))) % 100000}"
+            vdir = os.path.join(tmp, nm)
+            os.makedirs(vdir, exist_ok=True)
+            ref_bmp = os.path.join(vdir, "ref.bmp")
+            write_bmp(ref_bmp, 64, 36, lambda x, y: ref_pixel)
+            os.makedirs(snaps.ref_dir(nm), exist_ok=True)
+            shutil.copyfile(ref_bmp, os.path.join(snaps.ref_dir(nm), "0000.bmp"))
+            sig = snaps.signature_of(ref_bmp)
+            entry_v = {"name": nm, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                       "timeout": 60, "savedata": "none",
+                       "snaps": [dict(sig, index=0, verdict=verdict, mode=mode, pad_flip=flip)]}
+            with open(snaps.store_path(nm), "w", encoding="utf-8") as handle:
+                json.dump(entry_v, handle)
+
+            def stub(entry_, out_dir_):
+                os.makedirs(out_dir_, exist_ok=True)
+                write_bmp(os.path.join(out_dir_, "a.bmp"), 64, 36, lambda x, y: actual_pixel)
+                return ({flip: {"target_flip": flip, "actual_flip": flip, "file": "a.bmp"}},
+                        os.path.join(out_dir_, "run.log"))
+
+            saved_r, saved_here = snaps.run_replay, snaps.HERE
+            snaps.HERE = vdir
+            buf_v = io.StringIO()
+            saved_o, sys.stdout = sys.stdout, buf_v
+            try:
+                snaps.run_replay = stub
+
+                class VArgs:
+                    names = [nm]
+                rc_v = snaps.cmd_check(VArgs())
+            finally:
+                snaps.run_replay, snaps.HERE, sys.stdout = saved_r, saved_here, saved_o
+            return rc_v, buf_v.getvalue()
+
+        same, different = (10, 20, 30), (240, 250, 200)
+
+        # A CORRECT snap that still matches: pass, exit 0.
+        rc_v, out_v = check_run("correct", same, same)
+        check(rc_v == 0 and "OK" in out_v,
+              "a correct snap that still matches PASSES")
+
+        # A CORRECT snap that no longer matches: failure, NONZERO EXIT. This is the regression
+        # signal the whole system exists to produce.
+        rc_v, out_v = check_run("correct", same, different)
+        check(rc_v != 0, "a correct snap that no longer matches FAILS the run")
+        check("FAIL" in out_v, "...and says so")
+
+        # An INCORRECT snap that still looks wrong: reported, but NOT a failure.
+        rc_v, out_v = check_run("incorrect", same, same)
+        check(rc_v == 0, "a known-bad frame that is still bad does NOT fail the run")
+        check("still wrong" in out_v, "...and is reported as still wrong")
+
+        # An INCORRECT snap that CHANGED: info, not failure -- it may have been fixed.
+        rc_v, out_v = check_run("incorrect", same, different)
+        check(rc_v == 0,
+              "a known-bad frame that CHANGED does not fail the run -- it may have been fixed")
+        check("CHANGED" in out_v, "...and is surfaced so a person looks at it")
+
+        # NOT REACHED: a failure for a correct snap, not for an incorrect one. Never silently pass.
+        def check_unreached(verdict):
+            nm = f"nr{verdict}"
+            vdir = os.path.join(tmp, nm)
+            os.makedirs(vdir, exist_ok=True)
+            ref_bmp = os.path.join(vdir, "ref.bmp")
+            write_bmp(ref_bmp, 64, 36, lambda x, y: same)
+            entry_v = {"name": nm, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                       "timeout": 60, "savedata": "none",
+                       "snaps": [dict(snaps.signature_of(ref_bmp), index=0, verdict=verdict,
+                                      mode="anchor", pad_flip=900)]}
+            with open(snaps.store_path(nm), "w", encoding="utf-8") as handle:
+                json.dump(entry_v, handle)
+            saved_r, saved_here = snaps.run_replay, snaps.HERE
+            snaps.HERE = vdir
+            buf_v = io.StringIO()
+            saved_o, sys.stdout = sys.stdout, buf_v
+            try:
+                snaps.run_replay = lambda e, o: ({}, "log")     # captured nothing at all
+
+                class VArgs:
+                    names = [nm]
+                return snaps.cmd_check(VArgs()), buf_v.getvalue()
+            finally:
+                snaps.run_replay, snaps.HERE, sys.stdout = saved_r, saved_here, saved_o
+
+        rc_v, out_v = check_unreached("correct")
+        check(rc_v != 0 and "NOT REACHED" in out_v,
+              "a correct snap the route never reached FAILS -- never silently passed")
+        rc_v, out_v = check_unreached("incorrect")
+        check(rc_v == 0 and "NOT REACHED" in out_v,
+              "...while an unreached known-bad snap is reported without failing the run")
+
+        # The threshold is read from the ENTRY, so a set can be more or less tolerant than default.
+        strict = check_run("correct", same, (12, 22, 32))
+        check(strict[0] == 0, "a near-identical frame passes at the default threshold")
+
+        # A FAILING snap must leave both images behind. This is the review workflow: on a failure
+        # the actual is rendered in the terminal and the person says whether it is acceptable. If
+        # retention silently stops, every failure becomes unreviewable and `accept` has nothing to
+        # act on -- and nothing would have said so.
+        nm_r = "retain-me"
+        rdir = os.path.join(tmp, nm_r)
+        os.makedirs(rdir, exist_ok=True)
+        ref_r = os.path.join(rdir, "ref.bmp")
+        write_bmp(ref_r, 64, 36, lambda x, y: same)
+        os.makedirs(snaps.ref_dir(nm_r), exist_ok=True)
+        shutil.copyfile(ref_r, os.path.join(snaps.ref_dir(nm_r), "0000.bmp"))
+        entry_r = {"name": nm_r, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                   "timeout": 60, "savedata": "none",
+                   "snaps": [dict(snaps.signature_of(ref_r), index=0, verdict="correct",
+                                  mode="anchor", pad_flip=900)]}
+        with open(snaps.store_path(nm_r), "w", encoding="utf-8") as handle:
+            json.dump(entry_r, handle)
+
+        def stub_r(entry_, out_dir_):
+            os.makedirs(out_dir_, exist_ok=True)
+            write_bmp(os.path.join(out_dir_, "a.bmp"), 64, 36, lambda x, y: different)
+            return ({900: {"target_flip": 900, "actual_flip": 900, "file": "a.bmp"}},
+                    os.path.join(out_dir_, "run.log"))
+
+        saved_r2, saved_here2 = snaps.run_replay, snaps.HERE
+        snaps.HERE = rdir
+        buf_r = io.StringIO(); saved_o2, sys.stdout = sys.stdout, buf_r
+        try:
+            snaps.run_replay = stub_r
+
+            class RArgs:
+                names = [nm_r]
+            snaps.cmd_check(RArgs())
+        finally:
+            snaps.run_replay, snaps.HERE, sys.stdout = saved_r2, saved_here2, saved_o2
+        review_dir = os.path.join(rdir, "failures")
+        check(os.path.exists(os.path.join(review_dir, f"{nm_r}-0000-actual.bmp")),
+              "a failing snap retains the ACTUAL frame for review")
+        check(os.path.exists(os.path.join(review_dir, f"{nm_r}-0000-expected.bmp")),
+              "...and the EXPECTED one beside it, or the pair cannot be compared")
+
+        # The output directory must be CLEARED before a replay. A frame left by an earlier run
+        # could otherwise be matched and reported as a pass -- a wrong answer, stated confidently,
+        # from data the current run never produced.
+        stale_out = snaps.default_check_out_dir("stale-probe")
+        os.makedirs(stale_out, exist_ok=True)
+        sentinel = os.path.join(stale_out, "left-over.bmp")
+        write_bmp(sentinel, 64, 36, lambda x, y: same)
+        nm_s = "stale-probe"
+        sdir = os.path.join(tmp, nm_s)
+        os.makedirs(sdir, exist_ok=True)
+        write_bmp(os.path.join(sdir, "ref.bmp"), 64, 36, lambda x, y: same)
+        entry_s = {"name": nm_s, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                   "timeout": 60, "savedata": "none",
+                   "snaps": [dict(snaps.signature_of(os.path.join(sdir, "ref.bmp")), index=0,
+                                  verdict="correct", mode="anchor", pad_flip=900)]}
+        with open(snaps.store_path(nm_s), "w", encoding="utf-8") as handle:
+            json.dump(entry_s, handle)
+        saw_sentinel = {}
+
+        def stub_s(entry_, out_dir_):
+            saw_sentinel["present"] = os.path.exists(os.path.join(out_dir_, "left-over.bmp"))
+            os.makedirs(out_dir_, exist_ok=True)
+            write_bmp(os.path.join(out_dir_, "a.bmp"), 64, 36, lambda x, y: same)
+            return ({900: {"target_flip": 900, "actual_flip": 900, "file": "a.bmp"}},
+                    os.path.join(out_dir_, "run.log"))
+
+        saved_r3, saved_here3 = snaps.run_replay, snaps.HERE
+        snaps.HERE = sdir
+        buf_s = io.StringIO(); saved_o3, sys.stdout = sys.stdout, buf_s
+        try:
+            snaps.run_replay = stub_s
+
+            class SArgs:
+                names = [nm_s]
+            snaps.cmd_check(SArgs())
+        finally:
+            snaps.run_replay, snaps.HERE, sys.stdout = saved_r3, saved_here3, saved_o3
+        # A negative snap that CHANGED must retain its images too. This is the half of the review
+        # workflow that reports good news -- a known-bad frame may have been fixed -- and it was the
+        # one path where retention could be deleted in silence.
+        nm_c = "changed-retain"
+        cdir = os.path.join(tmp, nm_c)
+        os.makedirs(cdir, exist_ok=True)
+        ref_c = os.path.join(cdir, "ref.bmp")
+        write_bmp(ref_c, 64, 36, lambda x, y: same)
+        os.makedirs(snaps.ref_dir(nm_c), exist_ok=True)
+        shutil.copyfile(ref_c, os.path.join(snaps.ref_dir(nm_c), "0000.bmp"))
+        entry_c = {"name": nm_c, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                   "timeout": 60, "savedata": "none",
+                   "snaps": [dict(snaps.signature_of(ref_c), index=0, verdict="incorrect",
+                                  mode="anchor", pad_flip=900)]}
+        with open(snaps.store_path(nm_c), "w", encoding="utf-8") as handle:
+            json.dump(entry_c, handle)
+
+        def stub_c(entry_, out_dir_):
+            os.makedirs(out_dir_, exist_ok=True)
+            write_bmp(os.path.join(out_dir_, "a.bmp"), 64, 36, lambda x, y: different)
+            return ({900: {"target_flip": 900, "actual_flip": 900, "file": "a.bmp"}},
+                    os.path.join(out_dir_, "run.log"))
+
+        saved_r4, saved_here4 = snaps.run_replay, snaps.HERE
+        snaps.HERE = cdir
+        buf_c2 = io.StringIO(); saved_o4, sys.stdout = sys.stdout, buf_c2
+        try:
+            snaps.run_replay = stub_c
+
+            class CArgs:
+                names = [nm_c]
+            snaps.cmd_check(CArgs())
+        finally:
+            snaps.run_replay, snaps.HERE, sys.stdout = saved_r4, saved_here4, saved_o4
+        check(os.path.exists(os.path.join(cdir, "failures", f"{nm_c}-0000-actual.bmp")),
+              "a CHANGED known-bad frame retains its image too -- that is how a fix gets noticed")
+
+        # replay_env's remaining statements. It was extracted so it could be asserted; five of its
+        # keys were still unobserved.
+        full_env = snaps.replay_env(
+            {"det_fps": 60, "det_clock": "off", "route": "scripts/x/route.pad",
+             "savedata": "none",
+             "snaps": [{"pad_flip": 900, "mode": "anchor"}]}, tmp, base={})
+        check(full_env.get("SDL_VIDEODRIVER") == "offscreen",
+              "a check runs headless -- it is automation, not a person at a window")
+        check(full_env.get("PROSPER_RENDER") == "1", "...with the live renderer on")
+        check(full_env.get("PROSPER_GUEST_ARGS") == "-force-gfx-direct",
+              "...and the guest arg that reaches the frame loop")
+        check(full_env.get("PROSPER_PAD_SCRIPT", "").startswith("@"),
+              "the route is passed as a FILE reference (@path), not as inline script text")
+        check("900" in full_env.get("PROSPER_SNAP_AT_FLIPS", ""),
+              "the anchors to capture are handed to the emulator")
+
+        check(saw_sentinel.get("present") is False,
+              "the output directory is CLEARED before a replay, so a stale frame from an earlier "
+              "run can never be matched and reported as a pass")
+
         # ---- 6a1b-v-b. The CLI defaults ARE the behaviour change -----------------------------
         # --det-clock defaulting to off is this PR's headline change, and reverting either default
         # was silent. With it back on, every new session re-pins the guest clock -- which freezes
