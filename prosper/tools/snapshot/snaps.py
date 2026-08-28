@@ -52,6 +52,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROSPER_ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -446,22 +447,53 @@ def run_replay(entry, out_dir):
         "PROSPER_PAD_SCRIPT": "@" + os.path.join(REPO_ROOT, entry["route"]),
     })
     log = os.path.join(out_dir, "run.log")
-    with open(log, "w", encoding="utf-8") as handle:
-        try:
-            subprocess.run([APP, dump_path], env=env, stdout=handle, stderr=subprocess.STDOUT,
-                           timeout=entry.get("timeout", 900), check=False)
-        except subprocess.TimeoutExpired:
-            pass   # the run is bounded by design; whatever it captured before the bound still counts
-    actuals = {}
     manifest = os.path.join(out_dir, "actuals.jsonl")
-    if os.path.exists(manifest):
-        with open(manifest, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    record = json.loads(line)
-                    actuals[record["target_flip"]] = record
-    return actuals, log
+
+    def read_actuals():
+        found = {}
+        if os.path.exists(manifest):
+            with open(manifest, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue     # a record still being written; it will be there next poll
+                        found[record["target_flip"]] = record
+        return found
+
+    # Stop when the LAST anchor has been captured, not when a wall-clock timer expires. The timeout
+    # is a safety net for a run that hangs, not the normal way the run ends.
+    #
+    # This matters because of FMVs. The anchor is a flip count, so a movie contributes the same
+    # number of flips however slowly it renders -- which is exactly why flips beat wall-clock and why
+    # an authored route survives a title whose intro plays at 4.8 fps (measured on Blue Prince,
+    # ~37x slower than its menu). But the movie still eats real SECONDS, so a fixed timeout sized for
+    # a quick boot would cut the run off mid-route and report every later snap as NOT REACHED -- a
+    # failure with nothing to do with rendering, which is the whole class of bug this system exists
+    # to remove.
+    last_anchor = max(candidate_flips(entry)) if entry["snaps"] else 0
+    deadline = time.time() + entry.get("timeout", 3600)
+    with open(log, "w", encoding="utf-8") as handle:
+        proc = subprocess.Popen([APP, dump_path], env=env, stdout=handle,
+                                stderr=subprocess.STDOUT)
+        try:
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break                      # the guest exited on its own
+                if last_anchor in read_actuals():
+                    break                      # everything the check needs has been captured
+                time.sleep(2)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=20)
+    return read_actuals(), log
 
 
 def cmd_check(args):
@@ -616,7 +648,9 @@ def main():
     imp.add_argument("--name", required=True)
     imp.add_argument("--route")
     imp.add_argument("--dump")
-    imp.add_argument("--timeout", type=int, default=900)
+    imp.add_argument("--timeout", type=int, default=3600,
+                     help="safety net only; the run normally ends when the last "
+                          "anchor is captured")
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
     imp.add_argument("--flip-window", dest="flip_window", type=int, default=DEFAULT_FLIP_WINDOW,
                      help="flips either side of each anchor to search (0 = exact anchor only)")

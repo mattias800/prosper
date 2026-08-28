@@ -138,6 +138,22 @@ Two further consequences worth knowing before you debug something surprising:
   why the origin must never be established by a host hotkey — see the comment on
   `prosper_pad_flip_ordinal()` in `src/hle/input/hle_pad.cpp`.
 
+## FMVs, and why the anchor survives them
+
+**Movies play in the check exactly as they do when you author.** Nothing here disables video decode,
+and neither do the old guards.
+
+This is the case where a flip anchor earns its keep. An FMV of N frames contributes N flips however
+slowly it renders — so Blue Prince's intro, measured at **4.8 fps** against ~180 fps at its menu
+(#2215), shifts the run's wall-clock enormously and its flip anchors **not at all**. A wall-clock
+anchor would be useless here; a flip anchor is unaffected.
+
+What the movie *does* eat is real seconds. So the check does **not** stop on a timer: it runs until
+the last anchor has been captured, and the timeout is a safety net for a hung run. Sizing a timeout
+for a quick boot would cut the route off mid-run and report every later snap as `NOT REACHED` — a
+failure with nothing to do with rendering, which is the whole class of bug this system exists to
+remove.
+
 ## Where things live, and what is never committed
 
 | path | committed? | what |
