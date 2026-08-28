@@ -262,6 +262,24 @@ def main():
         check(score >= snaps.DEFAULT_MIN_SSIM,
               "...and it scores as a pass, where exact-anchor matching would have failed")
 
+        # ---- 6c2. Sampling is DENSE near the anchor, because that is where the match is ------
+        # Measured: two identical runs through Blue Prince's intro cutscene reached the same page of
+        # the same text at flip 10000 -- so drift across an FMV is small. They scored 0.465 anyway
+        # because one was mid-fade, and a few flips of drift during a transition is a large
+        # luminance change. Uniform spacing spends its samples far from the anchor, where the match
+        # almost never is.
+        geo = snaps.window_offsets({"flip_window": 900, "window_samples": 9})
+        positives = [o for o in geo if o > 0]
+        check(positives == sorted(positives), "offsets are ordered")
+        first_gap = positives[0]
+        last_gap = positives[-1] - positives[-2]
+        check(last_gap > first_gap * 2,
+              "spacing widens away from the anchor (dense near, sparse far)")
+        check(positives[0] < 900 // (len(positives) + 1),
+              "the nearest sample is much closer than uniform spacing would place it")
+        check(geo == [-o for o in reversed(geo)], "the window is symmetric about the anchor")
+        check(len(set(geo)) == len(geo), "no two samples collapse onto the same offset")
+
         # ---- 6d. An edge match is detectable, because that is how "the window is too narrow"
         # is told apart from "the picture changed" ----------------------------------------------
         edge_entry = {"flip_window": 600, "window_samples": 7}

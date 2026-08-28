@@ -443,14 +443,28 @@ def cmd_import(args):
 # ---------------------------------------------------------------------------------------------
 
 def window_offsets(entry):
-    """Flip offsets sampled either side of each anchor, always including 0 (the exact anchor)."""
+    """Flip offsets sampled either side of each anchor, always including 0 (the exact anchor).
+
+    Spacing is GEOMETRIC, not uniform: dense near the anchor and sparse at the edges. Measured
+    reason -- two identical runs through Blue Prince's intro cutscene reached the same page of the
+    same text at flip 10000, so drift across an FMV is SMALL. What made them score 0.465 was that
+    one was mid-fade: a few flips of drift during a transition is a large luminance change even
+    though the scene is the same. Uniform spacing puts most of its samples far away, where the match
+    almost never is, and leaves the near region -- where a fade needs resolving -- coarse.
+    """
     span = entry.get("flip_window", DEFAULT_FLIP_WINDOW)
     samples = max(1, entry.get("window_samples", DEFAULT_WINDOW_SAMPLES))
     if span <= 0 or samples == 1:
         return [0]
-    step = (2 * span) // (samples - 1)
-    offsets = sorted({-span + i * step for i in range(samples)} | {0})
-    return offsets
+    per_side = max(1, (samples - 1) // 2)
+    offsets = {0}
+    for i in range(1, per_side + 1):
+        # i/per_side raised to a power > 1 clusters the samples toward the anchor.
+        magnitude = int(round(span * (i / per_side) ** 2.2))
+        magnitude = max(magnitude, i)          # never collapse two samples onto each other
+        offsets.add(magnitude)
+        offsets.add(-magnitude)
+    return sorted(offsets)
 
 
 def candidate_flips(entry):
