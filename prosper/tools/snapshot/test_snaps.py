@@ -139,6 +139,7 @@ def main():
             dump = None
             timeout = 60
             min_ssim = snaps.DEFAULT_MIN_SSIM
+            savedata = "fresh"
             flip_window = snaps.DEFAULT_FLIP_WINDOW
             window_samples = snaps.DEFAULT_WINDOW_SAMPLES
 
@@ -178,6 +179,24 @@ def main():
         ref_sig = snaps.signature_of(os.path.join(refs, "unit", "0000.bmp"))
         check(ref_sig["luma16x9"] == promoted["luma16x9"],
               "accept moves the reference IMAGE too, so store and image cannot disagree")
+
+        # ---- 6a2. Both save roots are isolated, not just one -------------------------------
+        # A title with a save offers "Continue" ABOVE "New Game", so the same D-pad inputs select a
+        # different item -- the route does not merely mismatch, it diverges. prosper has two
+        # independent save roots and redirecting only one leaves file-mount titles reading the
+        # developer's real saves, which also means authoring silently writes into them.
+        sd_root = os.path.join(tmp, "sdroot")
+        sd_env = {}
+        snaps.apply_fresh_savedata(sd_env, sd_root)
+        check("PROSPER_SAVEDATA_DIR" in sd_env and "PROSPER_SAVE0" in sd_env,
+              "BOTH save roots are redirected, not just SaveDataMemory")
+        check(sd_env["PROSPER_SAVEDATA_DIR"] != sd_env["PROSPER_SAVE0"],
+              "the two roots are distinct directories")
+        for key in ("PROSPER_SAVEDATA_DIR", "PROSPER_SAVE0"):
+            check(os.path.isdir(sd_env[key]), f"{key} exists so the guest can write to it")
+            check(os.listdir(sd_env[key]) == [], f"{key} starts EMPTY, which is what 'fresh' means")
+            check(os.path.abspath(sd_env[key]).startswith(os.path.abspath(sd_root)),
+                  f"{key} is inside the run directory, never the developer's real save path")
 
         # ---- 6b. The anchor window: samples either side, always including the anchor ----------
         # Required, not defensive. A flip anchor is stable against rendering changes but drifts when

@@ -1,0 +1,42 @@
+{
+  "dump": "PPSA02664-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "alexkidd",
+  "route": "prosper/scripts/alexkidd/route.pad",
+  "snaps": [
+    {
+      "distinct_colors": 511,
+      "height": 1080,
+      "index": 0,
+      "luma16x9": "000000000000000000000000000000000000000000231f2f2f2b0b000000000000000000000f2717171f04001300000000000000000000000000006237000000001c65699fab3b0000000ec603000000000917353a4b34000000070b1e0000000000000000000000000000000000000000000000011d1e2935341a040000000000000000000000000000000000000000",
+      "nonblack_ratio": 0.06929,
+      "pad_flip": 4296,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 15373,
+      "height": 1080,
+      "index": 1,
+      "luma16x9": "f6eeedb9959a8d86b1bdbdbdbebfbebce9ccb3919182a1a8bfaac4c2c0c2cbb9caa392e2d294ab91afbbc6c1acb1b0b6c99ba2619dac9968a5bebab5afacacb9dfa5b8a384bf8193a3bebcaca8a7b1bed19969a1b4b59873abbdb2b0aaa2acbd6f7d6b7964cbb858bcbdbebdba938fb77e6b9786728c8a6ebcbcbdbcbdbdbdbc968b798a8f727192bbbdbdbbbdc2b5b4",
+      "nonblack_ratio": 0.992963,
+      "pad_flip": 5431,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 33468,
+      "height": 1080,
+      "index": 2,
+      "luma16x9": "7d839a9bab9b9799777372706d69725fa4998c9993ace2ecb583807e7ca3ab97bfc3bab8c1b19d9898958e8c8baaf0e4abc6c1c2c2aea3a09d9d9b98a3c7e0b78f9196a8aba0a3a2a2a3a4a9b99e9ca24757656b7c86a7a8c1d8ba8370787a75421e1b1f4c9fb4d5f0d8e6c64c33212a3b3e152c93a8a6aaa39dadb5a03d202e1e2932288fa4a5703c7cbaa19b8d2017",
+      "nonblack_ratio": 0.999869,
+      "pad_flip": 6704,
+      "verdict": "correct",
+      "width": 1920
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA02664",
+  "window_samples": 7
+}

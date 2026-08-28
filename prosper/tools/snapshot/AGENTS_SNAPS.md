@@ -154,6 +154,29 @@ for a quick boot would cut the route off mid-run and report every later snap as 
 failure with nothing to do with rendering, which is the whole class of bug this system exists to
 remove.
 
+## Save state: fresh by default, and why that is not optional
+
+Both halves run with **both** save roots redirected to empty per-run directories:
+
+    PROSPER_SAVEDATA_DIR -> SaveDataMemory slots (the whole save path for Unity titles)
+    PROSPER_SAVE0        -> the /savedata0 file mount
+
+Redirecting only the first leaves file-mount titles reading your real saves.
+
+This is not hygiene, it is correctness. A title with a save offers **"Continue" above "New Game"** —
+so the same D-pad inputs select a *different item*, and the route does not merely mismatch, it
+diverges into a different part of the game. Authoring against real saves also silently writes into
+them.
+
+`--savedata preserve` exists and is deliberately loud about the consequence: a session authored that
+way will not reproduce on a machine whose save state differs, including CI and anyone else's clone.
+
+**Wanting a save is legitimate** — it is how you would skip a long intro and author deep-game content
+without replaying an hour of route. The right shape for that is a save FIXTURE stored with the snap
+set and copied into the fresh directory before the run, so the starting state is part of the
+committed definition rather than a property of one machine. Not built yet; `preserve` is not a
+substitute for it.
+
 ## Where things live, and what is never committed
 
 | path | committed? | what |
