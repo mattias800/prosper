@@ -334,21 +334,37 @@ def default_check_out_dir(name):
     return os.path.join(os.path.expanduser("~"), ".cache", "prosper-snaps", name)
 
 
-def session_to_write(args, existing):
-    """(record_or_None, differing_keys) -- what an authoring run should store about itself.
+def reconcile_session(args, existing, was_passed=None):
+    """Settle an appending run against what the directory was already authored under.
 
-    Returns None for the record when appending to a directory whose stored parameters differ:
-    restamping would record the SECOND run's conditions for snaps taken during the first, and import
-    would then replay half of them at a rate nobody played them at. One directory describes one set
-    of conditions.
+    Returns (record, adopted, conflicts):
+      record    -- what to store in session.json
+      adopted   -- keys taken FROM the stored session because the caller did not ask for them
+      conflicts -- keys the caller explicitly asked for that contradict the stored session
+
+    This must run BEFORE the run environment is built. An earlier version resolved it afterwards,
+    so `--append --det-fps 60` on a directory authored at 30 ran the emulator paced at 60 while
+    recording 30 -- the run and its own record disagreeing, which is the exact divergence this
+    whole mechanism exists to prevent. It moved the damage from run 1 to run 2 rather than removing
+    it.
+
+    A directory describes ONE set of conditions, because its snaps share one route and one flip
+    axis. So an explicit contradiction is refused rather than silently resolved; a mere default is
+    adopted, since that is somebody continuing a session without retyping the flags.
     """
-    if getattr(args, "append", False) and existing:
-        differing = [k for k in SESSION_KEYS
-                     if k in existing and existing[k] != getattr(args, k)]
-        if differing:
-            return None, differing
-        return None, []
-    return session_record(args), []
+    was_passed = _flag_was_passed if was_passed is None else was_passed
+    if not (getattr(args, "append", False) and existing):
+        return session_record(args), [], []
+    adopted, conflicts = [], []
+    for key in SESSION_KEYS:
+        if key not in existing or existing[key] == getattr(args, key):
+            continue
+        (conflicts if was_passed(key) else adopted).append(key)
+    for key in adopted:
+        setattr(args, key, existing[key])
+    # Rewrite the record even when nothing differed: a session file written by an older version can
+    # be missing a key, and this is the only chance to complete it.
+    return session_record(args), adopted, conflicts
 
 
 def session_record(args):
@@ -474,6 +490,32 @@ def cmd_author(args):
 
     # Pacing, clock, savedata and the recorded session all come from the shared helpers above, so
     # this half and the check half cannot drift apart.
+    # Settle the session against anything already stored here FIRST -- author_env reads args, so a
+    # reconciliation after this point would run the emulator under different settings than it
+    # records.
+    session_path = os.path.join(out_dir, "session.json")
+    existing = {}
+    if os.path.exists(session_path):
+        try:
+            with open(session_path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError):
+            existing = {}
+    record, adopted, conflicts = reconcile_session(args, existing)
+    if conflicts:
+        raise SystemExit(
+            "snaps: this directory was authored with "
+            + ", ".join(f"{k}={existing[k]!r}" for k in conflicts)
+            + ", and you asked for "
+            + ", ".join(f"{k}={getattr(args, k)!r}" for k in conflicts)
+            + ".\n       Its existing snaps are anchored on flips recorded under the stored\n"
+              "       settings, so one directory can only describe one set of conditions.\n"
+              "       Use a fresh --out to author at different settings.")
+    if adopted:
+        print(f"  NOTE: continuing under the session's own "
+              f"{', '.join(f'{k}={existing[k]!r}' for k in adopted)} rather than the command-line "
+              f"default. This run is paced to match the snaps already here.")
+
     env = author_env(args, out_dir)
     if args.det_clock == "on":
         print(f"  guest clock: PINNED at {args.det_fps} fps, flips paced to match. This replaces "
@@ -494,23 +536,8 @@ def cmd_author(args):
     # --det-fps is a separate argument on both subcommands, each defaulting to 60: authoring at 30
     # and importing without the flag used to record 60, and BOTH halves would then pace at 60
     # against a session played at 30. Nothing failed loudly; the anchors just moved.
-    session_path = os.path.join(out_dir, "session.json")
-    existing = {}
-    if os.path.exists(session_path):
-        try:
-            with open(session_path, "r", encoding="utf-8") as handle:
-                existing = json.load(handle)
-        except (OSError, ValueError):
-            existing = {}
-    record, differing = session_to_write(args, existing)
-    if differing:
-        print(f"  NOTE: keeping the original session parameters for {', '.join(differing)} "
-              f"({', '.join(f'{k}={existing[k]!r}' for k in differing)}). This directory already "
-              f"holds snaps authored under them, and one directory can only describe one set of "
-              f"conditions -- use a fresh --out to author at different settings.")
-    if record is not None:
-        with open(session_path, "w", encoding="utf-8") as handle:
-            json.dump(record, handle, indent=2)
+    with open(session_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2)
 
     print(f"authoring '{args.name}' -> {out_dir}")
     print("  F6 = this frame looks CORRECT     F7 = this frame looks WRONG")

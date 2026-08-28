@@ -395,6 +395,35 @@ def main():
         check(os.path.exists(os.path.join(e2e, "session.json")),
               "an authoring session records itself on disk")
 
+        # The reviewer's exact reproduction, end to end: append to this directory WITHOUT repeating
+        # --det-fps and confirm the emulator is actually launched at the session's rate, not the
+        # CLI default. Asserting on `saw` -- the env handed to the process -- is the whole point:
+        # the previous version recorded 30 and ran at 60, and only the env can tell them apart.
+        saw = {}
+
+        class AppendE2E(AuthorE2E):
+            append = True
+            det_fps = snaps.DEFAULT_DET_FPS       # 60 -- the default, NOT what was authored
+
+        def capture_run(cmd, env=None, check_=False, **kw):
+            saw.update(env)
+            return fake_run(cmd, env=env)
+        saved_app, saved_run = snaps.APP, snaps.subprocess.run
+        try:
+            snaps.APP = fake_app
+            snaps.subprocess.run = capture_run
+            snaps.cmd_author(AppendE2E())
+        finally:
+            snaps.APP, snaps.subprocess.run = saved_app, saved_run
+
+        check(saw.get("PROSPER_FLIP_PACE_FPS") == "30",
+              "an appending run is PACED at the session's own rate, not the command-line default")
+        with open(os.path.join(e2e, "session.json"), "r", encoding="utf-8") as handle:
+            after = json.load(handle)
+        check(after.get("det_fps") == 30, "...and still records that rate")
+        check(saw.get("PROSPER_FLIP_PACE_FPS") == str(after.get("det_fps")),
+              "...so the run and its own record agree, which is the whole invariant")
+
         class ImportE2E(Args):
             capture_dir = e2e
             name = "e2e"
@@ -421,26 +450,76 @@ def main():
         check(out.startswith(os.path.expanduser("~")), "...it lands on real disk under $HOME")
         check("somegame" in out, "...in a per-set directory, so two sets cannot collide")
 
-        # ---- 6a1b-v. --append must not restamp a session authored at other settings ----------
-        # Appending would otherwise record the SECOND run's parameters for snaps taken during the
-        # first, and import would replay half of them at a rate nobody played them at.
+        # ---- 6a1b-v. --append: the run and its own record must agree -------------------------
+        # The first version of this fix resolved the stored session AFTER building the run
+        # environment, so `--append --det-fps 60` on a directory authored at 30 ran the emulator
+        # paced at 60 while recording 30. Every snap from that run would then be anchored on flips
+        # taken at 60 and replayed at 30 -- the divergence this whole mechanism exists to prevent,
+        # moved from run 1 to run 2 rather than removed.
         class Fresh:
             name = "s"; det_fps = 60; det_clock = "off"; savedata = "fresh"; append = False
 
-        class Appending:
+        rec, adopted, conflicts = snaps.reconcile_session(Fresh(), {}, was_passed=lambda k: False)
+        check(rec is not None and rec.get("det_fps") == 60 and not adopted and not conflicts,
+              "a fresh session records its own parameters")
+
+        # Not explicitly asked for -> adopt the stored value, AND mutate args so the run matches.
+        class Defaulted:
+            name = "s"; det_fps = 60; det_clock = "off"; savedata = "fresh"; append = True
+
+        d = Defaulted()
+        rec2, adopted2, conflicts2 = snaps.reconcile_session(
+            d, {"det_fps": 30, "det_clock": "off", "savedata": "fresh"},
+            was_passed=lambda k: False)
+        check(adopted2 == ["det_fps"] and not conflicts2,
+              "appending without the flag adopts the session's own rate")
+        check(d.det_fps == 30,
+              "...and ARGS is updated, so author_env paces the run to match what is recorded")
+        check(rec2.get("det_fps") == 30, "...so the run and its record cannot disagree")
+
+        # Explicitly asked for and contradicting -> a conflict the caller must resolve.
+        class Explicit:
+            name = "s"; det_fps = 60; det_clock = "off"; savedata = "fresh"; append = True
+
+        e = Explicit()
+        rec3, adopted3, conflicts3 = snaps.reconcile_session(
+            e, {"det_fps": 30, "det_clock": "off", "savedata": "fresh"},
+            was_passed=lambda k: k == "det_fps")
+        check(conflicts3 == ["det_fps"] and not adopted3,
+              "an explicit flag contradicting the session is a CONFLICT, not a silent override")
+        check(e.det_fps == 60, "...and args is left alone, so the caller sees what they asked for")
+
+        # Same settings -> silent, and the record still gets rewritten so a key missing from an
+        # older session file can be completed.
+        class Same:
             name = "s"; det_fps = 30; det_clock = "off"; savedata = "fresh"; append = True
 
-        rec, diff = snaps.session_to_write(Fresh(), {})
-        check(rec is not None and rec.get("det_fps") == 60 and diff == [],
-              "a fresh session records its own parameters")
-        rec2, diff2 = snaps.session_to_write(Appending(), {"det_fps": 60, "det_clock": "off",
-                                                           "savedata": "fresh"})
-        check(rec2 is None and diff2 == ["det_fps"],
-              "appending at a DIFFERENT rate keeps the original and names what differed")
-        rec3, diff3 = snaps.session_to_write(
-            Appending(), {"det_fps": 30, "det_clock": "off", "savedata": "fresh"})
-        check(rec3 is None and diff3 == [],
-              "appending at the SAME settings is silent and still does not restamp")
+        rec4, adopted4, conflicts4 = snaps.reconcile_session(
+            Same(), {"det_fps": 30}, was_passed=lambda k: False)
+        check(not adopted4 and not conflicts4, "appending at the same settings is silent")
+        check(rec4 is not None and rec4.get("savedata") == "fresh",
+              "...and a key missing from an older session file is completed rather than left out")
+
+        # ---- 6a1b-vi. _flag_was_passed sees argparse ABBREVIATIONS -----------------------------
+        # argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps. An exact-match
+        # check missed it, and the stored session would then silently override a flag the person
+        # did type. This is the arm that was missing when the fix landed.
+        saved_argv = sys.argv
+        try:
+            for argv, key, want in (
+                    (["--det-fps", "30"], "det_fps", True),
+                    (["--det-f", "30"], "det_fps", True),      # abbreviation
+                    (["--det-fps=30"], "det_fps", True),
+                    (["--det-f", "30"], "det_clock", False),   # must not bleed across flags
+                    (["--savedata", "none"], "det_fps", False),
+                    (["--"], "det_fps", False),                # end-of-options, not a flag
+                    ([], "det_fps", False)):
+                sys.argv = ["snaps.py", "import", "d"] + argv
+                got = snaps._flag_was_passed(key)
+                check(got == want,
+                      f"_flag_was_passed({key}) is {want} for {argv or 'no flags'}")
+        finally:
+            sys.argv = saved_argv
 
         # An inherited pace from the authoring shell must not survive into a run that specifies its
         # own -- same leak the clock arm above guards.
