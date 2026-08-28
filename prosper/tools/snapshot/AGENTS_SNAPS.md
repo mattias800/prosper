@@ -10,7 +10,20 @@ reaches the entrance hall inside 300–780 s any more.
 
 ## Authoring: play the game
 
-Run the title normally — a real window, audio, a pad — and record the route while you play:
+```bash
+python3 prosper/tools/snapshot/snaps.py author --name blue-prince --dump PPSA25009-app0
+```
+
+That launches the title with a real window, audio and pad, records the input route, and puts the
+snaps in `~/snaps/blue-prince`. One command rather than four environment variables, because getting
+`PROSPER_PAD_RECORD` wrong is not a *visible* mistake: you play the whole session, press F6/F7
+happily, and only discover at import time that there is no route and none of it can be replayed.
+
+It refuses to reuse a session directory, for the same class of reason — snap indices restart at 0
+each run, so a second session into one directory would overwrite the first session's images while
+appending to its manifest. Use a fresh `--out`, or `--append` if you mean it.
+
+The equivalent by hand, if you want to add your own variables:
 
 ```bash
 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
@@ -124,6 +137,22 @@ Two further consequences worth knowing before you debug something surprising:
   you press the key, names the file `..._unanchored.bmp`, and `import` rejects it out loud. This is
   why the origin must never be established by a host hotkey — see the comment on
   `prosper_pad_flip_ordinal()` in `src/hle/input/hle_pad.cpp`.
+
+## FMVs, and why the anchor survives them
+
+**Movies play in the check exactly as they do when you author.** Nothing here disables video decode,
+and neither do the old guards.
+
+This is the case where a flip anchor earns its keep. An FMV of N frames contributes N flips however
+slowly it renders — so Blue Prince's intro, measured at **4.8 fps** against ~180 fps at its menu
+(#2215), shifts the run's wall-clock enormously and its flip anchors **not at all**. A wall-clock
+anchor would be useless here; a flip anchor is unaffected.
+
+What the movie *does* eat is real seconds. So the check does **not** stop on a timer: it runs until
+the last anchor has been captured, and the timeout is a safety net for a hung run. Sizing a timeout
+for a quick boot would cut the route off mid-run and report every later snap as `NOT REACHED` — a
+failure with nothing to do with rendering, which is the whole class of bug this system exists to
+remove.
 
 ## Where things live, and what is never committed
 
