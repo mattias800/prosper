@@ -5,10 +5,12 @@
 # never be mistaken for movement.
 #
 # The measurement is minimap displacement, NOT world motion. Phase-correlate the minimap disc
-# between each window's first and last field frame (tools/frameclass/letterbox.py:hud_displacement):
+# between each window's first and last field frame. Reproduce with
+# scripts/dragon-quest-vii/classify_field.py locomotion -- the exact window list is in
+# scripts/dragon-quest-vii/README.md:
 #
-#     stick held   displacement >= 2 px in 7 of 8 windows, median 28 px of a 128 px disc
-#     neutral      >= 2 px in 0 of 8, seven of them exactly 0
+#     stick held   displacement >= 2 px in 6 of 8 windows, median 20.5 px of a 128 px disc
+#     neutral      >= 2 px in 0 of 8
 #
 # Measure the HUD, not the world. A world region flicking between rendered and collapsed swamps
 # the signal on this title; the minimap is drawn correctly regardless. See #1874.

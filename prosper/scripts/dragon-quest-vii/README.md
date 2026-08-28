@@ -107,7 +107,8 @@ established, and for the state of the composite in that phase.
 Reaches the field state in Pilchard Bay at t≈652 s and holds it to the end of the run (144 frames,
 588 s). Use this for gameplay work; `reach-gameplay.pad` stops inside the opening chapter's script.
 
-**This file is byte-for-byte the route that produced the checked-in evidence.** Do not extend it
+**This file is event-for-event the route that produced the checked-in evidence** (455 event
+lines, identical; only the comment header differs). Do not extend it
 without re-running — a published recipe that has never been executed is worth nothing.
 
 What it changes is **how much confirm the chapter is given**. Measured on one binary, quiet box,
@@ -135,20 +136,48 @@ PROSPER_PAD_SCRIPT_LOG=1 \
   --seconds 4 --count 310 --timeout 1350 --out <EVIDENCE_ROOT>/shots
 ```
 
-**Confirming you reached it.** Classify the captures — the phase restriction is an argument, not a
-post-hoc trim:
+**Confirming you reached it.** Every published number for this title comes from one committed
+script, so it can be re-derived rather than taken on trust:
 
 ```bash
-python3 tools/frameclass/letterbox.py <EVIDENCE_ROOT>/shots \
-    --seconds-per-frame 4 --after 330 --require-hud-corners
+python3 scripts/dragon-quest-vii/classify_field.py field <EVIDENCE_ROOT>/shots
+python3 scripts/dragon-quest-vii/classify_field.py world <EVIDENCE_ROOT>/shots
+python3 scripts/dragon-quest-vii/classify_field.py selftest
 ```
 
-Both halves are required. Cinematic bars alone cannot see a collapsed present (this title collapses
-to white, to black, and to flat blue with a magenta speckle); HUD-corner colour alone fires on a
-colourful cutscene.
+It keys on the party block's **HP bar**, not on "is there HUD art in the corners". The generic
+corner test fails on this title in both directions and both failures are real captures: a
+torn-composite cutscene whose bottom corners hold saturated structured water passes it (that is
+what produced two false "gameplay" frames in runs 1 and 2), and a flat blue collapse scores 1.00
+saturated while containing nothing.
 
-This route delivers **only Cross**, so it establishes the field state. Locomotion was measured
-separately, by alternating stick and neutral windows inside the field state and phase-correlating
-the **minimap disc** between each window's first and last frame: displacement ≥ 2 px in 7 of 8 stick
-windows against 0 of 8 neutral ones. Measure the HUD, not the world — a world region flicking
-between rendered and collapsed swamps the signal, while the minimap is drawn correctly regardless.
+This route delivers **only Cross**, so it establishes the field state. Locomotion is measured by
+`probe-locomotion.pad` — see below.
+
+## Locomotion — `probe-locomotion.pad`
+
+Mashes confirm to t=700 to reach the field state, then alternates eight stick windows against eight
+matched neutral windows inside it. Confirms stop at 700 so a press cannot be mistaken for movement.
+
+```bash
+# same environment as reach-field-control.pad, with:
+#   PROSPER_PAD_SCRIPT=@scripts/dragon-quest-vii/probe-locomotion.pad
+#   ./build-linux/screenshot ... --seconds 3 --count 420 --timeout 1400
+
+python3 scripts/dragon-quest-vii/classify_field.py locomotion <EVIDENCE_ROOT>/shots \
+    --window 710:740:neutral --window 740:770:stick \
+    --window 770:800:neutral --window 800:830:stick \
+    --window 830:860:neutral --window 860:890:stick \
+    --window 890:920:neutral --window 920:950:stick \
+    --window 950:980:neutral --window 980:1010:stick \
+    --window 1010:1040:neutral --window 1040:1070:stick \
+    --window 1070:1100:neutral --window 1100:1130:stick \
+    --window 1130:1160:neutral --window 1160:1190:stick
+```
+
+Measured: displacement ≥ 2 px in **6 of 8** stick windows (median 20.5 px of a 128 px disc) against
+**0 of 8** neutral. A 2 s guard band is trimmed from each window's end (`--guard`) because the
+character coasts after a release; it is an argument so it cannot hide inside the result.
+
+**Measure the HUD, not the world.** A world region flicking between rendered and collapsed swamps
+the signal on this title; the minimap is drawn correctly regardless.

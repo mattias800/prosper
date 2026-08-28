@@ -118,8 +118,22 @@ rule is checked by mutation: reverting it reddens the case that names it.
 Answers a different question from `frameclass.py`: not "does this frame carry content" but "is the
 title showing a **cutscene**". It measures the cinematic bars, which are geometric and therefore
 survive the colour degradation that makes chromatic metrics unreliable on several UE4 titles here.
+`--require-hud-corners` adds a positive half, `--after` restricts to a phase, `hud_displacement`
+phase-correlates a HUD region between two frames, and `--selftest` runs constructed cases.
 
-Two limits are documented in its own header and worth repeating, because both were paid for:
-a present collapsed to uniform **white** has no dark rows and so reads as un-barred, i.e. as
-gameplay — hence the uniformity guard rather than a brightness floor; and absence of bars is not
-presence of gameplay, since a menu has none either. Pair it with a positive per-title marker.
+Three limits, all paid for on `PPSA17942` and all repeated in the file's own header:
+
+- **A collapsed present has no dark rows either**, so absence of bars reads as gameplay. The guard is
+  a structure floor, not a brightness floor and not a colour count: a *flat* collapse and a
+  *speckled* one (18 distinct colours over 8.3 MP) both have to fail, and a brightness floor is
+  actively inverted, since real HUD-over-dark frames are darker than the garbage.
+- **Absence of bars is not presence of gameplay** — a menu has none. Pair it with a positive
+  per-title marker.
+- **The generic corner test is not that marker.** It fires on a colourful cutscene and on a flat
+  saturated collapse alike. Where a title draws a distinctive HUD element, key on that instead:
+  `scripts/dragon-quest-vii/classify_field.py` uses the party block's HP bar and separates by ~1.5x
+  on both sides, where the corner test produced false positives in both directions.
+
+The thresholds here have less headroom than the prose might suggest — on the title they were tuned
+against, the structure floor sits about 3 units below the field-frame minimum. Re-measure before
+trusting them on a new title, and prefer a per-title marker for anything load-bearing.

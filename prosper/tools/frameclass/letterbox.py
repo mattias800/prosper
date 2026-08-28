@@ -16,7 +16,7 @@ Two things to know before trusting an answer, both learned the hard way on PPSA1
 1. **A collapsed WHITE present has no dark rows, so it reads as "no bars" — i.e. as gameplay.**
    The first version of this guarded only against darkness and reported 61 un-barred world frames
    on a run that never left its cutscene; every one was blown to RGB(255,255,255). Guarding one
-   end of the range catches half the failure and INVERTS the other half. Hence `uniform()`.
+   end of the range catches half the failure and INVERTS the other half. Hence `collapsed()`, which measures structure rather than colour count.
 
 2. **Absence of bars is not presence of gameplay.** A menu has no bars either. Pair this with a
    positive test — for that title, the field HUD it draws only while the player has control — and
@@ -260,7 +260,9 @@ def main():
         if args.show:
             print(f"  t={t:6.0f}s  top={top:.3f} bot={bot:.3f} mid={mid:6.1f}  {state}")
 
-    print(f"\n{len(frames)} frames: {cine} cinematic, {len(open_frames)} open-frame, "
+    counted = cine + len(open_frames) + unusable
+    print(f"\n{counted} of {len(frames)} frames (the rest precede --after): "
+          f"{cine} cinematic, {len(open_frames)} open-frame, "
           f"{unusable} unusable (collapsed — blown white, crushed black, or a flat speckle)")
     if open_frames:
         label = ("frames with the field HUD and no cinematic bars — player control:"

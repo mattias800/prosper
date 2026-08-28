@@ -1,7 +1,7 @@
 # Dragon Quest VII Reimagined (PPSA17942) — title -> new adventure log -> name entry ->
 # first-run System Settings -> opening chapter -> FREE FIELD CONTROL in Pilchard Bay.
 #
-# THIS IS THE ROUTE THAT PRODUCED THE EVIDENCE, byte-for-byte. Do not extend it without re-running:
+# THIS IS THE ROUTE THAT PRODUCED THE EVIDENCE, event-for-event. Do not extend it without re-running:
 # a published recipe that has never been executed is worth nothing.
 #
 # What it changes against reach-gameplay.pad is how much confirm the opening chapter is given.

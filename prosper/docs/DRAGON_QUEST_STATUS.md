@@ -686,27 +686,40 @@ about the ROUTE until the confirm count has been pushed by an order of magnitude
 
 ### Locomotion is MEASURED, and the measurement is on the HUD
 
-A fourth run mashes Cross to t=700, then alternates eight 28 s stick windows against eight matched
-neutral windows, entirely inside the field state. All eight stick deliveries appear in the pad log
+A fourth run mashes Cross to t=700, then alternates eight stick windows against eight matched
+neutral windows entirely inside the field state. All eight stick deliveries appear in the pad log
 (`axes=left-stick-left/right/up/down`).
 
 **The signal is minimap displacement, not world motion.** Phase-correlating the minimap disc between
 the first and last field frame of each window:
 
-| | windows with displacement >= 2 px | median displacement |
+| | windows with displacement >= 2 px | median |
 | --- | --- | --- |
-| stick held | **7 of 8** | 28.0 px (of a 128 px disc) |
-| neutral | **0 of 8** | 0.0 px (seven exactly zero) |
+| stick held | **6 of 8** | 20.5 px (of a 128 px disc) |
+| neutral | **0 of 8** | 0.0 px |
+
+Reproduce it — every number below comes from this committed script, not from scratch analysis:
+
+```bash
+python3 scripts/dragon-quest-vii/classify_field.py locomotion <SHOTS> \
+    --window 710:740:neutral --window 740:770:stick  ...   # eight of each
+```
+
+**A 2 s guard band is trimmed from each window's end** (`--guard`, default 2.0) because the
+character coasts briefly after the stick is released; without it the following neutral window
+inherits that coast and two neutral windows register motion. It is an argument rather than a
+constant so it cannot hide inside the result.
 
 That is the separation a world-motion probe could not produce, and the reason is the composite: a
 world region flicking between rendered and collapsed swamps any real movement, while the HUD is
 drawn correctly regardless. **On a title whose composite is broken, the HUD is the reliable place to
-look for locomotion.** `tools/frameclass/letterbox.py:hud_displacement` implements it.
+look for locomotion.**
 
-For completeness, world motion in the same windows does separate once pairs where either frame is
-collapsed are excluded — stick median 117.9 against neutral 18.1, a 6.5x ratio — but only weakly by
-rank (P(stick > neutral) = 0.694, Mann-Whitney p = 0.016), because the neutral spread stays wide.
-The minimap answers cleanly where the world answers noisily.
+World motion in the same windows also separates once pairs where either frame is collapsed are
+excluded, but only weakly and the exact figures depend on how "collapsed" is drawn — reconstructions
+span roughly 1.4x to 6.8x with rank statistics from P=0.56 to P=0.83. The minimap answers cleanly
+where the world answers noisily; that is the finding, and no single world-motion number is quoted
+here because none of them is stable.
 
 Visually: across the first stick window the camera and character move together — the quest-marker
 house that sat centre-left ends up upper-right, a cliff face enters from the left, and the minimap
@@ -746,26 +759,31 @@ carries constructed self-test cases for each failure above.
 
 ## Ruled out — eliminated, do not re-run these
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
-  raising the confirm rate from one per 15 s to one per 2 s takes the run from 1 field-HUD frame to
-  145. See *Free field control is reached* above for the three-run table. #1874.
+  raising the confirm rate from one per 15 s to one per 2 s takes the run from 0 field-HUD frames to
+  144. See *The field state is reached* above for the three-run table. #1874.
 
 - **"A stick-versus-neutral motion probe can be run in the chapter-script phase."**
   **Falsified 2026-08-28**, and the result is void rather than negative: across four matched windows
   the NEUTRAL medians alone ranged 2.2 to 84.2, so no contrast the experiment could produce was
   interpretable. The cause is the PHASE, not the title — that run reached the field HUD zero times,
-  so every window sampled a cutscene. **This does not rule out the probe**, and it is still the one
-  experiment that would convert "field state reached" into "locomotion demonstrated": run it inside
-  the field window (t > 660 s on `reach-field-control.pad`), not before it. #1874.
+  so every window sampled a cutscene. **This does not rule out the probe** — run inside the field
+  window it answers, and `probe-locomotion.pad` did exactly that on 2026-08-28. Aim it at the phase,
+  and prefer the minimap to the world: see *Locomotion is MEASURED* above. #1874.
 
 - **"No cinematic bars means the run reached gameplay."** **Falsified 2026-08-28**, twice over.
   A present collapsed to uniform white has no dark rows, so a bar detector reports it as un-barred:
   the first version of this measurement returned 61 "un-barred" world frames on a run that never
   left its cutscene, every one RGB(255,255,255). A *colour-count* guard then still missed this
   title's dominant collapse — flat blue with a magenta speckle, 18 distinct colours across a full
-  8.3 MP frame. What separates all of them is **structure** (luma sigma 4.1 on the collapse against
-  95+ on a real frame), not brightness and not colour count; a brightness floor is actively
-  inverted here, since real HUD-over-dark frames measure 8.3-8.9 while the blue garbage measures
-  29.7-31.9. And absence of bars is not presence of gameplay in any case: a MENU has none either.
+  8.3 MP frame. What separates all of them is **structure** rather than brightness or colour count — but the
+  margin is narrow and worth stating honestly: over run 3's field phase the field frames run
+  sigma 14.67 (min) / 33.11 (median) / 115.15 (max) against a worst collapse of 11.71, so the
+  12.0 floor has about **3 units** of room, not the order of magnitude an earlier draft of this
+  line claimed. A brightness floor is worse still and actively inverted: real HUD-over-dark frames
+  measure 8.26-8.9 against a default floor of 8.0, with 73 of 144 within 1.0 of it, while the blue
+  garbage measures 29.7-31.9. That narrowness is why the per-title classifier
+  (`scripts/dragon-quest-vii/classify_field.py`) keys on the **HP bar** instead, which separates by
+  ~1.5x on both sides and does not consult a collapse test at all. And absence of bars is not presence of gameplay in any case: a MENU has none either.
   #1874.
 
 
