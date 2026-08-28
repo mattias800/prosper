@@ -67,6 +67,19 @@ REF_HOME = os.environ.get(
 # chosen there to survive subtle pixel improvements while catching a collapse.
 DEFAULT_MIN_SSIM = 0.85
 
+# How far either side of an authored anchor the check looks, in flips, and how many samples it takes
+# across that span.
+#
+# This is not belt-and-braces, it is required. A flip anchor is stable against RENDERING changes but
+# not against changes in how fast the guest gets there: Blue Prince's boot is asset-loading bound, so
+# under machine load the title screen arrives hundreds of flips later than on an idle run. Measured
+# during development -- an anchor that landed on the title screen on a quiet machine landed on a
+# still-black loading frame while builds and CI were running, and reported a confident FAIL with
+# "colors 14446 -> 1". Comparing only the exact flip makes the suite fail for reasons that have
+# nothing to do with the renderer, which is the failure this whole design exists to remove.
+DEFAULT_FLIP_WINDOW = 600
+DEFAULT_WINDOW_SAMPLES = 7
+
 
 # ---------------------------------------------------------------------------------------------
 # Image reading and the signature
@@ -287,6 +300,8 @@ def cmd_import(args):
         "route": route_rel,
         "timeout": args.timeout,
         "min_structural_similarity": args.min_ssim,
+        "flip_window": args.flip_window,
+        "window_samples": args.window_samples,
         "snaps": sorted(snaps, key=lambda s: s["pad_flip"]),
     }
     save_entry(args.name, entry)
@@ -303,6 +318,53 @@ def cmd_import(args):
 # check
 # ---------------------------------------------------------------------------------------------
 
+def window_offsets(entry):
+    """Flip offsets sampled either side of each anchor, always including 0 (the exact anchor)."""
+    span = entry.get("flip_window", DEFAULT_FLIP_WINDOW)
+    samples = max(1, entry.get("window_samples", DEFAULT_WINDOW_SAMPLES))
+    if span <= 0 or samples == 1:
+        return [0]
+    step = (2 * span) // (samples - 1)
+    offsets = sorted({-span + i * step for i in range(samples)} | {0})
+    return offsets
+
+
+def candidate_flips(entry):
+    """Every flip the replay should capture: each anchor, plus its window. Negatives are dropped --
+    a flip before the origin does not exist."""
+    out = set()
+    for snap in entry["snaps"]:
+        for offset in window_offsets(entry):
+            flip = snap["pad_flip"] + offset
+            if flip >= 0:
+                out.add(flip)
+    return out
+
+
+def best_match(snap, entry, actuals, out_dir):
+    """Best (ssim, record, signature) across the anchor's window, or None if nothing was captured.
+
+    Taking the BEST is the point: the authored frame is somewhere in this span, and which sample
+    lands on it depends on how fast the machine happened to be. Taking the exact anchor alone makes
+    the result a measure of system load.
+    """
+    best = None
+    reference = decode_luma(snap["luma16x9"])
+    for offset in window_offsets(entry):
+        flip = snap["pad_flip"] + offset
+        record = actuals.get(flip)
+        if not record:
+            continue
+        image = os.path.join(out_dir, record["file"])
+        if not os.path.exists(image):
+            continue
+        signature = signature_of(image)
+        score = structural_similarity(reference, decode_luma(signature["luma16x9"]))
+        if best is None or score > best[0]:
+            best = (score, record, signature, offset)
+    return best
+
+
 def run_replay(entry, out_dir):
     """Replay the authored route and capture the presented frame at every authored anchor."""
     dump = entry["dump"]
@@ -311,7 +373,7 @@ def run_replay(entry, out_dir):
         raise SystemExit(f"snaps: dump not found: {dump_path}")
     if not os.path.exists(APP):
         raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
-    flips = ",".join(str(s["pad_flip"]) for s in entry["snaps"])
+    flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
     env = dict(os.environ)
     env.update({
         "SDL_VIDEODRIVER": "offscreen",
@@ -360,22 +422,23 @@ def cmd_check(args):
 
         for snap in entry["snaps"]:
             flip = snap["pad_flip"]
-            record = actuals.get(flip)
             label = f"  snap {snap['index']:>3} {snap['verdict']:<9} flip {flip:>6}"
-            if not record:
+            found = best_match(snap, entry, actuals, out_dir)
+            if not found:
                 # Never silently pass a snap that was not reached: that is the failure mode the
                 # whole design exists to remove.
                 print(f"{label}  NOT REACHED -- the route never got here (log: {log})")
                 if snap["verdict"] == "correct":
                     failures += 1
                 continue
+            ssim, record, actual, offset = found
             actual_image = os.path.join(out_dir, record["file"])
-            actual = signature_of(actual_image)
-            ssim = structural_similarity(decode_luma(snap["luma16x9"]),
-                                         decode_luma(actual["luma16x9"]))
             matched = ssim >= threshold
+            # Report where in the window the best match came from. A snap that only matches at the
+            # edge of its window is a warning that the anchor is drifting and will fail outright
+            # once the drift exceeds the span.
             drift = record["actual_flip"] - flip
-            drift_note = "" if drift == 0 else f" (landed +{drift})"
+            drift_note = "" if drift == 0 else f" (matched {offset:+d}, landed {drift:+d})"
 
             if snap["verdict"] == "correct":
                 if matched:
@@ -473,6 +536,10 @@ def main():
     imp.add_argument("--dump")
     imp.add_argument("--timeout", type=int, default=900)
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
+    imp.add_argument("--flip-window", dest="flip_window", type=int, default=DEFAULT_FLIP_WINDOW,
+                     help="flips either side of each anchor to search (0 = exact anchor only)")
+    imp.add_argument("--window-samples", dest="window_samples", type=int,
+                     default=DEFAULT_WINDOW_SAMPLES, help="samples taken across the window")
     imp.set_defaults(func=cmd_import)
 
     chk = sub.add_parser("check", help="replay and compare")

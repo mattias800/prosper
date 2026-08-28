@@ -139,6 +139,8 @@ def main():
             dump = None
             timeout = 60
             min_ssim = snaps.DEFAULT_MIN_SSIM
+            flip_window = snaps.DEFAULT_FLIP_WINDOW
+            window_samples = snaps.DEFAULT_WINDOW_SAMPLES
 
         snaps.cmd_import(Args())
         entry = snaps.load_entry("unit")
@@ -176,6 +178,54 @@ def main():
         ref_sig = snaps.signature_of(os.path.join(refs, "unit", "0000.bmp"))
         check(ref_sig["luma16x9"] == promoted["luma16x9"],
               "accept moves the reference IMAGE too, so store and image cannot disagree")
+
+        # ---- 6b. The anchor window: samples either side, always including the anchor ----------
+        # Required, not defensive. A flip anchor is stable against rendering changes but drifts when
+        # the guest's own progress speeds up or slows down -- measured during development, an anchor
+        # that landed on the title screen on an idle machine landed on a still-black loading frame
+        # while builds were running, and reported a confident FAIL. Comparing only the exact flip
+        # makes the suite a measure of system load.
+        offsets = snaps.window_offsets(entry)
+        check(0 in offsets, "the exact anchor is always sampled")
+        check(min(offsets) < 0 < max(offsets), "the window looks both earlier and later")
+        check(len(offsets) >= 3, "the window takes several samples")
+        narrow = snaps.window_offsets({"flip_window": 0, "window_samples": 7})
+        check(narrow == [0], "a zero window degrades to exact-anchor matching")
+
+        candidates = snaps.candidate_flips(entry)
+        check(all(f >= 0 for f in candidates),
+              "no candidate flip is negative -- a flip before the origin does not exist")
+        for snap_entry in entry["snaps"]:
+            check(snap_entry["pad_flip"] in candidates,
+                  f"the anchor {snap_entry['pad_flip']} is itself always captured")
+
+        # ---- 6c. best_match picks the closest frame in the window, not the exact anchor -------
+        # The whole point: the authored frame is somewhere in the span, and which sample lands on it
+        # depends on how fast the machine happened to be.
+        win_dir = os.path.join(tmp, "win")
+        os.makedirs(win_dir, exist_ok=True)
+        target = next(s for s in entry["snaps"] if s["index"] == 0)
+        anchor = target["pad_flip"]
+        off = [o for o in snaps.window_offsets(entry) if o != 0][0]
+        # The exact anchor holds a black frame; a windowed sample holds the frame that was approved.
+        write_bmp(os.path.join(win_dir, "at.bmp"), 64, 36, lambda x, y: (0, 0, 0))
+        write_bmp(os.path.join(win_dir, "off.bmp"), 64, 36,
+                  lambda x, y: (x * 4 % 256, y * 7 % 256, (x + y) * 3 % 256))
+        windowed = {
+            anchor: {"target_flip": anchor, "actual_flip": anchor, "file": "at.bmp"},
+            anchor + off: {"target_flip": anchor + off, "actual_flip": anchor + off,
+                           "file": "off.bmp"},
+        }
+        # target currently holds the grey signature from arm 5; restore the gradient it was authored
+        # with so the window has something to find.
+        target.update(snaps.signature_of(os.path.join(capture, "a.bmp")))
+        found = snaps.best_match(target, entry, windowed, win_dir)
+        check(found is not None, "best_match finds a frame in the window")
+        score, record, _, matched_offset = found
+        check(matched_offset == off and record["file"] == "off.bmp",
+              "the windowed sample wins over a black frame sitting exactly on the anchor")
+        check(score >= snaps.DEFAULT_MIN_SSIM,
+              "...and it scores as a pass, where exact-anchor matching would have failed")
 
         # ---- 6. accept --verdict reclassifies a fixed known-bad frame -------------------------
         write_bmp(os.path.join(review, "unit-0001-actual.bmp"), 64, 36,
