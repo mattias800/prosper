@@ -41,6 +41,18 @@ from PIL import Image
 
 
 HP_BAR_MIN = 0.013
+
+# Measured class boundaries. These are what the thresholds above and in world_renders are checked
+# AGAINST by --selftest, so a retune that would drop a real frame or admit a collapse reddens
+# arithmetically rather than depending on a constructed frame landing exactly on a boundary.
+# Over 1,370 frames of four runs:
+FIELD_HP_MIN = 0.020097          # lowest HP-bar fraction among the 334 field frames
+NONFIELD_HP_MAX = 0.008860       # highest among every other frame
+# Over the 334 field frames, split by whether the world renders (143 / 191):
+RENDERED_MIN = (0.360, 207, 20.66)     # (usable, colours, sigma) minima of the rendered class
+# NOTE: the classes OVERLAP in every single dimension -- non-rendered frames reach usable 1.000,
+# 518 colours and sigma 125.90 -- so no one threshold separates them and only the conjunction does.
+# That is why world_renders ANDs three tests, and why each is pinned separately below.
 # The party block and the minimap disc, as fractions of the frame so they survive a resolution
 # change. Derived by eye from a 3840x2160 capture and pinned by --selftest.
 PARTY_BOX = (0.78, 0.77, 1.00, 1.00)
@@ -278,29 +290,25 @@ def selftest():
     box_area = (px[2] - px[0]) * (px[3] - px[1])
     # HARDCODED, not derived from PARTY_BOX. Deriving it reproduces the very circularity this case
     # exists to remove: widen the box and both the measurement and its expectation move together.
-    # 522x20 px inside the box PARTY_BOX describes at 3840x2160 is 10440 / 418624 = 0.024939.
-    frac_target = 0.024939
+    # _px truncates each edge independently, so at 3840x2160 PARTY_BOX is x 2995..3840, y 1663..2160
+    # = 845 x 497 = 419,965 px. A 522 x 20 bar is 10,440 / 419,965 = 0.0248592.
+    frac_target = 0.0248592
     p_field = save(field_frame(bar_px=(522, 20)))
     frac = hp_bar_fraction(p_field)
-    check(abs(frac - frac_target) < 0.002,
+    check(abs(frac - frac_target) < 0.0005,
           f"a fixed-size HP bar measures the area PARTY_BOX implies ({frac:.5f} vs "
           f"{frac_target:.5f}) -- moving or resizing the box moves this")
     check(in_field(p_field), "...and the frame classifies as field state")
 
-    # Both sides of the threshold, built at the REAL measured values so a retune in either
-    # direction reddens. 0.0201 is the field class; 0.008860 is the worst non-field frame across
-    # all four runs.
-    for name, target, want in (("the field class (0.0201)", 0.0201, True),
-                               ("the worst NON-field value (0.008860)", 0.008860, False)):
-        bw = 522
-        # Round UP. Rounding down builds the case just under the value it names, which is how the
-        # previous version left HP_BAR_MIN=0.00875 passing while it changed a published count.
-        bh = max(1, -(-int(target * box_area) // bw))
-        got = hp_bar_fraction(save(field_frame(bar_px=(bw, bh))))
-        # Build at or ABOVE the named value, never under it, or the case cannot pin the boundary.
-        check((got >= target * 0.99) and (in_field_frac(got) == want),
-              f"a bar at {name} classifies as {'field' if want else 'not field'} "
-              f"(measured {got:.5f})")
+    # Both sides of the threshold, asserted NUMERICALLY against the measured class boundaries.
+    # A constructed frame cannot do this reliably: the bar's height is an integer number of rows,
+    # so it lands beside the value it names rather than on it, and an earlier version rounded the
+    # UPPER case up to 0.021133 against a real class minimum of 0.020097 -- leaving a 5% band in
+    # which HP_BAR_MIN passed the selftest while taking run3 from 144 field frames to 5.
+    check(HP_BAR_MIN > NONFIELD_HP_MAX,
+          f"HP_BAR_MIN ({HP_BAR_MIN}) excludes the worst non-field frame ({NONFIELD_HP_MAX})")
+    check(HP_BAR_MIN <= FIELD_HP_MIN,
+          f"HP_BAR_MIN ({HP_BAR_MIN}) admits the faintest real field frame ({FIELD_HP_MIN})")
 
     # ---- collapses -----------------------------------------------------------------------
     check(not in_field(save(np.full((h, w, 3), 255, np.uint8))), "a blown-white collapse is not field")
@@ -328,25 +336,52 @@ def selftest():
     faintish = (128 + (rng.random((h, w, 3)) * 6 - 3)).astype(np.uint8)
     check(not world_renders(save(faintish)), "a nearly uniform mid-grey world does not")
 
-    # BETWEEN the thresholds, so tightening either one reddens. A real frame is not saturated in
-    # usable-range nor unlimited in colour: this one is ~0.6 usable with ~700 colours.
-    mid = np.zeros((h, w, 3), np.uint8)
-    mtiles = (rng.random((28, 28, 3)) * 170 + 40).astype(np.uint8)
-    mid[:] = np.repeat(np.repeat(mtiles, h // 28 + 1, axis=0), w // 28 + 1, axis=1)[:h, :w]
-    mid[: int(h * 0.35)] = 255                      # a blown band drags usable down to ~0.6
-    u_mid = np.asarray(Image.fromarray(mid).crop(_px(WORLD_BOX, (w, h))).resize((256, 144)))
-    lum_mid = u_mid.reshape(-1, 3).mean(axis=1)
-    check(world_renders(save(mid)),
-          f"a partly-blown world still reads as rendered "
-          f"(usable {float(((lum_mid > 25) & (lum_mid < 245)).mean()):.2f}, "
-          f"colours {len(np.unique(u_mid.reshape(-1, 3) // 8, axis=0))}) -- pins BOTH thresholds "
-          f"from the loose side")
+    # Upper side, numerically: each threshold must sit BELOW the rendered class's minimum, or it
+    # drops real frames. Tightening any one of them past its measured minimum reddens here.
+    for i, (nm, thr) in enumerate((("usable", 0.30), ("colours", 200), ("sigma", 20))):
+        check(thr < RENDERED_MIN[i],
+              f"world_renders' {nm} threshold ({thr}) sits below the rendered class minimum "
+              f"({RENDERED_MIN[i]})")
 
-    # WORLD_BOX itself: a frame whose WORLD region is a scene and whose HUD corners are flat. If the
-    # box moves onto the HUD, this stops reading as rendered.
-    # HARDCODED region, NOT _px(WORLD_BOX, ...). Painting the scene into the box under test moves
-    # the control with the box and the case can never fail -- the same circularity PARTY_BOX had.
-    # These are the pixels WORLD_BOX describes at 3840x2160: x 691..3148, y 108..1555.
+    # Lower side: one frame per threshold, built to SATISFY THE OTHER TWO and fail only the one
+    # under test. Without this a threshold can be lowered freely -- the previous cases left
+    # `usable` and `sigma` with no lower pin at all, because every frame that was meant to test
+    # them was actually being rejected by the colour count.
+    def world_frame(usable_target=1.0, blocks=48, contrast=200, luma_flat=False):
+        """A world region with one statistic dialled down and the other two satisfied.
+
+        `luma_flat` is how the sigma case is built: per-channel noise around mid-grey gives many
+        distinct quantised colours while the channel variations largely cancel in luma, so the
+        colour count stays high and the luma standard deviation stays low. Without that trick the
+        two are coupled -- every low-contrast frame is also low-colour, and the case would be
+        rejected by the colour test rather than by the one it means to exercise.
+        """
+        if luma_flat:
+            t = (128 + (rng.random((blocks, blocks, 3)) * 2 - 1) * 36).astype(np.uint8)
+        else:
+            t = (rng.random((blocks, blocks, 3)) * contrast + 25).astype(np.uint8)
+        f = np.repeat(np.repeat(t, h // blocks + 1, axis=0),
+                      w // blocks + 1, axis=1)[:h, :w].copy()
+        if usable_target < 1.0:                     # blow a band to white to drive usable down
+            wx = _px(WORLD_BOX, (w, h))
+            span = wx[3] - wx[1]
+            f[wx[1]:wx[1] + int(span * (1.0 - usable_target))] = 255
+        return f
+
+    # usable ~0.25, colours and sigma satisfied
+    check(not world_renders(save(world_frame(usable_target=0.25))),
+          "a world below the usable threshold is rejected even with colours and sigma satisfied")
+    # colours ~110, usable and sigma satisfied
+    check(not world_renders(save(world_frame(blocks=6))),
+          "a world below the colour threshold is rejected even with usable and sigma satisfied")
+    # sigma ~13.7 with ~905 colours, usable satisfied
+    check(not world_renders(save(world_frame(luma_flat=True))),
+          "a world below the sigma threshold is rejected even with usable and colours satisfied")
+
+    # WORLD_BOX's POSITION: a frame whose world region holds a scene and whose surroundings are
+    # flat. The painted region is HARDCODED, never _px(WORLD_BOX, ...) -- painting into the box
+    # under test moves the control with the box and the case can never fail. These are the pixels
+    # WORLD_BOX describes at 3840x2160: x 691..3148, y 108..1555.
     split = np.zeros((h, w, 3), np.uint8)
     split[:] = (10, 10, 10)
     split[108:1555, 691:3148] = scene[108:1555, 691:3148]
@@ -392,6 +427,60 @@ def in_field_frac(frac):
     return frac >= HP_BAR_MIN
 
 
+def run_mutants():
+    """Apply every mutation in mutants.txt to a copy and require --selftest to redden.
+
+    The point is that the claim "every threshold reddens under mutation" becomes re-runnable rather
+    than something a reader has to take on trust or rebuild from scratch. The NO-OP entry is the
+    control: if it reddens too, the harness is failing for some unrelated reason and the whole run
+    is void, not passing.
+    """
+    import subprocess, tempfile, shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    listing = os.path.join(here, "mutants.txt")
+    src = open(os.path.join(here, "classify_field.py"), encoding="utf-8").read()
+    rows = []
+    for raw in open(listing, encoding="utf-8"):
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        noop = line.startswith("NO-OP")
+        if noop:
+            line = line[len("NO-OP"):]
+        pat, _, rep = line.partition(" => ")
+        rows.append((pat, rep, noop))
+
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for pat, rep, noop in rows:
+            lines = src.split("\n")
+            hit = False
+            for i, l in enumerate(lines):
+                if l.startswith(pat):
+                    lines[i] = l.replace(pat, rep, 1)
+                    hit = True
+                    break
+            if not hit:
+                print(f"  MISSING  pattern not at a line start: {pat[:60]}")
+                failures += 1
+                continue
+            path = os.path.join(tmp, "classify_field.py")
+            open(path, "w", encoding="utf-8").write("\n".join(lines))
+            proc = subprocess.run([sys.executable, path, "selftest"],
+                                  capture_output=True, text=True)
+            reddened = proc.returncode != 0
+            want = not noop
+            ok = reddened == want
+            label = "NO-OP" if noop else "     "
+            print(f"  {'ok  ' if ok else 'FAIL'} {label} {'reddens' if reddened else 'stays green'}"
+                  f"  <- {rep.strip()[:70]}")
+            if not ok:
+                failures += 1
+    print(f"\n  {len(rows)} mutations, {failures} unexpected"
+          + ("  == mutants PASS ==" if not failures else "  == mutants FAIL =="))
+    return 0 if failures == 0 else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -413,6 +502,9 @@ def main():
     s.set_defaults(func=cmd_locomotion)
     s = sub.add_parser("selftest")
     s.set_defaults(func=lambda a: selftest())
+    s = sub.add_parser("mutants",
+                       help="apply each mutation in mutants.txt and require the selftest to redden")
+    s.set_defaults(func=lambda a: run_mutants())
     args = ap.parse_args()
     if not getattr(args, "func", None):
         ap.print_help()

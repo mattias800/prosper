@@ -16,7 +16,8 @@ Two things to know before trusting an answer, both learned the hard way on PPSA1
 1. **A collapsed WHITE present has no dark rows, so it reads as "no bars" — i.e. as gameplay.**
    The first version of this guarded only against darkness and reported 61 un-barred world frames
    on a run that never left its cutscene; every one was blown to RGB(255,255,255). Guarding one
-   end of the range catches half the failure and INVERTS the other half. Hence `collapsed()`, which measures structure rather than colour count.
+   end of the range catches half the failure and INVERTS the other half. Hence `collapsed()`, which ORs a structure floor with a colour count -- each alone has a
+   measured hole, and the two holes are different frames of the same failure.
 
 2. **Absence of bars is not presence of gameplay.** A menu has no bars either, so pair this with a
    positive per-title test. But do not assume `--require-hud-corners` is that test: on the title it

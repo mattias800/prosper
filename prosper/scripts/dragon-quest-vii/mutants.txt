@@ -1,0 +1,40 @@
+# Mutation list for classify_field.py --selftest, one per line:
+#     <line-start pattern> => <replacement>
+#
+# Committed because "every threshold reddens under mutation" is a claim about the selftest, and a
+# claim nobody can re-run is exactly what three review rounds kept finding wrong here. Run with:
+#     python3 classify_field.py mutants
+# Every line must redden the selftest. The NO-OP line must NOT -- it proves the harness can return
+# green, without which a run of all-red would prove nothing.
+#
+# Match is on a LINE START. A plain substring replace mutates the module docstring instead of the
+# code, which is how an earlier sweep reported HP_BAR_MIN as pinned when it was not.
+
+HP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.0205
+HP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.0210
+HP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.0201
+HP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.03
+HP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.00875
+PARTY_BOX = (0.78, 0.77, 1.00, 1.00) => PARTY_BOX = (0.60, 0.77, 1.00, 1.00)
+PARTY_BOX = (0.78, 0.77, 1.00, 1.00) => PARTY_BOX = (0.0, 0.0, 0.22, 0.23)
+PARTY_BOX = (0.78, 0.77, 1.00, 1.00) => PARTY_BOX = (0.90, 0.90, 1.00, 1.00)
+MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.0, 0.60, 0.40, 1.00)
+MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.5, 0.5, 0.7, 0.7)
+WORLD_BOX = (0.18, 0.05, 0.82, 0.72) => WORLD_BOX = (0.78, 0.77, 1.00, 1.00)
+WORLD_BOX = (0.18, 0.05, 0.82, 0.72) => WORLD_BOX = (0.0, 0.0, 1.0, 1.0)
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.95 and colours > 200 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.30 and colours > 1000 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.30 and colours > 5 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.30 and colours > 200 and sigma > 40
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.05 and colours > 200 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return True
+    return usable > 0.30 and colours > 200 and sigma > 20 =>    return False
+    return float(np.mean(np.abs(region(path_a) - region(path_b)))) =>    return float(np.mean(region(path_a) - region(path_b)))
+def minimap_change(path_a, path_b, box, size=128, disc=0.44): => def minimap_change(path_a, path_b, box, size=128, disc=0.99):
+def minimap_change(path_a, path_b, box, size=128, disc=0.44): => def minimap_change(path_a, path_b, box, size=16, disc=0.44):
+    return hp_bar_fraction(path) >= HP_BAR_MIN =>     return True
+# A SAFE retune: 0.0095 sits between the worst non-field frame (0.008860) and the faintest field
+# frame (0.020097), so it changes no published number and must NOT redden. A selftest that fires on
+# harmless changes is as useless as one that misses harmful ones.
+NO-OPHP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.0095
+NO-OP    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2] =>     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]  # noqa

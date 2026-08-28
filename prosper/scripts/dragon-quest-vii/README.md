@@ -147,9 +147,10 @@ python3 scripts/dragon-quest-vii/classify_field.py selftest
 
 It keys on the party block's **HP bar** and nothing else. A generic corner test fails in both
 directions here (a torn-composite cutscene's saturated water passes it; a flat blue collapse scores
-1.00 while containing nothing), a cinematic-bar veto measured a no-op across all four runs while
-rejecting nine genuine field frames when tight, and a brightness floor is inverted because field
-frames are dark precisely because they are HUD over an unrendered world.
+1.00 while containing nothing), a cinematic-bar veto is a no-op only above a bar threshold of
+~0.052 — at the 0.04 it shipped with it rejected nine genuine field frames (run 4: 190 → 181) whose
+world had collapsed to black — and a brightness floor is inverted, because field frames are dark
+precisely because they are HUD over an unrendered world.
 
 This route delivers **only Cross**, so it establishes the field state. Locomotion is measured by
 `probe-locomotion.pad` — see below.

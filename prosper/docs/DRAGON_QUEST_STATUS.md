@@ -488,7 +488,8 @@ current build.
   ch4..ch7 hold only a ~1e-9 residue, and **ch3 and ch8..ch11 are exactly zero**. So the title
   writes a stereo mix into a 12-channel container and never writes ch3 or ch8..ch11 at all — the
   LFE and height positions under the assumed order, so this describes which INDICES are dead
-  without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
+  without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate
+  +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
   the surround tier pairs even=left / odd=right; ch2 correlates near-equally with both groups
   (centre-like). Reproduced identically on a second independent 150 s run.
   **The 8-channel port (ctx1/port2) is exactly zero — and that is the GUEST's silence, not
@@ -516,7 +517,8 @@ current build.
   elsewhere that those are different findings. A left/right swap
   is inaudible without a reference in any case. Do not cite the listening test as layout evidence.
 - **Historical pre-fix measurement**, with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) on a
-  `reach-title-screen.pad` run of the direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN
+  `reach-title-screen.pad` run of the direct SDL3 frontend. The title creates **two** AudioOut2
+  contexts, each with one MAIN
   (`type=0x0`) port, and they carry opposite content. All figures below are the never-reset `LIFE:`
   run totals from the **final report line of a single run**, not summed interval samples:
 
@@ -541,7 +543,8 @@ current build.
 - **A declared channel count is not a description of the content.** The `0xc00` decode and the
   `2,310,144 B/s` figure above are both *derived from the same channel count*, so neither
   corroborates it, and "12 channels" reads as "a 7.1.4 bed with height" when the measured bed is
-  stereo with ten of its twelve channels carrying nothing audible. Measure the channels before designing a fold for them; see
+  stereo with ten of its twelve channels carrying nothing audible. Measure the channels before
+  designing a fold for them; see
   instrument-trap 43.
 - **Read the `LIFE:` totals, not a single interval.** This finding was initially called the opposite
   ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.
@@ -760,13 +763,18 @@ forbidding it.
   distance from a threshold to the nearest real frame is not margin — it is bounded by whichever
   collapse sits just under the line.
 
-The HP bar separates **0.0201 from 0.008860 across 1,370 frames** of four runs. `--selftest` pins
-`HP_BAR_MIN` from both sides, `PARTY_BOX` and `MINIMAP_BOX` in position **and extent**, all three
-`world_renders` thresholds from both sides, `WORLD_BOX`, and `minimap_change`'s disc mask, sampling
-size and absolute value — 13 mutations, every one reddening, with a no-op edit as the control that
-stays green. Controls are drawn at fixed pixel positions and sizes with the expected value
-**hardcoded**: deriving it from the box under test is what made three earlier versions of this
-selftest incapable of failing.
+The HP bar separates **0.0201 from 0.008860 across 1,370 frames** of four runs.
+
+**The selftest's coverage is itself re-runnable**, which is the only form of this claim worth
+making: `scripts/dragon-quest-vii/mutants.txt` lists every mutation and
+`classify_field.py mutants` applies each one and requires the selftest to redden. 25 entries — 23
+harmful mutations that must redden, and 2 controls that must not (a no-op edit, and a *safe*
+`HP_BAR_MIN` retune inside the measured band, because a selftest that cries wolf is as useless as
+one that misses). Thresholds are asserted numerically against measured class boundaries rather than
+against constructed frames, because a frame lands *beside* the value it names — that rounding left a
+5% band in which `HP_BAR_MIN` passed while destroying the headline. Box controls are drawn at fixed
+pixel positions with the expected value **hardcoded**; deriving it from the box under test is what
+made three earlier versions of this selftest incapable of failing.
 
 ## Ruled out — eliminated, do not re-run these
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
@@ -787,14 +795,17 @@ selftest incapable of failing.
   left its cutscene, every one RGB(255,255,255). A *colour-count* guard then still missed this
   title's dominant collapse — flat blue with a magenta speckle, 18 distinct colours across a full
   8.3 MP frame. What separates all of them is **structure** rather than brightness or colour count — but the
-  margin is narrow and worth stating honestly: over run 3's field phase the field frames run
-  sigma 14.67 (min) / 33.11 (median) / 115.15 (max) against a worst collapse of 11.71, so the
-  12.0 floor has about **3 units** of room, not the order of magnitude an earlier draft of this
-  line claimed. A brightness floor is worse still and actively inverted: real HUD-over-dark frames
+  gap between a threshold and the nearest real frame is **not** a margin, and this title shows why:
+  a genuine collapse (run 3 frame 188 — three distinct colours, nothing rendered) measures sigma
+  **13.14** and sits *over* a 12.0 floor, while its neighbour 195 measures 11.56 and is caught. The
+  closest sub-floor non-field frame across runs 3 and 4 is 11.95, i.e. 0.05 units away. (An earlier
+  draft quoted "3 units of room" from a frame at t=480 s, which is not even in the field phase.) A
+  brightness floor is worse still and actively inverted: real HUD-over-dark frames
   measure 8.26-8.9 against a default floor of 8.0, with 73 of 144 within 1.0 of it, while the blue
   garbage measures 29.7-31.9. That narrowness is why the per-title classifier
   (`scripts/dragon-quest-vii/classify_field.py`) keys on the **HP bar** instead, which separates by
-  ~1.5x on both sides and does not consult a collapse test at all. And absence of bars is not presence of gameplay in any case: a MENU has none either.
+  ~1.5x on both sides and does not consult a collapse test at all. And absence of bars is not
+  presence of gameplay in any case: a MENU has none either.
   #1874.
 
 
