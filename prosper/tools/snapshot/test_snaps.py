@@ -227,6 +227,17 @@ def main():
         check(score >= snaps.DEFAULT_MIN_SSIM,
               "...and it scores as a pass, where exact-anchor matching would have failed")
 
+        # ---- 6d. An edge match is detectable, because that is how "the window is too narrow"
+        # is told apart from "the picture changed" ----------------------------------------------
+        edge_entry = {"flip_window": 600, "window_samples": 7}
+        edge_offsets = snaps.window_offsets(edge_entry)
+        check(max(edge_offsets) == 600 and min(edge_offsets) == -600,
+              "the window reaches exactly the configured span at its edges")
+        check(abs(edge_offsets[0]) >= edge_entry["flip_window"],
+              "an outermost sample is recognisable as an edge match")
+        check(abs(edge_offsets[len(edge_offsets) // 2]) < edge_entry["flip_window"],
+              "a central sample is not mistaken for one")
+
         # ---- 6. accept --verdict reclassifies a fixed known-bad frame -------------------------
         write_bmp(os.path.join(review, "unit-0001-actual.bmp"), 64, 36,
                   lambda x, y: (x * 4 % 256, y * 7 % 256, (x + y) * 3 % 256))

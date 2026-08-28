@@ -77,7 +77,7 @@ DEFAULT_MIN_SSIM = 0.85
 # still-black loading frame while builds and CI were running, and reported a confident FAIL with
 # "colors 14446 -> 1". Comparing only the exact flip makes the suite fail for reasons that have
 # nothing to do with the renderer, which is the failure this whole design exists to remove.
-DEFAULT_FLIP_WINDOW = 600
+DEFAULT_FLIP_WINDOW = 900
 DEFAULT_WINDOW_SAMPLES = 7
 
 
@@ -432,6 +432,13 @@ def cmd_check(args):
                     failures += 1
                 continue
             ssim, record, actual, offset = found
+            # A best match sitting on the EDGE of the window is the signature of an anchor that has
+            # drifted out of range, not of a rendering change -- and without saying so the failure
+            # is indistinguishable from a real regression. Measured case: Blue Prince's boot reached
+            # the title screen ~600-1100 flips later under machine load, and the edge match was the
+            # only visible tell.
+            span = entry.get("flip_window", DEFAULT_FLIP_WINDOW)
+            at_edge = span > 0 and abs(offset) >= span
             actual_image = os.path.join(out_dir, record["file"])
             matched = ssim >= threshold
             # Report where in the window the best match came from. A snap that only matches at the
@@ -446,6 +453,11 @@ def cmd_check(args):
                 else:
                     failures += 1
                     print(f"{label}  FAIL  ssim {ssim:.3f} < {threshold}{drift_note}")
+                    if at_edge:
+                        print(f"    NOTE: the best match is at the EDGE of the +/-{span} flip "
+                              f"window, so the anchor may simply have drifted out of range rather "
+                              f"than the picture having changed. Re-import with a wider "
+                              f"--flip-window before treating this as a regression.")
                     _retain(review, name, snap, actual_image, actual)
             else:
                 if matched:
