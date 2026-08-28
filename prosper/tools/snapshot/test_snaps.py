@@ -16,6 +16,7 @@ reports a confident wrong answer is worse than one that errors:
 """
 
 import json
+import shutil
 import os
 import struct
 import subprocess
@@ -159,6 +160,42 @@ def main():
         check(os.path.exists(os.path.join(refs, "unit", "0000.bmp")),
               "the reference image is kept locally for later A/B review")
 
+        # ---- 4b. import takes its parameters from the SESSION, not from its own defaults -------
+        # --det-fps is a separate argument on `author` and on `import`, each defaulting to 60. Author
+        # at 30, import without the flag, and the entry recorded 60 -- so both halves then paced at
+        # 60 against a session a person actually played at 30. Nothing failed loudly; the anchors
+        # just moved. cmd_author now writes session.json and cmd_import prefers it.
+        cap2 = os.path.join(tmp, "cap2")
+        os.makedirs(cap2)
+        shutil.copyfile(os.path.join(capture, "route.pad"), os.path.join(cap2, "route.pad"))
+        write_bmp(os.path.join(cap2, "snap_0000_correct_f900.bmp"), 64, 36,
+                  lambda x, y: (x * 4 % 256, y * 7 % 256, 90))
+        with open(os.path.join(cap2, "snaps.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "index": 0, "verdict": "correct", "mode": "anchor", "pad_flip": 900,
+                "guest_present": 900, "width": 64, "height": 36,
+                "file": "snap_0000_correct_f900.bmp", "title_id": "PPSATEST"}) + "\n")
+        with open(os.path.join(cap2, "session.json"), "w", encoding="utf-8") as handle:
+            json.dump({"det_fps": 30, "det_clock": "off", "savedata": "fresh",
+                       "name": "unit2"}, handle)
+
+        class Args2(Args):
+            capture_dir = cap2
+            name = "unit2"
+            det_fps = snaps.DEFAULT_DET_FPS      # the CLI default, NOT what was authored
+            det_clock = "on"                     # ditto
+
+        snaps.cmd_import(Args2())
+        authored = snaps.load_entry("unit2")
+        check(authored["det_fps"] == 30,
+              "import records the rate the session was AUTHORED at, not its own default")
+        check(authored["det_clock"] == "off",
+              "...and the clock stance the session was authored under")
+        # The whole point is that both halves then agree.
+        env2 = snaps.replay_env(authored, tmp, base={})
+        check(env2["PROSPER_FLIP_PACE_FPS"] == "30",
+              "so the check paces at the rate the person actually played at")
+
         # ---- 5. accept: store AND reference image move together -------------------------------
         # If only one moved, the next failure would show an "expected" image that does not
         # correspond to the signature that failed -- misleading exactly when trust matters most.
@@ -222,12 +259,52 @@ def main():
         # never recorded under. Measured when this was wrong: all four alexkidd snaps failed, with
         # colour counts collapsing 14548 -> 108, because the flip-anchored ROUTE diverged rather than
         # the anchors merely drifting.
+        #
+        # These arms CALL snaps.clock_enabled rather than restating `.get(..., "on")`. An earlier
+        # version of this block asserted `legacy.get("det_clock", "on") == "on"` -- which is
+        # "on" == "on", passes with the bug reinstated, and printed a message claiming otherwise.
         legacy = {"det_fps": 60}                       # no det_clock key, as pre-4bf1c80c sets have
-        check(legacy.get("det_clock", "on") == "on",
+        check(snaps.clock_enabled(legacy) is True,
               "a set with no det_clock key reads as CLOCK ON, not as the new author default")
-        explicit_off = {"det_clock": "off"}
-        check(explicit_off.get("det_clock", "on") == "off",
+        check(snaps.clock_enabled({"det_clock": "off"}) is False,
               "...while a set that explicitly says off is still honoured")
+        check(snaps.clock_enabled({"det_clock": "on"}) is True, "...and one that says on is too")
+
+        # ---- 6a1b-ii. BOTH halves pace, at the SAME rate -----------------------------------
+        # This is the mechanism that lets the clock stay off, and until now nothing tested it at all.
+        # Routes are flip-anchored, so flip N is a fixed moment in the game only if flips happen at a
+        # fixed RATE; if one side paces and the other does not, presses land at different guest times
+        # and the route diverges. Assert against the real environment builder, not a restatement.
+        paced = snaps.replay_env({"det_fps": 60, "route": "r.pad", "snaps": [],
+                                  "savedata": "none"}, tmp, base={})
+        check(paced.get("PROSPER_FLIP_PACE_FPS") == "60",
+              "the CHECK paces its flips -- without this a flip-anchored route diverges")
+        check(paced.get("PROSPER_DET_CLOCK") == "1",
+              "...and a legacy entry with no det_clock key still replays with the clock pinned")
+
+        modern = snaps.replay_env({"det_fps": 60, "det_clock": "off", "route": "r.pad",
+                                   "snaps": [], "savedata": "none"}, tmp, base={})
+        check(modern.get("PROSPER_FLIP_PACE_FPS") == "60",
+              "a clock-off entry paces too -- pacing is what REPLACED the clock, not a companion "
+              "to it")
+        check("PROSPER_DET_CLOCK" not in modern, "...while its clock stays off")
+
+        # The rate both halves use has to come from one place, or a non-default authoring rate
+        # silently replays at 60.
+        slow = snaps.replay_env({"det_fps": 30, "det_clock": "off", "route": "r.pad",
+                                 "snaps": [], "savedata": "none"}, tmp, base={})
+        check(slow.get("PROSPER_FLIP_PACE_FPS") == "30",
+              "the pace rate is read from the entry, not hardcoded")
+        check(snaps.pace_fps({}) == snaps.DEFAULT_DET_FPS,
+              "an entry with no det_fps falls back to the documented default")
+
+        # An inherited pace from the authoring shell must not survive into a run that specifies its
+        # own -- same leak the clock arm above guards.
+        leaked_pace = snaps.replay_env({"det_fps": 30, "route": "r.pad", "snaps": [],
+                                        "savedata": "none"}, tmp,
+                                       base={"PROSPER_FLIP_PACE_FPS": "144"})
+        check(leaked_pace.get("PROSPER_FLIP_PACE_FPS") == "30",
+              "an inherited pace rate is OVERRIDDEN by the entry's own")
 
         # ---- 6a1c. The scan window never exceeds its configured span ------------------------
         # `step` floors at 1, so a sample count larger than the span used to walk past `forward`.
@@ -239,6 +316,16 @@ def main():
         wide = snaps.scan_offsets({})
         check(max(wide) <= snaps.DEFAULT_SCAN_FORWARD and min(wide) >= -snaps.DEFAULT_SCAN_BACK,
               "the DEFAULTS stay inside their own span (nothing else exercises them)")
+        # A negative bound turns the clamp from a limit into a filter that drops EVERY offset,
+        # anchor included, and the snap then reports NOT REACHED with nothing pointing at the store.
+        # Only reachable from a hand-edited set (neither key has a flag), which is why it needs a
+        # test rather than validation at the CLI.
+        for broken in ({"scan_forward": 100, "scan_back": -200},
+                       {"scan_forward": -10, "scan_back": -10},
+                       {"scan_forward": -5}, {"scan_back": -5}):
+            got = snaps.scan_offsets(broken)
+            check(len(got) > 0 and 0 in got,
+                  f"a negative span still yields the anchor rather than an empty sweep: {broken}")
 
         # ---- 6a2. Both save roots are isolated, not just one -------------------------------
         # A title with a save offers "Continue" ABOVE "New Game", so the same D-pad inputs select a
@@ -340,8 +427,10 @@ def main():
         pos = sorted(o for o in sc if o > 0)
         gaps = [b - a for a, b in zip(pos, pos[1:])]
         check(max(gaps) - min(gaps) <= 2, "scan sampling is uniform across the span")
-        # And an unbounded scan is NOT what this is: a recurring scene would otherwise match its
-        # first occurrence anywhere in the run.
+        # The span is bounded so a check cannot run for an unbounded time. It is NOT bounded to stop
+        # a recurring scene matching the wrong occurrence -- best_match takes the BEST score in the
+        # span rather than the first, so a repeat inside the span is resolved by score, not by
+        # position. (That reasoning was in an earlier draft and is retracted.)
         check(max(sc) <= scan_entry["scan_forward"] + 1, "a scan is bounded by its forward span")
 
         # ---- 6d. An edge match is detectable, because that is how "the window is too narrow"

@@ -262,7 +262,17 @@ def list_names():
 # PROSPER_DET_CLOCK makes the guest see exactly 1/DET_FPS seconds per flip, so a three-second logo
 # always costs the same number of flips however fast the host renders. That turns "the same flip" into
 # "the same guest time", which is the property flip anchoring assumes and otherwise does not have.
-# The deterministic clock is now OFF by default, and the pacer with it.
+# The deterministic clock is now OFF by default. The FLIP PACER is not -- it runs unconditionally on
+# both sides, and it is what replaced the clock. Pacing buys the same "same flip = same guest time"
+# correspondence honestly: the guest keeps a real clock and simply flips at a fixed rate, the way a
+# vsync-locked console does, so nothing has to lie to it about what time it is.
+#
+# PRECONDITION, and it is a real one: pacing can only ever SLOW a fast host down. flip_pace_wait()
+# sleeps when it is ahead of schedule and re-anchors when it is behind, so on any title/host that
+# cannot SUSTAIN det_fps the pacer is inert and the drift this section describes comes straight back.
+# Vsync has the same shape -- it caps a maximum, it does not guarantee a rate. Blue Prince measured
+# 180 fps windowed at its menu, 20 in gameplay and 4.8 during its FMV; the last two are below any
+# sane det_fps, so its post-FMV anchors need SCAN mode rather than pacing to be found.
 #
 # Both existed to stop anchors drifting when the host renders at a different rate than it did during
 # authoring. They bought that at a real cost: PROSPER_DET_CLOCK replaces EVERY time source the guest
@@ -306,6 +316,42 @@ def apply_deterministic_clock(env, det_fps, enabled=False):
         return
     env["PROSPER_DET_CLOCK"] = "1"
     env["PROSPER_DET_FPS"] = str(det_fps)
+
+
+def clock_enabled(entry):
+    """Does this stored set replay with the guest clock pinned?
+
+    The fallback is "on" while the author/import CLI default is "off", and that asymmetry is the
+    point: this can only ever apply to a set stored before the key existed, and there was no way to
+    author one of those with the clock off -- cmd_author applied it unconditionally until 4bf1c80c.
+    """
+    return entry.get("det_clock", "on") == "on"
+
+
+def pace_fps(entry):
+    """The flip rate BOTH halves must agree on. Written by cmd_import for every new set."""
+    return entry.get("det_fps", DEFAULT_DET_FPS)
+
+
+def replay_env(entry, out_dir, base=None):
+    """The environment a check run replays under. Extracted so it can be asserted directly."""
+    env = dict(os.environ if base is None else base)
+    # Pace the CHECK's flips to the rate the session was authored at. This is what lets the clock
+    # stay off: routes are FLIP-anchored, so flip N is a fixed moment in the game only if flips
+    # happen at a fixed RATE.
+    env["PROSPER_FLIP_PACE_FPS"] = str(pace_fps(entry))
+    apply_deterministic_clock(env, pace_fps(entry), clock_enabled(entry))
+    if entry.get("savedata", "fresh") == "fresh":
+        apply_fresh_savedata(env, out_dir)
+    env.update({
+        "SDL_VIDEODRIVER": "offscreen",
+        "PROSPER_RENDER": "1",
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_SNAP_DIR": out_dir,
+        "PROSPER_SNAP_AT_FLIPS": ",".join(str(f) for f in sorted(candidate_flips(entry))),
+        "PROSPER_PAD_SCRIPT": "@" + os.path.join(REPO_ROOT, entry["route"]),
+    })
+    return env
 
 
 def apply_fresh_savedata(env, root):
@@ -370,19 +416,20 @@ def cmd_author(args):
         "PROSPER_PAD_RECORD": route,
     })
     apply_deterministic_clock(env, args.det_fps, args.det_clock == "on")
-    # Pace the guest flips to the SAME rate the clock advances at, so guest time equals real time
-    # while you play. Without this the deterministic clock makes the game speed track the render
-    # rate -- measured on one authoring session: 3.1x during splash screens, 0.47x in a heavy scene,
-    # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
-    # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
-    # Pace the flips whether or not the clock is pinned: the check paces too, and the two must agree
-    # or a flip-anchored route lands at a different guest time on each side.
+    # Pace the guest flips, whether or not the clock is pinned. Two independent reasons:
+    #
+    #   While authoring, it is what makes the game run at the speed a person can judge. With the
+    #   clock pinned and flips unpaced, guest time tracks the RENDER rate -- measured on one
+    #   session: 3.1x during splash screens, 0.47x in a heavy scene, mean 1.58x.
+    #
+    #   For the check, it is what lets the clock stay off at all. The check paces too (replay_env),
+    #   and the two sides must agree: a flip-anchored route replayed at a different flip rate lands
+    #   its presses at different guest times.
     env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
     if args.det_clock == "on":
-        # With the clock pinned, pacing ALSO compensates for it: with it on, guest time runs at
-        # host_fps/DET_FPS, so the game plays fast or slow unless the flip rate matches. With the
-        # clock off the game is deltaTime driven and already runs at real speed, so pacing would only
-        # cap the frame rate for no benefit.
+        # With the clock pinned, pacing does a SECOND job on top of anchoring: guest time then runs
+        # at host_fps/DET_FPS, so the game plays fast or slow unless the flip rate matches. That is
+        # the extra reason to pace here -- not the only one. Pacing happens either way.
         print(f"  guest clock: PINNED at {args.det_fps} fps, flips paced to match. This replaces "
               f"every guest time source; some titles break (GRIS).")
     else:
@@ -399,6 +446,14 @@ def cmd_author(args):
               "            different item. Only use this deliberately.")
     # Deliberately NOT offscreen: authoring is a person looking at a window.
     env.pop("SDL_VIDEODRIVER", None)
+
+    # Record the parameters this session is being authored under, so `import` does not have to be
+    # told them again. --det-fps is a separate argument on both subcommands, each defaulting to 60:
+    # authoring at 30 and importing without the flag used to record 60, and BOTH halves would then
+    # pace at 60 against a session played at 30. Nothing failed loudly; the anchors just moved.
+    with open(os.path.join(out_dir, "session.json"), "w", encoding="utf-8") as handle:
+        json.dump({"det_fps": args.det_fps, "det_clock": args.det_clock,
+                   "savedata": args.savedata, "name": args.name}, handle, indent=2)
 
     print(f"authoring '{args.name}' -> {out_dir}")
     print("  F6 = this frame looks CORRECT     F7 = this frame looks WRONG")
@@ -424,6 +479,13 @@ def cmd_author(args):
 # import
 # ---------------------------------------------------------------------------------------------
 
+def _flag_was_passed(key):
+    """True if --key appears in argv. argparse cannot distinguish a default from an explicit value,
+    and here the difference decides whether the stored session or the command line wins."""
+    flag = "--" + key.replace("_", "-")
+    return any(a == flag or a.startswith(flag + "=") for a in sys.argv[1:])
+
+
 def cmd_import(args):
     manifest = os.path.join(args.capture_dir, "snaps.jsonl")
     if not os.path.exists(manifest):
@@ -448,6 +510,23 @@ def cmd_import(args):
               f"first pad poll, so it has no replay anchor")
     if not usable:
         raise SystemExit("snaps: every snap in this session was unanchored; nothing to import")
+
+    # Prefer what the session was actually authored under. An explicitly passed flag still wins, so
+    # a deliberate override remains possible; what this removes is the SILENT disagreement.
+    session = {}
+    session_path = os.path.join(args.capture_dir, "session.json")
+    if os.path.exists(session_path):
+        try:
+            with open(session_path, "r", encoding="utf-8") as handle:
+                session = json.load(handle)
+        except (OSError, ValueError) as exc:
+            print(f"  note: {session_path} unreadable ({exc}); falling back to the command line")
+    for key in ("det_fps", "det_clock", "savedata"):
+        if key in session and not _flag_was_passed(key):
+            if getattr(args, key) != session[key]:
+                print(f"  {key}: using {session[key]!r} from the authoring session "
+                      f"(command-line default was {getattr(args, key)!r})")
+            setattr(args, key, session[key])
 
     route_src = args.route or os.path.join(args.capture_dir, "route.pad")
     if not os.path.exists(route_src):
@@ -528,8 +607,13 @@ def scan_offsets(entry):
     probably near the anchor; a scan is used precisely when it is NOT, so weighting toward the anchor
     would spend the samples in the least likely place.
     """
-    forward = entry.get("scan_forward", DEFAULT_SCAN_FORWARD)
-    back = entry.get("scan_back", DEFAULT_SCAN_BACK)
+    # Floor both at 0. Neither has a CLI flag and cmd_import never writes them, so a negative can
+    # only arrive from a hand-edited store -- but the clamp below is a filter, and a negative bound
+    # makes it drop every offset INCLUDING the anchor itself. The snap would then report NOT REACHED
+    # with nothing to indicate the store was the problem. Verified: {forward:100, back:-200} and
+    # {forward:-10, back:-10} both yielded [] before this.
+    forward = max(0, entry.get("scan_forward", DEFAULT_SCAN_FORWARD))
+    back = max(0, entry.get("scan_back", DEFAULT_SCAN_BACK))
     samples = max(2, entry.get("scan_samples", DEFAULT_SCAN_SAMPLES))
     span = forward + back
     step = max(1, span // (samples - 1))
@@ -609,41 +693,10 @@ def run_replay(entry, out_dir):
         raise SystemExit(f"snaps: dump not found: {dump_path}")
     if not os.path.exists(APP):
         raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
-    flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
-    env = dict(os.environ)
-    # Pace the CHECK's flips to the same rate the session was authored at.
-    #
-    # This is what lets the clock be off. Routes are FLIP-anchored ("fN = display flips since the
-    # first pad poll"), so flip N is only a fixed moment in the game if flips happen at a fixed rate.
-    # Pinning the guest clock used to provide that and cost a lie about every guest time source;
-    # pacing provides it honestly, because the guest keeps a real clock and simply flips at 60/s the
-    # way a vsync-locked console does.
-    #
-    # Without this the route does not drift, it DIVERGES: a press window lands at a different guest
-    # time and can be swallowed entirely. Measured on alexkidd -- unpaced, all four snaps fail with
-    # colour counts collapsing 14548 -> 108, which is a different part of the game, not a shifted
-    # anchor. No amount of scanning fixes an input that landed in the wrong place.
-    env["PROSPER_FLIP_PACE_FPS"] = str(entry.get("det_fps", DEFAULT_DET_FPS))
-    apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS),
-                              # The READER fallback stays "on" even though the AUTHOR default is
-                              # now "off". It can only ever apply to a set stored before the key
-                              # existed, and there was no way to author one of those with the clock
-                              # off -- cmd_author applied it unconditionally until 4bf1c80c. Taking
-                              # the new default here would replay an old set under conditions it was
-                              # never recorded under. Measured: doing so fails all four alexkidd
-                              # snaps (ssim 0.001-0.522, colour counts collapsing 14548 -> 108),
-                              # because the flip-anchored ROUTE diverges, not merely the anchors.
-                              entry.get("det_clock", "on") == "on")
-    if entry.get("savedata", "fresh") == "fresh":
-        apply_fresh_savedata(env, out_dir)
-    env.update({
-        "SDL_VIDEODRIVER": "offscreen",
-        "PROSPER_RENDER": "1",
-        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
-        "PROSPER_SNAP_DIR": out_dir,
-        "PROSPER_SNAP_AT_FLIPS": flips,
-        "PROSPER_PAD_SCRIPT": "@" + os.path.join(REPO_ROOT, entry["route"]),
-    })
+    # The whole environment -- pacing, clock, fresh savedata, route, capture anchors -- is built by
+    # replay_env() so a test can assert what a check actually replays under. It used to be inlined
+    # here, which is how the reader fallback regressed unnoticed: there was nothing a test could call.
+    env = replay_env(entry, out_dir)
     log = os.path.join(out_dir, "run.log")
     manifest = os.path.join(out_dir, "actuals.jsonl")
 

@@ -154,6 +154,13 @@ for a quick boot would cut the route off mid-run and report every later snap as 
 failure with nothing to do with rendering, which is the whole class of bug this system exists to
 remove.
 
+**Pacing makes the run length a floor, not just a ceiling.** Because the check now paces flips to
+`det_fps`, a set cannot finish faster than `deepest_candidate_flip / det_fps` seconds however fast
+the machine is. For an anchored set that is small — `alexkidd`'s deepest candidate is 3134 + 900 =
+4034 flips, about **67 s** at 60/s. A **scan** snap extends its own anchor by `scan_forward` (12,000
+flips by default), so one scan snap puts a hard **~200 s minimum** on the whole set. Size `--timeout`
+above that floor, not merely above a fast machine's observed run.
+
 ### Do not anchor a snap mid-fade — measured, and it is the one real trap
 
 Two identical headless runs were driven through Blue Prince's New Game intro and sampled at the same
@@ -193,6 +200,17 @@ anchor. No amount of scanning fixes an input that landed in the wrong place.
 
 An old set stored before the `det_clock` key existed reads as **clock ON**, because there was no way
 to author one with it off. The author default being `off` does not change how such a set is replayed.
+
+**Pacing can only slow a fast host down — it cannot speed a slow one up.** `flip_pace_wait()` sleeps
+when it is ahead of schedule and *re-anchors* when it is behind, so on any title/host combination
+that cannot **sustain** `det_fps` the pacer is inert and the drift described above comes straight
+back. This is the same shape as vsync, which caps a maximum rather than guaranteeing a rate — and
+the numbers in the next section are the warning: Blue Prince measured 180 fps windowed at its menu,
+20 fps in gameplay and **4.8 fps during its FMV**. The last two are below any sane `det_fps`.
+
+So pacing is what makes an anchored snap reliable *on frames the host can render at rate*. For
+anything sitting behind a load screen or a movie, use a **scan** snap (`Shift+F6`) — that is exactly
+the case it exists for, and no amount of pacing substitutes for it.
 
 ## The guest clock: OFF by default (and why it used to be on)
 
