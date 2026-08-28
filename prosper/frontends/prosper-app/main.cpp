@@ -68,6 +68,7 @@
 // on the command line (`--volume 25`), not in the default every user inherits.
 static constexpr int kDefaultVolumePercent = 100;
 static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before backends install
+#include "snap_author.hpp"            // human-authored render snapshots (F6/F7), always available
 #ifdef PROSPER_AUDIO_FFMPEG
 #include "ajm_ffmpeg.hpp"              // install AJM MP3 decoder before guest instance creation
 #endif
@@ -986,6 +987,10 @@ static prosper::frontend::GameLibraryIo host_library_io() {
 // "Bendy and the Ink Machine" instead of the PPSA content-id directory. PS5 param.json stores the name under
 // localizedParameters.<lang>.titleName; we prefer the defaultLanguage's entry and fall back to the first
 // titleName found. Dependency-free string scan (no JSON lib in-tree); returns "" if the file/field is absent.
+// Flips since the guest's first pad poll, or -1 before that poll happens. Read-only by contract:
+// it never establishes the origin. Defined in src/hle/input/hle_pad.cpp.
+extern "C" int64_t prosper_pad_flip_ordinal();
+
 static std::string read_game_title(const std::string& dump) {
     // The parse lives in game_library.hpp so the library view and this window title read param.json
     // through exactly one implementation — and so that logic is unit-tested, which it never was while
@@ -1593,6 +1598,28 @@ int main(int argc, char** argv) {
     {
         grabNamer.set_title(activeCaptureTitle.id, activeCaptureTitle.label);
     }
+    // ---- Human-authored render snapshots (F6 "correct" / F7 "wrong") -------------------------
+    // The person playing is the oracle. Each press writes the presented frame plus a manifest
+    // record anchored on the PAD FLIP ORDINAL, the same axis PROSPER_PAD_RECORD writes routes
+    // against -- so a recorded route and the snaps taken during it index each other, and an
+    // automated run can replay to the exact moment a human passed judgement.
+    //
+    // Read-only accessor: it must not be the call that establishes the pad flip origin. See the
+    // comment on prosper_pad_flip_ordinal() in hle_pad.cpp for what that would corrupt.
+    const std::string snapDir = getenv("PROSPER_SNAP_DIR") ? getenv("PROSPER_SNAP_DIR") : grabDir;
+    std::optional<prosper::frontend::SnapVerdict> pendingSnapVerdict;
+    uint32_t snapCount = 0;
+    // Check side: capture the presented frame as each authored anchor arrives. Sorted ascending by
+    // the parser, so one forward-only cursor covers the run -- and a target already passed when the
+    // list is loaded is simply never armed, rather than firing late against the wrong scene.
+    const std::vector<int64_t> snapFlipTargets =
+        prosper::frontend::parse_snap_flip_list(getenv("PROSPER_SNAP_AT_FLIPS"));
+    size_t nextSnapTarget = 0;
+    std::optional<int64_t> pendingActualTarget;
+    if (!snapFlipTargets.empty())
+        std::fprintf(stderr, "[snap] replay capture armed for %zu anchor(s), first at pad flip %lld\n",
+                     snapFlipTargets.size(), static_cast<long long>(snapFlipTargets.front()));
+
     prosper::perf::InteractivePerformanceCapture& perfCapture =
         prosper::perf::interactive_performance_capture();
     const char* automaticPerfEnv = getenv("PROSPER_PERF_CAPTURE_AFTER_MS");
@@ -1793,6 +1820,65 @@ int main(int argc, char** argv) {
                 if (grabReservedBundles.size() >= 32) grabReservedBundles.erase(grabReservedBundles.begin());
                 grabReservedBundles.emplace_back(grab.bundle, grab.suffix);
                 return;
+    };
+
+    // Write one authored snap: the presented pixels, plus an appended JSON Lines manifest record.
+    // Appending per snap rather than rewriting an array is deliberate -- an authoring session ends
+    // when the person closes the window or kills the process, and a truncated array would lose the
+    // whole session's judgements rather than the last one.
+    auto flushPendingSnap = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
+        if (!pendingSnapVerdict) return;
+        const prosper::frontend::SnapVerdict verdict = *pendingSnapVerdict;
+        pendingSnapVerdict.reset();
+        const int64_t flip = prosper_pad_flip_ordinal();
+        const uint32_t index = snapCount++;
+        const std::string name = prosper::frontend::snap_file_name(index, verdict, flip);
+        std::error_code ec;
+        std::filesystem::create_directories(snapDir, ec);
+        const std::string path = (std::filesystem::path(snapDir) / name).string();
+        if (!write_frame_bmp(path, rgba, w, h)) {
+            std::fprintf(stderr, "[snap] FAILED to write %s -- this judgement was lost\n",
+                         path.c_str());
+            return;
+        }
+        const std::string manifest =
+            (std::filesystem::path(snapDir) / "snaps.jsonl").string();
+        if (FILE* f = fopen(manifest.c_str(), "a")) {
+            std::fprintf(f, "%s\n", prosper::frontend::snap_record_line(
+                index, verdict, flip, gpu::present_count(), w, h, name,
+                grabNamer.title_id()).c_str());
+            fclose(f);
+        } else {
+            std::fprintf(stderr, "[snap] wrote %s but could NOT append to %s -- the image exists "
+                                 "with no record, and import will not see it\n",
+                         name.c_str(), manifest.c_str());
+        }
+        std::fprintf(stderr, "%s\n",
+                     prosper::frontend::snap_author_line(index, verdict, flip, name).c_str());
+    };
+
+    auto flushPendingActual = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
+        if (!pendingActualTarget) return;
+        const int64_t target = *pendingActualTarget;
+        pendingActualTarget.reset();
+        const int64_t actual = prosper_pad_flip_ordinal();
+        const std::string name = prosper::frontend::snap_actual_file_name(target, actual);
+        std::error_code ec;
+        std::filesystem::create_directories(snapDir, ec);
+        const std::string path = (std::filesystem::path(snapDir) / name).string();
+        if (!write_frame_bmp(path, rgba, w, h)) {
+            std::fprintf(stderr, "[snap] FAILED to write %s\n", path.c_str());
+            return;
+        }
+        const std::string manifest =
+            (std::filesystem::path(snapDir) / "actuals.jsonl").string();
+        if (FILE* f = fopen(manifest.c_str(), "a")) {
+            std::fprintf(f, "%s\n", prosper::frontend::snap_actual_record_line(
+                target, actual, w, h, name).c_str());
+            fclose(f);
+        }
+        std::fprintf(stderr, "[snap] captured anchor %lld at pad flip %lld -> %s\n",
+                     static_cast<long long>(target), static_cast<long long>(actual), name.c_str());
     };
 
     auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
@@ -2109,6 +2195,24 @@ int main(int argc, char** argv) {
                     arm_frame_grab(false, "hotkey");
                     continue;
                 }
+                // F6 / F7: author a render snapshot from the frame currently on screen. F6 means
+                // "this looks CORRECT", F7 means "this looks WRONG" -- and the wrong ones are kept
+                // deliberately, because a title with no guard improves silently. Both are HOST
+                // hotkeys and are not forwarded to the guest. Armed here, written when the next
+                // frame is presented, so the pixels are the ones that were actually on screen.
+                if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
+                    (ev.key.key == SDLK_F6 || ev.key.key == SDLK_F7)) {
+                    if (pendingSnapVerdict) {
+                        std::fprintf(stderr,
+                                     "[snap] a snap is already armed and waiting for the next "
+                                     "presented frame; this press is ignored\n");
+                    } else {
+                        pendingSnapVerdict = ev.key.key == SDLK_F6
+                            ? prosper::frontend::SnapVerdict::correct
+                            : prosper::frontend::SnapVerdict::incorrect;
+                    }
+                    continue;
+                }
                 // Ctrl+O opens a title in the empty window (#1469). Deliberately unavailable once a
                 // game is running: the guest owns the keyboard from that point (O is its R1), and a
                 // second title needs a new process anyway — drop a folder on the window for that.
@@ -2339,6 +2443,26 @@ int main(int argc, char** argv) {
                 nextTimedDump = loopNow + std::chrono::milliseconds(timedDumpIntervalMs);
             else
                 timedDumpPending = false;
+        }
+
+        // Arm the next authored anchor once the guest reaches it. This sits in the COMMON path,
+        // deliberately: presentation has a GPU route and a CPU-fallback route, and the headless
+        // offscreen driver used by automated checks takes the fallback -- arming inside the GPU
+        // branch made the trigger fire on a window and do nothing at all in CI, which is precisely
+        // the case it exists for.
+        //
+        // Forward-only: every target at or below the current ordinal is consumed in one pass, so a
+        // stall that skips several anchors captures the frame that actually exists rather than
+        // replaying the backlog against later scenes.
+        if (nextSnapTarget < snapFlipTargets.size() && !pendingActualTarget) {
+            const int64_t nowFlip = prosper_pad_flip_ordinal();
+            if (nowFlip >= 0) {
+                while (nextSnapTarget + 1 < snapFlipTargets.size() &&
+                       snapFlipTargets[nextSnapTarget + 1] <= nowFlip)
+                    ++nextSnapTarget;
+                if (snapFlipTargets[nextSnapTarget] <= nowFlip)
+                    pendingActualTarget = snapFlipTargets[nextSnapTarget++];
+            }
         }
 
         // No game yet and no test pattern: nothing is producing frames. Draw the library so the window
@@ -2574,13 +2698,23 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 bool grabReady = false;
+                // A pending snap needs the presented pixels just as a grab screenshot does, so it
+                // must also request the readback -- without this the GPU path never stages them and
+                // F6/F7 would silently do nothing on the fast path.
                 PresentAttempt attempt = present_frame_gpu(
-                    vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady,
+                    vk, gf, gpuPrevSlot,
+                    !pendingGrabScreenshot.empty() || pendingSnapVerdict.has_value() ||
+                        pendingActualTarget.has_value(), grabReady,
                     showFps, fpsForPresent);
                 gpuPresentedW = gf.width; gpuPresentedH = gf.height;
-                if (grabReady)
+                if (grabReady) {
                     flushGrabScreenshot(static_cast<const uint8_t*>(vk.stageMapped),
                                         gf.width, gf.height);
+                    flushPendingSnap(static_cast<const uint8_t*>(vk.stageMapped),
+                                     gf.width, gf.height);
+                    flushPendingActual(static_cast<const uint8_t*>(vk.stageMapped),
+                                       gf.width, gf.height);
+                }
                 if (attempt == PresentAttempt::out_of_date) {
                     swapchainDirty = true;
                 } else if (attempt == PresentAttempt::skipped) {
@@ -2650,6 +2784,8 @@ int main(int argc, char** argv) {
                         havePresentedGuestFlip = true;
                         lastPresentedGuestFlip = cf.guest_present_count;
                         flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height);
+                        flushPendingSnap(cf.rgba->data(), cf.width, cf.height);
+                        flushPendingActual(cf.rgba->data(), cf.width, cf.height);
                     }
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -2681,6 +2817,8 @@ int main(int argc, char** argv) {
                     shown.record(prosper::frontend::PresentedFrameSource::Cpu, running);
                     lastFrameProgress = std::chrono::steady_clock::now();
                     flushGrabScreenshot(frame.rgba->data(), w, h);
+                    flushPendingSnap(frame.rgba->data(), w, h);
+                    flushPendingActual(frame.rgba->data(), w, h);
                     // Periodic present-rate log (every 60 presented frames).
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
