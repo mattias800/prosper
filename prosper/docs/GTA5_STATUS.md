@@ -4911,13 +4911,19 @@ a new one** — and note which entries are *solid* versus *void*, because a void
 falsification.
 
 - **The HTILE `gpu-preserving` suppression is load-bearing for GTA V's picture.** FALSE, measured
-  2026-08-28 (#3089). `1b5b9471` stopped invalidating retained depth when a guest HTILE write
+  2026-08-28 (#3089). **And it should never have shipped: the answer was already recorded above in
+  this same document** -- "should a write that provably preserves guest bytes invalidate a detached
+  Vulkan depth image? ... **yes, it must** ... and *Dead Cells* #611 is the counterexample where
+  sparing it makes gameplay geometry disappear. That is why no preservation policy is proposed
+  here." `97ecc58a` shipped that preservation policy anyway, and it cost *Blue Prince* its entire
+  picture. `97ecc58a` ("gpu: GTA V world rendering series", the squash of #2996; branch commit
+  `1b5b9471`, not on master) stopped invalidating retained depth when a guest HTILE write
   compared byte-identical, to keep the depth this title's deferred lighting samples. That rule is
   **unsound in principle**: prosper never writes rendered HiZ back into the guest HTILE plane, so
   the guest copy is a constant the guest's own writes keep reproducing, and the comparator reports
-  `changed=0` for a fast CLEAR exactly as readily as for the decompress it was written for. It cost
-  *Blue Prince* its entire picture (every DS invalidation suppressed; 0.00% non-black over 16,500+
-  readbacks). **Removing it does not cost GTA V anything measurable**: one binary, one lever, the
+  `changed=0` for a fast CLEAR exactly as readily as for the decompress it was written for -- on
+  *Blue Prince* every DS invalidation was suppressed (agree=1, suppressed=59,999) and the title went
+  to 0.00% non-black over 16,500+ readbacks. **Removing it does not cost GTA V anything measurable**: one binary, one lever, the
   540 s `reach-story-mode` route — the suppression fires **3,177 times** with it on and **0** with
   it off, and peak colour coverage is **99.78% in both arms**, on the same targets, at comparable
   readback ordinals (#237 vs #225). So the suppression was removed. Recovering that pass's retained

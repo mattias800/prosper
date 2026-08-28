@@ -344,14 +344,25 @@ both titles working.
 ## Ruled out (do-not-redo list)
 
 **The pure-black frame on master, 2026-08-28 (#3089, fixed by the PR that adds this row).** The
-regression bisected to `1b5b9471` (the GTA V rendering foundation, #2996) and the cause is one
-line: HTILE-driven depth/stencil invalidation was suppressed whenever the guest write carried the
-`gpu-preserving` origin, so Blue Prince's retained depth was never discarded and stale depth
-rejected the whole scene. **Do not re-derive this by reverting hunks of that commit** -- eight
-candidate mechanisms in it were eliminated by direct A/B measurement inside a single binary, and
-every one of them fires ZERO times on this title:
+cause is one line in `97ecc58a` ("gpu: GTA V world rendering series", the squash of #2996; the
+pre-squash branch commit is `1b5b9471`, which is NOT on master -- cite the squash, or a fresh clone
+cannot resolve it). HTILE-driven depth/stencil invalidation was suppressed whenever the guest write
+carried the `gpu-preserving` origin, so Blue Prince's retained depth was never discarded and stale
+depth rejected the whole scene.
 
-| candidate change in `1b5b9471` | evaluations | times it fires on Blue Prince |
+**The decision this reversed was already on record, in the status doc of the title it was written
+for.** `GTA5_STATUS.md` asks whether "a write that provably preserves guest bytes [should]
+invalidate a detached Vulkan depth image" and answers **"yes, it must -- byte equality with guest
+memory says nothing about equality with a renderer-owned image the renderer has since drawn into,
+and *Dead Cells* #611 is the counterexample where sparing it makes gameplay geometry disappear.
+That is why no preservation policy is proposed here."** `97ecc58a` shipped that preservation policy
+anyway. Read that passage before proposing any variant of it again.
+
+**Do not re-derive this by reverting hunks of that commit** -- seven candidate mechanisms were
+measured by direct A/B inside a single binary, computing the old and new predicate side by side.
+Six fire ZERO times on this title; the seventh is the cause:
+
+| candidate change | evaluations | times it fires on Blue Prince |
 | --- | --- | --- |
 | feedback narrowing (`mrt_target_view_feedback`) | 40,000 | 0 |
 | pass grouping (`mrt_same_color_pass` extent split) | 380,000 | 0 |
@@ -361,7 +372,15 @@ every one of them fires ZERO times on this title:
 | DCC zero-mip specialization guard removal | 820,000 | 0 |
 | **HTILE `gpu-preserving` suppression** | 60,000 | **59,999** |
 
-Two further method warnings from the same investigation, both of which cost hours:
+**Why 313 green tests shipped a black frame on a rung-6 title.** The #611 regression case
+(`tests/gpu/execute/test_gpu_execute.cpp:639`) is the guard for exactly this class -- "a compute
+fast-clear writes HTILE guest memory between graphics spans" -- and it could never fire. It drives
+`notify_guest_gpu_write`, the plain notifier, so the origin is `"unknown"` and the
+`strcmp(..., "gpu-preserving")` the suppression keyed on was false in every arm. The test stayed
+green through the regression and stays green after the fix. A guard that cannot reach the state it
+guards is not a guard; the corrected case in `test_ds_layer_stride.cpp` sets the origin explicitly.
+
+Three further method warnings from the same investigation, all of which cost hours:
 
 - **Comparing the first N readbacks proves nothing here.** Blue Prince is legitimately black for
   its first ~3,500 colour readbacks on BOTH sides of the regression; the fade-in starts only around
