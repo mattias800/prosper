@@ -88,10 +88,16 @@ DEFAULT_WINDOW_SAMPLES = 7
 # something to eliminate and becomes something to search past. It covers slow test runners, variable
 # loading, FMVs and frame-rate differences with one mechanism.
 #
-# Scanning is FORWARD-BIASED and anchored rather than unbounded, deliberately. A scene can recur --
-# return to a menu twice and an unbounded search would happily lock onto the first occurrence, which
-# is the wrong frame and would then be "accepted" into the store. Keeping the anchor as the ordering
-# hint means a snap authored after a loading screen matches the occurrence after that loading screen.
+# Scanning is FORWARD-BIASED and bounded rather than unbounded. What the bound buys is finite search
+# cost and a finite run: `best_match` takes the ARGMAX over every sampled offset, not the first match,
+# so bounding it does not protect against picking a wrong occurrence -- that framing was wrong and is
+# corrected here rather than repeated.
+#
+# The real hazard is a scene that recurs INSIDE the span, which the bound does not address: at 60
+# flips/s the default forward span is about 200 s of play, comfortably long enough to contain a menu
+# you return to. A scan snap of a screen the title revisits can therefore match the wrong visit and
+# score well doing it. Prefer an anchor snap for anything that recurs; keep scans for frames that sit
+# after something of variable length and appear once.
 DEFAULT_SCAN_FORWARD = 12000
 DEFAULT_SCAN_BACK = 900
 DEFAULT_SCAN_SAMPLES = 33
@@ -275,7 +281,7 @@ def list_names():
 DEFAULT_DET_FPS = 60
 
 
-def apply_deterministic_clock(env, det_fps, enabled=True):
+def apply_deterministic_clock(env, det_fps, enabled=False):
     """Pin the guest clock, unless this title is one the clock breaks.
 
     IT IS NOT UNIVERSALLY SAFE, and that has to be a per-title decision rather than a default nobody
@@ -369,18 +375,20 @@ def cmd_author(args):
     # rate -- measured on one authoring session: 3.1x during splash screens, 0.47x in a heavy scene,
     # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
     # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
+    # Pace the flips whether or not the clock is pinned: the check paces too, and the two must agree
+    # or a flip-anchored route lands at a different guest time on each side.
+    env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
     if args.det_clock == "on":
-        # Pacing is only needed to COMPENSATE for the pinned clock: with it on, guest time runs at
+        # With the clock pinned, pacing ALSO compensates for it: with it on, guest time runs at
         # host_fps/DET_FPS, so the game plays fast or slow unless the flip rate matches. With the
         # clock off the game is deltaTime driven and already runs at real speed, so pacing would only
         # cap the frame rate for no benefit.
-        env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
         print(f"  guest clock: PINNED at {args.det_fps} fps, flips paced to match. This replaces "
               f"every guest time source; some titles break (GRIS).")
     else:
-        print("  guest clock: REAL (the title runs exactly as it does in normal play, uncapped).\n"
-              "              Anchors are matched by SCANNING for the frame, so host speed does not\n"
-              "              have to agree between authoring and checking.")
+        print(f"  guest clock: REAL, flips paced to {args.det_fps}/s (as a vsync-locked console\n"
+              f"              does). The pacing is what keeps a flip-anchored route landing at the\n"
+              f"              same guest time on both sides; the clock itself is not touched.")
     if args.savedata == "fresh":
         apply_fresh_savedata(env, out_dir)
         print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
@@ -525,8 +533,11 @@ def scan_offsets(entry):
     samples = max(2, entry.get("scan_samples", DEFAULT_SCAN_SAMPLES))
     span = forward + back
     step = max(1, span // (samples - 1))
+    # Clamp to the configured span. `step` floors at 1, so a sample count larger than the span would
+    # otherwise walk past `forward` -- {forward:10, back:0, samples:33} produced offsets 0..32, more
+    # than three times the span it was asked for, and a zero span produced 0..32 as well.
     offsets = sorted({-back + i * step for i in range(samples)} | {0})
-    return [o for o in offsets if o >= -back]
+    return [o for o in offsets if -back <= o <= forward]
 
 
 def _anchor_offsets(entry):
@@ -600,8 +611,29 @@ def run_replay(entry, out_dir):
         raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
     flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
     env = dict(os.environ)
+    # Pace the CHECK's flips to the same rate the session was authored at.
+    #
+    # This is what lets the clock be off. Routes are FLIP-anchored ("fN = display flips since the
+    # first pad poll"), so flip N is only a fixed moment in the game if flips happen at a fixed rate.
+    # Pinning the guest clock used to provide that and cost a lie about every guest time source;
+    # pacing provides it honestly, because the guest keeps a real clock and simply flips at 60/s the
+    # way a vsync-locked console does.
+    #
+    # Without this the route does not drift, it DIVERGES: a press window lands at a different guest
+    # time and can be swallowed entirely. Measured on alexkidd -- unpaced, all four snaps fail with
+    # colour counts collapsing 14548 -> 108, which is a different part of the game, not a shifted
+    # anchor. No amount of scanning fixes an input that landed in the wrong place.
+    env["PROSPER_FLIP_PACE_FPS"] = str(entry.get("det_fps", DEFAULT_DET_FPS))
     apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS),
-                              entry.get("det_clock", "off") == "on")
+                              # The READER fallback stays "on" even though the AUTHOR default is
+                              # now "off". It can only ever apply to a set stored before the key
+                              # existed, and there was no way to author one of those with the clock
+                              # off -- cmd_author applied it unconditionally until 4bf1c80c. Taking
+                              # the new default here would replay an old set under conditions it was
+                              # never recorded under. Measured: doing so fails all four alexkidd
+                              # snaps (ssim 0.001-0.522, colour counts collapsing 14548 -> 108),
+                              # because the flip-anchored ROUTE diverges, not merely the anchors.
+                              entry.get("det_clock", "on") == "on")
     if entry.get("savedata", "fresh") == "fresh":
         apply_fresh_savedata(env, out_dir)
     env.update({

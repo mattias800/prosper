@@ -188,17 +188,22 @@ def main():
         # an anchor drifted clean out of its window. The game was not misbehaving -- it uses deltaTime
         # correctly; prosper was answering "what time is it" from a clock tied to render speed.
         clk = {}
-        snaps.apply_deterministic_clock(clk, 60)
+        snaps.apply_deterministic_clock(clk, 60, enabled=True)
         check(clk.get("PROSPER_DET_CLOCK") == "1", "the deterministic clock is enabled")
         check(clk.get("PROSPER_DET_FPS") == "60", "the clock rate is passed through")
         clk2 = {}
-        snaps.apply_deterministic_clock(clk2, 30)
+        snaps.apply_deterministic_clock(clk2, 30, enabled=True)
         check(clk2.get("PROSPER_DET_FPS") == "30", "a non-default rate is honoured")
 
         # The clock is NOT universally safe and must be disablable per title. GRIS freezes on its
         # opening FMV with it on -- 42,000 frames in 150 s off against 1,680 on, a 25x collapse.
         off = {}
         snaps.apply_deterministic_clock(off, 60, enabled=False)
+        implicit = {}
+        snaps.apply_deterministic_clock(implicit, 60)
+        check("PROSPER_DET_CLOCK" not in implicit,
+              "the helper's own default matches the tool's stance (off), so a new caller cannot "
+              "silently pin the clock")
         check("PROSPER_DET_CLOCK" not in off, "the clock can be turned off for a title")
         # And an inherited value must be CLEARED, not merely left unset: an authoring shell that
         # exported it would otherwise leak it into a run whose entry says the clock is off, making
@@ -209,6 +214,31 @@ def main():
               "an inherited clock is CLEARED when the title disables it")
         check(entry.get("det_fps") == snaps.DEFAULT_DET_FPS,
               "the rate is RECORDED in the entry, so the check reproduces how it was authored")
+
+        # ---- 6a1b. The det_clock READER fallback stays "on" -------------------------------
+        # The author/import CLI default is "off", but a stored set from before the key existed was
+        # necessarily authored with the clock pinned -- cmd_author applied it unconditionally then.
+        # Following the new default when READING would replay such a set under conditions it was
+        # never recorded under. Measured when this was wrong: all four alexkidd snaps failed, with
+        # colour counts collapsing 14548 -> 108, because the flip-anchored ROUTE diverged rather than
+        # the anchors merely drifting.
+        legacy = {"det_fps": 60}                       # no det_clock key, as pre-4bf1c80c sets have
+        check(legacy.get("det_clock", "on") == "on",
+              "a set with no det_clock key reads as CLOCK ON, not as the new author default")
+        explicit_off = {"det_clock": "off"}
+        check(explicit_off.get("det_clock", "on") == "off",
+              "...while a set that explicitly says off is still honoured")
+
+        # ---- 6a1c. The scan window never exceeds its configured span ------------------------
+        # `step` floors at 1, so a sample count larger than the span used to walk past `forward`.
+        tight = snaps.scan_offsets({"scan_forward": 10, "scan_back": 0, "scan_samples": 33})
+        check(max(tight) <= 10, "a sample count larger than the span does not overshoot it")
+        check(min(tight) >= 0, "...and does not reach behind a zero scan_back")
+        zero = snaps.scan_offsets({"scan_forward": 0, "scan_back": 0, "scan_samples": 33})
+        check(zero == [0], "a zero span collapses to the anchor alone")
+        wide = snaps.scan_offsets({})
+        check(max(wide) <= snaps.DEFAULT_SCAN_FORWARD and min(wide) >= -snaps.DEFAULT_SCAN_BACK,
+              "the DEFAULTS stay inside their own span (nothing else exercises them)")
 
         # ---- 6a2. Both save roots are isolated, not just one -------------------------------
         # A title with a save offers "Continue" ABOVE "New Game", so the same D-pad inputs select a

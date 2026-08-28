@@ -178,6 +178,22 @@ drift is small: with `--window-samples 9` over ±900 the offsets are `0, ±43, �
 rather than uniform ±225 steps. That resolves a short fade far better than even spacing, but it
 cannot rescue a snap taken in the middle of one.
 
+## Flips are paced on BOTH sides, which is what lets the clock stay off
+
+Routes are **flip-anchored** (`fN` = display flips since the first pad poll), so flip N is only a
+fixed moment in the game if flips happen at a fixed *rate*. Pinning the guest clock used to provide
+that, at the cost of lying about every guest time source. Pacing provides it honestly: the guest
+keeps a real clock and simply flips at 60/s, the way a vsync-locked console does.
+
+Both authoring and checking set `PROSPER_FLIP_PACE_FPS` to the set's `det_fps`, and they must agree.
+Without it the route does not drift, it **diverges**: a press window lands at a different guest time
+and can be swallowed. Measured on `alexkidd` with the check unpaced — **all four snaps failed**, with
+colour counts collapsing 14,548 → 108, which is a different part of the game rather than a shifted
+anchor. No amount of scanning fixes an input that landed in the wrong place.
+
+An old set stored before the `det_clock` key existed reads as **clock ON**, because there was no way
+to author one with it off. The author default being `off` does not change how such a set is replayed.
+
 ## The guest clock: OFF by default (and why it used to be on)
 
 **Both halves now run with the guest's REAL clock.** `--det-clock on` remains available per title and
@@ -243,10 +259,15 @@ held, and the check sweeps a wide span forward of the anchor instead of hugging 
 You are the only one who knows which frames those are, and you know it at the moment you press the
 key — which is why it is a modifier rather than a setting decided later.
 
-Scanning is **bounded and forward-biased**, not unbounded. A scene can recur — return to a menu twice
-and an unbounded search would happily lock onto the first occurrence, accept it, and store the wrong
-frame. Keeping the anchor as the ordering hint means a snap authored after a loading screen matches
-the occurrence *after that loading screen*.
+Scanning is **bounded and forward-biased**. What the bound buys is finite search cost and a finite
+run — *not* protection from matching the wrong occurrence, because `best_match` takes the argmax over
+every sampled offset rather than the first match. That earlier framing was wrong and is corrected
+here rather than repeated.
+
+**The real hazard is a scene that recurs INSIDE the span**, which the bound does not address: at 60
+flips/s the default forward span is about 200 s of play, easily long enough to contain a menu you
+return to. Use an anchor snap for anything that recurs; keep scans for frames that sit after
+something of variable length and appear once.
 
 Sampling across a scan is uniform, unlike the tight window's geometric spacing: a scan is used
 precisely when the match is *not* near the anchor, so weighting toward the anchor would spend the
