@@ -637,7 +637,7 @@ def main():
         # ---- 6a1b-iii-e. cmd_import's own refusals -------------------------------------------
         def import_dir(records, with_route=True):
             """Build a capture dir and import it; return the raised SystemExit, or None."""
-            d = os.path.join(tmp, f"imp{abs(hash(str(records))) % 100000}")
+            d = os.path.join(tmp, "imp{}".format(len(records)))
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "snaps.jsonl"), "w", encoding="utf-8") as handle:
                 for r in records:
@@ -647,7 +647,7 @@ def main():
 
             class IArgs(Args):
                 capture_dir = d
-                name = f"imp{abs(hash(str(records))) % 100000}"
+                name = "imp{}".format(len(records))
             try:
                 snaps.cmd_import(IArgs())
                 return None
@@ -668,6 +668,18 @@ def main():
         exc = import_dir(only_unanchored)
         check(isinstance(exc, SystemExit) and "unanchored" in str(exc),
               "a session whose every snap is unanchored is refused, and says why")
+
+        # A manifest whose images are all missing leaves nothing to import. This guard is the one
+        # I wrongly classified as a loud failure: with it removed, import returns 0, stores a set
+        # with ZERO snaps, and `check` then prints "replaying 0 anchor(s)" and exits 0 -- for ever.
+        # A guard set that guards nothing, reporting success. Verified before writing this arm.
+        no_images = [{"index": 0, "verdict": "correct", "mode": "anchor", "pad_flip": 900,
+                      "guest_present": 900, "width": 64, "height": 36,
+                      "file": "definitely-not-here.bmp", "title_id": "PPSATEST"}]
+        empty_exc = import_dir(no_images)
+        check(isinstance(empty_exc, SystemExit) and "no snap images" in str(empty_exc),
+              "a manifest whose images are all missing is REFUSED, not stored as an empty set "
+              "that would pass every future check")
 
         # ---- 6a1b-iii-f. cmd_import: an EXPLICIT flag beats the stored session ---------------
         # snaps.py's own comment states this contract in prose ("An explicitly passed flag still
@@ -929,7 +941,11 @@ def main():
             Returns (exit_code, output). The reference is what was approved; the actual is what the
             stubbed replay produced, so the two pixels decide whether it matches.
             """
-            nm = f"vc{abs(hash((verdict, ref_pixel, actual_pixel, mode))) % 100000}"
+            # Deterministic, so repeated runs reuse one directory instead of seeding a new one
+            # each time. hash() is randomised per process, which made this a slow leak into
+            # ~/.cache on every machine that runs ctest.
+            nm = "vc-{}-{}-{}-{}".format(verdict, "".join(str(c) for c in ref_pixel),
+                                         "".join(str(c) for c in actual_pixel), mode)
             vdir = os.path.join(tmp, nm)
             os.makedirs(vdir, exist_ok=True)
             ref_bmp = os.path.join(vdir, "ref.bmp")
@@ -1068,6 +1084,10 @@ def main():
         # The output directory must be CLEARED before a replay. A frame left by an earlier run
         # could otherwise be matched and reported as a pass -- a wrong answer, stated confidently,
         # from data the current run never produced.
+        # Pop any ambient PROSPER_SNAP_OUT: with it set, the sentinel below lands in
+        # default_check_out_dir() while cmd_check reads the override, and the arm passes with the
+        # rmtree deleted. Verified -- the mutant FAILs without the variable and PASSes with it.
+        stale_saved_env = os.environ.pop("PROSPER_SNAP_OUT", None)
         stale_out = snaps.default_check_out_dir("stale-probe")
         os.makedirs(stale_out, exist_ok=True)
         sentinel = os.path.join(stale_out, "left-over.bmp")
@@ -1155,6 +1175,8 @@ def main():
         check("900" in full_env.get("PROSPER_SNAP_AT_FLIPS", ""),
               "the anchors to capture are handed to the emulator")
 
+        if stale_saved_env is not None:
+            os.environ["PROSPER_SNAP_OUT"] = stale_saved_env
         check(saw_sentinel.get("present") is False,
               "the output directory is CLEARED before a replay, so a stale frame from an earlier "
               "run can never be matched and reported as a pass")
