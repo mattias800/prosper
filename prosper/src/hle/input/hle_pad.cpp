@@ -378,7 +378,7 @@ PadRecordAxis pad_record_axis() {
 // Record the final button stream as explicit flip or successful-pad-read ranges. Completed intervals
 // are flushed immediately; only a button still held when a process is force-killed can be absent from
 // the route tail. Metadata polls do not initialize or advance a pad-read-axis recording.
-void pad_record(int64_t frame, int64_t read, uint32_t buttons) {
+void pad_record(int64_t frame, int64_t read, uint32_t buttons, uint32_t sticks) {
     static const char* output = getenv("PROSPER_PAD_RECORD");
     if (!output || !*output) return;
     const PadRecordAxis axis = pad_record_axis();
@@ -418,7 +418,7 @@ void pad_record(int64_t frame, int64_t read, uint32_t buttons) {
         }
     }
     if (!recorder.file) return;
-    const std::string completed = recorder.state.observe(position, buttons);
+    const std::string completed = recorder.state.observe(position, buttons, sticks);
     if (completed.empty()) return;
     fputs(completed.c_str(), recorder.file);
     fflush(recorder.file);
@@ -441,7 +441,11 @@ HostPadState poll_controller(int /*handle*/, const char* what, bool consume_inpu
     const int64_t frame = pad_frame_now();
     const int64_t read = consume_input_read ? pad_read_now() : -1;
     apply_pad_script(s, frame, read);
-    pad_record(frame, read, s.buttons);
+    // Sticks are recorded as DIRECTIONS, like a d-pad: the script vocabulary is full-deflection
+    // only, so there is nothing finer to record. Without this a stick-driven route replayed as
+    // standing still, which is silent and total -- the guest simply never moves.
+    pad_record(frame, read, s.buttons,
+               pad_stick_mask(s.left_x, s.left_y, s.right_x, s.right_y));
     padlog_once(what, &s);
     return s;
 }

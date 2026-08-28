@@ -197,6 +197,56 @@ uint32_t pad_button_by_name(const std::string& name);
 // stable order so recorded routes have deterministic text.
 std::string pad_button_names(uint32_t mask);
 
+// ---- Recording analog sticks as DIRECTIONS ----------------------------------------------------
+//
+// The script vocabulary is full-deflection only ("left-stick-left"), so recording treats each stick
+// as a d-pad: past the dead zone in one direction, or centered. That is a deliberate fidelity limit,
+// not an oversight -- a gentle tilt records and replays as a full push, so a route that depends on
+// fine analog control will not reproduce its exact path. Recording nothing at all was the previous
+// behaviour and is strictly worse: a stick-driven route replayed as standing still.
+//
+// Bits are the PAD_SCRIPT_* axis flags paired with a sign bit, so one integer compares cheaply in
+// the recorder's change detection.
+enum : uint32_t {
+    PAD_REC_LEFT_X_NEG = 1u << 0, PAD_REC_LEFT_X_POS = 1u << 1,
+    PAD_REC_LEFT_Y_NEG = 1u << 2, PAD_REC_LEFT_Y_POS = 1u << 3,
+    PAD_REC_RIGHT_X_NEG = 1u << 4, PAD_REC_RIGHT_X_POS = 1u << 5,
+    PAD_REC_RIGHT_Y_NEG = 1u << 6, PAD_REC_RIGHT_Y_POS = 1u << 7,
+};
+
+// Sony axis bytes are 0=min, 0x80=center, 0xff=max. The dead zone is generous on purpose: a resting
+// stick drifts, and a recorder that emits an interval every time it wobbles produces a route full of
+// one-flip noise entries that replay as real input.
+inline constexpr uint8_t kPadRecordDeadZone = 48;
+
+// -1, 0 or +1 for one axis byte.
+constexpr int pad_axis_direction(uint8_t value, uint8_t dead_zone = kPadRecordDeadZone) {
+    const int centered = static_cast<int>(value) - 0x80;
+    if (centered <= -static_cast<int>(dead_zone)) return -1;
+    if (centered >= static_cast<int>(dead_zone)) return 1;
+    return 0;
+}
+
+// Pack the four axes into one comparable mask.
+constexpr uint32_t pad_stick_mask(uint8_t left_x, uint8_t left_y,
+                                  uint8_t right_x, uint8_t right_y,
+                                  uint8_t dead_zone = kPadRecordDeadZone) {
+    uint32_t mask = 0;
+    const int lx = pad_axis_direction(left_x, dead_zone);
+    const int ly = pad_axis_direction(left_y, dead_zone);
+    const int rx = pad_axis_direction(right_x, dead_zone);
+    const int ry = pad_axis_direction(right_y, dead_zone);
+    if (lx < 0) mask |= PAD_REC_LEFT_X_NEG; else if (lx > 0) mask |= PAD_REC_LEFT_X_POS;
+    if (ly < 0) mask |= PAD_REC_LEFT_Y_NEG; else if (ly > 0) mask |= PAD_REC_LEFT_Y_POS;
+    if (rx < 0) mask |= PAD_REC_RIGHT_X_NEG; else if (rx > 0) mask |= PAD_REC_RIGHT_X_POS;
+    if (ry < 0) mask |= PAD_REC_RIGHT_Y_NEG; else if (ry > 0) mask |= PAD_REC_RIGHT_Y_POS;
+    return mask;
+}
+
+// '+'-joined direction names, in the exact vocabulary parse_pad_script accepts, so a recorded route
+// round-trips through the parser.
+std::string pad_stick_names(uint32_t stick_mask);
+
 // Recording uses the same explicit-range syntax accepted by PROSPER_PAD_SCRIPT. Keep transition
 // tracking pure so interval boundaries and axis prefixes can be tested without an output file or
 // a controller backend. The caller supplies either the current display-flip or successful-read
@@ -209,11 +259,14 @@ enum class PadRecordAxis : uint8_t {
 class PadRecordState {
 public:
     explicit PadRecordState(PadRecordAxis axis = PadRecordAxis::display_flip) : axis_(axis) {}
-    std::string observe(int64_t position, uint32_t buttons);
+    // `sticks` is a pad_stick_mask(). A change in EITHER buttons or stick direction closes the
+    // current interval, so a route records "walked left, then pressed cross" as two entries.
+    std::string observe(int64_t position, uint32_t buttons, uint32_t sticks = 0);
 
 private:
     PadRecordAxis axis_;
     uint32_t previous_ = 0;
+    uint32_t previous_sticks_ = 0;
     int64_t start_ = 0;
 };
 

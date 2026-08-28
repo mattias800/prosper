@@ -629,6 +629,64 @@ int main() {
         CHECK(missing.empty() && !route_error.empty(), "route: missing @path reports an error");
     }
 
+    // ---- Recording analog sticks as directions --------------------------------------------
+    // Previously the recorder took buttons only, so a stick-driven route replayed as standing
+    // still: silent, total, and indistinguishable from the game ignoring input.
+    {
+        // Sony axis bytes: 0 = min, 0x80 = center, 0xff = max.
+        CHECK(pad_axis_direction(0x80) == 0, "stick: a centered axis is neutral");
+        CHECK(pad_axis_direction(0x00) == -1, "stick: fully negative reads as -1");
+        CHECK(pad_axis_direction(0xff) == 1, "stick: fully positive reads as +1");
+        // The dead zone must swallow rest drift, or every wobble emits a one-flip interval that
+        // replays as real input.
+        CHECK(pad_axis_direction(0x80 + 8) == 0 && pad_axis_direction(0x80 - 8) == 0,
+              "stick: small drift around center stays neutral");
+        CHECK(pad_axis_direction(0x80 + kPadRecordDeadZone) == 1,
+              "stick: exactly at the dead-zone edge counts as deflected");
+
+        CHECK(pad_stick_mask(0x80, 0x80, 0x80, 0x80) == 0, "stick: all centered packs to zero");
+        const uint32_t left_only = pad_stick_mask(0x00, 0x80, 0x80, 0x80);
+        CHECK(pad_stick_names(left_only) == "left-stick-left", "stick: one axis names one direction");
+        const uint32_t diagonal = pad_stick_mask(0xff, 0x00, 0x80, 0x80);
+        CHECK(pad_stick_names(diagonal) == "left-stick-right+left-stick-up",
+              "stick: a diagonal names both axes, '+'-joined");
+        CHECK(pad_stick_names(pad_stick_mask(0x80, 0x80, 0x00, 0xff)) ==
+                  "right-stick-left+right-stick-down",
+              "stick: the right stick is named independently");
+
+        // The recorder closes an interval when the STICK changes, not only when a button does.
+        PadRecordState rec(PadRecordAxis::display_flip);
+        CHECK(rec.observe(100, 0, left_only).empty(), "stick: the first observation opens an interval");
+        const std::string closed = rec.observe(140, 0, 0);
+        // observe() includes the trailing newline: pad_record writes it with a bare fputs, so the
+        // newline has to come from here or every entry would land on one line.
+        CHECK(closed == "f100-140:left-stick-left\n",
+              "stick: releasing the stick closes an interval naming the direction");
+
+        // Buttons and sticks together, and the result must round-trip through the parser -- a
+        // recorded route that the script loader drops is worse than no recording, because it looks
+        // like a working route and replays as nothing.
+        PadRecordState both(PadRecordAxis::display_flip);
+        both.observe(10, SCE_PAD_BUTTON_CROSS, left_only);
+        const std::string combined = both.observe(30, 0, 0);
+        CHECK(combined == "f10-30:cross+left-stick-left\n",
+              "stick: buttons and directions record together");
+        auto parsed = parse_pad_script(combined);
+        CHECK(parsed.size() == 1, "stick: a recorded combined interval parses back to one entry");
+        if (parsed.size() == 1) {
+            CHECK(parsed[0].button_mask == SCE_PAD_BUTTON_CROSS,
+                  "stick: the button survives the round trip");
+            CHECK((parsed[0].axis_mask & PAD_SCRIPT_LEFT_X) != 0 && parsed[0].left_x < 0,
+                  "stick: the direction survives the round trip as a left deflection");
+        }
+
+        // A neutral interval is still not recorded: nothing held is not an event.
+        PadRecordState quiet(PadRecordAxis::display_flip);
+        quiet.observe(5, 0, 0);
+        CHECK(quiet.observe(9, SCE_PAD_BUTTON_CROSS, 0).empty(),
+              "stick: a wholly neutral interval emits nothing");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

@@ -207,6 +207,25 @@ speeds with the clock on — 78.2 fps against 52.4 fps, a 1.49x spread:
 All three comfortably above the 0.85 bar, where the uncorrected rate difference had pushed an anchor
 past its whole window.
 
+## Analog sticks record as DIRECTIONS, like a d-pad
+
+A stick past its dead zone records as `left-stick-left`, `right-stick-down` and so on, `+`-joined
+with any buttons held at the same time, in the exact vocabulary `PROSPER_PAD_SCRIPT` replays. A
+recorded interval round-trips through the parser unchanged.
+
+This is deliberately coarse, because the script vocabulary is **full-deflection only** — there is
+nothing finer to record. The consequence is worth knowing before authoring a 3D title: a gentle tilt
+records and replays as a full push, so a route that depends on fine analog control will not
+reproduce its exact path. Prefer short, decisive movements when authoring, and take the snap once
+the camera has settled.
+
+The previous behaviour was strictly worse: sticks were not recorded at all, so a stick-driven route
+replayed as **standing still** — silent, total, and indistinguishable from the game ignoring input.
+
+The dead zone (48 of 128) is generous on purpose: a resting stick drifts, and a recorder that emits
+an interval on every wobble produces a route full of one-flip noise entries that replay as real
+input.
+
 ## Save state: fresh by default, and why that is not optional
 
 Both halves run with **both** save roots redirected to empty per-run directories:
