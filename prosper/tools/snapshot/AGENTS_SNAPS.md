@@ -154,6 +154,13 @@ for a quick boot would cut the route off mid-run and report every later snap as 
 failure with nothing to do with rendering, which is the whole class of bug this system exists to
 remove.
 
+**Pacing makes the run length a floor, not just a ceiling.** Because the check now paces flips to
+`det_fps`, a set cannot finish faster than `deepest_candidate_flip / det_fps` seconds however fast
+the machine is. For an anchored set that is small — `alexkidd`'s deepest candidate is 3134 + 900 =
+4034 flips, about **67 s** at 60/s. A **scan** snap extends its own anchor by `scan_forward` (12,000
+flips by default), so one scan snap puts a hard **~200 s minimum** on the whole set. Size `--timeout`
+above that floor, not merely above a fast machine's observed run.
+
 ### Do not anchor a snap mid-fade — measured, and it is the one real trap
 
 Two identical headless runs were driven through Blue Prince's New Game intro and sampled at the same
@@ -178,10 +185,45 @@ drift is small: with `--window-samples 9` over ±900 the offsets are `0, ±43, �
 rather than uniform ±225 steps. That resolves a short fade far better than even spacing, but it
 cannot rescue a snap taken in the middle of one.
 
-## The guest clock is deterministic in both halves, and it must be
+## Flips are paced on BOTH sides, which is what lets the clock stay off
 
-Both authoring and checking run with `PROSPER_DET_CLOCK=1` and the same `PROSPER_DET_FPS`
-(default 60). The guest then sees exactly 1/60 s per flip regardless of how fast the host renders.
+Routes are **flip-anchored** (`fN` = display flips since the first pad poll), so flip N is only a
+fixed moment in the game if flips happen at a fixed *rate*. Pinning the guest clock used to provide
+that, at the cost of lying about every guest time source. Pacing provides it honestly: the guest
+keeps a real clock and simply flips at 60/s, the way a vsync-locked console does.
+
+Both authoring and checking set `PROSPER_FLIP_PACE_FPS` to the set's `det_fps`, and they must agree.
+Without it the route does not drift, it **diverges**: a press window lands at a different guest time
+and can be swallowed. Measured on `alexkidd` with the check unpaced — **all four snaps failed**, with
+colour counts collapsing 14,548 → 108, which is a different part of the game rather than a shifted
+anchor. No amount of scanning fixes an input that landed in the wrong place.
+
+An old set stored before the `det_clock` key existed reads as **clock ON**, because there was no way
+to author one with it off. The author default being `off` does not change how such a set is replayed.
+
+**Pacing can only slow a fast host down — it cannot speed a slow one up.** `flip_pace_wait()` sleeps
+when it is ahead of schedule and *re-anchors* when it is behind, so on any title/host combination
+that cannot **sustain** `det_fps` the pacer is inert and the drift described above comes straight
+back. This is the same shape as vsync, which caps a maximum rather than guaranteeing a rate — and
+the numbers in the next section are the warning: Blue Prince measured 180 fps windowed at its menu,
+20 fps in gameplay and **4.8 fps during its FMV**. The last two are below any sane `det_fps`.
+
+So pacing is what makes an anchored snap reliable *on frames the host can render at rate*. For
+anything sitting behind a load screen or a movie, use a **scan** snap (`Shift+F6`) — that is exactly
+the case it exists for, and no amount of pacing substitutes for it.
+
+## The guest clock: OFF by default (and why it used to be on)
+
+**Both halves now run with the guest's REAL clock.** `--det-clock on` remains available per title and
+is off by default, because pinning the clock is a genuine correctness compromise: `PROSPER_DET_CLOCK`
+replaces *every* time source the guest has — `sceKernelReadTsc`, `GetProcessTime`, and the wall-clock
+anchor behind `CLOCK_REALTIME`, `gettimeofday`, `time()` and `sceRtc*` — with
+`anchor + flips × (1/DET_FPS)`.
+
+A guard recorded under that clock tests a machine nobody plays on. GRIS shows the divergence is not
+theoretical (below). Drift is handled by scanning for the frame instead; see SHIFT+F6 above.
+
+The history is kept because the measurement behind it is still true and still instructive:
 
 Without it the anchors are frame-rate dependent and simply cannot correspond. Measured on the first
 real authoring session: authoring windowed ran at **60.4 fps**, the headless check at **77.1 fps**,
@@ -225,6 +267,34 @@ replayed as **standing still** — silent, total, and indistinguishable from the
 The dead zone (48 of 128) is generous on purpose: a resting stick drifts, and a recorder that emits
 an interval on every wobble produces a route full of one-flip noise entries that replay as real
 input.
+
+### SHIFT+F6 / SHIFT+F7 — a snap to SCAN for
+
+Some frames cannot be found at a fixed offset, because what precedes them takes a different length of
+time on a different machine: a loading screen, an FMV, a streaming pause. Mark those with **shift**
+held, and the check sweeps a wide span forward of the anchor instead of hugging it.
+
+You are the only one who knows which frames those are, and you know it at the moment you press the
+key — which is why it is a modifier rather than a setting decided later.
+
+Scanning is **bounded and forward-biased**. What the bound buys is finite search cost and a finite
+run — *not* protection from matching the wrong occurrence, because `best_match` takes the argmax over
+every sampled offset rather than the first match. That earlier framing was wrong and is corrected
+here rather than repeated.
+
+**The real hazard is a scene that recurs INSIDE the span**, which the bound does not address: at 60
+flips/s the default forward span is about 200 s of play, easily long enough to contain a menu you
+return to. Use an anchor snap for anything that recurs; keep scans for frames that sit after
+something of variable length and appear once.
+
+Sampling across a scan is uniform, unlike the tight window's geometric spacing: a scan is used
+precisely when the match is *not* near the anchor, so weighting toward the anchor would spend the
+samples in the least likely place.
+
+**This is what replaced the deterministic clock.** Drift stopped being something to eliminate by
+lying to the guest about time, and became something to search past — which covers slow test runners,
+variable loading, FMVs and frame-rate differences with one mechanism, and leaves normal play
+untouched at whatever frame rate the machine can manage.
 
 ### The clock is not universally safe — GRIS is the counterexample
 

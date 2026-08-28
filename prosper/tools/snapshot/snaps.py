@@ -51,7 +51,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -81,6 +80,26 @@ DEFAULT_MIN_SSIM = 0.85
 # nothing to do with the renderer, which is the failure this whole design exists to remove.
 DEFAULT_FLIP_WINDOW = 900
 DEFAULT_WINDOW_SAMPLES = 7
+
+# A SCAN snap searches a wide span forward of its anchor instead of a tight window.
+#
+# This is what makes the whole scheme robust without touching the guest's clock: drift stops being
+# something to eliminate and becomes something to search past. It covers slow test runners, variable
+# loading, FMVs and frame-rate differences with one mechanism.
+#
+# Scanning is FORWARD-BIASED and bounded rather than unbounded. What the bound buys is finite search
+# cost and a finite run: `best_match` takes the ARGMAX over every sampled offset, not the first match,
+# so bounding it does not protect against picking a wrong occurrence -- that framing was wrong and is
+# corrected here rather than repeated.
+#
+# The real hazard is a scene that recurs INSIDE the span, which the bound does not address: at 60
+# flips/s the default forward span is about 200 s of play, comfortably long enough to contain a menu
+# you return to. A scan snap of a screen the title revisits can therefore match the wrong visit and
+# score well doing it. Prefer an anchor snap for anything that recurs; keep scans for frames that sit
+# after something of variable length and appear once.
+DEFAULT_SCAN_FORWARD = 12000
+DEFAULT_SCAN_BACK = 900
+DEFAULT_SCAN_SAMPLES = 33
 
 
 # ---------------------------------------------------------------------------------------------
@@ -242,10 +261,36 @@ def list_names():
 # PROSPER_DET_CLOCK makes the guest see exactly 1/DET_FPS seconds per flip, so a three-second logo
 # always costs the same number of flips however fast the host renders. That turns "the same flip" into
 # "the same guest time", which is the property flip anchoring assumes and otherwise does not have.
+# The deterministic clock is now OFF by default. The FLIP PACER is not -- it runs unconditionally on
+# both sides, and it is what replaced the clock. Pacing buys the same "same flip = same guest time"
+# correspondence honestly: the guest keeps a real clock and simply flips at a fixed rate, the way a
+# vsync-locked console does, so nothing has to lie to it about what time it is.
+#
+# PRECONDITION, and it is a real one: pacing can only ever SLOW a fast host down. flip_pace_wait()
+# sleeps when it is ahead of schedule and re-anchors when it is behind, so on any title/host that
+# cannot SUSTAIN det_fps the pacer is inert and the drift this section describes comes straight back.
+# Vsync has the same shape -- it caps a maximum, it does not guarantee a rate. Blue Prince measured
+# 180 fps windowed at its menu, 20 in gameplay and 4.8 during its FMV; the last two are below any
+# sane det_fps, so its post-FMV anchors need SCAN mode rather than pacing to be found.
+#
+# Both existed to stop anchors drifting when the host renders at a different rate than it did during
+# authoring. They bought that at a real cost: PROSPER_DET_CLOCK replaces EVERY time source the guest
+# has -- sceKernelReadTsc, GetProcessTime, and the wall-clock anchor behind CLOCK_REALTIME,
+# gettimeofday, time() and sceRtc* -- with anchor + flips*(1/DET_FPS). A guard recorded under that
+# clock tests a machine nobody plays on, and GRIS proves the divergence is not theoretical: its
+# opening FMV freezes with the clock on (1,680 frames and 47 forced-submit stalls against 42,000 and
+# 0 without it).
+#
+# Drift is now handled where it belongs -- in the MATCHER, by scanning for the frame rather than
+# demanding it appear at a fixed offset. That is robust to slow test runners, loading times, FMVs and
+# frame-rate differences at once, and it needs no lie about time. Normal play is untouched: real
+# clock, uncapped, 120 Hz fine.
+#
+# Both knobs remain available per title for a set that genuinely needs them.
 DEFAULT_DET_FPS = 60
 
 
-def apply_deterministic_clock(env, det_fps, enabled=True):
+def apply_deterministic_clock(env, det_fps, enabled=False):
     """Pin the guest clock, unless this title is one the clock breaks.
 
     IT IS NOT UNIVERSALLY SAFE, and that has to be a per-title decision rather than a default nobody
@@ -270,6 +315,149 @@ def apply_deterministic_clock(env, det_fps, enabled=True):
         return
     env["PROSPER_DET_CLOCK"] = "1"
     env["PROSPER_DET_FPS"] = str(det_fps)
+
+
+# The keys `author` records and `import` reads back. Named once so a rename cannot desynchronise the
+# producer from the consumer -- they were two hand-written literals, and renaming one left the whole
+# suite green.
+SESSION_KEYS = ("det_fps", "det_clock", "savedata")
+
+
+def default_check_out_dir(name):
+    """Where a check writes its captured frames.
+
+    Deliberately NOT tempfile.gettempdir(). On the Linux box /tmp is a RAM-backed tmpfs with a
+    per-user quota shared by every concurrent agent; exhausting it takes the machine's RAM with it
+    rather than merely failing the write. A check writes one BMP per candidate flip, and scan mode
+    raises that from 7 per snap to 34.
+    """
+    return os.path.join(os.path.expanduser("~"), ".cache", "prosper-snaps", name)
+
+
+def _coerce_like(stored, wanted):
+    """Read a stored session value as the type the argument uses.
+
+    A hand-edited session.json holding "30" rather than 30 otherwise reads as a CONTRADICTION of an
+    explicit --det-fps 30, and the run is then refused over settings that in fact agree. Returns the
+    value unchanged when it cannot be converted, so a genuinely different value still conflicts.
+    """
+    if not isinstance(wanted, int) or isinstance(stored, int):
+        return stored
+    try:
+        return int(str(stored).strip())
+    except (TypeError, ValueError):
+        return stored
+
+
+def reconcile_session(args, existing, was_passed=None):
+    """Settle an appending run against what the directory was already authored under.
+
+    Returns (record, adopted, conflicts):
+      record    -- what to store in session.json
+      adopted   -- keys taken FROM the stored session because the caller did not ask for them
+      conflicts -- keys the caller explicitly asked for that contradict the stored session
+
+    This must run BEFORE the run environment is built. An earlier version resolved it afterwards,
+    so `--append --det-fps 60` on a directory authored at 30 ran the emulator paced at 60 while
+    recording 30 -- the run and its own record disagreeing, which is the exact divergence this
+    whole mechanism exists to prevent. It moved the damage from run 1 to run 2 rather than removing
+    it.
+
+    A directory describes ONE set of conditions, because its snaps share one route and one flip
+    axis. So an explicit contradiction is refused rather than silently resolved; a mere default is
+    adopted, since that is somebody continuing a session without retyping the flags.
+    """
+    was_passed = _flag_was_passed if was_passed is None else was_passed
+    if not (getattr(args, "append", False) and isinstance(existing, dict) and existing):
+        return session_record(args, existing), [], []
+    adopted, conflicts = [], []
+    for key in SESSION_KEYS:
+        if key not in existing:
+            continue
+        stored, wanted = _coerce_like(existing[key], getattr(args, key)), getattr(args, key)
+        if stored == wanted:
+            continue
+        (conflicts if was_passed(key) else adopted).append(key)
+    for key in adopted:
+        setattr(args, key, _coerce_like(existing[key], getattr(args, key)))
+    # Rewrite the record even when nothing differed: a session file written by an older version can
+    # be missing a key, and this is the only chance to complete it.
+    return session_record(args, existing), adopted, conflicts
+
+
+def session_record(args, existing=None):
+    """What an authoring session stores about itself, so `import` need not be told again.
+
+    Anything already in the file that this tool does not understand is CARRIED THROUGH. A session
+    file is hand-editable and a person may have annotated it; silently dropping their keys on the
+    next --append is data loss that announces nothing.
+    """
+    record = dict(existing) if isinstance(existing, dict) else {}
+    record.update({key: getattr(args, key) for key in SESSION_KEYS})
+    # Deliberately no "name": cmd_import reads only SESSION_KEYS, and a stored name that disagreed
+    # with --name would be a second source of truth nobody consults.
+    return record
+
+
+def author_env(args, out_dir, base=None):
+    """The environment an AUTHORING session runs under.
+
+    Extracted for the same reason as replay_env: the pacing line here and the one there must agree,
+    and while both were inlined nothing could assert that. Deleting either used to leave the suite
+    fully green while every future session drifted against every future check.
+    """
+    env = dict(os.environ if base is None else base)
+    env.update({
+        "PROSPER_RENDER": "1",
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_SNAP_DIR": out_dir,
+        "PROSPER_PAD_RECORD": os.path.join(out_dir, "route.pad"),
+    })
+    # Both halves read their rate through pace_fps(), off a dict shaped like a stored entry, so the
+    # author and the check cannot disagree about what "60" means.
+    env["PROSPER_FLIP_PACE_FPS"] = str(pace_fps({"det_fps": args.det_fps}))
+    apply_deterministic_clock(env, args.det_fps, args.det_clock == "on")
+    if args.savedata == "fresh":
+        apply_fresh_savedata(env, out_dir)
+    # Deliberately NOT offscreen: authoring is a person looking at a window.
+    env.pop("SDL_VIDEODRIVER", None)
+    return env
+
+
+def clock_enabled(entry):
+    """Does this stored set replay with the guest clock pinned?
+
+    The fallback is "on" while the author/import CLI default is "off", and that asymmetry is the
+    point: this can only ever apply to a set stored before the key existed, and there was no way to
+    author one of those with the clock off -- cmd_author applied it unconditionally until 4bf1c80c.
+    """
+    return entry.get("det_clock", "on") == "on"
+
+
+def pace_fps(entry):
+    """The flip rate BOTH halves must agree on. Written by cmd_import for every new set."""
+    return entry.get("det_fps", DEFAULT_DET_FPS)
+
+
+def replay_env(entry, out_dir, base=None):
+    """The environment a check run replays under. Extracted so it can be asserted directly."""
+    env = dict(os.environ if base is None else base)
+    # Pace the CHECK's flips to the rate the session was authored at. This is what lets the clock
+    # stay off: routes are FLIP-anchored, so flip N is a fixed moment in the game only if flips
+    # happen at a fixed RATE.
+    env["PROSPER_FLIP_PACE_FPS"] = str(pace_fps(entry))
+    apply_deterministic_clock(env, pace_fps(entry), clock_enabled(entry))
+    if entry.get("savedata", "fresh") == "fresh":
+        apply_fresh_savedata(env, out_dir)
+    env.update({
+        "SDL_VIDEODRIVER": "offscreen",
+        "PROSPER_RENDER": "1",
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_SNAP_DIR": out_dir,
+        "PROSPER_SNAP_AT_FLIPS": ",".join(str(f) for f in sorted(candidate_flips(entry))),
+        "PROSPER_PAD_SCRIPT": "@" + os.path.join(REPO_ROOT, entry["route"]),
+    })
+    return env
 
 
 def apply_fresh_savedata(env, root):
@@ -324,40 +512,63 @@ def cmd_author(args):
             f"       first session's images while appending to its manifest. Use a fresh --out, or\n"
             f"       --append if you really mean to continue into the same directory.")
     os.makedirs(out_dir, exist_ok=True)
-    route = os.path.join(out_dir, "route.pad")
 
-    env = dict(os.environ)
-    env.update({
-        "PROSPER_RENDER": "1",
-        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
-        "PROSPER_SNAP_DIR": out_dir,
-        "PROSPER_PAD_RECORD": route,
-    })
-    apply_deterministic_clock(env, args.det_fps, args.det_clock == "on")
-    # Pace the guest flips to the SAME rate the clock advances at, so guest time equals real time
-    # while you play. Without this the deterministic clock makes the game speed track the render
-    # rate -- measured on one authoring session: 3.1x during splash screens, 0.47x in a heavy scene,
-    # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
-    # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
+    # Pacing, clock, savedata and the recorded session all come from the shared helpers above, so
+    # this half and the check half cannot drift apart.
+    # Settle the session against anything already stored here FIRST -- author_env reads args, so a
+    # reconciliation after this point would run the emulator under different settings than it
+    # records.
+    session_path = os.path.join(out_dir, "session.json")
+    existing = {}
+    if os.path.exists(session_path):
+        try:
+            with open(session_path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError) as exc:
+            print(f"  note: {session_path} is unreadable ({exc}); this run's own settings will be "
+                  f"recorded instead. If it holds snaps authored under other settings, they can no "
+                  f"longer be replayed faithfully -- prefer a fresh --out.")
+    if not isinstance(existing, dict):
+        print(f"  note: {session_path} does not hold an object; ignoring it and recording this "
+              f"run's settings.")
+        existing = {}
+    record, adopted, conflicts = reconcile_session(args, existing)
+    if conflicts:
+        raise SystemExit(
+            "snaps: this directory was authored with "
+            + ", ".join(f"{k}={existing[k]!r}" for k in conflicts)
+            + ", and you asked for "
+            + ", ".join(f"{k}={getattr(args, k)!r}" for k in conflicts)
+            + ".\n       Its existing snaps are anchored on flips recorded under the stored\n"
+              "       settings, so one directory can only describe one set of conditions.\n"
+              "       Use a fresh --out to author at different settings.")
+    if adopted:
+        print(f"  NOTE: continuing under the session's own "
+              f"{', '.join(f'{k}={existing[k]!r}' for k in adopted)} rather than the command-line "
+              f"default. This run is paced to match the snaps already here.")
+
+    env = author_env(args, out_dir)
     if args.det_clock == "on":
-        env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
-        print(f"  guest clock: deterministic at {args.det_fps} fps, flips paced to match "
-              f"(real-time feel, and anchors that do not depend on this machine's speed)")
+        print(f"  guest clock: PINNED at {args.det_fps} fps, flips paced to match. This replaces "
+              f"every guest time source; some titles break (GRIS).")
     else:
-        print("  guest clock: REAL time (--det-clock off). Anchors will depend on this machine's\n"
-              "              speed, so this set may need a wider --flip-window. Use this for titles\n"
-              "              the deterministic clock breaks -- GRIS freezes on its opening FMV with\n"
-              "              it on.")
+        print(f"  guest clock: REAL, flips paced to {args.det_fps}/s (as a vsync-locked console\n"
+              f"              does). The pacing is what keeps a flip-anchored route landing at the\n"
+              f"              same guest time on both sides; the clock itself is not touched.")
     if args.savedata == "fresh":
-        apply_fresh_savedata(env, out_dir)
         print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
     else:
         print("  savedata: PRESERVE -- this session uses your real saves, so the route will NOT\n"
               "            reproduce on a machine whose save state differs. A title that offers\n"
               "            'Continue' puts it above 'New Game', so the same inputs pick a\n"
               "            different item. Only use this deliberately.")
-    # Deliberately NOT offscreen: authoring is a person looking at a window.
-    env.pop("SDL_VIDEODRIVER", None)
+
+    # Record the parameters this session is authored under, so `import` need not be told them again.
+    # --det-fps is a separate argument on both subcommands, each defaulting to 60: authoring at 30
+    # and importing without the flag used to record 60, and BOTH halves would then pace at 60
+    # against a session played at 30. Nothing failed loudly; the anchors just moved.
+    with open(session_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2)
 
     print(f"authoring '{args.name}' -> {out_dir}")
     print("  F6 = this frame looks CORRECT     F7 = this frame looks WRONG")
@@ -382,6 +593,25 @@ def cmd_author(args):
 # ---------------------------------------------------------------------------------------------
 # import
 # ---------------------------------------------------------------------------------------------
+
+def _flag_was_passed(key):
+    """True if --key appears in argv. argparse cannot distinguish a default from an explicit value,
+    and here the difference decides whether the stored session or the command line wins.
+
+    Abbreviations count. argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps while
+    matching neither `--det-fps` nor `--det-fps=`; the session would then silently override a flag
+    the person did type, which is the exact failure this helper exists to prevent.
+    """
+    flag = "--" + key.replace("_", "-")
+    for arg in sys.argv[1:]:
+        name = arg.split("=", 1)[0]
+        # A prefix of the flag, at least "--x", is how argparse resolves an abbreviation. Being
+        # generous here is safe: the cost of a false positive is honouring the command line, which
+        # is what an explicit flag should do anyway.
+        if len(name) > 2 and name.startswith("--") and flag.startswith(name):
+            return True
+    return False
+
 
 def cmd_import(args):
     manifest = os.path.join(args.capture_dir, "snaps.jsonl")
@@ -408,6 +638,23 @@ def cmd_import(args):
     if not usable:
         raise SystemExit("snaps: every snap in this session was unanchored; nothing to import")
 
+    # Prefer what the session was actually authored under. An explicitly passed flag still wins, so
+    # a deliberate override remains possible; what this removes is the SILENT disagreement.
+    session = {}
+    session_path = os.path.join(args.capture_dir, "session.json")
+    if os.path.exists(session_path):
+        try:
+            with open(session_path, "r", encoding="utf-8") as handle:
+                session = json.load(handle)
+        except (OSError, ValueError) as exc:
+            print(f"  note: {session_path} unreadable ({exc}); falling back to the command line")
+    for key in SESSION_KEYS:
+        if key in session and not _flag_was_passed(key):
+            if getattr(args, key) != session[key]:
+                print(f"  {key}: using {session[key]!r} from the authoring session "
+                      f"(command-line default was {getattr(args, key)!r})")
+            setattr(args, key, session[key])
+
     route_src = args.route or os.path.join(args.capture_dir, "route.pad")
     if not os.path.exists(route_src):
         raise SystemExit(f"snaps: no route at {route_src}. An authoring run must set "
@@ -433,10 +680,12 @@ def cmd_import(args):
         snaps.append({
             "index": record["index"],
             "verdict": record["verdict"],
+            "mode": record.get("mode", "anchor"),
             "pad_flip": record["pad_flip"],
             **signature,
         })
-        print(f"  snap {record['index']:>3} {record['verdict']:<9} flip {record['pad_flip']:>6}  "
+        print(f"  snap {record['index']:>3} {record['verdict']:<9} "
+              f"{record.get('mode','anchor'):<6} flip {record['pad_flip']:>6}  "
               f"{signature['distinct_colors']:>6} colors  "
               f"nonblack {signature['nonblack_ratio']:.3f}")
 
@@ -471,7 +720,38 @@ def cmd_import(args):
 # check
 # ---------------------------------------------------------------------------------------------
 
-def window_offsets(entry):
+def window_offsets(entry, snap=None):
+    """Offsets for one snap. A snap marked `scan` searches a wide forward span instead."""
+    if snap is not None and snap.get("mode") == "scan":
+        return scan_offsets(entry)
+    return _anchor_offsets(entry)
+
+
+def scan_offsets(entry):
+    """A wide, forward-biased sweep: a little before the anchor, a long way after.
+
+    Sampling is uniform here rather than geometric. The anchor-window case knows the match is
+    probably near the anchor; a scan is used precisely when it is NOT, so weighting toward the anchor
+    would spend the samples in the least likely place.
+    """
+    # Floor both at 0. Neither has a CLI flag and cmd_import never writes them, so a negative can
+    # only arrive from a hand-edited store -- but the clamp below is a filter, and a negative bound
+    # makes it drop every offset INCLUDING the anchor itself. The snap would then report NOT REACHED
+    # with nothing to indicate the store was the problem. Verified: {forward:100, back:-200} and
+    # {forward:-10, back:-10} both yielded [] before this.
+    forward = max(0, entry.get("scan_forward", DEFAULT_SCAN_FORWARD))
+    back = max(0, entry.get("scan_back", DEFAULT_SCAN_BACK))
+    samples = max(2, entry.get("scan_samples", DEFAULT_SCAN_SAMPLES))
+    span = forward + back
+    step = max(1, span // (samples - 1))
+    # Clamp to the configured span. `step` floors at 1, so a sample count larger than the span would
+    # otherwise walk past `forward` -- {forward:10, back:0, samples:33} produced offsets 0..32, more
+    # than three times the span it was asked for, and a zero span produced 0..32 as well.
+    offsets = sorted({-back + i * step for i in range(samples)} | {0})
+    return [o for o in offsets if -back <= o <= forward]
+
+
+def _anchor_offsets(entry):
     """Flip offsets sampled either side of each anchor, always including 0 (the exact anchor).
 
     Spacing is GEOMETRIC, not uniform: dense near the anchor and sparse at the edges. Measured
@@ -501,7 +781,7 @@ def candidate_flips(entry):
     a flip before the origin does not exist."""
     out = set()
     for snap in entry["snaps"]:
-        for offset in window_offsets(entry):
+        for offset in window_offsets(entry, snap):
             flip = snap["pad_flip"] + offset
             if flip >= 0:
                 out.add(flip)
@@ -517,7 +797,7 @@ def best_match(snap, entry, actuals, out_dir):
     """
     best = None
     reference = decode_luma(snap["luma16x9"])
-    for offset in window_offsets(entry):
+    for offset in window_offsets(entry, snap):
         flip = snap["pad_flip"] + offset
         record = actuals.get(flip)
         if not record:
@@ -540,20 +820,10 @@ def run_replay(entry, out_dir):
         raise SystemExit(f"snaps: dump not found: {dump_path}")
     if not os.path.exists(APP):
         raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
-    flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
-    env = dict(os.environ)
-    apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS),
-                              entry.get("det_clock", "on") == "on")
-    if entry.get("savedata", "fresh") == "fresh":
-        apply_fresh_savedata(env, out_dir)
-    env.update({
-        "SDL_VIDEODRIVER": "offscreen",
-        "PROSPER_RENDER": "1",
-        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
-        "PROSPER_SNAP_DIR": out_dir,
-        "PROSPER_SNAP_AT_FLIPS": flips,
-        "PROSPER_PAD_SCRIPT": "@" + os.path.join(REPO_ROOT, entry["route"]),
-    })
+    # The whole environment -- pacing, clock, fresh savedata, route, capture anchors -- is built by
+    # replay_env() so a test can assert what a check actually replays under. It used to be inlined
+    # here, which is how the reader fallback regressed unnoticed: there was nothing a test could call.
+    env = replay_env(entry, out_dir)
     log = os.path.join(out_dir, "run.log")
     manifest = os.path.join(out_dir, "actuals.jsonl")
 
@@ -612,8 +882,7 @@ def cmd_check(args):
     failures = 0
     for name in names:
         entry = load_entry(name)
-        out_dir = os.path.join(tempfile.gettempdir(), f"prosper-snaps-{name}")
-        out_dir = os.environ.get("PROSPER_SNAP_OUT", out_dir)
+        out_dir = os.environ.get("PROSPER_SNAP_OUT", default_check_out_dir(name))
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir, exist_ok=True)
         print(f"[snaps] {name}: replaying {len(entry['snaps'])} anchor(s)")
@@ -624,7 +893,8 @@ def cmd_check(args):
 
         for snap in entry["snaps"]:
             flip = snap["pad_flip"]
-            label = f"  snap {snap['index']:>3} {snap['verdict']:<9} flip {flip:>6}"
+            label = (f"  snap {snap['index']:>3} {snap['verdict']:<9} "
+                     f"{snap.get('mode','anchor'):<6} flip {flip:>6}")
             found = best_match(snap, entry, actuals, out_dir)
             if not found:
                 # Never silently pass a snap that was not reached: that is the failure mode the
@@ -640,7 +910,7 @@ def cmd_check(args):
             # the title screen ~600-1100 flips later under machine load, and the edge match was the
             # only visible tell.
             span = entry.get("flip_window", DEFAULT_FLIP_WINDOW)
-            at_edge = span > 0 and abs(offset) >= span
+            at_edge = (snap.get("mode") != "scan") and span > 0 and abs(offset) >= span
             actual_image = os.path.join(out_dir, record["file"])
             matched = ssim >= threshold
             # Report where in the window the best match came from. A snap that only matches at the
@@ -738,7 +1008,12 @@ def cmd_list(args):
     return 0
 
 
-def main():
+def build_parser():
+    """The CLI, separated from main() so tests can drive the REAL argument parsing.
+
+    Hand-built args objects cannot see a defaulting bug, an argument registered on one subcommand
+    and not another, or a flag whose dest does not match what the code reads.
+    """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -747,8 +1022,9 @@ def main():
     aut.add_argument("--name", required=True)
     aut.add_argument("--dump", required=True, help="e.g. PPSA25009-app0")
     aut.add_argument("--out", help="capture directory (default ~/snaps/<name>)")
-    aut.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="on",
-                     help="off for titles the pinned clock breaks (GRIS freezes on its FMV)")
+    aut.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="off",
+                     help="pin the guest clock; OFF by default -- it replaces every guest time "
+                          "source and breaks some titles (GRIS freezes on its FMV)")
     aut.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
                      help="guest clock rate; must match at check time")
     aut.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",
@@ -766,8 +1042,8 @@ def main():
                      help="safety net only; the run normally ends when the last "
                           "anchor is captured")
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
-    imp.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="on",
-                     help="off for titles the pinned clock breaks (GRIS freezes on its FMV)")
+    imp.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="off",
+                     help="must match how the session was authored")
     imp.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
                      help="must match how the session was authored")
     imp.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",
@@ -792,7 +1068,11 @@ def main():
     lst = sub.add_parser("list", help="list snap sets")
     lst.set_defaults(func=cmd_list)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     return args.func(args)
 
 

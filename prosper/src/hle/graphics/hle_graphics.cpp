@@ -193,16 +193,23 @@ extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx
 
 // Hold the GUEST flip rate at PROSPER_FLIP_PACE_FPS, sleeping in the flip path when we are ahead.
 //
-// This exists for interactive authoring under PROSPER_DET_CLOCK. That clock advances guest time by
-// 1/DET_FPS per flip, which makes anchors independent of how fast the host renders -- the property
-// the snapshot routes need. The side effect is that guest time then runs at host_fps/DET_FPS: an
-// Alex Kidd splash screen rendering at 189 fps played at 3.1x speed, and a heavy scene at 28 fps
-// crawled at 0.47x. Measured across one authoring session: mean 95 fps, i.e. 1.58x real time,
-// swinging by a factor of six. A person cannot judge "does this look right" against that.
+// Snapshot routes are FLIP-anchored ("press Cross at flip 1200"), so "the same flip" only means "the
+// same moment in the game" if flips happen at a fixed RATE. That correspondence is what this
+// provides, and the snapshot tool sets it on BOTH sides -- while a person authors, and again when a
+// check replays. If only one side paces, the route does not merely drift, it DIVERGES: a press lands
+// at a different guest time and can be swallowed entirely.
 //
-// Pacing the flips to the same rate makes guest time equal REAL time again while keeping the
-// determinism, because the clock and the pacer are then driven by the same number. Off by default,
-// and never wanted for an automated check -- there the whole point is to run as fast as possible.
+// It also fixes a second problem when PROSPER_DET_CLOCK is on. That clock advances guest time by
+// 1/DET_FPS per flip, so guest time then runs at host_fps/DET_FPS: an Alex Kidd splash screen
+// rendering at 189 fps played at 3.1x speed, and a heavy scene at 28 fps crawled at 0.47x -- mean
+// 1.58x across one authoring session, swinging by a factor of six. A person cannot judge "does this
+// look right" against that.
+//
+// LIMIT: this can only slow a fast host DOWN. flip_pace_wait() sleeps when ahead and re-anchors when
+// behind, so on any title/host that cannot sustain the requested rate it is inert and the anchors
+// drift again. That is the case scan-mode snaps exist for.
+//
+// Off by default; the snapshot tool opts in on both sides.
 //
 // Deliberately a sleep in the flip path rather than a frame limiter in the frontend: the guest's
 // flip count is what the clock and the anchors are defined against, and the host's swapchain
@@ -710,7 +717,7 @@ HLE(g_vo_submitflip)  {
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
     flip_advance(buffer_index, (int64_t)a3);
-    flip_pace_wait();                              // interactive authoring: hold real-time pacing
+    flip_pace_wait();                              // both halves pace: see flip_pace_wait
     gpu::present_flip(buffer_index, (int64_t)a3);   // present the buffer (scanout front + count)
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
@@ -727,7 +734,7 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
-    flip_pace_wait();                      // interactive authoring: hold real-time pacing
+    flip_pace_wait();                      // both halves pace: see flip_pace_wait
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }

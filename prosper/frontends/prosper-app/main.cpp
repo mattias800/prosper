@@ -1608,6 +1608,7 @@ int main(int argc, char** argv) {
     // comment on prosper_pad_flip_ordinal() in hle_pad.cpp for what that would corrupt.
     const std::string snapDir = getenv("PROSPER_SNAP_DIR") ? getenv("PROSPER_SNAP_DIR") : grabDir;
     std::optional<prosper::frontend::SnapVerdict> pendingSnapVerdict;
+    prosper::frontend::SnapMode pendingSnapMode = prosper::frontend::SnapMode::anchor;
     uint32_t snapCount = 0;
     // Check side: capture the presented frame as each authored anchor arrives. Sorted ascending by
     // the parser, so one forward-only cursor covers the run -- and a target already passed when the
@@ -1829,7 +1830,9 @@ int main(int argc, char** argv) {
     auto flushPendingSnap = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
         if (!pendingSnapVerdict) return;
         const prosper::frontend::SnapVerdict verdict = *pendingSnapVerdict;
+        const prosper::frontend::SnapMode mode = pendingSnapMode;
         pendingSnapVerdict.reset();
+        pendingSnapMode = prosper::frontend::SnapMode::anchor;
         const int64_t flip = prosper_pad_flip_ordinal();
         const uint32_t index = snapCount++;
         const std::string name = prosper::frontend::snap_file_name(index, verdict, flip);
@@ -1845,7 +1848,7 @@ int main(int argc, char** argv) {
             (std::filesystem::path(snapDir) / "snaps.jsonl").string();
         if (FILE* f = fopen(manifest.c_str(), "a")) {
             std::fprintf(f, "%s\n", prosper::frontend::snap_record_line(
-                index, verdict, flip, gpu::present_count(), w, h, name,
+                index, verdict, mode, flip, gpu::present_count(), w, h, name,
                 grabNamer.title_id()).c_str());
             fclose(f);
         } else {
@@ -1854,7 +1857,7 @@ int main(int argc, char** argv) {
                          name.c_str(), manifest.c_str());
         }
         std::fprintf(stderr, "%s\n",
-                     prosper::frontend::snap_author_line(index, verdict, flip, name).c_str());
+                     prosper::frontend::snap_author_line(index, verdict, mode, flip, name).c_str());
     };
 
     auto flushPendingActual = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
@@ -2210,6 +2213,13 @@ int main(int argc, char** argv) {
                         pendingSnapVerdict = ev.key.key == SDLK_F6
                             ? prosper::frontend::SnapVerdict::correct
                             : prosper::frontend::SnapVerdict::incorrect;
+                        // SHIFT marks the frame as one to SCAN for rather than expect at a fixed
+                        // offset -- for anything sitting after a loading screen, an FMV, or any
+                        // other stretch whose length depends on the machine. The person pressing
+                        // the key is the only one who knows that, and they know it right now.
+                        pendingSnapMode = (ev.key.mod & SDL_KMOD_SHIFT)
+                            ? prosper::frontend::SnapMode::scan
+                            : prosper::frontend::SnapMode::anchor;
                     }
                     continue;
                 }
