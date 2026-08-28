@@ -341,6 +341,94 @@ into swap. Kill by explicit PID (never `pkill`).
 `97ecc58a` is what made **GTA V** render its world. A revert is not acceptable — the fix must keep
 both titles working.
 
+## Where the gameplay frame actually goes (2026-08-28, Linux/AMD, `aced0703`)
+
+Measured on an **interactive human-played session** at the Bedroom (Rank 2), ~20.7 fps — the owner
+pressed F8 and F9 in-game and the live process was sampled with `perf` while it ran. Three
+independent instruments, and they agree on the shape. Full decomposition in
+[#1284](https://github.com/mattias800/prosper/issues/1284).
+
+**The GPU is idle. This title is entirely CPU-bound on resource preparation.** F8, 5.03 s window,
+19.89 flips/s, 3732.5 ms of graphics time:
+
+| component | time | share |
+| --- | --- | --- |
+| **renderer-resource** | **2378.5 ms** | **61%** |
+| gpu-wait | 241.9 ms | 6.5% |
+| gpu-wait-overhead | 159.8 ms | 4.3% |
+| compute | 176.3 ms | 4.7% |
+| **gpu-device** | **82.1 ms** | **2.2%** |
+
+82 ms of device work per five seconds. `gpu-device` at 2.2% reproduces the figure recorded for the
+*menu* frame under #2215 — same number, now in gameplay, on a different OS and vendor.
+
+**Texture materialization is the largest single cost, ~3x the buffer path:**
+
+```
+build_resources (frontend materializer): 1297.1ms  [texture=1068.8 buffer=99.0]
+setup_resources (backend binding):       1081.3ms  [texture=533.5 buffer=443.9 (copy=313.0
+                                                    index_find=30.9 index_insert=33.7 hash=16.0)
+                                                    descriptor=59.3]
+```
+
+texture 1068.8 + 533.5 = **1602.3 ms = 43%** of graphics; buffer 542.9 ms = 14.5%.
+
+### The 43% is NOT reached by the mechanism #2289 measured — check before optimising it
+
+[#2289](https://github.com/mattias800/prosper/issues/2289) measured **43% of the Windows MENU frame**
+going to `memcmp` revalidating already-cached textures. The *share* reproduces here almost exactly
+(43%), which makes it very tempting to assume the same cause. **The instruction mix says otherwise.**
+`perf record -F 499 --call-graph=dwarf` for 15 s on the live process, 65,756 samples:
+
+| symbol | self |
+| --- | --- |
+| `__memmove_avx512_unaligned_erms` | **16.76%** |
+| `__memset_avx512_unaligned_erms` | **7.58%** |
+| `prosper::gpu::rdna2_walk` | 4.11% |
+| `ShaderCompileKeyHash::compute` | 2.90% |
+| `_int_malloc` | 2.76% |
+| `prosper::test::render_draw_pass_rgba` | 2.20% |
+| `prosper::gpu::resolve_dynamic_fetch` | 1.85% |
+| `prosper::gpu::realize_draw_item` | 1.66% |
+| `prosper::gpu::rdna2_decode_one` | 1.57% |
+| `prosper::gpu::extract_render_state` | 1.43% |
+| `getenv` | 1.24% |
+| guest Unity `Job.Worker` JIT frames | ~12% across 9 workers |
+
+**`memcmp` appears nowhere in the top 20.** This is copying and zeroing — 24.3% combined — not
+comparing. Either Linux gameplay reaches the same total by a different route, or revalidation stops
+dominating once a 3D scene streams. Two matching percentages are not a matching mechanism, and this
+is the cheapest possible place to lose a week.
+
+*Bound on that claim:* 38.67% of `perf` samples were lost during capture, so absence from the top 20
+is weaker evidence than presence. The dwarf callchains did not survive either, so **nobody has yet
+attributed the 16.76% `memmove` to a caller** — that is the single most valuable next measurement,
+and it needs a capture with `--call-graph=fp` or a smaller `-F`.
+
+### Two smaller results, both looking free
+
+- **~10.4% is shader decode/hashing, every frame in steady state**: `rdna2_walk` + `ShaderCompileKeyHash::compute`
+  + `rdna2_decode_one` + `resolve_dynamic_fetch`. Recompilation is supposed to be cached; something
+  re-walks or re-keys per draw.
+- **`getenv` is 1.24%**, pure overhead — 66 of 88 `getenv("PROSPER_*")` sites in `render_runner.h`
+  are uncached, 41 of 61 in `live_renderer.cpp`, 23 of 27 in `gpu_execute.hpp`, several per-draw.
+  [#3094](https://github.com/mattias800/prosper/issues/3094).
+
+### Compute is one program
+
+`0xa9ce619f334a683e` at `0x2011d4c800` — 2424 dispatches in 5.03 s (485/s), mean 0.07 ms, max
+0.34 ms, total 176.3 ms. No unknown groups.
+
+### The F9 frame is a trustworthy offline workbench
+
+`frame_grab_PPSA25009_20260828-070747-361.prgbundle`: 1 submit, 356 operations, 137 resources,
+~996 MiB logical / 356 MiB unique. It **replays pixel-faithfully** — 0 of 129,600 sampled pixels
+differ by more than 8/255 from the live capture (max channel delta 5), hash `a72336b7b796cec3`. So
+this exact Bedroom frame can be iterated on offline with `gpu_replay --bundle` without re-routing.
+Note the bundle's own `exact-reuse=0` / `logical=` counters describe **capture-file deduplication**,
+not runtime caching — they say nothing about whether prosper re-uploads a texture per frame, and
+reading them that way is a trap.
+
 ## Ruled out (do-not-redo list)
 
 **The pure-black frame on master, 2026-08-28 (#3089, fixed by the PR that adds this row).** The
