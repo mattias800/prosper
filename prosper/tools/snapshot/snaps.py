@@ -369,7 +369,7 @@ def reconcile_session(args, existing, was_passed=None):
     """
     was_passed = _flag_was_passed if was_passed is None else was_passed
     if not (getattr(args, "append", False) and isinstance(existing, dict) and existing):
-        return session_record(args), [], []
+        return session_record(args, existing), [], []
     adopted, conflicts = [], []
     for key in SESSION_KEYS:
         if key not in existing:
@@ -382,12 +382,18 @@ def reconcile_session(args, existing, was_passed=None):
         setattr(args, key, _coerce_like(existing[key], getattr(args, key)))
     # Rewrite the record even when nothing differed: a session file written by an older version can
     # be missing a key, and this is the only chance to complete it.
-    return session_record(args), adopted, conflicts
+    return session_record(args, existing), adopted, conflicts
 
 
-def session_record(args):
-    """What an authoring session stores about itself, so `import` need not be told again."""
-    record = {key: getattr(args, key) for key in SESSION_KEYS}
+def session_record(args, existing=None):
+    """What an authoring session stores about itself, so `import` need not be told again.
+
+    Anything already in the file that this tool does not understand is CARRIED THROUGH. A session
+    file is hand-editable and a person may have annotated it; silently dropping their keys on the
+    next --append is data loss that announces nothing.
+    """
+    record = dict(existing) if isinstance(existing, dict) else {}
+    record.update({key: getattr(args, key) for key in SESSION_KEYS})
     record["name"] = args.name
     return record
 

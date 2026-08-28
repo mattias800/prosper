@@ -160,6 +160,10 @@ def main():
               "both verdicts survive the round trip")
         check(os.path.exists(os.path.join(refs, "unit", "0000.bmp")),
               "the reference image is kept locally for later A/B review")
+        # The entry records a route path; if the file is not actually copied there, every later
+        # check dies on a missing route rather than on anything to do with rendering.
+        check(os.path.exists(os.path.join(tmp, entry["route"])),
+              "the route named by the entry actually exists at that path after import")
 
         # ---- 4b. import takes its parameters from the SESSION, not from its own defaults -------
         # --det-fps is a separate argument on `author` and on `import`, each defaulting to 60. Author
@@ -309,12 +313,45 @@ def main():
             det_clock = "off"
             savedata = "none"
 
+        # Every arm below used to pass det_clock="off" and savedata="none", so two of author_env's
+        # three lines were structurally unreachable: the arm asserting "PROSPER_DET_CLOCK not in
+        # aenv" is true whether the call is there or not. That is a positive control that cannot
+        # express the case it validates. Sweep the actual domain instead.
+        for clock in ("on", "off"):
+            for save in ("fresh", "none"):
+                class Dom:
+                    name = "dom"; det_fps = 45; det_clock = clock; savedata = save
+                d_root = os.path.join(tmp, f"dom-{clock}-{save}")
+                denv = snaps.author_env(Dom(), d_root, base={})
+                check(denv.get("PROSPER_FLIP_PACE_FPS") == "45",
+                      f"author_env paces at det_fps for clock={clock} savedata={save}")
+                # The clock line: present exactly when the session asks for it.
+                check((denv.get("PROSPER_DET_CLOCK") == "1") == (clock == "on"),
+                      f"author_env applies the deterministic clock iff asked (clock={clock})")
+                check((denv.get("PROSPER_DET_FPS") == "45") == (clock == "on"),
+                      f"...and passes the rate with it (clock={clock})")
+                # The savedata line: the AUTHOR half must isolate saves too, or the person plays
+                # against their real saves while the check runs fresh, and a title offering
+                # "Continue" puts it above "New Game" -- the same inputs pick a different item.
+                isolated = "PROSPER_SAVEDATA_DIR" in denv and "PROSPER_SAVE0" in denv
+                check(isolated == (save == "fresh"),
+                      f"author_env isolates BOTH save roots iff savedata=fresh (savedata={save})")
+                if save == "fresh":
+                    check(denv.get("PROSPER_SAVEDATA_DIR", "").startswith(d_root)
+                          and denv.get("PROSPER_SAVE0", "").startswith(d_root),
+                          "...under the session's own directory, not the developer's saves")
+
         aenv = snaps.author_env(AuthorArgs(), tmp, base={})
         check(aenv.get("PROSPER_FLIP_PACE_FPS") == "30",
               "the AUTHORING session paces its flips too")
         check("PROSPER_DET_CLOCK" not in aenv, "...with the clock off when the session says off")
         check(aenv.get("PROSPER_PAD_RECORD", "").endswith("route.pad"),
               "...and records the route the check will replay")
+        check(aenv.get("PROSPER_RENDER") == "1",
+              "...with the live renderer on -- authoring is a person looking at the game")
+        check("SDL_VIDEODRIVER" not in snaps.author_env(
+                  AuthorArgs(), tmp, base={"SDL_VIDEODRIVER": "offscreen"}),
+              "...and an inherited offscreen driver is CLEARED, or there is no window to look at")
 
         # The two halves must agree by CONSTRUCTION, not by two literals that happen to match.
         # Same det_fps in, same pace out, whichever side computes it.
@@ -438,6 +475,8 @@ def main():
               "hand-written mirror in between")
         check(round_tripped.get("det_clock") == "off",
               "...and the clock stance, through the same path")
+        check(round_tripped.get("savedata") == "none",
+              "...and savedata -- the third SESSION_KEY, which had no round-trip arm")
         check(snaps.replay_env(round_tripped, tmp, base={}).get("PROSPER_FLIP_PACE_FPS") == "30",
               "...so the check ends up paced at the rate the session was authored at")
 
@@ -498,8 +537,15 @@ def main():
         check(seen2["env"].get("PROSPER_FLIP_PACE_FPS") == "30",
               "...paced at the session's rate, not the CLI default")
         check("NOTE" in out2 and "30" in out2, "...and says which settings it adopted")
-        check("60" not in out2.split("NOTE")[0].split("paced to")[-1][:6],
-              "...without also claiming the default rate in the same run")
+        # Read the CLOCK BANNER line specifically. An earlier version of this arm sliced
+        # out2.split("NOTE")[0], which on this path is the two-space prefix before the NOTE -- it
+        # could not contain the banner at all, so it passed with "60/s" hardcoded into the source.
+        banner = [ln for ln in out2.splitlines() if "guest clock:" in ln]
+        check(len(banner) == 1, "the run prints exactly one clock banner")
+        check("paced to 30/s" in banner[0],
+              "...and the banner states the rate the run is ACTUALLY paced at")
+        check("60" not in banner[0],
+              "...never the command-line default it did not use")
 
         # A key missing from an older session file is completed by the run that notices it.
         with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
@@ -530,6 +576,28 @@ def main():
         # Restore for anything downstream.
         with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
             json.dump(before, handle)
+
+        # The PINNED branch of the clock banner. Nothing reached it: author_run's directory is
+        # authored clock-off, so the banner's rate could be hardcoded in silence.
+        pinned_dir = os.path.join(tmp, "pinned")
+        saved3 = (snaps.APP, snaps.subprocess.run, sys.argv, sys.stdout)
+        pbuf = io.StringIO()
+        try:
+            snaps.APP = fake_app
+            snaps.subprocess.run = fake_run
+            sys.argv = ["snaps.py", "author", "--name", "pin", "--dump", fake_dump,
+                        "--out", pinned_dir, "--det-clock", "on", "--det-fps", "45"]
+            sys.stdout = pbuf
+            snaps.cmd_author(snaps.build_parser().parse_args(sys.argv[1:]))
+        finally:
+            snaps.APP, snaps.subprocess.run, sys.argv, sys.stdout = saved3
+        pinned_out = pbuf.getvalue()
+        pbanner = [ln for ln in pinned_out.splitlines() if "guest clock:" in ln]
+        check(len(pbanner) == 1 and "PINNED" in pbanner[0],
+              "a --det-clock on session announces the clock as PINNED")
+        check("45" in pbanner[0],
+              "...at the rate actually requested, not a hardcoded default")
+        check("60" not in pbanner[0], "...and does not name a rate it is not using")
 
         # ---- 6a1b-iii-d. The refusals that protect an existing session ----------------------
         # These are the guards that stop a mistake becoming data loss, and every one of them could
@@ -579,6 +647,55 @@ def main():
         exc = import_dir(only_unanchored)
         check(isinstance(exc, SystemExit) and "unanchored" in str(exc),
               "a session whose every snap is unanchored is refused, and says why")
+
+        # ---- 6a1b-iii-f. cmd_import: an EXPLICIT flag beats the stored session ---------------
+        # snaps.py's own comment states this contract in prose ("An explicitly passed flag still
+        # wins, so a deliberate override remains possible"), and nothing tested it: dropping the
+        # `not _flag_was_passed(key)` half of the guard left the suite green. Then a deliberate
+        # re-import at a different rate is discarded without a word, replay_env paces the check at
+        # the session's rate instead, and every anchor lands somewhere else.
+        def import_with_argv(argv, capture, name):
+            saved_argv = sys.argv
+            try:
+                sys.argv = ["snaps.py", "import", capture, "--name", name] + argv
+                args_i = snaps.build_parser().parse_args(sys.argv[1:])
+                buf = io.StringIO()
+                saved_out, sys.stdout = sys.stdout, buf
+                try:
+                    snaps.cmd_import(args_i)
+                finally:
+                    sys.stdout = saved_out
+                return snaps.load_entry(name)
+            finally:
+                sys.argv = saved_argv
+
+        # A capture whose session says 60/on.
+        ovr = os.path.join(tmp, "ovr")
+        os.makedirs(ovr, exist_ok=True)
+        write_bmp(os.path.join(ovr, "snap_0000_correct_f900.bmp"), 64, 36,
+                  lambda x, y: (x * 2 % 256, y % 256, 10))
+        with open(os.path.join(ovr, "snaps.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "index": 0, "verdict": "correct", "mode": "anchor", "pad_flip": 900,
+                "guest_present": 900, "width": 64, "height": 36,
+                "file": "snap_0000_correct_f900.bmp", "title_id": "PPSATEST"}) + "\n")
+        open(os.path.join(ovr, "route.pad"), "w", encoding="utf-8").write("f900:cross\n")
+        with open(os.path.join(ovr, "session.json"), "w", encoding="utf-8") as handle:
+            json.dump({"det_fps": 60, "det_clock": "on", "savedata": "fresh"}, handle)
+
+        # No flags -> the session wins (this is the case already covered).
+        default_entry = import_with_argv([], ovr, "ovr-default")
+        check(default_entry.get("det_fps") == 60 and default_entry.get("det_clock") == "on",
+              "importing with no flags adopts the session's settings")
+
+        # Explicit flags -> the CALLER wins, on both keys.
+        forced = import_with_argv(["--det-fps", "30", "--det-clock", "off"], ovr, "ovr-forced")
+        check(forced.get("det_fps") == 30,
+              "an explicitly passed --det-fps OVERRIDES the stored session")
+        check(forced.get("det_clock") == "off",
+              "...and so does an explicitly passed --det-clock")
+        check(snaps.replay_env(forced, tmp, base={}).get("PROSPER_FLIP_PACE_FPS") == "30",
+              "...so the check is paced at what the person asked for, not what was stored")
 
         # ---- 6a1b-iv. A check does not write its frames into the shared tmpfs ----------------
         # /tmp here is RAM-backed with a per-user quota shared by every concurrent agent, and
@@ -655,6 +772,20 @@ def main():
             check(survived,
                   f"reconcile_session treats {junk!r} as no session at all, rather than crashing "
                   f"({rec_j if not survived else ''})")
+
+        # A session file is hand-editable and may carry keys this tool does not know. Dropping them
+        # on the next --append is data loss that announces nothing. (I reported this fixed a round
+        # before it actually was; it is fixed here.)
+        class Keep:
+            name = "s"; det_fps = 30; det_clock = "off"; savedata = "fresh"; append = True
+
+        kept, _, _ = snaps.reconcile_session(
+            Keep(), {"det_fps": 30, "authored_by": "someone", "notes": "first run"},
+            was_passed=lambda k: False)
+        check(kept.get("authored_by") == "someone" and kept.get("notes") == "first run",
+              "an append carries through keys the tool does not understand")
+        check(kept.get("savedata") == "fresh",
+              "...while still completing the ones it does")
 
         # ---- 6a1b-vi. _flag_was_passed sees argparse ABBREVIATIONS -----------------------------
         # argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps. An exact-match
