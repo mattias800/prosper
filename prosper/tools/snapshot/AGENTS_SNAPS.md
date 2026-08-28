@@ -10,7 +10,20 @@ reaches the entrance hall inside 300–780 s any more.
 
 ## Authoring: play the game
 
-Run the title normally — a real window, audio, a pad — and record the route while you play:
+```bash
+python3 prosper/tools/snapshot/snaps.py author --name blue-prince --dump PPSA25009-app0
+```
+
+That launches the title with a real window, audio and pad, records the input route, and puts the
+snaps in `~/snaps/blue-prince`. One command rather than four environment variables, because getting
+`PROSPER_PAD_RECORD` wrong is not a *visible* mistake: you play the whole session, press F6/F7
+happily, and only discover at import time that there is no route and none of it can be replayed.
+
+It refuses to reuse a session directory, for the same class of reason — snap indices restart at 0
+each run, so a second session into one directory would overwrite the first session's images while
+appending to its manifest. Use a fresh `--out`, or `--append` if you mean it.
+
+The equivalent by hand, if you want to add your own variables:
 
 ```bash
 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \

@@ -37,6 +37,7 @@ clone the numbers still work, but "show me what it used to look like" only works
 authored the run (or anyone who re-authors it).
 
 USAGE
+    snaps.py author --name <name> --dump <TITLE-app0>              play, and press F6/F7
     snaps.py import <capture-dir> --name <name> [--route <file>]   adopt an authoring session
     snaps.py check [name ...]                                      replay and compare; exit 1 on failure
     snaps.py accept <name> <index> [<index> ...]                   promote an actual to be the new snap
@@ -227,6 +228,67 @@ def list_names():
     if not os.path.isdir(SNAP_STORE):
         return []
     return sorted(f[:-5] for f in os.listdir(SNAP_STORE) if f.endswith(".json"))
+
+
+# ---------------------------------------------------------------------------------------------
+# author
+# ---------------------------------------------------------------------------------------------
+
+def cmd_author(args):
+    """Launch the game for an authoring session: real window, audio, pad, route recording on.
+
+    This exists so authoring is one command rather than four environment variables remembered
+    correctly. Getting PROSPER_PAD_RECORD wrong is not a visible mistake -- you play the whole
+    session, press F6/F7 happily, and only discover at import time that there is no route and the
+    snaps can never be replayed.
+    """
+    dump = args.dump
+    if not dump:
+        raise SystemExit("snaps: --dump is required (e.g. --dump PPSA25009-app0)")
+    dump_path = dump if os.path.isabs(dump) else os.path.join(GAME_ROOT, dump)
+    if not os.path.isdir(dump_path):
+        raise SystemExit(f"snaps: dump not found: {dump_path}")
+    if not os.path.exists(APP):
+        raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
+
+    out_dir = args.out or os.path.join(os.path.expanduser("~"), "snaps", args.name)
+    if os.path.exists(os.path.join(out_dir, "snaps.jsonl")) and not args.append:
+        raise SystemExit(
+            f"snaps: {out_dir} already holds an authoring session.\n"
+            f"       Snap indices restart at 0 each run, so a second session would overwrite the\n"
+            f"       first session's images while appending to its manifest. Use a fresh --out, or\n"
+            f"       --append if you really mean to continue into the same directory.")
+    os.makedirs(out_dir, exist_ok=True)
+    route = os.path.join(out_dir, "route.pad")
+
+    env = dict(os.environ)
+    env.update({
+        "PROSPER_RENDER": "1",
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_SNAP_DIR": out_dir,
+        "PROSPER_PAD_RECORD": route,
+    })
+    # Deliberately NOT offscreen: authoring is a person looking at a window.
+    env.pop("SDL_VIDEODRIVER", None)
+
+    print(f"authoring '{args.name}' -> {out_dir}")
+    print("  F6 = this frame looks CORRECT     F7 = this frame looks WRONG")
+    print("  take negative snaps too: they are the only thing that will tell you a broken")
+    print("  title got fixed.\n")
+    subprocess.run([APP, dump_path], env=env, check=False)
+
+    manifest = os.path.join(out_dir, "snaps.jsonl")
+    taken = 0
+    if os.path.exists(manifest):
+        with open(manifest, "r", encoding="utf-8") as handle:
+            taken = sum(1 for line in handle if line.strip())
+    print(f"\nsession ended: {taken} snap(s) in {out_dir}")
+    if not taken:
+        print("  nothing to import -- no F6/F7 presses were recorded")
+        return 0
+    print(f"  import with: python3 {os.path.relpath(__file__, os.getcwd())} import {out_dir} "
+          f"--name {args.name}")
+    return 0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -540,6 +602,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    aut = sub.add_parser("author", help="play the game and take snaps (F6/F7)")
+    aut.add_argument("--name", required=True)
+    aut.add_argument("--dump", required=True, help="e.g. PPSA25009-app0")
+    aut.add_argument("--out", help="capture directory (default ~/snaps/<name>)")
+    aut.add_argument("--append", action="store_true",
+                     help="continue into an existing session directory")
+    aut.set_defaults(func=cmd_author)
 
     imp = sub.add_parser("import", help="adopt an authoring session")
     imp.add_argument("capture_dir")
