@@ -312,8 +312,14 @@ def cmd_author(args):
         "PROSPER_PAD_RECORD": route,
     })
     apply_deterministic_clock(env, args.det_fps)
-    print(f"  guest clock: deterministic at {args.det_fps} fps (so anchors do not depend on how "
-          f"fast this machine renders)")
+    # Pace the guest flips to the SAME rate the clock advances at, so guest time equals real time
+    # while you play. Without this the deterministic clock makes the game speed track the render
+    # rate -- measured on one authoring session: 3.1x during splash screens, 0.47x in a heavy scene,
+    # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
+    # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
+    env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
+    print(f"  guest clock: deterministic at {args.det_fps} fps, flips paced to match "
+          f"(real-time feel, and anchors that do not depend on this machine's speed)")
     if args.savedata == "fresh":
         apply_fresh_savedata(env, out_dir)
         print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
