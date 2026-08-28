@@ -343,6 +343,37 @@ both titles working.
 
 ## Ruled out (do-not-redo list)
 
+**The pure-black frame on master, 2026-08-28 (#3089, fixed by the PR that adds this row).** The
+regression bisected to `1b5b9471` (the GTA V rendering foundation, #2996) and the cause is one
+line: HTILE-driven depth/stencil invalidation was suppressed whenever the guest write carried the
+`gpu-preserving` origin, so Blue Prince's retained depth was never discarded and stale depth
+rejected the whole scene. **Do not re-derive this by reverting hunks of that commit** -- eight
+candidate mechanisms in it were eliminated by direct A/B measurement inside a single binary, and
+every one of them fires ZERO times on this title:
+
+| candidate change in `1b5b9471` | evaluations | times it fires on Blue Prince |
+| --- | --- | --- |
+| feedback narrowing (`mrt_target_view_feedback`) | 40,000 | 0 |
+| pass grouping (`mrt_same_color_pass` extent split) | 380,000 | 0 |
+| renderer mip assembly (`assemble_renderer_mips`) | — | 0 |
+| `CB_COLORn_VIEW.MIP_LEVEL` base/extent rebasing | 550,000 | 0 |
+| RECT_LIST geometry synthesis (`PROSPER_RECTLOG`) | — | 0 |
+| DCC zero-mip specialization guard removal | 820,000 | 0 |
+| **HTILE `gpu-preserving` suppression** | 60,000 | **59,999** |
+
+Two further method warnings from the same investigation, both of which cost hours:
+
+- **Comparing the first N readbacks proves nothing here.** Blue Prince is legitimately black for
+  its first ~3,500 colour readbacks on BOTH sides of the regression; the fade-in starts only around
+  #3519 and climbs to ~21%. An A/B over the first 20-30 readbacks compares two black regions and
+  reports "identical inputs" — which is what made this look like a plumbing bug for two sessions.
+  Compare a running MAXIMUM over the whole run instead of a prefix.
+- **A predicate A/B is blind to a change UPSTREAM of the value it reads.** The grouping and feedback
+  probes above computed the old and new predicates side by side and agreed 380,000/380,000 — while
+  both read the same already-rewritten `color0_base`. Agreement there bounds the predicate logic,
+  never its inputs.
+
+
 **Persistent-texture revalidation, 2026-08-07 (Windows / NVIDIA RTX 4090, #2289 / #2290 / #2295).**
 **43.6% of the frame is `memcmp` revalidating 19 cached, unchanged textures** — 233 GiB of
 comparison per ~55 s route, on a cache running 34,303 hits against 19 misses. That number stands.

@@ -19,6 +19,22 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-28
+
+### Blue Prince is back
+
+Master had been rendering a pure black frame; the title screen and its desk of curiosities are
+whole again, and the fix costs GTA V nothing.
+
+![Blue Prince title screen: the BLUE PRINCE logo over NEW GAME and SETTINGS on the left, and a dark study on the right with a globe, a red paper crown on a stack of books, an hourglass, a violin, a pocket watch and blueprints spread across a desk](assets/screenshots/blue-prince-title-restored.png)
+
+One line in the GTA V rendering foundation stopped prosper from discarding a depth buffer when the
+guest rewrote its HTILE metadata with identical bytes — sound-looking, because identical bytes ought
+to mean nothing changed. But prosper never writes rendered HiZ back into that guest plane, so the
+plane is a constant the game keeps rewriting, and "unchanged" was equally true of Blue Prince's
+per-frame depth *clear*. Its depth was never cleared, stale depth rejected every piece of geometry,
+and the screen went black. ([#3089](https://github.com/mattias800/prosper/issues/3089))
+
 ## 2026-08-27
 
 ### Tomb Raider's world really is textured now
