@@ -531,6 +531,55 @@ def main():
         with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
             json.dump(before, handle)
 
+        # ---- 6a1b-iii-d. The refusals that protect an existing session ----------------------
+        # These are the guards that stop a mistake becoming data loss, and every one of them could
+        # be deleted with the suite green until this arm existed. They are cheap to assert and they
+        # are exactly the class the review rounds kept finding.
+        _, _, _, no_dump = author_run([], dump=os.path.join(tmp, "does-not-exist"))
+        check(no_dump is not None and "dump not found" in str(no_dump),
+              "a missing dump is refused before anything is created")
+
+        # A second session in a directory that already holds one would overwrite its images while
+        # appending to its manifest, because snap indices restart at 0 each run.
+        _, _, _, clobber = author_run([])          # no --append, and e2e already holds snaps.jsonl
+        check(clobber is not None and "--append" in str(clobber),
+              "a second session without --append is refused, and the message names the flag")
+
+        # ---- 6a1b-iii-e. cmd_import's own refusals -------------------------------------------
+        def import_dir(records, with_route=True):
+            """Build a capture dir and import it; return the raised SystemExit, or None."""
+            d = os.path.join(tmp, f"imp{abs(hash(str(records))) % 100000}")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "snaps.jsonl"), "w", encoding="utf-8") as handle:
+                for r in records:
+                    handle.write(json.dumps(r) + "\n")
+            if with_route:
+                open(os.path.join(d, "route.pad"), "w", encoding="utf-8").write("f1:cross\n")
+
+            class IArgs(Args):
+                capture_dir = d
+                name = f"imp{abs(hash(str(records))) % 100000}"
+            try:
+                snaps.cmd_import(IArgs())
+                return None
+            except SystemExit as exc:
+                return exc
+            except Exception as exc:                  # noqa: BLE001 -- a crash is not a refusal
+                return RuntimeError(f"crashed instead of refusing: {type(exc).__name__}: {exc}")
+
+        # Each arm names the message it expects. Checking only "something was raised" would let ONE
+        # guard satisfy the arm for another -- an empty manifest reaches the all-unanchored guard if
+        # the empty check is removed, so a bare "is not None" passes for the wrong reason.
+        empty = import_dir([])
+        check(isinstance(empty, SystemExit) and "is empty" in str(empty),
+              "an empty manifest is refused BY THE EMPTY CHECK, named in the message")
+        only_unanchored = [{"index": 0, "verdict": "correct", "mode": "anchor", "pad_flip": -1,
+                            "guest_present": 0, "width": 64, "height": 36,
+                            "file": "x.bmp", "title_id": "PPSATEST"}]
+        exc = import_dir(only_unanchored)
+        check(isinstance(exc, SystemExit) and "unanchored" in str(exc),
+              "a session whose every snap is unanchored is refused, and says why")
+
         # ---- 6a1b-iv. A check does not write its frames into the shared tmpfs ----------------
         # /tmp here is RAM-backed with a per-user quota shared by every concurrent agent, and
         # exhausting it takes the machine's RAM rather than merely failing the write. Scan mode
