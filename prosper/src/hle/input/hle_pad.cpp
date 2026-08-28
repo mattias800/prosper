@@ -287,6 +287,22 @@ int64_t pad_frame_now() {
     return flips >= base ? (int64_t)(flips - base) : 0;
 }
 
+// Read-only view of the pad flip anchor, for the frontend's snap authoring (F6/F7). Returns -1
+// while the origin is unset.
+//
+// This deliberately does NOT reuse pad_frame_now(), even though the arithmetic is identical:
+// pad_frame_now() ESTABLISHES g_pad_flip0 on its first call. A host hotkey is pressed by a human at
+// an arbitrary moment, and if that press were the first caller it would become the route's origin --
+// shifting every f<N> in a recorded route by however long the person took to reach for the key, and
+// silently desynchronising the snaps from the route they are supposed to index. The origin belongs
+// to the guest's first pad poll and to nothing else.
+extern "C" int64_t prosper_pad_flip_ordinal() {
+    const uint64_t base = g_pad_flip0.load(std::memory_order_relaxed);
+    if (base == std::numeric_limits<uint64_t>::max()) return -1;
+    const uint64_t flips = prosper_vo_flip_count();
+    return flips >= base ? static_cast<int64_t>(flips - base) : 0;
+}
+
 // Pad-read anchor: each successful scePadRead/scePadReadState call is one read, numbered from zero.
 // Metadata queries and rejected reads do not consume it; it advances even when presentation is paused.
 std::atomic<uint64_t> g_pad_read_count{0};

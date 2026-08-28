@@ -1017,6 +1017,10 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_window_controls PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_window_controls COMMAND test_prosper_app_window_controls)
 
+  add_executable(test_prosper_app_snap_author frontends/prosper-app/test_snap_author.cpp)
+  target_include_directories(test_prosper_app_snap_author PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_snap_author COMMAND test_prosper_app_snap_author)
+
   add_executable(test_prosper_app_capture_schedule frontends/prosper-app/test_capture_schedule.cpp)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_capture_schedule COMMAND test_prosper_app_capture_schedule)
