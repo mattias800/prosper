@@ -154,6 +154,30 @@ for a quick boot would cut the route off mid-run and report every later snap as 
 failure with nothing to do with rendering, which is the whole class of bug this system exists to
 remove.
 
+### Do not anchor a snap mid-fade — measured, and it is the one real trap
+
+Two identical headless runs were driven through Blue Prince's New Game intro and sampled at the same
+anchors. At flip 8000 they agreed (**SSIM 0.995**). At flip 10000 they scored **0.465** — a failure.
+
+Opening both frames explains it, and the explanation is reassuring about FMVs and unforgiving about
+transitions: **both runs were on the same page of the same cutscene text, word for word.** The drift
+across the movie was small. What differed was that one run was *mid-fade* (non-black 0.695 vs 0.365)
+and had a subtitle the other had not yet shown.
+
+So the rule is not "avoid FMVs". It is:
+
+> **Take snaps on visually STABLE moments.** A title screen, a menu, a held gameplay view. Not
+> during a fade, a wipe, a subtitle transition, or a rapidly cutting cinematic.
+
+A few flips of drift on a stable scene is invisible. The same drift during a fade is a large
+luminance change, and SSIM is sensitive to luminance by design — it is what makes it catch a
+collapse to black.
+
+The window sampling is geometric for this reason (dense near the anchor, sparse at the edges), since
+drift is small: with `--window-samples 9` over ±900 the offsets are `0, ±43, ±196, ±478, ±900`
+rather than uniform ±225 steps. That resolves a short fade far better than even spacing, but it
+cannot rescue a snap taken in the middle of one.
+
 ## Where things live, and what is never committed
 
 | path | committed? | what |
