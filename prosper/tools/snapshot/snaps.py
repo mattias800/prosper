@@ -245,7 +245,29 @@ def list_names():
 DEFAULT_DET_FPS = 60
 
 
-def apply_deterministic_clock(env, det_fps):
+def apply_deterministic_clock(env, det_fps, enabled=True):
+    """Pin the guest clock, unless this title is one the clock breaks.
+
+    IT IS NOT UNIVERSALLY SAFE, and that has to be a per-title decision rather than a default nobody
+    can override. GRIS is the measured counterexample: with a New Game route reaching its opening
+    FMV, 150 s of run produced 42,000 frames with the clock OFF and 1,680 with it ON, plus 47
+    "Forcing submitDone to avoid TRC R4089 breach" messages -- a 25x collapse and a frozen white
+    screen where the movie should play. Booting to its title screen is unaffected; the FMV is the
+    trigger.
+
+    The mechanism is the obvious one in hindsight: video playback is A/V-sync sensitive, and a clock
+    that advances per FLIP rather than per second makes the decoder wait for a presentation time that
+    never arrives at the rate it expects.
+
+    With the clock OFF the anchors become frame-rate dependent again, which is what the search window
+    exists to absorb. A title that needs the clock off may therefore need a wider --flip-window.
+    """
+    if not enabled:
+        # Explicitly clear, so an authoring shell that exported these does not leak them into a run
+        # whose entry says the clock is off -- the check would then disagree with the authoring.
+        env.pop("PROSPER_DET_CLOCK", None)
+        env.pop("PROSPER_DET_FPS", None)
+        return
     env["PROSPER_DET_CLOCK"] = "1"
     env["PROSPER_DET_FPS"] = str(det_fps)
 
@@ -311,15 +333,21 @@ def cmd_author(args):
         "PROSPER_SNAP_DIR": out_dir,
         "PROSPER_PAD_RECORD": route,
     })
-    apply_deterministic_clock(env, args.det_fps)
+    apply_deterministic_clock(env, args.det_fps, args.det_clock == "on")
     # Pace the guest flips to the SAME rate the clock advances at, so guest time equals real time
     # while you play. Without this the deterministic clock makes the game speed track the render
     # rate -- measured on one authoring session: 3.1x during splash screens, 0.47x in a heavy scene,
     # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
     # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
-    env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
-    print(f"  guest clock: deterministic at {args.det_fps} fps, flips paced to match "
-          f"(real-time feel, and anchors that do not depend on this machine's speed)")
+    if args.det_clock == "on":
+        env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
+        print(f"  guest clock: deterministic at {args.det_fps} fps, flips paced to match "
+              f"(real-time feel, and anchors that do not depend on this machine's speed)")
+    else:
+        print("  guest clock: REAL time (--det-clock off). Anchors will depend on this machine's\n"
+              "              speed, so this set may need a wider --flip-window. Use this for titles\n"
+              "              the deterministic clock breaks -- GRIS freezes on its opening FMV with\n"
+              "              it on.")
     if args.savedata == "fresh":
         apply_fresh_savedata(env, out_dir)
         print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
@@ -424,6 +452,7 @@ def cmd_import(args):
         "min_structural_similarity": args.min_ssim,
         "savedata": args.savedata,
         "det_fps": args.det_fps,
+        "det_clock": args.det_clock,
         "flip_window": args.flip_window,
         "window_samples": args.window_samples,
         "snaps": sorted(snaps, key=lambda s: s["pad_flip"]),
@@ -513,7 +542,8 @@ def run_replay(entry, out_dir):
         raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
     flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
     env = dict(os.environ)
-    apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS))
+    apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS),
+                              entry.get("det_clock", "on") == "on")
     if entry.get("savedata", "fresh") == "fresh":
         apply_fresh_savedata(env, out_dir)
     env.update({
@@ -717,6 +747,8 @@ def main():
     aut.add_argument("--name", required=True)
     aut.add_argument("--dump", required=True, help="e.g. PPSA25009-app0")
     aut.add_argument("--out", help="capture directory (default ~/snaps/<name>)")
+    aut.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="on",
+                     help="off for titles the pinned clock breaks (GRIS freezes on its FMV)")
     aut.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
                      help="guest clock rate; must match at check time")
     aut.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",
@@ -734,6 +766,8 @@ def main():
                      help="safety net only; the run normally ends when the last "
                           "anchor is captured")
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
+    imp.add_argument("--det-clock", dest="det_clock", choices=("on", "off"), default="on",
+                     help="off for titles the pinned clock breaks (GRIS freezes on its FMV)")
     imp.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
                      help="must match how the session was authored")
     imp.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",

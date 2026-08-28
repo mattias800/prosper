@@ -141,6 +141,7 @@ def main():
             min_ssim = snaps.DEFAULT_MIN_SSIM
             savedata = "fresh"
             det_fps = snaps.DEFAULT_DET_FPS
+            det_clock = "on"
             flip_window = snaps.DEFAULT_FLIP_WINDOW
             window_samples = snaps.DEFAULT_WINDOW_SAMPLES
 
@@ -193,6 +194,19 @@ def main():
         clk2 = {}
         snaps.apply_deterministic_clock(clk2, 30)
         check(clk2.get("PROSPER_DET_FPS") == "30", "a non-default rate is honoured")
+
+        # The clock is NOT universally safe and must be disablable per title. GRIS freezes on its
+        # opening FMV with it on -- 42,000 frames in 150 s off against 1,680 on, a 25x collapse.
+        off = {}
+        snaps.apply_deterministic_clock(off, 60, enabled=False)
+        check("PROSPER_DET_CLOCK" not in off, "the clock can be turned off for a title")
+        # And an inherited value must be CLEARED, not merely left unset: an authoring shell that
+        # exported it would otherwise leak it into a run whose entry says the clock is off, making
+        # the check silently disagree with how the session was authored.
+        leaked = {"PROSPER_DET_CLOCK": "1", "PROSPER_DET_FPS": "60"}
+        snaps.apply_deterministic_clock(leaked, 60, enabled=False)
+        check("PROSPER_DET_CLOCK" not in leaked and "PROSPER_DET_FPS" not in leaked,
+              "an inherited clock is CLEARED when the title disables it")
         check(entry.get("det_fps") == snaps.DEFAULT_DET_FPS,
               "the rate is RECORDED in the entry, so the check reproduces how it was authored")
 
