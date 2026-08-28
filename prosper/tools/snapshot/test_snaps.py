@@ -349,6 +349,68 @@ def main():
         check("SESSION_KEYS" in import_src,
               "import reads the shared key list rather than its own copy of the names")
 
+        # ---- 6a1b-iii-b. cmd_author -> cmd_import, for real ----------------------------------
+        # The strongest form of the producer/consumer check: actually RUN cmd_author (with the
+        # emulator stubbed out) and feed its output directory to cmd_import. Every earlier version
+        # of this test mirrored the session format by hand, which is exactly why renaming the keys
+        # cmd_author writes stayed green through two review rounds.
+        e2e = os.path.join(tmp, "e2e")
+        fake_dump = os.path.join(tmp, "PPSATEST-app0")
+        os.makedirs(fake_dump)
+        fake_app = os.path.join(tmp, "fake-prosper-app")
+        with open(fake_app, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_app, 0o755)
+
+        class AuthorE2E:
+            name = "e2e"
+            dump = fake_dump
+            out = e2e
+            append = False
+            det_fps = 30            # deliberately NOT the default
+            det_clock = "off"
+            savedata = "none"
+
+        saved_app, saved_run = snaps.APP, snaps.subprocess.run
+        # The session's own snaps.jsonl and route.pad are what a real run would leave behind.
+        def fake_run(cmd, env=None, check=False):
+            os.makedirs(env["PROSPER_SNAP_DIR"], exist_ok=True)
+            write_bmp(os.path.join(env["PROSPER_SNAP_DIR"], "snap_0000_correct_f900.bmp"),
+                      64, 36, lambda x, y: (x * 3 % 256, y * 5 % 256, 40))
+            with open(os.path.join(env["PROSPER_SNAP_DIR"], "snaps.jsonl"), "w",
+                      encoding="utf-8") as h:
+                h.write(json.dumps({
+                    "index": 0, "verdict": "correct", "mode": "anchor", "pad_flip": 900,
+                    "guest_present": 900, "width": 64, "height": 36,
+                    "file": "snap_0000_correct_f900.bmp", "title_id": "PPSATEST"}) + "\n")
+            open(env["PROSPER_PAD_RECORD"], "w", encoding="utf-8").write("f900:cross\n")
+            return None
+        try:
+            snaps.APP = fake_app
+            snaps.subprocess.run = fake_run
+            snaps.cmd_author(AuthorE2E())
+        finally:
+            snaps.APP, snaps.subprocess.run = saved_app, saved_run
+
+        check(os.path.exists(os.path.join(e2e, "session.json")),
+              "an authoring session records itself on disk")
+
+        class ImportE2E(Args):
+            capture_dir = e2e
+            name = "e2e"
+            det_fps = snaps.DEFAULT_DET_FPS      # the CLI default, NOT what was authored
+            det_clock = "on"
+
+        snaps.cmd_import(ImportE2E())
+        round_tripped = snaps.load_entry("e2e")
+        check(round_tripped.get("det_fps") == 30,
+              "import reads the rate cmd_author actually wrote -- producer to consumer, no "
+              "hand-written mirror in between")
+        check(round_tripped.get("det_clock") == "off",
+              "...and the clock stance, through the same path")
+        check(snaps.replay_env(round_tripped, tmp, base={}).get("PROSPER_FLIP_PACE_FPS") == "30",
+              "...so the check ends up paced at the rate the session was authored at")
+
         # ---- 6a1b-iv. A check does not write its frames into the shared tmpfs ----------------
         # /tmp here is RAM-backed with a per-user quota shared by every concurrent agent, and
         # exhausting it takes the machine's RAM rather than merely failing the write. Scan mode
