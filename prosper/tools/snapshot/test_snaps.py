@@ -187,13 +187,13 @@ def main():
 
         snaps.cmd_import(Args2())
         authored = snaps.load_entry("unit2")
-        check(authored["det_fps"] == 30,
+        check(authored.get("det_fps") == 30,
               "import records the rate the session was AUTHORED at, not its own default")
-        check(authored["det_clock"] == "off",
+        check(authored.get("det_clock") == "off",
               "...and the clock stance the session was authored under")
         # The whole point is that both halves then agree.
         env2 = snaps.replay_env(authored, tmp, base={})
-        check(env2["PROSPER_FLIP_PACE_FPS"] == "30",
+        check(env2.get("PROSPER_FLIP_PACE_FPS") == "30",
               "so the check paces at the rate the person actually played at")
 
         # ---- 5. accept: store AND reference image move together -------------------------------
@@ -297,6 +297,88 @@ def main():
               "the pace rate is read from the entry, not hardcoded")
         check(snaps.pace_fps({}) == snaps.DEFAULT_DET_FPS,
               "an entry with no det_fps falls back to the documented default")
+
+        # The AUTHOR half. Everything above this asserts the CHECK. An earlier revision headed this
+        # block "BOTH halves pace" while testing one of them, and deleting the author's pacing line
+        # left the whole suite green -- every future session would then run unpaced against a check
+        # paced at 60, which diverges rather than drifts.
+        class AuthorArgs:
+            name = "unit-author"
+            det_fps = 30
+            det_clock = "off"
+            savedata = "none"
+
+        aenv = snaps.author_env(AuthorArgs(), tmp, base={})
+        check(aenv.get("PROSPER_FLIP_PACE_FPS") == "30",
+              "the AUTHORING session paces its flips too")
+        check("PROSPER_DET_CLOCK" not in aenv, "...with the clock off when the session says off")
+        check(aenv.get("PROSPER_PAD_RECORD", "").endswith("route.pad"),
+              "...and records the route the check will replay")
+
+        # The two halves must agree by CONSTRUCTION, not by two literals that happen to match.
+        # Same det_fps in, same pace out, whichever side computes it.
+        for rate in (30, 60, 120):
+            class R:
+                name = "x"; det_fps = rate; det_clock = "off"; savedata = "none"
+            a = snaps.author_env(R(), tmp, base={}).get("PROSPER_FLIP_PACE_FPS")
+            c = snaps.replay_env({"det_fps": rate, "det_clock": "off", "route": "r.pad",
+                                  "snaps": [], "savedata": "none"}, tmp,
+                                 base={}).get("PROSPER_FLIP_PACE_FPS")
+            check(a == c == str(rate),
+                  f"author and check derive the SAME pace at det_fps={rate} ({a} vs {c})")
+
+        # ---- 6a1b-iii. What author WRITES is what import READS -------------------------------
+        # These were two hand-written literals. Renaming the keys cmd_author records left the suite
+        # fully green, because the import test mirrored the format by hand rather than obtaining it
+        # from the producer. Bind them to one list and assert the round trip.
+        class SessArgs:
+            name = "roundtrip"
+            det_fps = 30
+            det_clock = "off"
+            savedata = "fresh"
+
+        record = snaps.session_record(SessArgs())
+        check(set(snaps.SESSION_KEYS) <= set(record),
+              "the session record carries every key import looks up")
+        check(record.get("det_fps") == 30 and record.get("det_clock") == "off"
+              and record.get("savedata") == "fresh",
+              "...with the values the session was authored under")
+        # And import must consume exactly these -- not a superset, not a stale alias.
+        import inspect
+        import_src = inspect.getsource(snaps.cmd_import)
+        check("SESSION_KEYS" in import_src,
+              "import reads the shared key list rather than its own copy of the names")
+
+        # ---- 6a1b-iv. A check does not write its frames into the shared tmpfs ----------------
+        # /tmp here is RAM-backed with a per-user quota shared by every concurrent agent, and
+        # exhausting it takes the machine's RAM rather than merely failing the write. Scan mode
+        # raises the captures per snap from 7 to 34, so this got ~5x heavier than it used to be.
+        out = snaps.default_check_out_dir("somegame")
+        check(not out.startswith(tempfile.gettempdir() + os.sep) and out != tempfile.gettempdir(),
+              "a check's scratch does not land in the shared RAM-backed tmpfs")
+        check(out.startswith(os.path.expanduser("~")), "...it lands on real disk under $HOME")
+        check("somegame" in out, "...in a per-set directory, so two sets cannot collide")
+
+        # ---- 6a1b-v. --append must not restamp a session authored at other settings ----------
+        # Appending would otherwise record the SECOND run's parameters for snaps taken during the
+        # first, and import would replay half of them at a rate nobody played them at.
+        class Fresh:
+            name = "s"; det_fps = 60; det_clock = "off"; savedata = "fresh"; append = False
+
+        class Appending:
+            name = "s"; det_fps = 30; det_clock = "off"; savedata = "fresh"; append = True
+
+        rec, diff = snaps.session_to_write(Fresh(), {})
+        check(rec is not None and rec.get("det_fps") == 60 and diff == [],
+              "a fresh session records its own parameters")
+        rec2, diff2 = snaps.session_to_write(Appending(), {"det_fps": 60, "det_clock": "off",
+                                                           "savedata": "fresh"})
+        check(rec2 is None and diff2 == ["det_fps"],
+              "appending at a DIFFERENT rate keeps the original and names what differed")
+        rec3, diff3 = snaps.session_to_write(
+            Appending(), {"det_fps": 30, "det_clock": "off", "savedata": "fresh"})
+        check(rec3 is None and diff3 == [],
+              "appending at the SAME settings is silent and still does not restamp")
 
         # An inherited pace from the authoring shell must not survive into a run that specifies its
         # own -- same leak the clock arm above guards.

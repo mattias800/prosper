@@ -318,6 +318,72 @@ def apply_deterministic_clock(env, det_fps, enabled=False):
     env["PROSPER_DET_FPS"] = str(det_fps)
 
 
+# The keys `author` records and `import` reads back. Named once so a rename cannot desynchronise the
+# producer from the consumer -- they were two hand-written literals, and renaming one left the whole
+# suite green.
+SESSION_KEYS = ("det_fps", "det_clock", "savedata")
+
+
+def default_check_out_dir(name):
+    """Where a check writes its captured frames.
+
+    Deliberately NOT tempfile.gettempdir(). On the Linux box /tmp is a RAM-backed tmpfs with a
+    per-user quota shared by every concurrent agent; exhausting it takes the machine's RAM with it
+    rather than merely failing the write. A check writes one BMP per candidate flip, and scan mode
+    raises that from 7 per snap to 34.
+    """
+    return os.path.join(os.path.expanduser("~"), ".cache", "prosper-snaps", name)
+
+
+def session_to_write(args, existing):
+    """(record_or_None, differing_keys) -- what an authoring run should store about itself.
+
+    Returns None for the record when appending to a directory whose stored parameters differ:
+    restamping would record the SECOND run's conditions for snaps taken during the first, and import
+    would then replay half of them at a rate nobody played them at. One directory describes one set
+    of conditions.
+    """
+    if getattr(args, "append", False) and existing:
+        differing = [k for k in SESSION_KEYS
+                     if k in existing and existing[k] != getattr(args, k)]
+        if differing:
+            return None, differing
+        return None, []
+    return session_record(args), []
+
+
+def session_record(args):
+    """What an authoring session stores about itself, so `import` need not be told again."""
+    record = {key: getattr(args, key) for key in SESSION_KEYS}
+    record["name"] = args.name
+    return record
+
+
+def author_env(args, out_dir, base=None):
+    """The environment an AUTHORING session runs under.
+
+    Extracted for the same reason as replay_env: the pacing line here and the one there must agree,
+    and while both were inlined nothing could assert that. Deleting either used to leave the suite
+    fully green while every future session drifted against every future check.
+    """
+    env = dict(os.environ if base is None else base)
+    env.update({
+        "PROSPER_RENDER": "1",
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_SNAP_DIR": out_dir,
+        "PROSPER_PAD_RECORD": os.path.join(out_dir, "route.pad"),
+    })
+    # Both halves read their rate through pace_fps(), off a dict shaped like a stored entry, so the
+    # author and the check cannot disagree about what "60" means.
+    env["PROSPER_FLIP_PACE_FPS"] = str(pace_fps({"det_fps": args.det_fps}))
+    apply_deterministic_clock(env, args.det_fps, args.det_clock == "on")
+    if args.savedata == "fresh":
+        apply_fresh_savedata(env, out_dir)
+    # Deliberately NOT offscreen: authoring is a person looking at a window.
+    env.pop("SDL_VIDEODRIVER", None)
+    return env
+
+
 def clock_enabled(entry):
     """Does this stored set replay with the guest clock pinned?
 
@@ -406,30 +472,11 @@ def cmd_author(args):
             f"       first session's images while appending to its manifest. Use a fresh --out, or\n"
             f"       --append if you really mean to continue into the same directory.")
     os.makedirs(out_dir, exist_ok=True)
-    route = os.path.join(out_dir, "route.pad")
 
-    env = dict(os.environ)
-    env.update({
-        "PROSPER_RENDER": "1",
-        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
-        "PROSPER_SNAP_DIR": out_dir,
-        "PROSPER_PAD_RECORD": route,
-    })
-    apply_deterministic_clock(env, args.det_fps, args.det_clock == "on")
-    # Pace the guest flips, whether or not the clock is pinned. Two independent reasons:
-    #
-    #   While authoring, it is what makes the game run at the speed a person can judge. With the
-    #   clock pinned and flips unpaced, guest time tracks the RENDER rate -- measured on one
-    #   session: 3.1x during splash screens, 0.47x in a heavy scene, mean 1.58x.
-    #
-    #   For the check, it is what lets the clock stay off at all. The check paces too (replay_env),
-    #   and the two sides must agree: a flip-anchored route replayed at a different flip rate lands
-    #   its presses at different guest times.
-    env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
+    # Pacing, clock, savedata and the recorded session all come from the shared helpers above, so
+    # this half and the check half cannot drift apart.
+    env = author_env(args, out_dir)
     if args.det_clock == "on":
-        # With the clock pinned, pacing does a SECOND job on top of anchoring: guest time then runs
-        # at host_fps/DET_FPS, so the game plays fast or slow unless the flip rate matches. That is
-        # the extra reason to pace here -- not the only one. Pacing happens either way.
         print(f"  guest clock: PINNED at {args.det_fps} fps, flips paced to match. This replaces "
               f"every guest time source; some titles break (GRIS).")
     else:
@@ -437,23 +484,34 @@ def cmd_author(args):
               f"              does). The pacing is what keeps a flip-anchored route landing at the\n"
               f"              same guest time on both sides; the clock itself is not touched.")
     if args.savedata == "fresh":
-        apply_fresh_savedata(env, out_dir)
         print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
     else:
         print("  savedata: PRESERVE -- this session uses your real saves, so the route will NOT\n"
               "            reproduce on a machine whose save state differs. A title that offers\n"
               "            'Continue' puts it above 'New Game', so the same inputs pick a\n"
               "            different item. Only use this deliberately.")
-    # Deliberately NOT offscreen: authoring is a person looking at a window.
-    env.pop("SDL_VIDEODRIVER", None)
 
-    # Record the parameters this session is being authored under, so `import` does not have to be
-    # told them again. --det-fps is a separate argument on both subcommands, each defaulting to 60:
-    # authoring at 30 and importing without the flag used to record 60, and BOTH halves would then
-    # pace at 60 against a session played at 30. Nothing failed loudly; the anchors just moved.
-    with open(os.path.join(out_dir, "session.json"), "w", encoding="utf-8") as handle:
-        json.dump({"det_fps": args.det_fps, "det_clock": args.det_clock,
-                   "savedata": args.savedata, "name": args.name}, handle, indent=2)
+    # Record the parameters this session is authored under, so `import` need not be told them again.
+    # --det-fps is a separate argument on both subcommands, each defaulting to 60: authoring at 30
+    # and importing without the flag used to record 60, and BOTH halves would then pace at 60
+    # against a session played at 30. Nothing failed loudly; the anchors just moved.
+    session_path = os.path.join(out_dir, "session.json")
+    existing = {}
+    if os.path.exists(session_path):
+        try:
+            with open(session_path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError):
+            existing = {}
+    record, differing = session_to_write(args, existing)
+    if differing:
+        print(f"  NOTE: keeping the original session parameters for {', '.join(differing)} "
+              f"({', '.join(f'{k}={existing[k]!r}' for k in differing)}). This directory already "
+              f"holds snaps authored under them, and one directory can only describe one set of "
+              f"conditions -- use a fresh --out to author at different settings.")
+    if record is not None:
+        with open(session_path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2)
 
     print(f"authoring '{args.name}' -> {out_dir}")
     print("  F6 = this frame looks CORRECT     F7 = this frame looks WRONG")
@@ -481,9 +539,21 @@ def cmd_author(args):
 
 def _flag_was_passed(key):
     """True if --key appears in argv. argparse cannot distinguish a default from an explicit value,
-    and here the difference decides whether the stored session or the command line wins."""
+    and here the difference decides whether the stored session or the command line wins.
+
+    Abbreviations count. argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps while
+    matching neither `--det-fps` nor `--det-fps=`; the session would then silently override a flag
+    the person did type, which is the exact failure this helper exists to prevent.
+    """
     flag = "--" + key.replace("_", "-")
-    return any(a == flag or a.startswith(flag + "=") for a in sys.argv[1:])
+    for arg in sys.argv[1:]:
+        name = arg.split("=", 1)[0]
+        # A prefix of the flag, at least "--x", is how argparse resolves an abbreviation. Being
+        # generous here is safe: the cost of a false positive is honouring the command line, which
+        # is what an explicit flag should do anyway.
+        if len(name) > 2 and name.startswith("--") and flag.startswith(name):
+            return True
+    return False
 
 
 def cmd_import(args):
@@ -521,7 +591,7 @@ def cmd_import(args):
                 session = json.load(handle)
         except (OSError, ValueError) as exc:
             print(f"  note: {session_path} unreadable ({exc}); falling back to the command line")
-    for key in ("det_fps", "det_clock", "savedata"):
+    for key in SESSION_KEYS:
         if key in session and not _flag_was_passed(key):
             if getattr(args, key) != session[key]:
                 print(f"  {key}: using {session[key]!r} from the authoring session "
@@ -755,8 +825,7 @@ def cmd_check(args):
     failures = 0
     for name in names:
         entry = load_entry(name)
-        out_dir = os.path.join(tempfile.gettempdir(), f"prosper-snaps-{name}")
-        out_dir = os.environ.get("PROSPER_SNAP_OUT", out_dir)
+        out_dir = os.environ.get("PROSPER_SNAP_OUT", default_check_out_dir(name))
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir, exist_ok=True)
         print(f"[snaps] {name}: replaying {len(entry['snaps'])} anchor(s)")

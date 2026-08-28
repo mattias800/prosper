@@ -717,7 +717,7 @@ HLE(g_vo_submitflip)  {
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
     flip_advance(buffer_index, (int64_t)a3);
-    flip_pace_wait();                              // interactive authoring: hold real-time pacing
+    flip_pace_wait();                              // both halves pace: see flip_pace_wait
     gpu::present_flip(buffer_index, (int64_t)a3);   // present the buffer (scanout front + count)
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
@@ -734,7 +734,7 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
-    flip_pace_wait();                      // interactive authoring: hold real-time pacing
+    flip_pace_wait();                      // both halves pace: see flip_pace_wait
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
