@@ -15,6 +15,7 @@ reports a confident wrong answer is worse than one that errors:
     store and the images disagreeing, and the next failure would show a misleading "expected"
 """
 
+import io
 import json
 import shutil
 import os
@@ -440,6 +441,96 @@ def main():
         check(snaps.replay_env(round_tripped, tmp, base={}).get("PROSPER_FLIP_PACE_FPS") == "30",
               "...so the check ends up paced at the rate the session was authored at")
 
+        # ---- 6a1b-iii-c. cmd_author ACTS on the reconciliation -------------------------------
+        # Three review rounds in a row, the gap was the same shape: the helper's RETURN value was
+        # asserted and the command's USE of it was not. Deleting cmd_author's refusal, its refresh,
+        # or its NOTE each left the suite fully green. These arms assert what the COMMAND does.
+        def author_run(argv_extra, **overrides):
+            """Run cmd_author through the real argparse; return (launched, env, session, output)."""
+            seen = {"launched": False, "env": None}
+
+            def spy(cmd, env=None, check=False, **kw):
+                seen["launched"] = True
+                seen["env"] = dict(env)
+                return fake_run(cmd, env=env)
+            saved = (snaps.APP, snaps.subprocess.run, sys.argv, sys.stdout)
+            buf = io.StringIO()
+            try:
+                snaps.APP = fake_app
+                snaps.subprocess.run = spy
+                sys.argv = (["snaps.py", "author", "--name", "e2e", "--dump", fake_dump,
+                             "--out", e2e] + argv_extra)
+                sys.stdout = buf
+                args = snaps.build_parser().parse_args(sys.argv[1:])
+                for key, value in overrides.items():
+                    setattr(args, key, value)
+                raised = None
+                try:
+                    snaps.cmd_author(args)
+                except SystemExit as exc:
+                    raised = exc
+            finally:
+                snaps.APP, snaps.subprocess.run, sys.argv, sys.stdout = saved
+            stored = {}
+            path = os.path.join(e2e, "session.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    stored = json.load(handle)
+            return seen, stored, buf.getvalue(), raised
+
+        # An explicit flag contradicting the directory: refused, nothing launched, nothing restamped.
+        before = dict(json.load(open(os.path.join(e2e, "session.json"), encoding="utf-8")))
+        seen, stored, out, raised = author_run(["--append", "--det-fps", "60"])
+        check(raised is not None, "an explicit contradiction REFUSES the run")
+        check(not seen["launched"], "...the emulator is never launched")
+        check(stored == before,
+              "...and session.json is not restamped, so the snaps already here stay replayable")
+        check("fresh --out" in str(raised), "...and the message says how to proceed")
+
+        # The abbreviation must be refused identically, or the guard is bypassable by typing less.
+        _, stored_abbrev, _, raised_abbrev = author_run(["--append", "--det-f", "60"])
+        check(raised_abbrev is not None and stored_abbrev == before,
+              "an ABBREVIATED contradicting flag is refused the same way")
+
+        # Not asking for it: adopted, announced, and the run actually paced to match.
+        seen2, stored2, out2, raised2 = author_run(["--append"])
+        check(raised2 is None and seen2["launched"], "appending without the flag proceeds")
+        check(seen2["env"].get("PROSPER_FLIP_PACE_FPS") == "30",
+              "...paced at the session's rate, not the CLI default")
+        check("NOTE" in out2 and "30" in out2, "...and says which settings it adopted")
+        check("60" not in out2.split("NOTE")[0].split("paced to")[-1][:6],
+              "...without also claiming the default rate in the same run")
+
+        # A key missing from an older session file is completed by the run that notices it.
+        with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
+            json.dump({"det_fps": 30}, handle)
+        _, completed, _, _ = author_run(["--append"])
+        check(set(snaps.SESSION_KEYS) <= set(completed),
+              "an appending run completes a session file missing a key")
+        check(completed.get("det_fps") == 30, "...without changing the key that was already there")
+
+        # A stored string is not a contradiction of the same number typed explicitly.
+        with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
+            json.dump({"det_fps": "30", "det_clock": "off", "savedata": "none"}, handle)
+        _, _, _, raised_str = author_run(["--append", "--det-fps", "30"])
+        check(raised_str is None,
+              "a stored \"30\" does not conflict with an explicit --det-fps 30")
+        # A malformed session file must not take the run down. These are hand-editable, and the
+        # failure lands on somebody mid-session with a game open.
+        for junk in ("5", "true", '["a"]', '"text"', "{not json"):
+            with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
+                handle.write(junk)
+            seen_j, stored_j, out_j, raised_j = author_run(["--append"])
+            check(raised_j is None and seen_j["launched"],
+                  f"a session.json holding {junk!r} does not abort the run")
+            check("note:" in out_j, "...and the run says it ignored it rather than doing so quietly")
+            check(stored_j.get("det_fps") == snaps.DEFAULT_DET_FPS,
+                  "...recording this run's own settings instead")
+
+        # Restore for anything downstream.
+        with open(os.path.join(e2e, "session.json"), "w", encoding="utf-8") as handle:
+            json.dump(before, handle)
+
         # ---- 6a1b-iv. A check does not write its frames into the shared tmpfs ----------------
         # /tmp here is RAM-backed with a per-user quota shared by every concurrent agent, and
         # exhausting it takes the machine's RAM rather than merely failing the write. Scan mode
@@ -499,6 +590,22 @@ def main():
         check(not adopted4 and not conflicts4, "appending at the same settings is silent")
         check(rec4 is not None and rec4.get("savedata") == "fresh",
               "...and a key missing from an older session file is completed rather than left out")
+
+        # reconcile_session must survive a non-dict on its own, not only because cmd_author screens
+        # it first. Two layers, and each is asserted separately: a guard that is only ever reached
+        # through another guard is not actually load-bearing, and the next caller will not know.
+        for junk in (5, True, [1, 2], "text", None, 3.5):
+            class J:
+                name = "s"; det_fps = 60; det_clock = "off"; savedata = "fresh"; append = True
+            try:
+                rec_j, ad_j, cf_j = snaps.reconcile_session(J(), junk, was_passed=lambda k: False)
+                survived = rec_j is not None and not ad_j and not cf_j
+            except Exception as exc:                    # noqa: BLE001 -- the point IS "any crash"
+                survived = False
+                rec_j = f"{type(exc).__name__}: {exc}"
+            check(survived,
+                  f"reconcile_session treats {junk!r} as no session at all, rather than crashing "
+                  f"({rec_j if not survived else ''})")
 
         # ---- 6a1b-vi. _flag_was_passed sees argparse ABBREVIATIONS -----------------------------
         # argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps. An exact-match

@@ -334,6 +334,21 @@ def default_check_out_dir(name):
     return os.path.join(os.path.expanduser("~"), ".cache", "prosper-snaps", name)
 
 
+def _coerce_like(stored, wanted):
+    """Read a stored session value as the type the argument uses.
+
+    A hand-edited session.json holding "30" rather than 30 otherwise reads as a CONTRADICTION of an
+    explicit --det-fps 30, and the run is then refused over settings that in fact agree. Returns the
+    value unchanged when it cannot be converted, so a genuinely different value still conflicts.
+    """
+    if isinstance(wanted, bool) or not isinstance(wanted, int) or isinstance(stored, int):
+        return stored
+    try:
+        return int(str(stored).strip())
+    except (TypeError, ValueError):
+        return stored
+
+
 def reconcile_session(args, existing, was_passed=None):
     """Settle an appending run against what the directory was already authored under.
 
@@ -353,15 +368,18 @@ def reconcile_session(args, existing, was_passed=None):
     adopted, since that is somebody continuing a session without retyping the flags.
     """
     was_passed = _flag_was_passed if was_passed is None else was_passed
-    if not (getattr(args, "append", False) and existing):
+    if not (getattr(args, "append", False) and isinstance(existing, dict) and existing):
         return session_record(args), [], []
     adopted, conflicts = [], []
     for key in SESSION_KEYS:
-        if key not in existing or existing[key] == getattr(args, key):
+        if key not in existing:
+            continue
+        stored, wanted = _coerce_like(existing[key], getattr(args, key)), getattr(args, key)
+        if stored == wanted:
             continue
         (conflicts if was_passed(key) else adopted).append(key)
     for key in adopted:
-        setattr(args, key, existing[key])
+        setattr(args, key, _coerce_like(existing[key], getattr(args, key)))
     # Rewrite the record even when nothing differed: a session file written by an older version can
     # be missing a key, and this is the only chance to complete it.
     return session_record(args), adopted, conflicts
@@ -499,8 +517,14 @@ def cmd_author(args):
         try:
             with open(session_path, "r", encoding="utf-8") as handle:
                 existing = json.load(handle)
-        except (OSError, ValueError):
-            existing = {}
+        except (OSError, ValueError) as exc:
+            print(f"  note: {session_path} is unreadable ({exc}); this run's own settings will be "
+                  f"recorded instead. If it holds snaps authored under other settings, they can no "
+                  f"longer be replayed faithfully -- prefer a fresh --out.")
+    if not isinstance(existing, dict):
+        print(f"  note: {session_path} does not hold an object; ignoring it and recording this "
+              f"run's settings.")
+        existing = {}
     record, adopted, conflicts = reconcile_session(args, existing)
     if conflicts:
         raise SystemExit(
@@ -977,7 +1001,12 @@ def cmd_list(args):
     return 0
 
 
-def main():
+def build_parser():
+    """The CLI, separated from main() so tests can drive the REAL argument parsing.
+
+    Hand-built args objects cannot see a defaulting bug, an argument registered on one subcommand
+    and not another, or a flag whose dest does not match what the code reads.
+    """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1032,7 +1061,11 @@ def main():
     lst = sub.add_parser("list", help="list snap sets")
     lst.set_defaults(func=cmd_list)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     return args.func(args)
 
 
