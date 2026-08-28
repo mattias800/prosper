@@ -151,6 +151,13 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # The human-authored snapshot store. Runs with no dump and no emulator: every arm builds its own
+  # BMPs. The arms are chosen around SILENT failure -- a signature that cannot separate two scenes
+  # would pass every regression, and an accept() that moved the signature without the reference
+  # image would show a misleading "expected" at exactly the moment someone is deciding whether to
+  # trust it.
+  add_test(NAME snapshot_snaps_tool
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snaps.py")
   # iostore_index turns a .ucas read offset into a package name, which is the only instrument that
   # separates "reached gameplay" from "sat on an animating menu" on an Unreal title. Its failure
   # mode is a plausible WRONG name rather than an error, so the self-test pins the two-step
