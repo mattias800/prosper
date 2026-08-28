@@ -37,6 +37,7 @@ clone the numbers still work, but "show me what it used to look like" only works
 authored the run (or anyone who re-authors it).
 
 USAGE
+    snaps.py author --name <name> --dump <TITLE-app0>              play, and press F6/F7
     snaps.py import <capture-dir> --name <name> [--route <file>]   adopt an authoring session
     snaps.py check [name ...]                                      replay and compare; exit 1 on failure
     snaps.py accept <name> <index> [<index> ...]                   promote an actual to be the new snap
@@ -51,6 +52,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROSPER_ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -230,6 +232,67 @@ def list_names():
 
 
 # ---------------------------------------------------------------------------------------------
+# author
+# ---------------------------------------------------------------------------------------------
+
+def cmd_author(args):
+    """Launch the game for an authoring session: real window, audio, pad, route recording on.
+
+    This exists so authoring is one command rather than four environment variables remembered
+    correctly. Getting PROSPER_PAD_RECORD wrong is not a visible mistake -- you play the whole
+    session, press F6/F7 happily, and only discover at import time that there is no route and the
+    snaps can never be replayed.
+    """
+    dump = args.dump
+    if not dump:
+        raise SystemExit("snaps: --dump is required (e.g. --dump PPSA25009-app0)")
+    dump_path = dump if os.path.isabs(dump) else os.path.join(GAME_ROOT, dump)
+    if not os.path.isdir(dump_path):
+        raise SystemExit(f"snaps: dump not found: {dump_path}")
+    if not os.path.exists(APP):
+        raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
+
+    out_dir = args.out or os.path.join(os.path.expanduser("~"), "snaps", args.name)
+    if os.path.exists(os.path.join(out_dir, "snaps.jsonl")) and not args.append:
+        raise SystemExit(
+            f"snaps: {out_dir} already holds an authoring session.\n"
+            f"       Snap indices restart at 0 each run, so a second session would overwrite the\n"
+            f"       first session's images while appending to its manifest. Use a fresh --out, or\n"
+            f"       --append if you really mean to continue into the same directory.")
+    os.makedirs(out_dir, exist_ok=True)
+    route = os.path.join(out_dir, "route.pad")
+
+    env = dict(os.environ)
+    env.update({
+        "PROSPER_RENDER": "1",
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_SNAP_DIR": out_dir,
+        "PROSPER_PAD_RECORD": route,
+    })
+    # Deliberately NOT offscreen: authoring is a person looking at a window.
+    env.pop("SDL_VIDEODRIVER", None)
+
+    print(f"authoring '{args.name}' -> {out_dir}")
+    print("  F6 = this frame looks CORRECT     F7 = this frame looks WRONG")
+    print("  take negative snaps too: they are the only thing that will tell you a broken")
+    print("  title got fixed.\n")
+    subprocess.run([APP, dump_path], env=env, check=False)
+
+    manifest = os.path.join(out_dir, "snaps.jsonl")
+    taken = 0
+    if os.path.exists(manifest):
+        with open(manifest, "r", encoding="utf-8") as handle:
+            taken = sum(1 for line in handle if line.strip())
+    print(f"\nsession ended: {taken} snap(s) in {out_dir}")
+    if not taken:
+        print("  nothing to import -- no F6/F7 presses were recorded")
+        return 0
+    print(f"  import with: python3 {os.path.relpath(__file__, os.getcwd())} import {out_dir} "
+          f"--name {args.name}")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
 # import
 # ---------------------------------------------------------------------------------------------
 
@@ -384,22 +447,53 @@ def run_replay(entry, out_dir):
         "PROSPER_PAD_SCRIPT": "@" + os.path.join(REPO_ROOT, entry["route"]),
     })
     log = os.path.join(out_dir, "run.log")
-    with open(log, "w", encoding="utf-8") as handle:
-        try:
-            subprocess.run([APP, dump_path], env=env, stdout=handle, stderr=subprocess.STDOUT,
-                           timeout=entry.get("timeout", 900), check=False)
-        except subprocess.TimeoutExpired:
-            pass   # the run is bounded by design; whatever it captured before the bound still counts
-    actuals = {}
     manifest = os.path.join(out_dir, "actuals.jsonl")
-    if os.path.exists(manifest):
-        with open(manifest, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    record = json.loads(line)
-                    actuals[record["target_flip"]] = record
-    return actuals, log
+
+    def read_actuals():
+        found = {}
+        if os.path.exists(manifest):
+            with open(manifest, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue     # a record still being written; it will be there next poll
+                        found[record["target_flip"]] = record
+        return found
+
+    # Stop when the LAST anchor has been captured, not when a wall-clock timer expires. The timeout
+    # is a safety net for a run that hangs, not the normal way the run ends.
+    #
+    # This matters because of FMVs. The anchor is a flip count, so a movie contributes the same
+    # number of flips however slowly it renders -- which is exactly why flips beat wall-clock and why
+    # an authored route survives a title whose intro plays at 4.8 fps (measured on Blue Prince,
+    # ~37x slower than its menu). But the movie still eats real SECONDS, so a fixed timeout sized for
+    # a quick boot would cut the run off mid-route and report every later snap as NOT REACHED -- a
+    # failure with nothing to do with rendering, which is the whole class of bug this system exists
+    # to remove.
+    last_anchor = max(candidate_flips(entry)) if entry["snaps"] else 0
+    deadline = time.time() + entry.get("timeout", 3600)
+    with open(log, "w", encoding="utf-8") as handle:
+        proc = subprocess.Popen([APP, dump_path], env=env, stdout=handle,
+                                stderr=subprocess.STDOUT)
+        try:
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break                      # the guest exited on its own
+                if last_anchor in read_actuals():
+                    break                      # everything the check needs has been captured
+                time.sleep(2)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=20)
+    return read_actuals(), log
 
 
 def cmd_check(args):
@@ -541,12 +635,22 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    aut = sub.add_parser("author", help="play the game and take snaps (F6/F7)")
+    aut.add_argument("--name", required=True)
+    aut.add_argument("--dump", required=True, help="e.g. PPSA25009-app0")
+    aut.add_argument("--out", help="capture directory (default ~/snaps/<name>)")
+    aut.add_argument("--append", action="store_true",
+                     help="continue into an existing session directory")
+    aut.set_defaults(func=cmd_author)
+
     imp = sub.add_parser("import", help="adopt an authoring session")
     imp.add_argument("capture_dir")
     imp.add_argument("--name", required=True)
     imp.add_argument("--route")
     imp.add_argument("--dump")
-    imp.add_argument("--timeout", type=int, default=900)
+    imp.add_argument("--timeout", type=int, default=3600,
+                     help="safety net only; the run normally ends when the last "
+                          "anchor is captured")
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
     imp.add_argument("--flip-window", dest="flip_window", type=int, default=DEFAULT_FLIP_WINDOW,
                      help="flips either side of each anchor to search (0 = exact anchor only)")
