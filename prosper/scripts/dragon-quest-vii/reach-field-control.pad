@@ -7,7 +7,7 @@
 # What it changes against reach-gameplay.pad is how much confirm the opening chapter is given.
 # That route advances dialogue every 15 s and stops at t=700; this one presses every 2 s to
 # t=1180. Measured on one binary, quiet box, world phase only, classifying by the field HUD
-# (minimap + party block, with a structure floor so a flat colour collapse cannot pass):
+# (the party block's HP bar; see scripts/dragon-quest-vii/classify_field.py):
 #
 #     route                    confirms   frames with the field HUD
 #     reach-gameplay.pad         41         0

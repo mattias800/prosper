@@ -18,11 +18,13 @@ Two things to know before trusting an answer, both learned the hard way on PPSA1
    on a run that never left its cutscene; every one was blown to RGB(255,255,255). Guarding one
    end of the range catches half the failure and INVERTS the other half. Hence `collapsed()`, which measures structure rather than colour count.
 
-2. **Absence of bars is not presence of gameplay.** A menu has no bars either. Pair this with a
-   positive test — for that title, the field HUD it draws only while the player has control — and
-   require both. On PPSA17942 the conjunction separates cleanly where neither half does:
-   the world's colourful cutscene frames pass a HUD-colour test on their own, and its
-   white-collapsed gameplay frames pass a bar test on their own.
+2. **Absence of bars is not presence of gameplay.** A menu has no bars either, so pair this with a
+   positive per-title test. But do not assume `--require-hud-corners` is that test: on the title it
+   was written for it still admitted a torn-composite cutscene whose bottom corners held saturated
+   structured water, and its bar half later measured a no-op once a real marker existed. Where a
+   title draws a distinctive HUD element, key on that element —
+   `scripts/dragon-quest-vii/classify_field.py` replaced this conjunction with a single HP-bar test
+   and got a cleaner margin (~1.5x both sides) than either half of it.
 
 And it only means anything on a title that actually bars its cutscenes. Confirm that before
 reading a bar count as a cutscene count.
@@ -49,8 +51,11 @@ def collapsed(path, width=320, min_sigma=12.0):
       HUD-over-dark gameplay frames measure mean 8.3-8.9 while the blue garbage measures
       29.7-31.9. Raising the floor removes the real frames first.
 
-    Structure separates all three cleanly: sigma 4.1 on the blue collapse against 95+ on a real
-    frame.
+    Structure is what separates them, but the margin is narrow and worth knowing before you trust
+    it on a new title: on PPSA17942 the real frames run sigma 14.67 (min) / 33.11 (median) / 115.15
+    (max) against a worst collapse of 11.71, so this floor has about **3 units** of room. Where a
+    title draws a distinctive HUD element, key on that instead -- see
+    `scripts/dragon-quest-vii/classify_field.py`, which separates by ~1.5x on both sides.
     """
     img = Image.open(path).convert("L")
     h = max(1, round(img.height * width / img.width))
@@ -153,12 +158,15 @@ def corner_structure(path, frac_w=0.22, frac_h=0.28, min_sat=0.02, min_sigma=15.
 
     Absence of bars is not presence of gameplay — a menu has no bars either, and neither does a
     collapsed present. Some titles draw a persistent field HUD in the bottom corners (PPSA17942
-    puts a circular minimap bottom-left and a party block bottom-right, neither of which it draws
-    during a cutscene), and requiring BOTH halves separates cleanly where neither does alone.
+    puts a circular minimap bottom-left and a party block bottom-right).
 
     Keys on saturation AND structure, because either alone is fooled in the opposite direction:
-    a colourful CUTSCENE frame is saturated in both corners (measured 0.67 on this title's village
+    a colourful CUTSCENE frame is saturated in both corners (measured 0.67 on that title's village
     scene), and a flat saturated collapse scores 1.00 while containing nothing at all.
+
+    **This is a fallback, not a good marker.** Even with both halves it admitted a torn-composite
+    cutscene on PPSA17942 — saturated, structured water in the corners — producing false "gameplay"
+    frames. Prefer a specific HUD element where the title gives you one.
     """
     img = Image.open(path).convert("RGB")
     w, h = img.size
@@ -173,31 +181,44 @@ def corner_structure(path, frac_w=0.22, frac_h=0.28, min_sat=0.02, min_sigma=15.
     return all(out)
 
 
-def hud_displacement(path_a, path_b, box, size=128):
-    """Rigid translation between the same HUD region in two frames, by phase correlation.
+def hud_displacement(path_a, path_b, box, size=128, max_shift=None):
+    """Rigid translation between the same HUD region in two frames, in units of `size`.
 
     Why the HUD and not the world: on a title whose composite is broken, the world is the WORST
-    place to look for motion — a frame flicking between rendered and collapsed swamps any real
+    place to look for motion -- a frame flicking between rendered and collapsed swamps any real
     movement. The HUD is drawn correctly regardless, so a scrolling minimap is a locomotion signal
-    the composite defect cannot destroy. On PPSA17942 this separated cleanly where a world-motion
-    probe did not: displacement >= 2 px in 7 of 8 stick windows (median 28) against < 2 px in 8 of
-    8 neutral windows (seven of them exactly 0).
+    the composite defect cannot destroy.
 
-    `box` is the region in source pixels; it is title-specific by nature — pass the minimap disc.
+    **The correlation is ZERO-PADDED, and that is not an optimisation.** Plain phase correlation is
+    circular: a shift of more than half the window wraps around and comes back as a small number,
+    and the wrap point is a silent zero. Measured on PPSA17942 -- two windows in which the minimap
+    visibly scrolls reported exactly 0.0 px at size=128 and 57.8 / 58.5 at larger sizes, which is
+    the difference between "6 of 8 windows moved" and "8 of 8". Padding to 2x makes the correlation
+    linear, so any shift up to `size` is unambiguous.
+
+    Returns the displacement, or None when the peak lies outside `max_shift` -- an out-of-range
+    answer is reported as unknown rather than folded back into the valid range.
     """
     def region(p):
         im = Image.open(p).convert("L").crop(box).resize((size, size), Image.BILINEAR)
-        return np.asarray(im, dtype=np.float32)
+        a = np.asarray(im, dtype=np.float32)
+        return a - a.mean()
+
     a, b = region(path_a), region(path_b)
-    fa = np.fft.fft2(a - a.mean())
-    fb = np.fft.fft2(b - b.mean())
+    pad = np.zeros((size * 2, size * 2), dtype=np.float32)
+    pa = pad.copy(); pa[:size, :size] = a
+    pb = pad.copy(); pb[:size, :size] = b
+    fa, fb = np.fft.fft2(pa), np.fft.fft2(pb)
     r = fa * np.conj(fb)
     r /= (np.abs(r) + 1e-9)
     corr = np.fft.ifft2(r).real
     iy, ix = np.unravel_index(np.argmax(corr), corr.shape)
-    dy = iy - size if iy > size // 2 else iy
-    dx = ix - size if ix > size // 2 else ix
-    return float(np.hypot(dx, dy))
+    n = size * 2
+    dy = iy - n if iy > n // 2 else iy
+    dx = ix - n if ix > n // 2 else ix
+    dist = float(np.hypot(dx, dy))
+    limit = size if max_shift is None else max_shift
+    return dist if dist <= limit else None
 
 
 def main():

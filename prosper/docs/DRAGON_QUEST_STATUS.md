@@ -659,12 +659,14 @@ markers over doors. **144 frames spanning t=652-1240 s (588 s).** Linux, RADV ST
 3840x2160 through `tools/screenshot`, direct frontend, unmodified captures, UE4 recipe, isolated
 save roots, master `68f89186`.
 
-Reproduce the classification from the captures with the shipped tool — no post-hoc trimming, the
-phase restriction is an argument:
+Every number in this section comes from one committed script, so it can be re-derived rather than
+taken on trust — two earlier drafts published figures from scratch analysis and both were wrong:
 
 ```bash
-python3 tools/frameclass/letterbox.py <SHOTS> \
-    --seconds-per-frame 4 --after 330 --require-hud-corners
+python3 scripts/dragon-quest-vii/classify_field.py field <SHOTS>       # 0 / 0 / 144 / 190
+python3 scripts/dragon-quest-vii/classify_field.py world <SHOTS>       # 36/144 run3, 107/190 run4
+python3 scripts/dragon-quest-vii/classify_field.py locomotion <SHOTS> --window ...
+python3 scripts/dragon-quest-vii/classify_field.py selftest
 ```
 
 ### What was actually in the way
@@ -686,54 +688,46 @@ about the ROUTE until the confirm count has been pushed by an order of magnitude
 
 ### Locomotion is MEASURED, and the measurement is on the HUD
 
-A fourth run mashes Cross to t=700, then alternates eight stick windows against eight matched
-neutral windows entirely inside the field state. All eight stick deliveries appear in the pad log
+`probe-locomotion.pad` mashes Cross to t=700, then alternates eight stick windows against eight
+matched neutral windows inside the field state. All eight stick deliveries appear in the pad log
 (`axes=left-stick-left/right/up/down`).
 
-**The signal is minimap displacement, not world motion.** Phase-correlating the minimap disc between
-the first and last field frame of each window:
+| | windows changed >= 15 | median | range |
+| --- | --- | --- | --- |
+| stick held | **8 of 8** | 24.88 | 22.41 - 37.29 |
+| neutral | **0 of 8** | 3.01 | 0.00 - 12.67 |
 
-| | windows with displacement >= 2 px | median |
-| --- | --- | --- |
-| stick held | **6 of 8** | 20.5 px (of a 128 px disc) |
-| neutral | **0 of 8** | 0.0 px |
+Identical at `--guard` 0, 2 and 4, so the guard band is **not** load-bearing — an earlier draft
+claimed the neutral result depended on it, which running the tool refutes.
 
-Reproduce it — every number below comes from this committed script, not from scratch analysis:
+**The measure is masked minimap CHANGE, not phase correlation.** Two earlier drafts used
+correlation and it fails at both ends here. A long walk changes *which part* of the map is drawn, so
+the two crops share almost no structure and the peak lands at zero — reporting a long walk as "did
+not move"; two of eight stick windows read exactly 0.0 px that way while their minimaps were plainly
+of different places. And the crop must be **disc-masked**: the minimap is a circle in a square box
+and the corners show the world behind it, which collapses to black in one frame and white in the
+next. Unmasked, that background flip alone scores 56 on a window whose map is pixel-identical.
 
-```bash
-python3 scripts/dragon-quest-vii/classify_field.py locomotion <SHOTS> \
-    --window 710:740:neutral --window 740:770:stick  ...   # eight of each
-```
+**On a title whose composite is broken, the HUD is the reliable place to look for locomotion.**
 
-**A 2 s guard band is trimmed from each window's end** (`--guard`, default 2.0) because the
-character coasts briefly after the stick is released; without it the following neutral window
-inherits that coast and two neutral windows register motion. It is an argument rather than a
-constant so it cannot hide inside the result.
+Visually: across the first stick window the quest-marker house that sat centre-left ends up
+upper-right, a cliff face enters from the left, and the minimap scrolls to match.
+`assets/screenshots/dragon-quest-vii-walked-to-cliff.png` is that frame.
 
-That is the separation a world-motion probe could not produce, and the reason is the composite: a
-world region flicking between rendered and collapsed swamps any real movement, while the HUD is
-drawn correctly regardless. **On a title whose composite is broken, the HUD is the reliable place to
-look for locomotion.**
+### The composite: geometry is correct, the lit-material shading is not
 
-World motion in the same windows also separates once pairs where either frame is collapsed are
-excluded, but only weakly and the exact figures depend on how "collapsed" is drawn — reconstructions
-span roughly 1.4x to 6.8x with rank statistics from P=0.56 to P=0.83. The minimap answers cleanly
-where the world answers noisily; that is the finding, and no single world-motion number is quoted
-here because none of them is stable.
+Reviewed by eye on the checked-in captures, and the distinction matters for where to look next.
+**The geometry is right** — the harbour house, its door and windows, the rowing boat, the cliffs,
+the foliage and the character are all in the correct places at the correct shapes. **The 2D/UI path
+is correct too**: HUD, minimap, party block and area banner all render cleanly. What is wrong is the
+**shading of lit surfaces** — the house, the cliffs and the boat blow to white while the water
+crushes far too dark. So this is not a general composite failure: it is one path, and both
+directions of error appear in the same frame.
 
-Visually: across the first stick window the camera and character move together — the quest-marker
-house that sat centre-left ends up upper-right, a cliff face enters from the left, and the minimap
-scrolls correspondingly. `assets/screenshots/dragon-quest-vii-walked-to-cliff.png` is that frame.
-
-### The composite, which is now the whole of the remaining gap
-
-Of the 144 field frames, **36 (25%) render a recognisable scene**; the rest lose the world to a
-uniform white, a crushed black, or a flat blue speckle. The longest run of *strictly consecutive*
-rendered samples is **4 (12 s endpoint span, 16 s of coverage)** — the world comes and goes rather
-than holding. Even the good frames are severely colour-degraded — harbour buildings blown to white,
-ground crushed to navy, the player a black silhouette — but structurally complete: house, door,
-windows, rowing boat, foliage, cliff and character all present and recognisable. That is why this is
-rung 3 under the ladder's "degraded still counts" bar rather than rung 2's "world absent".
+Quantitatively, over the field frames: **36 of 144 (25%) render a recognisable scene in run 3, and
+107 of 190 (56%) in run 4**; the rest lose the world to a uniform white, a crushed black, or a flat
+blue speckle. Quote the run — they differ by more than a factor of two, and the 25% alone
+understates the title. Longest run of strictly consecutive rendered samples: 4 (run 3), 10 (run 4).
 #1486, #1588.
 
 ### Instruments — and why the obvious one cannot work HERE
@@ -747,15 +741,23 @@ cutscene, and a cutscene whose own activity varies 40x cannot be a baseline. The
 experiment aimed at the wrong phase — see the Ruled out entry, which scopes it rather than
 forbidding it.
 
-**Classification needs a conjunction, because each half fails alone and in opposite directions:**
-- Cinematic bars are *geometric*, so they survive the colour degradation that makes every chromatic
-  metric unreliable here — but a present collapsed to white, or to flat blue with a magenta
-  speckle, has no dark rows either and reads as un-barred.
-- HUD-corner colour catches those — but a colourful *cutscene* frame passes it alone (the Estard
-  village reads 0.67 saturated in both corners), and so does a flat saturated collapse (1.00).
+**Classification is ONE test: the party block's HP bar**
+(`scripts/dragon-quest-vii/classify_field.py`). Generic alternatives were tried and removed:
 
-`tools/frameclass/letterbox.py --require-hud-corners` requires both, plus a structure floor, and
-carries constructed self-test cases for each failure above.
+- *HUD-corner colour* fails in both directions on real captures here — a torn-composite cutscene
+  whose bottom corners hold saturated structured water passes it (that produced two false
+  "gameplay" frames in runs 1 and 2), and a flat blue collapse scores 1.00 while containing nothing.
+- *A cinematic-bar veto* measured a **no-op** across all four runs (0/0/144/190 with and without),
+  because a real cutscene's bars cover the party block anyway. While tight it was worse than
+  useless: at 0.04 it rejected nine genuine "Pilchard Bay: Church" frames whose world had collapsed
+  to black, reading unrendered darkness as letterboxing.
+- *A collapse or brightness floor* is inverted here — field frames are dark precisely BECAUSE they
+  are HUD over an unrendered world — and the structure floor has only ~3 units of margin against
+  them.
+
+The HP bar separates **0.0201 from 0.0089 across 1,370 frames** of four runs. `--selftest` pins both
+boxes and both sides of the threshold, with controls drawn at fixed screen positions rather than
+from the boxes under test, and every threshold reddens under mutation.
 
 ## Ruled out — eliminated, do not re-run these
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:

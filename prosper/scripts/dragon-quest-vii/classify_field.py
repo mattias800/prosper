@@ -41,7 +41,6 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "..", "tools", "frameclass"))
-from letterbox import bars, hud_displacement                     # noqa: E402
 
 HP_BAR_MIN = 0.013
 # The party block and the minimap disc, as fractions of the frame so they survive a resolution
@@ -67,16 +66,21 @@ def hp_bar_fraction(path):
 def in_field(path):
     """Is the guest in the field state -- player control, HUD up, not a cutscene?
 
-    Order matters. This deliberately does NOT consult a collapse test first: a frame carrying the
-    HP bar is by definition not a collapse, and the structure floor that detects collapses has only
-    ~3 units of margin against this title's field frames (min sigma 14.67 against a 12.0 floor,
-    with the worst collapse at 11.71). Gating on it would make the published counts depend on that
-    margin for no gain -- the HP bar already separates by ~1.5x on both sides. Cinematic bars are
-    still a veto, because the title draws the HUD under them during some scripted sequences.
+    One test, deliberately. Two others were tried and both removed:
+
+    * A **collapse test first.** Unnecessary -- a frame carrying the HP bar is by definition not a
+      collapse -- and its structure floor has only ~3 units of margin here, so it would have made
+      the published counts depend on a threshold the marker does not need.
+    * A **cinematic-bar veto.** Measured a no-op across all four runs (0/0/144/190 with and
+      without), because a real cinematic's bars are deep enough to cover the party block, so the
+      marker already rejects those frames. Worse than useless while it was tight: at 0.04 it
+      rejected nine genuine "Pilchard Bay: Church" frames whose *world* had collapsed to black,
+      reading unrendered darkness as letterboxing -- the same inversion that makes a brightness
+      floor useless on this title. Its test case also passed for the wrong reason, since drawing
+      30% bars over a synthetic frame erases the very HP bar the case depended on.
+
+    So: the HP bar, and nothing else. It separates 0.0201 from 0.0089 across 1,370 frames.
     """
-    top, bot, _ = bars(path)
-    if top >= 0.04 and bot >= 0.04:      # cinematic bars: the title took control away
-        return False
     return hp_bar_fraction(path) >= HP_BAR_MIN
 
 
@@ -159,16 +163,43 @@ def cmd_world(args):
     return 0
 
 
+def minimap_change(path_a, path_b, box, size=128, disc=0.44):
+    """How much the minimap's INTERIOR differs between two frames.
+
+    Not phase correlation, which two earlier drafts used and which fails at both ends here:
+    a large walk changes WHICH PART of the map is shown, so the two crops share almost no common
+    structure and the correlation peaks at zero -- reporting a long walk as "did not move". Two of
+    eight stick windows read exactly 0.0 px that way while their minimaps were plainly of different
+    places.
+
+    The disc mask is not cosmetic either. The minimap is a CIRCLE in a square crop, and the corners
+    show the world behind it -- which on this title collapses to black in one frame and white in the
+    next. Unmasked, that background flip alone scores 56 on a window whose map is pixel-identical,
+    which is larger than most real movements.
+    """
+    S = size
+    yy, xx = np.mgrid[0:S, 0:S]
+    mask = ((yy - (S - 1) / 2) ** 2 + (xx - (S - 1) / 2) ** 2) <= (S * disc) ** 2
+
+    def region(p):
+        im = Image.open(p).convert("L").crop(box).resize((S, S), Image.BILINEAR)
+        return np.asarray(im, dtype=np.float32)[mask]
+
+    return float(np.mean(np.abs(region(path_a) - region(path_b))))
+
+
 def cmd_locomotion(args):
-    """Windows are given as start:end:label. A guard band is subtracted from each window's end
-    because the character coasts for a moment after the stick is released -- without it the two
-    neutral windows that follow a release pick up that coast and the separation blurs. The band is
-    an argument so it cannot hide inside the result.
+    """Windows are given as start:end:label.
+
+    `--guard` trims the end of each window. It does NOT change which neutral windows register
+    movement -- swept 0 to 6 the counts are identical -- it changes the reported magnitudes, and it
+    is kept only so a window cannot include the frame in which the stick was released. Stated
+    because an earlier draft claimed the neutral result depended on it, which running the tool
+    refutes.
     """
     field = [(t, p) for t, p in load(args.shots) if in_field(p)]
     print(f"field-state frames: {len(field)}\n")
-    img0 = Image.open(field[0][1])
-    box = _px(MINIMAP_BOX, img0.size)
+    box = _px(MINIMAP_BOX, Image.open(field[0][1]).size)
     rows = []
     for spec in args.window:
         lo, hi, label = spec.split(":")
@@ -177,16 +208,17 @@ def cmd_locomotion(args):
         if len(inside) < 2:
             print(f"  {label:<10} {lo:6.0f}-{hi:<6.0f}  too few field frames ({len(inside)})")
             continue
-        d = hud_displacement(inside[0][1], inside[-1][1], box)
+        d = minimap_change(inside[0][1], inside[-1][1], box)
         rows.append((label, d))
-        print(f"  {label:<10} {lo:6.0f}-{hi:<6.0f}  displacement {d:6.1f} px  "
-              f"({len(inside)} frames)")
+        print(f"  {label:<10} {lo:6.0f}-{hi:<6.0f}  minimap change {d:7.2f}  ({len(inside)} frames)")
     if rows:
+        print()
         for group in sorted({l for l, _ in rows}):
             vals = [d for l, d in rows if l == group]
             moved = sum(1 for v in vals if v >= args.moved)
-            print(f"\n  {group:<10} {moved}/{len(vals)} windows moved >= {args.moved} px, "
-                  f"median {statistics.median(vals):.1f} px")
+            print(f"  {group:<10} {moved}/{len(vals)} windows changed >= {args.moved}, "
+                  f"median {statistics.median(vals):.2f}, "
+                  f"min {min(vals):.2f}, max {max(vals):.2f}")
     return 0
 
 
@@ -208,21 +240,40 @@ def selftest():
         Image.fromarray(arr).save(fh.name)
         return fh.name
 
-    # A frame shaped like a real field frame: a dim world, a minimap disc, and an HP bar of the
-    # real element's size. Deliberately not "black except the bar" -- an empty frame trips the
-    # cinematic-bar scan, which would make this case pass or fail for a reason unrelated to the
-    # marker it is meant to pin.
+    # A frame shaped like a real field frame. Two things this case must NOT do, both learned from
+    # review: it must not be "black except the bar" (an empty frame trips the bar scan, so the case
+    # would pass or fail for a reason unrelated to the marker), and the bar must be drawn at the
+    # REAL element's measured size rather than whatever fills the box -- a bar at 0.07 area cannot
+    # see a threshold retune to 0.03, which is inside the range a person might pick and which
+    # collapses the published count from 144 to 5.
     rng0 = np.random.default_rng(3)
     frame = (rng0.random((h, w, 3)) * 30).astype(np.uint8)      # dim but structured world
     mx0, my0, mx1, my1 = _px(MINIMAP_BOX, (w, h))
     frame[my0:my1, mx0:mx1] = (120, 150, 90)                     # minimap disc, roughly
     x0, y0, x1, y1 = _px(PARTY_BOX, (w, h))
-    bar_h = int((y1 - y0) * 0.09)
-    frame[y0 + bar_h * 3: y0 + bar_h * 4, x0 + 100: x1 - 60] = (60, 200, 60)
+    # Size the bar so its area fraction lands on the REAL element's 0.0201, not merely above the
+    # threshold. Then a retune to 0.03 -- which would silently take run3 from 144 frames to 5 --
+    # reddens this case instead of passing it.
+    target = 0.0201
+    bw = int(round((x1 - x0) * 0.62))
+    bh = max(1, int(round(target * (x1 - x0) * (y1 - y0) / bw)))
+    frame[y0 + bh * 3: y0 + bh * 4, x0 + (x1 - x0 - bw) // 2: x0 + (x1 - x0 + bw) // 2] = (60, 200, 60)
     p = save(frame)
     frac = hp_bar_fraction(p)
-    check(frac >= HP_BAR_MIN, f"a drawn HP bar clears the threshold ({frac:.4f} >= {HP_BAR_MIN})")
+    check(abs(frac - target) < 0.004,
+          f"the constructed HP bar matches the real element's area ({frac:.4f} vs {target})")
+    check(frac >= HP_BAR_MIN, f"...and clears the threshold ({frac:.4f} >= {HP_BAR_MIN})")
     check(in_field(p), "...and the frame classifies as field state")
+
+    # PARTY_BOX must be pinned by a control NOT drawn inside it, or the case moves with the box and
+    # can never fail. Draw the same bar at a FIXED screen position and require the box to find it.
+    fixed = (rng0.random((h, w, 3)) * 30).astype(np.uint8)
+    fixed[my0:my1, mx0:mx1] = (120, 150, 90)
+    fx0, fy0 = int(w * 0.86), int(h * 0.86)
+    fixed[fy0:fy0 + 22, fx0:fx0 + 300] = (60, 200, 60)
+    check(hp_bar_fraction(save(fixed)) > 0,
+          "PARTY_BOX covers the party block's real screen position (fixed control, not "
+          "drawn from the box)")
 
     # The two real failure modes, neither of which may pass.
     blue = np.zeros((h, w, 3), np.uint8)
@@ -242,10 +293,56 @@ def selftest():
     check(not in_field(wp), "...so a torn-composite cutscene is not field state")
 
     # Cinematic bars veto even with a HUD present.
+    # A deep-barred cinematic must not classify as field. Note this passes because the bars cover
+    # the party block, not because of a veto -- there is none. Recorded so nobody "restores" one.
     barred = frame.copy()
-    barred[: int(h * 0.10)] = 0
-    barred[-int(h * 0.10):] = 0
-    check(not in_field(save(barred)), "cinematic bars veto the field state even with the HUD up")
+    barred[: int(h * 0.30)] = 0
+    barred[-int(h * 0.30):] = 0
+    check(not in_field(save(barred)), "a deep-barred cinematic is not field state")
+
+    # The marker's LOWER side. Loosening the threshold must not admit the worst non-field frame
+    # measured across all four runs (0.0089) -- otherwise a retune downward silently adds frames.
+    faint = (rng0.random((h, w, 3)) * 30).astype(np.uint8)
+    faint[my0:my1, mx0:mx1] = (120, 150, 90)
+    fbw = int(round((x1 - x0) * 0.62))
+    fbh = max(1, int(round(0.0089 * (x1 - x0) * (y1 - y0) / fbw)))
+    faint[y0 + fbh * 3: y0 + fbh * 4,
+          x0 + (x1 - x0 - fbw) // 2: x0 + (x1 - x0 + fbw) // 2] = (60, 200, 60)
+    fp = save(faint)
+    check(not in_field(fp),
+          f"a frame at the worst measured NON-field value ({hp_bar_fraction(fp):.4f}) is rejected")
+
+    # MINIMAP_BOX, pinned by a control at a FIXED screen position rather than one drawn from the
+    # box -- the same trap PARTY_BOX had. A disc painted where the real minimap sits must register
+    # as changed when it is replaced, and the box must actually cover it.
+    mm_a = np.zeros((h, w, 3), np.uint8)
+    mm_b = np.zeros((h, w, 3), np.uint8)
+    cy, cx = int(h * 0.835), int(w * 0.086)          # real minimap centre, from a 4K capture
+    ry, rx = np.mgrid[0:h, 0:w]
+    disc_m = ((ry - cy) ** 2 + (rx - cx) ** 2) <= int(h * 0.113) ** 2
+    mm_a[disc_m] = (200, 180, 120)
+    mm_b[disc_m] = (40, 90, 60)
+    box_m = _px(MINIMAP_BOX, (w, h))
+    changed = minimap_change(save(mm_a), save(mm_b), box_m)
+    check(changed > 15,
+          f"MINIMAP_BOX covers the minimap's real screen position (change {changed:.1f})")
+
+    # world_renders carries the 25% headline and nothing tested it.
+    # Structured at a scale that SURVIVES the downscale. Two ways to get this wrong, both tried:
+    # per-pixel noise averages to flat grey under the resize, and coarse smooth gradients keep too
+    # few distinct colours. Real frames measure ~418 colours at sigma ~100, so the case is built
+    # from randomised blocks big enough to survive 256x144 and contrasty enough to look like a
+    # scene rather than a wash.
+    block = 24
+    bh_, bw_ = h // block + 1, w // block + 1
+    tiles = (rng0.random((bh_, bw_, 3)) * 235 + 10).astype(np.uint8)
+    scene = np.repeat(np.repeat(tiles, block, axis=0), block, axis=1)[:h, :w]
+    check(world_renders(save(scene)), "a structured world region reads as rendered")
+    check(not world_renders(save(np.full((h, w, 3), 255, np.uint8))),
+          "a blown-white world does not")
+    check(not world_renders(save(np.zeros((h, w, 3), np.uint8))), "a black world does not")
+    flat_blue = np.zeros((h, w, 3), np.uint8); flat_blue[:, :] = (0, 0, 255)
+    check(not world_renders(save(flat_blue)), "a flat blue world does not")
 
     print("  == selftest PASS ==" if ok else "  == selftest FAIL ==")
     return 0 if ok else 1
@@ -266,7 +363,9 @@ def main():
     s.add_argument("--guard", type=float, default=2.0,
                    help="seconds trimmed from each window's end; the character coasts briefly "
                         "after a release and without this the following neutral window inherits it")
-    s.add_argument("--moved", type=float, default=2.0)
+    s.add_argument("--moved", type=float, default=15.0,
+                   help="minimap change counting as movement; measured separation on PPSA17942 is "
+                        "stick 22.4-37.3 against neutral 0.0-12.7")
     s.set_defaults(func=cmd_locomotion)
     s = sub.add_parser("selftest")
     s.set_defaults(func=lambda a: selftest())

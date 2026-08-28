@@ -145,11 +145,11 @@ python3 scripts/dragon-quest-vii/classify_field.py world <EVIDENCE_ROOT>/shots
 python3 scripts/dragon-quest-vii/classify_field.py selftest
 ```
 
-It keys on the party block's **HP bar**, not on "is there HUD art in the corners". The generic
-corner test fails on this title in both directions and both failures are real captures: a
-torn-composite cutscene whose bottom corners hold saturated structured water passes it (that is
-what produced two false "gameplay" frames in runs 1 and 2), and a flat blue collapse scores 1.00
-saturated while containing nothing.
+It keys on the party block's **HP bar** and nothing else. A generic corner test fails in both
+directions here (a torn-composite cutscene's saturated water passes it; a flat blue collapse scores
+1.00 while containing nothing), a cinematic-bar veto measured a no-op across all four runs while
+rejecting nine genuine field frames when tight, and a brightness floor is inverted because field
+frames are dark precisely because they are HUD over an unrendered world.
 
 This route delivers **only Cross**, so it establishes the field state. Locomotion is measured by
 `probe-locomotion.pad` — see below.
@@ -175,9 +175,11 @@ python3 scripts/dragon-quest-vii/classify_field.py locomotion <EVIDENCE_ROOT>/sh
     --window 1130:1160:neutral --window 1160:1190:stick
 ```
 
-Measured: displacement ≥ 2 px in **6 of 8** stick windows (median 20.5 px of a 128 px disc) against
-**0 of 8** neutral. A 2 s guard band is trimmed from each window's end (`--guard`) because the
-character coasts after a release; it is an argument so it cannot hide inside the result.
+Measured: masked minimap change ≥ 15 in **8 of 8** stick windows (median 24.9, range 22.4-37.3)
+against **0 of 8** neutral (median 3.0, max 12.7). Identical at `--guard` 0, 2 and 4 — the guard is
+not load-bearing.
 
-**Measure the HUD, not the world.** A world region flicking between rendered and collapsed swamps
-the signal on this title; the minimap is drawn correctly regardless.
+**Measure the HUD, not the world**, and mask the disc. A world region flicking between rendered and
+collapsed swamps the signal; and the minimap is a circle in a square crop, so an unmasked box picks
+up the collapsing world in the corners — that alone scores 56 on a window whose map is
+pixel-identical.
