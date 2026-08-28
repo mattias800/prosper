@@ -145,5 +145,10 @@ python3 tools/frameclass/letterbox.py <EVIDENCE_ROOT>/shots \
 
 Both halves are required. Cinematic bars alone cannot see a collapsed present (this title collapses
 to white, to black, and to flat blue with a magenta speckle); HUD-corner colour alone fires on a
-colourful cutscene. Note also that this route delivers **only Cross** — it establishes the field
-state, not locomotion. Pushing the stick inside the field window is the open next step.
+colourful cutscene.
+
+This route delivers **only Cross**, so it establishes the field state. Locomotion was measured
+separately, by alternating stick and neutral windows inside the field state and phase-correlating
+the **minimap disc** between each window's first and last frame: displacement ≥ 2 px in 7 of 8 stick
+windows against 0 of 8 neutral ones. Measure the HUD, not the world — a world region flicking
+between rendered and collapsed swamps the signal, while the minimap is drawn correctly regardless.

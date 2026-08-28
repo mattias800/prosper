@@ -684,17 +684,33 @@ confirm, so a press landing early is absorbed rather than lost.
 **Worth generalising:** on a story-opening JRPG, "the route never leaves the cutscene" is a claim
 about the ROUTE until the confirm count has been pushed by an order of magnitude.
 
-### What is established, and what is inferred
+### Locomotion is MEASURED, and the measurement is on the HUD
 
-**Established by measurement:** the guest reaches and holds a field state that it does not render
-during cutscenes, and the world renders in a quarter of those frames.
+A fourth run mashes Cross to t=700, then alternates eight 28 s stick windows against eight matched
+neutral windows, entirely inside the field state. All eight stick deliveries appear in the pad log
+(`axes=left-stick-left/right/up/down`).
 
-**Inferred, not measured:** that the player could *move*. `reach-field-control.pad` delivers only
-Cross — no direction is ever pushed — so these runs show the field state, not locomotion. The
-inference rests on the title drawing this HUD only under player control, which is consistent with
-every frame examined (of the 144, none is letterboxed, none carries a dialogue plate, none a menu)
-but is not the same as a demonstration. A run that mashes Cross to t=660 and then pushes the stick
-inside the field window would settle it, and the machinery exists (#e209ac1c stick recording).
+**The signal is minimap displacement, not world motion.** Phase-correlating the minimap disc between
+the first and last field frame of each window:
+
+| | windows with displacement >= 2 px | median displacement |
+| --- | --- | --- |
+| stick held | **7 of 8** | 28.0 px (of a 128 px disc) |
+| neutral | **0 of 8** | 0.0 px (seven exactly zero) |
+
+That is the separation a world-motion probe could not produce, and the reason is the composite: a
+world region flicking between rendered and collapsed swamps any real movement, while the HUD is
+drawn correctly regardless. **On a title whose composite is broken, the HUD is the reliable place to
+look for locomotion.** `tools/frameclass/letterbox.py:hud_displacement` implements it.
+
+For completeness, world motion in the same windows does separate once pairs where either frame is
+collapsed are excluded — stick median 117.9 against neutral 18.1, a 6.5x ratio — but only weakly by
+rank (P(stick > neutral) = 0.694, Mann-Whitney p = 0.016), because the neutral spread stays wide.
+The minimap answers cleanly where the world answers noisily.
+
+Visually: across the first stick window the camera and character move together — the quest-marker
+house that sat centre-left ends up upper-right, a cliff face enters from the left, and the minimap
+scrolls correspondingly. `assets/screenshots/dragon-quest-vii-walked-to-cliff.png` is that frame.
 
 ### The composite, which is now the whole of the remaining gap
 

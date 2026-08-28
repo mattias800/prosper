@@ -173,6 +173,33 @@ def corner_structure(path, frac_w=0.22, frac_h=0.28, min_sat=0.02, min_sigma=15.
     return all(out)
 
 
+def hud_displacement(path_a, path_b, box, size=128):
+    """Rigid translation between the same HUD region in two frames, by phase correlation.
+
+    Why the HUD and not the world: on a title whose composite is broken, the world is the WORST
+    place to look for motion — a frame flicking between rendered and collapsed swamps any real
+    movement. The HUD is drawn correctly regardless, so a scrolling minimap is a locomotion signal
+    the composite defect cannot destroy. On PPSA17942 this separated cleanly where a world-motion
+    probe did not: displacement >= 2 px in 7 of 8 stick windows (median 28) against < 2 px in 8 of
+    8 neutral windows (seven of them exactly 0).
+
+    `box` is the region in source pixels; it is title-specific by nature — pass the minimap disc.
+    """
+    def region(p):
+        im = Image.open(p).convert("L").crop(box).resize((size, size), Image.BILINEAR)
+        return np.asarray(im, dtype=np.float32)
+    a, b = region(path_a), region(path_b)
+    fa = np.fft.fft2(a - a.mean())
+    fb = np.fft.fft2(b - b.mean())
+    r = fa * np.conj(fb)
+    r /= (np.abs(r) + 1e-9)
+    corr = np.fft.ifft2(r).real
+    iy, ix = np.unravel_index(np.argmax(corr), corr.shape)
+    dy = iy - size if iy > size // 2 else iy
+    dx = ix - size if ix > size // 2 else ix
+    return float(np.hypot(dx, dy))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
