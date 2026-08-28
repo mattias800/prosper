@@ -14,6 +14,11 @@
 *.self
 eboot.bin
 *.prgcap
+# F9 writes .prgbundle and F8 writes .prperf into PROSPER_CAPTURE_DIR, which defaults to the cwd --
+# so a capture taken while running from the repo root lands here. A .prgbundle carries game-derived
+# resource bytes and is routinely 200 MB - 2.7 GB, which must never reach a public repository.
+*.prgbundle
+*.prperf
 *.prgtl
 
 # ---- Build output ----
