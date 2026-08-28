@@ -343,6 +343,56 @@ both titles working.
 
 ## Ruled out (do-not-redo list)
 
+**The pure-black frame on master, 2026-08-28 (#3089, fixed by the PR that adds this row).** The
+cause is one line in `97ecc58a` ("gpu: GTA V world rendering series", the squash of #2996; the
+pre-squash branch commit is `1b5b9471`, which is NOT on master -- cite the squash, or a fresh clone
+cannot resolve it). HTILE-driven depth/stencil invalidation was suppressed whenever the guest write
+carried the `gpu-preserving` origin, so Blue Prince's retained depth was never discarded and stale
+depth rejected the whole scene.
+
+**The decision this reversed was already on record, in the status doc of the title it was written
+for.** `GTA5_STATUS.md` asks whether "a write that provably preserves guest bytes [should]
+invalidate a detached Vulkan depth image" and answers **"yes, it must -- byte equality with guest
+memory says nothing about equality with a renderer-owned image the renderer has since drawn into,
+and *Dead Cells* #611 is the counterexample where sparing it makes gameplay geometry disappear.
+That is why no preservation policy is proposed here."** `97ecc58a` shipped that preservation policy
+anyway. Read that passage before proposing any variant of it again.
+
+**Do not re-derive this by reverting hunks of that commit** -- seven candidate mechanisms were
+measured by direct A/B inside a single binary, computing the old and new predicate side by side.
+Six fire ZERO times on this title; the seventh is the cause:
+
+| candidate change | evaluations | times it fires on Blue Prince |
+| --- | --- | --- |
+| feedback narrowing (`mrt_target_view_feedback`) | 40,000 | 0 |
+| pass grouping (`mrt_same_color_pass` extent split) | 380,000 | 0 |
+| renderer mip assembly (`assemble_renderer_mips`) | — | 0 |
+| `CB_COLORn_VIEW.MIP_LEVEL` base/extent rebasing | 550,000 | 0 |
+| RECT_LIST geometry synthesis (`PROSPER_RECTLOG`) | — | 0 |
+| DCC zero-mip specialization guard removal | 820,000 | 0 |
+| **HTILE `gpu-preserving` suppression** | 60,000 | **59,999** |
+
+**Why 313 green tests shipped a black frame on a rung-6 title.** The #611 regression case
+(`tests/gpu/execute/test_gpu_execute.cpp:639`) is the guard for exactly this class -- "a compute
+fast-clear writes HTILE guest memory between graphics spans" -- and it could never fire. It drives
+`notify_guest_gpu_write`, the plain notifier, so the origin is `"unknown"` and the
+`strcmp(..., "gpu-preserving")` the suppression keyed on was false in every arm. The test stayed
+green through the regression and stays green after the fix. A guard that cannot reach the state it
+guards is not a guard; the corrected case in `test_ds_layer_stride.cpp` sets the origin explicitly.
+
+Three further method warnings from the same investigation, all of which cost hours:
+
+- **Comparing the first N readbacks proves nothing here.** Blue Prince is legitimately black for
+  its first ~3,500 colour readbacks on BOTH sides of the regression; the fade-in starts only around
+  #3519 and climbs to ~21%. An A/B over the first 20-30 readbacks compares two black regions and
+  reports "identical inputs" — which is what made this look like a plumbing bug for two sessions.
+  Compare a running MAXIMUM over the whole run instead of a prefix.
+- **A predicate A/B is blind to a change UPSTREAM of the value it reads.** The grouping and feedback
+  probes above computed the old and new predicates side by side and agreed 380,000/380,000 — while
+  both read the same already-rewritten `color0_base`. Agreement there bounds the predicate logic,
+  never its inputs.
+
+
 **Persistent-texture revalidation, 2026-08-07 (Windows / NVIDIA RTX 4090, #2289 / #2290 / #2295).**
 **43.6% of the frame is `memcmp` revalidating 19 cached, unchanged textures** — 233 GiB of
 comparison per ~55 s route, on a cache running 34,303 hits against 19 misses. That number stands.
