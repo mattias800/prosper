@@ -903,7 +903,26 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
     // because the wake is asynchronous and the unlocker's cmpxchg wins every race. Scoped to the
     // AkSoundEngine slot range that owns the contended lock (#2981); penalizing every guest mutex
     // system-wide costs throughput for no benefit here.
-    const bool fair = [] { static const bool on = getenv("PROSPER_MUTEX_FAIR") != nullptr; return on; }();
+    // DEFAULT ON since #3090. It was opt-in, and GRIS therefore shipped deadlocked: its opening FMV
+    // froze the whole guest -- all 72 threads asleep, no thread in state R, the render thread making
+    // no HLE calls at all because it was parked on a futex nobody would release. Measured on a New
+    // Game route, 180 s, three runs each:
+    //
+    //     off  10,620 frames   48 "Forcing submitDone to avoid TRC R4089 breach"   (frozen)
+    //     on   23,700-42,300   0-1                                                 (plays through)
+    //
+    // The freeze is what this fairness sleep already existed to prevent -- the comment below has
+    // named GRIS's bank commit since #2981 -- so the defect was the DEFAULT, not the mechanism.
+    // Leaving a fix for a known deadlock behind an environment variable means every user meets the
+    // deadlock and nobody meets the fix.
+    //
+    // Turning it on is cheap because the effect is already address-scoped to the AkSoundEngine slot
+    // range below: a title that does not use Wwise never reaches the sleep. Verified on Alex Kidd
+    // (no Wwise), which is unaffected: 10,920 frames off, 13,800 on.
+    const bool fair = [] {
+        static const bool off = getenv("PROSPER_NO_MUTEX_FAIR") != nullptr;
+        return !off;
+    }();
 #if (defined(__linux__) && !defined(__ANDROID__)) || defined(__GLIBC__)
     // glibc layout only: bit1 of the first word is the waiters flag. On other libc/platforms the
     // first word means something else entirely (macOS: a signature constant with that bit set,
