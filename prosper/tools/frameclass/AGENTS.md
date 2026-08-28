@@ -112,3 +112,14 @@ sampled from `assets/screenshots/`, deliberately: the thresholds were tuned agai
 control drawn from it would confirm the tuning rather than the classifier — which is exactly how the
 "clean gap" above came to be believed. Each case pins a mistake this tool has already made, and each
 rule is checked by mutation: reverting it reddens the case that names it.
+
+## `letterbox.py`
+
+Answers a different question from `frameclass.py`: not "does this frame carry content" but "is the
+title showing a **cutscene**". It measures the cinematic bars, which are geometric and therefore
+survive the colour degradation that makes chromatic metrics unreliable on several UE4 titles here.
+
+Two limits are documented in its own header and worth repeating, because both were paid for:
+a present collapsed to uniform **white** has no dark rows and so reads as un-barred, i.e. as
+gameplay — hence the uniformity guard rather than a brightness floor; and absence of bars is not
+presence of gameplay, since a menu has none either. Pair it with a positive per-title marker.

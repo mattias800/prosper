@@ -101,3 +101,32 @@ trusting the timings, and re-anchor the route if you extend it.
 Two independent runs reach Estard, write `GameSaveData000.dat` and render the world. Neither
 demonstrates free player control — see `docs/DRAGON_QUEST_STATUS.md` for exactly what is and is not
 established, and for the state of the composite in that phase.
+
+## Free field control — `reach-field-control.pad`
+
+Reaches free field control in Pilchard Bay at t~600 s and holds it to the end of the run. Use this
+one for gameplay work; `reach-gameplay.pad` stops inside the opening chapter's script.
+
+The only difference between them is **confirm spacing**: 2 s instead of 15 s. Measured on one
+binary, quiet box, world phase only — 41 confirms gave 1 frame with the field HUD, 447 gave 145.
+The chapter script is simply long, and every screen in it waits indefinitely for confirm, so a
+press that lands early is absorbed rather than lost. That makes this route unusually robust to the
+wall-clock drift recorded in #2764.
+
+```bash
+PROSPER_NULL_PAGE=1 \
+PROSPER_GUEST_ARGS= \
+PROSPER_RENDER=1 \
+PROSPER_SAVE0=<FRESH_SAVE_ROOT>/save0 \
+PROSPER_SAVEDATA_DIR=<FRESH_SAVE_ROOT>/savedata \
+PROSPER_PAD_SCRIPT=@scripts/dragon-quest-vii/reach-field-control.pad \
+PROSPER_PAD_SCRIPT_LOG=1 \
+./build-linux/screenshot <DUMP_ROOT>/PPSA17942-app0 \
+  --seconds 4 --count 310 --timeout 1350 --out <EVIDENCE_ROOT>/shots
+```
+
+**Confirming you reached it, without trusting the clock.** The field HUD is the positive marker:
+the circular minimap at bottom-left and the party block at bottom-right, neither of which the game
+draws during a cutscene. Cinematic bars are the negative one
+(`tools/frameclass/letterbox.py`). Require both — a collapsed white present has no bars either, and
+a colourful cutscene frame passes a HUD-colour test on its own.

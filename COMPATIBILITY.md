@@ -37,7 +37,7 @@ Last updated: 2026-08-27
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Story Mode reached in the guest; HUD and radar render over an absent 3D world | [#1873](https://github.com/mattias800/prosper/issues/1873) |
-| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Opening chapter in Estard — the game writes a save and renders the world; free player control not yet demonstrated, composite severely degraded | [#1874](https://github.com/mattias800/prosper/issues/1874) |
+| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Rung 3 — **free field control in Pilchard Bay**: the field HUD, minimap, location banner and player character, held for 636 s across 145 frames. What was in the way was never a wall but the route's patience — the opening chapter needs ~450 confirms, and every earlier route gave it ~40. The composite is severely degraded and intermittent: 25% of those frames render a recognisable scene, the rest lose the world to a white or black collapse (#1486 / #1588). Route: `scripts/dragon-quest-vii/reach-field-control.pad` | [#1874](https://github.com/mattias800/prosper/issues/1874) |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First-level gameplay | [#1875](https://github.com/mattias800/prosper/issues/1875) |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Level 1 gameplay | [#1876](https://github.com/mattias800/prosper/issues/1876) |
 | *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ First forest level | [#1877](https://github.com/mattias800/prosper/issues/1877) |
@@ -94,8 +94,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 26 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 27 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 16 |
 | **Below a title screen** — logo or splash only (rung 1) | 3 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
@@ -139,7 +139,7 @@ the engine recorded in the table:
 | Unreal Engine — 10 × UE4, 1 × UE5, 1 unversioned | 12 |
 | Hedgehog Engine, Hedgehog Engine 2, RAGE, Custom (Ancient), ASOBI — one each | 5 |
 
-**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 17 rung-2
+**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 16 rung-2
 rows are Unreal, against 18 Unreal rows in the table overall — the other six are one at gameplay
 (*Dragon Quest VII Reimagined*, whose world renders), two at rung 1 (*Little Nightmares II* and
 *Beast of Reincarnation*) and three at rung 0 (*The Lord of the Rings: Gollum*, *The First Berserker:
@@ -356,6 +356,8 @@ the HUD, radar and tutorial text are visible, but the 3D world is still black. S
 <p align="center"><img src="assets/screenshots/dragon-quest-vii-onboarding.png" alt="Dragon Quest VII Reimagined — first-run setup"></p>
 
 <p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.png" alt="Dragon Quest VII Reimagined — the Estard coast in the opening chapter"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-pilchard-bay-gameplay.png" alt="Dragon Quest VII Reimagined — free field control in Pilchard Bay: the player character stands outside a harbour house with a quest marker over its door and a rowing boat beached to the right, the circular minimap at bottom-left and the party status block (Lv.1, HP 22, MP 7) at bottom-right. Colour is severely degraded — the composite blows the buildings to white and crushes the ground to navy — but the scene is structurally complete."></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-field-hud.png" alt="Dragon Quest VII Reimagined — the Pilchard Bay location banner on entering the area, with the field HUD live: minimap, quest marker and party status. The world behind it is largely lost to the composite collapse."></p>
 
 The title, new-save flow, and first-run setup render at native 3840×2160 with audio. A scripted route now continues past them: the game creates a real adventure log (`GameSaveData000.dat`), loads Estard’s persistent level and the chapter-1 sequence, and runs the opening story with named-character dialogue over a rendered 3D world. **Free player control has not been demonstrated**, and the composite in that phase is severely degraded — flat black surfaces, rainbow-noise ground, and whole frames flashing uniform white or blue. See the [tracker](https://github.com/mattias800/prosper/issues/1874).
 

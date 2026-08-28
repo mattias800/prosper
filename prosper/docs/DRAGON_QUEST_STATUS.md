@@ -650,7 +650,73 @@ likely to close before rendering starts. **Do not quote 50% as a property of the
 Re-run the same command, discard any run that fails the acceptance rule, and compare only the asserted
 invariants. A change in frames, draws or wave64 skips is **not** evidence of anything on its own.
 
+## Free field control is reached — 2026-08-28, and the blocker was the route's patience
+
+**Rung 3.** `scripts/dragon-quest-vii/reach-field-control.pad` reaches free field control in
+Pilchard Bay: the field HUD (circular minimap bottom-left, party block bottom-right reading
+`Lv.1 / HP 22 / MP 7`), the location banner that fires on entering an area, the player character
+standing in the world, and quest markers over doors. Held for **636 s across 145 frames**
+(t=600-1236 s). Linux, RADV STRIX_HALO, native 3840x2160 through `tools/screenshot`, direct
+frontend, unmodified captures, UE4 recipe, isolated save roots, master `68f89186`.
+
+### What was actually in the way
+
+Not a control, not a screen, and not the renderer: **how many confirms the opening chapter is
+given.** Three runs on the same binary and the same quiet box, differing only in confirm spacing:
+
+| confirm spacing | confirms delivered | frames with the field HUD |
+| --- | --- | --- |
+| 15 s (`reach-gameplay.pad`) | 41 | 1 |
+| ~14 s (probe route) | 37 | 1 |
+| **2 s** (`reach-field-control.pad`) | **447** | **145** |
+
+The chapter script is long, and every earlier route ran out of patience rather than out of road.
+This is worth generalising: on a story-opening JRPG, "the route never leaves the cutscene" is a
+claim about the ROUTE until the confirm count has been pushed by an order of magnitude.
+
+### The composite, which is now the whole of the remaining gap
+
+Of the 145 gameplay frames, **36 (25%) render a recognisable scene**; the other 109 lose the world
+to a uniform white or black collapse. Continuous rendered stretches reach 24 s. Even the best
+frames are severely colour-degraded — harbour buildings blown to white, ground crushed to navy,
+the player a black silhouette — but structurally complete: house, door, windows, rowing boat,
+foliage, cliff and character all present and recognisable. That is why this is rung 3 under the
+ladder's "degraded still counts" bar rather than rung 2's "world absent". #1486, #1588.
+
+### Instruments, and why the obvious one cannot work here
+
+**A motion probe cannot answer "does the player have control" on this title.** Matched 32 s windows
+alternating neutral against full stick deflection, stick delivery proven in the pad log
+(`axes=left-stick-left/right/up`), produced neutral-window medians of 84.2, 2.2, 15.9 and 66.5 —
+a spread *larger* than any stick-versus-neutral difference. A cutscene whose own activity varies
+40x cannot be a baseline, so the experiment is void rather than negative. This is almost certainly
+why the 2026-08-20 probe "did not separate" too.
+
+**What works is a conjunction**, because each half fails alone:
+- `tools/frameclass/letterbox.py` — cinematic bars are *geometric*, so they survive the colour
+  degradation that makes every chromatic metric unreliable here. But a present collapsed to white
+  has no dark rows either, so bars alone report a dead frame as gameplay.
+- A HUD-colour test on the two bottom corners — but a colourful *cutscene* frame passes that alone
+  (the Estard village reads 0.67 saturated in both corners).
+
+Require both — no bars, not uniform, HUD art in both corners — and the classes separate cleanly.
+
 ## Ruled out — eliminated, do not re-run these
+- **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
+  raising the confirm rate from one per 15 s to one per 2 s takes the run from 1 field-HUD frame to
+  145. See *Free field control is reached* above for the three-run table. #1874.
+
+- **"A stick-versus-neutral motion probe can establish free control on this title."**
+  **Falsified 2026-08-28** and it is void rather than negative: across four matched windows the
+  NEUTRAL medians alone ranged 2.2 to 84.2, so no contrast the experiment can produce is
+  interpretable. Do not re-run it in this form; use the letterbox+HUD conjunction above. #1874.
+
+- **"No cinematic bars means the run reached gameplay."** **Falsified 2026-08-28.** A present
+  collapsed to uniform white has no dark rows, so a bar detector reports it as un-barred. The first
+  version of this measurement returned 61 "un-barred" world frames on a run that never left its
+  cutscene; every one was RGB(255,255,255). An absence test needs a uniformity guard, not a
+  brightness floor — guarding only against darkness inverts the other half of the range. #1874.
+
 
 - **"Reading a `Map/Product/World/**.umap` package means the run reached the world."** **Falsified
   2026-08-20** over two runs: two World maps are read at **0.0 s**, before the title map, and the
