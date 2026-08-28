@@ -32,7 +32,9 @@ in the harbour rather than watching it.
 
 ![Dragon Quest VII Reimagined: the same harbour after a left-stick window — the quest-marker house that stood centre-left is now upper-right, a cliff face has entered from the left, and the minimap has scrolled to match. The player has walked](assets/screenshots/dragon-quest-vii-walked-to-cliff.png)
 
-Three quarters of the frames still lose the world to the composite, and the colour is plainly wrong.
+The colour is plainly wrong, and depending on the run a quarter to a half of the frames still lose
+the world to the composite — geometry and the HUD are fine; it is the lit-material shading that is
+broken.
 Nothing was blocking control, though: the opening chapter is simply very long, and every route we
 had gave it about forty confirms before deciding it was a wall.
 

@@ -39,8 +39,6 @@ import argparse, glob, json, os, statistics, sys
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "..", "tools", "frameclass"))
 
 HP_BAR_MIN = 0.013
 # The party block and the minimap disc, as fractions of the frame so they survive a resolution
@@ -69,15 +67,19 @@ def in_field(path):
     One test, deliberately. Two others were tried and both removed:
 
     * A **collapse test first.** Unnecessary -- a frame carrying the HP bar is by definition not a
-      collapse -- and its structure floor has only ~3 units of margin here, so it would have made
-      the published counts depend on a threshold the marker does not need.
-    * A **cinematic-bar veto.** Measured a no-op across all four runs (0/0/144/190 with and
-      without), because a real cinematic's bars are deep enough to cover the party block, so the
-      marker already rejects those frames. Worse than useless while it was tight: at 0.04 it
-      rejected nine genuine "Pilchard Bay: Church" frames whose *world* had collapsed to black,
-      reading unrendered darkness as letterboxing -- the same inversion that makes a brightness
-      floor useless on this title. Its test case also passed for the wrong reason, since drawing
-      30% bars over a synthetic frame erases the very HP bar the case depended on.
+      collapse -- and its structure floor is not trustworthy here in any case: a genuine collapse
+      in this very run (frame 188: three distinct colours, nothing rendered) measures sigma 13.14
+      and sits OVER the 12.0 floor, while its neighbour 195 measures 11.56 and is caught. Do not
+      describe the distance from a threshold to the nearest real frame as "margin" -- it is
+      bounded by whichever collapse happens to sit just under the line.
+    * A **cinematic-bar veto.** A no-op only ABOVE a bar threshold of ~0.052 (0 frames rejected at
+      0.06 and 0.10, across all four runs), because a real cinematic's bars cover the party block
+      and the marker already rejects those frames. At the 0.04 it actually shipped with it was
+      worse than useless: it rejected nine genuine "Pilchard Bay: Church" frames whose *world* had
+      collapsed to black, reading unrendered darkness as letterboxing -- 190 field frames became
+      181. That is the same inversion that makes a brightness floor useless here. Its test case
+      also passed for the wrong reason, since drawing 30% bars over a synthetic frame erases the
+      very HP bar the case depended on.
 
     So: the HP bar, and nothing else. It separates 0.0201 from 0.0089 across 1,370 frames.
     """
@@ -223,8 +225,21 @@ def cmd_locomotion(args):
 
 
 def selftest():
-    """Pins the thresholds against constructed frames. The point is the MARGIN: each case sits
-    clearly on its side, so a small retune does not silently flip the published counts."""
+    """Pins the thresholds and the boxes against constructed frames.
+
+    Every case here exists because a review showed the previous version could not fail. Two traps
+    are worth naming, because both are easy to walk back into:
+
+    * **A control drawn FROM the box under test cannot pin that box.** The first version sized its
+      HP bar as a fraction of PARTY_BOX, so the measured area fraction came out at the target for
+      ANY box extent -- the case was arithmetically incapable of noticing a box change. Controls
+      here are drawn at fixed PIXEL positions and sizes, and the expected fraction is asserted
+      numerically, so moving or resizing a box moves the measurement off it.
+    * **A control that also satisfies the mutation cannot pin the operation.** The minimap case
+      compares a bright disc against a dark one, where a signed mean is as large as an absolute
+      one -- so it could not see `abs` being removed. The case below changes equal areas up and
+      down, which cancels under a signed mean.
+    """
     import tempfile
     ok = True
 
@@ -234,118 +249,147 @@ def selftest():
         ok = ok and bool(cond)
 
     h, w = 2160, 3840
+    rng = np.random.default_rng(3)
 
     def save(arr):
         fh = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         Image.fromarray(arr).save(fh.name)
         return fh.name
 
-    # A frame shaped like a real field frame. Two things this case must NOT do, both learned from
-    # review: it must not be "black except the bar" (an empty frame trips the bar scan, so the case
-    # would pass or fail for a reason unrelated to the marker), and the bar must be drawn at the
-    # REAL element's measured size rather than whatever fills the box -- a bar at 0.07 area cannot
-    # see a threshold retune to 0.03, which is inside the range a person might pick and which
-    # collapses the published count from 144 to 5.
-    rng0 = np.random.default_rng(3)
-    frame = (rng0.random((h, w, 3)) * 30).astype(np.uint8)      # dim but structured world
-    mx0, my0, mx1, my1 = _px(MINIMAP_BOX, (w, h))
-    frame[my0:my1, mx0:mx1] = (120, 150, 90)                     # minimap disc, roughly
-    x0, y0, x1, y1 = _px(PARTY_BOX, (w, h))
-    # Size the bar so its area fraction lands on the REAL element's 0.0201, not merely above the
-    # threshold. Then a retune to 0.03 -- which would silently take run3 from 144 frames to 5 --
-    # reddens this case instead of passing it.
-    target = 0.0201
-    bw = int(round((x1 - x0) * 0.62))
-    bh = max(1, int(round(target * (x1 - x0) * (y1 - y0) / bw)))
-    frame[y0 + bh * 3: y0 + bh * 4, x0 + (x1 - x0 - bw) // 2: x0 + (x1 - x0 + bw) // 2] = (60, 200, 60)
-    p = save(frame)
-    frac = hp_bar_fraction(p)
-    check(abs(frac - target) < 0.004,
-          f"the constructed HP bar matches the real element's area ({frac:.4f} vs {target})")
-    check(frac >= HP_BAR_MIN, f"...and clears the threshold ({frac:.4f} >= {HP_BAR_MIN})")
-    check(in_field(p), "...and the frame classifies as field state")
+    def field_frame(bar_px=None):
+        """A frame shaped like a real one: dim structured world, minimap disc, and optionally an
+        HP bar of an exact PIXEL size at a fixed screen position."""
+        f = (rng.random((h, w, 3)) * 30).astype(np.uint8)
+        cy, cx, r = int(h * 0.835), int(w * 0.086), int(h * 0.113)
+        yy, xx = np.mgrid[0:h, 0:w]
+        f[((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r] = (120, 150, 90)
+        if bar_px:
+            bw, bh = bar_px
+            # Inside PARTY_BOX (x from 0.78w, y from 0.77h) with room for the widest bar
+            # used below -- an overflowing bar is silently clipped and measures short.
+            by, bx = int(h * 0.905), int(w * 0.810)
+            f[by:by + bh, bx:bx + bw] = (60, 200, 60)
+        return f
 
-    # PARTY_BOX must be pinned by a control NOT drawn inside it, or the case moves with the box and
-    # can never fail. Draw the same bar at a FIXED screen position and require the box to find it.
-    fixed = (rng0.random((h, w, 3)) * 30).astype(np.uint8)
-    fixed[my0:my1, mx0:mx1] = (120, 150, 90)
-    fx0, fy0 = int(w * 0.86), int(h * 0.86)
-    fixed[fy0:fy0 + 22, fx0:fx0 + 300] = (60, 200, 60)
-    check(hp_bar_fraction(save(fixed)) > 0,
-          "PARTY_BOX covers the party block's real screen position (fixed control, not "
-          "drawn from the box)")
+    # ---- the marker, pinned at the REAL element's measured area ------------------------------
+    # PARTY_BOX spans 0.22w x 0.23h = 844 x 496 px at 4K. A bar of 522 x 20 px is 10440/418624 =
+    # 0.02494 of it. Asserted numerically: change the box extent and this number moves.
+    px = _px(PARTY_BOX, (w, h))
+    box_area = (px[2] - px[0]) * (px[3] - px[1])
+    # HARDCODED, not derived from PARTY_BOX. Deriving it reproduces the very circularity this case
+    # exists to remove: widen the box and both the measurement and its expectation move together.
+    # 522x20 px inside the box PARTY_BOX describes at 3840x2160 is 10440 / 418624 = 0.024939.
+    frac_target = 0.024939
+    p_field = save(field_frame(bar_px=(522, 20)))
+    frac = hp_bar_fraction(p_field)
+    check(abs(frac - frac_target) < 0.002,
+          f"a fixed-size HP bar measures the area PARTY_BOX implies ({frac:.5f} vs "
+          f"{frac_target:.5f}) -- moving or resizing the box moves this")
+    check(in_field(p_field), "...and the frame classifies as field state")
 
-    # The two real failure modes, neither of which may pass.
-    blue = np.zeros((h, w, 3), np.uint8)
-    blue[:, :] = (0, 0, 255)
-    check(not in_field(save(blue)), "a flat blue collapse is not field state")
-    check(not in_field(save(np.full((h, w, 3), 255, np.uint8))),
-          "a blown-white collapse is not field state")
+    # Both sides of the threshold, built at the REAL measured values so a retune in either
+    # direction reddens. 0.0201 is the field class; 0.008860 is the worst non-field frame across
+    # all four runs.
+    for name, target, want in (("the field class (0.0201)", 0.0201, True),
+                               ("the worst NON-field value (0.008860)", 0.008860, False)):
+        bw = 522
+        # Round UP. Rounding down builds the case just under the value it names, which is how the
+        # previous version left HP_BAR_MIN=0.00875 passing while it changed a published count.
+        bh = max(1, -(-int(target * box_area) // bw))
+        got = hp_bar_fraction(save(field_frame(bar_px=(bw, bh))))
+        # Build at or ABOVE the named value, never under it, or the case cannot pin the boundary.
+        check((got >= target * 0.99) and (in_field_frac(got) == want),
+              f"a bar at {name} classifies as {'field' if want else 'not field'} "
+              f"(measured {got:.5f})")
 
-    # Saturated, structured water in the corners -- the generic corner test's false positive.
+    # ---- collapses -----------------------------------------------------------------------
+    check(not in_field(save(np.full((h, w, 3), 255, np.uint8))), "a blown-white collapse is not field")
+    blue = np.zeros((h, w, 3), np.uint8); blue[:, :] = (0, 0, 255)
+    check(not in_field(save(blue)), "a flat blue collapse is not field")
+
+    # Saturated structured water in the corners -- the generic corner test's false positive.
     water = np.zeros((h, w, 3), np.uint8)
-    rng = np.random.default_rng(5)
     water[:, :, 2] = 120 + (rng.random((h, w)) * 90).astype(np.uint8)
     water[:, :, 1] = 40 + (rng.random((h, w)) * 40).astype(np.uint8)
-    wp = save(water)
-    check(hp_bar_fraction(wp) < HP_BAR_MIN,
-          f"structured blue water carries no HP bar ({hp_bar_fraction(wp):.4f})")
-    check(not in_field(wp), "...so a torn-composite cutscene is not field state")
+    check(not in_field(save(water)), "a torn-composite cutscene (structured water) is not field")
 
-    # Cinematic bars veto even with a HUD present.
-    # A deep-barred cinematic must not classify as field. Note this passes because the bars cover
-    # the party block, not because of a veto -- there is none. Recorded so nobody "restores" one.
-    barred = frame.copy()
-    barred[: int(h * 0.30)] = 0
-    barred[-int(h * 0.30):] = 0
-    check(not in_field(save(barred)), "a deep-barred cinematic is not field state")
-
-    # The marker's LOWER side. Loosening the threshold must not admit the worst non-field frame
-    # measured across all four runs (0.0089) -- otherwise a retune downward silently adds frames.
-    faint = (rng0.random((h, w, 3)) * 30).astype(np.uint8)
-    faint[my0:my1, mx0:mx1] = (120, 150, 90)
-    fbw = int(round((x1 - x0) * 0.62))
-    fbh = max(1, int(round(0.0089 * (x1 - x0) * (y1 - y0) / fbw)))
-    faint[y0 + fbh * 3: y0 + fbh * 4,
-          x0 + (x1 - x0 - fbw) // 2: x0 + (x1 - x0 + fbw) // 2] = (60, 200, 60)
-    fp = save(faint)
-    check(not in_field(fp),
-          f"a frame at the worst measured NON-field value ({hp_bar_fraction(fp):.4f}) is rejected")
-
-    # MINIMAP_BOX, pinned by a control at a FIXED screen position rather than one drawn from the
-    # box -- the same trap PARTY_BOX had. A disc painted where the real minimap sits must register
-    # as changed when it is replaced, and the box must actually cover it.
-    mm_a = np.zeros((h, w, 3), np.uint8)
-    mm_b = np.zeros((h, w, 3), np.uint8)
-    cy, cx = int(h * 0.835), int(w * 0.086)          # real minimap centre, from a 4K capture
-    ry, rx = np.mgrid[0:h, 0:w]
-    disc_m = ((ry - cy) ** 2 + (rx - cx) ** 2) <= int(h * 0.113) ** 2
-    mm_a[disc_m] = (200, 180, 120)
-    mm_b[disc_m] = (40, 90, 60)
-    box_m = _px(MINIMAP_BOX, (w, h))
-    changed = minimap_change(save(mm_a), save(mm_b), box_m)
-    check(changed > 15,
-          f"MINIMAP_BOX covers the minimap's real screen position (change {changed:.1f})")
-
-    # world_renders carries the 25% headline and nothing tested it.
-    # Structured at a scale that SURVIVES the downscale. Two ways to get this wrong, both tried:
-    # per-pixel noise averages to flat grey under the resize, and coarse smooth gradients keep too
-    # few distinct colours. Real frames measure ~418 colours at sigma ~100, so the case is built
-    # from randomised blocks big enough to survive 256x144 and contrasty enough to look like a
-    # scene rather than a wash.
+    # ---- world_renders: BOTH sides of all three thresholds --------------------------------
     block = 24
-    bh_, bw_ = h // block + 1, w // block + 1
-    tiles = (rng0.random((bh_, bw_, 3)) * 235 + 10).astype(np.uint8)
+    tiles = (rng.random((h // block + 1, w // block + 1, 3)) * 235 + 10).astype(np.uint8)
     scene = np.repeat(np.repeat(tiles, block, axis=0), block, axis=1)[:h, :w]
-    check(world_renders(save(scene)), "a structured world region reads as rendered")
-    check(not world_renders(save(np.full((h, w, 3), 255, np.uint8))),
-          "a blown-white world does not")
+    check(world_renders(save(scene)), "a structured world reads as rendered")
+    check(not world_renders(save(np.full((h, w, 3), 255, np.uint8))), "a blown-white world does not")
     check(not world_renders(save(np.zeros((h, w, 3), np.uint8))), "a black world does not")
-    flat_blue = np.zeros((h, w, 3), np.uint8); flat_blue[:, :] = (0, 0, 255)
-    check(not world_renders(save(flat_blue)), "a flat blue world does not")
+    check(not world_renders(save(blue)), "a flat blue world does not")
+    # Just-too-few colours, and just-too-flat: these pin the two thresholds a global test misses.
+    few = np.repeat(np.repeat((rng.random((6, 6, 3)) * 200 + 25).astype(np.uint8),
+                              h // 6 + 1, axis=0), w // 6 + 1, axis=1)[:h, :w]
+    check(not world_renders(save(few)), "a world of only a few large flat blocks does not")
+    faintish = (128 + (rng.random((h, w, 3)) * 6 - 3)).astype(np.uint8)
+    check(not world_renders(save(faintish)), "a nearly uniform mid-grey world does not")
+
+    # BETWEEN the thresholds, so tightening either one reddens. A real frame is not saturated in
+    # usable-range nor unlimited in colour: this one is ~0.6 usable with ~700 colours.
+    mid = np.zeros((h, w, 3), np.uint8)
+    mtiles = (rng.random((28, 28, 3)) * 170 + 40).astype(np.uint8)
+    mid[:] = np.repeat(np.repeat(mtiles, h // 28 + 1, axis=0), w // 28 + 1, axis=1)[:h, :w]
+    mid[: int(h * 0.35)] = 255                      # a blown band drags usable down to ~0.6
+    u_mid = np.asarray(Image.fromarray(mid).crop(_px(WORLD_BOX, (w, h))).resize((256, 144)))
+    lum_mid = u_mid.reshape(-1, 3).mean(axis=1)
+    check(world_renders(save(mid)),
+          f"a partly-blown world still reads as rendered "
+          f"(usable {float(((lum_mid > 25) & (lum_mid < 245)).mean()):.2f}, "
+          f"colours {len(np.unique(u_mid.reshape(-1, 3) // 8, axis=0))}) -- pins BOTH thresholds "
+          f"from the loose side")
+
+    # WORLD_BOX itself: a frame whose WORLD region is a scene and whose HUD corners are flat. If the
+    # box moves onto the HUD, this stops reading as rendered.
+    # HARDCODED region, NOT _px(WORLD_BOX, ...). Painting the scene into the box under test moves
+    # the control with the box and the case can never fail -- the same circularity PARTY_BOX had.
+    # These are the pixels WORLD_BOX describes at 3840x2160: x 691..3148, y 108..1555.
+    split = np.zeros((h, w, 3), np.uint8)
+    split[:] = (10, 10, 10)
+    split[108:1555, 691:3148] = scene[108:1555, 691:3148]
+    check(world_renders(save(split)),
+          "a scene confined to the WORLD region reads as rendered (pins WORLD_BOX's position)")
+
+    # ---- minimap_change: the disc mask AND the absolute value -----------------------------
+    box_m = _px(MINIMAP_BOX, (w, h))
+    base = field_frame()
+    # (a) change only OUTSIDE the disc: the mask must reject it.
+    outside = base.copy()
+    outside[int(h * 0.72):int(h * 0.95), int(w * 0.135):int(w * 0.150)] = (255, 255, 255)
+    check(minimap_change(save(base), save(outside), box_m) < 5,
+          "a change outside the disc does not count as movement (the mask is load-bearing)")
+    # (b) equal areas brighter and darker: a SIGNED mean cancels, an absolute one does not.
+    signed = base.copy()
+    cy, cx, r = int(h * 0.835), int(w * 0.086), int(h * 0.113)
+    yy, xx = np.mgrid[0:h, 0:w]
+    inside = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+    upper = inside & (yy < cy)
+    lower = inside & (yy >= cy)
+    signed[upper] = (220, 220, 220)
+    signed[lower] = (20, 20, 20)
+    check(minimap_change(save(base), save(signed), box_m) > 15,
+          "equal brightening and darkening still counts as change (pins the ABSOLUTE value)")
+
+    # A FINE-GRAINED change: alternating 8 px stripes inside the disc. At the working resolution
+    # this is plainly a change; downscale far enough and it averages to nothing, so this pins
+    # `size` against being reduced.
+    striped = base.copy()
+    stripe = (yy // 8) % 2 == 0
+    striped[inside & stripe] = (240, 240, 240)
+    striped[inside & ~stripe] = (15, 15, 15)
+    check(minimap_change(save(base), save(striped), box_m) > 15,
+          "a fine-grained change is still seen (pins the sampling size against being coarsened)")
 
     print("  == selftest PASS ==" if ok else "  == selftest FAIL ==")
     return 0 if ok else 1
+
+
+def in_field_frac(frac):
+    """Whether an already-measured HP-bar fraction counts as the field state."""
+    return frac >= HP_BAR_MIN
 
 
 def main():

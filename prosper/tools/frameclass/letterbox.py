@@ -35,32 +35,36 @@ import numpy as np
 from PIL import Image
 
 
-def collapsed(path, width=320, min_sigma=12.0):
-    """Is this a collapsed present rather than a picture — of ANY colour, flat or speckled?
+def collapsed(path, width=320, min_sigma=12.0, max_colours=32):
+    """Is this a collapsed present rather than a picture -- of ANY colour, flat or speckled?
 
-    Measured by structure (luma standard deviation), not by colour count and not by brightness.
-    Three failures forced that, all on PPSA17942 and all of them silent:
+    TWO tests, OR'd, because each one alone has a measured hole on the same title and phase:
 
-    - **Blown white.** A frame at RGB(255,255,255) has no dark rows, so a bar detector reports
-      "no bars" and it reads as GAMEPLAY. Guarding only against darkness inverts this half.
-    - **Flat blue with a magenta speckle.** 18 distinct colours across a full 8.3 MP frame, so a
-      colour-count guard (this function's previous form, `<= 3`) passes it straight through. It
-      was reported as un-barred — i.e. as a candidate for player control — on a run that never
-      left its cutscene.
-    - **A brightness floor cannot rescue either**, and on this title it is inverted: real
-      HUD-over-dark gameplay frames measure mean 8.3-8.9 while the blue garbage measures
-      29.7-31.9. Raising the floor removes the real frames first.
+    * **Colour count alone misses the speckled form.** `PPSA17942` run3 frame 150 is flat blue with
+      a magenta speckle and holds **18** distinct RGB values across a full 8.3 MP frame -- past any
+      `<= 3` guard -- while carrying no picture at all. (sigma 5.69, so structure catches it.)
+    * **Structure alone misses the BANDED form.** Frame 188 of the same run is the same blue/magenta
+      failure with the magenta gathered into a contiguous band instead of scattered dots. It holds
+      **3** distinct values and nothing is rendered, but the band's contrast lifts it to sigma
+      **13.14** -- over this floor. Its neighbour 195, identical in kind, measures 11.56 and is
+      caught. The two straddle the threshold, which is the clearest possible statement that a
+      structure floor cannot carry this alone.
 
-    Structure is what separates them, but the margin is narrow and worth knowing before you trust
-    it on a new title: on PPSA17942 the real frames run sigma 14.67 (min) / 33.11 (median) / 115.15
-    (max) against a worst collapse of 11.71, so this floor has about **3 units** of room. Where a
-    title draws a distinctive HUD element, key on that instead -- see
-    `scripts/dragon-quest-vii/classify_field.py`, which separates by ~1.5x on both sides.
+    Measured over 334 field frames of two runs, the combination rejects **none** of them (minimum
+    real sigma 14.67, minimum real colour count 1554) and catches all three collapse forms above.
+    Do not read the gap between 14.67 and 12.0 as headroom: it is bounded by whatever collapse
+    happens to sit just under the floor, and frame 188 shows a real one can sit *over* it.
+
+    Brightness is deliberately not used. On this title it is inverted -- real HUD-over-dark frames
+    measure mean 8.26-8.9 while the blue garbage measures 29.7-31.9 -- so a brightness floor removes
+    the real frames first.
     """
-    img = Image.open(path).convert("L")
-    h = max(1, round(img.height * width / img.width))
-    arr = np.asarray(img.resize((width, h), Image.BILINEAR), dtype=np.float32)
-    return float(arr.std()) < min_sigma
+    img = Image.open(path)
+    grey = img.convert("L")
+    h = max(1, round(grey.height * width / grey.width))
+    sigma = float(np.asarray(grey.resize((width, h), Image.BILINEAR), dtype=np.float32).std())
+    rgb = np.asarray(img.convert("RGB").resize((width, h), Image.NEAREST)).reshape(-1, 3)
+    return sigma < min_sigma or len(np.unique(rgb, axis=0)) <= max_colours
 
 
 def bars(path, dark=12, width=480):
@@ -143,6 +147,19 @@ def selftest():
     assert len(np.unique(speckle.reshape(-1, 3), axis=0)) > 3, "case must exceed a colour-count guard"
     case("a flat blue SPECKLED collapse is collapsed", speckle, want_collapsed=True)
 
+    # The BANDED collapse: three colours, but the magenta gathered into a contiguous band whose
+    # contrast lifts sigma over the structure floor. This is a real frame from the tuning title
+    # (run3 #188, sigma 13.14) and it is the case that proves a structure floor cannot stand alone.
+    banded = np.zeros((h, w, 3), np.uint8)
+    banded[:, :] = (0, 0, 255)
+    banded[int(h * 0.42):int(h * 0.52), :] = (255, 0, 255)
+    assert len(np.unique(banded.reshape(-1, 3), axis=0)) <= 3, "case must have few colours"
+    from PIL import Image as _I
+    _g = _I.fromarray(banded).convert("L").resize((320, 180), _I.BILINEAR)
+    assert float(np.asarray(_g, dtype=np.float32).std()) > 12.0, \
+        "case must EXCEED the structure floor, or it does not reproduce the failure"
+    case("a BANDED collapse (few colours, high sigma) is collapsed", banded, want_collapsed=True)
+
     # An all-dark frame drives both bar scans to the far end. It must not read as a superbly
     # barred cinematic -- assert on the BARS, or this case cannot see that regression.
     dark = (rng.random((h, w, 3)) * 6).astype(np.uint8)
@@ -179,46 +196,6 @@ def corner_structure(path, frac_w=0.22, frac_h=0.28, min_sat=0.02, min_sigma=15.
         sigma = float(np.asarray(img.crop(box).convert("L"), dtype=np.float32).std())
         out.append(float((sat > 0.25).mean()) >= min_sat and sigma > min_sigma)
     return all(out)
-
-
-def hud_displacement(path_a, path_b, box, size=128, max_shift=None):
-    """Rigid translation between the same HUD region in two frames, in units of `size`.
-
-    Why the HUD and not the world: on a title whose composite is broken, the world is the WORST
-    place to look for motion -- a frame flicking between rendered and collapsed swamps any real
-    movement. The HUD is drawn correctly regardless, so a scrolling minimap is a locomotion signal
-    the composite defect cannot destroy.
-
-    **The correlation is ZERO-PADDED, and that is not an optimisation.** Plain phase correlation is
-    circular: a shift of more than half the window wraps around and comes back as a small number,
-    and the wrap point is a silent zero. Measured on PPSA17942 -- two windows in which the minimap
-    visibly scrolls reported exactly 0.0 px at size=128 and 57.8 / 58.5 at larger sizes, which is
-    the difference between "6 of 8 windows moved" and "8 of 8". Padding to 2x makes the correlation
-    linear, so any shift up to `size` is unambiguous.
-
-    Returns the displacement, or None when the peak lies outside `max_shift` -- an out-of-range
-    answer is reported as unknown rather than folded back into the valid range.
-    """
-    def region(p):
-        im = Image.open(p).convert("L").crop(box).resize((size, size), Image.BILINEAR)
-        a = np.asarray(im, dtype=np.float32)
-        return a - a.mean()
-
-    a, b = region(path_a), region(path_b)
-    pad = np.zeros((size * 2, size * 2), dtype=np.float32)
-    pa = pad.copy(); pa[:size, :size] = a
-    pb = pad.copy(); pb[:size, :size] = b
-    fa, fb = np.fft.fft2(pa), np.fft.fft2(pb)
-    r = fa * np.conj(fb)
-    r /= (np.abs(r) + 1e-9)
-    corr = np.fft.ifft2(r).real
-    iy, ix = np.unravel_index(np.argmax(corr), corr.shape)
-    n = size * 2
-    dy = iy - n if iy > n // 2 else iy
-    dx = ix - n if ix > n // 2 else ix
-    dist = float(np.hypot(dx, dy))
-    limit = size if max_shift is None else max_shift
-    return dist if dist <= limit else None
 
 
 def main():

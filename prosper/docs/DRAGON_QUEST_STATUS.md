@@ -721,8 +721,9 @@ Reviewed by eye on the checked-in captures, and the distinction matters for wher
 the foliage and the character are all in the correct places at the correct shapes. **The 2D/UI path
 is correct too**: HUD, minimap, party block and area banner all render cleanly. What is wrong is the
 **shading of lit surfaces** — the house, the cliffs and the boat blow to white while the water
-crushes far too dark. So this is not a general composite failure: it is one path, and both
-directions of error appear in the same frame.
+crushes far too dark. That reads as one path rather than a general composite failure — though a same-frame
+observation cannot separate a broken lighting path from a partially-failing composite, so treat it
+as the working hypothesis it is.
 
 Quantitatively, over the field frames: **36 of 144 (25%) render a recognisable scene in run 3, and
 107 of 190 (56%) in run 4**; the rest lose the world to a uniform white, a crushed black, or a flat
@@ -747,17 +748,25 @@ forbidding it.
 - *HUD-corner colour* fails in both directions on real captures here — a torn-composite cutscene
   whose bottom corners hold saturated structured water passes it (that produced two false
   "gameplay" frames in runs 1 and 2), and a flat blue collapse scores 1.00 while containing nothing.
-- *A cinematic-bar veto* measured a **no-op** across all four runs (0/0/144/190 with and without),
-  because a real cutscene's bars cover the party block anyway. While tight it was worse than
-  useless: at 0.04 it rejected nine genuine "Pilchard Bay: Church" frames whose world had collapsed
-  to black, reading unrendered darkness as letterboxing.
+- *A cinematic-bar veto* is a no-op only **above a bar threshold of ~0.052** (0 rejected at 0.06 and
+  0.10 across all four runs), because a real cutscene's bars cover the party block anyway. At the
+  **0.04 it actually shipped with** it rejected nine genuine "Pilchard Bay: Church" frames whose
+  world had collapsed to black, reading unrendered darkness as letterboxing: 190 field frames
+  became 181.
 - *A collapse or brightness floor* is inverted here — field frames are dark precisely BECAUSE they
-  are HUD over an unrendered world — and the structure floor has only ~3 units of margin against
-  them.
+  are HUD over an unrendered world. And a structure floor is not safe on this title either: a
+  genuine collapse (run 3 frame 188, three distinct colours, nothing rendered) measures sigma
+  **13.14** and sits *over* a 12.0 floor, while its neighbour 195 measures 11.56 and is caught. The
+  distance from a threshold to the nearest real frame is not margin — it is bounded by whichever
+  collapse sits just under the line.
 
-The HP bar separates **0.0201 from 0.0089 across 1,370 frames** of four runs. `--selftest` pins both
-boxes and both sides of the threshold, with controls drawn at fixed screen positions rather than
-from the boxes under test, and every threshold reddens under mutation.
+The HP bar separates **0.0201 from 0.008860 across 1,370 frames** of four runs. `--selftest` pins
+`HP_BAR_MIN` from both sides, `PARTY_BOX` and `MINIMAP_BOX` in position **and extent**, all three
+`world_renders` thresholds from both sides, `WORLD_BOX`, and `minimap_change`'s disc mask, sampling
+size and absolute value — 13 mutations, every one reddening, with a no-op edit as the control that
+stays green. Controls are drawn at fixed pixel positions and sizes with the expected value
+**hardcoded**: deriving it from the box under test is what made three earlier versions of this
+selftest incapable of failing.
 
 ## Ruled out — eliminated, do not re-run these
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
