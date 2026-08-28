@@ -229,11 +229,24 @@ int main() {
               "...and a stencil-only write leaves the depth aspect valid");
     }
 
-    // ---- 10. A proven byte-preserving HTILE rewrite does not discard live depth ---------------
-    // GTA V runs a read/modify/write kernel over its complete HTILE plane between the G-buffer and
-    // deferred-lighting passes. When the exact GPU comparator proves the result byte-identical,
-    // the metadata describes the same logical surface as before. The ordinary changed-write arm is
-    // kept beside it: this exception must not hide a fast clear or any other real metadata update.
+    // ---- 10. A byte-preserving HTILE rewrite STILL discards retained depth (#3089) -----------
+    // This case previously asserted the opposite. The premise it rested on -- "byte-identical
+    // metadata describes the same logical surface" -- does not hold, because prosper never writes
+    // rendered HiZ back into the guest HTILE plane. The guest copy is therefore a constant that the
+    // guest's own writes keep reproducing, so the comparator reports changed=0 for a fast CLEAR
+    // exactly as readily as for the decompress the exception was written for. Byte equality cannot
+    // tell them apart, and the invalidation is the conservative half.
+    //
+    // Blue Prince (PPSA25009) is the measured counterexample: all three of its 196,608-byte HTILE
+    // planes are rewritten with all-zero words (49,152/49,152 equal, zero transitions), so every
+    // write after the first compares equal, every DS invalidation is suppressed (agree=1,
+    // suppressed=59,999) and the title renders a pure black frame -- 0.00% non-black over 16,500+
+    // colour readbacks. Restoring the invalidation restores its fade-in to ~21%.
+    //
+    // The contract of notify_guest_gpu_write_preserving_bytes already draws this line: byte
+    // preservation licenses skipping guest-memory watches and the submit journal, never the
+    // renderer-alias invalidation, whose owners "may differ from the exact guest bytes even when a
+    // compute result does not".
     {
         constexpr uint64_t kDepth = 0x20e0000000ull;
         constexpr uint64_t kStencil = 0x20f0000000ull;
@@ -253,15 +266,31 @@ int main() {
         const size_t preserved =
             prosper::test::invalidate_persistent_ds_guest_write(kHtile, 4096);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
-        check(preserved == 0 && image.depth_valid && image.stencil_valid,
-              "a byte-identical HTILE rewrite preserves both retained aspects");
+        check(preserved == 1 && !image.depth_valid && !image.stencil_valid,
+              "a byte-preserving HTILE rewrite still invalidates both retained aspects (#3089)");
 
+        // The changed-origin arm is kept beside it so the assertion above cannot pass merely
+        // because HTILE invalidation stopped depending on the origin in the wrong direction.
+        image.depth_valid = true;
+        image.stencil_valid = true;
         prosper::gpu::set_guest_gpu_write_origin("compute-writeback(buffer-full)");
         const size_t changed =
             prosper::test::invalidate_persistent_ds_guest_write(kHtile, 4096);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
         check(changed == 1 && !image.depth_valid && !image.stencil_valid,
               "a changed HTILE write still invalidates both aspects");
+
+        // ...and the origin must not have become load-bearing anywhere else: a write that touches
+        // NO plane of this surface stays inert under the preserving origin, so the arms above
+        // measure the HTILE decision rather than a blanket invalidate-everything.
+        image.depth_valid = true;
+        image.stencil_valid = true;
+        prosper::gpu::set_guest_gpu_write_origin("gpu-preserving");
+        const size_t unrelated =
+            prosper::test::invalidate_persistent_ds_guest_write(kHtile - 0x100000ull, 4096);
+        prosper::gpu::set_guest_gpu_write_origin(nullptr);
+        check(unrelated == 0 && image.depth_valid && image.stencil_valid,
+              "a preserving write outside every plane of this surface invalidates nothing");
     }
 
     if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }

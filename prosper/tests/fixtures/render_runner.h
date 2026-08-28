@@ -3402,19 +3402,38 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             const char* v = getenv("PROSPER_DS_HTILE_INVALIDATE");
             return !(v && v[0] == '0');
         }();
-        // A byte-preserving HTILE write cannot change the logical depth/stencil surface. This is
-        // narrower than treating every compute HTILE pass as a harmless "decompress": a changed
-        // metadata plane can still encode a real fast clear and therefore keeps the conservative
-        // invalidation below.
+        // A "gpu-preserving" origin must NOT suppress this invalidation (#3089).
         //
-        // GTA V's transition kernel 0x413cdf900 is the hand-checkable positive instance. It reads
-        // and rewrites exactly the 294,912-byte HTILE plane at 0x204ca00000; the GPU comparator
-        // proves changed=0, after which `notify_guest_gpu_write_preserving_bytes` names the write
-        // `gpu-preserving`. Invalidating on that notification discarded the non-zero retained
-        // depth produced by submits 3416-3425 immediately before deferred lighting.
-        const bool byte_preserving =
-            std::strcmp(prosper::gpu::guest_gpu_write_origin(), "gpu-preserving") == 0;
-        const bool htile_kill = htile_overlap && htile_invalidates && !byte_preserving;
+        // The rule this replaces read "a byte-preserving HTILE write cannot change the logical
+        // depth/stencil surface". That premise is false here, and the reason is structural rather
+        // than a mistuned threshold: prosper never writes rendered HiZ back into the guest HTILE
+        // plane, so the guest copy is a constant that the guest's own writes keep reproducing. The
+        // comparator therefore reports changed=0 for a fast CLEAR exactly as readily as for the
+        // decompress it was meant to recognise, and byte equality cannot separate the two.
+        //
+        // Measured on Blue Prince (PPSA25009): the compute kernel rewrites each of the three
+        // 196,608-byte HTILE planes with all-zero words -- 49,152 of 49,152 words equal, zero
+        // transitions -- so every write after the first compares equal and every DS invalidation is
+        // suppressed (tally agree=1, suppressed=59,999). The retained depth is then never
+        // discarded, stale depth rejects the scene, and the title renders a pure black frame: 0.00%
+        // non-black across 16,500+ colour readbacks, against a fade-in to ~21% before the change.
+        //
+        // `notify_guest_gpu_write_preserving_bytes` already draws this line, and its contract is
+        // the authority for it: byte-preservation licenses skipping guest-memory watches and the
+        // submit journal, because those bytes provably did not move. It does not license skipping
+        // the alias invalidation -- notifying the owners of renderer-resident aliases is the one
+        // thing that path exists to still do, "which may differ from the exact guest bytes even
+        // when a compute result does not". live_compute.cpp states the same invariant at the site
+        // that produces the classification: "Renderer-alias invalidation and writer provenance
+        // remain unconditional."
+        //
+        // GTA V keeps its picture without the shortcut, so this is not a trade of one title for
+        // another: on the 540 s reach-story-mode route the suppression fires 3,177 times, and
+        // disabling it changes neither the peak colour coverage (99.78% both arms) nor the targets
+        // reaching it. Recovering that pass's retained depth needs the fix the comment above still
+        // names -- decoding HTILE to tell a clear from a refresh -- not an equality test on a plane
+        // prosper does not maintain.
+        const bool htile_kill = htile_overlap && htile_invalidates;
         if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
         if (depth_overlap || htile_kill) image.depth_valid = false;
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
