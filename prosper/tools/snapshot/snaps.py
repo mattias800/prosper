@@ -231,6 +231,48 @@ def list_names():
     return sorted(f[:-5] for f in os.listdir(SNAP_STORE) if f.endswith(".json"))
 
 
+# The guest clock must advance per FLIP, not per second, for both halves.
+#
+# Without this the anchors are frame-rate dependent and cannot correspond. Measured on the first real
+# authoring session: authoring windowed ran at 60.4 fps, the headless check at 77.1 fps, and a
+# time-based intro logo therefore burned ~28% more flips in the check. The observed drift matched the
+# ratio almost exactly -- +600 flips at authored anchor 2516 against a predicted +694, and past the
+# window entirely by 4336. The picture was identical; only the rate differed.
+#
+# PROSPER_DET_CLOCK makes the guest see exactly 1/DET_FPS seconds per flip, so a three-second logo
+# always costs the same number of flips however fast the host renders. That turns "the same flip" into
+# "the same guest time", which is the property flip anchoring assumes and otherwise does not have.
+DEFAULT_DET_FPS = 60
+
+
+def apply_deterministic_clock(env, det_fps):
+    env["PROSPER_DET_CLOCK"] = "1"
+    env["PROSPER_DET_FPS"] = str(det_fps)
+
+
+def apply_fresh_savedata(env, root):
+    """Point BOTH save roots at empty per-run directories under `root`.
+
+    prosper has two independent save roots and a fresh console state needs both:
+
+        PROSPER_SAVEDATA_DIR -> SaveDataMemory slots (the whole save path for Unity titles)
+        PROSPER_SAVE0        -> the /savedata0 file mount (Blasphemous 2 writes slot0/slot1 here)
+
+    Redirecting only the first leaves file-mount titles reading the developer's real saves.
+
+    This matters for BOTH halves, which is why it lives here rather than in the check. A game with a
+    save offers "Continue" and puts it above "New Game" -- so the same D-pad inputs select a
+    different item, and the route does not merely mismatch, it diverges. Authoring against real
+    saves also silently writes into them.
+    """
+    save_dir = os.path.join(root, "savedata")
+    save0_dir = os.path.join(root, "savedata0")
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(save0_dir, exist_ok=True)
+    env["PROSPER_SAVEDATA_DIR"] = save_dir
+    env["PROSPER_SAVE0"] = save0_dir
+
+
 # ---------------------------------------------------------------------------------------------
 # author
 # ---------------------------------------------------------------------------------------------
@@ -269,6 +311,23 @@ def cmd_author(args):
         "PROSPER_SNAP_DIR": out_dir,
         "PROSPER_PAD_RECORD": route,
     })
+    apply_deterministic_clock(env, args.det_fps)
+    # Pace the guest flips to the SAME rate the clock advances at, so guest time equals real time
+    # while you play. Without this the deterministic clock makes the game speed track the render
+    # rate -- measured on one authoring session: 3.1x during splash screens, 0.47x in a heavy scene,
+    # mean 1.58x. Nobody can judge "does this look right" against that. The check deliberately does
+    # NOT pace: there the point is to finish quickly, and the clock makes the anchors agree anyway.
+    env["PROSPER_FLIP_PACE_FPS"] = str(args.det_fps)
+    print(f"  guest clock: deterministic at {args.det_fps} fps, flips paced to match "
+          f"(real-time feel, and anchors that do not depend on this machine's speed)")
+    if args.savedata == "fresh":
+        apply_fresh_savedata(env, out_dir)
+        print("  savedata: FRESH (your real saves are untouched, and the check starts here too)")
+    else:
+        print("  savedata: PRESERVE -- this session uses your real saves, so the route will NOT\n"
+              "            reproduce on a machine whose save state differs. A title that offers\n"
+              "            'Continue' puts it above 'New Game', so the same inputs pick a\n"
+              "            different item. Only use this deliberately.")
     # Deliberately NOT offscreen: authoring is a person looking at a window.
     env.pop("SDL_VIDEODRIVER", None)
 
@@ -363,6 +422,8 @@ def cmd_import(args):
         "route": route_rel,
         "timeout": args.timeout,
         "min_structural_similarity": args.min_ssim,
+        "savedata": args.savedata,
+        "det_fps": args.det_fps,
         "flip_window": args.flip_window,
         "window_samples": args.window_samples,
         "snaps": sorted(snaps, key=lambda s: s["pad_flip"]),
@@ -452,6 +513,9 @@ def run_replay(entry, out_dir):
         raise SystemExit(f"snaps: prosper-app not found at {APP} (set PROSPER_APP_BIN)")
     flips = ",".join(str(f) for f in sorted(candidate_flips(entry)))
     env = dict(os.environ)
+    apply_deterministic_clock(env, entry.get("det_fps", DEFAULT_DET_FPS))
+    if entry.get("savedata", "fresh") == "fresh":
+        apply_fresh_savedata(env, out_dir)
     env.update({
         "SDL_VIDEODRIVER": "offscreen",
         "PROSPER_RENDER": "1",
@@ -653,6 +717,10 @@ def main():
     aut.add_argument("--name", required=True)
     aut.add_argument("--dump", required=True, help="e.g. PPSA25009-app0")
     aut.add_argument("--out", help="capture directory (default ~/snaps/<name>)")
+    aut.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
+                     help="guest clock rate; must match at check time")
+    aut.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",
+                     help="fresh (default) isolates both save roots so the run is reproducible")
     aut.add_argument("--append", action="store_true",
                      help="continue into an existing session directory")
     aut.set_defaults(func=cmd_author)
@@ -666,6 +734,10 @@ def main():
                      help="safety net only; the run normally ends when the last "
                           "anchor is captured")
     imp.add_argument("--min-ssim", dest="min_ssim", type=float, default=DEFAULT_MIN_SSIM)
+    imp.add_argument("--det-fps", dest="det_fps", type=int, default=DEFAULT_DET_FPS,
+                     help="must match how the session was authored")
+    imp.add_argument("--savedata", choices=("fresh", "preserve"), default="fresh",
+                     help="must match how the session was authored")
     imp.add_argument("--flip-window", dest="flip_window", type=int, default=DEFAULT_FLIP_WINDOW,
                      help="flips either side of each anchor to search (0 = exact anchor only)")
     imp.add_argument("--window-samples", dest="window_samples", type=int,
