@@ -102,16 +102,26 @@ Two independent runs reach Estard, write `GameSaveData000.dat` and render the wo
 demonstrates free player control — see `docs/DRAGON_QUEST_STATUS.md` for exactly what is and is not
 established, and for the state of the composite in that phase.
 
-## Free field control — `reach-field-control.pad`
+## The field state — `reach-field-control.pad`
 
-Reaches free field control in Pilchard Bay at t~600 s and holds it to the end of the run. Use this
-one for gameplay work; `reach-gameplay.pad` stops inside the opening chapter's script.
+Reaches the field state in Pilchard Bay at t≈652 s and holds it to the end of the run (144 frames,
+588 s). Use this for gameplay work; `reach-gameplay.pad` stops inside the opening chapter's script.
 
-The only difference between them is **confirm spacing**: 2 s instead of 15 s. Measured on one
-binary, quiet box, world phase only — 41 confirms gave 1 frame with the field HUD, 447 gave 145.
-The chapter script is simply long, and every screen in it waits indefinitely for confirm, so a
-press that lands early is absorbed rather than lost. That makes this route unusually robust to the
-wall-clock drift recorded in #2764.
+**This file is byte-for-byte the route that produced the checked-in evidence.** Do not extend it
+without re-running — a published recipe that has never been executed is worth nothing.
+
+What it changes is **how much confirm the chapter is given**. Measured on one binary, quiet box,
+classifying by the field HUD:
+
+| route | confirms | frames with the field HUD |
+| --- | --- | --- |
+| `reach-gameplay.pad` (every 15 s, ends t=700) | 41 | **0** |
+| a probe route (stick windows, #1874) | 37 | **0** |
+| this route (every 2 s, ends t=1180) | **447** | **144** |
+
+The comparison routes also stop earlier, so spacing is not their only difference — but it is the one
+that matters, because every screen in the chapter waits indefinitely for confirm, so a press landing
+early is absorbed rather than lost. That also makes this route unusually tolerant of #2764's drift.
 
 ```bash
 PROSPER_NULL_PAGE=1 \
@@ -125,8 +135,15 @@ PROSPER_PAD_SCRIPT_LOG=1 \
   --seconds 4 --count 310 --timeout 1350 --out <EVIDENCE_ROOT>/shots
 ```
 
-**Confirming you reached it, without trusting the clock.** The field HUD is the positive marker:
-the circular minimap at bottom-left and the party block at bottom-right, neither of which the game
-draws during a cutscene. Cinematic bars are the negative one
-(`tools/frameclass/letterbox.py`). Require both — a collapsed white present has no bars either, and
-a colourful cutscene frame passes a HUD-colour test on its own.
+**Confirming you reached it.** Classify the captures — the phase restriction is an argument, not a
+post-hoc trim:
+
+```bash
+python3 tools/frameclass/letterbox.py <EVIDENCE_ROOT>/shots \
+    --seconds-per-frame 4 --after 330 --require-hud-corners
+```
+
+Both halves are required. Cinematic bars alone cannot see a collapsed present (this title collapses
+to white, to black, and to flat blue with a magenta speckle); HUD-corner colour alone fires on a
+colourful cutscene. Note also that this route delivers **only Cross** — it establishes the field
+state, not locomotion. Pushing the stick inside the field window is the open next step.

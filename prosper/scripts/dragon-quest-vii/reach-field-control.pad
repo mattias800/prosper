@@ -1,32 +1,30 @@
 # Dragon Quest VII Reimagined (PPSA17942) — title -> new adventure log -> name entry ->
 # first-run System Settings -> opening chapter -> FREE FIELD CONTROL in Pilchard Bay.
 #
-# The difference from reach-gameplay.pad is one thing only, and it is not a new control:
-# HOW MANY confirms the opening chapter is given. That route advances dialogue every 15 s
-# and never leaves the script; this one presses every 2 s and reaches free field control at
-# t~600 s. Measured over three runs on the same binary, quiet box, world phase only:
+# THIS IS THE ROUTE THAT PRODUCED THE EVIDENCE, byte-for-byte. Do not extend it without re-running:
+# a published recipe that has never been executed is worth nothing.
 #
-#     confirms delivered   frames with the field HUD
-#     41                   1
-#     37                   1
-#     447                  145        (t=600..1236 s)
+# What it changes against reach-gameplay.pad is how much confirm the opening chapter is given.
+# That route advances dialogue every 15 s and stops at t=700; this one presses every 2 s to
+# t=1180. Measured on one binary, quiet box, world phase only, classifying by the field HUD
+# (minimap + party block, with a structure floor so a flat colour collapse cannot pass):
 #
-# So the chapter script was never a wall — it is long, and the earlier routes ran out of
-# patience rather than out of road. Nothing here depends on a lucky press landing on a
-# particular screen: every screen in the chapter waits indefinitely for confirm, so a press
-# that arrives early is simply absorbed.
+#     route                    confirms   frames with the field HUD
+#     reach-gameplay.pad         41         0
+#     a probe route (see #1874)  37         0
+#     THIS ROUTE                447       144    (t=652..1240 s, 588 s)
 #
-# Read scripts/dragon-quest-vii/README.md for the control model before editing the part
-# above 320 s — OPTIONS is the jump-to-OK shortcut on the name keyboard, and the two System
-# Settings menus have DIFFERENT row counts.
+# It delivers only Cross, so it establishes the FIELD STATE, not locomotion.
+#
+# The two comparison routes also stop earlier than this one, so spacing is not the only
+# difference between them — but it is the one that matters, because every screen in the chapter
+# waits indefinitely for confirm. A press that lands early is absorbed, not lost, which is also
+# why this route tolerates the wall-clock drift of #2764.
+#
+# Read scripts/dragon-quest-vii/README.md for the control model before editing above 320 s —
+# OPTIONS is the jump-to-OK shortcut on the name keyboard, and the two System Settings menus
+# have DIFFERENT row counts.
 
-# first-run System Settings -> opening chapter in Estard (T001).
-#
-# The first seven pulses are reach-title-screen.pad unchanged; everything after 35 s was
-# derived by watching a live-reloaded route (PROSPER_PAD_SCRIPT_RELOAD=1) frame by frame.
-# Read scripts/dragon-quest-vii/README.md for the control model before editing this:
-# in particular OPTIONS is the jump-to-OK shortcut on the name keyboard, and the two
-# System Settings menus have DIFFERENT row counts, so the down-counts are not the same.
 3:cross
 6:cross
 9:cross
@@ -34,44 +32,25 @@
 15:cross
 18:cross
 30:cross
-# title is up by ~34 s
 35:cross
-# "Create a new adventure log" -> the slot list, with "1: Unused" highlighted
 55:cross
-# confirm the slot -> the player-name keyboard, cursor on 'A'
 75:cross
-# enter one character
 100:cross
-# OPTIONS jumps the cursor to the on-screen OK cell (cross alone never leaves the grid)
 120:options
-# OK -> "Are you happy to proceed with the name 'A'?", Yes preselected
 140:cross
-# Yes
 160:cross
-# System Settings 1/4: intro message
 180:cross
-# 1/4: character voice language, English preselected
 195:cross
-# 2/4: play style, Happy Medium preselected
 210:cross
-# 3/4: camera menu — FOUR rows (vertical axis / horizontal axis / revert / confirm).
-# Cross on a row only toggles that row's value, so walk down to Confirm first.
 230:down
 238:down
 246:down
 254:cross
-# 4/4: brightness menu — THREE rows (bar / revert / confirm). One fewer down than 3/4;
-# a third down wraps back to the bar.
 270:down
 278:down
 286:cross
-# "Adventure log successfully created." -> the save is written and the level load starts
 305:cross
 320:cross
-# opening chapter CS_CP1_001_010 and the walk into Estard; keep advancing dialogue
-
-# ---- mash confirm through the opening chapter ----------------------------------
-# 2 s spacing, not 15. This is the whole difference.
 324:cross
 326:cross
 328:cross
@@ -501,33 +480,3 @@
 1176:cross
 1178:cross
 1180:cross
-1182:cross
-1184:cross
-1186:cross
-1188:cross
-1190:cross
-1192:cross
-1194:cross
-1196:cross
-1198:cross
-1200:cross
-1202:cross
-1204:cross
-1206:cross
-1208:cross
-1210:cross
-1212:cross
-1214:cross
-1216:cross
-1218:cross
-1220:cross
-1222:cross
-1224:cross
-1226:cross
-1228:cross
-1230:cross
-1232:cross
-1234:cross
-1236:cross
-1238:cross
-1240:cross

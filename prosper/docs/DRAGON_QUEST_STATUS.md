@@ -650,72 +650,107 @@ likely to close before rendering starts. **Do not quote 50% as a property of the
 Re-run the same command, discard any run that fails the acceptance rule, and compare only the asserted
 invariants. A change in frames, draws or wave64 skips is **not** evidence of anything on its own.
 
-## Free field control is reached — 2026-08-28, and the blocker was the route's patience
+## The field state is reached — 2026-08-28, and the blocker was the route's patience
 
-**Rung 3.** `scripts/dragon-quest-vii/reach-field-control.pad` reaches free field control in
-Pilchard Bay: the field HUD (circular minimap bottom-left, party block bottom-right reading
-`Lv.1 / HP 22 / MP 7`), the location banner that fires on entering an area, the player character
-standing in the world, and quest markers over doors. Held for **636 s across 145 frames**
-(t=600-1236 s). Linux, RADV STRIX_HALO, native 3840x2160 through `tools/screenshot`, direct
-frontend, unmodified captures, UE4 recipe, isolated save roots, master `68f89186`.
+**Rung 3.** `scripts/dragon-quest-vii/reach-field-control.pad` reaches the field state in Pilchard
+Bay: the field HUD (circular minimap bottom-left, party block bottom-right reading
+`Lv.1 / HP 22 / MP 7`), the area-entry banner, the player character standing in the world, and quest
+markers over doors. **144 frames spanning t=652-1240 s (588 s).** Linux, RADV STRIX_HALO, native
+3840x2160 through `tools/screenshot`, direct frontend, unmodified captures, UE4 recipe, isolated
+save roots, master `68f89186`.
+
+Reproduce the classification from the captures with the shipped tool — no post-hoc trimming, the
+phase restriction is an argument:
+
+```bash
+python3 tools/frameclass/letterbox.py <SHOTS> \
+    --seconds-per-frame 4 --after 330 --require-hud-corners
+```
 
 ### What was actually in the way
 
-Not a control, not a screen, and not the renderer: **how many confirms the opening chapter is
-given.** Three runs on the same binary and the same quiet box, differing only in confirm spacing:
+Not a control, not a screen, not the renderer: **how many confirms the opening chapter is given.**
 
-| confirm spacing | confirms delivered | frames with the field HUD |
+| route | confirms delivered | frames with the field HUD |
 | --- | --- | --- |
-| 15 s (`reach-gameplay.pad`) | 41 | 1 |
-| ~14 s (probe route) | 37 | 1 |
-| **2 s** (`reach-field-control.pad`) | **447** | **145** |
+| `reach-gameplay.pad` (confirm every 15 s, ends t=700) | 41 | **0** |
+| a probe route (stick windows, see below) | 37 | **0** |
+| `reach-field-control.pad` (every 2 s, ends t=1180) | **447** | **144** |
 
-The chapter script is long, and every earlier route ran out of patience rather than out of road.
-This is worth generalising: on a story-opening JRPG, "the route never leaves the cutscene" is a
-claim about the ROUTE until the confirm count has been pushed by an order of magnitude.
+The two comparison routes also stop earlier, so spacing is not their only difference from the third
+— but it is the one that matters, because every screen in the chapter waits indefinitely for
+confirm, so a press landing early is absorbed rather than lost.
+
+**Worth generalising:** on a story-opening JRPG, "the route never leaves the cutscene" is a claim
+about the ROUTE until the confirm count has been pushed by an order of magnitude.
+
+### What is established, and what is inferred
+
+**Established by measurement:** the guest reaches and holds a field state that it does not render
+during cutscenes, and the world renders in a quarter of those frames.
+
+**Inferred, not measured:** that the player could *move*. `reach-field-control.pad` delivers only
+Cross — no direction is ever pushed — so these runs show the field state, not locomotion. The
+inference rests on the title drawing this HUD only under player control, which is consistent with
+every frame examined (of the 144, none is letterboxed, none carries a dialogue plate, none a menu)
+but is not the same as a demonstration. A run that mashes Cross to t=660 and then pushes the stick
+inside the field window would settle it, and the machinery exists (#e209ac1c stick recording).
 
 ### The composite, which is now the whole of the remaining gap
 
-Of the 145 gameplay frames, **36 (25%) render a recognisable scene**; the other 109 lose the world
-to a uniform white or black collapse. Continuous rendered stretches reach 24 s. Even the best
-frames are severely colour-degraded — harbour buildings blown to white, ground crushed to navy,
-the player a black silhouette — but structurally complete: house, door, windows, rowing boat,
-foliage, cliff and character all present and recognisable. That is why this is rung 3 under the
-ladder's "degraded still counts" bar rather than rung 2's "world absent". #1486, #1588.
+Of the 144 field frames, **36 (25%) render a recognisable scene**; the rest lose the world to a
+uniform white, a crushed black, or a flat blue speckle. The longest run of *strictly consecutive*
+rendered samples is **4 (12 s endpoint span, 16 s of coverage)** — the world comes and goes rather
+than holding. Even the good frames are severely colour-degraded — harbour buildings blown to white,
+ground crushed to navy, the player a black silhouette — but structurally complete: house, door,
+windows, rowing boat, foliage, cliff and character all present and recognisable. That is why this is
+rung 3 under the ladder's "degraded still counts" bar rather than rung 2's "world absent".
+#1486, #1588.
 
-### Instruments, and why the obvious one cannot work here
+### Instruments — and why the obvious one cannot work HERE
 
-**A motion probe cannot answer "does the player have control" on this title.** Matched 32 s windows
-alternating neutral against full stick deflection, stick delivery proven in the pad log
-(`axes=left-stick-left/right/up`), produced neutral-window medians of 84.2, 2.2, 15.9 and 66.5 —
-a spread *larger* than any stick-versus-neutral difference. A cutscene whose own activity varies
-40x cannot be a baseline, so the experiment is void rather than negative. This is almost certainly
-why the 2026-08-20 probe "did not separate" too.
+**A stick-versus-neutral motion probe could not answer in the window it was run.** Matched 32 s
+windows alternating neutral against full stick deflection, stick delivery proven in the pad log
+(`axes=left-stick-left/right/up`), produced neutral-window medians of 84.2, 2.2, 15.9 and 66.5 — a
+spread *larger* than any stick-versus-neutral difference. The reason is now known and is not a
+property of the title: **that run reached the field HUD zero times**, so every window sampled a
+cutscene, and a cutscene whose own activity varies 40x cannot be a baseline. The probe is the right
+experiment aimed at the wrong phase — see the Ruled out entry, which scopes it rather than
+forbidding it.
 
-**What works is a conjunction**, because each half fails alone:
-- `tools/frameclass/letterbox.py` — cinematic bars are *geometric*, so they survive the colour
-  degradation that makes every chromatic metric unreliable here. But a present collapsed to white
-  has no dark rows either, so bars alone report a dead frame as gameplay.
-- A HUD-colour test on the two bottom corners — but a colourful *cutscene* frame passes that alone
-  (the Estard village reads 0.67 saturated in both corners).
+**Classification needs a conjunction, because each half fails alone and in opposite directions:**
+- Cinematic bars are *geometric*, so they survive the colour degradation that makes every chromatic
+  metric unreliable here — but a present collapsed to white, or to flat blue with a magenta
+  speckle, has no dark rows either and reads as un-barred.
+- HUD-corner colour catches those — but a colourful *cutscene* frame passes it alone (the Estard
+  village reads 0.67 saturated in both corners), and so does a flat saturated collapse (1.00).
 
-Require both — no bars, not uniform, HUD art in both corners — and the classes separate cleanly.
+`tools/frameclass/letterbox.py --require-hud-corners` requires both, plus a structure floor, and
+carries constructed self-test cases for each failure above.
 
 ## Ruled out — eliminated, do not re-run these
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
   raising the confirm rate from one per 15 s to one per 2 s takes the run from 1 field-HUD frame to
   145. See *Free field control is reached* above for the three-run table. #1874.
 
-- **"A stick-versus-neutral motion probe can establish free control on this title."**
-  **Falsified 2026-08-28** and it is void rather than negative: across four matched windows the
-  NEUTRAL medians alone ranged 2.2 to 84.2, so no contrast the experiment can produce is
-  interpretable. Do not re-run it in this form; use the letterbox+HUD conjunction above. #1874.
+- **"A stick-versus-neutral motion probe can be run in the chapter-script phase."**
+  **Falsified 2026-08-28**, and the result is void rather than negative: across four matched windows
+  the NEUTRAL medians alone ranged 2.2 to 84.2, so no contrast the experiment could produce was
+  interpretable. The cause is the PHASE, not the title — that run reached the field HUD zero times,
+  so every window sampled a cutscene. **This does not rule out the probe**, and it is still the one
+  experiment that would convert "field state reached" into "locomotion demonstrated": run it inside
+  the field window (t > 660 s on `reach-field-control.pad`), not before it. #1874.
 
-- **"No cinematic bars means the run reached gameplay."** **Falsified 2026-08-28.** A present
-  collapsed to uniform white has no dark rows, so a bar detector reports it as un-barred. The first
-  version of this measurement returned 61 "un-barred" world frames on a run that never left its
-  cutscene; every one was RGB(255,255,255). An absence test needs a uniformity guard, not a
-  brightness floor — guarding only against darkness inverts the other half of the range. #1874.
+- **"No cinematic bars means the run reached gameplay."** **Falsified 2026-08-28**, twice over.
+  A present collapsed to uniform white has no dark rows, so a bar detector reports it as un-barred:
+  the first version of this measurement returned 61 "un-barred" world frames on a run that never
+  left its cutscene, every one RGB(255,255,255). A *colour-count* guard then still missed this
+  title's dominant collapse — flat blue with a magenta speckle, 18 distinct colours across a full
+  8.3 MP frame. What separates all of them is **structure** (luma sigma 4.1 on the collapse against
+  95+ on a real frame), not brightness and not colour count; a brightness floor is actively
+  inverted here, since real HUD-over-dark frames measure 8.3-8.9 while the blue garbage measures
+  29.7-31.9. And absence of bars is not presence of gameplay in any case: a MENU has none either.
+  #1874.
 
 
 - **"Reading a `Map/Product/World/**.umap` package means the run reached the world."** **Falsified
