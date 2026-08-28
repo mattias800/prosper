@@ -154,6 +154,35 @@ for a quick boot would cut the route off mid-run and report every later snap as 
 failure with nothing to do with rendering, which is the whole class of bug this system exists to
 remove.
 
+## The guest clock is deterministic in both halves, and it must be
+
+Both authoring and checking run with `PROSPER_DET_CLOCK=1` and the same `PROSPER_DET_FPS`
+(default 60). The guest then sees exactly 1/60 s per flip regardless of how fast the host renders.
+
+Without it the anchors are frame-rate dependent and simply cannot correspond. Measured on the first
+real authoring session: authoring windowed ran at **60.4 fps**, the headless check at **77.1 fps**,
+and a time-based intro logo therefore burned ~28% more flips in the check. The drift matched the
+ratio almost exactly — +600 flips at authored anchor 2516 against a predicted +694, and past the
+±900 window entirely by anchor 4336. The picture was identical; only the rate differed, and the
+check reported a confident FAIL showing an intro logo where gameplay had been snapped.
+
+"Just run the check windowed too" does not fix this. Vsync caps the maximum, it does not guarantee a
+rate: Alex Kidd authored at 60.4 fps windowed, while Blue Prince ran at 180 fps windowed at its menu,
+20 fps in gameplay and 4.8 fps during its FMV. Any title that cannot hold its cap drifts again, the
+rate becomes tied to the developer's display refresh, and a 17-title matrix would need 17 windows.
+
+**Verified rather than assumed.** The same route was replayed at two deliberately different host
+speeds with the clock on — 78.2 fps against 52.4 fps, a 1.49x spread:
+
+| anchor | SSIM | |
+| --- | --- | --- |
+| 1800 | 0.9618 | pass |
+| 2500 | 0.9917 | pass |
+| 4300 | 0.9784 | pass |
+
+All three comfortably above the 0.85 bar, where the uncorrected rate difference had pushed an anchor
+past its whole window.
+
 ## Save state: fresh by default, and why that is not optional
 
 Both halves run with **both** save roots redirected to empty per-run directories:
