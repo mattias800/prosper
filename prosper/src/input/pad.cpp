@@ -167,21 +167,45 @@ std::string pad_button_names(uint32_t mask) {
     return result;
 }
 
-std::string PadRecordState::observe(int64_t position, uint32_t buttons) {
-    if (buttons == previous_) return {};
+std::string pad_stick_names(uint32_t stick_mask) {
+    static constexpr struct { uint32_t bit; const char* name; } names[] = {
+        {PAD_REC_LEFT_X_NEG, "left-stick-left"},   {PAD_REC_LEFT_X_POS, "left-stick-right"},
+        {PAD_REC_LEFT_Y_NEG, "left-stick-up"},     {PAD_REC_LEFT_Y_POS, "left-stick-down"},
+        {PAD_REC_RIGHT_X_NEG, "right-stick-left"}, {PAD_REC_RIGHT_X_POS, "right-stick-right"},
+        {PAD_REC_RIGHT_Y_NEG, "right-stick-up"},   {PAD_REC_RIGHT_Y_POS, "right-stick-down"},
+    };
+    std::string result;
+    for (const auto& name : names) {
+        if (!(stick_mask & name.bit)) continue;
+        if (!result.empty()) result += '+';
+        result += name.name;
+    }
+    return result;
+}
+
+std::string PadRecordState::observe(int64_t position, uint32_t buttons, uint32_t sticks) {
+    if (buttons == previous_ && sticks == previous_sticks_) return {};
 
     std::string completed;
-    if (previous_) {
+    if (previous_ || previous_sticks_) {
         // A press and release can be observed at the same count (for example, through two pad
         // polls during one display flip). Preserve the existing recorder's non-empty range rule.
         const int64_t end = position > start_ ? position : start_ + 1;
-        const std::string names = pad_button_names(previous_);
+        // Buttons first, then stick directions, both in the parser's vocabulary and '+'-joined --
+        // so a recorded interval round-trips through parse_pad_script unchanged.
+        std::string names = pad_button_names(previous_);
+        const std::string stick_names = pad_stick_names(previous_sticks_);
+        if (!stick_names.empty()) {
+            if (!names.empty()) names += '+';
+            names += stick_names;
+        }
         if (!names.empty()) {
             completed = (axis_ == PadRecordAxis::pad_read ? "p" : "f") +
                         std::to_string(start_) + "-" + std::to_string(end) + ":" + names + "\n";
         }
     }
     previous_ = buttons;
+    previous_sticks_ = sticks;
     start_ = position;
     return completed;
 }
