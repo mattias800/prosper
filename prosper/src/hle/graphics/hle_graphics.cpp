@@ -190,6 +190,57 @@ namespace {
 // heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
 extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_rate; }
+
+// Hold the GUEST flip rate at PROSPER_FLIP_PACE_FPS, sleeping in the flip path when we are ahead.
+//
+// This exists for interactive authoring under PROSPER_DET_CLOCK. That clock advances guest time by
+// 1/DET_FPS per flip, which makes anchors independent of how fast the host renders -- the property
+// the snapshot routes need. The side effect is that guest time then runs at host_fps/DET_FPS: an
+// Alex Kidd splash screen rendering at 189 fps played at 3.1x speed, and a heavy scene at 28 fps
+// crawled at 0.47x. Measured across one authoring session: mean 95 fps, i.e. 1.58x real time,
+// swinging by a factor of six. A person cannot judge "does this look right" against that.
+//
+// Pacing the flips to the same rate makes guest time equal REAL time again while keeping the
+// determinism, because the clock and the pacer are then driven by the same number. Off by default,
+// and never wanted for an automated check -- there the whole point is to run as fast as possible.
+//
+// Deliberately a sleep in the flip path rather than a frame limiter in the frontend: the guest's
+// flip count is what the clock and the anchors are defined against, and the host's swapchain
+// presents are a different quantity that the guest can outrun.
+namespace {
+std::atomic<uint64_t> g_flip_pace_next_ns{0};
+
+uint32_t flip_pace_fps() {
+    static const uint32_t fps = [] {
+        const char* value = getenv("PROSPER_FLIP_PACE_FPS");
+        if (!value || !*value) return 0u;
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        // A malformed value disables pacing rather than picking a rate nobody asked for.
+        return end != value && *end == '\0' && parsed > 0 && parsed <= 1000 ? (uint32_t)parsed : 0u;
+    }();
+    return fps;
+}
+
+void flip_pace_wait() {
+    const uint32_t fps = flip_pace_fps();
+    if (!fps) return;
+    const uint64_t period = 1000000000ull / fps;
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    uint64_t next = g_flip_pace_next_ns.load(std::memory_order_relaxed);
+    if (next == 0 || now > next + period) {
+        // First flip, or we fell far behind (a load screen, a stall). Re-anchor instead of trying to
+        // catch up: sleeping less than zero is impossible, and a burst of catch-up flips would be
+        // exactly the speed-up the pacer exists to remove.
+        g_flip_pace_next_ns.store(now + period, std::memory_order_relaxed);
+        return;
+    }
+    if (now < next)
+        std::this_thread::sleep_for(std::chrono::nanoseconds(next - now));
+    g_flip_pace_next_ns.store(next + period, std::memory_order_relaxed);
+}
+}  // namespace
 extern "C" int prosper_vo_buffer_count() {
     std::lock_guard<std::mutex> lk(g_display_mx); return g_display.buffer_num;
 }
@@ -659,6 +710,7 @@ HLE(g_vo_submitflip)  {
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
     flip_advance(buffer_index, (int64_t)a3);
+    flip_pace_wait();                              // interactive authoring: hold real-time pacing
     gpu::present_flip(buffer_index, (int64_t)a3);   // present the buffer (scanout front + count)
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
@@ -675,6 +727,7 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
+    flip_pace_wait();                      // interactive authoring: hold real-time pacing
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }

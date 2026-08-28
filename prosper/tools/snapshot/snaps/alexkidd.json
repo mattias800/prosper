@@ -1,0 +1,54 @@
+{
+  "det_fps": 60,
+  "dump": "PPSA02664-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "alexkidd",
+  "route": "prosper/scripts/alexkidd/route.pad",
+  "savedata": "fresh",
+  "snaps": [
+    {
+      "distinct_colors": 511,
+      "height": 1080,
+      "index": 0,
+      "luma16x9": "000000000000000000000000000000000000000000231f2f2f2b0b000000000000000000000f2717171f04001300000000000000000000000000006237000000001c65699fab3b0000000ec603000000000917353a4b34000000070b1e0000000000000000000000000000000000000000000000011d1e2935341a040000000000000000000000000000000000000000",
+      "nonblack_ratio": 0.06929,
+      "pad_flip": 853,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 14548,
+      "height": 1080,
+      "index": 1,
+      "luma16x9": "e3daeacb8d948f8bb1babababbbbbbbad8b899889d7aa3a4bfaec0bac2c1c9b7d09385d9ca93a877aebabcb5afb4b4b5ba9d975890a39a64a2bab8b2afafafb9d89bb79e7eb07f8fa3bab7aaa3a4abbace9662a3b2b69771a6baadada8a0aab96e7d6b7864c9b856b8b9b9b9b6918eb3806b9786728d8760b9babab9bababab9968a798a8e79639ebababababbc0b1b2",
+      "nonblack_ratio": 0.989738,
+      "pad_flip": 1645,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 34254,
+      "height": 1080,
+      "index": 2,
+      "luma16x9": "747a90ac99868c93a68f73706d6a725fb2918386a2bbe6ebb6ae977f7da3ac9ad2c1b8b4bebeb7a39f9baf9d8cb1f0e3a9c7c3c1c2ababb8aba7a1acacc9e0b68c919da8a89e9fa8b5adabacc0a29ca24757666b7c86a7a8c4debc8371787b75441e1b1f4ca0b4d5f0d8e7c74d33212b3a3e162c94a8a6aaa39dadb6a03d202e1e2932288ea4a5703c7cbaa19b8d2017",
+      "nonblack_ratio": 0.999869,
+      "pad_flip": 2405,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 38758,
+      "height": 1080,
+      "index": 3,
+      "luma16x9": "1d4650248c8a8e673c70918a87814915867821248a9a9dbad4b99f9d9bac90157d89321f4ba2d3f3ede5cfb1b0931d1c6b7d61164fb4b6bac78a423928291812353424214fb8b6b7bcb7a22d1d23130f1b1e16173f937b5f8fc3be8425131b1b03030b20464f7374b1c2b4ad791f111107081557423647447beddcb26e44162a1d0e1c6b403837304b92a1904a722439",
+      "nonblack_ratio": 0.973542,
+      "pad_flip": 3134,
+      "verdict": "correct",
+      "width": 1920
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA02664",
+  "window_samples": 7
+}
