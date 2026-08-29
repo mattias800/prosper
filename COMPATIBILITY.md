@@ -75,7 +75,7 @@ Last updated: 2026-08-28
 | *Little Nightmares II* | `PPSA02154` | Unreal Engine 4 | 🔬 Rung 1 — a 4K logo sequence (Bandai Namco → Tarsier → Unreal) renders for ~130 s, then the composite is a flat white 4K clear for the remaining 260 s of a 390 s run and no title screen is reached ([#2932](https://github.com/mattias800/prosper/issues/2932)); it also calls the unregistered `sceAgcDcbDrawIndirect` ([#2929](https://github.com/mattias800/prosper/issues/2929)) | [#2884](https://github.com/mattias800/prosper/issues/2884) |
 | *Spacebase Startopia* | `PPSA02846` | Unity 2020.3.1 / IL2CPP | 🔬 Rung 0 — boots in 447 ms, publishes 3 flips and one black 1080p frame, then stops submitting while its own threads and FMOD audio keep running ([#2933](https://github.com/mattias800/prosper/issues/2933)) | [#2887](https://github.com/mattias800/prosper/issues/2887) |
 | *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Rung 0 — every frame is a flat 4K clear, white then magenta. Two further defects on the same boot: a GPU hard recovery from a compute submit, in 2 of 3 runs and both naming the same program ([#2935](https://github.com/mattias800/prosper/issues/2935)), and the guest's own out-of-memory assert in the third ([#2908](https://github.com/mattias800/prosper/issues/2908), shared with *Khazan*) | [#2885](https://github.com/mattias800/prosper/issues/2885) |
-| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — a routed run passes the title screen on Cross and skips the intro cinematic on **Square**, which is what that screen's own `Press ▢ to skip` prompt names, reaching the first level's map load (`normalvillage`, t≈78 s, absent from every default run). The level then composites as a flat two-tone clear ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/unbound-PPSA03274/` | [#2886](https://github.com/mattias800/prosper/issues/2886) |
+| *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — the title screen renders continuously on a default launch (40/40 samples over 200 s), and a routed run passes it on Cross and plays the **complete intro cinematic** in full colour to t≈65 s. The first level does not render. **The route needs an isolated `PROSPER_SAVE0`/`PROSPER_SAVEDATA_DIR`**: resuming a stale save at the shared default location turns the whole run black and looks exactly like a composite defect ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/unbound-PPSA03274/` | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 | *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.png`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
@@ -644,11 +644,18 @@ See [`prosper/docs/BENEATH_STATUS.md`](prosper/docs/BENEATH_STATUS.md) and the
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
-The title screen renders complete — wordmark, character, portal and prompt glyph — but on only about
-9% of frames, at a strict 5 s cadence; the rest are a near-black frame carrying a diagonal smeared
-band ([#2932](https://github.com/mattias800/prosper/issues/2932)). The prompt is waiting for Cross.
+The title screen renders complete — wordmark, character, portal and prompt glyph — and on current
+master it renders **continuously**: 40 of 40 samples over 200 s, with 354 distinct frames produced.
+The ~9% duty cycle and the 5 s cadence recorded in the 2026-08-22 survey
+([#2932](https://github.com/mattias800/prosper/issues/2932)) no longer reproduce here. The prompt is
+waiting for Cross.
 See [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and
 the [tracker](https://github.com/mattias800/prosper/issues/2886).
+
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic-village.png" alt="Unbound: Worlds Apart — a later moment of the intro cinematic at 3840x2160: a sunlit village clearing of thatched huts strung with orange bunting, tall trees and fireflies, pink mushrooms in the foreground grass and the small red-cloaked character at the right, with a prompt reading Press Square to skip"></p>
+
+A second, later frame of the same cinematic, captured with an isolated save on master `4ce6e11e` —
+the evidence that this title's black frames were the save and not the renderer.
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic.png" alt="Unbound: Worlds Apart — the intro cinematic at 3840x2160: the cloaked blue-hooded character Soli standing beside a golden deer in a teal moonlit forest clearing, thatched huts and bunting behind them, purple mushrooms and grass in the foreground, and a prompt reading Press Square to skip"></p>
 
@@ -656,9 +663,16 @@ A direct, unmodified `tools/screenshot` capture at 3840×2160, driven by
 [`prosper/scripts/unbound-PPSA03274/reach-first-level.pad`](prosper/scripts/unbound-PPSA03274/reach-first-level.pad).
 Cross clears the title screen, and the screen after it names a **different** button: its own prompt
 reads `Press ▢ to skip`. A cross-only ladder sat on this cinematic for 180 s; Square skips it and
-the first level's map load (`normalvillage`) follows at t ≈ 78 s, on two independent runs and never
-on a default one. The level itself composites as a flat two-tone clear, so the world does not yet
-render.
+the first level's map load (`normalvillage`) follows at t ≈ 78 s. The level itself does not render.
+
+**This route requires an isolated save.** With a stale save directory at the shared default location
+the title advances into a state that renders nothing, and the run goes black about 12 s after the
+first press — indistinguishable from a composite defect, and it is what the black-frame readings on
+this title had been measuring. A matched A/B on the same commit: 4 of 20 samples carried content with
+the shared save, 17 of 20 with a fresh `PROSPER_SAVE0` + `PROSPER_SAVEDATA_DIR`. Both arms are on
+master `4ce6e11e`; building the 2026-08-22 commit the route was validated against reproduced the black
+too, so there is no regression here — only a dirty save
+([#2932](https://github.com/mattias800/prosper/issues/2932)).
 
 ## BALAN WONDERWORLD — `PPSA02058`
 
