@@ -124,7 +124,21 @@ inline uint32_t mbcnt_source_bit(SpirvCompute& b, const RegState& rs, const Oper
 // breaks both.
 inline bool is_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
     const auto scalar_source_kind = [](const Operand& o) {
+        // `Literal` belongs here for the same reason the two Inline kinds do, and it is arguably the
+        // strongest member of the set: a literal is a 32-bit constant dword embedded in the
+        // instruction stream, so it is uniform across the wave BY CONSTRUCTION -- it cannot carry a
+        // per-lane value the way an SGPR at least notionally could. Its absence was an omission
+        // rather than a safety property; the paragraph above this function documents why VCC_HI is
+        // deliberately excluded and says nothing about literals.
+        //
+        // Measured on The House of the Dead 2: Remake (#1907), whose Training 1 world renders black:
+        // TWO full-resolution screen-space compute passes (240x135 groups of 8x8 = 1920x1080) are
+        // declined ~2,600 times each, and both decline on the byte-identical instruction
+        // `856aff6a 00000000` -- `s_cselect_b32 vcc_lo, vcc_lo, <literal>`. src[0] is VCC_LO and was
+        // already admitted; src[1] is the literal and was not, so the pair failed to classify as a
+        // B32 VCC scalar write and the whole program fell out.
         return o.kind == OperandKind::InlineInt || o.kind == OperandKind::InlineFloat ||
+               o.kind == OperandKind::Literal ||
                o.kind == OperandKind::SGPR ||
                (o.kind == OperandKind::Special && o.value == 106);
     };
