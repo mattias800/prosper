@@ -3538,52 +3538,55 @@ HLE(s_syss_safearea) {
     return 0;
 }
 
-// sceSystemServiceReportAbnormalTermination(cause) — THE GUEST IS TELLING US IT HAS CRASHED.
+// sceSystemServiceReportAbnormalTermination(cause) — the guest reporting a crash to the system.
 //
-// This is not a service prosper provides to the guest; it is the guest reporting its own abnormal
-// termination to the system. Unregistered, the dispatcher's default fired -- one opaque
-// `unimplemented: libSceSystemService::3s8cHiCBKBE -> returning 0` line among a dozen others -- and
-// the guest was allowed to carry on, so a self-reported crash presented as a live process with a
-// black window: indistinguishable from a hang, a stall, or a renderer defect.
-//
-// Found on Tactics Ogre: Reborn (PPSA03839, #1892), where it was the ONLY informative line in a
-// 50-line log with no faults, no compute rejects, no device loss and no missing present source.
-// Four other titles in the same sweep produced black screens with four different signatures; this
-// was the one where the guest said it had failed, and that fact was invisible.
-//
-// NID verified in the PS5 3.20 stub table:
+// Registered so the line is READABLE. Unregistered, the dispatcher default fired as one opaque
+// `unimplemented: libSceSystemService::3s8cHiCBKBE -> returning 0` among a dozen others, and
+// resolving it needed a hand lookup against the PS5 3.20 stub table:
 //   libSceSystemService.c:3976  sprx_dlsym(__handle, "3s8cHiCBKBE",
 //                                          &__ptr_sceSystemServiceReportAbnormalTermination)
 //
-// The return stays 0, exactly what the dispatcher default already produced, so what the guest
-// observes is unchanged and this cannot regress a title by answering differently. The only new
-// behaviour is that we SAY so and stop.
+// IT DOES NOT MEAN THE TITLE IS FAILING NOW, and an earlier revision of this handler assumed it did.
+// Independent review of #3120 opened five archived Tactics Ogre (PPSA03839) runs: the call is in ALL
+// of them, always at line 8, during boot before the first frame -- including the run that then
+// rendered 40,936 frames over 470 s and reached the tutorial battle, and the runs that stalled at
+// ~frame 993. `prosper_on_unimpl` logs only on FIRST invocation, so that is the title's one call.
+// It therefore has zero discriminating power: it is something this title does unconditionally at
+// startup. One reading consistent with all five logs, offered as hypothesis and not finding: the API
+// may report that the PREVIOUS session ended abnormally, and these runs are killed by `timeout`.
 //
-// Stopping uses the existing cooperative signal (host/platform/lifecycle.hpp). Note what that does
-// and does not do: run_entry() never observes it (game_path.hpp:82), so the guest thread is not
-// torn down -- the frontend run-loop winds down at its next boundary instead. That is the right
-// scope. Set PROSPER_ABNORMAL_TERMINATION_CONTINUE=1 to keep running anyway, which is what you want
-// when attaching a debugger to the post-crash state.
+// So the default is to LOG AND CONTINUE. Stopping is opt-in via PROSPER_ABNORMAL_TERMINATION_STOP.
+// Stopping by default would have been a live regression rather than a theoretical one: 23 of the 56
+// local dumps import this NID, four of them rung-6 guarded (The Messenger, Blasphemous 2, Alex Kidd,
+// Blue Prince), and `prosper_stop_requested()` is polled only by prosper-app -- so the snapshot
+// matrix, which drives boot_trace and screenshot, cannot see the breakage at all. It would have
+// failed only in a human's hands.
 //
-// The argument is logged raw. Its meaning is NOT established -- no layout for it has been confirmed
-// against any primary source -- so it is printed as an opaque value rather than decoded.
-// CONFIDENCE: HIGH that this NID is sceSystemServiceReportAbnormalTermination (firmware stub table)
-// and that a call means the guest reported abnormal termination. LOW on the argument's meaning.
+// SCOPE, stated because the opt-in is not uniform across frontends. prosper-app winds its run-loop
+// down (main.cpp) and run_entry() never observes the stop, so the guest thread is not torn down. On
+// screenshot and boot_trace nothing polls it, so the flag does not stop those runs -- and note it is
+// not inert there either: prosper_wait_while_paused() returns false permanently once stop latches,
+// which mutes the SDL3 audio sink in a frontend that keeps running.
+//
+// The return stays 0, identical to the dispatcher default, so no guest observes a different answer.
+// The argument is logged raw; no layout for it is confirmed against any primary source.
+// CONFIDENCE: HIGH on the NID identity. LOW on the argument, and on what a call implies about the
+// title's state.
 HLE(s_syss_report_abnormal_termination) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     // Read per call rather than caching in a static: this fires at most once in a run, so there is
-    // nothing to optimise, and a cached sample would make the escape hatch untestable in-process.
-    const bool keep_running = getenv("PROSPER_ABNORMAL_TERMINATION_CONTINUE") != nullptr;
+    // nothing to optimise, and a cached sample would make the opt-in untestable in-process.
+    const bool stop_run = getenv("PROSPER_ABNORMAL_TERMINATION_STOP") != nullptr;
     fprintf(stderr,
             "[prosper] GUEST REPORTED ABNORMAL TERMINATION: "
             "sceSystemServiceReportAbnormalTermination(0x%llx). The title has decided it is "
             "crashing -- this is the guest's own verdict, not prosper's. %s\n",
             (unsigned long long)a0,
-            keep_running ? "PROSPER_ABNORMAL_TERMINATION_CONTINUE is set; continuing anyway."
-                         : "Stopping the run; set PROSPER_ABNORMAL_TERMINATION_CONTINUE=1 to keep "
-                           "the process alive for debugging.");
+            stop_run ? "PROSPER_ABNORMAL_TERMINATION_STOP is set; stopping the run."
+                     : "Continuing: this title may call it at boot and run fine. Set "
+                       "PROSPER_ABNORMAL_TERMINATION_STOP=1 to stop on it.");
     fflush(stderr);
-    if (!keep_running) prosper::prosper_request_stop();
+    if (stop_run) prosper::prosper_request_stop();
     return 0;
 }
 

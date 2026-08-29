@@ -33,10 +33,10 @@ static int fails = 0;
 
 static void set_continue(bool on) {
 #ifdef _WIN32
-    _putenv_s("PROSPER_ABNORMAL_TERMINATION_CONTINUE", on ? "1" : "");
+    _putenv_s("PROSPER_ABNORMAL_TERMINATION_STOP", on ? "1" : "");
 #else
-    if (on) setenv("PROSPER_ABNORMAL_TERMINATION_CONTINUE", "1", 1);
-    else    unsetenv("PROSPER_ABNORMAL_TERMINATION_CONTINUE");
+    if (on) setenv("PROSPER_ABNORMAL_TERMINATION_STOP", "1", 1);
+    else    unsetenv("PROSPER_ABNORMAL_TERMINATION_STOP");
 #endif
 }
 
@@ -53,7 +53,7 @@ int main() {
           "dispatcher default and can never stop the run)");
     if (!fn) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
 
-    // ---- arm 1: the default path requests a stop --------------------------------------------
+    // ---- arm 1: the DEFAULT path does NOT stop ----------------------------------------------
     set_continue(false);
     prosper_reset_stop();
     CHECK(!prosper_stop_requested(), "precondition: no stop is pending before the call");
@@ -63,11 +63,12 @@ int main() {
     CHECK(rc == 0,
           "the handler still returns 0, so the guest observes exactly what the dispatcher default "
           "gave it and registering this NID changes no guest-visible answer");
-    CHECK(prosper_stop_requested(),
-          "reporting abnormal termination requests a stop -- THE fix; without it the guest's own "
-          "crash report presents as a hang");
+    CHECK(!prosper_stop_requested(),
+          "the default does NOT stop the run -- titles call this at boot and go on to render "
+          "(Tactics Ogre: present in a 470 s / 40,936-frame run), so stopping by default would "
+          "break 23 importing dumps including four rung-6 guarded ones");
 
-    // ---- arm 2 (mutation arm): the escape hatch suppresses the stop --------------------------
+    // ---- arm 2: the opt-in DOES stop --------------------------------------------------------
     // Kills two implementations that would pass arm 1: one that ignores the environment variable
     // and always stops, and one where arm 1's pass came from a stop latched by something other
     // than this handler.
@@ -78,8 +79,8 @@ int main() {
     rc = fn(0xBEEFull, 0, 0, 0, 0, 0);
 
     CHECK(rc == 0, "the suppressed path returns 0 as well");
-    CHECK(!prosper_stop_requested(),
-          "PROSPER_ABNORMAL_TERMINATION_CONTINUE keeps the process alive for debugging");
+    CHECK(prosper_stop_requested(),
+          "PROSPER_ABNORMAL_TERMINATION_STOP=1 opts into stopping the run");
 
     // ---- arm 3: clearing the variable restores the stop --------------------------------------
     // Proves arm 2's pass came from the variable rather than from the signal having become
@@ -87,9 +88,9 @@ int main() {
     set_continue(false);
     prosper_reset_stop();
     rc = fn(0xF00Dull, 0, 0, 0, 0, 0);
-    CHECK(prosper_stop_requested(),
-          "clearing the variable restores the stop, so arm 2 was the variable and not a latched "
-          "or exhausted signal");
+    CHECK(!prosper_stop_requested(),
+          "clearing the variable restores the continue default, so arm 2 was the variable and not "
+          "a signal that had latched permanently");
 
     prosper_reset_stop();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
