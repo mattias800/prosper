@@ -21,6 +21,29 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-29
 
+### Grand Theft Auto V renders its world again
+
+A regression took GTA V's lighting for a day — the bank heist still drew, but unlit and under a grid
+artifact. Restored.
+
+<p align="center"><img src="assets/screenshots/gta5-prologue-bank-restored.png" alt="Grand Theft Auto V — the prologue bank interior in full colour, the masked gunman in a red plaid shirt, water cooler, holiday cards and radar"></p>
+
+The cause was one line, and the reason it got through is worth more than the fix. #3093 made every
+HTILE write discard retained depth, to cure Blue Prince's black frame. It checked GTA and cleared
+it on **peak colour coverage — 99.78% in both arms** — but a world drawn with no lighting still
+covers 99.78% of the frame. The metric could not see the defect it was chosen to rule out.
+
+Restoring the exception fixes GTA and leaves Blue Prince exactly where it was: 0.2085 non-black in
+both arms, the same figure #3093 called healthy. There was never a trade-off between the two titles.
+
+Two hypotheses died on the way, both by measurement rather than argument. A "uniform HTILE plane
+means a fast clear" discriminator was checked before being written and is false — GTA's writes are
+6,500/6,500 uniform and Blue Prince's 62,000/62,000, all-zero, zero transitions, indistinguishable.
+So we still do not know why two identical-looking writes need opposite handling.
+[#3121](https://github.com/mattias800/prosper/issues/3121)
+
+## 2026-08-29
+
 ### Unbound: Worlds Apart was never rendering-broken — it was reading a stale save
 
 Its whole intro cinematic plays in full colour once the run gets a save directory of its own; the

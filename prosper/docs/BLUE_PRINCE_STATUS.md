@@ -431,6 +431,17 @@ reading them that way is a trap.
 
 ## Ruled out (do-not-redo list)
 
+**2026-08-29 — the HTILE byte-preserving suppression is NOT what keeps this title rendering.**
+#3093 removed that suppression to fix this title's black frame and recorded a fade-in to ~21% as the
+restored healthy value. Re-measured on current master with one binary and one environment variable
+(#3121), Blue Prince reaches `max_nonblack` **0.2085 in both arms** — suppression on and off — so
+whatever now carries this title, it is not that removal. The same change had meanwhile cost
+*Grand Theft Auto V* its deferred lighting (grid artifact, no illumination), which #3093's
+peak-colour-coverage check could not see, so the suppression has been restored. If this title
+regresses to black again, **the suppression is not the first thing to suspect**: it was measured
+neutral here.
+
+
 **The pure-black frame on master, 2026-08-28 (#3089, fixed by the PR that adds this row).** The
 cause is one line in `97ecc58a` ("gpu: GTA V world rendering series", the squash of #2996; the
 pre-squash branch commit is `1b5b9471`, which is NOT on master -- cite the squash, or a fresh clone

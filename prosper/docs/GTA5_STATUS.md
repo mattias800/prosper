@@ -1,7 +1,20 @@
 # Grand Theft Auto V (`PPSA04263`, RAGE) — status
 
-**Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws. The HUD, radar and
-tutorial text render; the 3D world does not.
+**Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws, **and since the
+rendering series (`97ecc58a`, #2996) the 3D world renders** — the prologue bank heist in full
+colour, on a default launch with the game's own **Performance** graphics mode selected. Route:
+`scripts/gta5/reach-performance-story.pad`; screenshots in `BLOG.md` (2026-08-26).
+
+> **The line above used to read "the HUD, radar and tutorial text render; the 3D world does not",
+> and it stayed there for three days after the world started rendering.** That stale sentence cost
+> real time on 2026-08-29: a user reported the world had regressed, and this document was quoted
+> back at them as evidence that it had never worked. Treat a rung claim here as stale until the
+> tracker or `BLOG.md` agrees with it.
+
+**The world renders only in the game's own Performance graphics mode**, chosen from the landing menu
+before the world loads (the default is Fidelity). That is a route property, not a build property —
+a run started straight into Story on Fidelity shows the HUD over a dark scene and looks exactly like
+a renderer regression.
 
 Tracker: **#1873**. Active frontier: **#2542** and **#2690** — #2542 names ONE hanging compute
 program and its title still calls it "the sole remaining cause"; there are at least three (#2690).
@@ -233,6 +246,19 @@ conclusion; it sharpens what "essentially all black" looks like.
   M0 is modelled elsewhere in the recompiler (LDS base, ADDTID spill slots), so this is narrower than
   "M0 unsupported"; the exact rejecting path is not located. M0 accounts for 20 of the shader's
   instructions (6 reads, 14 writes); whether all 20 are among the 79 is **not** established.
+
+## Ruled out — HTILE byte-preserving suppression (2026-08-29)
+
+| dead hypothesis | evidence that killed it | ref |
+| --- | --- | --- |
+| Removing the byte-preserving HTILE suppression is safe for GTA V, because peak colour coverage is 99.78% in both arms (#3093's own clearing check) | **False, and the check is the reason it passed.** `aced0703` cost GTA its deferred lighting for a day: the world still covered the frame, drawn with no illumination and a grid artifact from depth-dependent sampling. Peak coverage cannot see a wrongly-lit but fully-covered frame. Bisected from a user report over 52 commits, 4 builds, with 30-frame contact sheets reviewed by eye at each step. | #3121 |
+| A *uniform* HTILE plane means a fast clear, so uniformity can discriminate a clear from a HiZ refresh where byte equality cannot | **Measured false BEFORE it was implemented.** `PROSPER_HTILE_UNIFORMLOG` over both titles: GTA **6,500/6,500 writes uniform, zero transitions, first word 0x00000000**; Blue Prince **62,000/62,000 uniform, zero transitions, first word 0x00000000**. The two titles are indistinguishable at this site on every available signal, differing only in plane size (73,728 vs 49,152 words = resolution). A discriminator built on uniformity would have been built on a difference that does not exist. | #3121 |
+| Restoring the suppression re-breaks Blue Prince, so the two titles are in tension | **False.** One binary, one environment variable, measured the same day: Blue Prince reaches `max_nonblack` **0.2085 in BOTH arms** — the same "~21%" #3093 called its restored healthy value — while GTA is broken in one and correct in the other. There is no trade. | #3121 |
+
+**Still open, and not to be mistaken for solved:** *why* two byte-identical, uniform, all-zero HTILE
+writes need opposite handling in the two titles. The restored exception is behaviour measured
+correct for both, not an explanation. Decoding HTILE to tell a clear from a refresh — named in the
+code comment since long before this — remains the actual fix.
 
 ## Ruled out (2026-08-19)
 
