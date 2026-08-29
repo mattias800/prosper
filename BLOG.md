@@ -19,6 +19,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-29
+
+### Unbound: Worlds Apart was never rendering-broken — it was reading a stale save
+
+Its whole intro cinematic plays in full colour once the run gets a save directory of its own; the
+black screens we had been reading as a broken composite came from a leftover save on the shared box
+that made the title resume into a state it draws nothing for.
+
+![Unbound: Worlds Apart at 3840x2160 — a sunlit village clearing in the intro cinematic: thatched huts strung with orange bunting, tall trees and drifting fireflies, pink mushrooms in the foreground grass, the small red-cloaked character at the right, and a prompt reading Press Square to skip](assets/screenshots/unbound-worlds-apart-intro-cinematic-village.png)
+
+![Unbound: Worlds Apart at 3840x2160 — the title screen held for the full 200 s of a default launch with no input: the UNBOUND / Worlds Apart wordmark over a dark forest lit by fire, a cloaked figure at the left, the Cross prompt below and the Unreal Engine logo in the corner](assets/screenshots/unbound-worlds-apart-title-screen.png)
+
+The title screen also renders continuously now — 40 of 40 samples across 200 s, where the survey a
+week ago caught it on about 9%.
+
 ## 2026-08-28
 
 ### Dragon Quest VII reaches the field

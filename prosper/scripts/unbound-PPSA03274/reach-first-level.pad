@@ -8,6 +8,18 @@
 # headless `tools/screenshot` frontend, PROSPER_RENDER=1, PROSPER_GUEST_ARGS=-force-gfx-direct,
 # no render acceleration. Measured 2026-08-22 on master bb57d617.
 #
+# THIS ROUTE REQUIRES AN ISOLATED SAVE. Run it with
+#
+#     PROSPER_SAVE0=$HOME/<lane>/save0  PROSPER_SAVEDATA_DIR=$HOME/<lane>/data
+#
+# both pointing at directories nothing else writes. With a stale save at the shared default location
+# (~/.local/share/prosper/savedata0/PPSA03274) the title advances into a state that renders NOTHING:
+# the run goes black about 12 s after the first press and stays black. Measured 2026-08-29 on master
+# 4ce6e11e, matched A/B, only the save location differing -- 4 of 20 samples carried content with the
+# shared save, 17 of 20 with a fresh one. The failure looks exactly like a renderer defect (#2932) and
+# is stateful across runs, so it does not reproduce for whoever writes the route and reproduces
+# forever for whoever inherits the machine.
+
 # THE TITLE SCREEN'S PROMPT AND THE CINEMATIC'S PROMPT NAME DIFFERENT BUTTONS.
 #
 # The 4K title screen draws a lone `X` glyph, and CROSS is right for it. What follows is not
