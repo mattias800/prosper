@@ -312,6 +312,42 @@ int main() {
           tail_destination[0] == 0x34 && tail_destination[1] == 0x12 &&
           tail_destination[2] == 0 && tail_destination[3] == 0,
           "one-record Uint16 materialization copies two bytes and deterministically clears the tail");
+
+    // Dragon Quest VII's field phase binds this exact shape: a Float16 record ARRAY read at element
+    // zero (#1486). `size` is the RESOURCE's byte count, so pinning it to one record excluded every
+    // such buffer -- and the reject SKIPS the binding, so the shader ran with the descriptor absent.
+    // 549,623 rejects in one routed run, all for one address, all failing on this single term.
+    auto array_descriptor = tail_descriptor;
+    array_descriptor.zero_pad_semantic = StorageBufferTailSemantic::Float16;
+    ShaderResource array_resource;
+    array_resource.cls = ResourceClass::VertexBuffer;   // the class DQ7's own resource carries
+    array_resource.format = DataFormat::Float16;
+    array_resource.num_components = 1;
+    array_resource.size = 16;                            // eight records
+    array_resource.stride = 2;
+    const StorageBufferMaterializationPlan array_plan =
+        plan_storage_buffer_materialization(array_descriptor, array_resource);
+    const uint8_t array_source[16] = {0x78, 0x56, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                                      0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
+    uint8_t array_destination[4] = {0x5a, 0x5a, 0x5a, 0x5a};
+    CHECK(array_plan.valid && array_plan.zero_padded_tail &&
+          array_plan.logical_bytes == 2 && array_plan.binding_bytes == 4 &&
+          materialize_storage_buffer_bytes(
+              array_plan, array_source, sizeof(array_source),
+              array_destination, sizeof(array_destination)) &&
+          array_destination[0] == 0x78 && array_destination[1] == 0x56 &&
+          array_destination[2] == 0 && array_destination[3] == 0,
+          "a Float16 record ARRAY materializes element zero and clears the tail");
+
+    // CONTROL: the resource must still hold at least one WHOLE record. A one-byte resource cannot,
+    // and a three-byte one is not a whole number of 2-byte records -- both stay rejected, so the
+    // relaxation is "more records", not "any size".
+    ShaderResource half_record = array_resource; half_record.size = 1;
+    ShaderResource odd_record  = array_resource; odd_record.size = 3;
+    CHECK(!plan_storage_buffer_materialization(array_descriptor, half_record).valid,
+          "control: a resource smaller than one record is still rejected");
+    CHECK(!plan_storage_buffer_materialization(array_descriptor, odd_record).valid,
+          "control: a resource that is not a whole number of records is still rejected");
     ShaderResource ordinary_four_byte_resource = tail_resource;
     ordinary_four_byte_resource.format = DataFormat::Uint32;
     ordinary_four_byte_resource.size = 4;
