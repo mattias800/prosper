@@ -177,8 +177,9 @@ python3 scripts/dragon-quest-vii/classify_field.py locomotion <EVIDENCE_ROOT>/sh
 ```
 
 Measured: masked minimap change ≥ 15 in **8 of 8** stick windows (median 24.9, range 22.4-37.3)
-against **0 of 8** neutral (median 3.0, max 12.7). Identical at `--guard` 0, 2 and 4 — the guard is
-not load-bearing.
+against **0 of 8** neutral (median 3.0, max 12.7). The **counts** are identical at `--guard` 0, 2 and 4 — the guard is not
+load-bearing for the 8/8 vs 0/8 result. The magnitudes do move (stick median 26.67 at guard 0
+against 24.88 at guard 2), which is why one value is quoted rather than a range.
 
 **Measure the HUD, not the world**, and mask the disc. A world region flicking between rendered and
 collapsed swamps the signal; and the minimap is a circle in a square crop, so an unmasked box picks

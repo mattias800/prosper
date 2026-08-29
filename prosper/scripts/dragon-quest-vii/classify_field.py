@@ -31,7 +31,7 @@ not. Measured over all 950 frames of three runs:
 
 `HP_BAR_MIN = 0.013` sits ~1.5x below the class and ~1.5x above everything else. Compare the
 brightness floor it replaced, where 73 of 144 field frames sat within 1.0 of the threshold and the
-nearest collapse was 0.26 away -- the frames are DARK precisely because they are HUD over an
+faintest of them was only 0.26 above it -- the frames are DARK precisely because they are HUD over an
 unrendered world, so brightness was measuring the defect rather than the state.
 """
 import argparse, glob, json, os, statistics, sys
@@ -46,7 +46,10 @@ HP_BAR_MIN = 0.013
 # AGAINST by --selftest, so a retune that would drop a real frame or admit a collapse reddens
 # arithmetically rather than depending on a constructed frame landing exactly on a boundary.
 # Over 1,370 frames of four runs:
-FIELD_HP_MIN = 0.020097          # lowest HP-bar fraction among the 334 field frames
+# The EXACT class minimum, not a rounded copy. 99 of run3's 144 field frames and 121 of run4's 190
+# sit on precisely this value, so rounding it up by 1e-7 -- as an earlier version did -- lets
+# HP_BAR_MIN = 0.020097 pass the selftest while dropping run3 from 144 field frames to 45.
+FIELD_HP_MIN = 8440 / 419965     # = 0.0200969128..., lowest HP-bar fraction among the field frames
 NONFIELD_HP_MAX = 0.008860       # highest among every other frame
 # Over the 334 field frames, split by whether the world renders (143 / 191):
 RENDERED_MIN = (0.360, 207, 20.66)     # (usable, colours, sigma) minima of the rendered class
@@ -286,12 +289,12 @@ def selftest():
     # ---- the marker, pinned at the REAL element's measured area ------------------------------
     # PARTY_BOX spans 0.22w x 0.23h = 844 x 496 px at 4K. A bar of 522 x 20 px is 10440/418624 =
     # 0.02494 of it. Asserted numerically: change the box extent and this number moves.
-    px = _px(PARTY_BOX, (w, h))
-    box_area = (px[2] - px[0]) * (px[3] - px[1])
+    box_area = 419965
     # HARDCODED, not derived from PARTY_BOX. Deriving it reproduces the very circularity this case
     # exists to remove: widen the box and both the measurement and its expectation move together.
     # _px truncates each edge independently, so at 3840x2160 PARTY_BOX is x 2995..3840, y 1663..2160
-    # = 845 x 497 = 419,965 px. A 522 x 20 bar is 10,440 / 419,965 = 0.0248592.
+    # = 845 x 497 = 419,965 px, and a 522 x 20 bar is 10,440 / 419,965 = 0.0248592. (An earlier
+    # comment here said 844 x 496 = 418,624 -> 0.024939, which does not reproduce.)
     frac_target = 0.0248592
     p_field = save(field_frame(bar_px=(522, 20)))
     frac = hp_bar_fraction(p_field)
@@ -336,18 +339,18 @@ def selftest():
     faintish = (128 + (rng.random((h, w, 3)) * 6 - 3)).astype(np.uint8)
     check(not world_renders(save(faintish)), "a nearly uniform mid-grey world does not")
 
-    # Upper side, numerically: each threshold must sit BELOW the rendered class's minimum, or it
-    # drops real frames. Tightening any one of them past its measured minimum reddens here.
-    for i, (nm, thr) in enumerate((("usable", 0.30), ("colours", 200), ("sigma", 20))):
-        check(thr < RENDERED_MIN[i],
-              f"world_renders' {nm} threshold ({thr}) sits below the rendered class minimum "
-              f"({RENDERED_MIN[i]})")
+    # DELETED, and recorded so it is not restored. An earlier version looped over hardcoded copies of the
+    # three thresholds and asserted each was below RENDERED_MIN -- which compares two literals and
+    # never calls world_renders, so tightening a threshold in the function changed nothing. Pinning
+    # the upper side honestly needs a frame at each class minimum, which the corpus supplies and a
+    # constructed frame does not; until that exists, `mutants.txt` records these as NOT pinned
+    # rather than pretending otherwise.
 
     # Lower side: one frame per threshold, built to SATISFY THE OTHER TWO and fail only the one
     # under test. Without this a threshold can be lowered freely -- the previous cases left
     # `usable` and `sigma` with no lower pin at all, because every frame that was meant to test
     # them was actually being rejected by the colour count.
-    def world_frame(usable_target=1.0, blocks=48, contrast=200, luma_flat=False):
+    def world_frame(usable_target=1.0, blocks=48, contrast=200, luma_flat=False, half=36):
         """A world region with one statistic dialled down and the other two satisfied.
 
         `luma_flat` is how the sigma case is built: per-channel noise around mid-grey gives many
@@ -357,7 +360,7 @@ def selftest():
         rejected by the colour test rather than by the one it means to exercise.
         """
         if luma_flat:
-            t = (128 + (rng.random((blocks, blocks, 3)) * 2 - 1) * 36).astype(np.uint8)
+            t = (128 + (rng.random((blocks, blocks, 3)) * 2 - 1) * half).astype(np.uint8)
         else:
             t = (rng.random((blocks, blocks, 3)) * contrast + 25).astype(np.uint8)
         f = np.repeat(np.repeat(t, h // blocks + 1, axis=0),
@@ -377,6 +380,18 @@ def selftest():
     # sigma ~13.7 with ~905 colours, usable satisfied
     check(not world_renders(save(world_frame(luma_flat=True))),
           "a world below the sigma threshold is rejected even with usable and colours satisfied")
+
+    # Upper side: a frame just ABOVE each threshold that must be ACCEPTED, so tightening that
+    # threshold rejects it. These are what the corpus's rendered class minima look like
+    # (usable 0.3596, colours 207, sigma 20.66) -- an earlier version "pinned" this direction by
+    # comparing two hardcoded literals, which never calls world_renders at all.
+    check(world_renders(save(world_frame(usable_target=0.36))),
+          "a world just above the usable threshold is still accepted (pins it from above)")
+    check(world_renders(save(world_frame(blocks=8))),
+          "a world just above the colour threshold is still accepted (pins it from above)")
+    check(world_renders(save(world_frame(luma_flat=True, half=58))),
+          "a world just above the sigma threshold is still accepted (pins it from above)")
+
 
     # WORLD_BOX's POSITION: a frame whose world region holds a scene and whose surroundings are
     # flat. The painted region is HARDCODED, never _px(WORLD_BOX, ...) -- painting into the box
@@ -444,20 +459,31 @@ def run_mutants():
         line = raw.rstrip("\n")
         if not line.strip() or line.lstrip().startswith("#"):
             continue
+        # Three expectations, not two. UNPINNED is the honest half: a mutation that DOES move a
+        # published number and that this selftest cannot catch. Recording it green-but-labelled is
+        # the difference between "covered" and "we checked and it is not covered" -- and six review
+        # rounds went on this file claiming the former while the latter was true.
         noop = line.startswith("NO-OP")
+        unpinned = line.startswith("UNPINNED")
         if noop:
             line = line[len("NO-OP"):]
+        elif unpinned:
+            line = line[len("UNPINNED"):]
         pat, _, rep = line.partition(" => ")
-        rows.append((pat, rep, noop))
+        # Indentation is taken from the MATCHED LINE, never from the file. Writing it here means one
+        # space too few produces an IndentationError, which exits non-zero and scores as "the
+        # selftest caught it" -- eight arms passed that way while testing nothing.
+        rows.append((pat, rep.strip(), noop or unpinned, unpinned))
 
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
-        for pat, rep, noop in rows:
+        for pat, rep, expect_green, unpinned in rows:
             lines = src.split("\n")
             hit = False
             for i, l in enumerate(lines):
                 if l.startswith(pat):
-                    lines[i] = l.replace(pat, rep, 1)
+                    indent = l[:len(l) - len(l.lstrip())]
+                    lines[i] = indent + rep
                     hit = True
                     break
             if not hit:
@@ -466,17 +492,31 @@ def run_mutants():
                 continue
             path = os.path.join(tmp, "classify_field.py")
             open(path, "w", encoding="utf-8").write("\n".join(lines))
+            # A mutation that does not COMPILE is a broken entry, not a reddening. Without this
+            # check, a replacement whose indentation is off by one space raises IndentationError,
+            # exits non-zero, and scores as "the selftest caught it" -- which is how eight arms in
+            # the first version of this list passed while testing nothing. Three of them stay green
+            # once the indentation is corrected.
+            try:
+                compile(open(path, encoding="utf-8").read(), path, "exec")
+            except SyntaxError as exc:
+                print(f"  BROKEN  mutation does not compile ({exc.__class__.__name__}: "
+                      f"line {exc.lineno}) <- {rep.strip()[:60]}")
+                failures += 1
+                continue
             proc = subprocess.run([sys.executable, path, "selftest"],
                                   capture_output=True, text=True)
             reddened = proc.returncode != 0
-            want = not noop
+            want = not expect_green
             ok = reddened == want
-            label = "NO-OP" if noop else "     "
+            label = "UNPIN" if unpinned else ("NO-OP" if expect_green else "     ")
             print(f"  {'ok  ' if ok else 'FAIL'} {label} {'reddens' if reddened else 'stays green'}"
                   f"  <- {rep.strip()[:70]}")
             if not ok:
                 failures += 1
-    print(f"\n  {len(rows)} mutations, {failures} unexpected"
+    n_unpinned = sum(1 for r in rows if r[3])
+    print(f"\n  {len(rows)} mutations, {failures} unexpected, "
+          f"{n_unpinned} KNOWN-UNPINNED (listed, measured, not caught)"
           + ("  == mutants PASS ==" if not failures else "  == mutants FAIL =="))
     return 0 if failures == 0 else 1
 

@@ -700,7 +700,8 @@ matched neutral windows inside the field state. All eight stick deliveries appea
 | stick held | **8 of 8** | 24.88 | 22.41 - 37.29 |
 | neutral | **0 of 8** | 3.01 | 0.00 - 12.67 |
 
-Identical at `--guard` 0, 2 and 4, so the guard band is **not** load-bearing — an earlier draft
+The **counts** are identical at `--guard` 0, 2 and 4, so the guard band is **not** load-bearing
+for the 8/8 vs 0/8 result (the magnitudes do move: stick median 26.67 at guard 0) — an earlier draft
 claimed the neutral result depended on it, which running the tool refutes.
 
 **The measure is masked minimap CHANGE, not phase correlation.** Two earlier drafts used
@@ -765,12 +766,23 @@ forbidding it.
 
 The HP bar separates **0.0201 from 0.008860 across 1,370 frames** of four runs.
 
-**The selftest's coverage is itself re-runnable**, which is the only form of this claim worth
-making: `scripts/dragon-quest-vii/mutants.txt` lists every mutation and
-`classify_field.py mutants` applies each one and requires the selftest to redden. 25 entries — 23
-harmful mutations that must redden, and 2 controls that must not (a no-op edit, and a *safe*
-`HP_BAR_MIN` retune inside the measured band, because a selftest that cries wolf is as useless as
-one that misses). Thresholds are asserted numerically against measured class boundaries rather than
+**The selftest's coverage is itself re-runnable, and its GAPS are recorded.**
+`scripts/dragon-quest-vii/mutants.txt` lists every mutation and `classify_field.py mutants` applies
+each one. 30 entries: 25 that must redden, 2 controls that must not (a no-op edit, and a *safe*
+`HP_BAR_MIN` retune inside the measured band), and **3 marked `UNPINNED` — mutations that DO move a
+published number and that this selftest does not catch**. Those three are a coarser sampling
+resize, a narrower luma band, and a small `WORLD_BOX` shift; the reason is structural rather than an
+oversight, since a constructed frame cannot reproduce a real 4K frame's sensitivity to a small
+perturbation, and catching them would need corpus frames that are gigabytes and not committed. They
+are listed with their measured effect so the boundary of the guarantee is visible rather than
+implied.
+
+The runner rejects a mutation that does not COMPILE rather than scoring it as a reddening: an
+earlier version had eight arms whose replacement indentation was one space short, which raised
+`IndentationError`, exited non-zero, and read as "the selftest caught it" while testing nothing.
+Replacement indentation is now taken from the matched line, so the class of bug cannot recur.
+
+Thresholds are asserted numerically against measured class boundaries rather than
 against constructed frames, because a frame lands *beside* the value it names — that rounding left a
 5% band in which `HP_BAR_MIN` passed while destroying the headline. Box controls are drawn at fixed
 pixel positions with the expected value **hardcoded**; deriving it from the box under test is what

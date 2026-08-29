@@ -22,19 +22,36 @@ MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.0, 0.60, 0.40, 1.
 MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.5, 0.5, 0.7, 0.7)
 WORLD_BOX = (0.18, 0.05, 0.82, 0.72) => WORLD_BOX = (0.78, 0.77, 1.00, 1.00)
 WORLD_BOX = (0.18, 0.05, 0.82, 0.72) => WORLD_BOX = (0.0, 0.0, 1.0, 1.0)
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.95 and colours > 200 and sigma > 20
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.30 and colours > 1000 and sigma > 20
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.30 and colours > 5 and sigma > 20
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.30 and colours > 200 and sigma > 40
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return usable > 0.05 and colours > 200 and sigma > 20
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return True
-    return usable > 0.30 and colours > 200 and sigma > 20 =>    return False
-    return float(np.mean(np.abs(region(path_a) - region(path_b)))) =>    return float(np.mean(region(path_a) - region(path_b)))
+    return usable > 0.30 and colours > 200 and sigma > 20 => return usable > 0.95 and colours > 200 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 => return usable > 0.30 and colours > 1000 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 => return usable > 0.30 and colours > 5 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 => return usable > 0.30 and colours > 200 and sigma > 40
+    return usable > 0.30 and colours > 200 and sigma > 20 => return usable > 0.05 and colours > 200 and sigma > 20
+    return usable > 0.30 and colours > 200 and sigma > 20 => return True
+    return usable > 0.30 and colours > 200 and sigma > 20 => return False
+    return float(np.mean(np.abs(region(path_a) - region(path_b)))) => return float(np.mean(region(path_a) - region(path_b)))
 def minimap_change(path_a, path_b, box, size=128, disc=0.44): => def minimap_change(path_a, path_b, box, size=128, disc=0.99):
 def minimap_change(path_a, path_b, box, size=128, disc=0.44): => def minimap_change(path_a, path_b, box, size=16, disc=0.44):
-    return hp_bar_fraction(path) >= HP_BAR_MIN =>     return True
+    return hp_bar_fraction(path) >= HP_BAR_MIN => return True
 # A SAFE retune: 0.0095 sits between the worst non-field frame (0.008860) and the faintest field
 # frame (0.020097), so it changes no published number and must NOT redden. A selftest that fires on
 # harmless changes is as useless as one that misses harmful ones.
 NO-OPHP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.0095
-NO-OP    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2] =>     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]  # noqa
+NO-OP    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2] => r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]  # noqa
+
+# Parameters a reviewer found moving a published number. Two are caught; three are NOT, and are
+# marked UNPINNED so the gap is recorded rather than hidden. All five were measured.
+    colours = len(np.unique(arr // 8, axis=0)) => colours = len(np.unique(arr // 16, axis=0))
+MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.042, 0.742, 0.170, 0.969)
+
+# KNOWN UNPINNED. Each of these moves a published number and this selftest does not catch it. The
+# reason is structural rather than an oversight: a constructed frame cannot reproduce a real 4K
+# game frame's sensitivity to a small sampling or box perturbation -- the synthetic content is
+# uniform where the real content is not. Catching them needs corpus frames, which are not committed
+# (they are gigabytes of captures). Listed so the next reader knows the boundary of the guarantee.
+#   resize((128,72))       : world4 107 -> 73, longest4 10 -> 4
+#   luma band 30..240      : world3 36 -> 32, world4 107 -> 89
+#   WORLD_BOX +/-0.02      : world4 107 -> 80..110
+UNPINNED    arr = np.asarray(region.resize((256, 144))).reshape(-1, 3) => arr = np.asarray(region.resize((128, 72))).reshape(-1, 3)
+UNPINNED    usable = float(((lum > 25) & (lum < 245)).mean()) => usable = float(((lum > 30) & (lum < 240)).mean())
+UNPINNEDWORLD_BOX = (0.18, 0.05, 0.82, 0.72) => WORLD_BOX = (0.20, 0.07, 0.80, 0.70)
