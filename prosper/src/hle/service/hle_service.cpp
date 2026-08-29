@@ -5083,7 +5083,47 @@ HLE(s_savedata_transfermount_ps4) {
 // nothing is assumed about it because nothing is read or written.
 HLE(s_savedata_dirname_search_ps4) {
     svc_log("sceSaveDataDirNameSearchPs4", a0,a1,a2,a3,a4,a5);
-    return SAVE_DATA_ERR_NOT_FOUND;
+    // #3124: answer this exactly as the PS5 sibling above does, with an EXPLICIT zero-hit result.
+    //
+    // #2302 replaced the dispatcher's `return 0` with NOT_FOUND, and its diagnosis was right: SCE_OK
+    // over an out-struct nothing wrote is the false-success class, correct only by accident when the
+    // caller happens to pre-zero. But it changed the answer for a call it had not seen, and said so:
+    // "Not observed being CALLED at any boot depth reached so far". Tactics Ogre: Reborn (PPSA03839)
+    // calls it, once, right after sceSaveDataInitialize3 -- and on NOT_FOUND the title submits two
+    // DCBs, draws once and then stops submitting while staying alive, rendering one black frame for
+    // the rest of the run. Bisected over 700 commits.
+    //
+    // The commit named the better option and declined it only for want of evidence: "Returning
+    // SCE_OK with an explicitly-zeroed hit count would also be defensible -- but only if the
+    // argument layout were established from live evidence, and it is not."
+    //
+    // IT IS NOW, twice over. Captured with PROSPER_SVCLOG=1 on this title, the PS4 and PS5 calls
+    // carry a byte-identical result struct -- [0x00]=0, [0x08]=caller buffer pointer, [0x10]=0x400
+    // capacity -- and s_savedata_dirsearch above already writes that same layout (hitNum @0x00,
+    // dirNames @0x08, dirNamesNum @0x10, setNum @0x14), derived from live evidence in #299.
+    //
+    // So this is not an invented result. Zero hits is the honest answer: prosper has no PS4 save
+    // area at all -- both its save roots are PS5-side (PROSPER_SAVEDATA_DIR, PROSPER_SAVE0) -- so a
+    // search over PS4 save data genuinely finds nothing. Writing the count makes that true BY
+    // CONSTRUCTION rather than by the caller's habit of zeroing first, which is precisely what
+    // #2302 objected to. On the observed caller the write is a no-op (the field is already 0); on
+    // one that does not pre-zero it replaces stack residue, the #213 shape where a garbage count
+    // sized a 34 GB array.
+    //
+    // The charter's rule also binds here: the same question must be answered the same way through
+    // every library that exposes it. The PS5 spelling enumerates and reports its count; the PS4
+    // spelling reporting a hard error for the same question was a divergence on top of the
+    // regression.
+    //
+    // CONFIDENCE: HIGH that zero hits is the correct answer and that SCE_OK unblocks the title
+    // (measured both ways). HIGH on the layout -- two independent captures plus the sibling's
+    // established use of the same offsets.
+    if (!a1) return 0x809F0000ull;             // SAVE_DATA_ERROR_PARAMETER, as the sibling does
+    uint8_t* res = (uint8_t*)PW(a1);
+    if (!res) return 0x809F0000ull;
+    *(uint32_t*)(res + 0x00) = 0;              // hitNum
+    *(uint32_t*)(res + 0x14) = 0;              // setNum
+    return 0;
 }
 
 // sceSystemServiceGetNoticeScreenSkipFlag(bool* flag) — polled from DOLL's front-end menu.

@@ -212,30 +212,66 @@ void test_savedata_transferring_mount() {
         // verified with nid_census against the local dumps.
         CHECK(fn != nullptr, "sceSaveDataDirNameSearchPs4 is registered");
         if (fn) {
-            // POISONED, not zeroed, and that is the difference that makes this arm mean something.
-            // The mounts block above zeroes its result, so its "untouched" assertion cannot tell a
-            // handler that wrote zeros from one that wrote nothing. 0x5A can.
+            // THIS BLOCK ASSERTED THE OPPOSITE UNTIL #3124, and the reversal is deliberate.
+            //
+            // It required a hard error and a completely untouched buffer, and named the present
+            // behaviour as the mistake to avoid: "inventing a written result -- a zeroed hit count
+            // over a layout NOBODY HAS ESTABLISHED". That reasoning was right, and its condition is
+            // what changed: the layout is now established, twice over.
+            //
+            //   - s_savedata_dirsearch (the PS5 sibling) already writes hitNum @0x00,
+            //     dirNames @0x08, dirNamesNum @0x10, setNum @0x14, from live evidence in #299.
+            //   - PROSPER_SVCLOG=1 on Tactics Ogre (PPSA03839) captured BOTH spellings on one boot
+            //     with a byte-identical result struct: [0x00]=0, [0x08]=caller buffer, [0x10]=0x400.
+            //
+            // What forced the reversal is that the hard error is not inert. Tactics Ogre calls this
+            // once, after sceSaveDataInitialize3, and on NOT_FOUND it submits two DCBs, draws once,
+            // then stops submitting while staying alive -- one black frame for the rest of the run.
+            // Bisected over 700 commits (#3124). "Registering a NID can be worse than not" cuts both
+            // ways: the danger is not only a false SUCCESS, it is any answer a caller cannot proceed
+            // past.
+            //
+            // So the contract is now the sibling's: report zero hits EXPLICITLY and succeed. The
+            // original objection is preserved as the last two arms -- the handler must write the
+            // two count fields and NOTHING else, so "inventing a result" is still caught.
             unsigned char result[64];
             memset(result, 0x5A, sizeof(result));
             uint64_t param[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
             const uint64_t r = fn((uint64_t)(uintptr_t)param, (uint64_t)(uintptr_t)result, 0, 0, 0, 0);
 
-            // Kills: THE BUG, and equally a hand-written `return 0` stub replacing it.
-            CHECK(r != 0, "sceSaveDataDirNameSearchPs4 reports unavailable rather than success");
-            // Sign, not merely non-zero: Sony errors are 0x8xxxxxxx and guest sites gate with
-            // `test eax,eax; js`, so `return 1` would reinstate the bug with a non-zero check green.
-            CHECK((int32_t)(uint32_t)r < 0,
-                  "sceSaveDataDirNameSearchPs4 error is NEGATIVE as int32 (the sign call sites test)");
-            // Kills: inventing a written result -- a zeroed hit count over a layout nobody has
-            // established. That is the exact MIRROR of the defect being fixed, and it is the more
-            // tempting mistake because it looks more helpful.
-            CHECK(all_bytes_equal(result, sizeof(result), 0x5A),
-                  "sceSaveDataDirNameSearchPs4 writes NOTHING to the caller's result buffer");
-            // Kills: the two PS4-namespace entry points drifting apart. Both derive their answer
-            // from the same local-inventory fact -- prosper has no PS4 save-data store -- so a
-            // title's behaviour must not depend on which of them it happened to call.
-            CHECK(r == answers[1],
-                  "both PS4-namespace savedata entry points give the same answer");
+            // Kills: the #2302 hard error, which stalls PPSA03839's boot outright.
+            CHECK(r == 0, "sceSaveDataDirNameSearchPs4 succeeds (a hard error stalls PPSA03839)");
+            // Kills: THE ORIGINAL BUG and any `return 0` stub -- success is only honest if the
+            // count the caller reads was actually written. 0x5A poison, not zeros, is what makes
+            // "wrote zero" distinguishable from "wrote nothing".
+            CHECK(result[0x00] == 0 && result[0x01] == 0 && result[0x02] == 0 && result[0x03] == 0,
+                  "hitNum @0x00 is explicitly written to zero, not left as caller residue");
+            CHECK(result[0x14] == 0 && result[0x15] == 0 && result[0x16] == 0 && result[0x17] == 0,
+                  "setNum @0x14 is explicitly written to zero");
+            // Kills: a handler that memsets the whole struct, which would clobber the caller's own
+            // dirNames pointer @0x08 and capacity @0x10 -- the fields the sibling READS. This is
+            // the original block's "do not invent a result" objection, kept and made precise.
+            CHECK(all_bytes_equal(result + 0x04, 0x10, 0x5A),
+                  "the caller's dirNames pointer and capacity are NOT overwritten");
+            CHECK(all_bytes_equal(result + 0x18, sizeof(result) - 0x18, 0x5A),
+                  "nothing beyond the two count fields is written");
+            // The two PS4-namespace entry points were previously required to give the SAME answer,
+            // on the reasoning that both derive from one local-inventory fact (prosper has no PS4
+            // save-data store). #3124 separates them, because they ask different questions and the
+            // charter's same-answer rule is about one question asked through several libraries:
+            //
+            //   TransferringMountPs4  -- MOUNT a PS4 save area. There is none, so it FAILS, and it
+            //                            must: answering SCE_OK there is what black-screened Sonic
+            //                            Frontiers for four sessions (#2023).
+            //   DirNameSearchPs4      -- SEARCH that area for directories. There are none, so it
+            //                            SUCCEEDS WITH ZERO HITS. "Found nothing" is not an error.
+            //
+            // The sibling this one must agree with is the PS5 spelling of the SAME question,
+            // sceSaveDataDirNameSearch, which enumerates and reports its count -- and reports zero
+            // the same way when the search is empty.
+            CHECK(r != answers[1],
+                  "the PS4 SEARCH succeeds where the PS4 MOUNT fails -- different questions, and "
+                  "conflating them is what #3124 had to undo");
         }
     }
 }
