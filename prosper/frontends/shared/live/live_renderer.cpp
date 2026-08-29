@@ -51,6 +51,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <utility>
 #include <tuple>
 #include <map>
 #include <unordered_map>
@@ -2361,6 +2362,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (uint32_t channel = 0; channel < 4; ++channel)
                             found->second.uniform_color[channel] =
                                 clear_rgba[channel] ? 1.0f : 0.0f;
+                        // PROSPER_DCCLOG=1 -- diagnostic only, no behaviour change. A surface
+                        // materialised from a DCC fast-clear code becomes a UNIFORM colour for the
+                        // whole target, so if this decode is wrong the entire frame is one wrong
+                        // colour with no content -- which is exactly Little Nightmares III's
+                        // uniform-yellow presents (#2014). Deduped per (address, decoded colour) so a
+                        // run costs a handful of lines.
+                        if (const char* dcclog = std::getenv("PROSPER_DCCLOG")) {
+                            if (dcclog[0] == '1' && dcclog[1] == '\0') {
+                                static std::mutex dcc_mutex;
+                                static std::set<std::pair<uint64_t, uint32_t>> dcc_seen;
+                                const uint32_t packed = (uint32_t)clear_rgba[0] |
+                                    ((uint32_t)clear_rgba[1] << 8) |
+                                    ((uint32_t)clear_rgba[2] << 16) |
+                                    ((uint32_t)clear_rgba[3] << 24);
+                                bool first = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(dcc_mutex);
+                                    first = dcc_seen.emplace((uint64_t)found->first, packed).second;
+                                }
+                                if (first)
+                                    fprintf(stderr,
+                                            "[dcclog] addr=0x%llx %ux%u fmt=%d ncomp=%u "
+                                            "alpha_msb=%d clear_rgba=(%u,%u,%u,%u) -> uniform=(%.0f,%.0f,%.0f,%.0f)\n",
+                                            (unsigned long long)found->first,
+                                            found->second.w, found->second.h, (int)format,
+                                            resource.num_components, (int)resource.alpha_is_on_msb,
+                                            clear_rgba[0], clear_rgba[1], clear_rgba[2], clear_rgba[3],
+                                            found->second.uniform_color[0], found->second.uniform_color[1],
+                                            found->second.uniform_color[2], found->second.uniform_color[3]);
+                            }
+                        }
                         found->second.dcc_metadata_dirty = false;
                         ++dcc_materialize_surfaces;
                         dcc_materialize_bytes += sizeof(found->second.uniform_color);
