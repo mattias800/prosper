@@ -1595,6 +1595,37 @@ int main() {
                              native_cfg17d).empty(),
           "Wave64 low-only VCC scalar select accepts GTA's 1/-1 inline pair");
 
+    // The House of the Dead 2: Remake takes the same site with a LITERAL rather than an inline
+    // constant, and that was not admitted (#1907). Its Training 1 world renders black while TWO
+    // full-resolution screen-space passes (240x135 groups of 8x8 = 1920x1080) decline ~2,600 times
+    // each, both on the byte-identical instruction below. A literal is a 32-bit constant dword
+    // embedded in the instruction stream, so it is uniform across the wave BY CONSTRUCTION -- the
+    // strongest scalar source of the set, not a weaker one.
+    const uint32_t code17d1_vcc_low_literal[] = {
+        0xbe8f0380u, 0xbf08800fu,
+        0x856aff6au, 0x00000000u,  // exact HotD2 pc297: s_cselect_b32 vcc_lo, vcc_lo, lit(0)
+        0x7e02026au,               // one-dword scalar consumer
+        0x7d840100u,               // complete VCC replacement
+        0xbf810000u,
+    };
+    CHECK(!recompile_compute(code17d1_vcc_low_literal,
+                             std::size(code17d1_vcc_low_literal), nullptr,
+                             native_cfg17d).empty(),
+          "Wave64 low-only VCC scalar select accepts a LITERAL source (HotD2)");
+
+    // CONTROL at the same site: replacing that literal with VCC_HI -- a live mask half rather than a
+    // constant -- must STILL reject. This is what keeps the change "a literal is scalar" rather than
+    // "any source at this site is scalar", which is the mistake that would silently admit a mask.
+    const uint32_t code17d1_vcc_low_literal_control[] = {
+        0xbe8f0380u, 0xbf08800fu,
+        0x856a6b6au,               // same site, src1 = VCC_HI mask state instead of a literal
+        0x7e02026au, 0x7d840100u, 0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1_vcc_low_literal_control,
+                            std::size(code17d1_vcc_low_literal_control), nullptr,
+                            native_cfg17d).empty(),
+          "control: a mask half at the literal's operand slot still rejects");
+
     // Same-site packet mutation and a surviving implicit VCC read both remain fail-visible. The
     // first changes an inline scalar source to a mask half at the production instruction; the
     // second proves the old high-half mask really must be dead, not merely unused by the assertion.
