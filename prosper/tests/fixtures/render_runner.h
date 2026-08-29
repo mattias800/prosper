@@ -3433,7 +3433,73 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // reaching it. Recovering that pass's retained depth needs the fix the comment above still
         // names -- decoding HTILE to tell a clear from a refresh -- not an equality test on a plane
         // prosper does not maintain.
-        const bool htile_kill = htile_overlap && htile_invalidates;
+        // PROSPER_HTILE_UNIFORMLOG (#3121) -- MEASUREMENT ONLY, no behaviour change.
+        //
+        // The comment above says the actual fix is "decoding HTILE to tell a clear from a refresh",
+        // and #3093 removed the byte-preserving exception without one: every HTILE write now
+        // invalidates. That fixed Blue Prince and regressed GTA V's deferred lighting, because
+        // GTA's HiZ refresh loses the 4K depth its next pass samples.
+        //
+        // The candidate discriminator is UNIFORMITY of the written range, not byte equality:
+        // a fast CLEAR states "every tile is value X" and writes one value everywhere, while a HiZ
+        // refresh writes per-tile min/max Z and therefore varies. Blue Prince's measured clear is
+        // uniform (49,152 of 49,152 words equal, ZERO transitions). Whether GTA's refresh is
+        // non-uniform is the open question this logs, and nothing depends on the answer yet.
+        if (htile_overlap) {
+            static const bool uniformlog = getenv("PROSPER_HTILE_UNIFORMLOG") != nullptr;
+            if (uniformlog && size >= 4) {
+                const uint32_t* w = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
+                const size_t n = static_cast<size_t>(size / 4);
+                const uint32_t first = w[0];
+                size_t equal = 0, transitions = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (w[i] == first) ++equal;
+                    if (i && w[i] != w[i - 1]) ++transitions;
+                }
+                // Tally rather than print per write: this fires thousands of times per route, and a
+                // per-write line would itself perturb the run it is measuring.
+                static size_t calls = 0, uniform_calls = 0;
+                ++calls;
+                const bool uniform = (equal == n);
+                if (uniform) ++uniform_calls;
+                if (calls <= 8 || (calls % 500) == 0)
+                    fprintf(stderr,
+                            "[htile-uniform] call=%zu origin=%s words=%zu equal_to_first=%zu "
+                            "transitions=%zu first=0x%08x uniform=%d  tally uniform=%zu/%zu\n",
+                            calls, prosper::gpu::guest_gpu_write_origin(), n, equal, transitions,
+                            first, (int)uniform, uniform_calls, calls);
+            }
+        }
+        // A byte-preserving HTILE write does NOT discard retained depth (#3121, restoring the
+        // exception that #3093 removed).
+        //
+        // #3093 removed this to fix Blue Prince's black frame, and stated that GTA V was unharmed
+        // because "peak colour coverage (99.78% both arms)" was unchanged. That check could not see
+        // the defect it caused: GTA's world still covered the frame, drawn with no lighting and a
+        // grid artifact where depth-dependent sampling had gone wrong. Bisected to that commit from
+        // a user report, 2026-08-29.
+        //
+        // MEASURED ON CURRENT MASTER, one binary, one environment variable, both titles:
+        //
+        //   suppression OFF (as #3093 left it)  GTA broken      Blue Prince max-nonblack 0.2085
+        //   suppression ON  (this line)         GTA CORRECT     Blue Prince max-nonblack 0.2085
+        //
+        // So there is no trade here. Blue Prince is byte-for-byte as healthy either way -- 0.2085 is
+        // the very "~21%" #3093 called its restored value -- while GTA V's deferred lighting only
+        // survives with the exception. Whatever now carries Blue Prince, it is not this.
+        //
+        // WHAT IS STILL NOT KNOWN, stated so nobody mistakes this for an explanation. The two titles
+        // are INDISTINGUISHABLE at this site. Both arrive as origin=gpu-preserving writing a fully
+        // uniform all-zero plane with zero transitions -- GTA 6,500/6,500 uniform, Blue Prince
+        // 62,000/62,000, first word 0x00000000 in both, differing only in plane size (73,728 vs
+        // 49,152 words, i.e. resolution). A "uniform plane means a fast clear" discriminator was
+        // hypothesised and MEASURED FALSE before it was written; PROSPER_HTILE_UNIFORMLOG below is
+        // the instrument that killed it. So this restores behaviour known to be correct for both
+        // titles without knowing why the same event needs opposite handling, and the actual fix the
+        // comment above still names -- decoding HTILE to tell a clear from a refresh -- remains open.
+        const bool byte_preserving =
+            std::strcmp(prosper::gpu::guest_gpu_write_origin(), "gpu-preserving") == 0;
+        const bool htile_kill = htile_overlap && htile_invalidates && !byte_preserving;
         if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
         if (depth_overlap || htile_kill) image.depth_valid = false;
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
