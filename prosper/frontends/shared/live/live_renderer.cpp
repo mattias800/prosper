@@ -51,6 +51,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <tuple>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -6652,6 +6653,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     "[buffer-materialization-reject] set=%u binding=%u addr=%llx "
                                     "declared=%u\n",
                                     set, r.binding, (unsigned long long)r.gpu_addr, r.size);
+                            // Name the sub-condition, once per (set,binding,address). The line above
+                            // collapses every reason into one string, and an investigation cannot act
+                            // on that: "the descriptor carries a partial zero-pad marker set" and
+                            // "the resource is the wrong class" are different pieces of work. Same
+                            // shape and the same justification as [mimg-mip] in rdna2_emit_alu.cpp.
+                            //
+                            // Deduped rather than gated, because the volume is the whole problem:
+                            // Dragon Quest VII emits 549,623 of the line above in one routed run,
+                            // ALL of them for a single address (0x20013f1bc0, set 0 binding 10) with
+                            // 257 different declared sizes -- so the useful signal is one line
+                            // describing that binding, not half a million repetitions of it (#1486).
+                            {
+                                static std::mutex why_mutex;
+                                static std::set<std::tuple<uint32_t, uint32_t, uint64_t>> why_seen;
+                                bool first_why = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(why_mutex);
+                                    first_why = why_seen.emplace(set, r.binding,
+                                                                 (uint64_t)r.gpu_addr).second;
+                                }
+                                if (first_why) {
+                                    const auto& d = *reflected_binding;
+                                    const bool has_logical = d.zero_pad_logical_bytes != 0;
+                                    const bool has_binding_pad = d.zero_pad_binding_bytes != 0;
+                                    const bool has_semantic =
+                                        d.zero_pad_semantic !=
+                                        prosper::gpu::StorageBufferTailSemantic::None;
+                                    fprintf(stderr,
+                                            "[buffer-why] set=%u binding=%u addr=%llx declared=%u "
+                                            "markers=%d/%d/%d kind=%d readable=%d writable=%d "
+                                            "atomic=%d dynamic=%d required=%llu "
+                                            "pad_logical=%u pad_binding=%u semantic=%d "
+                                            "res_cls=%d fmt=%d ncomp=%u stride=%u size=%u "
+                                            "scalar_dwords=%u\n",
+                                            set, r.binding, (unsigned long long)r.gpu_addr, r.size,
+                                            (int)has_logical, (int)has_binding_pad,
+                                            (int)has_semantic,
+                                            (int)d.kind, (int)d.readable, (int)d.writable,
+                                            (int)d.atomic_access, (int)d.dynamic_access,
+                                            (unsigned long long)d.required_bytes,
+                                            d.zero_pad_logical_bytes, d.zero_pad_binding_bytes,
+                                            (int)d.zero_pad_semantic,
+                                            (int)r.cls, (int)r.format, r.num_components,
+                                            r.stride, r.size, r.scalar_buffer_dword_count);
+                                }
+                            }
                             continue;
                         }
                         // #1427: the guest's declared V#/V-buffer size is the real requirement — a
