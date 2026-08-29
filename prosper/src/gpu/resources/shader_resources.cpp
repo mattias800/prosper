@@ -703,13 +703,26 @@ StorageBufferMaterializationPlan plan_storage_buffer_materialization(
          resource.format == DataFormat::Uint16) ||
         (descriptor.zero_pad_semantic == StorageBufferTailSemantic::Float16 &&
          resource.format == DataFormat::Float16);
+    // `resource.size` is the RESOURCE's byte count, not the shader's. It used to be pinned to
+    // exactly 2 -- one Float16/Uint16 record -- which silently excluded every guest buffer that
+    // holds a record ARRAY and is read at element zero. The shader's own access is already bounded
+    // by the three terms above it: `required_bytes == 4` (one zero-padded record) and
+    // `dynamic_access == false` (that access is static), so a larger resource cannot be indexed past
+    // the record this plan materialises. What is required of the resource is therefore that it hold
+    // AT LEAST one whole record, which is what the two terms below now say.
+    //
+    // Measured on Dragon Quest VII (#1486): its field phase emits 549,623 materialisation rejects in
+    // one routed run, ALL for one address at set 0, and every one of them matched every term here
+    // except this one -- `size=16` at `stride=2`, i.e. eight records read at element zero. Each
+    // reject SKIPS the binding (`continue` at the call site), so the shader ran with the descriptor
+    // absent.
     if (descriptor.kind != SpirvDescriptorKind::StorageBuffer || !buffer_resource ||
         !descriptor.readable || descriptor.writable || descriptor.atomic_access ||
         descriptor.dynamic_access || descriptor.required_bytes != 4u ||
         descriptor.zero_pad_logical_bytes != 2u ||
         descriptor.zero_pad_binding_bytes != 4u ||
         !semantic_matches || resource.num_components != 1u ||
-        resource.stride != 2u || resource.size != 2u)
+        resource.stride != 2u || resource.size < 2u || (resource.size % 2u) != 0u)
         return plan;
 
     plan.logical_bytes = 2;
