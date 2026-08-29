@@ -101,3 +101,87 @@ trusting the timings, and re-anchor the route if you extend it.
 Two independent runs reach Estard, write `GameSaveData000.dat` and render the world. Neither
 demonstrates free player control — see `docs/DRAGON_QUEST_STATUS.md` for exactly what is and is not
 established, and for the state of the composite in that phase.
+
+## The field state — `reach-field-control.pad`
+
+Reaches the field state in Pilchard Bay at t≈652 s and holds it to the end of the run (144 frames,
+588 s). Use this for gameplay work; `reach-gameplay.pad` stops inside the opening chapter's script.
+
+**This file is event-for-event the route that produced the checked-in evidence** (455 event
+lines, identical; only the comment header differs). Do not extend it
+without re-running — a published recipe that has never been executed is worth nothing.
+
+What it changes is **how much confirm the chapter is given**. Measured on one binary, quiet box,
+classifying by the field HUD:
+
+| route | confirms | frames with the field HUD |
+| --- | --- | --- |
+| `reach-gameplay.pad` (every 15 s, ends t=700) | 41 | **0** |
+| a probe route (stick windows, #1874) | 37 | **0** |
+| this route (every 2 s, ends t=1180) | **447** | **144** |
+
+The comparison routes also stop earlier, so spacing is not their only difference — but it is the one
+that matters, because every screen in the chapter waits indefinitely for confirm, so a press landing
+early is absorbed rather than lost. That also makes this route unusually tolerant of #2764's drift.
+
+```bash
+PROSPER_NULL_PAGE=1 \
+PROSPER_GUEST_ARGS= \
+PROSPER_RENDER=1 \
+PROSPER_SAVE0=<FRESH_SAVE_ROOT>/save0 \
+PROSPER_SAVEDATA_DIR=<FRESH_SAVE_ROOT>/savedata \
+PROSPER_PAD_SCRIPT=@scripts/dragon-quest-vii/reach-field-control.pad \
+PROSPER_PAD_SCRIPT_LOG=1 \
+./build-linux/screenshot <DUMP_ROOT>/PPSA17942-app0 \
+  --seconds 4 --count 310 --timeout 1350 --out <EVIDENCE_ROOT>/shots
+```
+
+**Confirming you reached it.** Every published number for this title comes from one committed
+script, so it can be re-derived rather than taken on trust:
+
+```bash
+python3 scripts/dragon-quest-vii/classify_field.py field <EVIDENCE_ROOT>/shots
+python3 scripts/dragon-quest-vii/classify_field.py world <EVIDENCE_ROOT>/shots
+python3 scripts/dragon-quest-vii/classify_field.py selftest
+```
+
+It keys on the party block's **HP bar** and nothing else. A generic corner test fails in both
+directions here (a torn-composite cutscene's saturated water passes it; a flat blue collapse scores
+1.00 while containing nothing), a cinematic-bar veto is a no-op only above a bar threshold of
+~0.052 — at the 0.04 it shipped with it rejected nine genuine field frames (run 4: 190 → 181) whose
+world had collapsed to black — and a brightness floor is inverted, because field frames are dark
+precisely because they are HUD over an unrendered world.
+
+This route delivers **only Cross**, so it establishes the field state. Locomotion is measured by
+`probe-locomotion.pad` — see below.
+
+## Locomotion — `probe-locomotion.pad`
+
+Mashes confirm to t=700 to reach the field state, then alternates eight stick windows against eight
+matched neutral windows inside it. Confirms stop at 700 so a press cannot be mistaken for movement.
+
+```bash
+# same environment as reach-field-control.pad, with:
+#   PROSPER_PAD_SCRIPT=@scripts/dragon-quest-vii/probe-locomotion.pad
+#   ./build-linux/screenshot ... --seconds 3 --count 420 --timeout 1400
+
+python3 scripts/dragon-quest-vii/classify_field.py locomotion <EVIDENCE_ROOT>/shots \
+    --window 710:740:neutral --window 740:770:stick \
+    --window 770:800:neutral --window 800:830:stick \
+    --window 830:860:neutral --window 860:890:stick \
+    --window 890:920:neutral --window 920:950:stick \
+    --window 950:980:neutral --window 980:1010:stick \
+    --window 1010:1040:neutral --window 1040:1070:stick \
+    --window 1070:1100:neutral --window 1100:1130:stick \
+    --window 1130:1160:neutral --window 1160:1190:stick
+```
+
+Measured: masked minimap change ≥ 15 in **8 of 8** stick windows (median 24.9, range 22.4-37.3)
+against **0 of 8** neutral (median 3.0, max 12.7). The **counts** are identical at `--guard` 0, 2 and 4 — the guard is not
+load-bearing for the 8/8 vs 0/8 result. The magnitudes do move (stick median 26.67 at guard 0
+against 24.88 at guard 2), which is why one value is quoted rather than a range.
+
+**Measure the HUD, not the world**, and mask the disc. A world region flicking between rendered and
+collapsed swamps the signal; and the minimap is a circle in a square crop, so an unmasked box picks
+up the collapsing world in the corners — that alone scores 56 on a window whose map is
+pixel-identical.
