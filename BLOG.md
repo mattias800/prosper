@@ -21,6 +21,23 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-28
 
+### Dragon Quest VII reaches the field
+
+The field HUD is live — minimap, party status, the Pilchard Bay banner — and the player is standing
+in the harbour rather than watching it.
+
+![Dragon Quest VII Reimagined at 3840x2160: the player character stands outside a harbour house with an orange quest marker over its door and a rowing boat beached to the right, foliage and a cliff on the left. The circular minimap sits at bottom-left and the party block at bottom-right reads Lv.1, HP 22, MP 7. Colour is badly degraded — the buildings are blown to white and the ground crushed to navy — but the scene is structurally complete](assets/screenshots/dragon-quest-vii-pilchard-bay-gameplay.png)
+
+![Dragon Quest VII Reimagined: the Pilchard Bay location banner appearing as the player enters the area, with the field HUD live. The world behind it is largely lost to the composite collapse](assets/screenshots/dragon-quest-vii-field-hud.png)
+
+![Dragon Quest VII Reimagined: the same harbour after a left-stick window — the quest-marker house that stood centre-left is now upper-right, a cliff face has entered from the left, and the minimap has scrolled to match. The player has walked](assets/screenshots/dragon-quest-vii-walked-to-cliff.png)
+
+The colour is plainly wrong, and depending on the run a quarter to a half of the frames still lose
+the world to the composite — geometry and the HUD are fine; it is the lit-material shading that is
+broken.
+Nothing was blocking control, though: the opening chapter is simply very long, and every route we
+had gave it about forty confirms before deciding it was a wall.
+
 ### Blue Prince is back
 
 Master had been rendering a pure black frame; the title screen and its desk of curiosities are

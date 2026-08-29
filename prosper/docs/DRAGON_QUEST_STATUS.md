@@ -488,7 +488,8 @@ current build.
   ch4..ch7 hold only a ~1e-9 residue, and **ch3 and ch8..ch11 are exactly zero**. So the title
   writes a stereo mix into a 12-channel container and never writes ch3 or ch8..ch11 at all — the
   LFE and height positions under the assumed order, so this describes which INDICES are dead
-  without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
+  without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate
+  +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
   the surround tier pairs even=left / odd=right; ch2 correlates near-equally with both groups
   (centre-like). Reproduced identically on a second independent 150 s run.
   **The 8-channel port (ctx1/port2) is exactly zero — and that is the GUEST's silence, not
@@ -516,7 +517,8 @@ current build.
   elsewhere that those are different findings. A left/right swap
   is inaudible without a reference in any case. Do not cite the listening test as layout evidence.
 - **Historical pre-fix measurement**, with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) on a
-  `reach-title-screen.pad` run of the direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN
+  `reach-title-screen.pad` run of the direct SDL3 frontend. The title creates **two** AudioOut2
+  contexts, each with one MAIN
   (`type=0x0`) port, and they carry opposite content. All figures below are the never-reset `LIFE:`
   run totals from the **final report line of a single run**, not summed interval samples:
 
@@ -541,7 +543,8 @@ current build.
 - **A declared channel count is not a description of the content.** The `0xc00` decode and the
   `2,310,144 B/s` figure above are both *derived from the same channel count*, so neither
   corroborates it, and "12 channels" reads as "a 7.1.4 bed with height" when the measured bed is
-  stereo with ten of its twelve channels carrying nothing audible. Measure the channels before designing a fold for them; see
+  stereo with ten of its twelve channels carrying nothing audible. Measure the channels before
+  designing a fold for them; see
   instrument-trap 43.
 - **Read the `LIFE:` totals, not a single interval.** This finding was initially called the opposite
   ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.
@@ -650,7 +653,173 @@ likely to close before rendering starts. **Do not quote 50% as a property of the
 Re-run the same command, discard any run that fails the acceptance rule, and compare only the asserted
 invariants. A change in frames, draws or wave64 skips is **not** evidence of anything on its own.
 
+## The field state is reached — 2026-08-28, and the blocker was the route's patience
+
+**Rung 3.** `scripts/dragon-quest-vii/reach-field-control.pad` reaches the field state in Pilchard
+Bay: the field HUD (circular minimap bottom-left, party block bottom-right reading
+`Lv.1 / HP 22 / MP 7`), the area-entry banner, the player character standing in the world, and quest
+markers over doors. **144 frames spanning t=652-1240 s (588 s).** Linux, RADV STRIX_HALO, native
+3840x2160 through `tools/screenshot`, direct frontend, unmodified captures, UE4 recipe, isolated
+save roots, master `68f89186`.
+
+Every number in this section comes from one committed script, so it can be re-derived rather than
+taken on trust — two earlier drafts published figures from scratch analysis and both were wrong:
+
+```bash
+python3 scripts/dragon-quest-vii/classify_field.py field <SHOTS>       # 0 / 0 / 144 / 190
+python3 scripts/dragon-quest-vii/classify_field.py world <SHOTS>       # 36/144 run3, 107/190 run4
+python3 scripts/dragon-quest-vii/classify_field.py locomotion <SHOTS> --window ...
+python3 scripts/dragon-quest-vii/classify_field.py selftest
+```
+
+### What was actually in the way
+
+Not a control, not a screen, not the renderer: **how many confirms the opening chapter is given.**
+
+| route | confirms delivered | frames with the field HUD |
+| --- | --- | --- |
+| `reach-gameplay.pad` (confirm every 15 s, ends t=700) | 41 | **0** |
+| a probe route (stick windows, see below) | 37 | **0** |
+| `reach-field-control.pad` (every 2 s, ends t=1180) | **447** | **144** |
+
+The two comparison routes also stop earlier, so spacing is not their only difference from the third
+— but it is the one that matters, because every screen in the chapter waits indefinitely for
+confirm, so a press landing early is absorbed rather than lost.
+
+**Worth generalising:** on a story-opening JRPG, "the route never leaves the cutscene" is a claim
+about the ROUTE until the confirm count has been pushed by an order of magnitude.
+
+### Locomotion is MEASURED, and the measurement is on the HUD
+
+`probe-locomotion.pad` mashes Cross to t=700, then alternates eight stick windows against eight
+matched neutral windows inside the field state. All eight stick deliveries appear in the pad log
+(`axes=left-stick-left/right/up/down`).
+
+| | windows changed >= 15 | median | range |
+| --- | --- | --- | --- |
+| stick held | **8 of 8** | 24.88 | 22.41 - 37.29 |
+| neutral | **0 of 8** | 3.01 | 0.00 - 12.67 |
+
+The **counts** are identical at `--guard` 0, 2 and 4, so the guard band is **not** load-bearing
+for the 8/8 vs 0/8 result (the magnitudes do move: stick median 26.67 at guard 0) — an earlier draft
+claimed the neutral result depended on it, which running the tool refutes.
+
+**The measure is masked minimap CHANGE, not phase correlation.** Two earlier drafts used
+correlation and it fails at both ends here. A long walk changes *which part* of the map is drawn, so
+the two crops share almost no structure and the peak lands at zero — reporting a long walk as "did
+not move"; two of eight stick windows read exactly 0.0 px that way while their minimaps were plainly
+of different places. And the crop must be **disc-masked**: the minimap is a circle in a square box
+and the corners show the world behind it, which collapses to black in one frame and white in the
+next. Unmasked, that background flip alone scores 56 on a window whose map is pixel-identical.
+
+**On a title whose composite is broken, the HUD is the reliable place to look for locomotion.**
+
+Visually: across the first stick window the quest-marker house that sat centre-left ends up
+upper-right, a cliff face enters from the left, and the minimap scrolls to match.
+`assets/screenshots/dragon-quest-vii-walked-to-cliff.png` is that frame.
+
+### The composite: geometry is correct, the lit-material shading is not
+
+Reviewed by eye on the checked-in captures, and the distinction matters for where to look next.
+**The geometry is right** — the harbour house, its door and windows, the rowing boat, the cliffs,
+the foliage and the character are all in the correct places at the correct shapes. **The 2D/UI path
+is correct too**: HUD, minimap, party block and area banner all render cleanly. What is wrong is the
+**shading of lit surfaces** — the house, the cliffs and the boat blow to white while the water
+crushes far too dark. That reads as one path rather than a general composite failure — though a same-frame
+observation cannot separate a broken lighting path from a partially-failing composite, so treat it
+as the working hypothesis it is.
+
+Quantitatively, over the field frames: **36 of 144 (25%) render a recognisable scene in run 3, and
+107 of 190 (56%) in run 4**; the rest lose the world to a uniform white, a crushed black, or a flat
+blue speckle. Quote the run — they differ by more than a factor of two, and the 25% alone
+understates the title. Longest run of strictly consecutive rendered samples: 4 (run 3), 10 (run 4).
+#1486, #1588.
+
+### Instruments — and why the obvious one cannot work HERE
+
+**A stick-versus-neutral motion probe could not answer in the window it was run.** Matched 32 s
+windows alternating neutral against full stick deflection, stick delivery proven in the pad log
+(`axes=left-stick-left/right/up`), produced neutral-window medians of 84.2, 2.2, 15.9 and 66.5 — a
+spread *larger* than any stick-versus-neutral difference. The reason is now known and is not a
+property of the title: **that run reached the field HUD zero times**, so every window sampled a
+cutscene, and a cutscene whose own activity varies 40x cannot be a baseline. The probe is the right
+experiment aimed at the wrong phase — see the Ruled out entry, which scopes it rather than
+forbidding it.
+
+**Classification is ONE test: the party block's HP bar**
+(`scripts/dragon-quest-vii/classify_field.py`). Generic alternatives were tried and removed:
+
+- *HUD-corner colour* fails in both directions on real captures here — a torn-composite cutscene
+  whose bottom corners hold saturated structured water passes it (that produced two false
+  "gameplay" frames in runs 1 and 2), and a flat blue collapse scores 1.00 while containing nothing.
+- *A cinematic-bar veto* is a no-op only **above a bar threshold of ~0.052** (0 rejected at 0.06 and
+  0.10 across all four runs), because a real cutscene's bars cover the party block anyway. At the
+  **0.04 it actually shipped with** it rejected nine genuine "Pilchard Bay: Church" frames whose
+  world had collapsed to black, reading unrendered darkness as letterboxing: 190 field frames
+  became 181.
+- *A collapse or brightness floor* is inverted here — field frames are dark precisely BECAUSE they
+  are HUD over an unrendered world. And a structure floor is not safe on this title either: a
+  genuine collapse (run 3 frame 188, three distinct colours, nothing rendered) measures sigma
+  **13.14** and sits *over* a 12.0 floor, while its neighbour 195 measures 11.56 and is caught. The
+  distance from a threshold to the nearest real frame is not margin — it is bounded by whichever
+  collapse sits just under the line.
+
+The HP bar separates **0.0201 from 0.008860 across 1,370 frames** of four runs.
+
+**The selftest's coverage is itself re-runnable, and its GAPS are recorded.**
+`scripts/dragon-quest-vii/mutants.txt` lists every mutation and `classify_field.py mutants` applies
+each one. 30 entries: 25 that must redden, 2 controls that must not (a no-op edit, and a *safe*
+`HP_BAR_MIN` retune inside the measured band), and **3 marked `UNPINNED` — mutations that DO move a
+published number and that this selftest does not catch**. Those three are a coarser sampling
+resize, a narrower luma band, and a small `WORLD_BOX` shift; the reason is that no case has been
+written for them yet — **not** that none can exist. An earlier draft claimed the gap was structural;
+a reviewer disproved that by building a catching case for each in one sitting. They are listed with
+their measured effect so the boundary of the guarantee is visible rather than implied, and so the
+next person knows these are open work rather than a wall.
+
+The runner rejects a mutation that does not COMPILE rather than scoring it as a reddening: an
+earlier version had eight arms whose replacement indentation was one space short, which raised
+`IndentationError`, exited non-zero, and read as "the selftest caught it" while testing nothing.
+Replacement indentation is now taken from the matched line, so the class of bug cannot recur.
+
+Thresholds are asserted numerically against measured class boundaries rather than
+against constructed frames, because a frame lands *beside* the value it names — that rounding left a
+5% band in which `HP_BAR_MIN` passed while destroying the headline. Box controls are drawn at fixed
+pixel positions with the expected value **hardcoded**; deriving it from the box under test is what
+made three earlier versions of this selftest incapable of failing.
+
 ## Ruled out — eliminated, do not re-run these
+- **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
+  raising the confirm rate from one per 15 s to one per 2 s takes the run from 0 field-HUD frames to
+  144. See *The field state is reached* above for the three-run table. #1874.
+
+- **"A stick-versus-neutral motion probe can be run in the chapter-script phase."**
+  **Falsified 2026-08-28**, and the result is void rather than negative: across four matched windows
+  the NEUTRAL medians alone ranged 2.2 to 84.2, so no contrast the experiment could produce was
+  interpretable. The cause is the PHASE, not the title — that run reached the field HUD zero times,
+  so every window sampled a cutscene. **This does not rule out the probe** — run inside the field
+  window it answers, and `probe-locomotion.pad` did exactly that on 2026-08-28. Aim it at the phase,
+  and prefer the minimap to the world: see *Locomotion is MEASURED* above. #1874.
+
+- **"No cinematic bars means the run reached gameplay."** **Falsified 2026-08-28**, twice over.
+  A present collapsed to uniform white has no dark rows, so a bar detector reports it as un-barred:
+  the first version of this measurement returned 61 "un-barred" world frames on a run that never
+  left its cutscene, every one RGB(255,255,255). A *colour-count* guard then still missed this
+  title's dominant collapse — flat blue with a magenta speckle, 18 distinct colours across a full
+  8.3 MP frame. What separates all of them is **structure** rather than brightness or colour count — but the
+  gap between a threshold and the nearest real frame is **not** a margin, and this title shows why:
+  a genuine collapse (run 3 frame 188 — three distinct colours, nothing rendered) measures sigma
+  **13.14** and sits *over* a 12.0 floor, while its neighbour 195 measures 11.56 and is caught. The
+  closest sub-floor non-field frame across runs 3 and 4 is 11.95, i.e. 0.05 units away. (An earlier
+  draft quoted "3 units of room" from a frame at t=480 s, which is not even in the field phase.) A
+  brightness floor is worse still and actively inverted: real HUD-over-dark frames
+  measure 8.26-8.9 against a default floor of 8.0, with 73 of 144 within 1.0 of it, while the blue
+  garbage measures 29.7-31.9. That narrowness is why the per-title classifier
+  (`scripts/dragon-quest-vii/classify_field.py`) keys on the **HP bar** instead, which separates by
+  ~1.5x on both sides and does not consult a collapse test at all. And absence of bars is not
+  presence of gameplay in any case: a MENU has none either.
+  #1874.
+
 
 - **"Reading a `Map/Product/World/**.umap` package means the run reached the world."** **Falsified
   2026-08-20** over two runs: two World maps are read at **0.0 s**, before the title map, and the
