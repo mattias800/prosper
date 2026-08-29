@@ -1,0 +1,70 @@
+{
+  "det_clock": "off",
+  "det_fps": 60,
+  "dump": "PPSA02801-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "joe-mac",
+  "route": "prosper/scripts/joe-mac/route.pad",
+  "savedata": "fresh",
+  "snaps": [
+    {
+      "distinct_colors": 37106,
+      "height": 1080,
+      "index": 0,
+      "luma16x9": "938d7e87898fa4b4afaeb0948e8e8e8ebc8d80869fa3a7b3a3a9b0b2a4c9b2b59360698ed2c2d8d6b6eab9aec7cdcabe7c658890bdbab69e87c2aaa3a6ac93a39e81a2a2a2956138408683b7c9a886a48e90ada39b99737376878cc5c39a8696987c9c9292a28e7c76b18e9f6f7866647c7f867d817a494d45536582747b746d786f798971717467595e766772746373",
+      "mode": "anchor",
+      "nonblack_ratio": 0.956651,
+      "pad_flip": 1314,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 36317,
+      "height": 1080,
+      "index": 1,
+      "luma16x9": "938d7e87898f90a1a29e9c948e8e8e8ebc8d807d9990956b848ba1a7a3c9b2b5c46e6a8385797a6f79507f6a8ac5cabe9b6a85ab948b9f8a85876f8684a8a8a3a39f97b9bb9b66654c7e848abaaa88a48d8c91c0b99774625c8280aacbaf9396987d8b8db5909c8b7b6a75879b9869647e8ea4879684828a707f8674737a79727976888b8da97f867c79917477979477",
+      "mode": "anchor",
+      "nonblack_ratio": 0.954367,
+      "pad_flip": 1834,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 76557,
+      "height": 1080,
+      "index": 2,
+      "luma16x9": "8d80808294bdecc9e9c9b2c5a9878c5d907671687c7c9a97a7b49d8c8c8d7e598977577a69889f7674a892a7807e805091756972757e73857972ada691828261887a818d929da4b1aeb4b48d8e9d8cda8b7b718c797482727f765a605976879a8e7a8780567b768e877d5f63746c91736d827d817b6f8f908e937f81817f846f67877e85799396979a949d9171675359",
+      "mode": "anchor",
+      "nonblack_ratio": 0.986867,
+      "pad_flip": 2147,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 69212,
+      "height": 1080,
+      "index": 3,
+      "luma16x9": "8d807c8091c7edcce9c9b0c5a5858c5d90766052577580789b817461656e7e598977577a6994c0b59e9c99a74e5180509387737f7586a8cfb1a2bba6373882618d8c917a676a82899ba2b594363689da8b79878f7a72816383a16e643845879a8e769a926f818171a8c76b40292b66736d827d817b78937f8b877057433c446f677a83787194a49881857e7a6f645359",
+      "mode": "anchor",
+      "nonblack_ratio": 0.989591,
+      "pad_flip": 2540,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 69766,
+      "height": 1080,
+      "index": 4,
+      "luma16x9": "a59fa5bea39fb1a6aaa8b7a6a9976f82777a98a3728d9cc99ed0c9bcb3885e64274ecd997183a6af7fbcbbacb372545e252578707597b8967e9bc6b9b87b646a2b528b8a7ca1908a868da0b7bf987c783c6a84787b677b5a5a626770765b785e4751888a7288796378756557805a705c3f526a8a7682946f7f8073807f725f8a62444b3e242f4c454e36374e5c535153",
+      "mode": "anchor",
+      "nonblack_ratio": 0.997647,
+      "pad_flip": 3423,
+      "verdict": "correct",
+      "width": 1920
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA02801",
+  "window_samples": 7
+}

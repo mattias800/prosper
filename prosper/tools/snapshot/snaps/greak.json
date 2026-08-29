@@ -1,0 +1,45 @@
+{
+  "det_clock": "off",
+  "det_fps": 60,
+  "dump": "PPSA02849-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "greak",
+  "route": "prosper/scripts/greak/route.pad",
+  "savedata": "fresh",
+  "snaps": [
+    {
+      "distinct_colors": 553,
+      "height": 1080,
+      "index": 0,
+      "luma16x9": "0000000000000000000000000000000000000000002d536b605f23000000000000000000003767464d5e1b000000000000000000000000000000000000000000000000000000001c200000000000000000000009060e0314070b0b090100000000000000000000000000000000000000000b060703050a06060807050404030000000000000000000000000000000000",
+      "nonblack_ratio": 0.038133,
+      "pad_flip": 377,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 33875,
+      "height": 1080,
+      "index": 1,
+      "luma16x9": "00337274728379766b677262563d0928000cadbeab8c9eae9f9e5e554822070a000082e0c3967c6e71654f4b3a2c0709000049d38b9566676e5a54493f250707000056a9277c4d4547495d5d530d07070000032e0d5a5548433f596b570c0b0b010202040b3640554d376383581919180808070308133161645380a3632f2f430e160c0811144a70757893b15a474c58",
+      "nonblack_ratio": 0.841096,
+      "pad_flip": 1025,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 33761,
+      "height": 1080,
+      "index": 2,
+      "luma16x9": "d7c4e0e3d8d3c9d8ecebe9bb98d4d761c9c0e9e6e7e4e4dee7ebd74d6b9eba74f0edeae7e5e8e5f0d3e8b7658badbd75ede9e5e2dfe2a0e6acdcbb7a96a0ab78ebe6e3dfa1e077c296c37f828d849b80e5e2dfc573d57e9bb0a8897b6f607c74c2cbcca796827a859588685049423735988f8f91814c61796e64584e4b3f3f46a1808f8f865e6471675b62625e524d5e",
+      "nonblack_ratio": 0.999954,
+      "pad_flip": 2426,
+      "verdict": "correct",
+      "width": 1920
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA02849",
+  "window_samples": 7
+}

@@ -1,0 +1,26 @@
+{
+  "det_clock": "off",
+  "det_fps": 60,
+  "dump": "PPSA02058-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "balan",
+  "route": "prosper/scripts/balan/route.pad",
+  "savedata": "fresh",
+  "snaps": [
+    {
+      "distinct_colors": 44639,
+      "height": 2160,
+      "index": 0,
+      "luma16x9": "3147575e5350464d4e423c372722231c33383f433c4238353e36343648371c130d1e333c38333739423c57737366410e544a5c4a48383a514a3b3d3c503b2812182f424e393c3d3e463e313d453d2a1314202e362f302d3437352c3433342b161a2e39413a3937433a3a393f4c3b3116090b1b2323241d2f2324272b2e261e142122211a1f210f172e452a292a2d2817",
+      "mode": "anchor",
+      "nonblack_ratio": 0.978702,
+      "pad_flip": 240,
+      "verdict": "correct",
+      "width": 3840
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA02058",
+  "window_samples": 7
+}
