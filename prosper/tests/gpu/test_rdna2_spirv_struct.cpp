@@ -5502,6 +5502,76 @@ int main() {
     }
     printf("  [ok]   image_get_resinfo 3D lowers to size/level image queries\n");
 
+    // Sonic Frontiers' Cyber Space stage queries a 2D_ARRAY T# with image_get_resinfo before its
+    // screen-space passes (#2790). These are the guest's EXACT bytes: word1 names VADDR=v3,
+    // VDATA=v17 and SRSRC at s36, all three of which the live `[compute] skip` line reports as
+    // `dst=17(kind2) src=3(k2),36(k1)`, so the test cannot drift from the instruction it is about.
+    // dmask:xy (0x3) takes width and height only; the layer count is the third result and is not
+    // requested here.
+    ShaderResourceTable rt_2d_array;
+    { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 9; t.img_dim = 5;
+      t.width = 2048; t.height = 2048; t.depth = 1; t.sgpr_base = 36;
+      rt_2d_array.resources.push_back(t); }
+    const uint32_t cs_resinfo_2d_array[] = {
+        0x7e060280u,                        // v_mov_b32 v3, 0 (LOD)
+        0xf0380328u, 0x00091103u,           // image_get_resinfo v[17:18], v3, s[36:43] dmask:xy dim:2D_ARRAY
+        0xbf810000u,
+    };
+    std::vector<uint32_t> resinfo_2d_array_spv = recompile_valu(
+        cs_resinfo_2d_array, sizeof(cs_resinfo_2d_array)/sizeof(cs_resinfo_2d_array[0]), 0, 0,
+        &rt_2d_array);
+    if (resinfo_2d_array_spv.empty() || !has_opcode(resinfo_2d_array_spv, OpImageQuerySizeLod)) {
+        printf("  [FAIL] image_get_resinfo 2D_ARRAY did not lower to a SPIR-V image query\n");
+        return 1;
+    }
+    printf("  [ok]   image_get_resinfo 2D_ARRAY lowers to a size query\n");
+
+    // CONTROL, and it is the arm that keeps the change honest rather than merely wide: CUBE (dim 3)
+    // must STILL reject. Two of this stage's other programs issue exactly that form
+    // (`0xf0380118`, dmask:x), and admitting them would need the stacked-face lowering (#273) to
+    // promise what GET_RESINFO's third result means for a cube, which this change does not
+    // establish. Same word as the accepted case with DIM alone changed 5 -> 3, so a widening that
+    // reached past 2D_ARRAY reddens here.
+    std::vector<uint32_t> cs_resinfo_cube(std::begin(cs_resinfo_2d_array),
+                                          std::end(cs_resinfo_2d_array));
+    cs_resinfo_cube[1] = 0xf0380318u;       // DIM 5 -> 3 (CUBE), everything else identical
+    if (!recompile_valu(cs_resinfo_cube.data(), cs_resinfo_cube.size(), 0, 0,
+                        &rt_2d_array).empty()) {
+        printf("  [FAIL] control: image_get_resinfo CUBE was accepted\n");
+        return 1;
+    }
+    printf("  [ok]   control: image_get_resinfo CUBE still rejects\n");
+
+    // The two arms above pin the LOWERING (emit_alu's dispatch). They do not pin the COVERAGE
+    // predicate, which is the half the live `[compute] skip` decision actually consults -- verified
+    // by mutation: reverting the predicate alone leaves both of them green. So pin it directly.
+    // `recompile_coverage` runs table-less, so a MIMG form it accepts lands in `table_dependent`
+    // and an accepted dim leaves `unsupported` at zero, while a declined one is counted and named.
+    {
+        RecompileCoverage cov_2d_array = recompile_coverage(
+            cs_resinfo_2d_array, sizeof(cs_resinfo_2d_array)/sizeof(cs_resinfo_2d_array[0]));
+        if (cov_2d_array.unsupported != 0 || cov_2d_array.first_bad_fmt != -1) {
+            printf("  [FAIL] coverage still reports image_get_resinfo 2D_ARRAY unsupported "
+                   "(unsupported=%u fmt=%d op=0x%x)\n",
+                   cov_2d_array.unsupported, cov_2d_array.first_bad_fmt, cov_2d_array.first_bad_op);
+            return 1;
+        }
+        printf("  [ok]   coverage counts image_get_resinfo 2D_ARRAY as supported\n");
+
+        // Control on the same seam, and it names the opcode rather than only counting: CUBE must
+        // still be reported as the unsupported site, or a widening past 2D_ARRAY would go unnoticed
+        // by the census that decides whether the program runs at all.
+        RecompileCoverage cov_cube = recompile_coverage(
+            cs_resinfo_cube.data(), cs_resinfo_cube.size());
+        if (cov_cube.unsupported == 0 || cov_cube.first_bad_op != 0x0eu) {
+            printf("  [FAIL] control: coverage no longer reports image_get_resinfo CUBE as the "
+                   "unsupported site (unsupported=%u op=0x%x)\n",
+                   cov_cube.unsupported, cov_cube.first_bad_op);
+            return 1;
+        }
+        printf("  [ok]   control: coverage still names image_get_resinfo CUBE unsupported\n");
+    }
+
     // GTA V's exact stride-8/25-record BUFFER_ATOMIC_SWAP_X2 must be one qword exchange. Include an
     // ordinary dword load through the same binding so both the u32 and u64 Block variables are
     // statically used; reflection must coalesce those compatible aliases into one Vulkan binding.

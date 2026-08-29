@@ -377,6 +377,35 @@ shapes. `rdna2_emit_alu.cpp` only ever specialises this op away after proving th
 the resource is single-level; a 12-mip resource has no such proof, so it declines. Tracked as
 [#2818](https://github.com/mattias800/prosper/issues/2818).
 
+### `image_get_resinfo` on a 2D_ARRAY T# no longer declines (2026-08-29)
+
+Separate from the three scene-width kernels above, one stage program (`0x200581bb00`, `1x1x6` groups
+of `256x1`) declined at **pc=31** on `image_get_resinfo` with `dim=5` (2D_ARRAY), `dmask=0x3`. The
+SPIR-V lowering had already been widened for the arrayed form by #325 — `image_get_resinfo` branches
+on `tex_is_arrayed(binding)`, asks for the ivec3 query and reports its third component as the layer
+count, which is exactly what GET_RESINFO's third result means for a 2D_ARRAY T#. What still declined
+were the two *gates* in front of it: `emit_alu`'s dim dispatch and the coverage predicate — the same
+lag #2265 records for the atomic coverage predicate.
+
+Measured on the route, `boot_trace` + `PROSPER_COMPUTE_TRANSLATE_ONLY=1`, compared at the same census
+denominator (1,048,576 dispatch decisions over 32 programs):
+
+| | reject site | opcode |
+| --- | --- | --- |
+| before | pc=**31** | `fmt=14 op=0xe` — `image_get_resinfo` dim=5 |
+| after | pc=**130** | `fmt=4 op=0x5` — `s_cbranch_scc1` |
+
+`op=0xe dim=5` goes from one occurrence to **none** anywhere in the run, and the program advances 99
+instructions to an unrelated gap.
+
+**No program leaves the skip list and no image change is claimed** — 14 listed before and after. This
+closes one gap on one program's path; that program is still blocked further along, and the three
+scene-width kernels above are untouched by it.
+
+CUBE (`dim=3`) is deliberately still declined — two other stage programs issue it (`0xf0380118`,
+`dmask=0x1`), and admitting it would need the stacked-face lowering (#273) to promise what
+GET_RESINFO's third result means for a cube, which this did not establish.
+
 ### `image_load_mip` is the FIRST blocker of at least two, not the only one (2026-08-21)
 
 **This section used to say "All three now block on exactly one instruction", and #2818's summary
