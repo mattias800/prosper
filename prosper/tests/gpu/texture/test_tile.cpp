@@ -1170,6 +1170,41 @@ int main() {
               "64KB_R_X 3D golden: z3 maps to byte-offset bit 8");
     }
 
+    {
+        // Sonic Frontiers' Cyber Space scene-width kernels read one resource through
+        // IMAGE_LOAD_MIP: 2048x2048, R32G32_FLOAT (8 B/texel), tile_mode 27, TWELVE levels
+        // (#2818/#2790). Before any of that can be materialised, every level has to be locatable,
+        // so pin the placement the uploader would have to trust: all 12 supported, tail levels
+        // sharing one block, non-tail levels strictly disjoint and inside the chain.
+        const uint32_t ew = 2048, eh = 2048, bpe = 8, tm = 27, max_mip = 11;
+        const size_t chain = tiled_mip_chain_bytes(ew, eh, bpe, tm, max_mip);
+        CHECK(chain != 0, "Frontiers' 12-level 2048x2048 R32G32F chain is modeled");
+        bool all_ok = true, disjoint = true, in_chain = true;
+        uint32_t tail_levels = 0;
+        std::vector<std::pair<size_t, size_t>> spans;   // [begin, end) per non-tail level
+        for (uint32_t level = 0; level <= max_mip; ++level) {
+            const TiledMipLevelLayout l = tiled_mip_level_layout(ew, eh, bpe, tm, max_mip, level);
+            if (!l.supported) { all_ok = false; break; }
+            if (l.in_tail) { tail_levels++; continue; }   // tail levels share the first block
+            const uint32_t lw = std::max(ew >> level, 1u), lh = std::max(eh >> level, 1u);
+            const size_t bytes = (size_t)lw * lh * bpe;
+            if (l.byte_offset + bytes > chain) in_chain = false;
+            spans.emplace_back(l.byte_offset, l.byte_offset + bytes);
+        }
+        // Pairwise, NOT against a running end: a tiled chain stores its levels smallest-first, so
+        // byte_offset DEcreases as the level index rises and an ascending-order check reports a
+        // false overlap on a correct layout. (It did -- that was this test's first version.)
+        for (size_t a = 0; a < spans.size() && disjoint; ++a)
+            for (size_t b = a + 1; b < spans.size(); ++b)
+                if (spans[a].first < spans[b].second && spans[b].first < spans[a].second) {
+                    disjoint = false; break;
+                }
+        CHECK(all_ok, "every one of Frontiers' 12 mip levels reports a supported placement");
+        CHECK(in_chain, "no Frontiers mip level is placed past the end of its own chain");
+        CHECK(disjoint, "Frontiers' non-tail mip levels occupy disjoint byte ranges");
+        CHECK(tail_levels > 0, "the small Frontiers levels are packed into the shared mip tail");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
