@@ -1,0 +1,48 @@
+{
+  "det_clock": "off",
+  "det_fps": 60,
+  "dump": "PPSA01885-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "evergate",
+  "route": "prosper/scripts/evergate/route.pad",
+  "savedata": "fresh",
+  "snaps": [
+    {
+      "distinct_colors": 50989,
+      "height": 1080,
+      "index": 0,
+      "luma16x9": "070a0d0e1019180f0f121114110d0a070b0f0f1012213a5a5a3017181011100c0d101112123783a1a68f3319121718131615191754182943634f27291616171359531e1d5e4f231f3049413924201716405e4d4a353a1c1c242e414f251b19614b36625e404f47454328365b376b778714264e505e5c76696c80596b56587a730c1b2d30332e2a31211e2f362429597b",
+      "mode": "anchor",
+      "nonblack_ratio": 0.995725,
+      "pad_flip": 372,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 14034,
+      "height": 1080,
+      "index": 1,
+      "luma16x9": "1019202a3333302e2d302f2f2d221e16181d2126283135373939353735332f251f2122292d2e3234323230292c302f2e1b20262a2f2e2c2d312b262b2a2428292b1f262a332e282824221e1e3428201e2e2627353c322d3428231c191d2d221d27323740322434302b2c211a162f3220292b3e3b4240463c343630352f2d3c2e18212b302e323b3d4430262120252228",
+      "mode": "anchor",
+      "nonblack_ratio": 0.998881,
+      "pad_flip": 892,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 58324,
+      "height": 1080,
+      "index": 2,
+      "luma16x9": "171b222322241e3810141a132026351b21302b26181a183b18171a15181e4023252a211f1c201f3c151b1c14172e4d4d1f25291f252c29421b1a1418192221261c201d1820253751201b1c27232a22181f3b3e183a4a325e1c265041633434240c414c66688a989f977f8b683935492d10297388836d544f606c948c8a745539293a4e4e4b626d68687370585c5f4d32",
+      "mode": "anchor",
+      "nonblack_ratio": 0.982299,
+      "pad_flip": 2922,
+      "verdict": "correct",
+      "width": 1920
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA01885",
+  "window_samples": 7
+}
