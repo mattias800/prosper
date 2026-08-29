@@ -17,6 +17,7 @@
 #include "gpu/texture/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
 #include "host/platform/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
 #include "host/image/boot_program.hpp"  // guest_module_name: is a callback target guest code?
+#include "host/platform/lifecycle.hpp"  // cooperative stop when the guest reports its own crash (#3119)
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -3537,6 +3538,55 @@ HLE(s_syss_safearea) {
     return 0;
 }
 
+// sceSystemServiceReportAbnormalTermination(cause) — THE GUEST IS TELLING US IT HAS CRASHED.
+//
+// This is not a service prosper provides to the guest; it is the guest reporting its own abnormal
+// termination to the system. Unregistered, the dispatcher's default fired -- one opaque
+// `unimplemented: libSceSystemService::3s8cHiCBKBE -> returning 0` line among a dozen others -- and
+// the guest was allowed to carry on, so a self-reported crash presented as a live process with a
+// black window: indistinguishable from a hang, a stall, or a renderer defect.
+//
+// Found on Tactics Ogre: Reborn (PPSA03839, #1892), where it was the ONLY informative line in a
+// 50-line log with no faults, no compute rejects, no device loss and no missing present source.
+// Four other titles in the same sweep produced black screens with four different signatures; this
+// was the one where the guest said it had failed, and that fact was invisible.
+//
+// NID verified in the PS5 3.20 stub table:
+//   libSceSystemService.c:3976  sprx_dlsym(__handle, "3s8cHiCBKBE",
+//                                          &__ptr_sceSystemServiceReportAbnormalTermination)
+//
+// The return stays 0, exactly what the dispatcher default already produced, so what the guest
+// observes is unchanged and this cannot regress a title by answering differently. The only new
+// behaviour is that we SAY so and stop.
+//
+// Stopping uses the existing cooperative signal (host/platform/lifecycle.hpp). Note what that does
+// and does not do: run_entry() never observes it (game_path.hpp:82), so the guest thread is not
+// torn down -- the frontend run-loop winds down at its next boundary instead. That is the right
+// scope. Set PROSPER_ABNORMAL_TERMINATION_CONTINUE=1 to keep running anyway, which is what you want
+// when attaching a debugger to the post-crash state.
+//
+// The argument is logged raw. Its meaning is NOT established -- no layout for it has been confirmed
+// against any primary source -- so it is printed as an opaque value rather than decoded.
+// CONFIDENCE: HIGH that this NID is sceSystemServiceReportAbnormalTermination (firmware stub table)
+// and that a call means the guest reported abnormal termination. LOW on the argument's meaning.
+HLE(s_syss_report_abnormal_termination) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    // Read per call rather than caching in a static: this fires at most once in a run, so there is
+    // nothing to optimise, and a cached sample would make the escape hatch untestable in-process.
+    const bool keep_running = getenv("PROSPER_ABNORMAL_TERMINATION_CONTINUE") != nullptr;
+    fprintf(stderr,
+            "[prosper] GUEST REPORTED ABNORMAL TERMINATION: "
+            "sceSystemServiceReportAbnormalTermination(0x%llx). The title has decided it is "
+            "crashing -- this is the guest's own verdict, not prosper's. %s\n",
+            (unsigned long long)a0,
+            keep_running ? "PROSPER_ABNORMAL_TERMINATION_CONTINUE is set; continuing anyway."
+                         : "Stopping the run; set PROSPER_ABNORMAL_TERMINATION_CONTINUE=1 to keep "
+                           "the process alive for debugging.");
+    fflush(stderr);
+    if (!keep_running) prosper::prosper_request_stop();
+    return 0;
+}
+
 // sceSystemServiceGetHdrToneMapLuminance(out). Kyty models the output as three floats in this order:
 // max-full-frame, max, and min tone-map luminance. The imported function previously fell through to
 // success-without-output, so display setup consumed poisoned values. Use Kyty's 80/1000/0 values as
@@ -5415,6 +5465,9 @@ void register_service_hle() {
     Hle::register_fn("1n37q1Bvc5Y", (HleFn)s_syss_safearea, "sceSystemServiceGetDisplaySafeAreaInfo");
     Hle::register_fn("mPpPxv5CZt4", (HleFn)s_syss_hdr_luminance,
                      "sceSystemServiceGetHdrToneMapLuminance");
+    // #3119: the guest reporting its OWN crash must not look like a hang. See the handler.
+    Hle::register_fn("3s8cHiCBKBE", (HleFn)s_syss_report_abnormal_termination,
+                     "sceSystemServiceReportAbnormalTermination");
 
     // ---- Issue #232 services (raw NIDs; every pair verified against the PS5 3.20 stub tables) ----
     // libScePlayGo — everything installed & locus-local.
