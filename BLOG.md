@@ -21,6 +21,19 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-08-29
 
+### Tactics Ogre: Reborn comes back from 25 days of black
+
+<p align="center"><img src="assets/screenshots/tactics-ogre-title-restored.png" alt="Tactics Ogre: Reborn — the illustrated prologue map of the Valerian Isles with a subtitle line"></p>
+
+One save-data call did it. `sceSaveDataDirNameSearchPs4` was registered in #2302 and answered
+`NOT_FOUND` instead of the old success — a well-argued change whose own commit message noted it was
+"not observed being CALLED at any boot depth reached so far". This title calls it, once, and on the
+error it drew a single frame and then waited forever.
+
+Nine automated bisect steps over 700 commits found it. The fix answers the question the way the PS5
+sibling already does: zero hits, written explicitly, and success.
+[#3124](https://github.com/mattias800/prosper/issues/3124)
+
 ### Grand Theft Auto V renders its world again
 
 A regression took GTA V's lighting for a day — the bank heist still drew, but unlit and under a grid
