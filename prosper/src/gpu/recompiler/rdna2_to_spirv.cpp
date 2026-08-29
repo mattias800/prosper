@@ -2814,7 +2814,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
                         // lowering gate, which rejects only `len_dwords < 2`.
                         return (i.mimg_dim == 1u || i.mimg_dim == 5u) && i.mimg_dmask == 1u &&
                                !i.mimg_unorm && i.len_dwords >= 2u;
-                    if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D
+                    // image_get_resinfo 1D/2D/3D, plus 2D_ARRAY (dim 5), which lowers as Dim_2D with
+                    // Arrayed and reports the layer count as its third result (#2790). CUBE (dim 3) is
+                    // still declined: its stacked-face lowering (#273) would have to promise face-count
+                    // semantics for the third result that this has not established.
+                    if (i.opcode == 0x0eu) return i.mimg_dim <= 2u || i.mimg_dim == 5u;
                     if (i.opcode == 0x60u)                                     // fragment image_get_lod 2D
                         return i.mimg_dim == 1u && i.len_dwords == 2u &&
                                !mimg_get_lod_has_unmodeled_controls(i) &&

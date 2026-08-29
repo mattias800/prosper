@@ -7253,6 +7253,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.mimg_dim == 0u) dim = Dim_1D;
                 else if (in.mimg_dim == 1u) dim = Dim_2D;
                 else if (in.mimg_dim == 2u) dim = Dim_3D;
+                // #2790: 2D_ARRAY (dim 5) queries as SPIR-V Dim_2D with Arrayed set, which is the
+                // representation #325 already uploads and declares for these resources -- and
+                // `image_get_resinfo` already branches on `tex_is_arrayed(binding)` to ask for the
+                // ivec3 form and report its third component as the layer COUNT, which is exactly
+                // what GET_RESINFO's third result means for a 2D_ARRAY T#. The lowering was widened
+                // for the array case and this dispatch is the site that still declined it -- the
+                // same lag #2265 records for the atomic coverage predicate.
+                //
+                // `res_arrayed` above, not `mimg_dim == 5`, decides which query shape is emitted,
+                // and the distinction is load-bearing. `guest_texture_is_uploaded_array()` is dim-5
+                // AND depth>1 AND block-compressed; a dim-5 T# that fails it (Sonic Frontiers' own
+                // is depth=1) is a plain 2D image on both sides, so the ivec2 path runs and out[2]
+                // keeps its default of 1 -- the true layer count for a one-layer array.
+                //
+                // What this does NOT do is report a layer count for a MULTI-layer non-BC array,
+                // because prosper does not materialize one; the query then answers for the resource
+                // as actually uploaded, consistent with what every sample of it reads.
+                // CONFIDENCE: MED on that case alone -- no title in the corpus is known to issue
+                // one, so it is reasoned rather than measured.
+                else if (in.mimg_dim == 5u) dim = Dim_2D;
                 else { ok = false; return true; }
                 if (res->cls != ResourceClass::Texture) { ok = false; return true; }
                 if (!b.declare_texture(res->binding, dim, uint_texture, res_arrayed)) {
