@@ -12,6 +12,8 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <set>
+#include <tuple>
 
 namespace prosper::gpu {
 
@@ -297,6 +299,31 @@ RenderState extract_render_state(const GpuState& st) {
     // CB fast-clear color (CB_COLOR0_CLEAR_WORD0/1). Present only when the game programs a fast-clear
     // for MRT 0; the words carry the clear value in the target's pixel format (decoded in resolve).
     rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);
+    // PROSPER_CLEARLOG=1 -- diagnostic only, no behaviour change. `st.cx` is the PERSISTENT context
+    // register map, so `count()` answers "has this register ever been written", not "was it written
+    // for THIS target". If a title programs a fast-clear once and later binds a different colour
+    // target without reprogramming it, the stale value still reaches the render pass as its loadOp
+    // clear. This prints what each resolve actually decided, keyed to the target it decided it for,
+    // so that hypothesis can be confirmed or killed on a real run before anything is changed (#2014).
+    if (const char* clearlog = std::getenv("PROSPER_CLEARLOG")) {
+        if (clearlog[0] == '1' && clearlog[1] == '\0') {
+            static std::mutex clear_mutex;
+            static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> clear_seen;
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(clear_mutex);
+                first = clear_seen.emplace(rs.color0_base, rs.color0_format,
+                                           rs.color0_clear_word0).second;
+            }
+            if (first)
+                fprintf(stderr,
+                        "[clearlog] color0_base=0x%llx fmt=%u numtype=%u swap=%u has_clear=%d "
+                        "word0=0x%08x word1=0x%08x\n",
+                        (unsigned long long)rs.color0_base, rs.color0_format,
+                        rs.color0_number_type, rs.color0_comp_swap, (int)rs.color0_has_clear,
+                        rs.color0_clear_word0, rs.color0_clear_word1);
+        }
+    }
     rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
     rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
 
