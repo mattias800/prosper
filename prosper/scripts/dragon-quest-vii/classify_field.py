@@ -42,17 +42,22 @@ from PIL import Image
 
 HP_BAR_MIN = 0.013
 
-# Measured class boundaries. These are what the thresholds above and in world_renders are checked
-# AGAINST by --selftest, so a retune that would drop a real frame or admit a collapse reddens
-# arithmetically rather than depending on a constructed frame landing exactly on a boundary.
-# Over 1,370 frames of four runs:
+# Measured class boundaries over 1,370 frames of four runs.
+#
+# The HP constants below ARE checked arithmetically by --selftest, so a retune that would drop a
+# real frame or admit a collapse reddens without depending on a constructed frame landing exactly
+# on a boundary. RENDERED_MIN is DOCUMENTATION ONLY: the loop that compared world_renders'
+# thresholds against it was deleted, because comparing two hardcoded literals never called
+# world_renders and so could not notice it changing. Those three thresholds are pinned by
+# constructed frames either side of each one instead.
 # The EXACT class minimum, not a rounded copy. 99 of run3's 144 field frames and 121 of run4's 190
 # sit on precisely this value, so rounding it up by 1e-7 -- as an earlier version did -- lets
 # HP_BAR_MIN = 0.020097 pass the selftest while dropping run3 from 144 field frames to 45.
 FIELD_HP_MIN = 8440 / 419965     # = 0.0200969128..., lowest HP-bar fraction among the field frames
 NONFIELD_HP_MAX = 0.008860       # highest among every other frame
 # Over the 334 field frames, split by whether the world renders (143 / 191):
-RENDERED_MIN = (0.360, 207, 20.66)     # (usable, colours, sigma) minima of the rendered class
+RENDERED_MIN = (0.3596, 207, 20.66)    # (usable, colours, sigma) minima of the rendered class
+                                       # -- documentation only; nothing reads it
 # NOTE: the classes OVERLAP in every single dimension -- non-rendered frames reach usable 1.000,
 # 518 colours and sigma 125.90 -- so no one threshold separates them and only the conjunction does.
 # That is why world_renders ANDs three tests, and why each is pinned separately below.
@@ -289,7 +294,6 @@ def selftest():
     # ---- the marker, pinned at the REAL element's measured area ------------------------------
     # PARTY_BOX spans 0.22w x 0.23h = 844 x 496 px at 4K. A bar of 522 x 20 px is 10440/418624 =
     # 0.02494 of it. Asserted numerically: change the box extent and this number moves.
-    box_area = 419965
     # HARDCODED, not derived from PARTY_BOX. Deriving it reproduces the very circularity this case
     # exists to remove: widen the box and both the measurement and its expectation move together.
     # _px truncates each edge independently, so at 3840x2160 PARTY_BOX is x 2995..3840, y 1663..2160
@@ -411,11 +415,24 @@ def selftest():
     outside[int(h * 0.72):int(h * 0.95), int(w * 0.135):int(w * 0.150)] = (255, 255, 255)
     check(minimap_change(save(base), save(outside), box_m) < 5,
           "a change outside the disc does not count as movement (the mask is load-bearing)")
-    # (b) equal areas brighter and darker: a SIGNED mean cancels, an absolute one does not.
-    signed = base.copy()
+
+    # A high-contrast RING in the annulus between the sampled disc and the box edge. This pins the
+    # box's ALIGNMENT on both axes: shift MINIMAP_BOX a little either way and part of the ring falls
+    # inside the sampled disc, so a stationary pair starts registering as movement. Measured on the
+    # shipped box 0.00; shifted 0.02 in x 17.71, in y 5.87 -- hence a threshold of 3 between them.
+    # Without this a single-axis 0.02 shift stayed green while turning the locomotion result's
+    # "0 of 8 neutral" into 2/8 or 3/8, i.e. while reversing the discriminator the claim rests on.
+    ring = base.copy()
     cy, cx, r = int(h * 0.835), int(w * 0.086), int(h * 0.113)
     yy, xx = np.mgrid[0:h, 0:w]
-    inside = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+    r_out, r_in = int(h * 0.150), int(h * 0.114)
+    d2 = (yy - cy) ** 2 + (xx - cx) ** 2
+    ring[(d2 <= r_out * r_out) & (d2 >= r_in * r_in)] = (255, 255, 255)
+    check(minimap_change(save(base), save(ring), box_m) < 3,
+          "a ring outside the sampled disc does not register (pins the box alignment, both axes)")
+    # (b) equal areas brighter and darker: a SIGNED mean cancels, an absolute one does not.
+    signed = base.copy()
+    inside = d2 <= r * r
     upper = inside & (yy < cy)
     lower = inside & (yy >= cy)
     signed[upper] = (220, 220, 220)

@@ -771,11 +771,11 @@ The HP bar separates **0.0201 from 0.008860 across 1,370 frames** of four runs.
 each one. 30 entries: 25 that must redden, 2 controls that must not (a no-op edit, and a *safe*
 `HP_BAR_MIN` retune inside the measured band), and **3 marked `UNPINNED` — mutations that DO move a
 published number and that this selftest does not catch**. Those three are a coarser sampling
-resize, a narrower luma band, and a small `WORLD_BOX` shift; the reason is structural rather than an
-oversight, since a constructed frame cannot reproduce a real 4K frame's sensitivity to a small
-perturbation, and catching them would need corpus frames that are gigabytes and not committed. They
-are listed with their measured effect so the boundary of the guarantee is visible rather than
-implied.
+resize, a narrower luma band, and a small `WORLD_BOX` shift; the reason is that no case has been
+written for them yet — **not** that none can exist. An earlier draft claimed the gap was structural;
+a reviewer disproved that by building a catching case for each in one sitting. They are listed with
+their measured effect so the boundary of the guarantee is visible rather than implied, and so the
+next person knows these are open work rather than a wall.
 
 The runner rejects a mutation that does not COMPILE rather than scoring it as a reddening: an
 earlier version had eight arms whose replacement indentation was one space short, which raised

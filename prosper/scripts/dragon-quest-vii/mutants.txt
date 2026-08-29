@@ -39,19 +39,33 @@ def minimap_change(path_a, path_b, box, size=128, disc=0.44): => def minimap_cha
 NO-OPHP_BAR_MIN = 0.013 => HP_BAR_MIN = 0.0095
 NO-OP    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2] => r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]  # noqa
 
-# Parameters a reviewer found moving a published number. Two are caught; three are NOT, and are
-# marked UNPINNED so the gap is recorded rather than hidden. All five were measured.
+# Parameters a reviewer found moving a published number. The MINIMAP_BOX family is now caught by
+# a constructed ring case rather than disclosed; the rest are marked UNPINNED below.
     colours = len(np.unique(arr // 8, axis=0)) => colours = len(np.unique(arr // 16, axis=0))
 MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.042, 0.742, 0.170, 0.969)
 
-# KNOWN UNPINNED. Each of these moves a published number and this selftest does not catch it. The
-# reason is structural rather than an oversight: a constructed frame cannot reproduce a real 4K
-# game frame's sensitivity to a small sampling or box perturbation -- the synthetic content is
-# uniform where the real content is not. Catching them needs corpus frames, which are not committed
-# (they are gigabytes of captures). Listed so the next reader knows the boundary of the guarantee.
+# KNOWN UNPINNED. Each moves a published number and this selftest does not catch it.
+#
+# The reason is that NO CASE HAS BEEN WRITTEN YET -- not that none can exist. An earlier version of
+# this note claimed the gap was structural, that a constructed frame could not reproduce a real 4K
+# frame's sensitivity to a small perturbation. A reviewer disproved that by building a catching case
+# for all three in one sitting, and they are not hard: vertical stripes bound the colour count under
+# any resample filter; a large region at luma 27 sits inside the shipped band and outside a narrowed
+# one; a scene confined to the RIM of WORLD_BOX vanishes when the box insets. Attaching an
+# impossibility argument to a disclosure is the same over-claim as asserting coverage -- just
+# pointed at the limit instead of the result.
+#
 #   resize((128,72))       : world4 107 -> 73, longest4 10 -> 4
+#   resize((512,288))      : world4 107 -> 116, longest4 10 -> 15
+#   arr // 4               : world4 107 -> 124, longest4 10 -> 16
+#   colours > 150          : world4 107 -> 116
 #   luma band 30..240      : world3 36 -> 32, world4 107 -> 89
-#   WORLD_BOX +/-0.02      : world4 107 -> 80..110
+#   WORLD_BOX +/-0.02-0.05 : world3 36 -> 35, world4 107 -> 80..110, longest4 10 -> 8
 UNPINNED    arr = np.asarray(region.resize((256, 144))).reshape(-1, 3) => arr = np.asarray(region.resize((128, 72))).reshape(-1, 3)
 UNPINNED    usable = float(((lum > 25) & (lum < 245)).mean()) => usable = float(((lum > 30) & (lum < 240)).mean())
 UNPINNEDWORLD_BOX = (0.18, 0.05, 0.82, 0.72) => WORLD_BOX = (0.20, 0.07, 0.80, 0.70)
+UNPINNED    arr = np.asarray(region.resize((256, 144))).reshape(-1, 3) => arr = np.asarray(region.resize((512, 288))).reshape(-1, 3)
+UNPINNED    colours = len(np.unique(arr // 8, axis=0)) => colours = len(np.unique(arr // 4, axis=0))
+UNPINNED    return usable > 0.30 and colours > 200 and sigma > 20 => return usable > 0.30 and colours > 150 and sigma > 20
+MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.002, 0.722, 0.150, 0.949)
+MINIMAP_BOX = (0.022, 0.722, 0.150, 0.949) => MINIMAP_BOX = (0.022, 0.742, 0.150, 0.969)
