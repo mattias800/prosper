@@ -9506,6 +9506,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             last_scanout_present_from_guest =
                                 frame_origin == prosper::gpu::PresentFrameOrigin::GuestScanout;
                             present_frames_stored.fetch_add(1, std::memory_order_relaxed);
+                            // `retained_frame_action` decides on BYTE SIZES ALONE -- by design, since
+                            // it cannot know what a frame should look like. The consequence is that a
+                            // correctly-sized but CONTENTLESS frame is retained just as readily as a
+                            // good one, and is then re-served on every later submit that produces no
+                            // present source. Little Nightmares III presents a uniform (255,255,0)
+                            // frame on ~2/3 of samples for exactly that reason (#2014): the retained
+                            // frame is itself uniform.
+                            //
+                            // This names the ORIGIN of a uniform retained frame, which is the one
+                            // fact the existing counters cannot supply -- `fresh=N retained=M` says a
+                            // substitution happened, not what was substituted or where it came from.
+                            // Sampled, not exhaustive: a full uniformity scan of a 33 MB frame on the
+                            // present path would cost more than the render.
+                            if (const char* uni = std::getenv("PROSPER_UNIFORMLOG")) {
+                                if (uni[0] == '1' && uni[1] == '\0' && selected_pixels &&
+                                    selected_pixels->size() >= 4) {
+                                    const uint8_t* px = selected_pixels->data();
+                                    const size_t n = selected_pixels->size();
+                                    bool uniform = true;
+                                    for (size_t off = 4; off + 4 <= n; off += ((n / 4096) | 4u) & ~3u)
+                                        if (px[off] != px[0] || px[off+1] != px[1] ||
+                                            px[off+2] != px[2] || px[off+3] != px[3]) {
+                                            uniform = false; break;
+                                        }
+                                    if (uniform) {
+                                        static std::atomic<uint64_t> uniform_stores{0};
+                                        const uint64_t ord =
+                                            uniform_stores.fetch_add(1, std::memory_order_relaxed) + 1;
+                                        if (prosper::diag_should_print(ord))
+                                            fprintf(stderr,
+                                                    "[uniformlog] #%llu retaining a UNIFORM frame "
+                                                    "rgba=(%u,%u,%u,%u) bytes=%zu origin=%s\n",
+                                                    (unsigned long long)ord,
+                                                    px[0], px[1], px[2], px[3], n,
+                                                    frame_origin ==
+                                                        prosper::gpu::PresentFrameOrigin::GuestScanout
+                                                        ? "GuestScanout" : "Composited");
+                                    }
+                                }
+                            }
                             break;
                         case prosper::frontend::RetainedFrameAction::ServeRetained:
                             selected_pixels = last_scanout_present;
