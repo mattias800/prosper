@@ -1,0 +1,32 @@
+# Stray (PPSA02101) -- reach the title screen DETERMINISTICALLY and hold there.
+#
+# Anchored on FLIPS, not seconds. Measured 2026-08-30: a no-input boot reaches the
+# brightness-calibration screen at present_count ~1764 and then HOLDS it unchanged
+# (identical nonblack 0.1070 from present 1838 through 3205, i.e. t=140s..248s), because
+# that screen waits for input.
+#
+# That is what makes a single late anchor deterministic: the target state is not a moment,
+# it is a steady state, so any anchor after it arrives lands on it however slow the boot was.
+# A wall-clock route cannot do this -- the earlier 150s/160s version fired before calibration
+# on slower boots and reached the title only sometimes (measured 0.1095 once, then
+# 0.0063/0.0000/0.0063 on three unmodified reruns).
+#
+# ONE press: Cross accepts calibration (its own prompt bar names it). Nothing after it, so the
+# title screen holds instead of being selected past into the game.
+f2500-2515:cross
+#
+# MEASURED RESULT, 4 runs: every run that does not fault reaches the title screen at EXACTLY
+# max_nonblack 0.1097. The route contributes no variance at all. What varies is an intermittent
+# guest fault on accepting calibration -- 2 of 4 runs -- at a fixed
+# rip=image+0x12cc536 on 'RenderThread 1', WITH PROSPER_NULL_PAGE=1 already set. See #3126.
+#
+# RUN IT WITH PROSPER_NULL_PAGE=1. Without it the fault is worse, not absent.
+#
+#   PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+#   PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-title-flip.pad \
+#     ./build-linux/screenshot <DUMP_ROOT>/PPSA02101-app0 \
+#       --seconds 8 --count 10 --warmup-seconds 230 --timeout 305 --out <OUT>
+#
+# WHAT THE TITLE SCREEN CURRENTLY SHOWS: the menu only. START GAME / SETTINGS / CREDITS, the
+# highlight, the (X) Select prompt and the version stamp are correct; the cat-head logo, the STRAY
+# wordmark and the entire lit background are absent. Oracle screenshot on tracker #2883.
