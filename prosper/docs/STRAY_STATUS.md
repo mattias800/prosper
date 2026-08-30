@@ -294,8 +294,8 @@ drops still discard the background.
   read-back (25 of 64 non-zero dwords at texture offset 0). And the range is nonetheless **entirely
   zero when the shader samples it**: base `0x303cd10000`, BC1_SRGB 3840×2160, read by
   `0x300c150000`, `nonzero=0/512` at +65.7 s after its verified write.
-  So this is a **lifetime** defect — something zeroes these ranges between load and use — not a read
-  defect, and the pak reader is not the place to look. #3142.
+  So the pak reader is not the place to look; something zeroes these ranges between load and use, and
+  the row below names it. #3142.
 
 - **"The range is zeroed some time during the ~65 s before the shader reads it."** Falsified, and the
   65 s was an artifact of when the *shader* happened to look rather than of when the data went away.
@@ -306,6 +306,15 @@ drops still discard the background.
   file offset, so it is neither unmapped nor re-pointed. And because that mapping is `MAP_SHARED` on a
   memfd, reading the mapping **is** reading the file — there is no "stale view" case, so the content
   itself was zeroed. #3142, #3145.
+  - **The writer is the guest's own libc, and that reclassifies the whole issue.** With #3147's
+    re-baseline mode the write trace observes the window it previously could not, and attributes
+    **64 of 64 events to `libc.prx`** — guest code — storing sequentially from the buffer base at a
+    16-byte stride through a tight `0x3d71`–`0x3dd0` RIP loop, on one thread. The guest clears its own
+    staging buffer about a second after loading it, which is ordinary engine behaviour. So this is
+    **not** a memory-lifetime defect and never was: the pak reader delivers correctly, the guest
+    disposes of its buffer correctly, and prosper's defect is that a shader still reads that address
+    afterwards. The open question is now a descriptor one — why `0x300c150000`'s texture resolves to a
+    staging buffer the engine has finished with — which also fits its `rtt=MISS`. #3142.
   - Four mechanisms measured and excluded, each in the same runs: **`dmem_zero`'s hole punch** (all 20
     calls occur at startup, before every one of these writes); **a re-map of the VA** (one `[physmap]`
     per VA, created ~2 ms *before* its write, none after); **a second VA aliasing the phys** (none —
