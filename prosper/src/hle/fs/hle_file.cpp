@@ -8,6 +8,7 @@
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "diagnostics/diag_clock.hpp"
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "gpu/timeline/gpu_timeline.hpp" // optional exact guest-stdout capture gate
@@ -2685,6 +2686,7 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
 // PROSPER_APR_VERIFY=1 verifies every write; PROSPER_APR_VERIFY=0xADDR verifies only that
 // destination, which is what keeps the log readable on a title that streams thousands of chunks.
 static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
+    const uint64_t t_us = prosper::diagnostics::diag_now_us();
     const char* ev = getenv("PROSPER_APR_VERIFY");
     if (!ev || !*ev || size < 256) return;
     const uint64_t want = strtoull(ev, nullptr, 0);
@@ -2726,7 +2728,8 @@ static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
         if (used >= (int)sizeof detail) break;
     }
     fprintf(stderr,
-            "[apr-verify] dst=0x%llx size=%llu src_nonzero=%u/%u dst_nonzero=%u/%u %s%s\n",
+            "[apr-verify] t=%llu dst=0x%llx size=%llu src_nonzero=%u/%u dst_nonzero=%u/%u %s%s\n",
+            (unsigned long long)t_us,
             (unsigned long long)dst, (unsigned long long)size, src_nz, sampled, dst_nz, sampled,
             unreadable ? "UNREADABLE-WINDOWS"
                        : (src_nz == dst_nz ? "MATCH" : "MISMATCH-WRITE-LOST"),

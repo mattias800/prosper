@@ -1,5 +1,6 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include "diagnostics/diag_clock.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
 #include <algorithm>
@@ -986,8 +987,9 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     std::lock_guard<std::mutex> lk(cmx);
                     if (cseen.insert({shdr.code, d.base, verdict}).second)
                         fprintf(stderr,
-                                "[texcontent] shader=%p base=0x%llx %ux%u fmt=%u bytes=%llu "
+                                "[texcontent] t=%llu shader=%p base=0x%llx %ux%u fmt=%u bytes=%llu "
                                 "nonzero=%u/%u %s rtt=%s\n",
+                                (unsigned long long)prosper::diagnostics::diag_now_us(),
                                 shdr.code,
                                 (unsigned long long)d.base, d.width, d.height, d.format,
                                 (unsigned long long)span, nonzero, sampled_dwords,
