@@ -2704,7 +2704,9 @@ static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
         // construction -- and on this data that is not rare: the source is ~5.6% non-zero, so an
         // all-zero first window is common and padding is always one. A control that silently cannot
         // fail on some inputs is the failure it exists to rule out.
-        static uint32_t poison[64];
+        // Stack-local, not static: several APR threads can be in here at once, and a shared
+        // mutable buffer is a data race even when every writer stores the same value.
+        uint32_t poison[64];
         for (uint32_t i = 0; i < 64; ++i) poison[i] = 0xA5A5A5A5u;
         poison_distinct = memcmp(buf, poison, sizeof poison) != 0;
         struct iovec pl { (void*)poison, sizeof poison }, pr { (void*)(uintptr_t)dst, sizeof poison };
