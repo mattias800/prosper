@@ -327,13 +327,18 @@ drops still discard the background.
     **152 s** and reads zero every time, the earliest only 2.0 s after its byte-verified write. One
     address going quiet could be a descriptor pointing somewhere stale; two, with one of them read by
     five separate shaders, is the range.
-  - What blocks naming the writer, so nobody re-derives it: `PROSPER_DMEM_WRITE_TRACE` records writer
-    RIPs but is invalidated by a **host** write, and the APR load *is* a host write (all four host
-    writers of guest memory in the tree are file reads), so it can never watch a range APR loads into.
-    It reports `page-faults=0` — no guest write faulted — but the watch died too early for that to be
-    conclusive. A `SIGSEGV` trap hand-rolled to get the RIP directly killed the run at asset load and
-    was removed rather than debugged; extending the existing trace's lifecycle is the route, not a
-    second write-watch fighting the first.
+  - What *used* to block naming the writer, kept because it explains why this took so long and what
+    the attribution above depends on: `PROSPER_DMEM_WRITE_TRACE` records writer RIPs but was
+    invalidated by a **host** write, and the APR load *is* a host write (all four host writers of
+    guest memory in the tree are file reads), so it could never watch a range APR loads into — it
+    reported `page-faults=0` because the watch died at the load, not because no guest write happened.
+    **[#3147](https://github.com/mattias800/prosper/pull/3147) lifts that** with an opt-in
+    re-baseline mode, and the `libc.prx` attribution above is measured **with that PR applied**: on
+    master alone the trace still disarms at the load and reproduces nothing. If #3147 is merged when
+    you read this, drop this caveat; if it was closed, the attribution needs re-deriving.
+    A `SIGSEGV` trap hand-rolled to get the RIP directly killed the run at asset load and was removed
+    rather than debugged — extending the existing trace's lifecycle was the route, not a second
+    write-watch fighting the first.
   - Two traps came out of it and are recorded in `GAME_COMPAT_ORCHESTRATION.md`: **235**, log line
     order is not happens-before (the ordering above is a shared monotonic stamp, not line distance);
     **236**, a verifier that compares populations instead of content reports MATCH on entirely
