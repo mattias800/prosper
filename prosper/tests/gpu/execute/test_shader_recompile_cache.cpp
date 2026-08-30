@@ -233,11 +233,57 @@ int main() {
               stats.entries == 2,
           "byte-identical shader code at a different address reuses the compiled cache entry");
 
+    // #3130, the mirror of the arm above. With the trip-bound selector ARMED, the same bytes at two
+    // addresses must NOT share an entry: the selector targets one program, and the cache is keyed on
+    // code bytes, so a collision would hand the bounded module to an excluded program or the
+    // unbounded one to the target — silently destroying the isolation that makes a bounded run
+    // evidence about ONE program. `rdna2_cfg_support.hpp` states that contract and compute honours
+    // it; graphics did not, and could not be caught while fragment diagnostics were pinned at
+    // address 0, because a selector cannot match a program with no address.
+    {
+        std::vector<uint32_t> bound_a(kPs, kPs + std::size(kPs));
+        std::vector<uint32_t> bound_b(kPs, kPs + std::size(kPs));
+        char selector[32];
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(bound_a.data())));
+        setenv("PROSPER_CFG_TRIP_BOUND", "4", 1);
+        setenv("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector, 1);
+        setenv("PROSPER_CFG_TRIP_BOUND_PHASE", "0", 1);
+        const auto before = shader_recompile_cache_stats();
+        (void)recompile_graphics_shader_cached(
+            ShaderProgramStage::Fragment, bound_a.data(), bound_a.size(), nullptr);
+        (void)recompile_graphics_shader_cached(
+            ShaderProgramStage::Fragment, bound_b.data(), bound_b.size(), nullptr);
+        const auto after = shader_recompile_cache_stats();
+        unsetenv("PROSPER_CFG_TRIP_BOUND");
+        unsetenv("PROSPER_CFG_TRIP_BOUND_PROGRAM");
+        unsetenv("PROSPER_CFG_TRIP_BOUND_PHASE");
+        CHECK(after.misses == before.misses + 2 && after.hits == before.hits,
+              "#3130: an armed trip-bound selector separates identical bytes at two addresses");
+    }
+
     const auto direct_ps = recompile_fragment(kPs, std::size(kPs), nullptr);
     const auto cached_ps = recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr);
     CHECK(!direct_ps.empty() && cached_ps == direct_ps,
           "fragment cache output is byte-identical to the direct recompiler");
+
+    // #3130 threads the guest program address to the fragment recompiler as DIAGNOSTIC provenance.
+    // It must NOT reach the cache key: identical bytes produce identical SPIR-V at every guest
+    // address, so a relocated copy has to HIT. Without this arm a plumb-through that folded the
+    // address into ShaderCompileKey would compile, pass every other case here, and silently give
+    // each address its own entry -- a cache defeat visible only as a frame-time regression.
+    const auto before_relocated_ps = shader_recompile_cache_stats();
+    std::vector<uint32_t> relocated_ps(kPs, kPs + std::size(kPs));
+    const auto relocated_cached_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, relocated_ps.data(), relocated_ps.size(), nullptr);
+    const auto after_relocated_ps = shader_recompile_cache_stats();
+    CHECK(relocated_cached_ps == cached_ps &&
+              after_relocated_ps.misses == before_relocated_ps.misses &&
+              after_relocated_ps.hits == before_relocated_ps.hits + 1,
+          "a fragment program at a different address reuses its compiled cache entry (#3130)");
+
 
     // Unreal fragment shaders place small constant tables after S_ENDPGM and address them through an
     // s_getpc_b64-built V#. The owning cache copy must include that proven tail; copying only the walked
@@ -1912,6 +1958,25 @@ int main() {
               array_s8_again == array_s8 && stats.misses == 4 && stats.hits == 1 &&
               stats.entries == 4,
           "buffer-array cache separates arity, selector source, and same-entry admission mutations");
+
+    // #3130, and deliberately LAST. The arm above cannot show that the program address actually
+    // ARRIVES -- a signature that accepts the diagnostic context and drops it on the floor passes it.
+    // record_terminal_reject_reason() early-returns on a zero address, so while
+    // recompile_fragment_impl hardcoded 0 no fragment rejection was recorded for ANY program and
+    // last_terminal_reject_reason() came back empty for all of them. A terminal reject at a known
+    // address is the observable that separates the two.
+    //
+    // It runs last because it is not side-effect free: recording a reject reason, and the
+    // once-per-program-address consequence sets behind it, are process-global. Placed mid-suite it
+    // reddened six unrelated compute-identity cases -- so this position is load-bearing, not
+    // stylistic. Add new cases ABOVE it.
+    constexpr uint64_t kFragmentDiagnosticAddress = 0x0000004321000000ull;
+    const auto rejected_fragment = recompile_fragment(
+        kPs, std::size(kPs), nullptr, nullptr, /*pcrel_dispatch_target=*/7u, nullptr, false,
+        {RecompileDiagnosticStage::Fragment, kFragmentDiagnosticAddress});
+    CHECK(rejected_fragment.empty() &&
+              !last_terminal_reject_reason(kFragmentDiagnosticAddress).empty(),
+          "a fragment terminal reject is recorded against its own program address (#3130)");
 
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);
