@@ -2947,7 +2947,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     // and marks every overlapping cache registration dirty.
     host::guest_write_watch_notify_host_write(dst, size);
     // Paired on EVERY exit, not just the fast success. A notification without its completion leaves
-    // the in-flight depth permanently raised, which silently disables rebaselining -- exactly the
+    // its range recorded as in flight forever, which stops rebaselining for that address -- exactly the
     // regression this pairing was added to prevent, and one that only showed up by re-running the
     // measurement rather than in any test.
     struct HostWriteDone {

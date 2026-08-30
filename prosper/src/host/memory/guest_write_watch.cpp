@@ -1928,7 +1928,8 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
 
 // Paired with guest_write_watch_notify_host_write: called AFTER the host write has completed, so the
 // trace knows no bytes are in flight and a rebaseline may safely re-arm. Unpaired callers are safe --
-// the depth simply stays nonzero and rebaselining stops, which is the direction that cannot corrupt.
+// its range simply stays recorded and rebaselining stops for THAT address, which is the direction
+// that cannot corrupt -- and, unlike the global counter this replaced, cannot disable the feature.
 void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size) {
     if (!addr || !size || addr > UINT64_MAX - size) return;
     WatchState& w = state();
