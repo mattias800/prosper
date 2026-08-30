@@ -293,10 +293,31 @@ drops still discard the background.
   `dd`/`od` read of `hk_project-ps5.pak` outside the emulator agrees exactly with the in-memory
   read-back (25 of 64 non-zero dwords at texture offset 0). And the range is nonetheless **entirely
   zero when the shader samples it**: base `0x303cd10000`, BC1_SRGB 3840×2160, read by
-  `0x300c150000`, `nonzero=0/512` at **+65.7 s** after its verified write. A second base,
-  `0x302a300000`, is zero on five samples across 152 s, the earliest only **2.0 s** after its write.
-  So this is a **lifetime** defect — something reclaims, zeroes or remaps these ranges between load
-  and use — not a read defect, and the pak reader is not the place to look. #3142.
+  `0x300c150000`, `nonzero=0/512` at +65.7 s after its verified write.
+  So this is a **lifetime** defect — something zeroes these ranges between load and use — not a read
+  defect, and the pak reader is not the place to look. #3142.
+
+- **"The range is zeroed some time during the ~65 s before the shader reads it."** Falsified, and the
+  65 s was an artifact of when the *shader* happened to look rather than of when the data went away.
+  `PROSPER_ZEROWATCH` polls each armed destination every 50 ms and reports the transition itself: the
+  data is gone **0.5–2.3 s** after its load, and the defect therefore **reproduces in a 2-minute run**
+  rather than the 7-minute title route — it happens during asset load, long before the title screen.
+  At the instant of the flip the mapping is *unchanged*: still `rw-s` on the dmem memfd at the same
+  file offset, so it is neither unmapped nor re-pointed. And because that mapping is `MAP_SHARED` on a
+  memfd, reading the mapping **is** reading the file — there is no "stale view" case, so the content
+  itself was zeroed. #3142, #3145.
+  - Four mechanisms measured and excluded, each in the same runs: **`dmem_zero`'s hole punch** (all 20
+    calls occur at startup, before every one of these writes); **a re-map of the VA** (one `[physmap]`
+    per VA, created ~2 ms *before* its write, none after); **a second VA aliasing the phys** (none —
+    each phys range is mapped exactly once); and **the renderer writing back**
+    (`guest_memory_gpu_write` fires once per run, covering none of the zeroed ranges).
+  - What blocks naming the writer, so nobody re-derives it: `PROSPER_DMEM_WRITE_TRACE` records writer
+    RIPs but is invalidated by a **host** write, and the APR load *is* a host write (all four host
+    writers of guest memory in the tree are file reads), so it can never watch a range APR loads into.
+    It reports `page-faults=0` — no guest write faulted — but the watch died too early for that to be
+    conclusive. A `SIGSEGV` trap hand-rolled to get the RIP directly killed the run at asset load and
+    was removed rather than debugged; extending the existing trace's lifecycle is the route, not a
+    second write-watch fighting the first.
   - Two traps came out of it and are recorded in `GAME_COMPAT_ORCHESTRATION.md`: **235**, log line
     order is not happens-before (the ordering above is a shared monotonic stamp, not line distance);
     **236**, a verifier that compares populations instead of content reports MATCH on entirely

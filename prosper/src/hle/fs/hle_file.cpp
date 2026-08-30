@@ -2701,6 +2701,7 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
 namespace {
 struct ZeroWatchEntry {
     uint64_t dst = 0, size = 0, t_armed = 0;
+    const char* path = "?";
     bool seen_nonzero = false, reported = false;
 };
 std::mutex g_zw_mx;
@@ -2732,6 +2733,11 @@ bool zw_read256(uint64_t addr, uint32_t* out) {
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 256;
 }
 
+// Runs until the process ends, and is never joined. That is safe here only because every exit path
+// in this project is _Exit -- prosper-app, tools/screenshot, and the guest's own _exit and fatal
+// raise -- so no static this thread touches is ever destroyed under it. A normal `return` from main
+// would make this a use-after-free, so if an exit path ever stops being _Exit, this thread needs a
+// stop flag before that lands.
 void zerowatch_poll_forever() {
     for (;;) {
         {
@@ -2752,14 +2758,20 @@ void zerowatch_poll_forever() {
                 uint32_t nz = 0;
                 for (uint32_t k = 0; k < 64; ++k) if (w[k]) ++nz;
                 if (nz) { e.seen_nonzero = true; continue; }
-                // All-zero. Only interesting if this range was observed holding data first --
-                // otherwise it is a buffer that was never filled, which is not this defect.
+                // All-zero in the sampled window. Only interesting if this range is KNOWN to have
+                // held data -- otherwise it is a buffer that was never filled, which is not this
+                // defect. That knowledge is seeded at arm time from the source buffer, never from
+                // this window: an all-zero first 256 bytes is common on this data (the source is
+                // ~5.6% non-zero and padding is always zero), so deciding it here would make a
+                // payload with a zero-padded head unreportable -- silently, and exactly for the
+                // class under investigation.
                 if (e.seen_nonzero) {
                     e.reported = true;
                     fprintf(stderr,
-                            "[zerowatch] t=%llu dst=0x%llx size=%llu WENT-ZERO after %.3fs  maps=%s\n",
+                            "[zerowatch] t=%llu dst=0x%llx size=%llu sampled=256B@0 armed-via=%s "
+                            "WENT-ZERO after %.3fs  maps=%s\n",
                             (unsigned long long)prosper::diagnostics::diag_now_us(),
-                            (unsigned long long)e.dst, (unsigned long long)e.size,
+                            (unsigned long long)e.dst, (unsigned long long)e.size, e.path,
                             (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
                             zw_mapping_of(e.dst).c_str());
                     // Dump the dmem write trace HERE, at the moment the data disappears. Its own
@@ -2781,13 +2793,36 @@ void zerowatch_poll_forever() {
     }
 }
 
-void zerowatch_arm(uint64_t dst, uint64_t size) {
+// `src` is the buffer just written, so "did this range ever hold data" is answered from the payload
+// rather than from a later poll of the destination. `path` names which write path armed it, because
+// the two are not equivalent: the retry path MAP_FIXEDs anonymous memory over guest pages first, and
+// a range that went through it is the most interesting kind to watch, not one to skip.
+void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* path) {
     if (!zerowatch_enabled() || size < (1u << 20)) return;   // large payloads only: textures, not records
     std::lock_guard<std::mutex> lk(g_zw_mx);
     for (auto& e : g_zw) if (e.dst == dst) return;
-    if (g_zw.size() >= 64) return;
+    if (g_zw.size() >= 64) {
+        // Never drop silently: a capped watch list turns "nothing else went zero" into "nothing else
+        // was looked at", and those read identically in a log.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[zerowatch] watch list FULL at %zu entries -- later destinations are "
+                            "NOT watched; counts below are a floor, not a total\n", g_zw.size());
+        }
+        return;
+    }
     ZeroWatchEntry e;
     e.dst = dst; e.size = size; e.t_armed = prosper::diagnostics::diag_now_us();
+    e.path = path;
+    // Seed from the SOURCE (see the poll loop): scan a spread of the payload, not just its head.
+    const uint8_t* p8 = static_cast<const uint8_t*>(src);
+    for (uint32_t w = 0; w < 8 && !e.seen_nonzero; ++w) {
+        const uint64_t off = ((size - 256ull) / 7ull) * w;
+        for (uint32_t k = 0; k < 256; ++k)
+            if (p8[off + k]) { e.seen_nonzero = true; break; }
+    }
+    if (!e.seen_nonzero) return;   // the payload itself is all zeros; nothing to lose here
     g_zw.push_back(e);
     if (!g_zw_thread.exchange(true)) std::thread(zerowatch_poll_forever).detach();
 }
@@ -2877,7 +2912,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
         apr_verify_write(dst, buf, size);
-        zerowatch_arm(dst, size);
+        zerowatch_arm(dst, buf, size, "direct");
         return true;
     }
     bool committed = false;
@@ -2891,7 +2926,12 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     }
     if (!committed) return false;
     const bool retried = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-    if (retried) apr_verify_write(dst, buf, size);
+    if (retried) {
+        apr_verify_write(dst, buf, size);
+        // The retry path MAP_FIXEDs fresh anonymous pages over the destination first, which makes
+        // it the MOST interesting class to watch, not one to leave uncovered as it was.
+        zerowatch_arm(dst, buf, size, "commit-retry");
+    }
     return retried;
 }
 #endif
