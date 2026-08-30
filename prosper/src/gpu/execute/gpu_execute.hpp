@@ -1678,6 +1678,24 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                          (unsigned long long)(draw ? draw->command_order : 0));
         return false;
     }
+    // PROSPER_DRAWMAP=1 -- one line per distinct (fragment program, colour target, extent, scissor)
+    // with how many draws share it. Answers "which shader owns which pixels" as a static filter over
+    // a whole route in ONE run. Painting one shader at a time answers the same question one
+    // candidate per run; on a title with 66 fragment stages that is the difference between one run
+    // and a bisect. It is what identified Stray's full-screen composite (#3126).
+    if (getenv("PROSPER_DRAWMAP")) {
+        static std::mutex dmx; static std::map<std::string, uint64_t> dseen;
+        char k[192];
+        snprintf(k, sizeof k, "ps=0x%llx target=0x%llx %ux%u scissor=%u,%u..%u,%u tm=0x%x",
+                 (unsigned long long)rs.ps_addr, (unsigned long long)rs.color0_base,
+                 rs.color0_width, rs.color0_height,
+                 (unsigned)rs.scissor_left, (unsigned)rs.scissor_top,
+                 (unsigned)rs.scissor_right, (unsigned)rs.scissor_bottom, rs.cb_target_mask);
+        std::lock_guard<std::mutex> lk(dmx);
+        const uint64_t n = ++dseen[k];
+        if (n == 1 || n % 4096 == 0)
+            fprintf(stderr, "[drawmap] x%llu %s\n", (unsigned long long)n, k);
+    }
     const auto* fused_back = static_cast<const AgcShaderHeader*>(
         prosper_agc_fused_back_header_for_front(rs.es_addr));
     const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;

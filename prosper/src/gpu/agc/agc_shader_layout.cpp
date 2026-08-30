@@ -1,5 +1,6 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
 #include <algorithm>
 #include <climits>
@@ -918,6 +919,44 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     }
                     tseen[key] = done;
                 }
+            }
+            // PROSPER_TEXCONTENT=1 -- for every large sampled texture, report BOTH sources a
+            // sample can come from: whether its guest memory holds anything, and whether the
+            // renderer's own cache calls it authoritative. Reporting only one is how #3126 produced
+            // a false alarm -- an address the renderer authored is legitimately zero in guest
+            // memory, because its pixels live in the cache.
+            //
+            // Deduped on (base, VERDICT), never on base alone. An address-keyed probe reports
+            // whatever the FIRST decode saw, which on a long run is the boot-time state, so a
+            // surface filled moments later still reads as empty. That mistake cost three published
+            // corrections on #3140 before it was caught; with the verdict in the key a state change
+            // prints and "it was empty" cannot masquerade as "it is empty".
+            if (getenv("PROSPER_TEXCONTENT") && d.width >= 1920u && d.height >= 1080u &&
+                d.base > 0x1000000000ull) {
+                static std::mutex cmx; static std::set<std::pair<uint64_t, int>> cseen;
+                std::lock_guard<std::mutex> lk(cmx);
+                const uint64_t span = (uint64_t)d.width * d.height;
+                uint32_t nonzero = 0, sampled_dwords = 0;
+                for (uint32_t s = 0; s < 8; ++s) {
+                    const uint64_t addr = d.base + (((span / 8u) * s) & ~(uint64_t)3);
+                    if (!guest_readable(addr, 256)) continue;
+                    const uint32_t* words = (const uint32_t*)(uintptr_t)addr;
+                    for (uint32_t k = 0; k < 64; ++k) {
+                        ++sampled_dwords;
+                        if (words[k]) ++nonzero;
+                    }
+                }
+                const bool cached = prosper::gpu::is_live_render_target(d.base);
+                const int verdict = ((sampled_dwords == 0) ? 0 : (nonzero == 0 ? 1 : 2)) |
+                                    (cached ? 4 : 0);
+                if (cseen.insert({d.base, verdict}).second)
+                    fprintf(stderr,
+                            "[texcontent] base=0x%llx %ux%u fmt=%u nonzero=%u/%u %s rtt=%s\n",
+                            (unsigned long long)d.base, d.width, d.height, d.format,
+                            nonzero, sampled_dwords,
+                            sampled_dwords == 0 ? "UNREADABLE"
+                                                : (nonzero == 0 ? "ALL-ZERO" : "has-content"),
+                            cached ? "authoritative" : "MISS");
             }
             if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_TEXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
