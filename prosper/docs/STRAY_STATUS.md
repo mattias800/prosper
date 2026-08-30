@@ -285,6 +285,23 @@ drops still discard the background.
 
 ## Ruled out
 
+- **"The 4K title background is black because its asset never loads, or loads late."** Falsified, and
+  by three sources that share no code. The pak read delivers the bytes: `PROSPER_APR_VERIFY`
+  re-reads each guest destination through `process_vm_readv` immediately after the write and
+  **`memcmp`s it against the source** — 21,499 of 21,499 writes byte-identical on the title route,
+  with a mutation arm (`PROSPER_APR_VERIFY_SELFTEST`) proving the comparison can report a loss. A
+  `dd`/`od` read of `hk_project-ps5.pak` outside the emulator agrees exactly with the in-memory
+  read-back (25 of 64 non-zero dwords at texture offset 0). And the range is nonetheless **entirely
+  zero when the shader samples it**: base `0x303cd10000`, BC1_SRGB 3840×2160, read by
+  `0x300c150000`, `nonzero=0/512` at **+65.7 s** after its verified write. A second base,
+  `0x302a300000`, is zero on five samples across 152 s, the earliest only **2.0 s** after its write.
+  So this is a **lifetime** defect — something reclaims, zeroes or remaps these ranges between load
+  and use — not a read defect, and the pak reader is not the place to look. #3142.
+  - Two traps came out of it and are recorded in `GAME_COMPAT_ORCHESTRATION.md`: **235**, log line
+    order is not happens-before (the ordering above is a shared monotonic stamp, not line distance);
+    **236**, a verifier that compares populations instead of content reports MATCH on entirely
+    different bytes, and passes a mutation arm while doing so.
+
 - **"The biggest dropped stage is the title-screen background."** Falsified: `0x3011560000` was the
   largest single loss on this route — one instruction discarding **1536 full-screen 3840×2160 draws
   per boot** — and fixing it (#3138) left `max_nonblack` unchanged at **0.0069**, a menu-only title

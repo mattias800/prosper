@@ -8,6 +8,7 @@
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "diagnostics/diag_clock.hpp"
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "gpu/timeline/gpu_timeline.hpp" // optional exact guest-stdout capture gate
@@ -2667,6 +2668,93 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
     if (off < cap) out[off] = 0;
     return found;
 }
+// DIAGNOSTIC (PROSPER_APR_VERIFY): read the destination back through the SAME mechanism that wrote
+// it, in the same thread, immediately after the write returns -- and compare it against the source
+// buffer at identical offsets.
+//
+// This exists because `got=<size> OK` in the APR log proves only that the bytes were TRANSFERRED.
+// It does not prove they were non-zero (a pread over a sparse or wrongly-offset region returns full
+// size and zeros) and it does not prove they are still there when a consumer samples the address
+// later. #3142 is exactly that gap: a kernel-verified 4.7 MB write to 0x303cb90000 followed by an
+// all-zero read of the same address by the texture sampler.
+//
+// The comparison is source-vs-destination at the SAME offsets rather than against an expected
+// value, so it cannot be wrong about what it should have seen -- whatever the source holds is the
+// oracle. Reading back with process_vm_readv (not a raw dereference) keeps the probe from being a
+// new failure mode of its own: an unmapped destination reports UNREADABLE instead of faulting.
+//
+// PROSPER_APR_VERIFY=1 verifies every write; PROSPER_APR_VERIFY=0xADDR verifies only that
+// destination, which is what keeps the log readable on a title that streams thousands of chunks.
+static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
+    const char* ev = getenv("PROSPER_APR_VERIFY");
+    if (!ev || !*ev || size < 256) return;
+    const uint64_t t_us = prosper::diagnostics::diag_now_us();
+    const uint64_t want = strtoull(ev, nullptr, 0);
+    if (want > 0x1000ull && want != dst) return;
+
+    // POSITIVE CONTROL (PROSPER_APR_VERIFY_SELFTEST=1): deliberately corrupt the destination's first
+    // window before verifying, so the probe must report MISMATCH. Without this arm an all-MATCH
+    // census is void rather than negative -- it cannot distinguish "the write path never loses data"
+    // from "this comparison is incapable of reporting a loss". A clean zero has to be shown to be a
+    // zero the instrument could have broken.
+    bool selftest = false, poison_landed = false, poison_distinct = false;
+    if (getenv("PROSPER_APR_VERIFY_SELFTEST")) {
+        selftest = true;
+        // A pattern, not zeros. Zeroing a window whose source is ALREADY zero is undetectable by
+        // construction -- and on this data that is not rare: the source is ~5.6% non-zero, so an
+        // all-zero first window is common and padding is always one. A control that silently cannot
+        // fail on some inputs is the failure it exists to rule out.
+        // Stack-local, not static: several APR threads can be in here at once, and a shared
+        // mutable buffer is a data race even when every writer stores the same value.
+        uint32_t poison[64];
+        for (uint32_t i = 0; i < 64; ++i) poison[i] = 0xA5A5A5A5u;
+        poison_distinct = memcmp(buf, poison, sizeof poison) != 0;
+        struct iovec pl { (void*)poison, sizeof poison }, pr { (void*)(uintptr_t)dst, sizeof poison };
+        poison_landed =
+            process_vm_writev(getpid(), &pl, 1, &pr, 1, 0) == (ssize_t)sizeof poison;
+    }
+
+    const uint8_t* src = (const uint8_t*)buf;
+    uint32_t src_nz = 0, dst_nz = 0, sampled = 0, unreadable = 0, diverged = 0;
+    char detail[512];
+    int used = 0;
+    for (uint32_t s = 0; s < 8; ++s) {
+        const uint64_t off = (((size - 256ull) / 7ull) * s) & ~(uint64_t)3;
+        uint32_t back[64];
+        struct iovec bl { back, sizeof back }, br { (void*)(uintptr_t)(dst + off), sizeof back };
+        if (process_vm_readv(getpid(), &bl, 1, &br, 1, 0) != (ssize_t)sizeof back) {
+            ++unreadable;
+            used += snprintf(detail + used, sizeof detail - (size_t)used, " w%u=UNREADABLE", s);
+            continue;
+        }
+        const uint32_t* sw = (const uint32_t*)(src + off);
+        uint32_t sn = 0, dn = 0;
+        for (uint32_t k = 0; k < 64; ++k) {
+            ++sampled;
+            if (sw[k]) ++sn;
+            if (back[k]) ++dn;
+        }
+        src_nz += sn; dst_nz += dn;
+        // The verdict is BYTE IDENTITY, not equal population. Comparing non-zero counts would call a
+        // destination holding entirely different bytes a MATCH whenever the totals happened to
+        // agree, and would let a loss in one window cancel a gain in another. Both buffers are in
+        // hand, so there is no reason to compare anything weaker than the bytes.
+        if (memcmp(back, sw, sizeof back) != 0) ++diverged;
+        used += snprintf(detail + used, sizeof detail - (size_t)used, " w%u=%u/%u%s", s, dn, sn,
+                         memcmp(back, sw, sizeof back) ? "!" : "");
+    }
+    fprintf(stderr,
+            "[apr-verify] t=%llu dst=0x%llx size=%llu src_nonzero=%u/%u dst_nonzero=%u/%u %s%s\n",
+            (unsigned long long)t_us,
+            (unsigned long long)dst, (unsigned long long)size, src_nz, sampled, dst_nz, sampled,
+            unreadable      ? "UNREADABLE-WINDOWS"
+            : diverged      ? "MISMATCH-WRITE-LOST"
+            : selftest && !(poison_landed && poison_distinct)
+                            ? "SELFTEST-INVALID"
+                            : "MATCH",
+            detail);
+}
+
 static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     if (!size) return true;
     apr_dest_record(dst, size);
@@ -2679,7 +2767,10 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     // and marks every overlapping cache registration dirty.
     host::guest_write_watch_notify_host_write(dst, size);
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
-    if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) return true;
+    if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
+        apr_verify_write(dst, buf, size);
+        return true;
+    }
     bool committed = false;
     for (uint64_t p = dst & ~0xffffull; p < dst + size; p += 0x10000) {
         unsigned char vec;
@@ -2690,7 +2781,9 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
             committed = true;
     }
     if (!committed) return false;
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+    const bool retried = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+    if (retried) apr_verify_write(dst, buf, size);
+    return retried;
 }
 #endif
 
@@ -2702,6 +2795,13 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
 // #2139: APR is a DMA-style producer, so it must be able to write a destination page even when the
 // renderer/compute caches currently hold it write-protected for dirty tracking. Notifying first both
 // restores write access and dirties every overlapping cache registration, exactly as on POSIX.
+// PROSPER_APR_VERIFY is POSIX-only and this is the divergence, stated rather than left to be
+// discovered: the probe reads the destination back with process_vm_readv, which has no direct
+// Windows equivalent in this file's toolkit, so a Windows run of that switch prints nothing at all
+// rather than printing a wrong answer. The comment above warns that two builders differing in how
+// they write a destination is the failure the shared core exists to prevent -- that warning is about
+// the WRITE, which is still shared. Only the verification is missing here. If a Windows guest-memory
+// defect ever needs this, ReadProcessMemory against the current process is the sibling to add.
 static bool apr_write_guest_dst(uint64_t dst, void* src, uint64_t bytes) {
     if (!bytes) return true;
     host::guest_write_watch_notify_host_write(dst, bytes);

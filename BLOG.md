@@ -19,6 +19,32 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-30
+
+### Stray's black title screen is not a loading failure — the data arrives, then leaves
+
+No picture in this one: the title screen still renders black, so there is nothing new to look at. But
+we now know what is *not* wrong, and that took four instruments.
+
+The 4K background reads its texture from the game's pak. That read works. It delivers the bytes
+byte-for-byte — verified by re-reading each destination immediately after the write and `memcmp`ing
+it against the source, 21,499 of 21,499 writes on the title route — and a plain `dd` of the pak from
+outside the emulator agrees with what landed in memory, exactly. Sixty-five seconds later, when the
+shader samples that same address, it is entirely zero. Another surface is already zero **two seconds**
+after its write, and stays zero across five samples and 152 seconds.
+
+So something reclaims these ranges between load and use, and the pak reader — where this
+investigation spent its first day — was never the place to look.
+
+Two things nearly sent us the wrong way, and both are worth repeating. We argued the read finished
+first because it appeared 1,428 log lines earlier; that is not evidence at all, since those lines come
+from different threads sharing one stderr. And the write-verifier initially compared *counts* of
+non-zero values rather than the values themselves, so it would have called a completely different
+buffer a match — and it passed its own mutation test while doing so. Both are now recorded as
+instrument traps, because the failure that survives a green test is the expensive kind.
+
+[#3142](https://github.com/mattias800/prosper/issues/3142)
+
 ## 2026-08-29
 
 ### Tactics Ogre: Reborn comes back from 25 days of black
