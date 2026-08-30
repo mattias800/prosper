@@ -465,7 +465,9 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
                                          uint32_t pcrel_dispatch_target = UINT32_MAX,
                                          const FragmentInterpolationLayout* interpolation = nullptr,
-                                         bool wave32 = false);
+                                         bool wave32 = false,
+                                         RecompileDiagnosticContext diagnostic = {
+                                             RecompileDiagnosticStage::Fragment, 0});
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.

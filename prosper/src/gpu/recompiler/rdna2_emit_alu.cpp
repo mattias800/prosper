@@ -7005,9 +7005,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 int ud_origin = 0;
                 const bool has_ud_alias = sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin);
                 const ShaderResource* pa = has_ud_alias ? rt->by_sgpr_base(ud_origin) : nullptr;
-                fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s written=%d (%zu res)\n",
+                fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u op=0x%02x storage=%d srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s written=%d (%zu res)\n",
                         (unsigned long long)b.diagnostic.program_address,
-                        in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
+                        in.pc, in.opcode, (int)storage_only_op,
+                        in.src[1].value, has_srt_tag ? "" : "NONE ",
                         has_srt_tag ? srt_tag : 0u,
                         pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
