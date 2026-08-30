@@ -963,18 +963,24 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     // is_live_render_target() is safe to call here only because PROSPER_TEXCONTENT
                     // is in parallel_draw_diagnostic_active()'s list, so draw realization is serial
                     // while this diagnostic is armed. That callback drains and mutates the renderer's
-                    // write queue; calling it from parallel workers is UB and perturbs the very cache
-                    // state this reports.
+                    // write queue, and calling it from parallel workers is UB.
+                    // Serialising fixes the UB and nothing else: the callback still runs once per
+                    // large texture slot per draw, so this diagnostic still shifts the timing of the
+                    // very write queue it reports on. Arming it changes when guest writes land, which
+                    // is why a content verdict from a PROSPER_TEXCONTENT run is evidence about that
+                    // run and not about a default one.
                     const bool cached = prosper::gpu::is_live_render_target(d.base);
                     const int verdict = ((sampled_dwords == 0) ? 0 : (nonzero == 0 ? 1 : 2)) |
                                         (cached ? 4 : 0);
-                    // Deduped on (base, VERDICT), never on base alone. An address-keyed probe reports
-                    // whatever the FIRST observation saw, which on a long run is the boot-time state,
-                    // so a surface filled moments later still reads as empty. That mistake cost three
-                    // published corrections before it was caught.
-                    // Keyed on (shader, base, verdict): the same surface is sampled by several
-                    // stages, and "which shader reads a surface that is empty" is the question this
-                    // answers -- a base-only key reports one sampler and hides the rest.
+                    // Deduped on (SHADER, base, VERDICT), never on base alone, and every part of
+                    // that key earns its place:
+                    //   - verdict, because an address-keyed probe reports whatever the FIRST
+                    //     observation saw, which on a long run is the boot-time state -- a surface
+                    //     filled moments later still reads as empty. That mistake cost three
+                    //     published corrections before it was caught.
+                    //   - shader, because the same surface is sampled by several stages, and "which
+                    //     shader reads a surface that is empty" is the question this answers. A key
+                    //     without it reports one sampler and hides the rest.
                     static std::mutex cmx;
                     static std::set<std::tuple<const void*, uint64_t, int>> cseen;
                     std::lock_guard<std::mutex> lk(cmx);
