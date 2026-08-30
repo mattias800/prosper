@@ -1475,6 +1475,12 @@ static int64_t read_full(int fd, void* buf, size_t count, bool positioned, off_t
     // read succeeds, and mark it Dirty since its bytes are changing (#1144 B5). No-op off Linux / when
     // nothing is armed.
     host::guest_write_watch_notify_host_write(reinterpret_cast<uint64_t>(buf), count);
+    // Paired below on every exit from the loop: the write is in flight until the last byte lands, and
+    // nothing may re-arm a watch over `buf` before then (#3146 review B1).
+    struct HostWriteDone {
+        uint64_t addr; uint64_t size;
+        ~HostWriteDone() { host::guest_write_watch_notify_host_write_done(addr, size); }
+    } host_write_done{reinterpret_cast<uint64_t>(buf), count};
     size_t done = 0;
     while (done < count) {
         ssize_t r = positioned ? ::pread(fd, (char*)buf + done, count - done, off + (off_t)done)
@@ -1598,11 +1604,24 @@ static void disarm_iovec_watches(const struct iovec* v, int n) {
             host::guest_write_watch_notify_host_write(
                 reinterpret_cast<uint64_t>(v[i].iov_base), v[i].iov_len);
 }
+// The completion half. This path is why it exists: it notifies for EVERY iovec BEFORE the single
+// ::readv/::preadv runs, so between the first notification and the syscall there is a window in which
+// a watch could be re-armed over a buffer the read is about to fill -- and the store would then hit a
+// read-only page and EFAULT the read. Calling this after the syscall closes the window (#3146 B1).
+void rearm_iovec_watches(const struct iovec* v, int n) {
+    if (!v || n <= 0) return;
+    for (int i = 0; i < n; ++i)
+        if (v[i].iov_base && v[i].iov_len)
+            host::guest_write_watch_notify_host_write_done(
+                reinterpret_cast<uint64_t>(v[i].iov_base), v[i].iov_len);
+}
 HLE(f_readv)  { const struct iovec* v = (const struct iovec*)P(a1); disarm_iovec_watches(v, (int)a2);
-                return (uint64_t)(int64_t)::readv((int)a0, v, (int)a2); }
+                const uint64_t r = (uint64_t)(int64_t)::readv((int)a0, v, (int)a2);
+                rearm_iovec_watches(v, (int)a2); return r; }
 HLE(f_writev) { return (uint64_t)(int64_t)::writev((int)a0, (const struct iovec*)P(a1), (int)a2); }
 HLE(f_preadv) { const struct iovec* v = (const struct iovec*)P(a1); disarm_iovec_watches(v, (int)a2);
-                return (uint64_t)(int64_t)::preadv((int)a0, v, (int)a2, (off_t)a3); }
+                const uint64_t r = (uint64_t)(int64_t)::preadv((int)a0, v, (int)a2, (off_t)a3);
+                rearm_iovec_watches(v, (int)a2); return r; }
 HLE(f_pwritev){ return (uint64_t)(int64_t)::pwritev((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
 #else
 // Windows positioned/vectored IO. MinGW has no pread/pwrite/*v, and these previously returned -1
@@ -2919,6 +2938,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     host::guest_write_watch_notify_host_write(dst, size);
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
+        host::guest_write_watch_notify_host_write_done(dst, size);
         apr_verify_write(dst, buf, size);
         zerowatch_arm(dst, buf, size, "direct");
         return true;

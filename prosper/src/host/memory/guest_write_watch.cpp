@@ -500,6 +500,7 @@ void guest_write_watch_invalidate_all() {
 
 // Windows never arms pages (create() always refuses), so a host/kernel write can never EFAULT here.
 void guest_write_watch_notify_host_write(uint64_t, uint64_t) {}
+void guest_write_watch_notify_host_write_done(uint64_t, uint64_t) {}
 void guest_write_watch_notify_gpu_write(uint64_t, uint64_t) {}
 
 bool guest_write_watch_handle_fault(uint64_t addr) {
@@ -618,6 +619,9 @@ struct DmemTraceState {
     uint64_t selection_uncertain_faults = 0;
     uint64_t completed_steps = 0;
     uint64_t rearms = 0;
+    // Re-arms caused specifically by a host-write rebaseline. Distinct from `rearms`, which the
+    // ordinary per-step re-arm also bumps -- see trace_rebase_locked.
+    uint64_t host_write_rebases = 0;
     // #3146: set when a host write disarmed the trace and PROSPER_DMEM_WRITE_TRACE_REBASE asked for
     // a re-baseline rather than a permanent invalidation. Cleared when the re-arm succeeds.
     bool rebase_pending = false;
@@ -652,6 +656,12 @@ struct WatchState {
     // exact thread owns the diagnostic's one-instruction step.
     std::atomic<int64_t> pending_trace_step_tid{0};
     DmemTraceState trace;
+    // Host writes currently between their notification and their completion. The notify contract is
+    // "notify, then write", so a nonzero depth means bytes may land in a watched page at any moment
+    // and nothing may re-arm it. Incremented by guest_write_watch_notify_host_write and decremented
+    // by its paired ..._done; a caller that never pairs simply keeps rebaselining disabled, which is
+    // the safe direction.
+    int host_writes_in_flight = 0;
 };
 static_assert(std::atomic<int64_t>::is_always_lock_free,
               "the signal-path pending-step discriminator must be lock-free");
@@ -1472,7 +1482,7 @@ void guest_dmem_write_trace_report() {
                  "[dmem-write-trace] summary status=%s reason=%s result=%s"
                  " allocation-matches=%llu mapping-matches=%llu page-faults=%llu"
                  " selected-faults=%llu selection-uncertain-faults=%llu"
-                 " steps=%llu rearms=%llu coverage-gaps=%llu"
+                 " steps=%llu rearms=%llu host-write-rebases=%llu coverage-gaps=%llu"
                  " overflow=%llu occurrence-mode=%s requested-occurrence=%u"
                  " observed-occurrences=%llu selected-occurrence=%llu events=%u/%u\n",
                  trace_status_name(trace.status), trace_reason_name(trace.invalid_reason), result,
@@ -1483,6 +1493,7 @@ void guest_dmem_write_trace_report() {
                  static_cast<unsigned long long>(trace.selection_uncertain_faults),
                  static_cast<unsigned long long>(trace.completed_steps),
                  static_cast<unsigned long long>(trace.rearms),
+                 static_cast<unsigned long long>(trace.host_write_rebases),
                  static_cast<unsigned long long>(trace.coverage_gaps),
                  static_cast<unsigned long long>(trace.overflow_events),
                  trace.config.allocation_occurrence ? "ordinal" : "unique",
@@ -1734,6 +1745,23 @@ bool trace_rebase_locked(WatchState& w) {
     DmemTraceState& trace = w.trace;
     if (!trace.rebase_pending) return false;
     if (!w.fault_onstack.load(std::memory_order_acquire)) return false;
+    // B1: never re-arm while a host write is IN FLIGHT. The notification contract is "notify, then
+    // write", and the write does not happen under this mutex -- so "the write that is notifying now
+    // does not overlap" is not the same as "no overlapping write is running". The vectored read path
+    // makes that deterministic without any concurrency: it notifies for EVERY iovec before calling
+    // ::preadv, so an iovec in the watched buffer plus an iovec in another dmem alias would disarm,
+    // re-arm, and then EFAULT the read -- the exact failure the disarm exists to prevent.
+    if (w.host_writes_in_flight != 0) return false;
+    // B3: rebuild the page/alias list rather than re-arming the one captured at arm time. Every
+    // mapping and protection hook gates on Armed||Stepping, so nothing maintained that list while the
+    // trace sat pending -- and mprotect'ing a stale entry would make an unrelated guest mapping
+    // read-only and record fabricated events against it. That is the one route by which a rebaselined
+    // trace could MISATTRIBUTE, which matters because its output is being used to reclassify a defect.
+    if (!trace_collect_pages_locked(w)) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged);
+        trace.rebase_pending = false;
+        return false;
+    }
     if (!set_trace_armed_locked(w, true, false)) return false;
     if (!trace_copy_target_locked(trace, trace.initial)) {
         (void)set_trace_armed_locked(w, false, false);
@@ -1743,6 +1771,11 @@ bool trace_rebase_locked(WatchState& w) {
     trace.invalid_reason = GuestDmemWriteTraceInvalidReason::None;
     trace.rebase_pending = false;
     trace.rearms++;
+    // B2: `rearms` alone cannot say a run was rebaselined -- the ordinary per-step re-arm bumps the
+    // same counter. A rebaselined trace answers a strictly weaker question ("who wrote since the last
+    // host write"), so a reader must be able to tell, and clearing invalid_reason erases the only
+    // other trace of it.
+    trace.host_write_rebases++;
     return true;
 }
 
@@ -1786,6 +1819,10 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // the feature is off (the default) nothing is ever armed, so skip without even taking the lock.
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
     std::lock_guard lock(w.mutex);
+    // Counted for the whole call, not just the overlapping case: an iovec that misses the watched
+    // range still means a read is about to run, and the vectored path notifies every iovec before
+    // any of them is written.
+    ++w.host_writes_in_flight;
     // A host/kernel store into an armed (read-only) guest page would EFAULT — e.g. sceKernelPread
     // streaming texture bytes straight into a watched dmem buffer returns an I/O error where real
     // hardware succeeds (review B5). The HLE calls this by guest VA range BEFORE such a write: restore
@@ -1828,6 +1865,17 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     if (hit.empty()) return;
     set_pages_armed(w, hit, false);
     for (WatchedPage* page : hit) page->generation++;
+}
+
+// Paired with guest_write_watch_notify_host_write: called AFTER the host write has completed, so the
+// trace knows no bytes are in flight and a rebaseline may safely re-arm. Unpaired callers are safe --
+// the depth simply stays nonzero and rebaselining stops, which is the direction that cannot corrupt.
+void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size) {
+    if (!addr || !size || addr > UINT64_MAX - size) return;
+    WatchState& w = state();
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(w.mutex);
+    if (w.host_writes_in_flight > 0) --w.host_writes_in_flight;
 }
 
 void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {

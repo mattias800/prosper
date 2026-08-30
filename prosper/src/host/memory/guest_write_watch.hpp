@@ -198,6 +198,8 @@ void guest_write_watch_invalidate_all();
 // read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages
 // the range overlaps and marks them Dirty. No-op on Windows/macOS (no pages are ever armed there).
 void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
+// Paired completion for the call above. Optional: not calling it only disables rebaselining.
+void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size);
 
 // Device/DMA writes already carry an exact guest VA range. Mark only registrations whose logical
 // source overlaps that range; unlike a CPU protection fault, an adjacent write on the same host page
