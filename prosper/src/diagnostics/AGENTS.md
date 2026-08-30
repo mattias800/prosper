@@ -35,3 +35,12 @@ So when adding anything here, ask which half it belongs to. A new *report* or ag
 `core/`/`storage/` work and may stay behind `PROSPER_DIAGNOSTICS`. A new signal that answers
 "where did it stop?" must be reachable without a rebuild, or it will be missing on the day it
 matters.
+
+`diag_clock.hpp` is the second thing on the always-reachable side, and it is here rather than in a
+subsystem because its whole purpose is to be shared. Diagnostics in different subsystems write to
+one stderr stream from different threads, so their line order carries no ordering information —
+comparing two of them by position in a log is unsound, and doing exactly that produced a wrong
+published conclusion on #3142. `diag_now_us()` gives them a common monotonic reading; steady_clock
+is process-wide, so independently taken values in unrelated translation units compare directly with
+no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
+subsystem should stamp it rather than grow a private clock.
