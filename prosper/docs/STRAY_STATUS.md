@@ -315,6 +315,15 @@ drops still discard the background.
     disposes of its buffer correctly, and prosper's defect is that a shader still reads that address
     afterwards. The open question is now a descriptor one — why `0x300c150000`'s texture resolves to a
     staging buffer the engine has finished with — which also fits its `rtt=MISS`. #3142.
+
+    **And it is NOT why the background is black** — established after the above and worth stating
+    here, because the reclassification reads like a lead and is not one. The graphics RTT sampler
+    resolves these surfaces correctly: a landed title-screen run measures **58,569 sample HITs against
+    185 misses and 5 skips**, and all five skips are 32x32/64x64 3D textures. `PROSPER_RTT=1` renders
+    no additional pixel. So the composite reads black because its INPUTS are black at source (see the
+    section of that name), not because a sample was served from cleared guest memory. The staging
+    buffer being cleared is ordinary engine behaviour with no bearing on the picture. #3140 is
+    falsified; do not restart from the RTT cache.
   - Four mechanisms measured and excluded, each in the same runs: **`dmem_zero`'s hole punch** (all 20
     calls occur at startup, before every one of these writes); **a re-map of the VA** (one `[physmap]`
     per VA, created ~2 ms *before* its write, none after); **a second VA aliasing the phys** (none —
@@ -333,9 +342,8 @@ drops still discard the background.
     guest memory in the tree are file reads), so it could never watch a range APR loads into — it
     reported `page-faults=0` because the watch died at the load, not because no guest write happened.
     **[#3147](https://github.com/mattias800/prosper/pull/3147) lifts that** with an opt-in
-    re-baseline mode, and the `libc.prx` attribution above is measured **with that PR applied**: on
-    master alone the trace still disarms at the load and reproduces nothing. If #3147 is merged when
-    you read this, drop this caveat; if it was closed, the attribution needs re-deriving.
+    re-baseline mode (`PROSPER_DMEM_WRITE_TRACE_REBASE=1`), which is what makes the `libc.prx`
+    attribution above reproducible.
     A `SIGSEGV` trap hand-rolled to get the RIP directly killed the run at asset load and was removed
     rather than debugged — extending the existing trace's lifecycle was the route, not a second
     write-watch fighting the first.

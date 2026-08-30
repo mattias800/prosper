@@ -47,6 +47,7 @@
 // For other titles, set the appropriate env before running (e.g. a UE4 title:
 // PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1).
 #include "loader/linker.hpp"          // Program
+#include "host/memory/guest_write_watch.hpp"
 #include "host/image/boot_program.hpp"       // boot_program
 #include "host/image/exec_image.hpp"         // run_entry
 #include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
@@ -965,5 +966,11 @@ int main(int argc, char** argv) {
             tracker.max_pixel_stale_seconds(),
             screenshot::guest_run_state_name(guest_outcome.state), verdict.status);
     gpu::close_gpu_timeline();
+    // The dmem write trace registers its report with std::atexit, which _exit does not run -- so on
+    // every screenshot run the trace was recording writer RIPs and printing them nowhere. This is the
+    // frontend the project uses for progression and investigation evidence, and prosper-app already
+    // reports here; the asymmetry was silent, because a diagnostic that produces no output looks
+    // exactly like one that found nothing. Report before exiting, as prosper-app does.
+    prosper::host::guest_dmem_write_trace_report();
     _exit(verdict.exit_code);   // the guest thread is detached and running guest code; don't block on teardown
 }
