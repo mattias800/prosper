@@ -1,5 +1,6 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
 #include <algorithm>
 #include <climits>
@@ -917,6 +918,82 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                         }
                     }
                     tseen[key] = done;
+                }
+            }
+            // PROSPER_TEXCONTENT=1 -- for every large sampled texture, report BOTH sources a
+            // sample can come from: whether its guest memory holds anything, and whether the
+            // renderer's own cache calls it authoritative. Reporting only one is how #3126 produced
+            // a false alarm -- an address the renderer authored is legitimately zero in guest
+            // memory, because its pixels live in the cache.
+            //
+            // Deduped on (base, VERDICT), never on base alone. An address-keyed probe reports
+            // whatever the FIRST decode saw, which on a long run is the boot-time state, so a
+            // surface filled moments later still reads as empty. That mistake cost three published
+            // corrections on #3140 before it was caught; with the verdict in the key a state change
+            // prints and "it was empty" cannot masquerade as "it is empty".
+            if (getenv("PROSPER_TEXCONTENT") && d.width >= 1920u && d.height >= 1080u &&
+                d.base > 0x1000000000ull) {
+                // BYTES, not texels. Offsets computed in texels and applied as byte addresses sample
+                // only the first bytes-per-texel'th of an RGBA8 surface -- reporting a false
+                // ALL-ZERO for anything below that -- and run PAST the end of a BCn one, reporting a
+                // false has-content from unrelated memory. The block arithmetic is the same one
+                // PROSPER_DUMP_TILERAW uses above.
+                Gen5ImageFormatInfo cfi;
+                const bool cfmt = gen5_image_format(d.format, &cfi) && cfi.bytes_per_block &&
+                                  cfi.block_width && cfi.block_height;
+                const uint64_t span =
+                    cfmt ? (uint64_t)((d.width + cfi.block_width - 1) / cfi.block_width) *
+                               ((d.height + cfi.block_height - 1) / cfi.block_height) *
+                               cfi.bytes_per_block
+                         : 0ull;
+                if (cfmt && span >= 256) {
+                    uint32_t nonzero = 0, sampled_dwords = 0;
+                    for (uint32_t s = 0; s < 8; ++s) {
+                        // Every 256-byte window stays inside the footprint: the last one starts at
+                        // span-256 rather than at 7/8 of span plus a read that would overrun.
+                        const uint64_t off = ((span - 256ull) / 7ull) * s;
+                        const uint64_t addr = d.base + (off & ~(uint64_t)3);
+                        if (!guest_readable(addr, 256)) continue;
+                        const uint32_t* words = (const uint32_t*)(uintptr_t)addr;
+                        for (uint32_t k = 0; k < 64; ++k) {
+                            ++sampled_dwords;
+                            if (words[k]) ++nonzero;
+                        }
+                    }
+                    // is_live_render_target() is safe to call here only because PROSPER_TEXCONTENT
+                    // is in parallel_draw_diagnostic_active()'s list, so draw realization is serial
+                    // while this diagnostic is armed. That callback drains and mutates the renderer's
+                    // write queue, and calling it from parallel workers is UB.
+                    // Serialising fixes the UB and nothing else: the callback still runs once per
+                    // large texture slot per draw, so this diagnostic still shifts the timing of the
+                    // very write queue it reports on. Arming it changes when guest writes land, which
+                    // is why a content verdict from a PROSPER_TEXCONTENT run is evidence about that
+                    // run and not about a default one.
+                    const bool cached = prosper::gpu::is_live_render_target(d.base);
+                    const int verdict = ((sampled_dwords == 0) ? 0 : (nonzero == 0 ? 1 : 2)) |
+                                        (cached ? 4 : 0);
+                    // Deduped on (SHADER, base, VERDICT), never on base alone, and every part of
+                    // that key earns its place:
+                    //   - verdict, because an address-keyed probe reports whatever the FIRST
+                    //     observation saw, which on a long run is the boot-time state -- a surface
+                    //     filled moments later still reads as empty. That mistake cost three
+                    //     published corrections before it was caught.
+                    //   - shader, because the same surface is sampled by several stages, and "which
+                    //     shader reads a surface that is empty" is the question this answers. A key
+                    //     without it reports one sampler and hides the rest.
+                    static std::mutex cmx;
+                    static std::set<std::tuple<const void*, uint64_t, int>> cseen;
+                    std::lock_guard<std::mutex> lk(cmx);
+                    if (cseen.insert({shdr.code, d.base, verdict}).second)
+                        fprintf(stderr,
+                                "[texcontent] shader=%p base=0x%llx %ux%u fmt=%u bytes=%llu "
+                                "nonzero=%u/%u %s rtt=%s\n",
+                                shdr.code,
+                                (unsigned long long)d.base, d.width, d.height, d.format,
+                                (unsigned long long)span, nonzero, sampled_dwords,
+                                sampled_dwords == 0 ? "UNREADABLE"
+                                                    : (nonzero == 0 ? "ALL-ZERO" : "has-content"),
+                                cached ? "authoritative" : "MISS");
                 }
             }
             if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_TEXLOG")) {

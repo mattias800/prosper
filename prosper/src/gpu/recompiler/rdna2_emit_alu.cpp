@@ -6948,6 +6948,41 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Ungated, and deduped per (pc, srsrc). It fires only when an image op has already
                 // failed to resolve, so its volume is bounded by the defect it reports. Behind
                 // PROSPER_DBG it was unreachable in practice on any routed boot.
+            // PROSPER_MIMG_SOFT=1 -- diagnostic only, and deliberately WRONG output.
+            //
+            // Placed BEFORE the reporting dedupe below on purpose. That dedupe fires once per
+            // (program, pc, srsrc); downstream of it, only the FIRST compile of each site would be
+            // softened and every later one -- reachable through ordinary shader-cache eviction --
+            // would take the reject path unchanged. The recorded result would then be
+            // indistinguishable from "nothing was softened", which is exactly the reading this
+            // diagnostic exists to produce. When an image
+            // op cannot resolve its descriptor, write a constant instead of failing the stage, so a
+            // frame can be seen that would otherwise be discarded entirely. It answers one question
+            // nothing else here can: how much of the picture is riding on THIS resolution failure.
+            // On Stray it showed the answer was "none" -- the composite compiled and the frame did
+            // not change -- which is what redirected #3126 away from the recompiler.
+            //
+            // Never acceptable in a run that produces progression evidence: every unresolved sample
+            // reads a flat value.
+            if (!res && getenv("PROSPER_MIMG_SOFT")) {
+                const uint32_t soft = b.uconst(fbits(0.5f));
+                uint32_t comps = 0;
+                for (uint32_t m = 0; m < 4; ++m) if (in.mimg_dmask & (1u << m)) ++comps;
+                if (!comps) comps = 1;
+                for (uint32_t k = 0; k < comps; ++k) {
+                    const int dst = in.dst.value + static_cast<int>(k);
+                    if (dst < 0) break;
+                    const uint32_t old = vreg_old(b, rs, dst);
+                    rs.vreg[dst] = soft;
+                    predicate_write(b, rs, dst, old);
+                }
+                static std::mutex smx; static std::set<uint64_t> sseen;
+                std::lock_guard<std::mutex> lk(smx);
+                if (sseen.insert(((uint64_t)b.diagnostic.program_address << 16) | in.pc).second)
+                    fprintf(stderr, "[mimg-soft] program=0x%llx pc=%u -> constant %u comps\n",
+                            (unsigned long long)b.diagnostic.program_address, in.pc, comps);
+                return true;
+            }
                 static std::mutex mimg_mutex;
                 // Keyed by PROGRAM as well as (pc, srsrc): every shader has a pc 16, so a
                 // pc-only key lets the first program to reach one silence all later programs and
