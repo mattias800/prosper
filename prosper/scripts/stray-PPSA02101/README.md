@@ -3,8 +3,29 @@
 `reach-first-map.pad` drives the boot past the **brightness-calibration screen** to the first map
 load.
 
-`reach-title-flip.pad` stops one screen earlier — it reaches the **title screen** and holds there —
-and it is the one to use for anything that has to be reproducible.
+`reach-title-flip.pad` was landed as "reaches the title screen and holds there". **Measured 2026-08-30,
+that is wrong**: over a 320 s run all 16 captured frames are the brightness-calibration screen
+(`max_nonblack` 0.1140). Its single flip-anchored Cross does not accept. Treat it as a deterministic
+way to *hold calibration*, which is still useful — that screen renders correctly and is a stable
+oracle — but not as a title-screen route.
+
+**`reach-title-hold.pad` is the title route**, and it needs `PROSPER_NULL_PAGE=1`. Without that the
+run either faults with a `[nullpage]` report or survives and renders pure black after Accept. With it
+the route lands on the title screen (`max_nonblack` 0.0069, held) in roughly **one run in three**, so
+repeat any measurement rather than trusting one arm.
+
+```bash
+PROSPER_NULL_PAGE=1 \
+PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-title-hold.pad \
+  ./build-linux/screenshot <DUMP_ROOT>/PPSA02101-app0 \
+    --seconds 6 --count 30 --warmup-seconds 140 --timeout 360 \
+    --allow-guest-fault --no-stop-after-guest-fault --out <OUTDIR>
+```
+
+Frames 09-28 settle at 0.0069 when it lands. It presses Cross twice (t=150 and t=160): the first
+accepts calibration, and the second is the margin for a slow boot — on a fast one it lands on the
+title menu's already-selected `START GAME`, which is why a window that runs far past t=160 can catch
+a load instead of the title.
 
 ## Why the title route is anchored on flips, not seconds
 

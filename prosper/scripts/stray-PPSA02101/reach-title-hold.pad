@@ -1,0 +1,11 @@
+# Stray (PPSA02101) -- accept the brightness calibration and HOLD on the title screen.
+#
+# TIMING MEASURED 2026-08-29, not inherited. A no-input boot settles on the calibration screen at
+# t~140 s (nonblack 0.1097, then constant to t=270 s), NOT the much earlier point the 2026-08-22
+# routes assume. The committed reach-first-map.pad presses Cross every 3 s from t=3, so on today's
+# build every one of those presses lands before there is anything to accept.
+#
+# Cross accepts calibration (its own prompt bar names it). A few spaced presses after the screen is
+# up, then silence, so the title screen holds for the rest of the run instead of being selected past.
+150-150.5:cross
+160-160.5:cross
