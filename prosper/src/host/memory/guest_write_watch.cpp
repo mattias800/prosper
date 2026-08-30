@@ -622,6 +622,9 @@ struct DmemTraceState {
     // Re-arms caused specifically by a host-write rebaseline. Distinct from `rearms`, which the
     // ordinary per-step re-arm also bumps -- see trace_rebase_locked.
     uint64_t host_write_rebases = 0;
+    // Rebaseline attempts that could not complete. Without this a refusal is invisible and reads
+    // exactly like the mode being off.
+    uint64_t rebase_failures = 0;
     // #3146: set when a host write disarmed the trace and PROSPER_DMEM_WRITE_TRACE_REBASE asked for
     // a re-baseline rather than a permanent invalidation. Cleared when the re-arm succeeds.
     bool rebase_pending = false;
@@ -1483,7 +1486,7 @@ void guest_dmem_write_trace_report() {
                  "[dmem-write-trace] summary status=%s reason=%s result=%s"
                  " allocation-matches=%llu mapping-matches=%llu page-faults=%llu"
                  " selected-faults=%llu selection-uncertain-faults=%llu"
-                 " steps=%llu rearms=%llu host-write-rebases=%llu coverage-gaps=%llu"
+                 " steps=%llu rearms=%llu host-write-rebases=%llu rebase-failures=%llu coverage-gaps=%llu"
                  " overflow=%llu occurrence-mode=%s requested-occurrence=%u"
                  " observed-occurrences=%llu selected-occurrence=%llu events=%u/%u\n",
                  trace_status_name(trace.status), trace_reason_name(trace.invalid_reason), result,
@@ -1495,6 +1498,7 @@ void guest_dmem_write_trace_report() {
                  static_cast<unsigned long long>(trace.completed_steps),
                  static_cast<unsigned long long>(trace.rearms),
                  static_cast<unsigned long long>(trace.host_write_rebases),
+                 static_cast<unsigned long long>(trace.rebase_failures),
                  static_cast<unsigned long long>(trace.coverage_gaps),
                  static_cast<unsigned long long>(trace.overflow_events),
                  trace.config.allocation_occurrence ? "ordinal" : "unique",
@@ -1752,23 +1756,41 @@ bool trace_rebase_locked(WatchState& w) {
     // makes that deterministic without any concurrency: it notifies for EVERY iovec before calling
     // ::preadv, so an iovec in the watched buffer plus an iovec in another dmem alias would disarm,
     // re-arm, and then EFAULT the read -- the exact failure the disarm exists to prevent.
-    for (const DmemTracePage& page : trace.pages)
-        for (const PageAlias& alias : page.aliases)
-            for (const auto& range : w.host_write_ranges)
-                if (alias.addr >= range.first && alias.addr < range.second) return false;
+    // (the in-flight check moved below trace_collect_pages_locked -- see there)
     // B3: rebuild the page/alias list rather than re-arming the one captured at arm time. Every
     // mapping and protection hook gates on Armed||Stepping, so nothing maintained that list while the
     // trace sat pending -- and mprotect'ing a stale entry would make an unrelated guest mapping
     // read-only and record fabricated events against it. That is the one route by which a rebaselined
     // trace could MISATTRIBUTE, which matters because its output is being used to reclassify a defect.
     if (!trace_collect_pages_locked(w)) {
-        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged);
+        // B7: trace_invalidate_locked early-returns when the status is already Invalid, and this
+        // function is only reached in that state -- so calling it here recorded NOTHING and the
+        // summary stayed indistinguishable from a mode-off run. Set the reason directly and stop
+        // retrying, so a topology change is visible in the summary rather than silent.
+        trace.invalid_reason = GuestDmemWriteTraceInvalidReason::MappingTopologyChanged;
         trace.rebase_pending = false;
+        trace.rebase_failures++;
         return false;
     }
-    if (!set_trace_armed_locked(w, true, false)) return false;
+    // B6: this check belongs AFTER the rebuild, because the point of the rebuild is that the old
+    // list may be stale -- a new alias of the traced phys can appear during the pending window
+    // (notify_direct_mapping_added appends unconditionally while its trace block gates on
+    // Armed||Stepping), and guarding the list we are about to REPLACE would arm that new alias with
+    // no check at all, re-opening the EFAULT this guard exists to close.
+    for (const DmemTracePage& page : trace.pages)
+        for (const PageAlias& alias : page.aliases)
+            for (const auto& range : w.host_write_ranges)
+                if (alias.addr >= range.first && alias.addr < range.second) {
+                    trace.rebase_failures++;
+                    return false;
+                }
+    if (!set_trace_armed_locked(w, true, false)) {
+        trace.rebase_failures++;
+        return false;
+    }
     if (!trace_copy_target_locked(trace, trace.initial)) {
         (void)set_trace_armed_locked(w, false, false);
+        trace.rebase_failures++;
         return false;
     }
     trace.status = GuestDmemWriteTraceStatus::Armed;
@@ -1861,7 +1883,13 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // and its own range is excluded by the overlap test above. Recording first made the guard see its
     // own notification and refuse every rebaseline, silently turning the feature off -- caught only
     // by re-running the measurement that motivated it, not by any test.
-    w.host_write_ranges.emplace_back(begin, end);
+    //
+    // Gated on the rebaseline mode, and that gate is load-bearing rather than tidy: this runs before
+    // EVERY guest read on a path where `fault_onstack` is true on any ordinary Linux boot, several
+    // callers never pair a completion, and the erase matches an exact (begin,end) -- so ungated this
+    // is an unbounded vector plus an O(N) scan under this mutex on the default path. A diagnostic
+    // must cost nothing when it is off.
+    if (trace_rebase_enabled()) w.host_write_ranges.emplace_back(begin, end);
     std::vector<WatchedPage*> hit;
     for (uint64_t va = begin; va < end; va += kPage) {
         auto it = w.pages_by_addr.find(va);
@@ -1879,6 +1907,7 @@ void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size) {
     if (!addr || !size || addr > UINT64_MAX - size) return;
     WatchState& w = state();
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
+    if (!trace_rebase_enabled()) return;   // nothing is ever recorded when the mode is off
     std::lock_guard lock(w.mutex);
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);

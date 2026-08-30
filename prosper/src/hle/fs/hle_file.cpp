@@ -1608,7 +1608,7 @@ static void disarm_iovec_watches(const struct iovec* v, int n) {
 // ::readv/::preadv runs, so between the first notification and the syscall there is a window in which
 // a watch could be re-armed over a buffer the read is about to fill -- and the store would then hit a
 // read-only page and EFAULT the read. Calling this after the syscall closes the window (#3146 B1).
-void rearm_iovec_watches(const struct iovec* v, int n) {
+static void rearm_iovec_watches(const struct iovec* v, int n) {
     if (!v || n <= 0) return;
     for (int i = 0; i < n; ++i)
         if (v[i].iov_base && v[i].iov_len)
