@@ -63,7 +63,11 @@ One compute program, `0x3011300000`, accounts for ~605 ms of that at roughly 32 
 3840×2160. So the cost is on the host side of the boundary, and pointing a GPU profiler at this title
 answers a question it does not have. Detail on [#3126](https://github.com/mattias800/prosper/issues/3126).
 
-## The title-screen defect, as far as it is established
+## The unresolved image ops — established on CALIBRATION
+
+> **The five-op census below was read on the calibration screen**, like every other live census above
+> § *The title screen's REAL numbers*. The resource-table finding it rests on is a statement about
+> shader stages and holds regardless of screen; the count of five does not.
 
 `[mimg-unresolved]` reports five image ops on one routed boot whose descriptor resolves to nothing;
 every draw using those shaders is discarded. What is **established**: for the shader stages that were
@@ -83,25 +87,28 @@ Separately, four stages declare a *writable* 8-dword T# that reaches no resource
 ([#3128](https://github.com/mattias800/prosper/issues/3128)); one of them has four image ops against a
 completely empty table. Whether that is what its image ops want is untested — see Ruled out.
 
-## Where the missing draws actually are
+## The dropped-draw census — measured on CALIBRATION
 
-`PROSPER_DROPPED_DRAW_CENSUS=1` on the title-screen route, at 1024 discarded draws:
+> **VOID as title-screen evidence, and this warning covers BOTH censuses below it.** Every number in
+> this section was read on the brightness-calibration screen (`max_nonblack` 0.1140), not on the
+> title screen (0.0069). The section is kept because two *mechanism* findings survive the screen
+> mix-up — no `CB_TARGET_MASK` register is being lost (so this is not the *Oregon Trail* defect
+> #1946), and the colour-masked-off draws come from one shader — and because these numbers are cited
+> elsewhere and need somewhere to point. Every *quantity* here describes the wrong screen. Do not
+> quote the 1024, the 7, the 32,649 or the 92% as facts about the title screen; § *The title
+> screen's REAL numbers* has that screen's own census, and it disagrees.
+
+`PROSPER_DROPPED_DRAW_CENSUS=1` on the **calibration** route, at 1024 discarded draws:
 
 | reason | count | targets |
 | --- | --- | --- |
 | `no-effect(early)` | 1015 | `0x9fc0000000` (511), `0x9fc2000000` (504), two others |
 | `shader-recompile` | 7 | `0x9fc2000000` (4), `0x9fc0000000` (3) |
 
-So the unresolved image ops cost **7 draws, not the picture**. Nearly everything discarded is dropped
-because every colour target's write mask is zero and there is no depth/stencil side effect.
-
-> **VOID as title-screen evidence — measured on the brightness-calibration screen (0.1140), not on
-> the title screen (0.0069).** The whole of this section is kept because its *mechanism* finding
-> stands (no `CB_TARGET_MASK` register is being lost, so this is not the *Oregon Trail* defect
-> #1946), and because the number is cited elsewhere and needs somewhere to point. Its *quantities*
-> describe the wrong screen and are contradicted by the title-screen census below: 8192 draws
-> discarded there against 1024 here. Do not quote the 92% or the 32,649 as facts about the title
-> screen.
+So **on calibration** the unresolved image ops cost 7 draws, and nearly everything discarded is
+dropped because every colour target's write mask is zero with no depth/stencil side effect. That
+conclusion does **not** transfer: the same census on the title screen reads ~3800 `shader-recompile`
+of 8192 discarded.
 
 **But the dropped draws are not where the missing picture is either.** `PROSPER_COLORSTATETRACE=1`
 over a shorter window traced **32,649** draws, and every single one carries a *decoded*
@@ -218,8 +225,9 @@ disagree.**
 ## The title screen's REAL numbers (measured on a 0.0069 frame)
 
 Everything above this section that quotes a live census was measured on calibration. Each such
-section now carries that warning at its own head rather than only here — a retraction a hundred lines
-below the number it retracts is one most readers never reach. These are the
+section carries that warning **at its own head, above the first number it covers** — a retraction a
+hundred lines below the number it retracts is one most readers never reach, and a banner placed
+mid-section silently exempts whatever sits above it. These are the
 title screen, `PROSPER_NULL_PAGE=1`, census read at the same cumulative total in every arm:
 
 | | calibration (0.1140) | **title screen (0.0069)** |
@@ -299,7 +307,9 @@ contradictory new evidence.
   one of those draws is a **full-screen 3840×2160 pass**. Draw *count* is not area, and the failing
   shaders are the composite. #3126.
 
-**VOID, not falsified — the next THREE rows only**, each individually marked. Every one was measured
+**VOID, not falsified — every row below whose bullet begins `VOID`**, and only those. The scoping is
+per-row and stated in the row itself, never positional: an earlier version of this paragraph said
+"the next three rows", which silently changed meaning the moment a row was inserted, and did. Every one was measured
 on a route that settles on the
 **brightness-calibration** screen (`max_nonblack` 0.1140), not the title screen (0.0069). They are
 correct statements about calibration and say nothing about the title screen, so they are neither
@@ -325,9 +335,11 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
 - **"The world renders into an HDR target that the composite then loses."** Falsified: every seeded
   scene target in the title-screen frame is black at source (brightest channel 0-6 across five HDR
   targets). #3126.
-- **"A skipped compute dispatch collapses the composite" (the charter's LUT/exposure shape).**
-  Falsified: `PROSPER_COMPUTE_PROGRAM_CENSUS` reports the only program with any skips at
-  **executed=7455, skipped=2**. #3126.
+- **VOID — "A skipped compute dispatch collapses the composite" (the charter's LUT/exposure shape).**
+  `PROSPER_COMPUTE_PROGRAM_CENSUS` reports the only program with any skips at **executed=7455,
+  skipped=2** — but that census was read on **calibration** and has not been re-run on the title
+  screen, so it is not a falsification for it. This row said `Falsified` and was corrected: the
+  measurement is real, the scope was overclaimed. #3126.
 - **MIMG `SRSRC` is not a user-SGPR index.** It names any SGPR, so a scan that treats every SRSRC as
   a user-data slot reports mostly false positives — scratch registers the shader loaded a descriptor
   into. An earlier list of "bases missing from the table" derived that way is discarded. #3126.
