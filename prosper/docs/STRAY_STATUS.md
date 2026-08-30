@@ -310,7 +310,14 @@ drops still discard the background.
     calls occur at startup, before every one of these writes); **a re-map of the VA** (one `[physmap]`
     per VA, created ~2 ms *before* its write, none after); **a second VA aliasing the phys** (none —
     each phys range is mapped exactly once); and **the renderer writing back**
-    (`guest_memory_gpu_write` fires once per run, covering none of the zeroed ranges).
+    (`guest_memory_gpu_write` fires once per run, covering none of the zeroed ranges). A fifth:
+    **the address being recycled for another asset** — `0x303cd10000` receives exactly one payload
+    and is never written again, though 956 of 6,574 destinations in the run genuinely are reused, so
+    this had to be checked per-address rather than assumed either way.
+  - Corroborated on a second base: `0x302a300000` is sampled by five different shaders across
+    **152 s** and reads zero every time, the earliest only 2.0 s after its byte-verified write. One
+    address going quiet could be a descriptor pointing somewhere stale; two, with one of them read by
+    five separate shaders, is the range.
   - What blocks naming the writer, so nobody re-derives it: `PROSPER_DMEM_WRITE_TRACE` records writer
     RIPs but is invalidated by a **host** write, and the APR load *is* a host write (all four host
     writers of guest memory in the tree are file reads), so it can never watch a range APR loads into.

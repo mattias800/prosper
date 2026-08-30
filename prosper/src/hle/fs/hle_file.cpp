@@ -2701,6 +2701,10 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
 namespace {
 struct ZeroWatchEntry {
     uint64_t dst = 0, size = 0, t_armed = 0;
+    // The offset of the window the SOURCE was found non-zero at. The probe must read this window and
+    // no other: seeding from one window and probing a different one compares two unrelated places,
+    // and reports a flip for a range that never changed.
+    uint64_t seed_off = 0;
     const char* path = "?";
     bool seen_nonzero = false, reported = false;
 };
@@ -2745,7 +2749,7 @@ void zerowatch_poll_forever() {
             for (auto& e : g_zw) {
                 if (e.reported) continue;
                 uint32_t w[64];
-                if (!zw_read256(e.dst, w)) {
+                if (!zw_read256(e.dst + e.seed_off, w)) {
                     e.reported = true;
                     fprintf(stderr,
                             "[zerowatch] t=%llu dst=0x%llx WENT-UNMAPPED after %.3fs  maps=%s\n",
@@ -2758,20 +2762,21 @@ void zerowatch_poll_forever() {
                 uint32_t nz = 0;
                 for (uint32_t k = 0; k < 64; ++k) if (w[k]) ++nz;
                 if (nz) { e.seen_nonzero = true; continue; }
-                // All-zero in the sampled window. Only interesting if this range is KNOWN to have
-                // held data -- otherwise it is a buffer that was never filled, which is not this
-                // defect. That knowledge is seeded at arm time from the source buffer, never from
-                // this window: an all-zero first 256 bytes is common on this data (the source is
-                // ~5.6% non-zero and padding is always zero), so deciding it here would make a
-                // payload with a zero-padded head unreportable -- silently, and exactly for the
-                // class under investigation.
-                if (e.seen_nonzero) {
+                // All-zero at the window the payload was non-zero at, so this range HELD data and
+                // no longer does. `seen_nonzero` is guaranteed true for every entry (arming returns
+                // early otherwise), which is why the probe reading `seed_off` rather than offset 0
+                // is what carries the correctness here: an all-zero first 256 bytes is common on
+                // this data (the source is ~5.6% non-zero and padding is always zero), so probing
+                // offset 0 while seeding elsewhere would report a flip for a range that never
+                // changed -- and would burn the one-shot write-trace report on a non-event.
+                {
                     e.reported = true;
                     fprintf(stderr,
-                            "[zerowatch] t=%llu dst=0x%llx size=%llu sampled=256B@0 armed-via=%s "
+                            "[zerowatch] t=%llu dst=0x%llx size=%llu sampled=256B@0x%llx armed-via=%s "
                             "WENT-ZERO after %.3fs  maps=%s\n",
                             (unsigned long long)prosper::diagnostics::diag_now_us(),
-                            (unsigned long long)e.dst, (unsigned long long)e.size, e.path,
+                            (unsigned long long)e.dst, (unsigned long long)e.size,
+                            (unsigned long long)e.seed_off, e.path,
                             (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
                             zw_mapping_of(e.dst).c_str());
                     // Dump the dmem write trace HERE, at the moment the data disappears. Its own
@@ -2818,11 +2823,14 @@ void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* pat
     // Seed from the SOURCE (see the poll loop): scan a spread of the payload, not just its head.
     const uint8_t* p8 = static_cast<const uint8_t*>(src);
     for (uint32_t w = 0; w < 8 && !e.seen_nonzero; ++w) {
-        const uint64_t off = ((size - 256ull) / 7ull) * w;
+        const uint64_t off = (((size - 256ull) / 7ull) * w) & ~(uint64_t)3;
         for (uint32_t k = 0; k < 256; ++k)
-            if (p8[off + k]) { e.seen_nonzero = true; break; }
+            if (p8[off + k]) { e.seen_nonzero = true; e.seed_off = off; break; }
     }
-    if (!e.seen_nonzero) return;   // the payload itself is all zeros; nothing to lose here
+    // An all-zero payload is skipped, and skipping it is NOT silent-by-omission here: it means the
+    // load itself delivered zeros, which `apr_verify_write` reports on the same write. There is no
+    // disappearance to watch for.
+    if (!e.seen_nonzero) return;
     g_zw.push_back(e);
     if (!g_zw_thread.exchange(true)) std::thread(zerowatch_poll_forever).detach();
 }
