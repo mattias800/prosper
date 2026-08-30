@@ -1647,6 +1647,41 @@ int main() {
         return 1;
     }
     printf("  [ok]   GDS append derives its byte base from M0[31:16]\n");
+    // #3133: compiled code BORROWS M0. It saves the driver's entry value, overwrites M0 with the
+    // base it wants, uses it, and puts the original back -- the exact shape of the two sequences in
+    // Stray's `0x300c010000`, a full-screen fragment pass whose SAVE was an unresolved operand, so
+    // the whole stage failed and every draw bound to it was discarded.
+    //
+    // The entry value is modelled as an OPAQUE TOKEN, never as a number: the save marks the
+    // destination and leaves it with no `sreg` value, and only the restore consumes it. This arm
+    // pins both halves: the round trip must compile, and the saved copy consumed as anything other
+    // than the restore must still reject. The second arm is the one that matters -- it is the
+    // `v_add_nc_u32 v1, m0, v0` form that test_rdna2_to_spirv's kernel X2 pins, with one
+    // instruction in front of it, which is exactly how a fabricated value would escape the direct
+    // form that guard checks into the data domain.
+    const uint32_t m0_roundtrip[] = {
+        0xBE80037Cu,                            // s_mov_b32 s0, m0          (save)
+        0xbefc03ffu, 0x0c600020u,               // s_mov_b32 m0, 0x0c600020  (its own base)
+        0xd8f80010u, 0x00000000u,               // ds_append v0 offset:0x10  (uses M0)
+        0xBEFC0300u,                            // s_mov_b32 m0, s0          (restore)
+        0xbf810000u,
+    };
+    const uint32_t m0_leak[] = {
+        0xBE80037Cu,                            // s_mov_b32 s0, m0          (save)
+        0x807C8100u,                            // s_add_u32 m0, s0, 1       (consume as DATA)
+        0xd8f80010u, 0x00000000u,               // ds_append v0 offset:0x10  (keeps M0 live)
+        0xbf810000u,
+    };
+    if (recompile_compute(m0_roundtrip, std::size(m0_roundtrip), nullptr, m0_config).empty()) {
+        printf("  [FAIL] #3133: the M0 save/overwrite/restore round trip did not compile\n");
+        return 1;
+    }
+    printf("  [ok]   #3133: the M0 save/overwrite/restore round trip compiles\n");
+    if (!recompile_compute(m0_leak, std::size(m0_leak), nullptr, m0_config).empty()) {
+        printf("  [FAIL] #3133: the saved entry-M0 was consumable as ALU data\n");
+        return 1;
+    }
+    printf("  [ok]   #3133: the saved entry-M0 is opaque -- consuming it as data still rejects\n");
     if (m0_lds_spv.empty() ||
         !binary_uses_literal_operands(
             m0_lds_spv, OpBitwiseAnd, 0x0c600020u, 0xffffu) ||

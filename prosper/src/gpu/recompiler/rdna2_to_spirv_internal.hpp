@@ -4524,6 +4524,13 @@ struct RegState {
     // provenance is independent of `sreg`: an unrepresentable write deliberately erases its SSA
     // value, but must still invalidate an entry-time direct descriptor stored in that register.
     std::unordered_set<int> sreg_written;
+    // Scalar registers currently holding the ENTRY value of M0 -- the value the driver left before
+    // this shader wrote M0 -- as an OPAQUE token rather than as data (#3133). Membership is not a
+    // value: the register has no `sreg` entry, so every ordinary consumer still rejects it exactly
+    // as an untracked read does. Only `s_mov_b32 m0, sSRC` may consume it, and consuming it returns
+    // M0 to untracked. That is what makes the containment structural instead of a promise: there is
+    // no fabricated number anywhere for arithmetic, a V_WRITELANE source, or an LDS index to pick up.
+    std::unordered_set<int> sreg_entry_m0;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     // One restored physical dword of a Wave64 mask is not a complete B64 predicate. Keep its Bool

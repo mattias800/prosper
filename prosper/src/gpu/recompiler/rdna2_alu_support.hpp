@@ -182,6 +182,19 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
             }
             auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: {
+            // Holding the ENTRY value of M0 as an opaque token (#3133). It is not data, and the
+            // register's stale `sreg_input` word is not it either -- reading either here would be
+            // exactly the fabricated value the token exists to avoid. Only `s_mov_b32 m0, sSRC`
+            // consumes it, and it does so without going through this function.
+            // The token is live only while the register still has NO value. Any later write --
+            // SMEM, SOP2, anything -- puts a real word there and supersedes it, so the check is
+            // `token AND untracked` rather than a set that every write site would have to remember
+            // to clear. Stray's `0x300c010000` is exactly why: it saves M0 into s0, restores from
+            // s0, and then `s_load_dword s0, ...` reuses the register for real data twelve dwords
+            // later. A token that outlived that write rejected a legitimate read.
+            if (rs.sreg_entry_m0.contains(o.value) && !rs.sreg.contains(o.value)) {
+                if (ok) *ok = false; return b.uconst(0);
+            }
             auto it = rs.sreg.find(o.value);
             if (it != rs.sreg.end()) return it->second;
             auto input = rs.sreg_input.find(o.value);
