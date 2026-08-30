@@ -2685,6 +2685,102 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
 //
 // PROSPER_APR_VERIFY=1 verifies every write; PROSPER_APR_VERIFY=0xADDR verifies only that
 // destination, which is what keeps the log readable on a title that streams thousands of chunks.
+// DIAGNOSTIC (PROSPER_ZEROWATCH=1): catch the MOMENT guest data disappears, and say what the
+// mapping looked like when it did.
+//
+// #3142 established that APR writes land byte-identically and that the same address reads all-zero
+// seconds later, with no dmem hole-punch, no aliasing mapping and no re-map of the VA in between.
+// Every instrument so far samples at two points and infers what happened between them. This one
+// watches, so the transition itself is the observation rather than something reconstructed from its
+// endpoints -- and it dumps /proc/self/maps for the address at the instant it flips, which is the
+// question the two-point instruments cannot answer: is it still the same mapping?
+//
+// Reads through process_vm_readv, like the write verifier, so a range that becomes unmapped reports
+// that rather than faulting the watchdog thread.
+namespace {
+struct ZeroWatchEntry {
+    uint64_t dst = 0, size = 0, t_armed = 0;
+    bool seen_nonzero = false, reported = false;
+};
+std::mutex g_zw_mx;
+std::vector<ZeroWatchEntry> g_zw;
+std::atomic<bool> g_zw_thread{false};
+
+bool zerowatch_enabled() { static int v = getenv("PROSPER_ZEROWATCH") ? 1 : 0; return v; }
+
+// The covering /proc/self/maps line, so a flip can be attributed to a re-map rather than a write.
+std::string zw_mapping_of(uint64_t addr) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return "<maps-unavailable>";
+    char line[512];
+    std::string hit = "<unmapped>";
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long lo = 0, hi = 0;
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && addr >= lo && addr < hi) {
+            hit = line;
+            if (!hit.empty() && hit.back() == '\n') hit.pop_back();
+            break;
+        }
+    }
+    fclose(f);
+    return hit;
+}
+
+bool zw_read256(uint64_t addr, uint32_t* out) {
+    struct iovec l { out, 256 }, r { (void*)(uintptr_t)addr, 256 };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 256;
+}
+
+void zerowatch_poll_forever() {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_zw_mx);
+            for (auto& e : g_zw) {
+                if (e.reported) continue;
+                uint32_t w[64];
+                if (!zw_read256(e.dst, w)) {
+                    e.reported = true;
+                    fprintf(stderr,
+                            "[zerowatch] t=%llu dst=0x%llx WENT-UNMAPPED after %.3fs  maps=%s\n",
+                            (unsigned long long)prosper::diagnostics::diag_now_us(),
+                            (unsigned long long)e.dst,
+                            (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
+                            zw_mapping_of(e.dst).c_str());
+                    continue;
+                }
+                uint32_t nz = 0;
+                for (uint32_t k = 0; k < 64; ++k) if (w[k]) ++nz;
+                if (nz) { e.seen_nonzero = true; continue; }
+                // All-zero. Only interesting if this range was observed holding data first --
+                // otherwise it is a buffer that was never filled, which is not this defect.
+                if (e.seen_nonzero) {
+                    e.reported = true;
+                    fprintf(stderr,
+                            "[zerowatch] t=%llu dst=0x%llx size=%llu WENT-ZERO after %.3fs  maps=%s\n",
+                            (unsigned long long)prosper::diagnostics::diag_now_us(),
+                            (unsigned long long)e.dst, (unsigned long long)e.size,
+                            (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
+                            zw_mapping_of(e.dst).c_str());
+                }
+            }
+        }
+        struct timespec ts { 0, 50 * 1000 * 1000 };   // 50 ms
+        nanosleep(&ts, nullptr);
+    }
+}
+
+void zerowatch_arm(uint64_t dst, uint64_t size) {
+    if (!zerowatch_enabled() || size < (1u << 20)) return;   // large payloads only: textures, not records
+    std::lock_guard<std::mutex> lk(g_zw_mx);
+    for (auto& e : g_zw) if (e.dst == dst) return;
+    if (g_zw.size() >= 64) return;
+    ZeroWatchEntry e;
+    e.dst = dst; e.size = size; e.t_armed = prosper::diagnostics::diag_now_us();
+    g_zw.push_back(e);
+    if (!g_zw_thread.exchange(true)) std::thread(zerowatch_poll_forever).detach();
+}
+} // namespace
+
 static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
     const char* ev = getenv("PROSPER_APR_VERIFY");
     if (!ev || !*ev || size < 256) return;
@@ -2769,6 +2865,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
         apr_verify_write(dst, buf, size);
+        zerowatch_arm(dst, size);
         return true;
     }
     bool committed = false;
