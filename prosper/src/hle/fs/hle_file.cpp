@@ -8,6 +8,7 @@
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include "diagnostics/diag_clock.hpp"
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
@@ -2761,6 +2762,17 @@ void zerowatch_poll_forever() {
                             (unsigned long long)e.dst, (unsigned long long)e.size,
                             (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
                             zw_mapping_of(e.dst).c_str());
+                    // Dump the dmem write trace HERE, at the moment the data disappears. Its own
+                    // triggers are guest _exit and the fatal raise, neither of which a bounded
+                    // capture run reaches -- so it was recording writer RIPs and printing them
+                    // nowhere. This is the instant at which they answer a question.
+                    //
+                    // No backing-file cross-check accompanies it, and an earlier version tried one:
+                    // the range is MAP_SHARED on a memfd, so reading the mapping IS reading the
+                    // file. There is no "stale view" case for MAP_SHARED to exclude, which makes an
+                    // all-zero read proof that the CONTENT was zeroed rather than proof that this
+                    // view stopped tracking it.
+                    host::guest_dmem_write_trace_report();
                 }
             }
         }
