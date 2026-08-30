@@ -1,3 +1,18 @@
+# Stray (PPSA02101) -- reach the brightness-CALIBRATION screen deterministically and hold there.
+#
+# CORRECTION 2026-08-30: this file was landed as a TITLE-screen route and it is not one. Everything
+# below the correction is the original header, kept because its flip-anchor reasoning is sound and
+# its measurements were real; only the screen it names was wrong.
+#
+# The unresolved part, stated rather than hidden: the original header reports FOUR runs reaching
+# "the title screen" at max_nonblack 0.1097, while a later 16-frame run of this same route settles at
+# 0.1140 on a frame that visibly IS the calibration screen (three cat heads, the Adjust-the-value
+# text, the 16-step slider, the Defaults/Accept prompts). 0.1097 and 0.1140 are close but not equal,
+# and the two measurements have not been reconciled. Whoever picks this up should settle it by
+# LOOKING at a frame from each rather than by comparing the numbers -- that is what exposed the
+# original misreading. See docs/STRAY_STATUS.md and #3126.
+#
+# --- original header follows ---
 # Stray (PPSA02101) -- reach the title screen DETERMINISTICALLY and hold there.
 #
 # Anchored on FLIPS, not seconds. Measured 2026-08-30: a no-input boot reaches the

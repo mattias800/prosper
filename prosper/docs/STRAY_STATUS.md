@@ -268,15 +268,22 @@ contradictory new evidence.
   them as `StorageImage` left both `mimg-unresolved` (5) and `max_nonblack` (0.1097) exactly
   unchanged. That arm may have used a class/provenance the MIMG resolver does not match on, so the
   question is open — but do not assume the fix moves this title. #3128.
-- **"A wall-clock pad route reaches the title screen."** Falsified: 0.1095 once, then 0.0063 / 0.0000
-  / 0.0063 on three unmodified reruns. The single lucky sample was adopted as an A/B baseline and four
-  hypotheses were run against it before the reruns exposed it. Use `reach-title-flip.pad`. #3127.
+- **RETRACTED — "A wall-clock pad route reaches the title screen." (was: *Falsified*.)** The evidence
+  was 0.1095 once, then 0.0063 / 0.0000 / 0.0063 on three unmodified reruns, read at the time as "the
+  timed route works once by luck". Under the corrected number map that reading **inverts**: ~0.11 is
+  the *calibration* screen and ~0.006 is the *title* screen, so the three "failures" are the runs that
+  reached the title and the "lucky" sample is the one that did not. This doc now commits a wall-clock
+  route (`reach-title-hold.pad`, Cross at 150 s/160 s) as the title route for exactly that reason. The
+  row is kept rather than deleted because the mistake it records — adopting a single sample as an A/B
+  baseline — was real even though its conclusion was upside down. #3127.
 - **"The unresolved image ops are what is missing from the title screen."** ~~Falsified by the
   dropped-draw census~~ — **this row was wrong and is retained as a warning.** The census reading (7
   of 1024 discarded draws are `shader-recompile`) is correct, and the inference from it is not: every
   one of those draws is a **full-screen 3840×2160 pass**. Draw *count* is not area, and the failing
   shaders are the composite. #3126.
-**VOID, not falsified — the next five rows.** Every one was measured on a route that settles on the
+
+**VOID, not falsified — the next THREE rows only**, each individually marked. Every one was measured
+on a route that settles on the
 **brightness-calibration** screen (`max_nonblack` 0.1140), not the title screen (0.0069). They are
 correct statements about calibration and say nothing about the title screen, so they are neither
 evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a window that reaches

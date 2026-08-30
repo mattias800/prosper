@@ -30,9 +30,10 @@ a load instead of the title.
 ## Why the title route is anchored on flips, not seconds
 
 A wall-clock route cannot hit this title reliably: an earlier 150 s/160 s version fired before
-calibration on slower boots and reached the title only sometimes (`max_nonblack` 0.1095 once, then
-0.0063 / 0.0000 / 0.0063 on three unmodified reruns — a single lucky sample adopted as a baseline is
-how that hour was lost). The flip anchor works because the target is a **steady state** rather than a
+calibration on slower boots and reached the title only sometimes (`max_nonblack` a timed route reached the title only
+sometimes. **That reading was inverted** and is corrected in
+`docs/STRAY_STATUS.md` § Ruled out: ~0.11 is the calibration screen and ~0.006 is the title screen, so
+the samples read as failures were the successes. The flip anchor works because the target is a **steady state** rather than a
 moment: a no-input boot reaches calibration at `present_count` ≈ 1764 and then holds it unchanged
 (identical nonblack 0.1070 from present 1838 through 3205), because that screen waits for input. Any
 anchor after it arrives lands on it however slow the boot was.
