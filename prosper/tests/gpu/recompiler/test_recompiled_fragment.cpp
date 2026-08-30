@@ -1142,17 +1142,23 @@ int main() {
         const std::vector<uint32_t> ld_frag = recompile_fragment(ldexp_abs, std::size(ldexp_abs));
         CHECK(!ld_frag.empty(),
               "#3138: v_ldexp_f32 with ABS on its float source recompiles");
-        if (!ld_frag.empty()) {
-            std::vector<uint32_t> ld_vert(kTriVertSpv, kTriVertSpv + std::size(kTriVertSpv));
-            const std::vector<uint8_t> ld_px =
-                prosper::test::render_triangle_rgba(ld_vert, ld_frag, W, H);
-            const uint8_t* c = ld_px.size() == (size_t)W * H * 4
-                ? &ld_px[((size_t)(H / 2) * W + W / 2) * 4] : nullptr;
-            printf("  #3138 centre pixel = %02x %02x %02x\n",
-                   c ? c[0] : 0, c ? c[1] : 0, c ? c[2] : 0);
-            CHECK(c && c[1] > 0x20 && c[0] < 0x20 && c[2] < 0x20,
-                  "#3138: ABS is APPLIED, not dropped (green carries +0.25, not a clamped -0.25)");
-        }
+        // Deliberately NOT nested under the check above: a reverted gate must redden BOTH arms, and
+        // it does only if the value arm still runs and finds no pixel. Nesting it would make the
+        // second arm silently SKIP on exactly the mutation it exists to catch.
+        std::vector<uint32_t> ld_vert(kTriVertSpv, kTriVertSpv + std::size(kTriVertSpv));
+        const std::vector<uint8_t> ld_px =
+            ld_frag.empty() ? std::vector<uint8_t>()
+                            : prosper::test::render_triangle_rgba(ld_vert, ld_frag, W, H);
+        const uint8_t* c = ld_px.size() == (size_t)W * H * 4
+            ? &ld_px[((size_t)(H / 2) * W + W / 2) * 4] : nullptr;
+        printf("  #3138 centre pixel = %02x %02x %02x (want 00 40 00)\n",
+               c ? c[0] : 0, c ? c[1] : 0, c ? c[2] : 0);
+        // A BAND, not a floor. `> 0x20` would also accept 0xff, which is what an
+        // ABS-applied-but-exponent-dropped lowering produces (|-1.0| * 2^0 = 1.0) -- the competing
+        // wrong answer this arm most needs to exclude. |-1.0| * 2^-2 = 0.25 = 0x40 exactly, and this
+        // is the only numeric check of ldexp_f32_bits in the tree.
+        CHECK(c && c[1] > 0x30 && c[1] < 0x50 && c[0] < 0x20 && c[2] < 0x20,
+              "#3138: ABS applied AND the exponent honoured (green is 0.25, not 0 and not 1.0)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
