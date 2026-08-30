@@ -2667,6 +2667,72 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
     if (off < cap) out[off] = 0;
     return found;
 }
+// DIAGNOSTIC (PROSPER_APR_VERIFY): read the destination back through the SAME mechanism that wrote
+// it, in the same thread, immediately after the write returns -- and compare it against the source
+// buffer at identical offsets.
+//
+// This exists because `got=<size> OK` in the APR log proves only that the bytes were TRANSFERRED.
+// It does not prove they were non-zero (a pread over a sparse or wrongly-offset region returns full
+// size and zeros) and it does not prove they are still there when a consumer samples the address
+// later. #3142 is exactly that gap: a kernel-verified 4.7 MB write to 0x303cb90000 followed by an
+// all-zero read of the same address by the texture sampler.
+//
+// The comparison is source-vs-destination at the SAME offsets rather than against an expected
+// value, so it cannot be wrong about what it should have seen -- whatever the source holds is the
+// oracle. Reading back with process_vm_readv (not a raw dereference) keeps the probe from being a
+// new failure mode of its own: an unmapped destination reports UNREADABLE instead of faulting.
+//
+// PROSPER_APR_VERIFY=1 verifies every write; PROSPER_APR_VERIFY=0xADDR verifies only that
+// destination, which is what keeps the log readable on a title that streams thousands of chunks.
+static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
+    const char* ev = getenv("PROSPER_APR_VERIFY");
+    if (!ev || !*ev || size < 256) return;
+    const uint64_t want = strtoull(ev, nullptr, 0);
+    if (want > 0x1000ull && want != dst) return;
+
+    // POSITIVE CONTROL (PROSPER_APR_VERIFY_SELFTEST=1): deliberately corrupt the destination's first
+    // window before verifying, so the probe must report MISMATCH. Without this arm an all-MATCH
+    // census is void rather than negative -- it cannot distinguish "the write path never loses data"
+    // from "this comparison is incapable of reporting a loss". A clean zero has to be shown to be a
+    // zero the instrument could have broken.
+    if (getenv("PROSPER_APR_VERIFY_SELFTEST")) {
+        static const uint32_t poison[64] = {0};
+        struct iovec pl { (void*)poison, sizeof poison }, pr { (void*)(uintptr_t)dst, sizeof poison };
+        (void)process_vm_writev(getpid(), &pl, 1, &pr, 1, 0);
+    }
+
+    const uint8_t* src = (const uint8_t*)buf;
+    uint32_t src_nz = 0, dst_nz = 0, sampled = 0, unreadable = 0;
+    char detail[512];
+    int used = 0;
+    for (uint32_t s = 0; s < 8; ++s) {
+        const uint64_t off = (((size - 256ull) / 7ull) * s) & ~(uint64_t)3;
+        uint32_t back[64];
+        struct iovec bl { back, sizeof back }, br { (void*)(uintptr_t)(dst + off), sizeof back };
+        if (process_vm_readv(getpid(), &bl, 1, &br, 1, 0) != (ssize_t)sizeof back) {
+            ++unreadable;
+            used += snprintf(detail + used, sizeof detail - (size_t)used, " w%u=UNREADABLE", s);
+            continue;
+        }
+        const uint32_t* sw = (const uint32_t*)(src + off);
+        uint32_t sn = 0, dn = 0;
+        for (uint32_t k = 0; k < 64; ++k) {
+            ++sampled;
+            if (sw[k]) ++sn;
+            if (back[k]) ++dn;
+        }
+        src_nz += sn; dst_nz += dn;
+        used += snprintf(detail + used, sizeof detail - (size_t)used, " w%u=%u/%u", s, dn, sn);
+        if (used >= (int)sizeof detail) break;
+    }
+    fprintf(stderr,
+            "[apr-verify] dst=0x%llx size=%llu src_nonzero=%u/%u dst_nonzero=%u/%u %s%s\n",
+            (unsigned long long)dst, (unsigned long long)size, src_nz, sampled, dst_nz, sampled,
+            unreadable ? "UNREADABLE-WINDOWS"
+                       : (src_nz == dst_nz ? "MATCH" : "MISMATCH-WRITE-LOST"),
+            detail);
+}
+
 static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     if (!size) return true;
     apr_dest_record(dst, size);
@@ -2679,7 +2745,10 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     // and marks every overlapping cache registration dirty.
     host::guest_write_watch_notify_host_write(dst, size);
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
-    if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) return true;
+    if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
+        apr_verify_write(dst, buf, size);
+        return true;
+    }
     bool committed = false;
     for (uint64_t p = dst & ~0xffffull; p < dst + size; p += 0x10000) {
         unsigned char vec;
@@ -2690,7 +2759,9 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
             committed = true;
     }
     if (!committed) return false;
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+    const bool retried = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+    if (retried) apr_verify_write(dst, buf, size);
+    return retried;
 }
 #endif
 
