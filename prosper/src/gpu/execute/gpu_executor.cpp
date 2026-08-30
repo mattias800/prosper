@@ -9357,6 +9357,12 @@ bool parallel_draw_diagnostic_active(bool log) {
         "PROSPER_SHADER_DUMP_SUCCESS", "PROSPER_DRAWLOG", "PROSPER_DBG",
         "PROSPER_STAGE_FOLD_PROFILE", "PROSPER_DESCRIPTOR_VALIDATE",
         "PROSPER_NO_SHADER_CACHE",
+        // PROSPER_TEXCONTENT queries is_live_render_target(), and that callback is NOT a pure read:
+        // it begins with drain_guest_gpu_writes(), which steals the pending guest-write queue and
+        // mutates an unsynchronised map. Calling it from parallel realization workers is undefined
+        // behaviour AND perturbs the cache state the diagnostic exists to report. Serialising is the
+        // whole reason this list exists.
+        "PROSPER_TEXCONTENT",
     };
     for (const char* name : diagnostics)
         if (std::getenv(name)) return true;

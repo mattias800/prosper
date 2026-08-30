@@ -933,30 +933,57 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // prints and "it was empty" cannot masquerade as "it is empty".
             if (getenv("PROSPER_TEXCONTENT") && d.width >= 1920u && d.height >= 1080u &&
                 d.base > 0x1000000000ull) {
-                static std::mutex cmx; static std::set<std::pair<uint64_t, int>> cseen;
-                std::lock_guard<std::mutex> lk(cmx);
-                const uint64_t span = (uint64_t)d.width * d.height;
-                uint32_t nonzero = 0, sampled_dwords = 0;
-                for (uint32_t s = 0; s < 8; ++s) {
-                    const uint64_t addr = d.base + (((span / 8u) * s) & ~(uint64_t)3);
-                    if (!guest_readable(addr, 256)) continue;
-                    const uint32_t* words = (const uint32_t*)(uintptr_t)addr;
-                    for (uint32_t k = 0; k < 64; ++k) {
-                        ++sampled_dwords;
-                        if (words[k]) ++nonzero;
+                // BYTES, not texels. Offsets computed in texels and applied as byte addresses sample
+                // only the first bytes-per-texel'th of an RGBA8 surface -- reporting a false
+                // ALL-ZERO for anything below that -- and run PAST the end of a BCn one, reporting a
+                // false has-content from unrelated memory. The block arithmetic is the same one
+                // PROSPER_DUMP_TILERAW uses above.
+                Gen5ImageFormatInfo cfi;
+                const bool cfmt = gen5_image_format(d.format, &cfi) && cfi.bytes_per_block &&
+                                  cfi.block_width && cfi.block_height;
+                const uint64_t span =
+                    cfmt ? (uint64_t)((d.width + cfi.block_width - 1) / cfi.block_width) *
+                               ((d.height + cfi.block_height - 1) / cfi.block_height) *
+                               cfi.bytes_per_block
+                         : 0ull;
+                if (cfmt && span >= 256) {
+                    uint32_t nonzero = 0, sampled_dwords = 0;
+                    for (uint32_t s = 0; s < 8; ++s) {
+                        // Every 256-byte window stays inside the footprint: the last one starts at
+                        // span-256 rather than at 7/8 of span plus a read that would overrun.
+                        const uint64_t off = ((span - 256ull) / 7ull) * s;
+                        const uint64_t addr = d.base + (off & ~(uint64_t)3);
+                        if (!guest_readable(addr, 256)) continue;
+                        const uint32_t* words = (const uint32_t*)(uintptr_t)addr;
+                        for (uint32_t k = 0; k < 64; ++k) {
+                            ++sampled_dwords;
+                            if (words[k]) ++nonzero;
+                        }
                     }
+                    // is_live_render_target() is safe to call here only because PROSPER_TEXCONTENT
+                    // is in parallel_draw_diagnostic_active()'s list, so draw realization is serial
+                    // while this diagnostic is armed. That callback drains and mutates the renderer's
+                    // write queue; calling it from parallel workers is UB and perturbs the very cache
+                    // state this reports.
+                    const bool cached = prosper::gpu::is_live_render_target(d.base);
+                    const int verdict = ((sampled_dwords == 0) ? 0 : (nonzero == 0 ? 1 : 2)) |
+                                        (cached ? 4 : 0);
+                    // Deduped on (base, VERDICT), never on base alone. An address-keyed probe reports
+                    // whatever the FIRST observation saw, which on a long run is the boot-time state,
+                    // so a surface filled moments later still reads as empty. That mistake cost three
+                    // published corrections before it was caught.
+                    static std::mutex cmx; static std::set<std::pair<uint64_t, int>> cseen;
+                    std::lock_guard<std::mutex> lk(cmx);
+                    if (cseen.insert({d.base, verdict}).second)
+                        fprintf(stderr,
+                                "[texcontent] base=0x%llx %ux%u fmt=%u bytes=%llu nonzero=%u/%u %s "
+                                "rtt=%s\n",
+                                (unsigned long long)d.base, d.width, d.height, d.format,
+                                (unsigned long long)span, nonzero, sampled_dwords,
+                                sampled_dwords == 0 ? "UNREADABLE"
+                                                    : (nonzero == 0 ? "ALL-ZERO" : "has-content"),
+                                cached ? "authoritative" : "MISS");
                 }
-                const bool cached = prosper::gpu::is_live_render_target(d.base);
-                const int verdict = ((sampled_dwords == 0) ? 0 : (nonzero == 0 ? 1 : 2)) |
-                                    (cached ? 4 : 0);
-                if (cseen.insert({d.base, verdict}).second)
-                    fprintf(stderr,
-                            "[texcontent] base=0x%llx %ux%u fmt=%u nonzero=%u/%u %s rtt=%s\n",
-                            (unsigned long long)d.base, d.width, d.height, d.format,
-                            nonzero, sampled_dwords,
-                            sampled_dwords == 0 ? "UNREADABLE"
-                                                : (nonzero == 0 ? "ALL-ZERO" : "has-content"),
-                            cached ? "authoritative" : "MISS");
             }
             if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_TEXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
