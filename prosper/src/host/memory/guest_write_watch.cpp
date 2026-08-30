@@ -656,12 +656,13 @@ struct WatchState {
     // exact thread owns the diagnostic's one-instruction step.
     std::atomic<int64_t> pending_trace_step_tid{0};
     DmemTraceState trace;
-    // Host writes currently between their notification and their completion. The notify contract is
-    // "notify, then write", so a nonzero depth means bytes may land in a watched page at any moment
-    // and nothing may re-arm it. Incremented by guest_write_watch_notify_host_write and decremented
-    // by its paired ..._done; a caller that never pairs simply keeps rebaselining disabled, which is
-    // the safe direction.
-    int host_writes_in_flight = 0;
+    // Host-write RANGES currently between their notification and their completion. The notify
+    // contract is "notify, then write", so bytes may land in any of these at any moment and no watch
+    // over them may be re-armed. Ranges rather than a depth: a global counter is never zero on a
+    // title that streams assets from several threads, which made the rebaseline correct and useless
+    // at the same time -- it fired once per run instead of the 66 times it needs to. The traced
+    // region is at most two pages, so testing it against these is a handful of comparisons.
+    std::vector<std::pair<uint64_t, uint64_t>> host_write_ranges;
 };
 static_assert(std::atomic<int64_t>::is_always_lock_free,
               "the signal-path pending-step discriminator must be lock-free");
@@ -1751,7 +1752,10 @@ bool trace_rebase_locked(WatchState& w) {
     // makes that deterministic without any concurrency: it notifies for EVERY iovec before calling
     // ::preadv, so an iovec in the watched buffer plus an iovec in another dmem alias would disarm,
     // re-arm, and then EFAULT the read -- the exact failure the disarm exists to prevent.
-    if (w.host_writes_in_flight != 0) return false;
+    for (const DmemTracePage& page : trace.pages)
+        for (const PageAlias& alias : page.aliases)
+            for (const auto& range : w.host_write_ranges)
+                if (alias.addr >= range.first && alias.addr < range.second) return false;
     // B3: rebuild the page/alias list rather than re-arming the one captured at arm time. Every
     // mapping and protection hook gates on Armed||Stepping, so nothing maintained that list while the
     // trace sat pending -- and mprotect'ing a stale entry would make an unrelated guest mapping
@@ -1819,10 +1823,6 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // the feature is off (the default) nothing is ever armed, so skip without even taking the lock.
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
     std::lock_guard lock(w.mutex);
-    // Counted for the whole call, not just the overlapping case: an iovec that misses the watched
-    // range still means a read is about to run, and the vectored path notifies every iovec before
-    // any of them is written.
-    ++w.host_writes_in_flight;
     // A host/kernel store into an armed (read-only) guest page would EFAULT — e.g. sceKernelPread
     // streaming texture bytes straight into a watched dmem buffer returns an I/O error where real
     // hardware succeeds (review B5). The HLE calls this by guest VA range BEFORE such a write: restore
@@ -1857,6 +1857,11 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
             overlap = trace_va_to_phys_locked(w.trace, va, ignored_phys);
         if (!overlap) (void)trace_rebase_locked(w);
     }
+    // Recorded AFTER the rebaseline decision, not before it: THIS call's write has not started yet
+    // and its own range is excluded by the overlap test above. Recording first made the guard see its
+    // own notification and refuse every rebaseline, silently turning the feature off -- caught only
+    // by re-running the measurement that motivated it, not by any test.
+    w.host_write_ranges.emplace_back(begin, end);
     std::vector<WatchedPage*> hit;
     for (uint64_t va = begin; va < end; va += kPage) {
         auto it = w.pages_by_addr.find(va);
@@ -1875,7 +1880,14 @@ void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size) {
     WatchState& w = state();
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
     std::lock_guard lock(w.mutex);
-    if (w.host_writes_in_flight > 0) --w.host_writes_in_flight;
+    const uint64_t begin = addr & ~(kPage - 1);
+    const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
+    for (auto it = w.host_write_ranges.begin(); it != w.host_write_ranges.end(); ++it) {
+        if (it->first == begin && it->second == end) {
+            w.host_write_ranges.erase(it);
+            return;
+        }
+    }
 }
 
 void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
