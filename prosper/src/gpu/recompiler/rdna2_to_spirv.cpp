@@ -3346,12 +3346,26 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
 
     std::vector<Rdna2Inst> instructions;
     rdna2_walk(code, dwords, instructions);
+    const bool prologlog = getenv("PROSPER_PROLOGLOG") != nullptr;
+    uint64_t phash = 0xcbf29ce484222325ull;
+    if (prologlog)
+        for (size_t i = 0; i < dwords && i < 4096; ++i) phash = (phash ^ code[i]) * 0x100000001b3ull;
+    auto prolog_note = [&](const char* what, const Rdna2Inst* at) {
+        if (!prologlog) return;
+        static std::set<uint64_t> seen; static std::mutex mx;
+        std::lock_guard<std::mutex> lk(mx);
+        if (!seen.insert(phash).second) return;
+        fprintf(stderr, "[prologlog] hash=%016llx dwords=%zu %s pc=%u fmt=%d\n",
+                (unsigned long long)phash, dwords, what, at ? at->pc : 0u, at ? (int)at->fmt : -1);
+    };
     for (const Rdna2Inst& instruction : instructions) {
         // A fetch prolog has no architectural output or program termination of its own. Encountering
         // either before the transfer means this is a complete/different shader, not the split ABI.
         if (instruction.is_end || instruction.fmt == Rdna2Format::EXP ||
-            instruction.fmt == Rdna2Format::Unknown)
+            instruction.fmt == Rdna2Format::Unknown) {
+            prolog_note("BAIL", &instruction);
             return {};
+        }
         if (instruction.fmt != Rdna2Format::SOP1 || instruction.opcode != 0x20)
             continue;
 
@@ -3361,6 +3375,7 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
         if (instruction.n_src != 1 || instruction.src[0].kind != OperandKind::SGPR ||
             instruction.src[0].value != 6 || instruction.len_dwords != 1)
             return {};
+        prolog_note("TRANSFER", &instruction);
         result.valid = instruction.pc != 0;
         result.setpc_pc = instruction.pc;
         result.prefix_dwords = instruction.pc;

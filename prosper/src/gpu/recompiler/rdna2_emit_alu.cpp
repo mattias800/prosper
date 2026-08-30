@@ -6969,6 +6969,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         pa ? (pa->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         sreg_range_written(rs, in.src[1].value, 8) ? 1 : 0,
                         rt->resources.size());
+                // #3126: say what WAS available, not only what failed. "key_res=null pc_res=null"
+                // tells you the lookups missed; it does not tell you whether the table holds the
+                // descriptor under a different key, holds it classified as something else, or does
+                // not hold it at all -- and those are three different bugs. Print every resource's
+                // class and provenance so the miss can be diagnosed from one line instead of a
+                // rebuild. Bounded, and only on a reject.
+                {
+                    std::string avail;
+                    size_t shown = 0;
+                    for (const ShaderResource& r : rt->resources) {
+                        if (shown++ >= 16) { avail += " ..."; break; }
+                        char one[96];
+                        const char* cls =
+                            r.cls == ResourceClass::Texture         ? "tex"
+                          : r.cls == ResourceClass::StorageImage    ? "simg"
+                          : r.cls == ResourceClass::ConstantBuffer  ? "cbuf"
+                          : r.cls == ResourceClass::VertexBuffer    ? "vbuf"
+                          : r.cls == ResourceClass::Sampler         ? "samp" : "other";
+                        if (r.sgpr_base == 0xFFFFFFFFu)
+                            snprintf(one, sizeof one, " [b%u %s srt=0x%x]", r.binding, cls, r.srt_offset);
+                        else
+                            snprintf(one, sizeof one, " [b%u %s s%u]", r.binding, cls, r.sgpr_base);
+                        avail += one;
+                    }
+                    fprintf(stderr, "[mimg-unresolved]   available:%s\n",
+                            avail.empty() ? " (none)" : avail.c_str());
+                }
             }
             if (!res) { ok = false; return true; }
             const bool uint_texture = res->format == DataFormat::Uint8 ||

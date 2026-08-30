@@ -1946,6 +1946,20 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     if (vs_words.empty() || fs_words.empty() ||
         ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty())) {
+        if (getenv("PROSPER_PROLOGLOG")) {
+            // #3126: name the FAILING program by the same content hash the prolog recogniser uses,
+            // so the reject and the chain decision can be joined inside ONE run.
+            const uint32_t* fc = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr));
+            uint64_t fh = 0xcbf29ce484222325ull;
+            if (fc && vertex_dwords)
+                for (size_t i = 0; i < vertex_dwords && i < 4096; ++i) fh = (fh ^ fc[i]) * 0x100000001b3ull;
+            static std::set<uint64_t> seen_fail; static std::mutex fm;
+            std::lock_guard<std::mutex> lk(fm);
+            if (seen_fail.insert(fh).second)
+                fprintf(stderr, "[failshader] hash=%016llx dwords=%zu vs_empty=%d fs_empty=%d chain=%d\n",
+                        (unsigned long long)fh, vertex_dwords, (int)vs_words.empty(),
+                        (int)fs_words.empty(), (int)vertex_chain);
+        }
         report_dropped_draw_target(rs.color0_base, "shader-recompile", rs.cb_target_mask,
                                    rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
