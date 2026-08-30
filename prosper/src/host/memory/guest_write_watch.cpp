@@ -618,6 +618,9 @@ struct DmemTraceState {
     uint64_t selection_uncertain_faults = 0;
     uint64_t completed_steps = 0;
     uint64_t rearms = 0;
+    // #3146: set when a host write disarmed the trace and PROSPER_DMEM_WRITE_TRACE_REBASE asked for
+    // a re-baseline rather than a permanent invalidation. Cleared when the re-arm succeeds.
+    bool rebase_pending = false;
     uint64_t coverage_gaps = 0;
     uint64_t overflow_events = 0;
     uint64_t selected_occurrence = 0;
@@ -1701,6 +1704,48 @@ void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {
 // Its null has a real scope: only writes the HLE routes through this notification are seen. A guest
 // that reads into a staging buffer and memcpys from there in guest code writes with plain stores,
 // which nothing here can observe.
+// #3146: PROSPER_DMEM_WRITE_TRACE_REBASE=1 makes a host write RE-BASELINE the trace instead of
+// invalidating it permanently.
+//
+// The default is invalidation and stays that way, because it is the honest answer to the question the
+// trace was built for -- "who wrote these exact bytes, starting from this exact content". A host write
+// bypasses page protection, so those bytes changed without the trace seeing it, and any later diff is
+// measured from a baseline that is no longer true.
+//
+// Re-baselining answers a strictly weaker question -- "who wrote them since the last host write" --
+// and that weaker question is the only one available for a range the HLE loads into. Every host writer
+// of guest memory in the tree is a file read, so a buffer a title streams an asset into disarms the
+// watch at the moment the asset arrives, which is before the window of interest even opens (#3142).
+//
+// The re-arm is deferred rather than immediate: this notification fires BEFORE the host write, so the
+// bytes to baseline against do not exist yet. It happens on the next notification that does not
+// overlap the watched range, which on a streaming title is milliseconds away.
+bool trace_rebase_enabled() {
+    static const int on = [] {
+        const char* v = std::getenv("PROSPER_DMEM_WRITE_TRACE_REBASE");
+        return v && *v && *v != '0' ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+// Re-snapshot the baseline and re-arm. Caller holds w.mutex and must have established that no host
+// write is in flight over the watched range.
+bool trace_rebase_locked(WatchState& w) {
+    DmemTraceState& trace = w.trace;
+    if (!trace.rebase_pending) return false;
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return false;
+    if (!set_trace_armed_locked(w, true, false)) return false;
+    if (!trace_copy_target_locked(trace, trace.initial)) {
+        (void)set_trace_armed_locked(w, false, false);
+        return false;
+    }
+    trace.status = GuestDmemWriteTraceStatus::Armed;
+    trace.invalid_reason = GuestDmemWriteTraceInvalidReason::None;
+    trace.rebase_pending = false;
+    trace.rearms++;
+    return true;
+}
+
 void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     if (!addr || !size || addr > UINT64_MAX - size) return;
     // The watch spec is parsed ONCE. This function runs before every read()/pread() and once per
@@ -1755,9 +1800,25 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
         bool overlap = false;
         for (uint64_t va = begin; va < end && !overlap; va += kPage)
             overlap = trace_va_to_phys_locked(w.trace, va, ignored_phys);
-        if (overlap)
+        if (overlap) {
             trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::HostWrite,
                                     true);
+            // Deferred, not immediate: the host write has not happened yet, so there is nothing to
+            // baseline against until it has.
+            if (trace_rebase_enabled()) w.trace.rebase_pending = true;
+        }
+    } else if (w.trace.rebase_pending &&
+               w.trace.status == GuestDmemWriteTraceStatus::Invalid &&
+               w.trace.invalid_reason == GuestDmemWriteTraceInvalidReason::HostWrite) {
+        // The previous host write has landed, so its result is now the content to measure from --
+        // but only re-arm if THIS write does not touch the watched range. Re-arming pages that are
+        // about to receive a host store would make that store hit a read-only page and EFAULT the
+        // read, which is the exact failure the disarm above exists to prevent.
+        uint64_t ignored_phys = 0;
+        bool overlap = false;
+        for (uint64_t va = begin; va < end && !overlap; va += kPage)
+            overlap = trace_va_to_phys_locked(w.trace, va, ignored_phys);
+        if (!overlap) (void)trace_rebase_locked(w);
     }
     std::vector<WatchedPage*> hit;
     for (uint64_t va = begin; va < end; va += kPage) {
