@@ -780,6 +780,106 @@ int main() {
             reinterpret_cast<uint64_t>(occurrence_two_mapping), allocation_size);
         munmap(occurrence_two_mapping, allocation_size);
     }
+    // ---- host-write rebaseline (#3146) --------------------------------------------------------
+    //
+    // Three review rounds found three defects in this feature and no test could reach any of them,
+    // because the mode was a cached getenv read on first use. The arms below are the two that would
+    // have caught them: a rebaseline that never happens (the global-depth regression, which silently
+    // turned the feature off and was found only by re-running an emulator measurement), and one that
+    // happens while a host write is still in flight (the EFAULT the guard exists to prevent).
+    {
+        constexpr uint64_t rebase_physical = 0x860000;
+        constexpr uint32_t rebase_chain = 11;
+        prosper::host::guest_dmem_write_trace_set_rebase_enabled_for_test(1);
+        CHECK(setenv("PROSPER_DMEM_CALLER", "1", 1) == 0 &&
+                  setenv("PROSPER_DMEM_WRITE_TRACE", "11:0x3000:0x1120:16", 1) == 0,
+              "configure the rebaseline trace selector");
+        prosper::host::guest_dmem_write_trace_init_from_environment();
+        prosper::host::guest_dmem_write_trace_notify_allocation(
+            rebase_physical, allocation_size, rebase_chain);
+        auto* rebase_mapping = static_cast<uint8_t*>(
+            mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(rebase_mapping != MAP_FAILED, "map the rebaseline canary range");
+        if (rebase_mapping != MAP_FAILED) {
+            std::memset(rebase_mapping + offset, 0x22, bytes);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                reinterpret_cast<uint64_t>(rebase_mapping), allocation_size, rebase_physical, 0x3);
+            const uint64_t traced = reinterpret_cast<uint64_t>(rebase_mapping) + offset;
+            // A page of the same mapping that the trace does NOT cover.
+            const uint64_t elsewhere = reinterpret_cast<uint64_t>(rebase_mapping);
+            CHECK(prosper::host::guest_dmem_write_trace_snapshot().status ==
+                      prosper::host::GuestDmemWriteTraceStatus::Armed,
+                  "rebaseline trace arms");
+
+            // A host write over the traced page disarms it and leaves it pending.
+            prosper::host::guest_write_watch_notify_host_write(traced, bytes);
+            auto after_write = prosper::host::guest_dmem_write_trace_snapshot();
+            CHECK(after_write.status == prosper::host::GuestDmemWriteTraceStatus::Invalid,
+                  "a host write over the traced page disarms the trace");
+
+            // While that write is STILL IN FLIGHT, an unrelated host write must not re-arm it --
+            // re-arming now would make the pending store hit a read-only page and EFAULT the read.
+            prosper::host::guest_write_watch_notify_host_write(elsewhere, 16);
+            auto during = prosper::host::guest_dmem_write_trace_snapshot();
+            CHECK(during.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+                      during.host_write_rebases == 0 && during.rebase_in_flight_refusals > 0,
+                  "no rebaseline while a host write over the traced page is in flight");
+            prosper::host::guest_write_watch_notify_host_write_done(elsewhere, 16);
+
+            // Once it completes, the next unrelated host write DOES rebaseline. This is the arm the
+            // global-depth version failed: it refused forever and the feature went silently dead.
+            prosper::host::guest_write_watch_notify_host_write_done(traced, bytes);
+            prosper::host::guest_write_watch_notify_host_write(elsewhere, 16);
+            auto after = prosper::host::guest_dmem_write_trace_snapshot();
+            CHECK(after.status == prosper::host::GuestDmemWriteTraceStatus::Armed &&
+                      after.host_write_rebases == 1,
+                  "the completed host write lets the next unrelated one rebaseline exactly once");
+            prosper::host::guest_write_watch_notify_host_write_done(elsewhere, 16);
+
+            // B8: the caller-range half of the guard, which the arms above cannot reach.
+            //
+            // The scenario needs the second alias to appear WHILE THE TRACE IS PENDING: the trace's
+            // own mapping hook ignores an Invalid trace, so V2 lands in the watch's alias list and
+            // not in trace.pages. The caller-side overlap test then runs against the stale page list
+            // and misses it, the rebuild pulls it in, and only the caller-range clause is left to
+            // notice that the write about to run covers a page the rebase is about to arm read-only.
+            // Without that clause this is the EFAULT the whole guard exists to prevent.
+            prosper::host::guest_write_watch_notify_host_write(traced, bytes);
+            prosper::host::guest_write_watch_notify_host_write_done(traced, bytes);
+            auto* second_alias = static_cast<uint8_t*>(
+                mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            CHECK(second_alias != MAP_FAILED, "map a second alias of the traced physical range");
+            if (second_alias != MAP_FAILED) {
+                const uint64_t rebases_before =
+                    prosper::host::guest_dmem_write_trace_snapshot().host_write_rebases;
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(second_alias), allocation_size, rebase_physical, 0x3);
+                prosper::host::guest_write_watch_notify_host_write(
+                    reinterpret_cast<uint64_t>(second_alias) + offset, bytes);
+                auto aliased = prosper::host::guest_dmem_write_trace_snapshot();
+                CHECK(aliased.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+                          aliased.host_write_rebases == rebases_before,
+                      "a write into an alias added during the pending window cannot rebaseline");
+                prosper::host::guest_write_watch_notify_host_write_done(
+                    reinterpret_cast<uint64_t>(second_alias) + offset, bytes);
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(second_alias), allocation_size);
+                munmap(second_alias, allocation_size);
+            }
+
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                reinterpret_cast<uint64_t>(rebase_mapping), allocation_size);
+            munmap(rebase_mapping, allocation_size);
+        }
+        prosper::host::guest_dmem_write_trace_set_rebase_enabled_for_test(-1);
+        // Paired like the earlier blocks: this one is last in main today, so leaking would be
+        // harmless right up until somebody appends an arm and inherits a configured selector.
+        unsetenv("PROSPER_DMEM_WRITE_TRACE");
+        unsetenv("PROSPER_DMEM_CALLER");
+    }
+
     prosper::host::guest_write_watch_set_fault_onstack(false);
 
     if (failures) return 1;

@@ -132,6 +132,8 @@ struct GuestDmemWriteTraceSnapshot {
     uint64_t selection_uncertain_faults = 0;
     uint64_t completed_steps = 0;
     uint64_t rearms = 0;
+    uint64_t host_write_rebases = 0;
+    uint64_t rebase_in_flight_refusals = 0;
     uint64_t coverage_gaps = 0;
     uint64_t overflow_events = 0;
     uint64_t selected_occurrence = 0;
@@ -198,6 +200,8 @@ void guest_write_watch_invalidate_all();
 // read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages
 // the range overlaps and marks them Dirty. No-op on Windows/macOS (no pages are ever armed there).
 void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
+// Paired completion for the call above. Optional: not calling it only disables rebaselining.
+void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size);
 
 // Device/DMA writes already carry an exact guest VA range. Mark only registrations whose logical
 // source overlaps that range; unlike a CPU protection fault, an adjacent write on the same host page
@@ -257,6 +261,11 @@ void guest_dmem_write_trace_set_contention_hook_for_test(
 using GuestDmemWriteTraceDynamicProtectionHookForTest = void (*)();
 void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
     GuestDmemWriteTraceDynamicProtectionHookForTest hook);
+// Force the host-write rebaseline mode on/off regardless of the environment. The mode is otherwise a
+// cached getenv read on first use, which makes it order-dependent and effectively untestable in
+// process -- and three rounds of review found three defects in this feature with no test able to
+// reach any of them. -1 restores the environment's answer.
+void guest_dmem_write_trace_set_rebase_enabled_for_test(int enabled);
 void guest_dmem_write_trace_lock_state_for_test();
 void guest_dmem_write_trace_unlock_state_for_test();
 
