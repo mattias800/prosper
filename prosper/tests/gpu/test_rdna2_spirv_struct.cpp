@@ -3127,20 +3127,34 @@ int main() {
         printf("  [FAIL] GTA V v_ldexp_f32 did not emit its defined integer-domain SPIR-V\n");
         return 1;
     }
-    // Same-site modifier mutations remain outside this bounded admission. These exact bits exercise
-    // each generic VOP3 modifier field; accepting one would mean the opcode case silently lost it.
+    // Modifier admission, split by OPERAND DOMAIN rather than uniformly (#3138). `D.f = S0.f *
+    // 2**S1.i`: src0 is a FLOAT, so ABS/NEG on it are the ordinary VOP3 float modifiers the emitter
+    // applies through fv() everywhere else, and they now compile. src1 is the INTEGER exponent,
+    // where "absolute value" and "negate" are not float modifiers at all — the original comment's
+    // reason ("silently ignoring either would corrupt mip/scale reconstruction") is a statement
+    // about the exponent, and it still stands. src2 is unused, and CLAMP/OMOD carry denormal
+    // behaviour that needs its own contract.
+    //
+    // The split is not cosmetic: Stray's `0x3011560000` is a 3684-dword fragment stage whose ONLY
+    // unsupported instruction was `v_ldexp_f32 v39, |v35|, -2` (`d7620127`, ABS[2:0]=001), and it
+    // discarded 1536 full-screen 3840x2160 draws per routed boot.
     const uint32_t ldexp_abs0[]  = {0xd7620100u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_neg0[]  = {0xd7620000u, 0x2002030du, 0xbf810000u};
+    if (recompile_valu(ldexp_abs0, std::size(ldexp_abs0), 14, 0).empty() ||
+        recompile_valu(ldexp_neg0, std::size(ldexp_neg0), 14, 0).empty()) {
+        printf("  [FAIL] v_ldexp_f32 rejected a float-source modifier it can express\n");
+        return 1;
+    }
+    // The remaining fields stay outside the admission. These exact bits exercise each one;
+    // accepting any would mean the opcode case silently lost it.
     const uint32_t ldexp_abs1[]  = {0xd7620200u, 0x0002030du, 0xbf810000u};
     const uint32_t ldexp_abs2[]  = {0xd7620400u, 0x0002030du, 0xbf810000u};
-    const uint32_t ldexp_neg0[]  = {0xd7620000u, 0x2002030du, 0xbf810000u};
     const uint32_t ldexp_neg1[]  = {0xd7620000u, 0x4002030du, 0xbf810000u};
     const uint32_t ldexp_neg2[]  = {0xd7620000u, 0x8002030du, 0xbf810000u};
     const uint32_t ldexp_clamp[] = {0xd7628000u, 0x0002030du, 0xbf810000u};
     const uint32_t ldexp_omod[]  = {0xd7620000u, 0x0802030du, 0xbf810000u};
-    if (!recompile_valu(ldexp_abs0, std::size(ldexp_abs0), 14, 0).empty() ||
-        !recompile_valu(ldexp_abs1, std::size(ldexp_abs1), 14, 0).empty() ||
+    if (!recompile_valu(ldexp_abs1, std::size(ldexp_abs1), 14, 0).empty() ||
         !recompile_valu(ldexp_abs2, std::size(ldexp_abs2), 14, 0).empty() ||
-        !recompile_valu(ldexp_neg0, std::size(ldexp_neg0), 14, 0).empty() ||
         !recompile_valu(ldexp_neg1, std::size(ldexp_neg1), 14, 0).empty() ||
         !recompile_valu(ldexp_neg2, std::size(ldexp_neg2), 14, 0).empty() ||
         !recompile_valu(ldexp_clamp, std::size(ldexp_clamp), 14, 0).empty() ||

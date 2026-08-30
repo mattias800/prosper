@@ -4574,13 +4574,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // behavior need separate contracts, and silently ignoring either would corrupt
                 // mip/scale reconstruction. ldexp_f32_bits covers the full unmodified i32 exponent
                 // domain without relying on GLSL.std.450 Ldexp's undefined overflow cases.
-                if (in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
-                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                // src0 is the FLOAT operand, and ABS/NEG on a float source is the ordinary VOP3
+                // modifier every other float op here already applies through fv() -- hardware order
+                // ABS then NEG. Admitting it is not a new contract (#3138). The original gate
+                // rejected all three sources together, which also refused this well-defined case:
+                // Stray's `0x3011560000` is `v_ldexp_f32 v39, |v35|, -2` (`d7620127,00018523`,
+                // ABS[2:0]=001), and that ONE instruction failed a 3684-dword fragment stage and
+                // discarded 1536 full-screen 3840x2160 draws per routed boot.
+                //
+                // src1 keeps rejecting, and for a reason the gate's own comment gives: it is the
+                // integer EXPONENT, where "absolute value" and "negate" are not float modifiers at
+                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP and
+                // OMOD keep rejecting too -- their denormal behaviour needs its own contract.
+                if (in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[1] || in.src_neg[2] ||
                     in.clamp || in.omod) {
                     ok = false;
                 } else {
-                    vreg[in.dst.value] = b.ldexp_f32_bits(
-                        val(in.src[0]), val(in.src[1]));
+                    vreg[in.dst.value] = b.ldexp_f32_bits(fv(0), val(in.src[1]));
                 }
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):

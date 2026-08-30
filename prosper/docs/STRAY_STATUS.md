@@ -55,6 +55,12 @@ completely empty table. Whether that is what its image ops want is untested — 
 
 ## Ruled out
 
+- **"The biggest dropped stage is the title-screen background."** Falsified: `0x3011560000` was the
+  largest single loss on this route — one instruction discarding **1536 full-screen 3840×2160 draws
+  per boot** — and fixing it (#3138) left `max_nonblack` unchanged at **0.0069**, a menu-only title
+  screen. Draw-loss rank does not predict which draws carry the picture, so the next candidate should
+  not be chosen by that rank alone. #3138.
+
 One line per falsified hypothesis, the evidence, and the link. Do not restart these without
 contradictory new evidence.
 
