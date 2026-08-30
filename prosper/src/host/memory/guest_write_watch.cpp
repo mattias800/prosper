@@ -525,6 +525,11 @@ void guest_dmem_write_trace_set_contention_hook_for_test(
         GuestDmemWriteTraceContentionHookForTest) {}
 void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
         GuestDmemWriteTraceDynamicProtectionHookForTest) {}
+// Stubbed for the same reason as everything above it, not as a gap: the rebaseline mode is a modifier
+// on a trace that never arms here, because the whole mechanism is mprotect + SIGSEGV and Windows'
+// create() always refuses. A real implementation would set a flag no code path reads.
+void guest_dmem_write_trace_set_rebase_enabled_for_test(int) {}
+
 void guest_dmem_write_trace_lock_state_for_test() {}
 void guest_dmem_write_trace_unlock_state_for_test() {}
 
@@ -625,6 +630,9 @@ struct DmemTraceState {
     // Rebaseline attempts that could not complete. Without this a refusal is invisible and reads
     // exactly like the mode being off.
     uint64_t rebase_failures = 0;
+    // Benign: a rebaseline declined because a host write covers a traced page. Counted apart from
+    // rebase_failures so "we waited" cannot read as "we broke" -- they need different reactions.
+    uint64_t rebase_in_flight_refusals = 0;
     // #3146: set when a host write disarmed the trace and PROSPER_DMEM_WRITE_TRACE_REBASE asked for
     // a re-baseline rather than a permanent invalidation. Cleared when the re-arm succeeds.
     bool rebase_pending = false;
@@ -1464,6 +1472,8 @@ GuestDmemWriteTraceSnapshot guest_dmem_write_trace_snapshot() {
     out.selection_uncertain_faults = trace.selection_uncertain_faults;
     out.completed_steps = trace.completed_steps;
     out.rearms = trace.rearms;
+    out.host_write_rebases = trace.host_write_rebases;
+    out.rebase_in_flight_refusals = trace.rebase_in_flight_refusals;
     out.coverage_gaps = trace.coverage_gaps;
     out.overflow_events = trace.overflow_events;
     out.selected_occurrence = trace.selected_occurrence;
@@ -1486,7 +1496,7 @@ void guest_dmem_write_trace_report() {
                  "[dmem-write-trace] summary status=%s reason=%s result=%s"
                  " allocation-matches=%llu mapping-matches=%llu page-faults=%llu"
                  " selected-faults=%llu selection-uncertain-faults=%llu"
-                 " steps=%llu rearms=%llu host-write-rebases=%llu rebase-failures=%llu coverage-gaps=%llu"
+                 " steps=%llu rearms=%llu host-write-rebases=%llu rebase-failures=%llu rebase-inflight-refusals=%llu coverage-gaps=%llu"
                  " overflow=%llu occurrence-mode=%s requested-occurrence=%u"
                  " observed-occurrences=%llu selected-occurrence=%llu events=%u/%u\n",
                  trace_status_name(trace.status), trace_reason_name(trace.invalid_reason), result,
@@ -1499,6 +1509,7 @@ void guest_dmem_write_trace_report() {
                  static_cast<unsigned long long>(trace.rearms),
                  static_cast<unsigned long long>(trace.host_write_rebases),
                  static_cast<unsigned long long>(trace.rebase_failures),
+                 static_cast<unsigned long long>(trace.rebase_in_flight_refusals),
                  static_cast<unsigned long long>(trace.coverage_gaps),
                  static_cast<unsigned long long>(trace.overflow_events),
                  trace.config.allocation_occurrence ? "ordinal" : "unique",
@@ -1736,7 +1747,11 @@ void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {
 // The re-arm is deferred rather than immediate: this notification fires BEFORE the host write, so the
 // bytes to baseline against do not exist yet. It happens on the next notification that does not
 // overlap the watched range, which on a streaming title is milliseconds away.
+std::atomic<int> g_rebase_enabled_override{-1};
+
 bool trace_rebase_enabled() {
+    const int override_value = g_rebase_enabled_override.load(std::memory_order_relaxed);
+    if (override_value >= 0) return override_value != 0;
     static const int on = [] {
         const char* v = std::getenv("PROSPER_DMEM_WRITE_TRACE_REBASE");
         return v && *v && *v != '0' ? 1 : 0;
@@ -1746,7 +1761,13 @@ bool trace_rebase_enabled() {
 
 // Re-snapshot the baseline and re-arm. Caller holds w.mutex and must have established that no host
 // write is in flight over the watched range.
-bool trace_rebase_locked(WatchState& w) {
+// `caller_begin/caller_end` is the range of the host write that is ABOUT TO RUN in the calling
+// notification. It is not in `host_write_ranges` yet -- it is appended after this returns -- so it
+// has to be folded in here explicitly. The caller does test it, but against the PRE-rebuild page
+// list, and the whole point of the rebuild is that that list can be stale: a new alias of the traced
+// phys recorded during the pending window is invisible to the caller's test, pulled in by the
+// rebuild, and would then be armed read-only under the very read that is about to fill it.
+bool trace_rebase_locked(WatchState& w, uint64_t caller_begin, uint64_t caller_end) {
     DmemTraceState& trace = w.trace;
     if (!trace.rebase_pending) return false;
     if (!w.fault_onstack.load(std::memory_order_acquire)) return false;
@@ -1778,12 +1799,17 @@ bool trace_rebase_locked(WatchState& w) {
     // Armed||Stepping), and guarding the list we are about to REPLACE would arm that new alias with
     // no check at all, re-opening the EFAULT this guard exists to close.
     for (const DmemTracePage& page : trace.pages)
-        for (const PageAlias& alias : page.aliases)
+        for (const PageAlias& alias : page.aliases) {
+            if (alias.addr >= caller_begin && alias.addr < caller_end) {
+                trace.rebase_in_flight_refusals++;
+                return false;
+            }
             for (const auto& range : w.host_write_ranges)
                 if (alias.addr >= range.first && alias.addr < range.second) {
-                    trace.rebase_failures++;
+                    trace.rebase_in_flight_refusals++;
                     return false;
                 }
+        }
     if (!set_trace_armed_locked(w, true, false)) {
         trace.rebase_failures++;
         return false;
@@ -1877,7 +1903,7 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
         bool overlap = false;
         for (uint64_t va = begin; va < end && !overlap; va += kPage)
             overlap = trace_va_to_phys_locked(w.trace, va, ignored_phys);
-        if (!overlap) (void)trace_rebase_locked(w);
+        if (!overlap) (void)trace_rebase_locked(w, begin, end);
     }
     // Recorded AFTER the rebaseline decision, not before it: THIS call's write has not started yet
     // and its own range is excluded by the overlap test above. Recording first made the guard see its
@@ -2296,6 +2322,10 @@ void guest_dmem_write_trace_set_contention_hook_for_test(
 void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
         GuestDmemWriteTraceDynamicProtectionHookForTest hook) {
     trace_dynamic_protection_hook_for_test.store(hook, std::memory_order_release);
+}
+
+void guest_dmem_write_trace_set_rebase_enabled_for_test(int enabled) {
+    g_rebase_enabled_override.store(enabled, std::memory_order_relaxed);
 }
 
 void guest_dmem_write_trace_lock_state_for_test() { state().mutex.lock(); }

@@ -1479,7 +1479,14 @@ static int64_t read_full(int fd, void* buf, size_t count, bool positioned, off_t
     // nothing may re-arm a watch over `buf` before then (#3146 review B1).
     struct HostWriteDone {
         uint64_t addr; uint64_t size;
-        ~HostWriteDone() { host::guest_write_watch_notify_host_write_done(addr, size); }
+        // errno is preserved across this: the guard runs on the way out of a function whose CALLER
+        // reads errno after a short/failed read, and a diagnostic completion must not be able to
+        // change what the guest is told went wrong.
+        ~HostWriteDone() {
+            const int saved = errno;
+            host::guest_write_watch_notify_host_write_done(addr, size);
+            errno = saved;
+        }
     } host_write_done{reinterpret_cast<uint64_t>(buf), count};
     size_t done = 0;
     while (done < count) {
@@ -1609,6 +1616,9 @@ static void disarm_iovec_watches(const struct iovec* v, int n) {
 // a watch could be re-armed over a buffer the read is about to fill -- and the store would then hit a
 // read-only page and EFAULT the read. Calling this after the syscall closes the window (#3146 B1).
 static void rearm_iovec_watches(const struct iovec* v, int n) {
+    // Runs between the readv/preadv and the caller's errno read, so it must leave errno alone.
+    const int saved_errno = errno;
+    struct RestoreErrno { int v; ~RestoreErrno() { errno = v; } } restore_errno{saved_errno};
     if (!v || n <= 0) return;
     for (int i = 0; i < n; ++i)
         if (v[i].iov_base && v[i].iov_len)
@@ -2942,7 +2952,14 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     // measurement rather than in any test.
     struct HostWriteDone {
         uint64_t addr; uint64_t size;
-        ~HostWriteDone() { host::guest_write_watch_notify_host_write_done(addr, size); }
+        // errno is preserved across this: the guard runs on the way out of a function whose CALLER
+        // reads errno after a short/failed read, and a diagnostic completion must not be able to
+        // change what the guest is told went wrong.
+        ~HostWriteDone() {
+            const int saved = errno;
+            host::guest_write_watch_notify_host_write_done(addr, size);
+            errno = saved;
+        }
     } host_write_done{dst, size};
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
