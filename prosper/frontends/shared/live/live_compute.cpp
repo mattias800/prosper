@@ -842,6 +842,12 @@ struct ComputeImageCacheKey {
     uint32_t mip_tail_offset = 0, mip_tail_bytes = 0;
     uint32_t mip_tail_x = 0, mip_tail_y = 0;
     uint32_t vk_format = 0;
+    // #3149: the DCC metadata plane is part of a compressed surface's identity. Base bytes alone do
+    // NOT determine its content -- that is precisely why compressed surfaces were excluded from this
+    // cache -- so the metadata range joins the key, and the validation below requires it unchanged
+    // too. Zero for an uncompressed surface, which keeps every existing entry's identity unchanged.
+    uint64_t metadata_addr = 0;
+    uint32_t metadata_bytes = 0;
     bool storage = false;
     bool in_mip_tail = false;
     bool srgb = false;
@@ -881,7 +887,13 @@ ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource&
         resource.layer_stride_bytes, resource.layer_mip_offset_bytes,
         resource.mip_tail_offset, resource.mip_tail_bytes,
         resource.mip_tail_x, resource.mip_tail_y,
-        static_cast<uint32_t>(native_format), true, resource.in_mip_tail,
+        static_cast<uint32_t>(native_format),
+        // #3149: same positional slot as the sampled key -- between vk_format and storage.
+        resource.compression_enabled ? resource.metadata_addr : 0ull,
+        resource.compression_enabled
+            ? static_cast<uint32_t>(prosper::gpu::gpu_capture_dcc_metadata_footprint(resource))
+            : 0u,
+        true, resource.in_mip_tail,
         resource.srgb, resource.depth_compare};
 }
 
@@ -1983,6 +1995,9 @@ struct VulkanComputeContext {
         ++cached.pins;
         image = cached.image;
         memory = cached.memory;
+        // The epoch fast path is per-submit and covers both ranges implicitly: an epoch is only
+        // reused within a submit, and a metadata write inside the submit bumps the journal that
+        // `metadata_unchanged` below consults on the next acquisition.
         if (!key.host_data && validation_epoch && cached.validation_epoch == validation_epoch) {
             upload_skipped = cached.validation_result;
             return true;
@@ -1992,7 +2007,16 @@ struct VulkanComputeContext {
         // entries only against their exact retained snapshot. This makes warm replay exercise the
         // same image residency as live execution without ever trusting an unrelated guest address.
         const bool exact_source_only = key.host_data != 0;
+        // Both ranges, not just the base. A compressed surface whose metadata changed while its
+        // base bytes did not would otherwise serve stale pixels -- the exact unsafety that kept
+        // these surfaces out of the cache. An uncompressed entry has metadata_bytes == 0 and takes
+        // the same path it always did.
+        const bool metadata_unchanged = key.metadata_bytes == 0 ||
+            prosper::gpu::guest_gpu_writes_since(cached.validation_snapshot,
+                                                 key.metadata_addr, key.metadata_bytes) ==
+                prosper::gpu::GuestGpuWriteQuery::Unchanged;
         const bool submit_unchanged = cached.content_valid && !exact_source_only &&
+            metadata_unchanged &&
             prosper::gpu::guest_gpu_writes_since(cached.validation_snapshot,
                                                   key.gpu_addr, key.guest_bytes) ==
                 prosper::gpu::GuestGpuWriteQuery::Unchanged;
@@ -6832,7 +6856,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // this first narrow path uncached rather than teaching the existing base-byte key
                 // an unsafe partial identity; staging materialization is still far cheaper than
                 // detiling and converting the 2x-larger FP16 base.
-                bi.cache_candidate = !sampled_dcc_fast_clear && dcc_cache_safe &&
+                // PROSPER_DCC_CACHE_UPSIDE=1 (#3149) is a MEASUREMENT, not a fix, and must never
+                // become the default: it admits DCC-compressed surfaces to the image cache whose
+                // identity is base bytes only, so a surface whose metadata changes while its base
+                // bytes do not would serve stale pixels. It exists to answer one question -- is the
+                // real fix (folding the metadata plane into the cache identity) worth building? --
+                // because that fix is a correctness-sensitive change this code explicitly warns
+                // against making naively, and it should not be built on a guess about its payoff.
+                // #3149: a compressed surface is now cacheable because its DCC metadata plane is
+                // part of the cache identity and is validated alongside the base bytes -- the
+                // "unsafe partial identity" this code warned about is exactly what was added, so the
+                // warning is satisfied rather than bypassed. Requires a metadata range to validate:
+                // compression with no metadata address stays out, failing closed as before.
+                // Kill switch, and it earns its place: this admits a whole class of surface to a
+                // cache it was previously excluded from, so a single variable must be able to
+                // restore the old behaviour exactly -- for bisecting a rendering report, and for the
+                // pixel A/B that justified the change in the first place.
+                static const bool dcc_cache_disabled =
+                    std::getenv("PROSPER_NO_DCC_IMAGE_CACHE") != nullptr;
+                const bool dcc_identity_tracked = !dcc_cache_disabled &&
+                    r->compression_enabled && r->metadata_addr &&
+                    prosper::gpu::gpu_capture_dcc_metadata_footprint(*r) > 0;
+                bi.cache_candidate = !sampled_dcc_fast_clear &&
+                    (dcc_cache_safe || dcc_identity_tracked) &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
                 const VkFormat transfer_native_format =
                     compute_transfer_storage_vk_format(r->format, sampled_components);
@@ -6884,7 +6930,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->layer_stride_bytes, r->layer_mip_offset_bytes,
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
-                        static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
+                        static_cast<uint32_t>(image_format),
+                        // #3149: metadata plane joins the identity. Positional aggregate init --
+                        // these two MUST sit between vk_format and storage, matching the struct.
+                        r->compression_enabled ? r->metadata_addr : 0ull,
+                        r->compression_enabled
+                            ? static_cast<uint32_t>(
+                                  prosper::gpu::gpu_capture_dcc_metadata_footprint(*r))
+                            : 0u,
+                        bi.storage, r->in_mip_tail,
                         r->srgb, r->depth_compare};
                     // An ordinary native typed 2D image or native typed 3D volume is byte- and
                     // format-identical to the sampled upload that follows it. Borrow that retained
@@ -7231,6 +7285,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          r->mip_tail_x, r->mip_tail_y);
                     unpack_source = linear.get();
                 } else if (r->tile_mode) {
+                    const prosper::gpu::TileCensusScope tcs("stor-seed");
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     detile_surface(linear.get(), src, r->width, r->height, r->tile_mode, 0,
                                    static_cast<uint32_t>(guest_texel));
@@ -7692,6 +7747,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                  r->tile_mode, bpt, r->mip_tail_x,
                                                  r->mip_tail_y);
                         } else if (r->tile_mode) {
+                            const prosper::gpu::TileCensusScope tcs("smpl-upl");
                             detile_surface(linear.get(), src, r->width, r->height,
                                            r->tile_mode, 0, bpt);
                         }
@@ -10271,6 +10327,7 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // exercised by a regression test rather than only by a routed run.
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    const prosper::gpu::TileCensusScope tile_census_scope("compute");
     auto fail_closed_items = [&]() {
         for (const auto& item : items)
             prosper::gpu::notify_compute_authority_boundary({

@@ -84,6 +84,16 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
 // De-swizzle a surface of `bytes_per_texel`-byte texels from tiled `src` into linear `dst` (each
 // width*height*bpt bytes). `tile_mode` selects the swizzle; Linear/unknown modes do a straight
 // copy. `pitch` is the padded row pitch in texels (0 -> use `width`).
+// PROSPER_TILECENSUS attribution: which SUBSYSTEM asked for this tiling work. The profiler cannot
+// say -- at -O3 the callers inline away and DWARF collapses through the guest JIT -- and the geometry
+// census alone shows a 4K FP16 surface detiled 2199 times without saying who wants it. Scoped by RAII
+// at the two subsystem entry points; unset reads as "?".
+struct TileCensusScope {
+    explicit TileCensusScope(const char* who);
+    ~TileCensusScope();
+    const char* prev;
+};
+
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
