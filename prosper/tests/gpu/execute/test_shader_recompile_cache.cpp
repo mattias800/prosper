@@ -142,6 +142,17 @@ static const uint32_t kPs[] = {
     0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
 
+// setenv/unsetenv are POSIX and absent on MinGW, where the CI Windows job builds this file.
+// `live_renderer.cpp` splits the same way; a null value clears the variable on both platforms.
+static void set_env_for_test(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else       unsetenv(name);
+#endif
+}
+
 int main() {
     std::printf("== test_shader_recompile_cache ==\n");
     clear_shader_recompile_cache();
@@ -247,18 +258,19 @@ int main() {
         std::snprintf(selector, sizeof selector, "0x%llx",
                       static_cast<unsigned long long>(
                           reinterpret_cast<uintptr_t>(bound_a.data())));
-        setenv("PROSPER_CFG_TRIP_BOUND", "4", 1);
-        setenv("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector, 1);
-        setenv("PROSPER_CFG_TRIP_BOUND_PHASE", "0", 1);
+        // MinGW has no setenv/unsetenv; live_renderer.cpp uses the same _putenv_s split.
+        set_env_for_test("PROSPER_CFG_TRIP_BOUND", "4");
+        set_env_for_test("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        set_env_for_test("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
         const auto before = shader_recompile_cache_stats();
         (void)recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, bound_a.data(), bound_a.size(), nullptr);
         (void)recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, bound_b.data(), bound_b.size(), nullptr);
         const auto after = shader_recompile_cache_stats();
-        unsetenv("PROSPER_CFG_TRIP_BOUND");
-        unsetenv("PROSPER_CFG_TRIP_BOUND_PROGRAM");
-        unsetenv("PROSPER_CFG_TRIP_BOUND_PHASE");
+        set_env_for_test("PROSPER_CFG_TRIP_BOUND", nullptr);
+        set_env_for_test("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        set_env_for_test("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
         CHECK(after.misses == before.misses + 2 && after.hits == before.hits,
               "#3130: an armed trip-bound selector separates identical bytes at two addresses");
     }
