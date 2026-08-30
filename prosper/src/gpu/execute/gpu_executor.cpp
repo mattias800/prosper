@@ -8208,6 +8208,20 @@ std::vector<ComputeItem> realize_compute_dispatches(
                          static_cast<int>(cf9200_valid), table->resources.size());
         assign_convention_bindings(*table, 2);
 
+        // PROSPER_COMPUTEMAP=1 -- every storage-image destination a compute dispatch binds. The
+        // graphics-side DRAWMAP cannot see these, so without it a surface written only by compute
+        // looks like a surface nothing writes at all -- which is exactly the wrong turn #3126 took.
+        if (getenv("PROSPER_COMPUTEMAP") && table) {
+            static std::mutex kmx; static std::set<std::pair<uint64_t, uint64_t>> kseen;
+            std::lock_guard<std::mutex> lk(kmx);
+            for (const ShaderResource& r : table->resources) {
+                if (r.cls != ResourceClass::StorageImage) continue;
+                if (!kseen.insert({code_addr, r.gpu_addr}).second) continue;
+                fprintf(stderr, "[computemap] program=0x%llx writes 0x%llx %ux%u binding=%u\n",
+                        (unsigned long long)code_addr, (unsigned long long)r.gpu_addr,
+                        r.width, r.height, r.binding);
+            }
+        }
         ComputeItem item;
         // Fold-time half of the paired read: the descriptors this dispatch will use were just
         // resolved from guest memory, so sample that memory NOW, before anything else runs.
@@ -9343,6 +9357,12 @@ bool parallel_draw_diagnostic_active(bool log) {
         "PROSPER_SHADER_DUMP_SUCCESS", "PROSPER_DRAWLOG", "PROSPER_DBG",
         "PROSPER_STAGE_FOLD_PROFILE", "PROSPER_DESCRIPTOR_VALIDATE",
         "PROSPER_NO_SHADER_CACHE",
+        // PROSPER_TEXCONTENT queries is_live_render_target(), and that callback is NOT a pure read:
+        // it begins with drain_guest_gpu_writes(), which steals the pending guest-write queue and
+        // mutates an unsynchronised map. Calling it from parallel realization workers is undefined
+        // behaviour AND perturbs the cache state the diagnostic exists to report. Serialising is the
+        // whole reason this list exists.
+        "PROSPER_TEXCONTENT",
     };
     for (const char* name : diagnostics)
         if (std::getenv(name)) return true;
