@@ -3,6 +3,23 @@
 `reach-first-map.pad` drives the boot past the **brightness-calibration screen** to the first map
 load.
 
+`reach-title-flip.pad` stops one screen earlier — it reaches the **title screen** and holds there —
+and it is the one to use for anything that has to be reproducible.
+
+## Why the title route is anchored on flips, not seconds
+
+A wall-clock route cannot hit this title reliably: an earlier 150 s/160 s version fired before
+calibration on slower boots and reached the title only sometimes (`max_nonblack` 0.1095 once, then
+0.0063 / 0.0000 / 0.0063 on three unmodified reruns — a single lucky sample adopted as a baseline is
+how that hour was lost). The flip anchor works because the target is a **steady state** rather than a
+moment: a no-input boot reaches calibration at `present_count` ≈ 1764 and then holds it unchanged
+(identical nonblack 0.1070 from present 1838 through 3205), because that screen waits for input. Any
+anchor after it arrives lands on it however slow the boot was.
+
+```bash
+export PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-title-flip.pad
+```
+
 ```bash
 export PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct
 export PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-first-map.pad
