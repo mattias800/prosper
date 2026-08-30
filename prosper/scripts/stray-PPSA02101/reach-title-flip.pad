@@ -22,9 +22,14 @@
 #
 # That is what makes a single late anchor deterministic: the target state is not a moment,
 # it is a steady state, so any anchor after it arrives lands on it however slow the boot was.
-# A wall-clock route cannot do this -- the earlier 150s/160s version fired before calibration
-# on slower boots and reached the title only sometimes (measured 0.1095 once, then
-# 0.0063/0.0000/0.0063 on three unmodified reruns).
+# The claim that used to sit here -- "a wall-clock route cannot do this", citing an earlier
+# 150s/160s version that "reached the title only sometimes (0.1095 once, then
+# 0.0063/0.0000/0.0063 on three unmodified reruns)" -- is INVERTED and is withdrawn.
+# Under the corrected number map ~0.11 is calibration and ~0.006 is the title screen, so the
+# run read as the success was calibration and two of the three read as failures were the
+# TITLE SCREEN. That route reached the title 2 of 4 times, not 1 of 4, and it is committed as
+# reach-title-hold.pad -- the route this title actually uses. The flip anchor is a good way to
+# hold CALIBRATION; it was never evidence against wall-clock timing.
 #
 # ONE press: Cross accepts calibration (its own prompt bar names it). Nothing after it, so the
 # title screen holds instead of being selected past into the game.

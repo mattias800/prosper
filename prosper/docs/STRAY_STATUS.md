@@ -91,10 +91,14 @@ completely empty table. Whether that is what its image ops want is untested — 
 
 > **VOID as title-screen evidence, and this warning covers BOTH censuses below it.** Every number in
 > this section was read on the brightness-calibration screen (`max_nonblack` 0.1140), not on the
-> title screen (0.0069). The section is kept because two *mechanism* findings survive the screen
-> mix-up — no `CB_TARGET_MASK` register is being lost (so this is not the *Oregon Trail* defect
-> #1946), and the colour-masked-off draws come from one shader — and because these numbers are cited
-> elsewhere and need somewhere to point. Every *quantity* here describes the wrong screen. Do not
+> title screen (0.0069). The section is kept because these numbers are cited elsewhere and need
+> somewhere to point — **not** because anything in it survives as title-screen evidence. An earlier
+> version of this banner claimed two *mechanism* findings did survive: that no `CB_TARGET_MASK`
+> register is being lost (so this is not the *Oregon Trail* defect #1946), and that the
+> colour-masked-off draws come from one shader. Both are marked VOID in `## Ruled out`, and the
+> banner cannot exempt them: a trace that ran only on calibration says nothing about which registers
+> reach the GPU on the title screen, mechanism or quantity. Every number here describes the wrong
+> screen. Do not
 > quote the 1024, the 7, the 32,649 or the 92% as facts about the title screen; § *The title
 > screen's REAL numbers* has that screen's own census, and it disagrees.
 
