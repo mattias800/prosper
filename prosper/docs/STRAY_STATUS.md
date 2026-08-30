@@ -71,11 +71,13 @@ dumped, the resource table is complete and correct — each declared read-only T
 SGPR-resident one under DIRECT (`sgpr_base`) provenance and the EUD-resident ones under INDIRECT
 (`srt_offset = (offset_dw - num_user_sgprs) * 4`) provenance, which is exactly what the table shows.
 
-What is **not** established is which stage the five failures belong to. Every line reports
-`program=0x0`, because `recompile_fragment_impl` hardcodes a zero program address
+What was **not** established at the time of that census is which stage the five failures belong to.
+Every line reported `program=0x0`, because `recompile_fragment_impl` hardcoded a zero program address
 ([#3130](https://github.com/mattias800/prosper/issues/3130)) — so no fragment-shader recompile failure
-on any title can currently be attributed to a shader. Fixing that turns this investigation from an
-inference into a lookup, and is the cheapest next step.
+on any title could be attributed to a shader. **That is fixed** (#3132): fragment diagnostics now carry
+the real guest program address, which turns this from an inference into a lookup. The five failures
+above predate the fix and were never re-attributed, so they remain unassigned to a stage — re-running
+the census is what would assign them.
 
 Separately, four stages declare a *writable* 8-dword T# that reaches no resource table at all
 ([#3128](https://github.com/mattias800/prosper/issues/3128)); one of them has four image ops against a
@@ -92,6 +94,14 @@ completely empty table. Whether that is what its image ops want is untested — 
 
 So the unresolved image ops cost **7 draws, not the picture**. Nearly everything discarded is dropped
 because every colour target's write mask is zero and there is no depth/stencil side effect.
+
+> **VOID as title-screen evidence — measured on the brightness-calibration screen (0.1140), not on
+> the title screen (0.0069).** The whole of this section is kept because its *mechanism* finding
+> stands (no `CB_TARGET_MASK` register is being lost, so this is not the *Oregon Trail* defect
+> #1946), and because the number is cited elsewhere and needs somewhere to point. Its *quantities*
+> describe the wrong screen and are contradicted by the title-screen census below: 8192 draws
+> discarded there against 1024 here. Do not quote the 92% or the 32,649 as facts about the title
+> screen.
 
 **But the dropped draws are not where the missing picture is either.** `PROSPER_COLORSTATETRACE=1`
 over a shorter window traced **32,649** draws, and every single one carries a *decoded*
@@ -191,18 +201,25 @@ quadrant covering the top-left 1920×1080**, i.e. prosper's own seed-miss fill. 
 the seed-miss *gradient*. A brightness metric ranks all three above any real content in this frame,
 which is the recorded hazard: open the image before believing the number.
 
-## Everything else is measured and is not the cause
+## Measured on CALIBRATION, and only one row survives as title-screen evidence
 
-| candidate | measurement |
-| --- | --- |
-| dropped draws | 7 `shader-recompile`, ~30,000 draws executed |
-| skipped compute | `0x300ba70000` executed **7455**, skipped **2** (`PROSPER_COMPUTE_PROGRAM_CENSUS=1`) |
-| lost colour write masks | present and decoded on 32,649 of 32,649 traced draws |
-| composite / tonemap | the HDR sources are black before it runs |
+Every number in this table was read on the 0.1140 calibration screen. The table is kept because it is
+cited, and annotated because three of its four rows were read as ruling out causes on the title
+screen, which they cannot do. **The next section has the title screen's own numbers, and they
+disagree.**
+
+| candidate | measurement (calibration) | title-screen status |
+| --- | --- | --- |
+| dropped draws | 7 `shader-recompile`, ~30,000 draws executed | **FALSIFIED for the title screen** — ~3800 there, see below |
+| skipped compute | `0x300ba70000` executed **7455**, skipped **2** (`PROSPER_COMPUTE_PROGRAM_CENSUS=1`) | not re-measured on the title screen |
+| lost colour write masks | present and decoded on 32,649 of 32,649 traced draws | mechanism holds (no register lost); count is calibration's |
+| composite / tonemap | the HDR sources are black before it runs | holds — established on the title-screen bundle |
 
 ## The title screen's REAL numbers (measured on a 0.0069 frame)
 
-Everything above this section that quotes a live census was measured on calibration. These are the
+Everything above this section that quotes a live census was measured on calibration. Each such
+section now carries that warning at its own head rather than only here — a retraction a hundred lines
+below the number it retracts is one most readers never reach. These are the
 title screen, `PROSPER_NULL_PAGE=1`, census read at the same cumulative total in every arm:
 
 | | calibration (0.1140) | **title screen (0.0069)** |

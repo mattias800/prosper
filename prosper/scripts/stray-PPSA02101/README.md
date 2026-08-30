@@ -27,18 +27,31 @@ accepts calibration, and the second is the margin for a slow boot — on a fast 
 title menu's already-selected `START GAME`, which is why a window that runs far past t=160 can catch
 a load instead of the title.
 
-## Why the title route is anchored on flips, not seconds
+## Why the CALIBRATION route is anchored on flips, not seconds
 
-A wall-clock route cannot hit this title reliably: an earlier 150 s/160 s version fired before
-calibration on slower boots and reached the title only sometimes (`max_nonblack` a timed route reached the title only
-sometimes. **That reading was inverted** and is corrected in
-`docs/STRAY_STATUS.md` § Ruled out: ~0.11 is the calibration screen and ~0.006 is the title screen, so
-the samples read as failures were the successes. The flip anchor works because the target is a **steady state** rather than a
-moment: a no-input boot reaches calibration at `present_count` ≈ 1764 and then holds it unchanged
-(identical nonblack 0.1070 from present 1838 through 3205), because that screen waits for input. Any
-anchor after it arrives lands on it however slow the boot was.
+This section is about `reach-title-flip.pad`, which despite its name reaches **calibration**, not the
+title. The title route is the wall-clock one above; this heading used to claim the opposite and the
+export below used to present this file as the title route, both of which contradicted the top of this
+same README.
+
+The flip anchor is the right shape *for calibration* because that target is a **steady state** rather
+than a moment: a no-input boot reaches calibration at `present_count` ≈ 1764 and then holds it
+unchanged (identical nonblack 0.1070 from present 1838 through 3205), because that screen waits for
+input. Any anchor after it arrives lands on it however slow the boot was — which is what makes it a
+stable oracle.
+
+An earlier attempt to read wall-clock timing as unreliable rested on an **inverted number map**:
+~0.11 was taken for the title screen and ~0.006 for a failure, when it is the other way round
+(`docs/STRAY_STATUS.md` § Ruled out). The samples read as failures were the successes. That is why
+the wall-clock `reach-title-hold.pad` above is the title route despite this section once arguing no
+wall-clock route could work.
+
+Note the unreconciled figure recorded in `reach-title-flip.pad`'s own header: this file's runs
+settle at 0.1140 while an earlier set reported 0.1097 for what should be the same screen. Both are
+calibration; the gap is not explained.
 
 ```bash
+# calibration hold -- NOT the title route
 export PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-title-flip.pad
 ```
 
