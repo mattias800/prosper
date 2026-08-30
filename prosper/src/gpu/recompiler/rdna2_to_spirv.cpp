@@ -3359,6 +3359,8 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
                 (unsigned long long)phash, dwords, what, at ? at->pc : 0u, at ? (int)at->fmt : -1);
     };
     for (const Rdna2Inst& instruction : instructions) {
+        // A fetch prolog has no architectural output or program termination of its own. Encountering
+        // either before the transfer means this is a complete/different shader, not the split ABI.
         if (instruction.is_end || instruction.fmt == Rdna2Format::EXP ||
             instruction.fmt == Rdna2Format::Unknown) {
             prolog_note("BAIL", &instruction);
