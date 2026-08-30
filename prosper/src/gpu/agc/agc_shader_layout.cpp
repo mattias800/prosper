@@ -972,12 +972,17 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     // whatever the FIRST observation saw, which on a long run is the boot-time state,
                     // so a surface filled moments later still reads as empty. That mistake cost three
                     // published corrections before it was caught.
-                    static std::mutex cmx; static std::set<std::pair<uint64_t, int>> cseen;
+                    // Keyed on (shader, base, verdict): the same surface is sampled by several
+                    // stages, and "which shader reads a surface that is empty" is the question this
+                    // answers -- a base-only key reports one sampler and hides the rest.
+                    static std::mutex cmx;
+                    static std::set<std::tuple<const void*, uint64_t, int>> cseen;
                     std::lock_guard<std::mutex> lk(cmx);
-                    if (cseen.insert({d.base, verdict}).second)
+                    if (cseen.insert({shdr.code, d.base, verdict}).second)
                         fprintf(stderr,
-                                "[texcontent] base=0x%llx %ux%u fmt=%u bytes=%llu nonzero=%u/%u %s "
-                                "rtt=%s\n",
+                                "[texcontent] shader=%p base=0x%llx %ux%u fmt=%u bytes=%llu "
+                                "nonzero=%u/%u %s rtt=%s\n",
+                                shdr.code,
                                 (unsigned long long)d.base, d.width, d.height, d.format,
                                 (unsigned long long)span, nonzero, sampled_dwords,
                                 sampled_dwords == 0 ? "UNREADABLE"
