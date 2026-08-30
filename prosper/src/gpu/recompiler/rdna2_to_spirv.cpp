@@ -2928,9 +2928,9 @@ static std::vector<uint32_t> recompile_fragment_impl(
         const PixelSystemInputMapping* system_inputs,
         uint32_t pcrel_dispatch_target,
         const FragmentInterpolationLayout* interpolation,
-        uint32_t wave_size) {
+        uint32_t wave_size,
+        RecompileDiagnosticContext diagnostic) {
     if (wave_size != 32 && wave_size != 64) return {};
-    const RecompileDiagnosticContext diagnostic{RecompileDiagnosticStage::Fragment, 0};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
@@ -3160,16 +3160,18 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const PixelSystemInputMapping* system_inputs,
                                          uint32_t pcrel_dispatch_target,
                                          const FragmentInterpolationLayout* interpolation,
-                                         bool wave32) {
+                                         bool wave32,
+                                         RecompileDiagnosticContext diagnostic) {
     return recompile_fragment_impl(code, dwords, rt, system_inputs,
                                    pcrel_dispatch_target, interpolation,
-                                   wave32 ? 32u : 64u);
+                                   wave32 ? 32u : 64u, diagnostic);
 }
 
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
         const uint32_t* code, size_t dwords) {
     return recompile_fragment_impl(code, dwords, nullptr, nullptr,
-                                   UINT32_MAX, nullptr, 32);
+                                   UINT32_MAX, nullptr, 32,
+                                   {RecompileDiagnosticStage::Fragment, 0});
 }
 
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv) {

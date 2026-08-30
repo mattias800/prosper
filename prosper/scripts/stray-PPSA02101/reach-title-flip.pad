@@ -1,3 +1,18 @@
+# Stray (PPSA02101) -- reach the brightness-CALIBRATION screen deterministically and hold there.
+#
+# CORRECTION 2026-08-30: this file was landed as a TITLE-screen route and it is not one. Everything
+# below the correction is the original header, kept because its flip-anchor reasoning is sound and
+# its measurements were real; only the screen it names was wrong.
+#
+# The unresolved part, stated rather than hidden: the original header reports FOUR runs reaching
+# "the title screen" at max_nonblack 0.1097, while a later 16-frame run of this same route settles at
+# 0.1140 on a frame that visibly IS the calibration screen (three cat heads, the Adjust-the-value
+# text, the 16-step slider, the Defaults/Accept prompts). 0.1097 and 0.1140 are close but not equal,
+# and the two measurements have not been reconciled. Whoever picks this up should settle it by
+# LOOKING at a frame from each rather than by comparing the numbers -- that is what exposed the
+# original misreading. See docs/STRAY_STATUS.md and #3126.
+#
+# --- original header follows ---
 # Stray (PPSA02101) -- reach the title screen DETERMINISTICALLY and hold there.
 #
 # Anchored on FLIPS, not seconds. Measured 2026-08-30: a no-input boot reaches the
@@ -7,9 +22,14 @@
 #
 # That is what makes a single late anchor deterministic: the target state is not a moment,
 # it is a steady state, so any anchor after it arrives lands on it however slow the boot was.
-# A wall-clock route cannot do this -- the earlier 150s/160s version fired before calibration
-# on slower boots and reached the title only sometimes (measured 0.1095 once, then
-# 0.0063/0.0000/0.0063 on three unmodified reruns).
+# The claim that used to sit here -- "a wall-clock route cannot do this", citing an earlier
+# 150s/160s version that "reached the title only sometimes (0.1095 once, then
+# 0.0063/0.0000/0.0063 on three unmodified reruns)" -- is INVERTED and is withdrawn.
+# Under the corrected number map ~0.11 is calibration and ~0.006 is the title screen, so the
+# run read as the success was calibration and two of the three read as failures were the
+# TITLE SCREEN. That route reached the title 2 of 4 times, not 1 of 4, and it is committed as
+# reach-title-hold.pad -- the route this title actually uses. The flip anchor is a good way to
+# hold CALIBRATION; it was never evidence against wall-clock timing.
 #
 # ONE press: Cross accepts calibration (its own prompt bar names it). Nothing after it, so the
 # title screen holds instead of being selected past into the game.

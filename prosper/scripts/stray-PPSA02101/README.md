@@ -3,20 +3,56 @@
 `reach-first-map.pad` drives the boot past the **brightness-calibration screen** to the first map
 load.
 
-`reach-title-flip.pad` stops one screen earlier — it reaches the **title screen** and holds there —
-and it is the one to use for anything that has to be reproducible.
+`reach-title-flip.pad` was landed as "reaches the title screen and holds there". **Measured 2026-08-30,
+that is wrong**: over a 320 s run all 16 captured frames are the brightness-calibration screen
+(`max_nonblack` 0.1140). Its single flip-anchored Cross does not accept. Treat it as a deterministic
+way to *hold calibration*, which is still useful — that screen renders correctly and is a stable
+oracle — but not as a title-screen route.
 
-## Why the title route is anchored on flips, not seconds
-
-A wall-clock route cannot hit this title reliably: an earlier 150 s/160 s version fired before
-calibration on slower boots and reached the title only sometimes (`max_nonblack` 0.1095 once, then
-0.0063 / 0.0000 / 0.0063 on three unmodified reruns — a single lucky sample adopted as a baseline is
-how that hour was lost). The flip anchor works because the target is a **steady state** rather than a
-moment: a no-input boot reaches calibration at `present_count` ≈ 1764 and then holds it unchanged
-(identical nonblack 0.1070 from present 1838 through 3205), because that screen waits for input. Any
-anchor after it arrives lands on it however slow the boot was.
+**`reach-title-hold.pad` is the title route**, and it needs `PROSPER_NULL_PAGE=1`. Without that the
+run either faults with a `[nullpage]` report or survives and renders pure black after Accept. With it
+the route lands on the title screen (`max_nonblack` 0.0069, held) in roughly **one run in three**, so
+repeat any measurement rather than trusting one arm.
 
 ```bash
+PROSPER_NULL_PAGE=1 \
+PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-title-hold.pad \
+  ./build-linux/screenshot <DUMP_ROOT>/PPSA02101-app0 \
+    --seconds 6 --count 30 --warmup-seconds 140 --timeout 360 \
+    --allow-guest-fault --no-stop-after-guest-fault --out <OUTDIR>
+```
+
+Frames 09-28 settle at 0.0069 when it lands. It presses Cross twice (t=150 and t=160): the first
+accepts calibration, and the second is the margin for a slow boot — on a fast one it lands on the
+title menu's already-selected `START GAME`, which is why a window that runs far past t=160 can catch
+a load instead of the title.
+
+## Why the CALIBRATION route is anchored on flips, not seconds
+
+This section is about `reach-title-flip.pad`, which despite its name reaches **calibration**, not the
+title. The title route is the wall-clock one above; this heading used to claim the opposite and the
+export below used to present this file as the title route, both of which contradicted the top of this
+same README.
+
+The flip anchor is the right shape *for calibration* because that target is a **steady state** rather
+than a moment: a no-input boot reaches calibration at `present_count` ≈ 1764 and then holds it
+unchanged (identical nonblack 0.1070 from present 1838 through 3205), because that screen waits for
+input. Any anchor after it arrives lands on it however slow the boot was — which is what makes it a
+stable oracle.
+
+An earlier attempt to read wall-clock timing as unreliable rested on an **inverted number map**:
+~0.11 was taken for the title screen and ~0.006 for a failure, when it is the other way round
+(`docs/STRAY_STATUS.md` § Ruled out). Two of the three samples read as failures were the successes —
+the third was a black frame, which is a failure under either map. That is why
+the wall-clock `reach-title-hold.pad` above is the title route despite this section once arguing no
+wall-clock route could work.
+
+Note the unreconciled figure recorded in `reach-title-flip.pad`'s own header: this file's runs
+settle at 0.1140 while an earlier set reported 0.1097 for what should be the same screen. Both are
+calibration; the gap is not explained.
+
+```bash
+# calibration hold -- NOT the title route
 export PROSPER_PAD_SCRIPT=@prosper/scripts/stray-PPSA02101/reach-title-flip.pad
 ```
 

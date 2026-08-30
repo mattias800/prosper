@@ -1653,8 +1653,15 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     return key;
 }
 
+// `program_address` is the guest address of the shader this key was built from. It is DIAGNOSTIC
+// PROVENANCE ONLY and deliberately arrives as a separate argument rather than inside the key: the
+// same program bytes produce the same SPIR-V at every guest address, so folding it into
+// ShaderCompileKey would give each address its own cache entry and quietly defeat the cache. The
+// key's own `code` pointer cannot serve here -- it points into the key's owned COPY of the words,
+// not at guest memory (#3130).
 std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
-                                              const ShaderResourceTable* resources) {
+                                              const ShaderResourceTable* resources,
+                                              uint64_t program_address) {
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
@@ -1678,7 +1685,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
-                                  &interpolation, key.fragment_wave32);
+                                  &interpolation, key.fragment_wave32,
+                                  {RecompileDiagnosticStage::Fragment, program_address});
     }
     return {};
 }
@@ -1747,7 +1755,8 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
 
 SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, ShaderCompileKey key,
                                                   const ShaderResourceTable* resources,
-                                                  uint64_t* cache_identity) {
+                                                  uint64_t* cache_identity,
+                                                  uint64_t program_address) {
     if (cache_identity) *cache_identity = 0;
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
@@ -1756,7 +1765,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
             ++cache.stats.bypasses;
         }
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
-            compile_graphics_shader(stage, key, resources));
+            compile_graphics_shader(stage, key, resources, program_address));
         maybe_dump_successful_shader(stage, key, *spirv);
         return spirv;
     }
@@ -1774,7 +1783,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
 
     const auto start = std::chrono::steady_clock::now();
     auto spirv = std::make_shared<const std::vector<uint32_t>>(
-        compile_graphics_shader(stage, key, resources));
+        compile_graphics_shader(stage, key, resources, program_address));
     maybe_dump_successful_shader(stage, key, *spirv);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
@@ -1937,7 +1946,21 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,
                                                    fragment_wave32, vertex_capture_position);
-    return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity);
+    // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
+    // be captured here because the key owns a copy of the words rather than pointing at them.
+    const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
+    // The trip-bound selector has to be in the key, for exactly the reason the compute path already
+    // mixes it in (`rdna2_cfg_support.hpp`: the cache is keyed on CODE BYTES and never on the
+    // address, so a target and a non-target with the same body collide on one entry, and whichever
+    // compiled first serves the other). Graphics never did this, and it was harmless only because
+    // fragment diagnostics were pinned at address 0 — the selector could not match a program that
+    // had no address. This change gives them their real address, which makes the hazard real for
+    // graphics exactly as it already is for compute, so the guard has to arrive with it.
+    key.trip_bound = compute_trip_bound_settings();
+    if (key.trip_bound.bound) key.trip_bound_program_address = program_address;
+    key.cached_hash = ShaderCompileKeyHash::compute(key);
+    return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity,
+                                          program_address);
 }
 
 SharedShaderWords recompile_vertex_chain_cached_shared(
@@ -1953,8 +1976,12 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         if (cache_identity) *cache_identity = 0;
         return {};
     }
-    return cache_compiled_graphics_shader(ShaderProgramStage::Vertex, std::move(key), resources,
-                                          cache_identity);
+    const uint64_t chain_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prolog));
+    key.trip_bound = compute_trip_bound_settings();
+    if (key.trip_bound.bound) key.trip_bound_program_address = chain_address;
+    key.cached_hash = ShaderCompileKeyHash::compute(key);
+    return cache_compiled_graphics_shader(
+        ShaderProgramStage::Vertex, std::move(key), resources, cache_identity, chain_address);
 }
 
 std::vector<uint32_t> recompile_graphics_shader_cached(
