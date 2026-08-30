@@ -8,6 +8,7 @@
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include "diagnostics/diag_clock.hpp"
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
@@ -2685,6 +2686,156 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
 //
 // PROSPER_APR_VERIFY=1 verifies every write; PROSPER_APR_VERIFY=0xADDR verifies only that
 // destination, which is what keeps the log readable on a title that streams thousands of chunks.
+// DIAGNOSTIC (PROSPER_ZEROWATCH=1): catch the MOMENT guest data disappears, and say what the
+// mapping looked like when it did.
+//
+// #3142 established that APR writes land byte-identically and that the same address reads all-zero
+// seconds later, with no dmem hole-punch, no aliasing mapping and no re-map of the VA in between.
+// Every instrument so far samples at two points and infers what happened between them. This one
+// watches, so the transition itself is the observation rather than something reconstructed from its
+// endpoints -- and it dumps /proc/self/maps for the address at the instant it flips, which is the
+// question the two-point instruments cannot answer: is it still the same mapping?
+//
+// Reads through process_vm_readv, like the write verifier, so a range that becomes unmapped reports
+// that rather than faulting the watchdog thread.
+namespace {
+struct ZeroWatchEntry {
+    uint64_t dst = 0, size = 0, t_armed = 0;
+    // The offset of the window the SOURCE was found non-zero at. The probe must read this window and
+    // no other: seeding from one window and probing a different one compares two unrelated places,
+    // and reports a flip for a range that never changed.
+    uint64_t seed_off = 0;
+    const char* path = "?";
+    bool seen_nonzero = false, reported = false;
+};
+std::mutex g_zw_mx;
+std::vector<ZeroWatchEntry> g_zw;
+std::atomic<bool> g_zw_thread{false};
+
+bool zerowatch_enabled() { static int v = getenv("PROSPER_ZEROWATCH") ? 1 : 0; return v; }
+
+// The covering /proc/self/maps line, so a flip can be attributed to a re-map rather than a write.
+std::string zw_mapping_of(uint64_t addr) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return "<maps-unavailable>";
+    char line[512];
+    std::string hit = "<unmapped>";
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long lo = 0, hi = 0;
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && addr >= lo && addr < hi) {
+            hit = line;
+            if (!hit.empty() && hit.back() == '\n') hit.pop_back();
+            break;
+        }
+    }
+    fclose(f);
+    return hit;
+}
+
+bool zw_read256(uint64_t addr, uint32_t* out) {
+    struct iovec l { out, 256 }, r { (void*)(uintptr_t)addr, 256 };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 256;
+}
+
+// Runs until the process ends, and is never joined. That is safe here only because every exit path
+// in this project is _Exit -- prosper-app, tools/screenshot, and the guest's own _exit and fatal
+// raise -- so no static this thread touches is ever destroyed under it. A normal `return` from main
+// would make this a use-after-free, so if an exit path ever stops being _Exit, this thread needs a
+// stop flag before that lands.
+void zerowatch_poll_forever() {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_zw_mx);
+            for (auto& e : g_zw) {
+                if (e.reported) continue;
+                uint32_t w[64];
+                if (!zw_read256(e.dst + e.seed_off, w)) {
+                    e.reported = true;
+                    fprintf(stderr,
+                            "[zerowatch] t=%llu dst=0x%llx WENT-UNMAPPED after %.3fs  maps=%s\n",
+                            (unsigned long long)prosper::diagnostics::diag_now_us(),
+                            (unsigned long long)e.dst,
+                            (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
+                            zw_mapping_of(e.dst).c_str());
+                    continue;
+                }
+                uint32_t nz = 0;
+                for (uint32_t k = 0; k < 64; ++k) if (w[k]) ++nz;
+                if (nz) { e.seen_nonzero = true; continue; }
+                // All-zero at the window the payload was non-zero at, so this range HELD data and
+                // no longer does. `seen_nonzero` is guaranteed true for every entry (arming returns
+                // early otherwise), which is why the probe reading `seed_off` rather than offset 0
+                // is what carries the correctness here: an all-zero first 256 bytes is common on
+                // this data (the source is ~5.6% non-zero and padding is always zero), so probing
+                // offset 0 while seeding elsewhere would report a flip for a range that never
+                // changed -- and would burn the one-shot write-trace report on a non-event.
+                {
+                    e.reported = true;
+                    fprintf(stderr,
+                            "[zerowatch] t=%llu dst=0x%llx size=%llu sampled=256B@0x%llx armed-via=%s "
+                            "WENT-ZERO after %.3fs  maps=%s\n",
+                            (unsigned long long)prosper::diagnostics::diag_now_us(),
+                            (unsigned long long)e.dst, (unsigned long long)e.size,
+                            (unsigned long long)e.seed_off, e.path,
+                            (double)(prosper::diagnostics::diag_now_us() - e.t_armed) / 1e6,
+                            zw_mapping_of(e.dst).c_str());
+                    // Dump the dmem write trace HERE, at the moment the data disappears. Its own
+                    // triggers are guest _exit and the fatal raise, neither of which a bounded
+                    // capture run reaches -- so it was recording writer RIPs and printing them
+                    // nowhere. This is the instant at which they answer a question.
+                    //
+                    // No backing-file cross-check accompanies it, and an earlier version tried one:
+                    // the range is MAP_SHARED on a memfd, so reading the mapping IS reading the
+                    // file. There is no "stale view" case for MAP_SHARED to exclude, which makes an
+                    // all-zero read proof that the CONTENT was zeroed rather than proof that this
+                    // view stopped tracking it.
+                    host::guest_dmem_write_trace_report();
+                }
+            }
+        }
+        struct timespec ts { 0, 50 * 1000 * 1000 };   // 50 ms
+        nanosleep(&ts, nullptr);
+    }
+}
+
+// `src` is the buffer just written, so "did this range ever hold data" is answered from the payload
+// rather than from a later poll of the destination. `path` names which write path armed it, because
+// the two are not equivalent: the retry path MAP_FIXEDs anonymous memory over guest pages first, and
+// a range that went through it is the most interesting kind to watch, not one to skip.
+void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* path) {
+    if (!zerowatch_enabled() || size < (1u << 20)) return;   // large payloads only: textures, not records
+    std::lock_guard<std::mutex> lk(g_zw_mx);
+    for (auto& e : g_zw) if (e.dst == dst) return;
+    if (g_zw.size() >= 64) {
+        // Never drop silently: a capped watch list turns "nothing else went zero" into "nothing else
+        // was looked at", and those read identically in a log.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[zerowatch] watch list FULL at %zu entries -- later destinations are "
+                            "NOT watched; counts below are a floor, not a total\n", g_zw.size());
+        }
+        return;
+    }
+    ZeroWatchEntry e;
+    e.dst = dst; e.size = size; e.t_armed = prosper::diagnostics::diag_now_us();
+    e.path = path;
+    // Seed from the SOURCE (see the poll loop): scan a spread of the payload, not just its head.
+    const uint8_t* p8 = static_cast<const uint8_t*>(src);
+    for (uint32_t w = 0; w < 8 && !e.seen_nonzero; ++w) {
+        const uint64_t off = (((size - 256ull) / 7ull) * w) & ~(uint64_t)3;
+        for (uint32_t k = 0; k < 256; ++k)
+            if (p8[off + k]) { e.seen_nonzero = true; e.seed_off = off; break; }
+    }
+    // An all-zero payload is skipped, and skipping it is NOT silent-by-omission here: it means the
+    // load itself delivered zeros, which `apr_verify_write` reports on the same write. There is no
+    // disappearance to watch for.
+    if (!e.seen_nonzero) return;
+    g_zw.push_back(e);
+    if (!g_zw_thread.exchange(true)) std::thread(zerowatch_poll_forever).detach();
+}
+} // namespace
+
 static void apr_verify_write(uint64_t dst, const void* buf, uint64_t size) {
     const char* ev = getenv("PROSPER_APR_VERIFY");
     if (!ev || !*ev || size < 256) return;
@@ -2769,6 +2920,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) {
         apr_verify_write(dst, buf, size);
+        zerowatch_arm(dst, buf, size, "direct");
         return true;
     }
     bool committed = false;
@@ -2782,7 +2934,12 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     }
     if (!committed) return false;
     const bool retried = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-    if (retried) apr_verify_write(dst, buf, size);
+    if (retried) {
+        apr_verify_write(dst, buf, size);
+        // The retry path MAP_FIXEDs fresh anonymous pages over the destination first, which makes
+        // it the MOST interesting class to watch, not one to leave uncovered as it was.
+        zerowatch_arm(dst, buf, size, "commit-retry");
+    }
     return retried;
 }
 #endif

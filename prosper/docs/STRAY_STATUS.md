@@ -293,10 +293,52 @@ drops still discard the background.
   `dd`/`od` read of `hk_project-ps5.pak` outside the emulator agrees exactly with the in-memory
   read-back (25 of 64 non-zero dwords at texture offset 0). And the range is nonetheless **entirely
   zero when the shader samples it**: base `0x303cd10000`, BC1_SRGB 3840×2160, read by
-  `0x300c150000`, `nonzero=0/512` at **+65.7 s** after its verified write. A second base,
-  `0x302a300000`, is zero on five samples across 152 s, the earliest only **2.0 s** after its write.
-  So this is a **lifetime** defect — something reclaims, zeroes or remaps these ranges between load
-  and use — not a read defect, and the pak reader is not the place to look. #3142.
+  `0x300c150000`, `nonzero=0/512` at +65.7 s after its verified write.
+  So the pak reader is not the place to look; something zeroes these ranges between load and use, and
+  the row below names it. #3142.
+
+- **"The range is zeroed some time during the ~65 s before the shader reads it."** Falsified, and the
+  65 s was an artifact of when the *shader* happened to look rather than of when the data went away.
+  `PROSPER_ZEROWATCH` polls each armed destination every 50 ms and reports the transition itself: the
+  data is gone **0.5–2.3 s** after its load, and the defect therefore **reproduces in a 2-minute run**
+  rather than the 7-minute title route — it happens during asset load, long before the title screen.
+  At the instant of the flip the mapping is *unchanged*: still `rw-s` on the dmem memfd at the same
+  file offset, so it is neither unmapped nor re-pointed. And because that mapping is `MAP_SHARED` on a
+  memfd, reading the mapping **is** reading the file — there is no "stale view" case, so the content
+  itself was zeroed. #3142, #3145.
+  - **The writer is the guest's own libc, and that reclassifies the whole issue.** With #3147's
+    re-baseline mode the write trace observes the window it previously could not, and attributes
+    **64 of 64 events to `libc.prx`** — guest code — storing sequentially from the buffer base at a
+    16-byte stride through a tight `0x3d71`–`0x3dd0` RIP loop, on one thread. The guest clears its own
+    staging buffer about a second after loading it, which is ordinary engine behaviour. So this is
+    **not** a memory-lifetime defect and never was: the pak reader delivers correctly, the guest
+    disposes of its buffer correctly, and prosper's defect is that a shader still reads that address
+    afterwards. The open question is now a descriptor one — why `0x300c150000`'s texture resolves to a
+    staging buffer the engine has finished with — which also fits its `rtt=MISS`. #3142.
+  - Four mechanisms measured and excluded, each in the same runs: **`dmem_zero`'s hole punch** (all 20
+    calls occur at startup, before every one of these writes); **a re-map of the VA** (one `[physmap]`
+    per VA, created ~2 ms *before* its write, none after); **a second VA aliasing the phys** (none —
+    each phys range is mapped exactly once); and **the renderer writing back**
+    (`guest_memory_gpu_write` fires once per run, covering none of the zeroed ranges). A fifth:
+    **the address being recycled for another asset** — `0x303cd10000` receives exactly one payload
+    and is never written again, though 956 of 6,574 destinations in the run genuinely are reused, so
+    this had to be checked per-address rather than assumed either way.
+  - Corroborated on a second base: `0x302a300000` is sampled by five different shaders across
+    **152 s** and reads zero every time, the earliest only 2.0 s after its byte-verified write. One
+    address going quiet could be a descriptor pointing somewhere stale; two, with one of them read by
+    five separate shaders, is the range.
+  - What *used* to block naming the writer, kept because it explains why this took so long and what
+    the attribution above depends on: `PROSPER_DMEM_WRITE_TRACE` records writer RIPs but was
+    invalidated by a **host** write, and the APR load *is* a host write (all four host writers of
+    guest memory in the tree are file reads), so it could never watch a range APR loads into — it
+    reported `page-faults=0` because the watch died at the load, not because no guest write happened.
+    **[#3147](https://github.com/mattias800/prosper/pull/3147) lifts that** with an opt-in
+    re-baseline mode, and the `libc.prx` attribution above is measured **with that PR applied**: on
+    master alone the trace still disarms at the load and reproduces nothing. If #3147 is merged when
+    you read this, drop this caveat; if it was closed, the attribution needs re-deriving.
+    A `SIGSEGV` trap hand-rolled to get the RIP directly killed the run at asset load and was removed
+    rather than debugged — extending the existing trace's lifecycle was the route, not a second
+    write-watch fighting the first.
   - Two traps came out of it and are recorded in `GAME_COMPAT_ORCHESTRATION.md`: **235**, log line
     order is not happens-before (the ordering above is a shared monotonic stamp, not line distance);
     **236**, a verifier that compares populations instead of content reports MATCH on entirely

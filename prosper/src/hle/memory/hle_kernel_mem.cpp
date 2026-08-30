@@ -13,6 +13,7 @@
 #endif
 #endif
 #include "hle/dispatch/dispatch.hpp"
+#include "diagnostics/diag_clock.hpp"
 #include "hle/memory/dmem_caller_chain.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/dispatch/nid.hpp"
@@ -1429,9 +1430,27 @@ namespace {
     // range sparse). Called only at ALLOCATION time, so it never disturbs the aliasing contract
     // (which is about mapping an already-allocated phys at a second VA). CONFIDENCE: HIGH (matches
     // the console's fresh-page-zeroed semantics).
+    // DIAGNOSTIC (PROSPER_PHYSLOG): dmem_zero and map_phys_at are the pair that can make guest data
+    // vanish with NO CPU store anywhere -- the signature #3142 is chasing. The VA-level guards
+    // (map_at, map_phys_at_impl) refuse to clobber a committed or untracked mapping, so they are not
+    // the candidate; dmem_zero is, because it punches a hole in the SHARED memfd at a PHYS offset and
+    // every VA aliasing that phys reads zero immediately, with no equivalent guard. dmem_take is
+    // first-fit over released gaps, so a phys range handed to a new tenant may still be mapped and in
+    // use by an old one -- a risk this file already records in prose ("an Ampr map flavor could
+    // already land on an offset a previous tenant wrote") but that nothing measures.
+    //
+    // Logging both sides makes the chain checkable: [physmap] gives VA <-> phys, [dmemzero] gives the
+    // phys ranges that were zeroed and when, and the shared diag_now_us() stamp orders them against
+    // [apr-verify] and [texcontent]. Line order across threads cannot (trap 235).
+    bool physlog() { static int v = getenv("PROSPER_PHYSLOG") ? 1 : 0; return v; }
+
     void dmem_zero(uint64_t phys, uint64_t sz) {
         int fd = dmem_fd();
         if (fd < 0 || phys >= kDmemBase + kDmemTotal || !sz) return;
+        if (physlog())
+            fprintf(stderr, "[dmemzero] t=%llu phys=0x%llx size=0x%llx\n",
+                    (unsigned long long)prosper::diagnostics::diag_now_us(),
+                    (unsigned long long)phys, (unsigned long long)sz);
 #ifdef __linux__
         fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)phys, (off_t)sz);
 #else
@@ -1507,10 +1526,19 @@ namespace {
     void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0,
                       bool fixed = true) {
         void* p = map_phys_at_impl(hint, len, prot, phys, align, fixed);
-        if (p)
+        if (p) {
             host::guest_write_watch_notify_direct_mapping_added(
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)), len, phys,
                 static_cast<uint32_t>(prot));
+            // Logged HERE rather than at the call sites precisely because this is the documented
+            // single chokepoint for every dmem alias: a per-API log would miss whichever path a
+            // future alias takes, which is the same reason the write-watch was moved here.
+            if (physlog())
+                fprintf(stderr, "[physmap] t=%llu va=0x%llx phys=0x%llx len=0x%llx prot=%d\n",
+                        (unsigned long long)prosper::diagnostics::diag_now_us(),
+                        (unsigned long long)reinterpret_cast<uintptr_t>(p),
+                        (unsigned long long)phys, (unsigned long long)len, prot);
+        }
         return p;
     }
 }
@@ -3253,6 +3281,23 @@ bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
 
 bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t bytes) {
     if (!source || !guest_memory_gpu_write_supported(destination, bytes)) return false;
+    // PROSPER_PHYSLOG: this is the renderer writing INTO guest direct memory. #3142 is chasing a
+    // range that holds byte-verified loaded data and reads all-zero ~1 s later with its mapping
+    // unchanged -- which a write of zeros through this path produces exactly. Log the destination
+    // and how much of the payload is non-zero: "the renderer wrote here" and "the renderer wrote
+    // ZEROS over loaded data here" are different findings, and only the second is a defect.
+    {
+        static const int physlog_on = getenv("PROSPER_PHYSLOG") ? 1 : 0;
+        if (physlog_on) {
+            const uint8_t* p8 = static_cast<const uint8_t*>(source);
+            size_t probe = bytes < 4096 ? bytes : 4096, nz = 0;
+            for (size_t k = 0; k < probe; ++k) if (p8[k]) ++nz;
+            fprintf(stderr, "[gpuwrite] t=%llu dst=0x%llx bytes=%llu src_nonzero=%llu/%llu\n",
+                    (unsigned long long)prosper::diagnostics::diag_now_us(),
+                    (unsigned long long)destination, (unsigned long long)bytes,
+                    (unsigned long long)nz, (unsigned long long)probe);
+        }
+    }
 
     auto resolve_direct = [](uint64_t address, size_t size, uint64_t& physical) {
         const auto after = std::upper_bound(
