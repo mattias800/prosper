@@ -214,6 +214,10 @@ which is the recorded hazard: open the image before believing the number.
 
 ## Measured on CALIBRATION, and only one row survives as title-screen evidence
 
+(The one is the composite/tonemap row, which was established on the title-screen bundle. An earlier
+version of this section counted two, by crediting the colour-write-mask row with a surviving
+"mechanism" its own VOID marking denies.)
+
 Every number in this table was read on the 0.1140 calibration screen. The table is kept because it is
 cited, and annotated because three of its four rows were read as ruling out causes on the title
 screen, which they cannot do. **The next section has the title screen's own numbers, and they
@@ -223,7 +227,7 @@ disagree.**
 | --- | --- | --- |
 | dropped draws | 7 `shader-recompile`, ~30,000 draws executed | **FALSIFIED for the title screen** — ~3800 there, see below |
 | skipped compute | `0x300ba70000` executed **7455**, skipped **2** (`PROSPER_COMPUTE_PROGRAM_CENSUS=1`) | not re-measured on the title screen |
-| lost colour write masks | present and decoded on 32,649 of 32,649 traced draws | mechanism holds (no register lost); count is calibration's |
+| lost colour write masks | present and decoded on 32,649 of 32,649 traced draws | **VOID** — a trace run only on calibration says nothing about which registers reach the GPU on the title screen |
 | composite / tonemap | the HDR sources are black before it runs | holds — established on the title-screen bundle |
 
 ## The title screen's REAL numbers (measured on a 0.0069 frame)
@@ -300,8 +304,11 @@ contradictory new evidence.
 - **RETRACTED — "A wall-clock pad route reaches the title screen." (was: *Falsified*.)** The evidence
   was 0.1095 once, then 0.0063 / 0.0000 / 0.0063 on three unmodified reruns, read at the time as "the
   timed route works once by luck". Under the corrected number map that reading **inverts**: ~0.11 is
-  the *calibration* screen and ~0.006 is the *title* screen, so the three "failures" are the runs that
-  reached the title and the "lucky" sample is the one that did not. This doc now commits a wall-clock
+  the *calibration* screen and ~0.006 is the *title* screen, so **two** of the three "failures" (the
+  0.0063 pair) are the runs that reached the title, the "lucky" 0.1095 sample is the one that did not,
+  and 0.0000 is neither screen — a black frame is still a failure. Two of four, which is consistent
+  with the "roughly one run in three" this doc records elsewhere; an earlier version of this row said
+  three of four by counting the black frame as a success. This doc now commits a wall-clock
   route (`reach-title-hold.pad`, Cross at 150 s/160 s) as the title route for exactly that reason. The
   row is kept rather than deleted because the mistake it records — adopting a single sample as an A/B
   baseline — was real even though its conclusion was upside down. #3127.

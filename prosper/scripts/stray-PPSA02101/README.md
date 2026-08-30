@@ -42,7 +42,8 @@ stable oracle.
 
 An earlier attempt to read wall-clock timing as unreliable rested on an **inverted number map**:
 ~0.11 was taken for the title screen and ~0.006 for a failure, when it is the other way round
-(`docs/STRAY_STATUS.md` § Ruled out). The samples read as failures were the successes. That is why
+(`docs/STRAY_STATUS.md` § Ruled out). Two of the three samples read as failures were the successes —
+the third was a black frame, which is a failure under either map. That is why
 the wall-clock `reach-title-hold.pad` above is the title route despite this section once arguing no
 wall-clock route could work.
 
