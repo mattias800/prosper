@@ -882,6 +882,18 @@ def cmd_check(args):
     failures = 0
     for name in names:
         entry = load_entry(name)
+        # A set with no snaps is a broken store, not a guard that passed -- symmetric with
+        # cmd_import's own refusal to ever WRITE one. Without this the loop below simply never
+        # runs, `failures` never moves, and `check` reports "replaying 0 anchor(s)" then exits 0
+        # -- a guard that guards nothing, silently answering "still fine" for ever. Caught by
+        # review of #3103, which had to add the mirror-image guard to cmd_import to see it.
+        if not entry.get("snaps"):
+            failures += 1
+            print(f"[snaps] {name}: FAIL -- this snap set has ZERO snaps ({store_path(name)}). "
+                  f"A store with no snaps can never fail, so it is refused rather than treated "
+                  f"as a pass. Re-import it from an authoring session, or remove the set if it "
+                  f"was never meant to exist.")
+            continue
         out_dir = os.environ.get("PROSPER_SNAP_OUT", default_check_out_dir(name))
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir, exist_ok=True)

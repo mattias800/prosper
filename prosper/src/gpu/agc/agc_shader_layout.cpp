@@ -737,10 +737,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // user SGPRs), then loads it with `s_load_dwordx4 ..., 0xb0` and consumes it in
     // buffer_store_format_xyzw. Other live kernels put size=0 8-dword image descriptors in the same
     // category; interpreting their first four dwords as V#s fabricated gigabyte-class capture ranges.
-    // Emit only size-flagged, buffer-shaped entries here. Writable images remain handled by the dynamic
-    // descriptor fold. ConstantBuffer is the existing read/write Vulkan storage-buffer class (the live
-    // compute backend copies every reflected storage buffer back to guest memory). Keep sharp[3] first so
-    // shaders using the two conventional cbuf bindings retain their ordering.
+    // Emit only size-flagged, buffer-shaped entries here; the size=0 (8-dword T#/U#) shape is handled
+    // by the writable-IMAGE loop directly below (#3128) — this used to claim those "remain handled by
+    // the dynamic descriptor fold" (`resolve_dynamic_fetch`'s SrtUse mechanism), which is true only
+    // when the shader s_loads the T# through a table pointer the fold can trace; a T# placed DIRECTLY
+    // in the entry user-data SGPRs has no such load and fell through every path. ConstantBuffer is the
+    // existing read/write Vulkan storage-buffer class (the live compute backend copies every reflected
+    // storage buffer back to guest memory). Keep sharp[3] first so shaders using the two conventional
+    // cbuf bindings retain their ordering.
     const AgcShaderSharp* writable_buffers = ud->sharp_resource_offset[1];
     if (arr_ok(writable_buffers, ud->sharp_resource_count[1], sizeof(AgcShaderSharp))) {
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[1]; slot++) {
@@ -765,6 +769,118 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             const bool in_eud = (uint64_t)off + 4 > num_user_sgprs;
             r.srt_offset = in_eud ? srt : 0xFFFFFFFFu;
             r.sgpr_base  = in_eud ? 0xFFFFFFFFu : (user_sgpr_base + off);
+            table.resources.push_back(r);
+        }
+    }
+
+    // Writable IMAGES: the size=0 (8-dword T#/U#) entries the loop above deliberately skips (#3128).
+    // The comment there used to say these "remain handled by the dynamic descriptor fold" — true only
+    // for a T# the shader s_loads through a table pointer, where the fold's own const-fold walk
+    // rediscovers the descriptor independent of this array. A T# placed DIRECTLY in the entry user-data
+    // SGPRs (the common case: the driver writes the descriptor straight into consecutive user SGPRs, no
+    // s_load involved) has no in-shader load for the fold to trace, and the read-only texture loop below
+    // only ever walks category [0] — so a DIRECT writable T# fell through both loops and never entered
+    // `table.resources` at all (measured: 58 of 86 writable slots on one title, PROSPER_SHARPLOG). A
+    // shader op reading it then resolves nothing and the recompiler rejects the whole stage
+    // (`[mimg-unresolved]`), discarding every draw that uses it — a correctness gap, not a missing
+    // opcode.
+    //
+    // Decode exactly like the read-only texture loop (same load_sharp -> decode_image_descriptor ->
+    // gen5_image_format -> reject-reason pipeline) and classify ResourceClass::StorageImage: per
+    // shader_resources.hpp, that is precisely "read/written by image_load/image_store WITHOUT a
+    // sampler", which is what a writable T#/U# is. No paired-sampler lookup: writable resources are not
+    // sampled. This loop only ever admits the size=0 shape the buffer loop above explicitly excludes
+    // (`!s.size()`), so it cannot re-admit anything the buffer loop already claimed.
+    if (arr_ok(writable_buffers, ud->sharp_resource_count[1], sizeof(AgcShaderSharp))) {
+        for (uint16_t slot = 0; slot < ud->sharp_resource_count[1]; slot++) {
+            const AgcShaderSharp& s = writable_buffers[slot];
+            if (s.empty() || s.size()) continue;              // size=1 (V#) handled by the loop above
+            const uint32_t off = s.offset_dw();
+            auto wr_drop = [&](const char* why) {
+                if (!sharplog_on) return;
+                static std::mutex mx;
+                static std::set<std::tuple<const void*, uint32_t, std::string>> seen;
+                std::lock_guard<std::mutex> lk(mx);
+                if (!seen.insert({(const void*)ud, slot, std::string(why)}).second) return;
+                fprintf(stderr, "[sharp]   ud=%p rw[%u] offset_dw=%u size=0 DROPPED as writable image: %s\n",
+                        (const void*)ud, slot, off, why);
+            };
+            uint32_t tv[8];
+            const uint32_t tsrt = load_sharp(off, 8, tv);
+            if (tsrt == 0xFFFFFFFFu) {
+                wr_drop("load_sharp failed (out of block / EUD absent / unreadable)");
+                continue;
+            }
+            const bool in_eud = (uint64_t)off + 8 > num_user_sgprs;
+            const DecodedImageDescriptor d = decode_image_descriptor(tv);
+            if (const char* reject = image_descriptor_reject_reason(d)) {
+                wr_drop(reject);
+                continue;
+            }
+            Gen5ImageFormatInfo fi;
+            if (!gen5_image_format(d.format, &fi)) {
+                wr_drop("unmapped Gen5 IMG_FMT");
+                continue;
+            }
+            const bool is_bcn = fi.block_width > 1;
+            if (is_bcn && fi.snorm) {
+                wr_drop("signed block-compressed format (decode not wired)");
+                continue;
+            }
+            const DecodedImageView view = image_base_level_view(d, fi);
+            if (!view.supported) {
+                warn_unsupported_image_view(d);
+                wr_drop("unsupported image view (mip/array layout)");
+                continue;
+            }
+            const uint64_t backing_bytes_per_sample = is_bcn
+                ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
+                : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+            if (!d.sample_count || backing_bytes_per_sample > UINT32_MAX / d.sample_count) {
+                wr_drop("implausible multisample backing byte size");
+                continue;
+            }
+            const uint64_t backing_bytes = backing_bytes_per_sample * d.sample_count;
+            if (!backing_bytes || backing_bytes > UINT32_MAX) {
+                wr_drop("implausible backing byte size");
+                continue;
+            }
+            ShaderResource r;
+            r.cls           = ResourceClass::StorageImage;
+            r.format        = fi.format;
+            r.num_components = fi.num_components;
+            r.binding       = binding++;
+            r.gpu_addr      = view.base;
+            r.width         = view.width;
+            r.height        = view.height;
+            r.depth         = d.depth;
+            r.sample_count  = d.sample_count;
+            r.declared_mip_levels = d.sample_count > 1u ? 1u :
+                (d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
+            r.tile_mode     = d.tile_mode;
+            r.in_mip_tail   = view.in_mip_tail;
+            r.mip_tail_offset = view.in_mip_tail ? static_cast<uint32_t>(view.mip_offset) : 0;
+            r.mip_tail_bytes = view.mip_tail_bytes;
+            r.mip_tail_x = view.mip_tail_x;
+            r.mip_tail_y = view.mip_tail_y;
+            r.layer_stride_bytes = static_cast<uint32_t>(view.layer_stride);
+            r.layer_mip_offset_bytes = static_cast<uint32_t>(view.layer_mip_offset);
+            r.max_uncompressed_block_size = d.max_uncompressed_block_size;
+            r.max_compressed_block_size = d.max_compressed_block_size;
+            const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
+            r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
+            r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
+            r.compression_enabled = shifted_view ? false : d.compression_enabled;
+            r.alpha_is_on_msb = d.alpha_is_on_msb;
+            r.color_transform = d.color_transform;
+            r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
+            r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
+            r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
+            r.img_dim       = image_type_to_dim(d.type);
+            r.srgb          = fi.srgb;
+            r.size          = static_cast<uint32_t>(backing_bytes);
+            r.sgpr_base     = in_eud ? 0xFFFFFFFFu : (user_sgpr_base + off);
+            r.srt_offset    = in_eud ? tsrt : 0xFFFFFFFFu;
             table.resources.push_back(r);
         }
     }
