@@ -5411,7 +5411,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Shared failure handling for both the declining and the non-declining helpers below. A
     // VK_ERROR_DEVICE_LOST is fatal wherever it happens, including in optional setup, so it is
     // reported and latched here rather than in either caller.
-    auto vk_note_failure = [&](VkResult result, const char* stage) {
+    // Explicit captures, all copy-safe, so this helper can be carried into a deferred phase:
+    // `ctx` outlives every dispatch, `item` belongs to the caller's batch vector which outlives
+    // the whole submit, and `trace` is a bool. A [&] capture here would dangle the moment
+    // execute_item's frame dies (#3157).
+    auto vk_note_failure = [&ctx, &item, trace](VkResult result, const char* stage) {
         if (result == VK_ERROR_DEVICE_LOST && !ctx.device_lost) {
             ctx.device_lost = true;
             std::fprintf(stderr,
@@ -5430,7 +5434,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Declining forms: the dispatch cannot proceed, so the census must name the refusal.
     // `stage` is a string literal at every call site, and a Vulkan failure is already identified by
     // the stage that produced it, so the stage name is the reason.
-    auto vk_ok = [&](VkResult result, const char* stage) {
+    auto vk_ok = [vk_note_failure, decline](VkResult result, const char* stage) {
         if (result == VK_SUCCESS) return true;
         vk_note_failure(result, stage);
         return decline(stage);
@@ -5449,7 +5453,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // count — for a dispatch that then executed, which is precisely the class of misread instrument
     // this change exists to end. A census that names non-events is worse than no census, because the
     // count is what invites trust.
-    auto vk_soft_ok = [&](VkResult result, const char* stage) {
+    auto vk_soft_ok = [vk_note_failure](VkResult result, const char* stage) {
         if (result == VK_SUCCESS) return true;
         vk_note_failure(result, stage);
         return false;
