@@ -1193,6 +1193,21 @@ value and `PROSPER_STENCIL_REPLACE=<0..255>` overrides the replacement reference
 ALWAYS+REPLACE stencil-prime draw. These are diagnostic controls only; they do not change guest-state
 extraction or the default render path.
 
+`PROSPER_TILECENSUS=1` answers "which surface geometry is the detiling/tiling cost?" without a
+profiler. It counts every `tile_surface`/`detile_surface` call keyed by `(op, caller tag, width,
+height, bytes-per-element, tile mode)` and dumps the heaviest rows by bytes moved, periodically
+rather than at exit — every frontend here leaves via `_exit`, so an `atexit` report never prints.
+The caller tag comes from a `TileCensusScope` RAII guard, so a row says *which* call site moved the
+bytes rather than only what shape they were; it is part of the key, so one geometry reached from two
+sites shows as two rows instead of reporting whichever ran last. It found #3149: on Stray's splash a
+single 3840x2160 bpe=8 detile dominated the whole run, because DCC-compressed sampled surfaces were
+excluded from the compute image cache and re-detiled on every use.
+
+`PROSPER_NO_DCC_IMAGE_CACHE=1` restores that pre-#3149 exclusion — DCC-compressed sampled surfaces
+are kept out of the persistent compute image cache. It exists to bisect a rendering report against
+that change with one variable, and to run the A/B that justified it; it is not a performance knob,
+and setting it makes the affected titles slower.
+
 ## Shared-box hygiene
 
 Several agents and the human run this repo at once, so anything that kills a process is a

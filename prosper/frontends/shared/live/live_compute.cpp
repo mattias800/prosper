@@ -6821,8 +6821,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
                 }
 
+                static const bool dcc_cache_disabled =
+                    std::getenv("PROSPER_NO_DCC_IMAGE_CACHE") != nullptr;
+                // #3149: the all-0xff scan is a full pass over the metadata plane, per binding per
+                // dispatch, and after this change nothing on the DEFAULT path acts on its result --
+                // the gate below admits either way. Computing it anyway would add dead work to the
+                // exact hot path this change exists to shorten, so it runs only when something can
+                // consume it: the kill switch (which restores the old gate) or the compute trace
+                // (which reports it). Skipping it leaves `dcc_cache_safe` false for a compressed
+                // surface, which is what the new gate wants and what the old gate would have
+                // concluded for anything that is genuinely compressed.
                 bool dcc_cache_safe = !r->compression_enabled;
-                if (r->compression_enabled) {
+                if (r->compression_enabled && (dcc_cache_disabled || trace)) {
                     dcc_cache_safe = sampled_dcc_metadata && sampled_dcc_metadata_bytes &&
                         std::all_of(sampled_dcc_metadata,
                                     sampled_dcc_metadata + sampled_dcc_metadata_bytes,
@@ -6832,8 +6842,57 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // this first narrow path uncached rather than teaching the existing base-byte key
                 // an unsafe partial identity; staging materialization is still far cheaper than
                 // detiling and converting the 2x-larger FP16 base.
-                bi.cache_candidate = !sampled_dcc_fast_clear && dcc_cache_safe &&
-                    persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
+                // #3149: the DCC-metadata test is dropped from this gate, and the reason is that
+                // it answers the wrong question. `dcc_cache_safe` asks whether the metadata plane
+                // reads as all-0xff, i.e. "nothing is actually compressed"; what decides whether an
+                // entry may be reused is whether the metadata can change the bytes this cache
+                // serves. On the sampled path it cannot. The plane's only consumer here is
+                // `compute_sampled_dcc_fast_clear_rgba8`; the PROBE above runs it for every
+                // compressed sampled surface, and what `!sampled_dcc_fast_clear` excludes is the
+                // MATERIALIZATION that would act on its answer. The operative consequence is the
+                // same and is the sentence to quote: what a cacheable entry replays is detile +
+                // unpack of the BASE bytes and nothing else. (Stated precisely because the revision
+                // this replaced died of a comment that asserted more than its code did.)
+                // (This branch is already inside `compute_sampled_guest_prepare_required`, i.e.
+                // !storage && !renderer_owned, so storage targets keep their own stricter gate.)
+                // Base bytes are precisely what the validation in `acquire_cached_image` already
+                // covers, so a compressed surface's cache identity was complete all along and the
+                // metadata test was only ever costing hit rate -- on Stray, most of the detiling
+                // work in the whole run. #3149 carries the census.
+                //
+                // This deliberately does NOT change how a compressed surface decodes -- only
+                // whether that decode's result may be reused. If reading base bytes without
+                // consulting a live DCC plane is wrong for some surface, it is equally wrong on
+                // both sides of this branch, and the cache serves the same pixels the uncached path
+                // would have uploaded. That is what makes the change pixel-neutral by construction,
+                // and what the frame A/B on #3149 measures rather than assumes.
+                //
+                // `cache_candidate` gates more than the reuse the argument above covers:
+                // `acquire_cached_image` (replay this decode's result), sampled RETENTION, and
+                // `borrow_cached_image_for_compute_transfer` (seed from a retained STORAGE image --
+                // a different source, not this decode). Widening the gate newly admits compressed
+                // sampled descriptors to that borrow. It is safe, but for its own reason: the
+                // borrow demands `compute_transfer_valid && content_valid` plus a journal, watch or
+                // exact proof over the BASE range since the producing writeback, and the storage
+                // entry it borrows could only have been authorized through the STORAGE gate, which
+                // still requires an all-0xff plane. Diverging would need the plane to go non-0xff
+                // while the base bytes stayed byte-identical, which outside a fast clear -- excluded
+                // upstream -- is not producible.
+                //
+                // Kill switch, and it earns its place: this admits a whole class of surface to a
+                // cache it was previously excluded from, so a single variable must restore the old
+                // behaviour exactly -- for bisecting a rendering report, and for that A/B. It gates
+                // the entire change, because the gate below is now the entire change.
+                // Designated, not positional: inserting a field into this struct must not be able
+                // to silently re-bind these arguments.  #3149 lost a round to exactly that hazard
+                // in ComputeImageCacheKey.
+                bi.cache_candidate = compute_sampled_cache_gate_candidate({
+                    .sampled_dcc_fast_clear = sampled_dcc_fast_clear,
+                    .dcc_cache_safe = dcc_cache_safe,
+                    .dcc_cache_disabled = dcc_cache_disabled,
+                    .persistent_enabled = persistent_compute_image_enabled(
+                        sbytes, ComputeImageCacheClass::sampled),
+                });
                 const VkFormat transfer_native_format =
                     compute_transfer_storage_vk_format(r->format, sampled_components);
                 const bool float32_uint32_transfer_alias =
@@ -6947,12 +7006,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         !bi.compute_transfer_seed_borrowed);
                     if (bi.persistent && bi.upload_skipped)
                         g_sampled_image_upload_skips.fetch_add(1, std::memory_order_relaxed);
+                    // `compressed`/`dcc-safe` are here so this line can answer "did a surface that
+                    // only #3149 admits actually reach the cache on this route?".  Without them a
+                    // clean cross-title snapshot is equally consistent with the new path never
+                    // executing: compressed=1 dcc-safe=0 is exactly the class the old gate rejected.
                     if (trace && bi.persistent)
                         std::fprintf(stderr,
                                      "[compute]   persistent sampled image binding=%u "
-                                     "addr=0x%llx guest=%zu upload-skipped=%u\n",
+                                     "addr=0x%llx guest=%zu upload-skipped=%u compressed=%u "
+                                     "dcc-safe=%u\n",
                                      bi.binding, (unsigned long long)r->gpu_addr,
-                                     sampled_guest_need, bi.upload_skipped ? 1u : 0u);
+                                     sampled_guest_need, bi.upload_skipped ? 1u : 0u,
+                                     r->compression_enabled ? 1u : 0u, dcc_cache_safe ? 1u : 0u);
                     if (!bi.persistent && !bi.compute_transfer_seed_borrowed)
                         bi.cache_source_snapshot.assign(
                             sampled_guest_source,
@@ -7231,6 +7296,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          r->mip_tail_x, r->mip_tail_y);
                     unpack_source = linear.get();
                 } else if (r->tile_mode) {
+                    const prosper::gpu::TileCensusScope tcs("stor-seed");
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     detile_surface(linear.get(), src, r->width, r->height, r->tile_mode, 0,
                                    static_cast<uint32_t>(guest_texel));
@@ -7692,6 +7758,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                  r->tile_mode, bpt, r->mip_tail_x,
                                                  r->mip_tail_y);
                         } else if (r->tile_mode) {
+                            const prosper::gpu::TileCensusScope tcs("smpl-upl");
                             detile_surface(linear.get(), src, r->width, r->height,
                                            r->tile_mode, 0, bpt);
                         }
@@ -10271,6 +10338,7 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // exercised by a regression test rather than only by a routed run.
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    const prosper::gpu::TileCensusScope tile_census_scope("compute");
     auto fail_closed_items = [&]() {
         for (const auto& item : items)
             prosper::gpu::notify_compute_authority_boundary({

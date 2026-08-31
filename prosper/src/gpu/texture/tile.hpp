@@ -84,6 +84,24 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
 // De-swizzle a surface of `bytes_per_texel`-byte texels from tiled `src` into linear `dst` (each
 // width*height*bpt bytes). `tile_mode` selects the swizzle; Linear/unknown modes do a straight
 // copy. `pitch` is the padded row pitch in texels (0 -> use `width`).
+// PROSPER_TILECENSUS attribution: which SUBSYSTEM asked for this tiling work. The profiler cannot
+// say -- at -O3 the callers inline away and DWARF collapses through the guest JIT -- and the geometry
+// census alone shows a 4K FP16 surface detiled over and over without saying who wants it (#3149).
+// Scoped by RAII at the two subsystem entry points; unset reads as "?".
+// `who` is stored by pointer and outlives every scope, so it MUST be a string
+// literal (or otherwise static-lifetime).  The census also compares and hashes it by
+// pointer identity, so two equal-but-distinct spellings would split one call site into
+// two rows.  Passing a temporary's c_str() here dangles.
+struct TileCensusScope {
+    explicit TileCensusScope(const char* who);
+    ~TileCensusScope();
+    // A user-declared destructor does NOT suppress the copy constructor, and a copy would restore
+    // `prev` twice. Deleting it matters more now that this type lives in a widely included header.
+    TileCensusScope(const TileCensusScope&) = delete;
+    TileCensusScope& operator=(const TileCensusScope&) = delete;
+    const char* prev;
+};
+
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
