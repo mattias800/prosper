@@ -1164,6 +1164,26 @@ struct VulkanComputeContext {
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence dispatch_fence = VK_NULL_HANDLE;
+    // #3157 dispatch ring. Each slot owns its own command pool, buffer and fence so a submitted
+    // dispatch can stay in flight while the next one records -- the per-dispatch fence wait costs
+    // ~330us against ~171us of GPU execution, so ~160us per dispatch is pure scheduling latency.
+    // `command_buffer`/`dispatch_fence` above alias the CURRENT slot, so recording code is
+    // unchanged. A separate pool per slot matters: vkResetCommandPool resets every buffer in the
+    // pool, which would clobber a slot still executing.
+    struct DispatchSlot {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        // Set while this slot has been submitted but not yet consumed.
+        std::function<bool()> finish;
+        std::vector<prosper::frontend::ComputeGuestRange> writes;
+    };
+    std::vector<DispatchSlot> dispatch_slots;
+    size_t dispatch_slot_cursor = 0;
+    // Result of every consumed dispatch, folded by the caller.
+    bool pending_all_ok = true;
+    uint64_t ring_drains_on_alias = 0;
+    uint64_t ring_deferred_dispatches = 0;
     VkQueryPool dispatch_timestamp_pool = VK_NULL_HANDLE;
     float timestamp_period_ns = 0.0f;
     uint32_t timestamp_valid_bits = 0;
@@ -1388,6 +1408,23 @@ struct VulkanComputeContext {
         release_cached_buffers();
         release_cached_images();
         release_cached_memory();
+        // Slots must be drained by the caller before teardown; destroying a fence a queued
+        // submit still references is undefined. drain_dispatch_ring() is called at the end of
+        // every batch, so a live slot here means a leak in the caller, not a race to paper over.
+        for (auto& slot : dispatch_slots) {
+            if (slot.fence) vkDestroyFence(device, slot.fence, nullptr);
+            if (slot.pool) vkDestroyCommandPool(device, slot.pool, nullptr);
+        }
+        if (!dispatch_slots.empty()) {
+            // command_buffer/dispatch_fence ALIAS the current slot's handles while the ring is
+            // active -- that is what keeps every recording site unchanged. The slot loop above
+            // has already destroyed them, so the unconditional destroy further down would be a
+            // second destroy of the same handle. It aborts as a heap double free at exit, from
+            // the atexit context teardown rather than from any dispatch.
+            dispatch_fence = VK_NULL_HANDLE;
+            command_buffer = VK_NULL_HANDLE;
+        }
+        dispatch_slots.clear();
         if (dispatch_fence) vkDestroyFence(device, dispatch_fence, nullptr);
         if (dispatch_timestamp_pool)
             vkDestroyQueryPool(device, dispatch_timestamp_pool, nullptr);
@@ -1426,7 +1463,115 @@ struct VulkanComputeContext {
         return enabled;
     }
 
+    // Ring depth. 1 reproduces the historical behaviour exactly (submit, wait, consume), so
+    // the feature is opt-in and a malformed value falls back to it rather than to a guess.
+    size_t dispatch_ring_depth() {
+        static const size_t depth = [] {
+            const char* v = std::getenv("PROSPER_COMPUTE_RING");
+            if (!v || !*v) return size_t{1};
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(v, &end, 10);
+            if (!end || *end || parsed < 1 || parsed > 8) return size_t{1};
+            return static_cast<size_t>(parsed);
+        }();
+        return depth;
+    }
+
+    // Free the slot this dispatch will use, BEFORE it acquires any cached resource. The
+    // previous occupant's cleanup releases cached buffers/images by key, so running it later --
+    // once the new dispatch holds the same keys -- frees live resources and double-frees on the
+    // next release. Caught by live_compute_descriptor_array and gpu_capture_render_replay.
+    bool reserve_dispatch_slot() {
+        if (dispatch_ring_depth() <= 1) return true;
+        if (dispatch_slots.size() != dispatch_ring_depth())
+            dispatch_slots.resize(dispatch_ring_depth());
+        return consume_dispatch_slot(dispatch_slots[dispatch_slot_cursor]);
+    }
+
+    // Consume one slot: wait, writeback, cleanup. Safe to call on an empty slot.
+    bool consume_dispatch_slot(DispatchSlot& slot) {
+        if (!slot.finish) return true;
+        auto finish = std::move(slot.finish);
+        slot.finish = nullptr;
+        slot.writes.clear();
+        const bool ok = finish();
+        // execute_item already returned `true` provisionally for this dispatch, so a failure
+        // discovered here has to be recorded somewhere the caller still reads.
+        pending_all_ok = pending_all_ok && ok;
+        return ok;
+    }
+
+    // Drain every in-flight slot, oldest first. Ordering matters: two dispatches may write the
+    // same guest bytes, and the later one must land last.
+    bool drain_dispatch_ring() {
+        bool ok = true;
+        for (size_t i = 0; i < dispatch_slots.size(); i++) {
+            auto& slot = dispatch_slots[(dispatch_slot_cursor + i) % dispatch_slots.size()];
+            ok &= consume_dispatch_slot(slot);
+        }
+        return ok;
+    }
+
+    // The alias guard. A dispatch about to READ guest bytes that an in-flight dispatch still owes
+    // a WRITEBACK to would read stale memory -- the writeback target and the next seed source are
+    // the same address (see the seed site). Measured overlap on Stray is ~6%, so this drains
+    // rarely enough to leave the pipelining win intact.
+    bool drain_ring_if_overlaps(uint64_t addr, uint64_t bytes) {
+        if (bytes == 0) return true;   // reads nothing, cannot alias
+        const prosper::frontend::ComputeGuestRange probe{addr, bytes};
+        for (const auto& slot : dispatch_slots) {
+            if (!slot.finish) continue;
+            for (const auto& w : slot.writes) {
+                if (prosper::frontend::compute_guest_ranges_overlap(probe, w)) {
+                    ring_drains_on_alias++;
+                    return drain_dispatch_ring();
+                }
+            }
+        }
+        return true;
+    }
+
     bool prepare_dispatch_commands() {
+        // Ring path: hand out the cursor's slot and alias command_buffer/dispatch_fence to it, so
+        // every recording site below is unchanged. The slot is consumed first if it is still
+        // holding a previous dispatch -- that is the only place the ring blocks.
+        if (dispatch_ring_depth() > 1) {
+            if (dispatch_slots.size() != dispatch_ring_depth())
+                dispatch_slots.resize(dispatch_ring_depth());
+            auto& slot = dispatch_slots[dispatch_slot_cursor];
+            // The slot must already be free: consuming it here would run the PREVIOUS dispatch's
+            // cleanup after this one has acquired its cached buffers and images, and that cleanup
+            // releases resources by cache key -- it would free them out from under the dispatch
+            // now recording. reserve_dispatch_slot() does it before any acquisition instead.
+            if (slot.finish && !consume_dispatch_slot(slot)) return false;
+            if (!slot.pool) {
+                VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+                pool_info.queueFamilyIndex = queue_family;
+                if (vkCreateCommandPool(device, &pool_info, nullptr, &slot.pool) != VK_SUCCESS)
+                    return false;
+                VkCommandBufferAllocateInfo allocate{
+                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                allocate.commandPool = slot.pool;
+                allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                allocate.commandBufferCount = 1;
+                if (vkAllocateCommandBuffers(device, &allocate, &slot.command_buffer) !=
+                    VK_SUCCESS)
+                    return false;
+            } else if (vkResetCommandPool(device, slot.pool, 0) != VK_SUCCESS) {
+                return false;
+            }
+            if (!slot.fence) {
+                VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                if (vkCreateFence(device, &fence_info, nullptr, &slot.fence) != VK_SUCCESS)
+                    return false;
+            } else if (vkResetFences(device, 1, &slot.fence) != VK_SUCCESS) {
+                return false;
+            }
+            command_buffer = slot.command_buffer;
+            dispatch_fence = slot.fence;
+            return command_buffer != VK_NULL_HANDLE;
+        }
         if (!command_pool) {
             VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -4924,6 +5069,9 @@ void parent_scan_dump_pair(uint64_t addr, const uint8_t* after, size_t count,
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
+    // #3157: free this dispatch's ring slot before touching any cached resource (see the note on
+    // reserve_dispatch_slot). No-op unless the ring is enabled.
+    if (!ctx.reserve_dispatch_slot()) return false;
     auto decline = [&item](const char* reason) {
         report_compute_decline(item, reason);
         return false;
@@ -5388,6 +5536,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // #3157: this dispatch's guest seed sources and writeback targets, collected only when the
     // alias census is armed so a default run pays nothing.
     std::vector<prosper::frontend::ComputeGuestRange> alias_seeds, alias_writes;
+    // The ring needs the same write ranges the census collects, to guard the next dispatch's seed
+    // reads against a writeback this one still owes.
+    const bool collect_alias_ranges =
+        alias_census_enabled() || ctx.dispatch_ring_depth() > 1;
     std::vector<VkBuffer> staging(image_descriptors.size(), VK_NULL_HANDLE);          // upload/readback
     std::vector<VkDeviceMemory> staging_memory(image_descriptors.size(), VK_NULL_HANDLE);
     std::vector<VkDeviceSize> staging_bytes(image_descriptors.size(), 0);
@@ -5605,6 +5757,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (buffers[i].alias_of == SIZE_MAX) {
+                // #3157: an in-flight dispatch may still owe a writeback to exactly these
+                // guest bytes. Reading them now would seed from stale memory, so drain first.
+                // Measured overlap is ~6%, so this is rare enough to leave the pipelining win.
+                (void)ctx.drain_ring_if_overlaps(resource->gpu_addr, buffers[i].guest_bytes);
                 const uint8_t* source = buffers[i].atomic_image
                     ? resource_bytes_for(resource, buffers[i].guest_bytes)
                     : resource_bytes_for(resource, buffers[i].guest_bytes);
@@ -7189,9 +7345,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
+                // #3157: an in-flight dispatch may still owe a writeback to exactly these
+                // guest bytes. Reading them now would seed from stale memory, so drain first.
+                // Measured overlap is ~6%, so this is rare enough to leave the pipelining win.
+                (void)ctx.drain_ring_if_overlaps(r->gpu_addr, guest_bytes);
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
-                if (alias_census_enabled()) {
+                if (collect_alias_ranges) {
                     // A binding that reads nothing from guest memory cannot alias: `src` is null
                     // exactly when the seed is skipped or the source is renderer-owned.
                     if (src) alias_seeds.push_back({r->gpu_addr, guest_bytes});
@@ -8927,7 +9087,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 5);
         if (!vk_ok(vkEndCommandBuffer(command), "command-end")) break;
-        if (alias_census_enabled()) {
+        if (collect_alias_ranges) {
             // Storage buffers alias through guest memory exactly as images do, so a guard that
             // saw only the image path would be a correctness hole rather than a tradeoff. An
             // `alias_of` entry shares an earlier entry's guest range and would double-count.
@@ -10019,6 +10179,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         return ok;
     };
+    // #3157: with a ring, hand the phase to the slot that owns this dispatch's fence and
+    // command buffer instead of blocking on it now. The slot is consumed when it comes round
+    // again, when a later dispatch's seed aliases one of its writeback targets, or at the end of
+    // the batch -- whichever happens first.
+    //
+    // A device loss is never deferred: the caller checks ctx.device_lost to stop the batch, and
+    // that has to be true before it looks.
+    if (submitted_dispatch && ctx.dispatch_ring_depth() > 1 && !ctx.device_lost &&
+        !ctx.dispatch_slots.empty()) {
+        auto& slot = ctx.dispatch_slots[ctx.dispatch_slot_cursor];
+        slot.finish = std::move(finish_dispatch);
+        slot.writes = std::move(alias_writes);
+        ctx.dispatch_slot_cursor =
+            (ctx.dispatch_slot_cursor + 1) % ctx.dispatch_slots.size();
+        ctx.ring_deferred_dispatches++;
+        // Provisional. The real verdict is folded into ctx.pending_all_ok on consume, which the
+        // caller reads after draining -- a deferred failure must not read as success.
+        return true;
+    }
     return finish_dispatch();
 }
 
@@ -10662,6 +10841,17 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                     item.submit_no, item.command_order, 0, 0, false});
         }
         if (context.device_lost) break;
+    }
+
+    // #3157: every dispatch the ring deferred must be consumed before this call returns. The
+    // guest may read its memory as soon as the submit completes, and the writebacks live in
+    // those slots -- so this drain is what makes deferral invisible to the guest rather than a
+    // visible reordering. It also has to run on the device-lost path, or the slots leak their
+    // Vulkan handles.
+    if (!context.dispatch_slots.empty()) {
+        context.drain_dispatch_ring();
+        all_ok = all_ok && context.pending_all_ok;
+        context.pending_all_ok = true;
     }
     if (timing_enabled) {
         const double elapsed = std::chrono::duration<double, std::milli>(
