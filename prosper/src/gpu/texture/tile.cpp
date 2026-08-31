@@ -1237,6 +1237,10 @@ void tile_census_report() {
 
 // Row count for a volume, saturating instead of wrapping: this only names a census bucket, so a
 // clamped value groups honestly while an overflowed one silently merges two unrelated geometries.
+// Note what saturating does NOT fix: the row's `bytes` weight is derived from the same clamped
+// value, and the report ranks by bytes, so a saturated row would sort high on a fabricated weight.
+// Unreachable for any real surface -- a volume would need >2^32 rows -- and left visible rather
+// than dropped, because a census that silently discards a geometry cannot show its own invalidity.
 uint32_t census_rows(uint32_t height, uint32_t depth) {
     const uint64_t rows = static_cast<uint64_t>(height) * depth;
     return rows > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(rows);

@@ -49,8 +49,14 @@ constexpr bool compute_storage_cache_gate_candidate(
 //   * if a sampled decode ever starts DECLINING on metadata state, this gate has to decline with
 //     it.  That seam already exists and is unwired:
 //     `gpu/resources/compressed_source_authority.hpp`'s `sampled_source_decision` has no production
-//     caller today, and the surfaces admitted here are precisely the ones it would return
-//     `DeclinedUnsupportedMetadataState` for.  Wiring it must move this gate in the same commit.
+//     caller today, and it classifies exactly the surfaces this gate now admits.  **Wiring it must
+//     move this gate in the same commit.**  Deliberately not stated more precisely than that: the
+//     two do not stand in a clean correspondence.  That function has five distinct decline reasons
+//     and a non-declining `DccUncompressedBase` outcome, its `CompressionMetadataKind` is an
+//     adapter-supplied input so `Unknown` is reachable, and an import bypass pre-empts the metadata
+//     reasons entirely -- so a compressed surface admitted here can land on several of its
+//     outcomes, including non-declining ones.  An earlier draft of this comment named one specific
+//     reason and was wrong in both directions (#3150 review).
 // Nothing here can assert either mechanically, so both are written where somebody touching that
 // decision will be looking.
 //

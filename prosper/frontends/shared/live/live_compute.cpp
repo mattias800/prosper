@@ -6867,8 +6867,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // would have uploaded. That is what makes the change pixel-neutral by construction,
                 // and what the frame A/B on #3149 measures rather than assumes.
                 //
-                // `cache_candidate` gates TWO things, and the argument above covers only the
-                // first: `acquire_cached_image` (reuse this decode's result) and
+                // `cache_candidate` gates more than the reuse the argument above covers:
+                // `acquire_cached_image` (replay this decode's result), sampled RETENTION, and
                 // `borrow_cached_image_for_compute_transfer` (seed from a retained STORAGE image --
                 // a different source, not this decode). Widening the gate newly admits compressed
                 // sampled descriptors to that borrow. It is safe, but for its own reason: the
