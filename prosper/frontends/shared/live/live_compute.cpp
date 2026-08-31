@@ -5528,6 +5528,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return reinterpret_cast<uint8_t*>(uintptr_t(resource->gpu_addr));
     };
 
+    // #3157: hoisted out of the do-block so the deferred post-submit phase, which is
+    // constructed after that block, can still see them. `compare_targets` holds raw pointers into
+    // `buffers`/`images`; moving those vectors transfers the allocation rather than relocating
+    // elements, so the pointers stay valid across the move into the deferred phase.
+    struct CompareTarget {
+        VkBuffer current = VK_NULL_HANDLE;
+        VkBuffer baseline = VK_NULL_HANDLE;
+        VkDeviceSize bytes = 0;
+        VkAccessFlags current_src_access = 0;
+        BoundBuffer* buffer = nullptr;
+        BoundImage* image = nullptr;
+    };
+    std::vector<CompareTarget> compare_targets;
+    bool image_timing = false;
     do {
         std::vector<VkDescriptorSetLayoutBinding> layout_bindings(descriptors.size());
         for (size_t descriptor_index = 0; descriptor_index < descriptors.size();
@@ -5885,7 +5899,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             images_ready = false;
         };
-        const bool image_timing =
+        image_timing =
             image_timing_requested && timing_item_selected &&
             (!timing_capture_only || perf_capture_timing) &&
             (!timing_trace_only || trace);
@@ -8291,15 +8305,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // one flag. Exact-width image bytes are canonical; raw-uvec4 image bytes enter this path
         // only for proven-full write-only targets. The optimization is deliberately limited to
         // whole uvec4s; unaligned byte counts retain the collision-free CPU comparison below.
-        struct CompareTarget {
-            VkBuffer current = VK_NULL_HANDLE;
-            VkBuffer baseline = VK_NULL_HANDLE;
-            VkDeviceSize bytes = 0;
-            VkAccessFlags current_src_access = 0;
-            BoundBuffer* buffer = nullptr;
-            BoundImage* image = nullptr;
-        };
-        std::vector<CompareTarget> compare_targets;
         for (BoundBuffer& buffer : buffers) {
             if (buffer.alias_of == SIZE_MAX && buffer.writable && buffer.persistent &&
                 buffer.upload_skipped && buffer.result_baseline && buffer.resource->size &&
