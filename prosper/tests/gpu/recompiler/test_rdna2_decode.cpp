@@ -710,6 +710,40 @@ int main() {
               rdna2_mimg_zero_mip_shape(gta_store_mip_2d_xyzw, &mip_vgpr) &&
               mip_vgpr == 6u,
           "GTA V 0x2042f49800 IMAGE_STORE_MIP keeps v[0:3], (v5,v4), and v6 mip exact");
+    // #3134 (Stray PPSA02101): a live-captured fragment IMAGE_LOAD_MIP with an NSA extra address
+    // dword, byte-verified against llvm-mc gfx1030's `image_load_mip v[5:7], [v0, v42, v5],
+    // s[32:39] dmask:0x7 dim:SQ_RSRC_IMG_2D` (no unorm/glc modifier in the source assembly).
+    // Same NSA arity/dword as GTA V's IMAGE_STORE_MIP NSA form above, one opcode over -- but with
+    // UNORM=0/GLC=0 where GTA V's two evidenced shapes both have UNORM=1/GLC=1, and dmask=0x7
+    // where they require 1 or 0xf. Recognizing the packet does not by itself admit the guest
+    // program: the live resource this addresses has six real mip levels and an unproven mip
+    // register, so the emitter's zero-mip fast path still (correctly) declines it -- see
+    // docs/RECOMPILER_REMAINING.md and docs/STRAY_STATUS.md, both `## Ruled out`.
+    const uint32_t stray_load_mip_2d_nsa_words[] = {0xf004070au, 0x00080500u, 0x0000052au};
+    const Rdna2Inst stray_load_mip_2d_nsa =
+        rdna2_decode_one(stray_load_mip_2d_nsa_words, 3);
+    CHECK(stray_load_mip_2d_nsa.opcode == 0x01u && stray_load_mip_2d_nsa.mimg_dim == 1u &&
+              stray_load_mip_2d_nsa.mimg_nsa == 1u && stray_load_mip_2d_nsa.len_dwords == 3u &&
+              !stray_load_mip_2d_nsa.mimg_unorm && !stray_load_mip_2d_nsa.mimg_glc &&
+              stray_load_mip_2d_nsa.mimg_dmask == 0x7u &&
+              rdna2_mimg_zero_mip_shape(stray_load_mip_2d_nsa, &mip_vgpr) && mip_vgpr == 5u,
+          "Stray IMAGE_LOAD_MIP NSA 2D identifies its explicit v5 mip operand with UNORM/GLC clear");
+    // Setting UNORM+GLC on the exact same address bytes must NOT also match the GTA V
+    // dmask-{1,0xf} branches -- dmask stays 0x7, which neither of those shapes admits.
+    const uint32_t stray_load_mip_2d_nsa_unorm_glc_words[] = {
+        0xf004370au, 0x00080500u, 0x0000052au,
+    };
+    // Same address bytes, dmask narrowed to 0x3 (matches neither the UNORM/GLC-clear dmask:0x7
+    // shape above nor the UNORM/GLC-set dmask:{1,0xf} shapes) -- an unevidenced combination stays
+    // fail-visible rather than silently widening past what any capture has shown.
+    const uint32_t stray_load_mip_2d_nsa_dmask3_words[] = {
+        0xf004030au, 0x00080500u, 0x0000052au,
+    };
+    CHECK(!rdna2_mimg_zero_mip_shape(
+                  rdna2_decode_one(stray_load_mip_2d_nsa_unorm_glc_words, 3)) &&
+              !rdna2_mimg_zero_mip_shape(
+                  rdna2_decode_one(stray_load_mip_2d_nsa_dmask3_words, 3)),
+          "Stray IMAGE_LOAD_MIP NSA shape rejects UNORM/GLC-set and dmask mutations");
     const uint32_t gta_pc10_vop2_word[] = {0x4a000804u};
     const uint32_t wide_vop3_words[] = {0xd5761e01u, 0x040a0100u};
     const uint32_t wide_mimg_words[] = {0xf0003f08u, 0x00050000u};
