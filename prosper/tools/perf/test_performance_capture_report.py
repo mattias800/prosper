@@ -140,23 +140,45 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         # zero window. An OFFSCREEN capture -- whose samples DO carry a real rendered_frames counter,
         # so GPU present was not adopted -- then took the GPU-present branch and was told its
         # readback was real work, sending the reader to optimise the harness. Key on the field.
+        # Asserted, not guarded: `if classification == "readback"` would make these arms silently
+        # vacuous if a future change classified a degenerate capture differently, and a vacuous arm
+        # on the exact regression it was written for is worse than no arm.
         one_sample = [dict(SAMPLES[0])]
         summary = summarize(capture(one_sample, renderer=self.READBACK_RENDERER))
-        if summary["classification"] == "readback":
-            self.assertIn("harness, not the title", summary["readback_note"])
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("harness, not the title", summary["readback_note"])
 
         frozen_clock = [dict(SAMPLES[0]), dict(SAMPLES[0])]     # equal t_ns => rate is None
         summary = summarize(capture(frozen_clock, renderer=self.READBACK_RENDERER))
-        if summary["classification"] == "readback":
-            self.assertIn("harness, not the title", summary["readback_note"])
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("harness, not the title", summary["readback_note"])
 
     def test_mixed_gpu_present_population_says_it_cannot_tell(self):
         # Adopted and then lost mid-capture. Neither branch is honest, so the note must decline
         # rather than pick one -- a wrong confident answer here is the failure being prevented.
         mixed = [dict(SAMPLES[0]), {k: v for k, v in SAMPLES[1].items() if k != "rendered_frames"}]
         summary = summarize(capture(mixed, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("cannot say", summary["readback_note"])
+
+    def test_explicit_null_rendered_frames_is_the_real_wire_shape(self):
+        # `write_optional` serializes an adopted GPU present as the KEY PRESENT WITH A NULL VALUE,
+        # not as an absent key. The other GPU-present arm omits the key, so without this one the
+        # discriminator is never tested against the shape a real capture actually carries.
+        wire = [{**s, "rendered_frames": None} for s in SAMPLES]
+        summary = summarize(capture(wire, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("real", summary["readback_note"])
+        self.assertNotIn("harness, not the title", summary["readback_note"])
+
+    def test_no_post_samples_cannot_determine_gpu_present(self):
+        # The one uncovered line in the helper. With no post population there is nothing to read the
+        # field from, so the honest answer is the third state rather than either branch.
+        summary = summarize(capture([], renderer=self.READBACK_RENDERER))
         if summary["classification"] == "readback":
             self.assertIn("cannot say", summary["readback_note"])
+        else:
+            self.assertIsNone(summary["readback_note"])
 
     def test_non_readback_verdict_carries_no_readback_note(self):
         # The note is specific to the readback verdict; on every report it would be noise.
