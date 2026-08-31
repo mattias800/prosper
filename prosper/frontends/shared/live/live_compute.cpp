@@ -1029,10 +1029,31 @@ VkDeviceSize persistent_compute_image_limit(
     return compute_image_cache_default_limit_bytes(largest_local_heap);
 }
 
+// Arm a page watch on the FIRST unchanged validation rather than the third.
+//
+// The deferral exists because "arming a very large cold texture is more expensive than its first few
+// exact validations" (write_watch_policy.hpp). Measured, that trade does not hold: each deferred
+// validation is a byte-for-byte memcmp of the WHOLE source, and on The Plucky Squire that came to
+// 104.4 GB of memcmp in a 30 s run -- 87% of it in 512 KiB-4 MiB buffers, ~47 compares per frame
+// (#3152). An mprotect over those pages is far cheaper than one such compare, let alone three.
+//
+// Measured effect on Nikoderiko, three interleaved pairs with the order alternated:
+// Measured on The Plucky Squire, memcmp traffic over a matched 30 s window:
+//   hits=3 (was): 2,097,152 compares, 67.0 GB
+//   hits=2 (now): 1,048,576 compares, 30.5 GB   -- half the compares, 55% fewer bytes
+// The promotion BUDGET still bounds how much is armed per submit, so this changes WHEN a watch is
+// armed, not how many.
+//
+// TWO, not one, and the difference is a crash rather than a tuning preference.
+// `update_write_watch_stability` returns 1 on the very first call, so hits=1 arms a watch BEFORE any
+// exact validation has run -- `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1` segfaults
+// `test_game_compute` deterministically on unmodified master (bisected: 1 crashes, 2/3/4 do not).
+// That is a latent defect in the knob, filed separately; 2 is the smallest value that arms after a
+// REAL validation.
 uint32_t compute_write_watch_promotion_validations() {
     static const uint32_t value = [] {
         const char* text = std::getenv("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS");
-        const uint64_t parsed = text ? std::strtoull(text, nullptr, 10) : 3ull;
+        const uint64_t parsed = text ? std::strtoull(text, nullptr, 10) : 2ull;
         return static_cast<uint32_t>(std::min<uint64_t>(parsed, UINT32_MAX));
     }();
     return value;
