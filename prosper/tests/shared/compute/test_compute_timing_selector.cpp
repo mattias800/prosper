@@ -276,6 +276,25 @@ int main() {
               !claim_compute_transfer_gate_selector_summary(missing_consumer),
           "transfer selector summary is claimed exactly once");
 
+    // #3157: the guest-range overlap test that decides whether a dispatch may be pipelined
+    // past the previous one. A false negative here would let a dispatch seed from stale guest
+    // bytes, so the boundary cases are the point.
+    CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1080, 0x100}),
+          "partially overlapping guest ranges alias");
+    CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1040, 0x10}),
+          "a contained guest range aliases");
+    CHECK(compute_guest_ranges_overlap({0x1040, 0x10}, {0x1000, 0x100}),
+          "containment aliases in either argument order");
+    CHECK(!compute_guest_ranges_overlap({0x1000, 0x100}, {0x1100, 0x100}),
+          "adjacent half-open guest ranges do NOT alias");
+    CHECK(!compute_guest_ranges_overlap({0x1100, 0x100}, {0x1000, 0x100}),
+          "adjacency is symmetric");
+    CHECK(!compute_guest_ranges_overlap({0x1000, 0}, {0x1000, 0x100}) &&
+              !compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0}),
+          "a zero-length range reads nothing and never aliases");
+    CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0x100}),
+          "identical guest ranges alias");
+
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;
