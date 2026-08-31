@@ -1118,6 +1118,12 @@ struct VulkanComputeContext {
     std::filesystem::path pipeline_cache_path;
     std::mutex pipeline_cache_mutex;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    // #3157: the GPU result-comparison pool, owned by the context so it is reset rather than
+    // recreated per dispatch. Measured 853 vkCreateDescriptorPool + 853 vkDestroy per second on
+    // The Plucky Squire before this; the main descriptor pool above already works this way.
+    VkDescriptorPool compare_pool = VK_NULL_HANDLE;
+    uint32_t compare_pool_sets = 0;
+    uint32_t compare_pool_buffers = 0;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence dispatch_fence = VK_NULL_HANDLE;
@@ -1350,6 +1356,8 @@ struct VulkanComputeContext {
             vkDestroyQueryPool(device, dispatch_timestamp_pool, nullptr);
         if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
+        compare_pool = VK_NULL_HANDLE;
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -1458,6 +1466,32 @@ struct VulkanComputeContext {
         if (!count || vkCreateDescriptorPool(device, &info, nullptr, &descriptor_pool) != VK_SUCCESS)
             descriptor_pool = VK_NULL_HANDLE;
         return descriptor_pool;
+    }
+
+    // Reset-and-reuse the comparison descriptor pool. Same contract as prepare_descriptor_pool:
+    // grow capacities monotonically, reset when the request fits, recreate only when it does not.
+    VkDescriptorPool prepare_compare_descriptor_pool(uint32_t sets, uint32_t buffers) {
+        static const bool reuse =
+            std::getenv("PROSPER_NO_COMPARE_POOL_REUSE") == nullptr;   // opt-out for bisection
+        if (!reuse || !sets || !buffers) return VK_NULL_HANDLE;
+        if (compare_pool && sets <= compare_pool_sets && buffers <= compare_pool_buffers) {
+            if (vkResetDescriptorPool(device, compare_pool, 0) == VK_SUCCESS) return compare_pool;
+            vkDestroyDescriptorPool(device, compare_pool, nullptr);
+            compare_pool = VK_NULL_HANDLE;
+        } else if (compare_pool) {
+            vkDestroyDescriptorPool(device, compare_pool, nullptr);
+            compare_pool = VK_NULL_HANDLE;
+        }
+        compare_pool_sets = std::max(sets, compare_pool_sets);
+        compare_pool_buffers = std::max(buffers, compare_pool_buffers);
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, compare_pool_buffers};
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = compare_pool_sets;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &size;
+        if (vkCreateDescriptorPool(device, &dpci, nullptr, &compare_pool) != VK_SUCCESS)
+            compare_pool = VK_NULL_HANDLE;
+        return compare_pool;
     }
 
     static bool persistent_mapping_enabled() {
@@ -5314,6 +5348,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     VkBuffer compare_flags = VK_NULL_HANDLE;
     VkDeviceMemory compare_flags_memory = VK_NULL_HANDLE;
     VkDescriptorPool compare_descriptor_pool = VK_NULL_HANDLE;
+    bool compare_pool_owned_by_context = false;
     std::vector<VkDescriptorSet> compare_descriptor_sets;
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
@@ -5380,7 +5415,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     };
 
     auto cleanup = [&] {
-        if (compare_descriptor_pool)
+        if (compare_descriptor_pool && !compare_pool_owned_by_context)
             vkDestroyDescriptorPool(ctx.device, compare_descriptor_pool, nullptr);
         if (compare_flags) vkDestroyBuffer(ctx.device, compare_flags, nullptr);
         if (compare_flags_memory) ctx.release_memory(compare_flags_memory);
@@ -8253,9 +8288,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 dpci.maxSets = static_cast<uint32_t>(compare_targets.size());
                 dpci.poolSizeCount = 1;
                 dpci.pPoolSizes = &size;
-                compare_ready = vk_soft_ok(vkCreateDescriptorPool(
-                    ctx.device, &dpci, nullptr, &compare_descriptor_pool),
-                    "compare-descriptor-pool");
+                compare_descriptor_pool = ctx.prepare_compare_descriptor_pool(
+                    static_cast<uint32_t>(compare_targets.size()), size.descriptorCount);
+                if (compare_descriptor_pool != VK_NULL_HANDLE) {
+                    compare_pool_owned_by_context = true;   // context resets it; do not destroy here
+                    compare_ready = true;
+                } else {
+                    compare_ready = vk_soft_ok(vkCreateDescriptorPool(
+                        ctx.device, &dpci, nullptr, &compare_descriptor_pool),
+                        "compare-descriptor-pool");
+                }
             }
             if (compare_ready) {
                 compare_descriptor_sets.resize(compare_targets.size());
