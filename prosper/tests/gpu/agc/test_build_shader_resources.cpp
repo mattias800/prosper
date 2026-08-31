@@ -705,8 +705,10 @@ int main() {
 
     // sharp[1] also contains writable images. Live volume kernels use size=0 8-dword T#/U# entries;
     // decoding their first four dwords as a V# loses the image descriptor's <<8 address scale and can
-    // fabricate a >1 GiB storage-buffer range, which makes full capture fail preflight. Leave these for
-    // the compute backend's dynamic storage-image fold instead of emitting a false buffer resource.
+    // fabricate a >1 GiB storage-buffer range, which makes full capture fail preflight — so this must
+    // never be misclassified as a buffer. #3128: it must also not be DROPPED. A DIRECT (in-SGPR) T#
+    // here has no in-shader s_load for the dynamic-fold's const-fold walk to trace, so it must be
+    // decoded right here, the same way the read-only texture loop below decodes sharp[0].
     {
         uint32_t sg[32]; memset(sg, 0, sizeof sg);
         make_tsharp(&sg[0], 0x207C670000ull, 120, 68, /*fmt*/56, /*tile*/27, /*type 2D*/9);
@@ -718,8 +720,47 @@ int main() {
         ish.file_header = 0x34333231u; ish.version = 0x18; ish.type = 0; ish.user_data = &iud;
 
         ShaderResourceTable it = build_shader_resources(ish, sg, 32);
-        CHECK(it.resources.empty(),
-              "#719: sharp[1] size=0 writable image is not misclassified as a giant buffer");
+        CHECK(it.resources.size() == 1,
+              "#3128: sharp[1] size=0 writable image enters the resource table exactly once");
+        const ShaderResource* wi = it.by_sgpr_base(0);
+        CHECK(wi && wi->cls == ResourceClass::StorageImage,
+              "#3128: sharp[1] size=0 writable image is not misclassified as a giant buffer, "
+              "and IS classified as a writable (sampler-less) storage image");
+        CHECK(wi && wi->gpu_addr == 0x207C670000ull && wi->width == 120 && wi->height == 68 &&
+              wi->format == DataFormat::Unorm8 && wi->num_components == 4 && wi->tile_mode == 27,
+              "#3128: writable T# decodes base/width/height/format/tile_mode exactly like a "
+              "read-only T# would");
+        CHECK(wi && wi->srt_offset == 0xFFFFFFFFu,
+              "#3128: in-SGPR writable T# resolves by DIRECT sgpr_base provenance, not srt_offset");
+    }
+
+    // #3128: an EUD-resident writable T# resolves by its s_load provenance key (srt_offset), exactly
+    // like the read-only EUD texture path (#257/#382) — sgpr_base must be invalid so a stray by_sgpr_base
+    // lookup for an unrelated SGPR number can't spuriously match it.
+    {
+        uint32_t sg[32]; memset(sg, 0, sizeof sg);
+        uint32_t eud[16]; memset(eud, 0, sizeof eud);
+        make_tsharp(&eud[0], 0x30A1000000ull, 64, 64, /*fmt*/56, /*tile*/0, /*type 2D*/9);   // eoff 0
+        const uint64_t eud_ptr = (uint64_t)(uintptr_t)eud;
+        uint16_t dro5[6]; for (auto& x : dro5) x = 0xffff;
+        dro5[5] = 4;
+        sg[4] = (uint32_t)eud_ptr; sg[5] = (uint32_t)(eud_ptr >> 32);
+        AgcShaderSharp writable_image_eud;
+        writable_image_eud.bits = (uint16_t)32u;   // offset_dw=32 (>= 32 user SGPRs -> EUD), size=0
+        AgcShaderUserData eiud; memset(&eiud, 0, sizeof eiud);
+        eiud.direct_resource_offset = dro5; eiud.direct_resource_count = 6;
+        eiud.eud_size_dw = 16;
+        eiud.sharp_resource_offset[1] = &writable_image_eud; eiud.sharp_resource_count[1] = 1;
+        AgcShaderHeader eish; memset(&eish, 0, sizeof eish);
+        eish.file_header = 0x34333231u; eish.version = 0x18; eish.type = 0; eish.user_data = &eiud;
+
+        ShaderResourceTable eit = build_shader_resources(eish, sg, 32);
+        CHECK(eit.resources.size() == 1,
+              "#3128: EUD-resident sharp[1] size=0 writable image also enters the resource table");
+        const ShaderResource* ewi = eit.by_srt_offset(0);   // EUD provenance key = eoff*4 = (32-32)*4 = 0
+        CHECK(ewi && ewi->cls == ResourceClass::StorageImage && ewi->gpu_addr == 0x30A1000000ull &&
+              ewi->sgpr_base == 0xFFFFFFFFu,
+              "#3128: EUD-resident writable T# resolves only by its s_load provenance key");
     }
 
     // --- vertex buffers: direct resource usage type 8 (V# inline in the user-data SGPRs) ------------
