@@ -8983,7 +8983,26 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // must follow it. cleanup(), inside the epilogue, destroys the compare-flags buffer the
     // consume reads, so the two cannot be separated. wait_and_consume stays a nested lambda so
     // its failure returns skip the remaining consume work WITHOUT skipping the epilogue.
-    auto finish_dispatch = [&]() -> bool {
+    // Explicit captures so this phase can outlive execute_item's frame when a ring defers it.
+    // by-ref: all five outlive every dispatch -- ctx and the two censuses are process-lifetime,
+    // item belongs to the caller's batch vector, and spirv aliases either a static override or
+    // item.spirv. moved: the per-dispatch containers; vector move transfers the allocation, so
+    // the BoundBuffer*/BoundImage* inside compare_targets stay valid. Everything else is a
+    // handle, a scalar, or a lambda already made copy-safe (#3157).
+    auto finish_dispatch = [&authority_census, &ctx, &item, &spirv, &transfer_gate_census, 
+        buffers = std::move(buffers), compare_targets = std::move(compare_targets), 
+        images = std::move(images), staging = std::move(staging), 
+        staging_bytes = std::move(staging_bytes), staging_memory = std::move(staging_memory), 
+        authority_observation, compare_descriptor_pool, compare_flags, compare_flags_memory, 
+        compare_pool_owned_by_context, completion_proven, descriptor_layout, descriptor_pool, 
+        descriptor_pool_reused, image_cache_ms, image_map_ms, image_notify_ms, 
+        image_prepare_ms, image_timing, image_watch_ms, layout_ms, ok, pack_ms, 
+        perf_capture_timing, perf_gpu_timing, phase_dispatch, phase_pipeline, phase_setup, 
+        phase_start, phase_timing, phase_writeback, pipeline, pipeline_cached, pipeline_layout, 
+        resource_bytes, resource_bytes_for, setup_buffers_ms, setup_validate_ms, shader, 
+        submission_entered, submitted_dispatch, timing_program_hash, trace, 
+        transfer_gate_observation, vk_ok, vk_soft_ok, writeback_buffers_ms, 
+        writeback_images_ms, writeback_prepare_ms, writeback_publish_ms]() mutable -> bool {
         // Defined here, not at function scope: it releases buffers/images and reads `ok`, which
         // the deferred phase owns. Binding it inside means it acts on the deferred copies rather
         // than on a moved-from original (#3157).
