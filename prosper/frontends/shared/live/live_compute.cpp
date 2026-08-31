@@ -5464,59 +5464,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return false;
     };
 
-    auto cleanup = [&] {
-        if (compare_descriptor_pool && !compare_pool_owned_by_context)
-            vkDestroyDescriptorPool(ctx.device, compare_descriptor_pool, nullptr);
-        if (compare_flags) vkDestroyBuffer(ctx.device, compare_flags, nullptr);
-        if (compare_flags_memory) ctx.release_memory(compare_flags_memory);
-        if (!pipeline_cached) {
-            if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
-            if (pipeline_layout) vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
-            if (shader) vkDestroyShaderModule(ctx.device, shader, nullptr);
-            if (descriptor_layout)
-                vkDestroyDescriptorSetLayout(ctx.device, descriptor_layout, nullptr);
-        }
-        if (descriptor_pool && !descriptor_pool_reused)
-            vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
-        for (auto& buffer : buffers) {
-            if (buffer.alias_of != SIZE_MAX) continue;
-            if (buffer.persistent) {
-                // A failed command/submit/readback may have modified the retained host-visible
-                // buffer without publishing matching guest bytes. Force exact source validation on
-                // its next use rather than trusting the pre-dispatch write snapshot.
-                if (!ok) ctx.invalidate_cached_buffer_source(buffer.cache_key);
-                ctx.release_cached_buffer(buffer.cache_key);
-                continue;
-            }
-            if (buffer.buffer) vkDestroyBuffer(ctx.device, buffer.buffer, nullptr);
-            if (buffer.memory) ctx.release_memory(buffer.memory);
-        }
-        for (size_t i = 0; i < images.size(); i++) {
-            // A pin is taken per successful import, so it is released per import -- including for a
-            // binding that a later alias check folded into an earlier one (#1095).
-            if (images[i].imported || images[i].depth_bits_source)
-                release_live_render_target_image(images[i].imported_addr);
-            if (images[i].alias_of != SIZE_MAX) continue;
-            if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
-            if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
-            if (images[i].compute_transfer_seed_borrowed)
-                ctx.release_cached_image(images[i].compute_transfer_seed_key);
-            if (images[i].persistent) {
-                // A failed submit/readback can leave the retained VkImage and its exact-result
-                // baseline newer than guest memory. Force the retry to upload and publish again;
-                // otherwise it could compare against that newer baseline and skip forever.
-                if (!ok) ctx.invalidate_cached_image_source(images[i].cache_key);
-                ctx.release_cached_image(images[i].cache_key);
-            } else {
-            // An imported image belongs to the live renderer: release the pin, destroy nothing.
-                if (images[i].image && !images[i].imported)
-                    vkDestroyImage(ctx.device, images[i].image, nullptr);
-                if (images[i].memory) ctx.release_memory(images[i].memory);
-            }
-            if (staging[i]) vkDestroyBuffer(ctx.device, staging[i], nullptr);
-            if (staging_memory[i]) ctx.release_memory(staging_memory[i]);
-        }
-    };
     auto resource_bytes = [](const ShaderResource* resource) -> uint8_t* {
         if (resource->host_data && resource->host_data_size >= resource->size)
             return resource->host_data;
@@ -9037,6 +8984,62 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // consume reads, so the two cannot be separated. wait_and_consume stays a nested lambda so
     // its failure returns skip the remaining consume work WITHOUT skipping the epilogue.
     auto finish_dispatch = [&]() -> bool {
+        // Defined here, not at function scope: it releases buffers/images and reads `ok`, which
+        // the deferred phase owns. Binding it inside means it acts on the deferred copies rather
+        // than on a moved-from original (#3157).
+        auto cleanup = [&] {
+            if (compare_descriptor_pool && !compare_pool_owned_by_context)
+                vkDestroyDescriptorPool(ctx.device, compare_descriptor_pool, nullptr);
+            if (compare_flags) vkDestroyBuffer(ctx.device, compare_flags, nullptr);
+            if (compare_flags_memory) ctx.release_memory(compare_flags_memory);
+            if (!pipeline_cached) {
+                if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
+                if (pipeline_layout) vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
+                if (shader) vkDestroyShaderModule(ctx.device, shader, nullptr);
+                if (descriptor_layout)
+                    vkDestroyDescriptorSetLayout(ctx.device, descriptor_layout, nullptr);
+            }
+            if (descriptor_pool && !descriptor_pool_reused)
+                vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
+            for (auto& buffer : buffers) {
+                if (buffer.alias_of != SIZE_MAX) continue;
+                if (buffer.persistent) {
+                    // A failed command/submit/readback may have modified the retained host-visible
+                    // buffer without publishing matching guest bytes. Force exact source validation on
+                    // its next use rather than trusting the pre-dispatch write snapshot.
+                    if (!ok) ctx.invalidate_cached_buffer_source(buffer.cache_key);
+                    ctx.release_cached_buffer(buffer.cache_key);
+                    continue;
+                }
+                if (buffer.buffer) vkDestroyBuffer(ctx.device, buffer.buffer, nullptr);
+                if (buffer.memory) ctx.release_memory(buffer.memory);
+            }
+            for (size_t i = 0; i < images.size(); i++) {
+                // A pin is taken per successful import, so it is released per import -- including for a
+                // binding that a later alias check folded into an earlier one (#1095).
+                if (images[i].imported || images[i].depth_bits_source)
+                    release_live_render_target_image(images[i].imported_addr);
+                if (images[i].alias_of != SIZE_MAX) continue;
+                if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
+                if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
+                if (images[i].compute_transfer_seed_borrowed)
+                    ctx.release_cached_image(images[i].compute_transfer_seed_key);
+                if (images[i].persistent) {
+                    // A failed submit/readback can leave the retained VkImage and its exact-result
+                    // baseline newer than guest memory. Force the retry to upload and publish again;
+                    // otherwise it could compare against that newer baseline and skip forever.
+                    if (!ok) ctx.invalidate_cached_image_source(images[i].cache_key);
+                    ctx.release_cached_image(images[i].cache_key);
+                } else {
+                // An imported image belongs to the live renderer: release the pin, destroy nothing.
+                    if (images[i].image && !images[i].imported)
+                        vkDestroyImage(ctx.device, images[i].image, nullptr);
+                    if (images[i].memory) ctx.release_memory(images[i].memory);
+                }
+                if (staging[i]) vkDestroyBuffer(ctx.device, staging[i], nullptr);
+                if (staging_memory[i]) ctx.release_memory(staging_memory[i]);
+            }
+        };
         // #3157 step B1: the whole post-submit phase -- fence wait, its failure handling, GPU
         // timestamps, and the consume tail -- as ONE callable. Immediately invoked here, so
         // behaviour is unchanged. This is the unit a dispatch ring defers: cleanup() (run in
