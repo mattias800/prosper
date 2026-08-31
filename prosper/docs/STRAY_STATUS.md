@@ -427,3 +427,30 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
 - **MIMG `SRSRC` is not a user-SGPR index.** It names any SGPR, so a scan that treats every SRSRC as
   a user-data slot reports mostly false positives — scratch registers the shader loaded a descriptor
   into. An earlier list of "bases missing from the table" derived that way is discarded. #3126.
+- **"Widening `rdna2_mimg_zero_mip_shape()` to recognize the rejected `IMAGE_LOAD_MIP` NSA packet
+  (#3134) closes the reject, the same way it did for GTA V's `IMAGE_STORE_MIP` NSA sibling."**
+  Half right, half falsified. Fragment `0x30be800000`'s reject at pc=134
+  (`words=f004070a,00080500,0000052a`) is byte-verified against llvm-mc gfx1030's
+  `image_load_mip v[5:7], [v0, v42, v5], s[32:39] dmask:0x7 dim:SQ_RSRC_IMG_2D`, and widening the
+  shape function to admit it (UNORM=0/GLC=0, dmask=0x7, matching the plain-assembly encoding rather
+  than GTA V's UNORM=1/GLC=1/dmask∈{1,0xf}) does make `rdna2_mimg_zero_mip_shape()` correctly report
+  `shape=1`/`mip_vgpr=5`. **But the resource this instruction addresses is not eligible for the
+  "prove the mip is zero and discard it" fast path at all**: on the live `s14072.prgcap` capture it
+  declares **six real mip levels**, is **in the mip tail**, and the guest's mip VGPR is **not
+  provably zero** (`[mimg-mip] shape=1 proven_zero_mip=0 img_dim=1/1 mips=6 mip_tail=1
+  dataformat=7(Uint16) ncomp=2`) — a small `R16G16_UINT` pyramid, most plausibly a UE4-style
+  auto-exposure luminance chain the guest computes itself via its own mip-level writes, not a
+  downsampled color texture. This is the same underlying gap #2818 found on *Sonic Frontiers*'
+  compute-side `IMAGE_LOAD_MIP` (12-mip 2D_ARRAY, not in the mip tail) — prosper's graphics texture
+  path only ever *generates* a mip chain by blitting level 0 (`tests/fixtures/render_runner.h`,
+  gated to `VK_FORMAT_R8G8B8A8_UNORM`), never uploads the guest's own per-level bytes, and an integer
+  format like this one cannot even use that generation path (no meaningful linear-filtered downsample
+  of texel IDs, and Vulkan does not expose `SAMPLED_IMAGE_FILTER_LINEAR` on pure-integer formats
+  regardless). So the emitter's `res->declared_mip_levels != 1u` / `!res->proven_zero_mip` gates are
+  correctly still rejecting it after the shape widening — reading `Lod=0` or a blit-synthesized
+  chain would both render a wrong image, which per #2818's own rule is worse than the current
+  visible reject. The shape widening landed anyway (decode-level groundwork, tested against the
+  exact captured bytes) because it makes the CPU-side zero-mip proof accurate for this encoding and
+  may unblock some OTHER draw that shares it but addresses a genuinely single-mip resource; it does
+  **not** close #3134 on its own. Full detail: `docs/RECOMPILER_REMAINING.md` § Ruled out. #3134,
+  #2818.
