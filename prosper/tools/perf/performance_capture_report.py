@@ -58,6 +58,29 @@ def validate_capture(records):
             raise CaptureError(f"footer has invalid {key}")
 
 
+def _gpu_present_adopted(post):
+    """Was GPU present adopted? True / False / None when the capture cannot say.
+
+    `rendered_frame_counter` returns nullopt when GPU present is adopted rather than substituting the
+    app's host-present count, so the PRESENCE OF THE FIELD is the signal -- exactly the rule
+    `_resource_breakdown` states below ("Absent and zero are the same number and opposite facts").
+
+    Deliberately NOT derived from `rendered_fps`: that rate is also None for a sample population with
+    fewer than two entries, a non-increasing `t_ns`, or a zero window, so an OFFSCREEN capture (whose
+    samples carry a real counter) would read as adopted and get told its readback is real work --
+    inverting the advice in the one direction this whole note exists to prevent. That inversion was
+    live at 92c27046 and is what this function replaces.
+    """
+    if not post:
+        return None
+    present = [s.get("rendered_frames") is not None for s in post]
+    if all(present):
+        return False        # a real counter on every sample => GPU present was NOT adopted
+    if not any(present):
+        return True         # absent/null throughout => adopted
+    return None             # adopted then lost, or never coherent: say so rather than guess
+
+
 def _counter_rate(samples, field, seconds):
     if len(samples) < 2 or seconds <= 0:
         return None
@@ -306,12 +329,13 @@ def summarize(records):
     # different instrument that happens to share the mechanism.
     readback_note = None
     if classification == "readback":
-        # NOTE THE SENSE: a null rendered-frame population means GPU present WAS adopted, because
-        # `rendered_frame_counter` returns nullopt in that case rather than substituting the app's
-        # host-present count. Getting this backwards inverts the advice, which is how a reader ends
-        # up dismissing real readback as a harness artifact -- I had it inverted until the paired
-        # tests below caught it.
-        if rates.get("rendered_fps") is not None:
+        adopted = _gpu_present_adopted(post)
+        if adopted is None:
+            readback_note = (
+                "this capture cannot say whether GPU present was adopted, so it cannot say whether "
+                "the readback is real or the harness copying every scanout frame to the CPU. Check "
+                "the run log for a GPU-present surface failure before acting on this verdict")
+        elif adopted is False:
             readback_note = (
                 "GPU present was NOT adopted for this capture, so the frontend copied every scanout "
                 "frame to the CPU -- most often prosper-app under SDL_VIDEODRIVER=offscreen, which "

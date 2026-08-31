@@ -134,6 +134,30 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn("real", summary["readback_note"])
         self.assertNotIn("harness, not the title", summary["readback_note"])
 
+    def test_degenerate_sample_population_does_not_flip_an_offscreen_capture(self):
+        # THE REGRESSION. The discriminator used to be `rendered_fps is not None`, but that derived
+        # rate is also None for a population with fewer than two samples, a non-increasing t_ns, or a
+        # zero window. An OFFSCREEN capture -- whose samples DO carry a real rendered_frames counter,
+        # so GPU present was not adopted -- then took the GPU-present branch and was told its
+        # readback was real work, sending the reader to optimise the harness. Key on the field.
+        one_sample = [dict(SAMPLES[0])]
+        summary = summarize(capture(one_sample, renderer=self.READBACK_RENDERER))
+        if summary["classification"] == "readback":
+            self.assertIn("harness, not the title", summary["readback_note"])
+
+        frozen_clock = [dict(SAMPLES[0]), dict(SAMPLES[0])]     # equal t_ns => rate is None
+        summary = summarize(capture(frozen_clock, renderer=self.READBACK_RENDERER))
+        if summary["classification"] == "readback":
+            self.assertIn("harness, not the title", summary["readback_note"])
+
+    def test_mixed_gpu_present_population_says_it_cannot_tell(self):
+        # Adopted and then lost mid-capture. Neither branch is honest, so the note must decline
+        # rather than pick one -- a wrong confident answer here is the failure being prevented.
+        mixed = [dict(SAMPLES[0]), {k: v for k, v in SAMPLES[1].items() if k != "rendered_frames"}]
+        summary = summarize(capture(mixed, renderer=self.READBACK_RENDERER))
+        if summary["classification"] == "readback":
+            self.assertIn("cannot say", summary["readback_note"])
+
     def test_non_readback_verdict_carries_no_readback_note(self):
         # The note is specific to the readback verdict; on every report it would be noise.
         summary = summarize(capture(SAMPLES, renderer=[{
