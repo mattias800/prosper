@@ -9024,6 +9024,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 5);
         if (!vk_ok(vkEndCommandBuffer(command), "command-end")) break;
+        if (alias_census_enabled()) {
+            // Storage buffers alias through guest memory exactly as images do, so a guard that
+            // saw only the image path would be a correctness hole rather than a tradeoff. An
+            // `alias_of` entry shares an earlier entry's guest range and would double-count.
+            for (const auto& b : buffers) {
+                if (!b.resource || b.guest_bytes == 0 || b.alias_of != SIZE_MAX) continue;
+                if (!b.upload_skipped)
+                    alias_seeds.push_back({b.resource->gpu_addr, b.guest_bytes});
+                if (b.writable)
+                    alias_writes.push_back({b.resource->gpu_addr, b.guest_bytes});
+            }
+        }
         if (alias_census_enabled() && !alias_seeds.empty()) {
             g_alias_census.dispatches++;
             g_alias_census.seed_ranges += alias_seeds.size();
