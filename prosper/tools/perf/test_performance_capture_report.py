@@ -104,6 +104,29 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertEqual(summary["classification"], "inconclusive")
         self.assertIsNone(summary["seconds"])
 
+    def test_readback_verdict_warns_that_it_is_probably_the_harness(self):
+        # #3152: an offscreen capture of The Forgotten City reported readback as 51% and named it
+        # "primary evidence", while the same phase through a real window had readback at 0.0 ms.
+        # The verdict is allowed to stand -- readback really was the largest measured component --
+        # but it must not stand unqualified, because acting on it means optimising the harness.
+        summary = summarize(capture(SAMPLES, renderer=[{
+            "total_ms": 100, "gpu_device_ms": 5, "gpu_wait_ms": 6,
+            "build_resources_ms": 8, "setup_resources_ms": 7, "readback_ms": 60,
+        }]))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIsNotNone(summary["harness_note"])
+        self.assertIn("without GPU present", summary["harness_note"])
+
+    def test_non_readback_verdict_carries_no_harness_warning(self):
+        # The warning must be specific to the readback verdict; a GPU-present capture that lands on
+        # any other component has nothing to caveat, and a warning on every report is noise.
+        summary = summarize(capture(SAMPLES, renderer=[{
+            "total_ms": 100, "gpu_device_ms": 10, "gpu_wait_ms": 12,
+            "build_resources_ms": 25, "setup_resources_ms": 25, "readback_ms": 2,
+        }]))
+        self.assertEqual(summary["classification"], "renderer-resource")
+        self.assertIsNone(summary["harness_note"])
+
     def test_pacing_gap_is_evidence_not_cause(self):
         summary = summarize(capture(SAMPLES, renderer=[{
             "total_ms": 100, "gpu_device_ms": 60, "gpu_timestamp_samples": 1,

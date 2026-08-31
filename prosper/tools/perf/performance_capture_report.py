@@ -285,6 +285,28 @@ def summarize(records):
         reason = (f"the process used {cpu_cores:.2f} CPU cores with no retained renderer/compute "
                   "timing records")
 
+    # A capture whose largest component is READBACK is nearly always measuring its own harness.
+    # prosper's shipped present path (#1270) blits the renderer's image straight to the swapchain and
+    # performs NO readback, so a large readback figure means the frontend fell back to copying every
+    # scanout frame to the CPU -- which `tools/screenshot` always does (it never calls
+    # `set_gpu_present_active`), and which `prosper-app` does whenever GPU present fails, most often
+    # under `SDL_VIDEODRIVER=offscreen`, where the surface needs `VK_EXT_headless_surface`:
+    #
+    #     [app] GPU present: surface on shared instance failed (VK_EXT_headless_surface ...)
+    #
+    # Measured on The Forgotten City (#3152): the same title, phase and trigger reported readback as
+    # 396.9 ms / 51% and "primary evidence: readback" under offscreen, against 0.0 ms through a real
+    # window -- where the verdict became renderer-resource and the whole graphics total halved. The
+    # offscreen answer names the harness as the bottleneck, confidently and in the report's own
+    # headline field. Say so here rather than letting the reader act on it (instrument traps 237/238).
+    harness_note = None
+    if classification == "readback":
+        harness_note = (
+            "readback is not part of the shipped present path -- a dominant readback almost always "
+            "means the capture came from a frontend without GPU present (tools/screenshot always, or "
+            "prosper-app under SDL_VIDEODRIVER=offscreen). Re-measure through a real window before "
+            "acting on this verdict")
+
     pacing_note = None
     if rates["guest_fps"] is not None and rates["rendered_fps"] is not None:
         if rates["guest_fps"] > max(1.0, rates["rendered_fps"] * 1.5):
@@ -315,6 +337,7 @@ def summarize(records):
         "classification": classification,
         "reason": reason,
         "pacing_note": pacing_note,
+        "harness_note": harness_note,
         "truncation": truncation,
         "counts": {
             "pre": footer["pre_samples"],
@@ -408,6 +431,8 @@ def print_summary(summary):
                   "  [breakdown UNAVAILABLE — this capture predates the backend sub-buckets;"
                   " do NOT subtract the frontend figures above from it, they are a different layer]")
     print(f"primary evidence: {summary['classification']} — {summary['reason']}")
+    if summary.get("harness_note"):
+        print(f"WARNING: {summary['harness_note']}")
     if summary["pacing_note"]:
         print(f"pacing: {summary['pacing_note']}")
 
