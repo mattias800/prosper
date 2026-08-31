@@ -937,6 +937,7 @@ force:
 | `PROSPER_CAPTURE_MAX_SUBMITS` | **uncapped** — the inverse of the request | **the process refuses to start**, exit status 3. There is no honest default: `0` means uncapped, so a typo removed the only content bound on exactly the run that needed it. Express "uncapped" by leaving the variable unset. |
 | `PROSPER_CAPTURE_BUNDLE_MAX_MB` | the default budget, so a raise was discarded | same value in force, plus one `[grab]` line saying the raise was discarded (or naming the 64/3072 MiB bound it was clamped to) |
 | `PROSPER_CAPTURE_FRAMES` | 1 — the very width the `window had no submits` message tells you to widen | same value in force, plus one `[grab]` line; a mistyped remedy no longer reproduces the original failure in silence |
+
 If present counts vary and the title emits no honest guest-stdout marker, use the headless F9 control:
 set `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` together with
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`, keep the trigger absent at process start, and create it

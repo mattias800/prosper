@@ -29,6 +29,47 @@ the first data row, which orphans the entire body.
 Fenced code blocks are skipped: this repository's docs paste tool output containing pipe
 characters, and this file's own defect example would otherwise fail the check that documents it.
 
+A THIRD BLIND SPOT (#3088, 2026-08-31): a row wrapped onto a second physical line. GFM does not
+require a table row to start with `|` -- once the header and delimiter are seen, EVERY following
+non-blank line becomes another row of the SAME table, pipe-prefixed or not, until a blank line or
+another block construct ends it. `parse_tables` used to require every row to start with `|`, so a
+continuation line simply fell OUT of the run: it was never counted as a row, never arity-checked,
+and (unless something pipe-prefixed happened to follow it) left no trace at all -- the file exited
+0, "unbroken, every row matching its header". PR #3049 lost a qualifying clause and its `#2790`
+link this way; `tools/AGENTS.md:917` still carries the same shape pre-existing on master.
+
+MEASURED against GitHub's own renderer (`POST /markdown`, mode=gfm), not reasoned:
+
+    | abc | def |            renders bar as a genuine second row (one cell, `def` blank) when it
+    | --- | --- |            directly abuts the table, but as an ordinary <p> when a blank line
+    | bar | baz |            separates them -- this is the GFM spec's own worked example, and it
+    bar                      is what makes a wrapped continuation dangerous: nothing SYNTACTIC
+                             marks it as wrong.
+
+    | # | What |             a row missing ONLY its leading pipe, with an interior/trailing pipe
+    | --- | --- |            count that still matches the header, renders as a completely normal,
+    | 1 | a |                unbroken 3-row table -- so the pre-#3088 STRUCTURE message ("did it
+    2 | b |                  lose its leading '|'?") was itself a FALSE POSITIVE on this shape,
+    | 3 | c |                fixed as a consequence of fixing the blind spot above (see the
+                             corrected test, formerly "a row that lost its leading pipe ends the
+                             table").
+
+    | # | What |             a genuine block construct -- ATX heading, blockquote, bullet/ordered
+    | --- | --- |            list item, thematic break, HTML block -- interrupts an open table
+    | 1 | a |                WITHOUT needing a blank line, the same way each interrupts a plain
+    ## Heading               paragraph: it renders as its own block (`<h2>Heading</h2>` here), not
+                             as an absorbed row. `interrupts_table()` recognizes these so the fix
+                             does not swallow ordinary trailing prose sections into the table above
+                             them.
+
+So the fix is not "any non-pipe line ends the table" (the old rule, too strict -- misses the
+wrap) and not "any non-pipe line is absorbed" (too loose -- would report a false break on the
+missing-leading-pipe case above, and would silently swallow a heading/list/quote/rule/HTML block
+that legitimately follows a table with no blank line). It is: once a table is OPEN (header +
+valid delimiter matched), a non-blank line that does not start another recognized block is
+ABSORBED as another body row, exactly as GFM renders it -- letting the pre-existing ARITY class
+see it and report the cell-count mismatch a wrap or a stray paragraph almost always produces.
+
 FOUR CLASSES OF CHECK, deliberately separated:
 
   STRUCTURE (always on) -- no blank line may split a table. A fact about Markdown, true of
@@ -91,13 +132,18 @@ What ARITY specifically cannot see, stated so silence is not read as coverage:
   * Any pipe run with no delimiter row -- a fragment has no header to be measured against, so its
     rows are unchecked. The structure class reports the fragment itself when it abuts a real table
     above it, but an isolated delimiter-less pipe block is invisible to every class here.
-  * Tables whose rows have NO LEADING PIPE (`a | b` / `--- | ---`), and tables inside a BLOCKQUOTE
-    (`> | a | b |`). GitHub renders both as real tables and truncates them exactly the same way,
-    and `parse_tables` sees neither, because it requires a row to start with `|`. Both are real
+  * A table whose HEADER row has NO LEADING PIPE (`a | b` / `--- | ---`), and a table inside a
+    BLOCKQUOTE (`> | a | b |`). GitHub renders both as real tables, and `parse_tables` sees
+    neither, because opening a run still requires the FIRST line to start with `|`. Both are real
     false negatives rather than judgement calls; there are zero instances in the corpus today,
     which is the only reason they are recorded here instead of fixed. Note the shape of this
     entry: it is trap 112's own rule -- a gate's silence is only evidence about the class it
     inspects -- applied to trap 112's own gate (#2116 review).
+    **This no longer covers BODY rows.** Until #3088 a body row with no leading pipe was equally
+    invisible -- `parse_tables` ended the run the moment any row lost its `|`. It is now absorbed
+    into the still-open table like every other GFM continuation line, so ARITY sees it if its cell
+    count disagrees with the header. Only the table's OPENING line is still required to lead with
+    a pipe; nothing here parses a header that does not.
   * Content INSIDE a cell. A pipe that is correctly escaped is counted as text and nothing asks
     whether `\|` was what the author meant; equally, a cell count that matches the header proves
     nothing about the cells being in the right ORDER or the right columns.
@@ -216,6 +262,39 @@ from pathlib import Path
 FENCE = re.compile(r"^\s*(```|~~~)")
 DELIMITER = re.compile(r"^\s*\|[\s:|-]+\|?\s*$")
 LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
+
+# Block constructs that interrupt an OPEN table without needing a blank line first -- the same
+# family of constructs that can interrupt a plain paragraph in CommonMark, generalised (measured
+# against GitHub's renderer, #3088) to apply to an open GFM table too. Each was checked with a
+# table's last row directly followed by one of these, no blank line: an ATX heading rendered as
+# `<h2>`, a blockquote as `<blockquote>`, a bullet/ordered list as `<ul>`/`<ol>`, `---` as `<hr>`,
+# and `<div>...</div>` as itself -- none became an absorbed row. An indented (4+ space) code block
+# was NOT added: CommonMark's own rule is that indented code cannot interrupt a paragraph either,
+# so the default (absorb) is already the measured-correct answer there, matching a plain wrapped
+# continuation.
+_ATX_HEADING = re.compile(r"^ {0,3}#{1,6}(\s|$)")
+_BLOCKQUOTE = re.compile(r"^ {0,3}>")
+_BULLET_LIST = re.compile(r"^ {0,3}[-*+](\s|$)")
+_ORDERED_LIST = re.compile(r"^ {0,3}\d{1,9}[.)](\s|$)")
+_THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])[ \t]*(\1[ \t]*){2,}$")
+_HTML_BLOCK_START = re.compile(r"^ {0,3}<")
+
+
+def interrupts_table(line: str) -> bool:
+    """True if `line` opens a block construct that ends an open table on its own, with no blank
+    line required -- see the measurements above the regexes. Checked BEFORE a line is considered
+    for absorption into a still-open table (parse_tables); a line that matches nothing here is
+    ordinary text, which GFM keeps consuming as another table row regardless of a leading `|`.
+    """
+    return bool(
+        _ATX_HEADING.match(line)
+        or _BLOCKQUOTE.match(line)
+        or _THEMATIC_BREAK.match(line)
+        or _BULLET_LIST.match(line)
+        or _ORDERED_LIST.match(line)
+        or _HTML_BLOCK_START.match(line)
+    )
+
 
 # See N1 in persistence_problems: how far above the baseline's maximum a NEW row number may
 # sit before it is treated as a typo rather than as a deliberate step clear of a collision.
@@ -339,6 +418,14 @@ def parse_tables(lines: list[str]) -> tuple[list[Table], set[int], set[int]]:
     a split table (#1709) -- it is a non-blank line between two pipe runs -- but it is a
     correct document. It is separable by a rule as principled as the blank-line one, which
     is why this is a fix rather than another entry in KNOWN LIMIT.
+
+    #3088: once a run has become an OPEN table (header + a matching delimiter row already seen),
+    a non-blank line that does not open another block construct is ABSORBED into the run instead
+    of ending it -- exactly how GFM keeps consuming lines as table rows with no leading-pipe
+    requirement. See the module docstring for the measurements this is built from. A run that has
+    NOT yet opened a proper table (a fragment -- body rows already orphaned by an earlier break)
+    is not absorbed into; that heuristic exists to flag orphaned rows, not to model real parsing,
+    and only a PROPER table is ever "open" in GFM's sense to begin with.
     """
     tables: list[Table] = []
     blanks: set[int] = set()
@@ -367,7 +454,12 @@ def parse_tables(lines: list[str]) -> tuple[list[Table], set[int], set[int]]:
                 run_start = i
             run.append(line)
             continue
-        if not line.strip():
+        if line.strip():
+            run_open = len(run) >= 2 and bool(DELIMITER.match(run[1]))
+            if run and run_open and not interrupts_table(line):
+                run.append(line)
+                continue
+        else:
             blanks.add(i)
         if run:
             tables.append(Table(run_start, run))
@@ -628,9 +720,14 @@ def check(
     # one.
     #
     # What separates the runs does NOT decide whether this is a break -- only whether the run
-    # below is a proper table does. A blank line and a row that lost its leading pipe both end a
-    # table, and the second is the likelier lane accident. Treating a non-blank gap as "these are
-    # unrelated" loses that entirely: the rows below leave the sequence check with it, so a
+    # below is a proper table does. A blank line always ends a table; since #3088 a non-blank,
+    # non-pipe line does NOT (parse_tables absorbs it into the still-open table instead, letting
+    # ARITY see it -- see the module docstring). This branch is only reachable now when the RUN
+    # ABOVE the gap was never itself open (a fragment left by an earlier break), or when the
+    # interrupting line is a genuine block construct (heading/list/quote/rule/HTML) that GFM lets
+    # interrupt a table without a blank line -- either way parse_tables correctly ended the run,
+    # and the fragment below it is the interruption's fallout. Treating a non-blank gap as "these
+    # are unrelated" loses that entirely: the rows below leave the sequence check with it, so a
     # duplicate number underneath passes green, and the success line reports the truncated row
     # count as though it were the whole table.
     origin: Table | None = None
