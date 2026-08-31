@@ -86,8 +86,12 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
 // copy. `pitch` is the padded row pitch in texels (0 -> use `width`).
 // PROSPER_TILECENSUS attribution: which SUBSYSTEM asked for this tiling work. The profiler cannot
 // say -- at -O3 the callers inline away and DWARF collapses through the guest JIT -- and the geometry
-// census alone shows a 4K FP16 surface detiled 2199 times without saying who wants it. Scoped by RAII
-// at the two subsystem entry points; unset reads as "?".
+// census alone shows a 4K FP16 surface detiled over and over without saying who wants it (#3149).
+// Scoped by RAII at the two subsystem entry points; unset reads as "?".
+// `who` is stored by pointer and outlives every scope, so it MUST be a string
+// literal (or otherwise static-lifetime).  The census also compares and hashes it by
+// pointer identity, so two equal-but-distinct spellings would split one call site into
+// two rows.  Passing a temporary's c_str() here dangles.
 struct TileCensusScope {
     explicit TileCensusScope(const char* who);
     ~TileCensusScope();

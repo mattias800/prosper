@@ -1177,19 +1177,34 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
 // Keyed on (direction, w, h, bytes-per-element, tile_mode) and dumped at exit, so a 3840x2160x8
 // surface running once per frame is immediately distinguishable from a small one running constantly.
 namespace {
+// `who` is part of the KEY, not the value.  Holding it as a value field made attribution
+// last-writer-wins: one geometry reached from two call sites reported whichever ran last, which
+// on #3149 printed the outer `compute` scope for a row whose work is really `smpl-upl`.  Keying on
+// it splits that row instead, so a geometry reached from several sites is visible as several rows
+// and the percentages stay attributable.  Tags and ops are string literals, so pointer identity is
+// the intended comparison.
 struct TileCensusKey {
-    const char* op; uint32_t w, h, bpe, mode;
+    const char* op; const char* who; uint32_t w, h, bpe, mode;
     bool operator==(const TileCensusKey& o) const {
-        return op == o.op && w == o.w && h == o.h && bpe == o.bpe && mode == o.mode;
+        return op == o.op && who == o.who && w == o.w && h == o.h && bpe == o.bpe &&
+               mode == o.mode;
     }
 };
 struct TileCensusHash {
     size_t operator()(const TileCensusKey& k) const {
-        return std::hash<const void*>{}(k.op) ^ (size_t(k.w) << 1) ^ (size_t(k.h) << 13) ^
-               (size_t(k.bpe) << 27) ^ (size_t(k.mode) << 33);
+        // A fixed-width 64-bit accumulator rather than shifts off `size_t`: the previous form
+        // shifted by 33, which is UB rather than a wrap wherever `size_t` is 32-bit.  Nothing here
+        // needs the spread those shifts were reaching for.
+        uint64_t h = std::hash<const void*>{}(k.op);
+        h = h * 1099511628211ull ^ std::hash<const void*>{}(k.who);
+        h = h * 1099511628211ull ^ k.w;
+        h = h * 1099511628211ull ^ k.h;
+        h = h * 1099511628211ull ^ k.bpe;
+        h = h * 1099511628211ull ^ k.mode;
+        return static_cast<size_t>(h);
     }
 };
-struct TileCensusValue { uint64_t calls = 0, bytes = 0; const char* who = "?"; };
+struct TileCensusValue { uint64_t calls = 0, bytes = 0; };
 std::mutex g_tile_census_mx;
 std::unordered_map<TileCensusKey, TileCensusValue, TileCensusHash> g_tile_census;
 
@@ -1214,7 +1229,7 @@ void tile_census_report() {
     for (size_t i = 0; i < rows.size() && i < 14; ++i)
         std::fprintf(stderr,
                      "[tilecensus]   %-9s %-20s %5ux%-5u bpe=%u mode=%u calls=%llu %.1f MiB (%.1f%%)\n",
-                     rows[i].second.who, rows[i].first.op, rows[i].first.w, rows[i].first.h, rows[i].first.bpe,
+                     rows[i].first.who, rows[i].first.op, rows[i].first.w, rows[i].first.h, rows[i].first.bpe,
                      rows[i].first.mode, (unsigned long long)rows[i].second.calls,
                      double(rows[i].second.bytes) / (1024.0 * 1024.0),
                      total_bytes ? 100.0 * double(rows[i].second.bytes) / double(total_bytes) : 0.0);
@@ -1225,8 +1240,7 @@ void tile_census_note(const char* op, uint32_t w, uint32_t h, uint32_t bpe, uint
     bool due = false;
     {
         std::lock_guard<std::mutex> lk(g_tile_census_mx);
-        auto& v = g_tile_census[TileCensusKey{op, w, h, bpe, mode}];
-        v.who = g_tile_census_tag;
+        auto& v = g_tile_census[TileCensusKey{op, g_tile_census_tag, w, h, bpe, mode}];
         ++v.calls;
         v.bytes += uint64_t(w) * h * bpe;
         // Dumped PERIODICALLY, not at exit: a bounded capture run is killed with SIGTERM and every

@@ -31,6 +31,39 @@ constexpr bool compute_storage_cache_gate_candidate(
            inputs.persistent_enabled;
 }
 
+// The sampled-image cache decision, in the same shape and for the same reason: a census that
+// reports only the candidate bit cannot tell "this surface was ineligible" from "the gate was never
+// reached".
+//
+// `dcc_cache_safe` is deliberately NOT required here, and that asymmetry against the storage gate
+// above is the substance of #3149 rather than an oversight.  A storage target's base bytes may not
+// be authoritative while a DCC plane is live, so that gate must consult it.  A *sampled* upload is
+// detile + unpack of the base bytes and never reads the metadata plane -- the fast-clear helper is
+// its only consumer, and `sampled_dcc_fast_clear` excludes exactly the surfaces that reach it.  So
+// base bytes are the whole identity of a cacheable sampled entry, which is what the cache already
+// validates, and requiring an all-0xff plane on top of that only cost hit rate.
+//
+// That last sentence is a live invariant, not a historical note: **if a sampled decode ever starts
+// consulting the DCC metadata plane, this gate has to consult it too**, or the cache will replay a
+// decode whose input it never validated.  Nothing here can assert that mechanically, so it is
+// written where somebody adding such a consumer will be looking.
+//
+// `dcc_cache_disabled` (PROSPER_NO_DCC_IMAGE_CACHE) restores the older, stricter behaviour exactly,
+// so a rendering report can be bisected against this change with one variable.
+struct ComputeSampledCacheGateInputs {
+    bool sampled_dcc_fast_clear = false;
+    bool dcc_cache_safe = false;
+    bool dcc_cache_disabled = false;
+    bool persistent_enabled = false;
+};
+
+constexpr bool compute_sampled_cache_gate_candidate(
+    const ComputeSampledCacheGateInputs& inputs) {
+    return !inputs.sampled_dcc_fast_clear &&
+           (inputs.dcc_cache_safe || !inputs.dcc_cache_disabled) &&
+           inputs.persistent_enabled;
+}
+
 // A compressed writable target cannot enter the persistent cache before dispatch because its base
 // bytes are not yet authoritative.  A successful ordinary writeback changes that fact: it publishes
 // exact base bytes and marks the complete DCC plane uncompressed.  Admit that result only when DCC
