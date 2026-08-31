@@ -3390,6 +3390,36 @@ uint64_t fnv1a(const void* data, size_t size) {
     return hash;
 }
 
+// PROSPER_COMPUTE_STORAGE_GATE_CENSUS=1: why a storage surface is or is not a cache candidate,
+// grouped BY GEOMETRY. The [compute-transfer-gates] detail line answers the same question, but only
+// for a program pair selected by hash -- which cannot be supplied until you already know which
+// surface matters. Astro Bot's tiling is 75% one geometry (3840x2160 bpe=8, tiled 766x and detiled
+// only 12x in 55 s), so the key that finds it is the surface, not the program.
+bool storage_gate_census_enabled() {
+    static const bool on = std::getenv("PROSPER_COMPUTE_STORAGE_GATE_CENSUS") != nullptr;
+    return on;
+}
+
+std::mutex g_storage_gate_mutex;
+std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::array<uint64_t, 8>> g_storage_gate_rows;
+
+void dump_storage_gate_census() {
+    std::lock_guard<std::mutex> lk(g_storage_gate_mutex);
+    std::fprintf(stderr, "[storage-gate-census] by geometry:\n");
+    for (const auto& kv : g_storage_gate_rows) {
+        const auto& c = kv.second;
+        std::fprintf(stderr,
+                     "  %ux%u bpe=%u evaluated=%llu renderer_owned=%llu dcc_safe=%llu "
+                     "poison_verify=%llu exact=%llu seed_skip=%llu persistent=%llu "
+                     "CANDIDATE=%llu\n",
+                     std::get<0>(kv.first), std::get<1>(kv.first), std::get<2>(kv.first),
+                     (unsigned long long)c[0], (unsigned long long)c[1],
+                     (unsigned long long)c[2], (unsigned long long)c[3],
+                     (unsigned long long)c[4], (unsigned long long)c[5],
+                     (unsigned long long)c[6], (unsigned long long)c[7]);
+    }
+}
+
 bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
     if (std::getenv("PROSPER_COMPUTELOG")) return true;
     const char* code_env = std::getenv("PROSPER_COMPUTELOG_CODE");
@@ -7220,6 +7250,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     *r, static_cast<uint32_t>(guest_bytes), image_format);
                 bi.cache_candidate =
                     compute_storage_cache_gate_candidate(storage_cache_gates);
+                if (storage_gate_census_enabled()) {
+                    // Report periodically as well as at exit: a bounded run ends in SIGTERM, whose
+                    // default action skips atexit handlers entirely.
+                    static uint64_t evaluations = 0;
+                    static const bool once = [] {
+                        std::atexit(dump_storage_gate_census); return true; }();
+                    (void)once;
+                    bool want_dump = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_storage_gate_mutex);
+                        auto& c = g_storage_gate_rows[std::make_tuple(
+                            r->width, r->height, static_cast<uint32_t>(guest_texel))];
+                        c[0]++;
+                        c[1] += storage_cache_gates.renderer_owned ? 1 : 0;
+                        c[2] += storage_cache_gates.dcc_cache_safe ? 1 : 0;
+                        c[3] += storage_cache_gates.poison_verify ? 1 : 0;
+                        c[4] += storage_cache_gates.exact_storage ? 1 : 0;
+                        c[5] += storage_cache_gates.seed_skip ? 1 : 0;
+                        c[6] += storage_cache_gates.persistent_enabled ? 1 : 0;
+                        c[7] += bi.cache_candidate ? 1 : 0;
+                        want_dump = (++evaluations % 4096 == 0);
+                    }
+                    if (want_dump) dump_storage_gate_census();
+                }
                 bi.post_writeback_promotion_candidate =
                     compute_storage_post_writeback_promotion_candidate({
                         storage_cache_gates,
