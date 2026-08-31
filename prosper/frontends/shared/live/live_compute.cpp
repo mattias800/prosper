@@ -5541,6 +5541,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         BoundImage* image = nullptr;
     };
     std::vector<CompareTarget> compare_targets;
+    bool submitted_dispatch = false;
     bool image_timing = false;
     do {
         std::vector<VkDescriptorSetLayoutBinding> layout_bindings(descriptors.size());
@@ -9028,340 +9029,187 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
-        // #3157 step B1: the whole post-submit phase -- fence wait, its failure handling, GPU
-        // timestamps, and the consume tail -- as ONE callable. Immediately invoked here, so
-        // behaviour is unchanged. This is the unit a dispatch ring defers: cleanup() (run in
-        // the epilogue) destroys the compare-flags buffer the consume reads, so the boundary
-        // has to enclose the wait, not sit after it.
-        auto wait_and_consume = [&]() -> bool {
-            if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
-            const auto fence_wait_start = ComputeClock::now();
-            const VkResult wait_result = vkWaitForFences(
-                ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
-            // Report a LONG wait even when it succeeds.
-            //
-            // A zero timeout count was read as proof that no compute dispatch hangs. That inference has a
-            // hole: an amdgpu context reset SIGNALS pending fences, so a dispatch the kernel watchdog
-            // killed can return VK_SUCCESS here and look indistinguishable from one that finished in
-            // microseconds — with the loss surfacing only at the NEXT submit. Duration is what separates
-            // them: a killed job sits at roughly the kernel's timeout (~10 s), a real one is sub-millisecond.
-            {
-                const double waited_ms = std::chrono::duration<double, std::milli>(
-                    ComputeClock::now() - fence_wait_start).count();
-                if (waited_ms >= 100.0) {
-                    static std::atomic<int> slow{0};
-                    const int n = slow.fetch_add(1);
-                    if (n < 24 || (n & 255) == 0)
+        submitted_dispatch = true;
+    } while (false);
+
+    // #3157 step B1: the whole post-submit phase -- fence wait, its failure handling, GPU
+    // timestamps, and the consume tail -- as ONE callable. Immediately invoked here, so
+    // behaviour is unchanged. This is the unit a dispatch ring defers: cleanup() (run in
+    // the epilogue) destroys the compare-flags buffer the consume reads, so the boundary
+    // has to enclose the wait, not sit after it.
+    auto wait_and_consume = [&]() -> bool {
+        if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
+        const auto fence_wait_start = ComputeClock::now();
+        const VkResult wait_result = vkWaitForFences(
+            ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
+        // Report a LONG wait even when it succeeds.
+        //
+        // A zero timeout count was read as proof that no compute dispatch hangs. That inference has a
+        // hole: an amdgpu context reset SIGNALS pending fences, so a dispatch the kernel watchdog
+        // killed can return VK_SUCCESS here and look indistinguishable from one that finished in
+        // microseconds — with the loss surfacing only at the NEXT submit. Duration is what separates
+        // them: a killed job sits at roughly the kernel's timeout (~10 s), a real one is sub-millisecond.
+        {
+            const double waited_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - fence_wait_start).count();
+            if (waited_ms >= 100.0) {
+                static std::atomic<int> slow{0};
+                const int n = slow.fetch_add(1);
+                if (n < 24 || (n & 255) == 0)
+                    std::fprintf(stderr,
+                                 "[compute] SLOW fence wait %.1f ms result=%d program=0x%llx "
+                                 "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
+                                 waited_ms, static_cast<int>(wait_result),
+                                 static_cast<unsigned long long>(item.code_addr),
+                                 static_cast<unsigned long long>(item.submit_no),
+                                 static_cast<unsigned long long>(item.dispatch_index),
+                                 static_cast<unsigned long long>(item.command_order),
+                                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+            }
+        }
+        if (!vk_ok(wait_result, "queue-wait")) {
+            // cleanup() releases resources referenced by the command buffer, including a borrowed
+            // renderer image's pin. With that image bound, in-flight work still references it and
+            // its layout transitions, so drain the queue first rather than freeing it underneath
+            // the GPU.
+            // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
+            // to success; this item stays failed either way, which is the conservative choice for a
+            // dispatch whose results we can no longer trust.
+            if (!ctx.device_lost) {
+                std::unique_lock<std::mutex> qlk(
+                    prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
+                if (prosper::gpu::shared_present_active()) qlk.lock();
+                const VkResult drain_result = vkQueueWaitIdle(ctx.queue);
+                completion_proven = drain_result == VK_SUCCESS;
+                // Soft: this drain runs INSIDE the queue-wait failure path, which has already
+                // declined. Declining again would report one fence timeout as two refusals.
+                if (!vk_soft_ok(drain_result, "queue-drain") && trace)
+                    std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
+            }
+            return false;   // was `break` out of the do/while(false)
+        }
+        completion_proven = true;
+        if (perf_gpu_timing) {
+            uint64_t timestamps[6]{};
+            if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, 6,
+                                      sizeof(timestamps), timestamps, sizeof(uint64_t),
+                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                const uint64_t mask = ctx.timestamp_valid_bits >= 64
+                    ? UINT64_MAX : ((uint64_t{1} << ctx.timestamp_valid_bits) - 1u);
+                const uint64_t device_ticks = (timestamps[5] - timestamps[0]) & mask;
+                const uint64_t shader_ticks = (timestamps[2] - timestamps[1]) & mask;
+                ++g_perf_compute_gpu_timestamp_samples;
+                g_perf_compute_gpu_device_ms +=
+                    static_cast<double>(device_ticks) * ctx.timestamp_period_ns / 1'000'000.0;
+                g_perf_compute_gpu_shader_ms +=
+                    static_cast<double>(shader_ticks) * ctx.timestamp_period_ns / 1'000'000.0;
+                g_perf_compute_gpu_pre_ms += static_cast<double>(
+                    (timestamps[1] - timestamps[0]) & mask) *
+                    ctx.timestamp_period_ns / 1'000'000.0;
+                g_perf_compute_gpu_storage_copy_ms += static_cast<double>(
+                    (timestamps[3] - timestamps[2]) & mask) *
+                    ctx.timestamp_period_ns / 1'000'000.0;
+                g_perf_compute_gpu_compare_ms += static_cast<double>(
+                    (timestamps[4] - timestamps[3]) & mask) *
+                    ctx.timestamp_period_ns / 1'000'000.0;
+                g_perf_compute_gpu_restore_ms += static_cast<double>(
+                    (timestamps[5] - timestamps[4]) & mask) *
+                    ctx.timestamp_period_ns / 1'000'000.0;
+            }
+        }
+        if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
+        phase_dispatch = ComputeClock::now();
+        // #3157 step A: the consume tail as one callable unit. Immediately invoked here, so
+        // behaviour is unchanged -- this only proves the tail is a coherent block with known
+        // escapes before it is deferred behind a dispatch ring.
+        auto consume_dispatch = [&]() -> bool {
+            const auto writeback_prepare_start = phase_dispatch;
+
+            if (!compare_targets.empty()) {
+                void* mapped = nullptr;
+                const VkDeviceSize flag_stride = ctx.compare_flag_stride();
+                if (ctx.map_memory(compare_flags_memory, 0,
+                                   compare_targets.size() * flag_stride, &mapped) == VK_SUCCESS) {
+                    // Step by the DESCRIPTOR stride, not by sizeof(uint32_t). Indexing a uint32_t* by
+                    // target would read the padding between flags on any device whose alignment exceeds
+                    // four, reporting every target after the first as unchanged.
+                    const auto* flag_bytes = static_cast<const uint8_t*>(mapped);
+                    for (size_t j = 0; j < compare_targets.size(); ++j) {
+                        CompareTarget& target = compare_targets[j];
+                        uint32_t changed = 0;
+                        std::memcpy(&changed, flag_bytes + j * flag_stride, sizeof(changed));
+                        if (target.buffer) target.buffer->gpu_result_unchanged = changed == 0;
+                        if (target.image) target.image->gpu_result_unchanged = changed == 0;
+                    }
+                    ctx.unmap_memory(compare_flags_memory);
+                }
+            }
+
+            // The fence proves every upload is complete and every sampled image is back in GENERAL.
+            // New entries become cache-owned only here, so an earlier Vulkan failure cannot retain an
+            // uninitialized image. A dirty hit rearms its source watch after the refreshed upload.
+            for (BoundImage& image : images) {
+                if (image.storage || image.imported || image.alias_of != SIZE_MAX ||
+                    !image.cache_candidate)
+                    continue;
+                // When this dispatch samples and writes the same guest view through distinct bindings,
+                // the post-dispatch storage image is the cache authority. Retaining the sampled seed here
+                // would occupy the identical key before storage writeback can retain the actual result.
+                const bool replaced_by_storage = std::any_of(
+                    images.begin(), images.end(), [&](const BoundImage& candidate) {
+                        return candidate.storage && candidate.cache_candidate &&
+                               candidate.cache_key == image.cache_key;
+                    });
+                if (replaced_by_storage) continue;
+                if (image.persistent) {
+                    if (!image.upload_skipped) {
+                        if (image.compute_transfer_seed_borrowed)
+                            ctx.validate_cached_image_source_from_compute_transfer(
+                                image.cache_key);
+                        else
+                            ctx.validate_cached_image_source(image.cache_key);
+                    }
+                } else if (image.image && image.memory && image.allocation_bytes &&
+                           (image.cache_source_snapshot.empty()
+                                ? ctx.retain_image(image.cache_key, image.image, image.memory,
+                                                   image.allocation_bytes,
+                                                   static_cast<const uint8_t*>(nullptr))
+                                : ctx.retain_image(image.cache_key, image.image, image.memory,
+                                                   image.allocation_bytes,
+                                                   std::move(image.cache_source_snapshot)))) {
+                    image.persistent = true;
+                    if (trace)
                         std::fprintf(stderr,
-                                     "[compute] SLOW fence wait %.1f ms result=%d program=0x%llx "
-                                     "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
-                                     waited_ms, static_cast<int>(wait_result),
-                                     static_cast<unsigned long long>(item.code_addr),
-                                     static_cast<unsigned long long>(item.submit_no),
-                                     static_cast<unsigned long long>(item.dispatch_index),
-                                     static_cast<unsigned long long>(item.command_order),
-                                     item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+                                     "[compute]   retained sampled image binding=%u addr=0x%llx "
+                                     "allocation=%llu\n",
+                                     image.binding,
+                                     (unsigned long long)image.resource->gpu_addr,
+                                     (unsigned long long)image.allocation_bytes);
                 }
             }
-            if (!vk_ok(wait_result, "queue-wait")) {
-                // cleanup() releases resources referenced by the command buffer, including a borrowed
-                // renderer image's pin. With that image bound, in-flight work still references it and
-                // its layout transitions, so drain the queue first rather than freeing it underneath
-                // the GPU.
-                // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
-                // to success; this item stays failed either way, which is the conservative choice for a
-                // dispatch whose results we can no longer trust.
-                if (!ctx.device_lost) {
-                    std::unique_lock<std::mutex> qlk(
-                        prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
-                    if (prosper::gpu::shared_present_active()) qlk.lock();
-                    const VkResult drain_result = vkQueueWaitIdle(ctx.queue);
-                    completion_proven = drain_result == VK_SUCCESS;
-                    // Soft: this drain runs INSIDE the queue-wait failure path, which has already
-                    // declined. Declining again would report one fence timeout as two refusals.
-                    if (!vk_soft_ok(drain_result, "queue-drain") && trace)
-                        std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
-                }
-                return false;   // was `break` out of the do/while(false)
-            }
-            completion_proven = true;
-            if (perf_gpu_timing) {
-                uint64_t timestamps[6]{};
-                if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, 6,
-                                          sizeof(timestamps), timestamps, sizeof(uint64_t),
-                                          VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-                    const uint64_t mask = ctx.timestamp_valid_bits >= 64
-                        ? UINT64_MAX : ((uint64_t{1} << ctx.timestamp_valid_bits) - 1u);
-                    const uint64_t device_ticks = (timestamps[5] - timestamps[0]) & mask;
-                    const uint64_t shader_ticks = (timestamps[2] - timestamps[1]) & mask;
-                    ++g_perf_compute_gpu_timestamp_samples;
-                    g_perf_compute_gpu_device_ms +=
-                        static_cast<double>(device_ticks) * ctx.timestamp_period_ns / 1'000'000.0;
-                    g_perf_compute_gpu_shader_ms +=
-                        static_cast<double>(shader_ticks) * ctx.timestamp_period_ns / 1'000'000.0;
-                    g_perf_compute_gpu_pre_ms += static_cast<double>(
-                        (timestamps[1] - timestamps[0]) & mask) *
-                        ctx.timestamp_period_ns / 1'000'000.0;
-                    g_perf_compute_gpu_storage_copy_ms += static_cast<double>(
-                        (timestamps[3] - timestamps[2]) & mask) *
-                        ctx.timestamp_period_ns / 1'000'000.0;
-                    g_perf_compute_gpu_compare_ms += static_cast<double>(
-                        (timestamps[4] - timestamps[3]) & mask) *
-                        ctx.timestamp_period_ns / 1'000'000.0;
-                    g_perf_compute_gpu_restore_ms += static_cast<double>(
-                        (timestamps[5] - timestamps[4]) & mask) *
-                        ctx.timestamp_period_ns / 1'000'000.0;
-                }
-            }
-            if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
-            phase_dispatch = ComputeClock::now();
-            // #3157 step A: the consume tail as one callable unit. Immediately invoked here, so
-            // behaviour is unchanged -- this only proves the tail is a coherent block with known
-            // escapes before it is deferred behind a dispatch ring.
-            auto consume_dispatch = [&]() -> bool {
-                const auto writeback_prepare_start = phase_dispatch;
 
-                if (!compare_targets.empty()) {
-                    void* mapped = nullptr;
-                    const VkDeviceSize flag_stride = ctx.compare_flag_stride();
-                    if (ctx.map_memory(compare_flags_memory, 0,
-                                       compare_targets.size() * flag_stride, &mapped) == VK_SUCCESS) {
-                        // Step by the DESCRIPTOR stride, not by sizeof(uint32_t). Indexing a uint32_t* by
-                        // target would read the padding between flags on any device whose alignment exceeds
-                        // four, reporting every target after the first as unchanged.
-                        const auto* flag_bytes = static_cast<const uint8_t*>(mapped);
-                        for (size_t j = 0; j < compare_targets.size(); ++j) {
-                            CompareTarget& target = compare_targets[j];
-                            uint32_t changed = 0;
-                            std::memcpy(&changed, flag_bytes + j * flag_stride, sizeof(changed));
-                            if (target.buffer) target.buffer->gpu_result_unchanged = changed == 0;
-                            if (target.image) target.image->gpu_result_unchanged = changed == 0;
-                        }
-                        ctx.unmap_memory(compare_flags_memory);
-                    }
-                }
-
-                // The fence proves every upload is complete and every sampled image is back in GENERAL.
-                // New entries become cache-owned only here, so an earlier Vulkan failure cannot retain an
-                // uninitialized image. A dirty hit rearms its source watch after the refreshed upload.
-                for (BoundImage& image : images) {
-                    if (image.storage || image.imported || image.alias_of != SIZE_MAX ||
-                        !image.cache_candidate)
-                        continue;
-                    // When this dispatch samples and writes the same guest view through distinct bindings,
-                    // the post-dispatch storage image is the cache authority. Retaining the sampled seed here
-                    // would occupy the identical key before storage writeback can retain the actual result.
-                    const bool replaced_by_storage = std::any_of(
-                        images.begin(), images.end(), [&](const BoundImage& candidate) {
-                            return candidate.storage && candidate.cache_candidate &&
-                                   candidate.cache_key == image.cache_key;
-                        });
-                    if (replaced_by_storage) continue;
-                    if (image.persistent) {
-                        if (!image.upload_skipped) {
-                            if (image.compute_transfer_seed_borrowed)
-                                ctx.validate_cached_image_source_from_compute_transfer(
-                                    image.cache_key);
-                            else
-                                ctx.validate_cached_image_source(image.cache_key);
-                        }
-                    } else if (image.image && image.memory && image.allocation_bytes &&
-                               (image.cache_source_snapshot.empty()
-                                    ? ctx.retain_image(image.cache_key, image.image, image.memory,
-                                                       image.allocation_bytes,
-                                                       static_cast<const uint8_t*>(nullptr))
-                                    : ctx.retain_image(image.cache_key, image.image, image.memory,
-                                                       image.allocation_bytes,
-                                                       std::move(image.cache_source_snapshot)))) {
-                        image.persistent = true;
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   retained sampled image binding=%u addr=0x%llx "
-                                         "allocation=%llu\n",
-                                         image.binding,
-                                         (unsigned long long)image.resource->gpu_addr,
-                                         (unsigned long long)image.allocation_bytes);
-                    }
-                }
-
-                writeback_prepare_ms = std::chrono::duration<double, std::milli>(
-                    ComputeClock::now() - writeback_prepare_start).count();
-                const auto writeback_buffers_start = ComputeClock::now();
-                bool readback_ok = true;
-                for (auto& buffer : buffers) {
-                    if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
-                    // The exact GPU comparator saw the same bytes as the retained baseline, while source
-                    // validation independently proved that the guest mirror still contains that baseline.
-                    // Preserve architectural write notification, but avoid mapping and scanning the whole
-                    // host-visible buffer merely to rediscover equality.
-                    if (buffer.gpu_result_unchanged) {
-                        g_buffer_gpu_result_skips.fetch_add(1, std::memory_order_relaxed);
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   skipped GPU-identical buffer writeback binding=%u "
-                                         "addr=0x%llx bytes=%u\n",
-                                         buffer.resource->binding,
-                                         (unsigned long long)buffer.resource->gpu_addr,
-                                         buffer.resource->size);
-                        if (buffer.resource->gpu_addr)
-                            notify_guest_gpu_write_preserving_bytes(
-                                buffer.resource->gpu_addr, buffer.resource->size);
-                        if (buffer.persistent)
-                            ctx.validate_cached_buffer_source(buffer.cache_key);
-                        if (!buffer.resource->host_data && writer_provenance_enabled())
-                            record_guest_write(GuestWriterKind::ComputeBuffer,
-                                               buffer.resource->gpu_addr, buffer.resource->size,
-                                               item.submit_no, item.dispatch_index,
-                                               item.command_order, item.code_addr);
-                        continue;
-                    }
-                    void* mapped = nullptr;
-                    if (ctx.map_memory(buffer.memory, 0, buffer.bytes, &mapped) != VK_SUCCESS) {
-                        readback_ok = false;
-                        break;
-                    }
-                    uint8_t* destination = buffer.atomic_image
-                        ? resource_bytes_for(buffer.resource, buffer.guest_bytes)
-                        : resource_bytes_for(buffer.resource, buffer.guest_bytes);
-                    const auto* result = static_cast<const uint8_t*>(mapped);
-                    if (buffer.atomic_image) {
-                        if (trace) {
-                            buffer.after_hash = fnv1a(result, buffer.bytes);
-                            for (size_t i = 0; i < buffer.bytes; ++i)
-                                buffer.changed_bytes += buffer.linear_seed[i] != result[i];
-                        }
-                        if (!buffer.resource->host_data && buffer.resource->gpu_addr)
-                            prosper::host::guest_write_watch_notify_host_write(
-                                buffer.resource->gpu_addr, buffer.guest_bytes);
-                        // #2265: mirror of the upload -- per-layer 2D retile at the physical slice stride.
-                        const size_t layer_linear_bytes =
-                            static_cast<size_t>(buffer.resource->width) * buffer.resource->height * 4u;
-                        for (uint32_t layer = 0; layer < buffer.atomic_layers; ++layer) {
-                            uint8_t* dst = destination + layer * buffer.atomic_slice_bytes;
-                            const uint8_t* src = result + layer * layer_linear_bytes;
-                            if (buffer.resource->tile_mode) {
-                                tile_surface(dst, src, buffer.resource->width, buffer.resource->height,
-                                             buffer.resource->tile_mode, 0, sizeof(uint32_t));
-                            } else {
-                                const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
-                                const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
-                                    ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
-                                for (uint32_t y = 0; y < buffer.resource->height; ++y)
-                                    std::memcpy(dst + y * destination_pitch,
-                                                src + y * tight_pitch, tight_pitch);
-                            }
-                        }
-                        ctx.unmap_memory(buffer.memory);
-                        if (buffer.resource->gpu_addr) {
-                            set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
-                            notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
-                            set_guest_gpu_write_origin(nullptr);
-                        }
-                        if (!buffer.resource->host_data && writer_provenance_enabled())
-                            record_guest_write(GuestWriterKind::ComputeBuffer,
-                                               buffer.resource->gpu_addr, buffer.guest_bytes,
-                                               item.submit_no, item.dispatch_index,
-                                               item.command_order, item.code_addr);
-                        continue;
-                    }
-                    const bool changed = !compute_buffers_equal(
-                        destination, result, buffer.bytes);
-                    if (trace) {
-                        buffer.after_hash = fnv1a(result, buffer.bytes);
-                        for (size_t i = 0; i < buffer.bytes; i++)
-                            buffer.changed_bytes += destination[i] != result[i];
-                        // PROSPER_COMPUTELOG_CHANGED=N: the first N changed DWORD indices with old->new.
-                        //
-                        // `changed_bytes` says how much moved and nothing about where, which is the only
-                        // question that separates a wrong VALUE from a wrong INDEX. For a structure written
-                        // as adjacent pairs, the indices are the evidence: a head at k and its tail at k+1
-                        // is correct, a head at k and a tail at k+2 is not, and neither is visible in a byte
-                        // count or a hash.
-                        // How many bindings collapsed onto this one Vulkan buffer. Exact aliases are
-                        // merged and writability is ORed onto the first owner, so the owner's binding is
-                        // NOT evidence that the owner performed the store: a read-only binding followed by
-                        // a writable exact alias reports as though the first wrote, and with several
-                        // writable aliases no single store site can be named at all. The changed indices
-                        // below are allocation-level evidence and stand on their own; the binding is
-                        // reported as `owner-binding` with the alias count beside it so a reader cannot
-                        // mistake it for attribution.
-                        size_t alias_count = 0;
-                        for (const auto& other : buffers)
-                            if (other.alias_of != SIZE_MAX &&
-                                &buffers[other.alias_of] == &buffer) ++alias_count;
-                        if (const char* limit_env = std::getenv("PROSPER_COMPUTELOG_CHANGED")) {
-                            char* end = nullptr;
-                            const unsigned long limit = std::strtoul(limit_env, &end, 0);
-                            if (end && !*end && limit) {
-                                // memcpy, not a reinterpret_cast: `destination` is guest-addressed byte
-                                // storage and `result` is mapped device memory, and neither contract
-                                // promises uint32_t alignment or a uint32_t object lifetime there. The byte
-                                // bound below deliberately ignores a partial trailing dword.
-                                const size_t dwords = buffer.bytes / sizeof(uint32_t);
-                                const auto load_dword = [](const uint8_t* bytes, size_t index) {
-                                    uint32_t value = 0;
-                                    std::memcpy(&value, bytes + index * sizeof(uint32_t), sizeof(value));
-                                    return value;
-                                };
-                                unsigned long shown = 0;
-                                for (size_t i = 0; i < dwords && shown < limit; ++i) {
-                                    const uint32_t before_value = load_dword(destination, i);
-                                    const uint32_t after_value = load_dword(result, i);
-                                    if (before_value == after_value) continue;
-                                    // Carry submit/dispatch on EVERY line. Without them the lines from
-                                    // consecutive dispatches concatenate into one stream that looks like a
-                                    // single dispatch's writes -- and a per-dispatch structural claim built
-                                    // on that stream is meaningless. The first analysis run here did exactly
-                                    // that and reported one index changing twice in "one" dispatch.
-                                    std::fprintf(stderr,
-                                                 "[compute]     changed submit=%llu dispatch=%llu "
-                                                 "addr=0x%llx owner-binding=%u aliases=%zu index=%zu "
-                                                 "0x%08x -> 0x%08x (tag=%u bit30=%u next=%u)\n",
-                                                 (unsigned long long)item.submit_no,
-                                                 (unsigned long long)item.dispatch_index,
-                                                 (unsigned long long)(buffer.resource
-                                                     ? buffer.resource->gpu_addr : 0ull),
-                                                 buffer.resource ? buffer.resource->binding : 0u,
-                                                 alias_count, i,
-                                                 before_value, after_value, after_value & 7u,
-                                                 (after_value >> 30) & 1u,
-                                                 (after_value >> 3) & 0x07FFFFFFu);
-                                    ++shown;
-                                }
-                            }
-                        }
-                    }
-                    // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
-                    // the values it already contains. Terminator 2D's startup kernel binds 8,847,360 bytes;
-                    // after its first dispatch all later readbacks are identical. Avoiding the redundant host
-                    // write removes one full pass over both source and destination. Renderer-alias
-                    // invalidation and writer provenance remain unconditional: renderer-resident state can
-                    // differ from guest RAM even when consecutive compute readbacks contain identical bytes.
-                    if (changed) {
-                        if (!buffer.resource->host_data && buffer.resource->gpu_addr)
-                            prosper::host::guest_write_watch_notify_host_write(
-                                buffer.resource->gpu_addr, buffer.resource->size);
-                        copy_compute_buffer(destination, result, buffer.bytes);
-                    }
-                    if (buffer.persistent && !buffer.result_baseline &&
-                        ctx.retain_cached_buffer_result(buffer.cache_key, result) && trace)
+            writeback_prepare_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - writeback_prepare_start).count();
+            const auto writeback_buffers_start = ComputeClock::now();
+            bool readback_ok = true;
+            for (auto& buffer : buffers) {
+                if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
+                // The exact GPU comparator saw the same bytes as the retained baseline, while source
+                // validation independently proved that the guest mirror still contains that baseline.
+                // Preserve architectural write notification, but avoid mapping and scanning the whole
+                // host-visible buffer merely to rediscover equality.
+                if (buffer.gpu_result_unchanged) {
+                    g_buffer_gpu_result_skips.fetch_add(1, std::memory_order_relaxed);
+                    if (trace)
                         std::fprintf(stderr,
-                                     "[compute]   retained exact GPU buffer result baseline binding=%u "
+                                     "[compute]   skipped GPU-identical buffer writeback binding=%u "
                                      "addr=0x%llx bytes=%u\n",
                                      buffer.resource->binding,
                                      (unsigned long long)buffer.resource->gpu_addr,
                                      buffer.resource->size);
-                    ctx.unmap_memory(buffer.memory);
-                    if (buffer.resource->gpu_addr) {
-                        if (changed) {
-                            set_guest_gpu_write_origin("compute-writeback(buffer-full)");
-                            notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
-                            set_guest_gpu_write_origin(nullptr);
-                        } else {
-                            notify_guest_gpu_write_preserving_bytes(
-                                buffer.resource->gpu_addr, buffer.resource->size);
-                        }
-                    }
+                    if (buffer.resource->gpu_addr)
+                        notify_guest_gpu_write_preserving_bytes(
+                            buffer.resource->gpu_addr, buffer.resource->size);
                     if (buffer.persistent)
                         ctx.validate_cached_buffer_source(buffer.cache_key);
                     if (!buffer.resource->host_data && writer_provenance_enabled())
@@ -9369,500 +9217,658 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                            buffer.resource->gpu_addr, buffer.resource->size,
                                            item.submit_no, item.dispatch_index,
                                            item.command_order, item.code_addr);
+                    continue;
                 }
-                writeback_buffers_ms = std::chrono::duration<double, std::milli>(
-                    ComputeClock::now() - writeback_buffers_start).count();
-                if (!readback_ok) return false;   // was `break` out of the do-while; the call
-                                                  // site turns a false return back into that break
-                const auto writeback_images_start = ComputeClock::now();
-                // Storage-image writeback (#590): copy exact-width texels or pack raw uvec4 channels back
-                // into the guest format, then restore its linear or 3D tiled address layout and notify the
-                // render side exactly like the buffer path.
-                for (size_t i = 0; i < images.size() && readback_ok; i++) {
-                    BoundImage& bi = images[i];
-                    if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
-                    const auto image_writeback_start = ComputeClock::now();
-                    const bool image_cache_hit = bi.persistent;
-                    const ShaderResource* r = bi.resource;
-                    const uint32_t cb = data_format_bytes(r->format);
-                    const uint32_t nc = r->num_components ? r->num_components : 1;
-                    const size_t guest_texel = (r->format == DataFormat::Float10_11_11 ||
-                                                r->format == DataFormat::Unorm2_10_10_10)
-                        ? 4u : (size_t)cb * nc;
-                    const size_t texels = (size_t)r->width * r->height * r->depth;
-                    const size_t linear_bytes = texels * guest_texel;
-                    uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
-                    // GPU comparison is an exact word-for-word equality reduction and acquire_cached_image
-                    // independently proved that the guest mirror still contains that baseline. This path
-                    // therefore needs neither a large staging mapping nor a CPU memory pass.
-                    if (bi.gpu_result_unchanged && bi.upload_skipped) {
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   skipped GPU-identical storage writeback binding=%u "
-                                         "addr=0x%llx bytes=%llu\n",
-                                         bi.binding, (unsigned long long)r->gpu_addr,
-                                         (unsigned long long)bi.exact_result_bytes);
-                        if (r->gpu_addr)
-                            notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
-                        continue;
-                    }
-                    void* mapped = nullptr;
-                    const auto map_start = ComputeClock::now();
-                    if (g_fail_next_storage_readback_for_test.exchange(
-                            false, std::memory_order_acq_rel)) {
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   injected storage readback failure binding=%u\n",
-                                         bi.binding);
-                        readback_ok = false;
-                        break;
-                    }
-                    if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {
-                        readback_ok = false;
-                        break;
-                    }
-                    const auto map_done = ComputeClock::now();
-                    const bool array_image = backend_uses_2d_array(*r);
-                    static const bool direct_tiled_writeback_disabled =
-                        std::getenv("PROSPER_NO_DIRECT_TILED_WRITEBACK") != nullptr;
-                    const bool tile_mapped_bytes = storage_writeback_can_tile_mapped_bytes(
-                        bi.exact_storage_bytes(), r->tile_mode, bi.poison_verify,
-                        direct_tiled_writeback_disabled);
-                    std::unique_ptr<uint8_t[]> linear;
-                    uint8_t* packed = destination;
-                    if ((r->tile_mode && !tile_mapped_bytes) ||
-                        (!r->tile_mode && array_image && r->depth > 1)) {
-                        linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
-                        packed = linear.get();
-                    }
-                    const uint32_t* channels = static_cast<const uint32_t*>(mapped);
-                    const uint8_t* native_texels = static_cast<const uint8_t*>(mapped);
-                    // A retained, proven-full output can avoid the expensive CPU pack/retile and renderer
-                    // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
-                    // that guest memory still contains the prior result, and this dispatch reproduced the
-                    // same row-major bytes. If either comparison fails, take the ordinary writeback below.
-                    const bool repeated_output = bi.cache_candidate && bi.persistent &&
-                        bi.upload_skipped && bi.exact_storage_bytes() &&
-                        ctx.cached_image_result_matches(bi.cache_key, native_texels, linear_bytes);
-                    const auto prepare_done = ComputeClock::now();
-                    if (repeated_output) {
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   skipped identical storage writeback binding=%u "
-                                         "addr=0x%llx bytes=%llu\n",
-                                         bi.binding, (unsigned long long)r->gpu_addr,
-                                         (unsigned long long)bi.exact_result_bytes);
-                        ctx.unmap_memory(staging_memory[i]);
-                        if (r->gpu_addr)
-                            notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
-                        continue;
-                    }
-                    // Notify page-based dirty trackers only when bytes will actually be written. Doing this
-                    // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
-                    // even on the no-write path, defeating the validation that made that path safe.
-                    if (!r->host_data && r->gpu_addr)
-                        prosper::host::guest_write_watch_notify_host_write(
-                            r->gpu_addr, bi.guest_bytes);
-                    const auto watch_done = ComputeClock::now();
-                    // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
-                    // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
-                    // any survivor == partial coverage (must always seed). Cache the verdict per (code,binding)
-                    // and, for a partial write, restore the un-stored texels from the clean seed after packing.
-                    std::vector<uint8_t> poison_texel;   // 1 == this texel survived as poison (untouched)
-                    if (bi.poison_verify) {
-                        size_t survived = 0;
-                        poison_texel.assign(texels, 0);
-                        for (size_t t = 0; t < texels; ++t) {
-                            bool all = true;
-                            if (bi.exact_storage_bytes()) {
-                                const uint8_t* texel = native_texels + t * guest_texel;
-                                for (size_t b = 0; b < guest_texel; ++b)
-                                    if (texel[b] != 0x5a) all = false;
-                            } else {
-                                for (uint32_t c = 0; c < 4; ++c)
-                                    if (channels[t * 4 + c] != 0xDEADBEEFu) all = false;
-                            }
-                            if (all) { ++survived; poison_texel[t] = 1; }
-                        }
-                        {
-                            const SeedCoverageKey proof_key{item.code_addr, bi.binding,
-                                                            r->width, r->height, r->depth};
-                            std::lock_guard<std::mutex> lk(seed_coverage_mu);
-                            // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
-                            seed_coverage_proof[proof_key] =
-                                SeedVerdict{ survived ? SeedCoverage::Partial : SeedCoverage::Full, 0 };
-                        }
-                        std::fprintf(stderr,
-                                     "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
-                                     (unsigned long long)item.code_addr, bi.binding, texels, survived,
-                                     survived ? "PARTIAL-COVERAGE (will always seed)" : "full-coverage (seed-skip proven)");
-                    }
+                void* mapped = nullptr;
+                if (ctx.map_memory(buffer.memory, 0, buffer.bytes, &mapped) != VK_SUCCESS) {
+                    readback_ok = false;
+                    break;
+                }
+                uint8_t* destination = buffer.atomic_image
+                    ? resource_bytes_for(buffer.resource, buffer.guest_bytes)
+                    : resource_bytes_for(buffer.resource, buffer.guest_bytes);
+                const auto* result = static_cast<const uint8_t*>(mapped);
+                if (buffer.atomic_image) {
                     if (trace) {
-                        if (bi.exact_storage_bytes()) {
-                            for (size_t t = 0; t < texels; ++t) {
-                                const uint8_t* texel = native_texels + t * guest_texel;
-                                for (size_t b = 0; b < guest_texel; ++b)
-                                    bi.nonzero_channels += texel[b] != 0;
-                            }
+                        buffer.after_hash = fnv1a(result, buffer.bytes);
+                        for (size_t i = 0; i < buffer.bytes; ++i)
+                            buffer.changed_bytes += buffer.linear_seed[i] != result[i];
+                    }
+                    if (!buffer.resource->host_data && buffer.resource->gpu_addr)
+                        prosper::host::guest_write_watch_notify_host_write(
+                            buffer.resource->gpu_addr, buffer.guest_bytes);
+                    // #2265: mirror of the upload -- per-layer 2D retile at the physical slice stride.
+                    const size_t layer_linear_bytes =
+                        static_cast<size_t>(buffer.resource->width) * buffer.resource->height * 4u;
+                    for (uint32_t layer = 0; layer < buffer.atomic_layers; ++layer) {
+                        uint8_t* dst = destination + layer * buffer.atomic_slice_bytes;
+                        const uint8_t* src = result + layer * layer_linear_bytes;
+                        if (buffer.resource->tile_mode) {
+                            tile_surface(dst, src, buffer.resource->width, buffer.resource->height,
+                                         buffer.resource->tile_mode, 0, sizeof(uint32_t));
                         } else {
-                            for (size_t t = 0; t < texels; t++)
-                                for (uint32_t c = 0; c < 4; c++)
-                                    bi.nonzero_channels += channels[t * 4 + c] != 0;
+                            const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
+                            const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
+                                ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
+                            for (uint32_t y = 0; y < buffer.resource->height; ++y)
+                                std::memcpy(dst + y * destination_pitch,
+                                            src + y * tight_pitch, tight_pitch);
                         }
                     }
-                    const auto pack_start = ComputeClock::now();
-                    static const bool pack_range_enabled = !std::getenv("PROSPER_NO_PACK_RANGE");
-                    if (bi.exact_storage_bytes()) {
-                        // The typed Vulkan image has already applied the PS5 descriptor's UNORM/float
-                        // conversion. Its transfer bytes are the guest's exact row-major texels. A tiled
-                        // non-proving write can feed those bytes straight to the tiler, avoiding a second
-                        // full-surface allocation and memcpy (66.8 MiB for Astro Bot's 4K RGBA16F target).
-                        if (!tile_mapped_bytes)
-                            parallel_compute_texels(texels, linear_bytes * 2,
-                                [&](size_t begin, size_t end) {
-                                    std::memcpy(packed + begin * guest_texel,
-                                                native_texels + begin * guest_texel,
-                                                (end - begin) * guest_texel);
-                                });
-                    } else if (pack_range_enabled) {
-                        storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
-                    } else {
-                        for (size_t t = 0; t < texels; t++)
-                            storage_pack_texel(channels + t * 4, r->format, nc,
-                                               packed + t * guest_texel);
+                    ctx.unmap_memory(buffer.memory);
+                    if (buffer.resource->gpu_addr) {
+                        set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
+                        notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
+                        set_guest_gpu_write_origin(nullptr);
                     }
-                    // #1122: a proving frame that turned out partial-coverage packed poison garbage into the
-                    // un-stored texels. Restore each from the clean seed so the guest keeps its real prior
-                    // content (exactly a partial write's contract). Full-coverage proving frames have no
-                    // survivors, so this is a no-op there. bi.seed_linear shares this row-major texel layout.
-                    if (bi.poison_verify && !poison_texel.empty() &&
-                        bi.seed_linear.size() == linear_bytes) {
-                        for (size_t t = 0; t < texels; ++t) {
-                            if (poison_texel[t])
-                                std::memcpy(packed + t * guest_texel,
-                                            bi.seed_linear.data() + t * guest_texel, guest_texel);
-                        }
-                    }
-                    const auto pack_done = ComputeClock::now();
-                    static const bool verify_pack = std::getenv("PROSPER_VERIFY_PACK") != nullptr;
-                    if (verify_pack && !bi.exact_storage_bytes()) {
-                        // Fail-visible A/B (mirrors PROSPER_VERIFY_UNPACK): the specialized range pack must
-                        // be bit-identical to the per-texel path it replaces, verified against the real
-                        // workload's texels. Logs the clean case too, so a verified run is self-proving.
-                        std::vector<uint8_t> expect(guest_texel);
-                        size_t bad = 0, first_bad = 0;
-                        for (size_t t = 0; t < texels; ++t) {
-                            std::memset(expect.data(), 0, expect.size());
-                            storage_pack_texel(channels + t * 4, r->format, nc, expect.data());
-                            if (std::memcmp(expect.data(), packed + t * guest_texel,
-                                            guest_texel) != 0) {
-                                if (!bad) first_bad = t;
-                                ++bad;
-                            }
-                        }
-                        std::fprintf(stderr,
-                                     "[compute] pack-verify binding=%u addr=0x%llx fmt=%u nc=%u "
-                                     "texels=%zu mismatches=%zu%s\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr, (unsigned)r->format,
-                                     nc, texels, bad, bad ? " MISMATCH" : "");
-                        if (bad)
-                            std::fprintf(stderr, "[compute] pack-verify first mismatch texel=%zu\n",
-                                         first_bad);
-                    }
-                    const uint8_t* layout_source = tile_mapped_bytes ? native_texels : packed;
-                    if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
-                        if (!tile_volume(destination, bi.guest_bytes, layout_source, r->width, r->height,
-                                         r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
-                            readback_ok = false;
-                            ctx.unmap_memory(staging_memory[i]);
-                            break;
-                        }
-                    } else if (array_image && r->depth > 1) {
-                        const size_t linear_slice = static_cast<size_t>(r->width) * r->height * guest_texel;
-                        const size_t selected_slice = r->in_mip_tail
-                            ? r->mip_tail_bytes
-                            : (r->tile_mode
-                                   ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
-                                                         static_cast<uint32_t>(guest_texel))
-                                   : (r->layer_stride_bytes
-                                          ? linear_array_surface_bytes(
-                                                *r, static_cast<uint32_t>(guest_texel))
-                                          : linear_slice));
-                        const size_t layer_stride = r->layer_stride_bytes
-                            ? r->layer_stride_bytes : selected_slice;
-                        for (uint32_t layer = 0; layer < r->depth; ++layer) {
-                            uint8_t* layer_base = destination + layer_stride * layer;
-                            if (!r->tile_mode) {
-                                const size_t row_pitch = r->layer_stride_bytes
-                                    ? linear_array_row_pitch(
-                                          *r, static_cast<uint32_t>(guest_texel))
-                                    : static_cast<size_t>(r->width) * guest_texel;
-                                for (uint32_t y = 0; y < r->height; ++y)
-                                    std::memcpy(
-                                        layer_base + r->layer_mip_offset_bytes + y * row_pitch,
-                                        layout_source + linear_slice * layer +
-                                            static_cast<size_t>(y) * r->width * guest_texel,
-                                        static_cast<size_t>(r->width) * guest_texel);
-                            } else if (r->in_mip_tail) {
-                                tile_surface_level(
-                                    layer_base, r->mip_tail_bytes,
-                                    layout_source + linear_slice * layer,
-                                    r->width, r->height, r->tile_mode,
-                                    static_cast<uint32_t>(guest_texel), r->mip_tail_x, r->mip_tail_y);
-                            } else {
-                                tile_surface(
-                                    layer_base + r->layer_mip_offset_bytes,
-                                    layout_source + linear_slice * layer,
-                                    r->width, r->height, r->tile_mode, 0,
-                                    static_cast<uint32_t>(guest_texel));
-                            }
-                        }
-                    } else if (r->tile_mode && r->in_mip_tail) {
-                        tile_surface_level(destination, bi.guest_bytes, layout_source,
-                                           r->width, r->height, r->tile_mode,
-                                           static_cast<uint32_t>(guest_texel),
-                                           r->mip_tail_x, r->mip_tail_y);
-                    } else if (r->tile_mode) {
-                        tile_surface(destination, layout_source, r->width, r->height, r->tile_mode, 0,
-                                     static_cast<uint32_t>(guest_texel));
-                    }
-                    const auto layout_done = ComputeClock::now();
-                    pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
-                    layout_ms += std::chrono::duration<double, std::milli>(layout_done - pack_done).count();
-                    if (trace) bi.after_hash = fnv1a(destination, bi.guest_bytes);
-                    const auto notify_start = ComputeClock::now();
-                    // Name the writer. "a guest write covers this surface" and "prosper's own compute
-                    // writeback covers this surface" are different facts, and only the second says the
-                    // emulator is invalidating its own caches. Everything reaching the DS invalidation path
-                    // used to report the default `gpu`, which cannot distinguish them.
-                    set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
-                    notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
-                    set_guest_gpu_write_origin(nullptr);
-                    if (!r->host_data && writer_provenance_enabled())
+                    if (!buffer.resource->host_data && writer_provenance_enabled())
                         record_guest_write(GuestWriterKind::ComputeBuffer,
-                                           r->gpu_addr, bi.guest_bytes,
+                                           buffer.resource->gpu_addr, buffer.guest_bytes,
                                            item.submit_no, item.dispatch_index,
                                            item.command_order, item.code_addr);
-                    if (bi.dcc_metadata && bi.dcc_metadata_bytes) {
-                        const bool leave_compressed_for_test =
-                            g_leave_next_dcc_metadata_compressed_for_test.exchange(
-                                false, std::memory_order_acq_rel);
-                        if (!leave_compressed_for_test) {
-                            std::memset(bi.dcc_metadata, 0xff, bi.dcc_metadata_bytes);
-                            // This announcement lands on `metadata_addr`, which for a DEPTH surface is its
-                            // HTILE base -- and the DS cache treats an HTILE overlap as "may describe both
-                            // aspects" and invalidates depth as well as stencil. So this reset can discard a
-                            // retained depth image. Tagged so that consequence is attributable rather than
-                            // appearing as an anonymous `gpu` write; whether it SHOULD invalidate is a
-                            // separate question that needs the operation's real HTILE semantics proven.
-                            set_guest_gpu_write_origin("compute-writeback(metadata-reset)");
-                            notify_guest_gpu_write(r->metadata_addr, bi.dcc_metadata_bytes);
-                            set_guest_gpu_write_origin(nullptr);
-                            if (!r->dcc_metadata_host_data && writer_provenance_enabled())
-                                record_guest_write(GuestWriterKind::ComputeBuffer,
-                                                   r->metadata_addr, bi.dcc_metadata_bytes,
-                                                   item.submit_no, item.dispatch_index,
-                                                   item.command_order, item.code_addr);
-                            if (trace)
+                    continue;
+                }
+                const bool changed = !compute_buffers_equal(
+                    destination, result, buffer.bytes);
+                if (trace) {
+                    buffer.after_hash = fnv1a(result, buffer.bytes);
+                    for (size_t i = 0; i < buffer.bytes; i++)
+                        buffer.changed_bytes += destination[i] != result[i];
+                    // PROSPER_COMPUTELOG_CHANGED=N: the first N changed DWORD indices with old->new.
+                    //
+                    // `changed_bytes` says how much moved and nothing about where, which is the only
+                    // question that separates a wrong VALUE from a wrong INDEX. For a structure written
+                    // as adjacent pairs, the indices are the evidence: a head at k and its tail at k+1
+                    // is correct, a head at k and a tail at k+2 is not, and neither is visible in a byte
+                    // count or a hash.
+                    // How many bindings collapsed onto this one Vulkan buffer. Exact aliases are
+                    // merged and writability is ORed onto the first owner, so the owner's binding is
+                    // NOT evidence that the owner performed the store: a read-only binding followed by
+                    // a writable exact alias reports as though the first wrote, and with several
+                    // writable aliases no single store site can be named at all. The changed indices
+                    // below are allocation-level evidence and stand on their own; the binding is
+                    // reported as `owner-binding` with the alias count beside it so a reader cannot
+                    // mistake it for attribution.
+                    size_t alias_count = 0;
+                    for (const auto& other : buffers)
+                        if (other.alias_of != SIZE_MAX &&
+                            &buffers[other.alias_of] == &buffer) ++alias_count;
+                    if (const char* limit_env = std::getenv("PROSPER_COMPUTELOG_CHANGED")) {
+                        char* end = nullptr;
+                        const unsigned long limit = std::strtoul(limit_env, &end, 0);
+                        if (end && !*end && limit) {
+                            // memcpy, not a reinterpret_cast: `destination` is guest-addressed byte
+                            // storage and `result` is mapped device memory, and neither contract
+                            // promises uint32_t alignment or a uint32_t object lifetime there. The byte
+                            // bound below deliberately ignores a partial trailing dword.
+                            const size_t dwords = buffer.bytes / sizeof(uint32_t);
+                            const auto load_dword = [](const uint8_t* bytes, size_t index) {
+                                uint32_t value = 0;
+                                std::memcpy(&value, bytes + index * sizeof(uint32_t), sizeof(value));
+                                return value;
+                            };
+                            unsigned long shown = 0;
+                            for (size_t i = 0; i < dwords && shown < limit; ++i) {
+                                const uint32_t before_value = load_dword(destination, i);
+                                const uint32_t after_value = load_dword(result, i);
+                                if (before_value == after_value) continue;
+                                // Carry submit/dispatch on EVERY line. Without them the lines from
+                                // consecutive dispatches concatenate into one stream that looks like a
+                                // single dispatch's writes -- and a per-dispatch structural claim built
+                                // on that stream is meaningless. The first analysis run here did exactly
+                                // that and reported one index changing twice in "one" dispatch.
                                 std::fprintf(stderr,
-                                             "[compute]   DCC uncompressed binding=%u meta=0x%llx "
-                                             "bytes=%zu code=0xff\n",
-                                             bi.binding, (unsigned long long)r->metadata_addr,
-                                             bi.dcc_metadata_bytes);
-                        } else if (trace) {
-                            std::fprintf(stderr,
-                                         "[compute]   injected unresolved DCC writeback binding=%u\n",
-                                         bi.binding);
+                                             "[compute]     changed submit=%llu dispatch=%llu "
+                                             "addr=0x%llx owner-binding=%u aliases=%zu index=%zu "
+                                             "0x%08x -> 0x%08x (tag=%u bit30=%u next=%u)\n",
+                                             (unsigned long long)item.submit_no,
+                                             (unsigned long long)item.dispatch_index,
+                                             (unsigned long long)(buffer.resource
+                                                 ? buffer.resource->gpu_addr : 0ull),
+                                             buffer.resource ? buffer.resource->binding : 0u,
+                                             alias_count, i,
+                                             before_value, after_value, after_value & 7u,
+                                             (after_value >> 30) & 1u,
+                                             (after_value >> 3) & 0x07FFFFFFu);
+                                ++shown;
+                            }
                         }
                     }
-                    if (bi.mirror_result_to_imported) {
-                        const BoundImage& mirror = images[bi.seed_from_imported];
-                        notify_live_render_target_image_written({
-                            r->gpu_addr, mirror.imported_width, mirror.imported_height,
-                            mirror.imported_pixel_format});
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   mirrored storage result into renderer RTT "
-                                         "binding=%u addr=0x%llx extent=%ux%u\n",
-                                         bi.binding, (unsigned long long)r->gpu_addr,
-                                         mirror.imported_width, mirror.imported_height);
+                }
+                // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
+                // the values it already contains. Terminator 2D's startup kernel binds 8,847,360 bytes;
+                // after its first dispatch all later readbacks are identical. Avoiding the redundant host
+                // write removes one full pass over both source and destination. Renderer-alias
+                // invalidation and writer provenance remain unconditional: renderer-resident state can
+                // differ from guest RAM even when consecutive compute readbacks contain identical bytes.
+                if (changed) {
+                    if (!buffer.resource->host_data && buffer.resource->gpu_addr)
+                        prosper::host::guest_write_watch_notify_host_write(
+                            buffer.resource->gpu_addr, buffer.resource->size);
+                    copy_compute_buffer(destination, result, buffer.bytes);
+                }
+                if (buffer.persistent && !buffer.result_baseline &&
+                    ctx.retain_cached_buffer_result(buffer.cache_key, result) && trace)
+                    std::fprintf(stderr,
+                                 "[compute]   retained exact GPU buffer result baseline binding=%u "
+                                 "addr=0x%llx bytes=%u\n",
+                                 buffer.resource->binding,
+                                 (unsigned long long)buffer.resource->gpu_addr,
+                                 buffer.resource->size);
+                ctx.unmap_memory(buffer.memory);
+                if (buffer.resource->gpu_addr) {
+                    if (changed) {
+                        set_guest_gpu_write_origin("compute-writeback(buffer-full)");
+                        notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+                        set_guest_gpu_write_origin(nullptr);
+                    } else {
+                        notify_guest_gpu_write_preserving_bytes(
+                            buffer.resource->gpu_addr, buffer.resource->size);
                     }
-                    const auto notify_done = ComputeClock::now();
-                    bool retain_gpu_result_baseline = false;
-                    bool promoted_after_writeback = false;
-                    const bool final_dcc_cache_safe = bi.dcc_metadata && bi.dcc_metadata_bytes &&
-                        std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
-                                    [](uint8_t value) { return value == 0xff; });
-                    if (bi.post_writeback_promotion_candidate && final_dcc_cache_safe) {
-                        const uint8_t* retained_source =
-                            (adaptive_storage_result_validation_enabled() &&
-                             cold_storage_result_snapshot_can_defer(
-                                 r->host_data != nullptr, bi.seed_skip, bi.guest_bytes,
-                                 cold_storage_result_snapshot_defer_min_bytes()))
-                            ? nullptr : destination;
-                        if (bi.forced_seed_allocation_reused) {
-                            // The exact cache entry was already pinned and forcibly reseeded before this
-                            // dispatch. Successful writeback plus the final all-uncompressed metadata scan
-                            // may now restore source/transfer authority without replacing its allocation.
-                            bi.cache_candidate = true;
-                            g_dcc_post_writeback_promotions.fetch_add(
-                                1, std::memory_order_relaxed);
-                            if (trace)
-                                std::fprintf(stderr,
-                                             "[compute]   promoted reused post-writeback DCC storage "
-                                             "image binding=%u addr=0x%llx allocation=%llu\n",
-                                             bi.binding, (unsigned long long)r->gpu_addr,
-                                             (unsigned long long)bi.allocation_bytes);
-                        } else if (bi.image && bi.memory && bi.allocation_bytes &&
-                            ctx.replace_or_retain_image(
-                                bi.cache_key, bi.image, bi.memory,
-                                bi.allocation_bytes, retained_source)) {
-                            bi.cache_candidate = true;
-                            bi.persistent = true;
-                            promoted_after_writeback = true;
-                            g_dcc_post_writeback_promotions.fetch_add(
-                                1, std::memory_order_relaxed);
-                            if (trace)
-                                std::fprintf(stderr,
-                                             "[compute]   promoted post-writeback DCC storage image "
-                                             "binding=%u addr=0x%llx allocation=%llu\n",
-                                             bi.binding, (unsigned long long)r->gpu_addr,
-                                             (unsigned long long)bi.allocation_bytes);
-                        }
-                    }
-                    if (bi.forced_seed_allocation_reused && !final_dcc_cache_safe)
-                        ctx.invalidate_cached_image_source(bi.cache_key);
-                    if (bi.cache_candidate) {
-                        if (bi.persistent && !promoted_after_writeback) {
-                            // Guest bytes now mirror the retained image again. A changing full-overwrite
-                            // target needs no source snapshot; the first repeated result retains one exact
-                            // baseline, and subsequent identical GPU skips do not recopy it.
-                            ctx.validate_cached_image_source(
-                                bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
-                                bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
-                                    native_3d_transfer_enabled());
-                        } else if (bi.image && bi.memory && bi.allocation_bytes &&
-                                   ctx.retain_image(bi.cache_key, bi.image, bi.memory,
-                                                    bi.allocation_bytes,
-                                                    (adaptive_storage_result_validation_enabled() &&
-                                                     cold_storage_result_snapshot_can_defer(
-                                                         r->host_data != nullptr, bi.seed_skip,
-                                                         bi.guest_bytes,
-                                                         cold_storage_result_snapshot_defer_min_bytes()))
-                                                        ? nullptr : destination)) {
-                            bi.persistent = true;
-                            if (trace)
-                                std::fprintf(stderr,
-                                             "[compute]   retained storage image binding=%u "
-                                             "addr=0x%llx allocation=%llu\n",
-                                             bi.binding, (unsigned long long)r->gpu_addr,
-                                             (unsigned long long)bi.allocation_bytes);
-                        }
-                        // An aligned exact result is retained as the staging buffer immediately below.
-                        // Copying it into a host vector first only to clear that vector after ownership
-                        // transfer is pure churn (66.4 MiB for a native 4K RGBA16F target). Unavailable GPU
-                        // setup keeps the exact current host fallback; a failed ownership attempt invalidates
-                        // any older fallback so the next dispatch takes the ordinary writeback path.
-                        const bool force_host_result_fallback =
-                            bi.persistent && !bi.result_baseline && bi.exact_result_bytes &&
-                            !(bi.exact_result_bytes & 15u) &&
-                            g_force_next_image_result_host_fallback_for_test.exchange(
-                                false, std::memory_order_acq_rel);
-                        retain_gpu_result_baseline = bi.persistent && !bi.result_baseline &&
-                            bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
-                            !force_host_result_fallback && ctx.prepare_compare_pipeline();
-                        if (bi.persistent && !retain_gpu_result_baseline)
-                            ctx.remember_cached_image_result(
-                                bi.cache_key, native_texels,
-                                static_cast<size_t>(bi.exact_result_bytes));
-                    }
-                    const auto cache_done = ComputeClock::now();
-                    ctx.unmap_memory(staging_memory[i]);
-                    const VkBuffer retained_result = staging[i];
-                    if (retain_gpu_result_baseline &&
-                        ctx.retain_cached_image_result_buffer(
-                            bi.cache_key, staging[i], staging_memory[i],
-                            bi.staging_allocation_bytes, bi.exact_result_bytes)) {
-                        bi.result_baseline = retained_result;
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   retained exact GPU result baseline binding=%u "
-                                         "addr=0x%llx bytes=%zu\n",
-                                         bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
-                    }
-                    const auto image_writeback_done = ComputeClock::now();
-                    const auto image_milliseconds = [](auto begin, auto end) {
-                        return std::chrono::duration<double, std::milli>(end - begin).count();
-                    };
-                    image_map_ms += image_milliseconds(map_start, map_done);
-                    image_prepare_ms += image_milliseconds(map_done, prepare_done);
-                    image_watch_ms += image_milliseconds(prepare_done, watch_done);
-                    image_notify_ms += image_milliseconds(notify_start, notify_done);
-                    image_cache_ms += image_milliseconds(notify_done, cache_done);
-                    if (image_timing)
+                }
+                if (buffer.persistent)
+                    ctx.validate_cached_buffer_source(buffer.cache_key);
+                if (!buffer.resource->host_data && writer_provenance_enabled())
+                    record_guest_write(GuestWriterKind::ComputeBuffer,
+                                       buffer.resource->gpu_addr, buffer.resource->size,
+                                       item.submit_no, item.dispatch_index,
+                                       item.command_order, item.code_addr);
+            }
+            writeback_buffers_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - writeback_buffers_start).count();
+            if (!readback_ok) return false;   // was `break` out of the do-while; the call
+                                              // site turns a false return back into that break
+            const auto writeback_images_start = ComputeClock::now();
+            // Storage-image writeback (#590): copy exact-width texels or pack raw uvec4 channels back
+            // into the guest format, then restore its linear or 3D tiled address layout and notify the
+            // render side exactly like the buffer path.
+            for (size_t i = 0; i < images.size() && readback_ok; i++) {
+                BoundImage& bi = images[i];
+                if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
+                const auto image_writeback_start = ComputeClock::now();
+                const bool image_cache_hit = bi.persistent;
+                const ShaderResource* r = bi.resource;
+                const uint32_t cb = data_format_bytes(r->format);
+                const uint32_t nc = r->num_components ? r->num_components : 1;
+                const size_t guest_texel = (r->format == DataFormat::Float10_11_11 ||
+                                            r->format == DataFormat::Unorm2_10_10_10)
+                    ? 4u : (size_t)cb * nc;
+                const size_t texels = (size_t)r->width * r->height * r->depth;
+                const size_t linear_bytes = texels * guest_texel;
+                uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
+                // GPU comparison is an exact word-for-word equality reduction and acquire_cached_image
+                // independently proved that the guest mirror still contains that baseline. This path
+                // therefore needs neither a large staging mapping nor a CPU memory pass.
+                if (bi.gpu_result_unchanged && bi.upload_skipped) {
+                    if (trace)
                         std::fprintf(stderr,
-                                     "[compute-image-writeback] code=0x%llx hash=0x%016llx "
-                                     "binding=%u addr=0x%llx "
-                                     "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
-                                     "poison=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
-                                     "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
-                                     "total_ms=%.3f\n",
-                                     (unsigned long long)item.code_addr,
-                                     (unsigned long long)timing_program_hash, bi.binding,
-                                     (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
-                                     r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
-                                     bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u,
-                                     image_milliseconds(map_start, map_done),
-                                     image_milliseconds(map_done, prepare_done),
-                                     image_milliseconds(prepare_done, watch_done),
-                                     image_milliseconds(pack_start, pack_done),
-                                     image_milliseconds(pack_done, layout_done),
-                                     image_milliseconds(notify_start, notify_done),
-                                     image_milliseconds(notify_done, cache_done),
-                                     image_milliseconds(image_writeback_start, image_writeback_done));
+                                     "[compute]   skipped GPU-identical storage writeback binding=%u "
+                                     "addr=0x%llx bytes=%llu\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     (unsigned long long)bi.exact_result_bytes);
+                    if (r->gpu_addr)
+                        notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
+                    continue;
                 }
-                writeback_images_ms = std::chrono::duration<double, std::milli>(
-                    ComputeClock::now() - writeback_images_start).count();
-                if (!readback_ok) return false;   // was `break` out of the do-while; the call
-                                                  // site turns a false return back into that break
-                const auto writeback_publish_start = ComputeClock::now();
-                // Every storage image is back in GENERAL, all exact guest writebacks/notifications have
-                // completed, and a failed dispatch cannot reach here. Native results may seed a later
-                // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
-                // also be exported directly to graphics. Raw interchange images are compatible with neither.
-                for (const BoundImage& image : images) {
-                    if (!image.storage) continue;
-                    const bool unique = image.alias_of == SIZE_MAX;
-                    const bool native_exact_storage = image.native_float_storage ||
-                        image.native_uint_storage || image.packed_r11_storage;
-                    const bool publish_eligible = native_exact_storage && unique &&
-                        image.cache_candidate && image.persistent;
-                    const bool authorized = publish_eligible &&
-                        ctx.authorize_cached_image_compute_transfer(image.cache_key);
-                    transfer_gate_census.record_storage_publish(
-                        transfer_gate_observation.role, native_exact_storage, unique,
-                        image.cache_candidate, image.persistent, authorized);
-                    if (authority_observation.selected && unique && image.resource) {
-                        authority_census.record_selected_storage_output(
-                            item, image.binding,
-                            ShadowComputeAuthorityRange::from(
-                                image.resource->gpu_addr, image.guest_bytes),
-                            authorized);
+                void* mapped = nullptr;
+                const auto map_start = ComputeClock::now();
+                if (g_fail_next_storage_readback_for_test.exchange(
+                        false, std::memory_order_acq_rel)) {
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   injected storage readback failure binding=%u\n",
+                                     bi.binding);
+                    readback_ok = false;
+                    break;
+                }
+                if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {
+                    readback_ok = false;
+                    break;
+                }
+                const auto map_done = ComputeClock::now();
+                const bool array_image = backend_uses_2d_array(*r);
+                static const bool direct_tiled_writeback_disabled =
+                    std::getenv("PROSPER_NO_DIRECT_TILED_WRITEBACK") != nullptr;
+                const bool tile_mapped_bytes = storage_writeback_can_tile_mapped_bytes(
+                    bi.exact_storage_bytes(), r->tile_mode, bi.poison_verify,
+                    direct_tiled_writeback_disabled);
+                std::unique_ptr<uint8_t[]> linear;
+                uint8_t* packed = destination;
+                if ((r->tile_mode && !tile_mapped_bytes) ||
+                    (!r->tile_mode && array_image && r->depth > 1)) {
+                    linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
+                    packed = linear.get();
+                }
+                const uint32_t* channels = static_cast<const uint32_t*>(mapped);
+                const uint8_t* native_texels = static_cast<const uint8_t*>(mapped);
+                // A retained, proven-full output can avoid the expensive CPU pack/retile and renderer
+                // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
+                // that guest memory still contains the prior result, and this dispatch reproduced the
+                // same row-major bytes. If either comparison fails, take the ordinary writeback below.
+                const bool repeated_output = bi.cache_candidate && bi.persistent &&
+                    bi.upload_skipped && bi.exact_storage_bytes() &&
+                    ctx.cached_image_result_matches(bi.cache_key, native_texels, linear_bytes);
+                const auto prepare_done = ComputeClock::now();
+                if (repeated_output) {
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   skipped identical storage writeback binding=%u "
+                                     "addr=0x%llx bytes=%llu\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     (unsigned long long)bi.exact_result_bytes);
+                    ctx.unmap_memory(staging_memory[i]);
+                    if (r->gpu_addr)
+                        notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
+                    continue;
+                }
+                // Notify page-based dirty trackers only when bytes will actually be written. Doing this
+                // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
+                // even on the no-write path, defeating the validation that made that path safe.
+                if (!r->host_data && r->gpu_addr)
+                    prosper::host::guest_write_watch_notify_host_write(
+                        r->gpu_addr, bi.guest_bytes);
+                const auto watch_done = ComputeClock::now();
+                // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
+                // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
+                // any survivor == partial coverage (must always seed). Cache the verdict per (code,binding)
+                // and, for a partial write, restore the un-stored texels from the clean seed after packing.
+                std::vector<uint8_t> poison_texel;   // 1 == this texel survived as poison (untouched)
+                if (bi.poison_verify) {
+                    size_t survived = 0;
+                    poison_texel.assign(texels, 0);
+                    for (size_t t = 0; t < texels; ++t) {
+                        bool all = true;
+                        if (bi.exact_storage_bytes()) {
+                            const uint8_t* texel = native_texels + t * guest_texel;
+                            for (size_t b = 0; b < guest_texel; ++b)
+                                if (texel[b] != 0x5a) all = false;
+                        } else {
+                            for (uint32_t c = 0; c < 4; ++c)
+                                if (channels[t * 4 + c] != 0xDEADBEEFu) all = false;
+                        }
+                        if (all) { ++survived; poison_texel[t] = 1; }
                     }
-                    if (publish_eligible && image.graphics_sampled_usage)
-                        ctx.authorize_cached_image_export(image.cache_key, item.command_order);
+                    {
+                        const SeedCoverageKey proof_key{item.code_addr, bi.binding,
+                                                        r->width, r->height, r->depth};
+                        std::lock_guard<std::mutex> lk(seed_coverage_mu);
+                        // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
+                        seed_coverage_proof[proof_key] =
+                            SeedVerdict{ survived ? SeedCoverage::Partial : SeedCoverage::Full, 0 };
+                    }
+                    std::fprintf(stderr,
+                                 "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
+                                 (unsigned long long)item.code_addr, bi.binding, texels, survived,
+                                 survived ? "PARTIAL-COVERAGE (will always seed)" : "full-coverage (seed-skip proven)");
                 }
-                writeback_publish_ms = std::chrono::duration<double, std::milli>(
-                    ComputeClock::now() - writeback_publish_start).count();
-                ok = true;
-                phase_writeback = ComputeClock::now();
-                return true;
-            };
-            if (!consume_dispatch()) return false;
+                if (trace) {
+                    if (bi.exact_storage_bytes()) {
+                        for (size_t t = 0; t < texels; ++t) {
+                            const uint8_t* texel = native_texels + t * guest_texel;
+                            for (size_t b = 0; b < guest_texel; ++b)
+                                bi.nonzero_channels += texel[b] != 0;
+                        }
+                    } else {
+                        for (size_t t = 0; t < texels; t++)
+                            for (uint32_t c = 0; c < 4; c++)
+                                bi.nonzero_channels += channels[t * 4 + c] != 0;
+                    }
+                }
+                const auto pack_start = ComputeClock::now();
+                static const bool pack_range_enabled = !std::getenv("PROSPER_NO_PACK_RANGE");
+                if (bi.exact_storage_bytes()) {
+                    // The typed Vulkan image has already applied the PS5 descriptor's UNORM/float
+                    // conversion. Its transfer bytes are the guest's exact row-major texels. A tiled
+                    // non-proving write can feed those bytes straight to the tiler, avoiding a second
+                    // full-surface allocation and memcpy (66.8 MiB for Astro Bot's 4K RGBA16F target).
+                    if (!tile_mapped_bytes)
+                        parallel_compute_texels(texels, linear_bytes * 2,
+                            [&](size_t begin, size_t end) {
+                                std::memcpy(packed + begin * guest_texel,
+                                            native_texels + begin * guest_texel,
+                                            (end - begin) * guest_texel);
+                            });
+                } else if (pack_range_enabled) {
+                    storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
+                } else {
+                    for (size_t t = 0; t < texels; t++)
+                        storage_pack_texel(channels + t * 4, r->format, nc,
+                                           packed + t * guest_texel);
+                }
+                // #1122: a proving frame that turned out partial-coverage packed poison garbage into the
+                // un-stored texels. Restore each from the clean seed so the guest keeps its real prior
+                // content (exactly a partial write's contract). Full-coverage proving frames have no
+                // survivors, so this is a no-op there. bi.seed_linear shares this row-major texel layout.
+                if (bi.poison_verify && !poison_texel.empty() &&
+                    bi.seed_linear.size() == linear_bytes) {
+                    for (size_t t = 0; t < texels; ++t) {
+                        if (poison_texel[t])
+                            std::memcpy(packed + t * guest_texel,
+                                        bi.seed_linear.data() + t * guest_texel, guest_texel);
+                    }
+                }
+                const auto pack_done = ComputeClock::now();
+                static const bool verify_pack = std::getenv("PROSPER_VERIFY_PACK") != nullptr;
+                if (verify_pack && !bi.exact_storage_bytes()) {
+                    // Fail-visible A/B (mirrors PROSPER_VERIFY_UNPACK): the specialized range pack must
+                    // be bit-identical to the per-texel path it replaces, verified against the real
+                    // workload's texels. Logs the clean case too, so a verified run is self-proving.
+                    std::vector<uint8_t> expect(guest_texel);
+                    size_t bad = 0, first_bad = 0;
+                    for (size_t t = 0; t < texels; ++t) {
+                        std::memset(expect.data(), 0, expect.size());
+                        storage_pack_texel(channels + t * 4, r->format, nc, expect.data());
+                        if (std::memcmp(expect.data(), packed + t * guest_texel,
+                                        guest_texel) != 0) {
+                            if (!bad) first_bad = t;
+                            ++bad;
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[compute] pack-verify binding=%u addr=0x%llx fmt=%u nc=%u "
+                                 "texels=%zu mismatches=%zu%s\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr, (unsigned)r->format,
+                                 nc, texels, bad, bad ? " MISMATCH" : "");
+                    if (bad)
+                        std::fprintf(stderr, "[compute] pack-verify first mismatch texel=%zu\n",
+                                     first_bad);
+                }
+                const uint8_t* layout_source = tile_mapped_bytes ? native_texels : packed;
+                if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
+                    if (!tile_volume(destination, bi.guest_bytes, layout_source, r->width, r->height,
+                                     r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
+                        readback_ok = false;
+                        ctx.unmap_memory(staging_memory[i]);
+                        break;
+                    }
+                } else if (array_image && r->depth > 1) {
+                    const size_t linear_slice = static_cast<size_t>(r->width) * r->height * guest_texel;
+                    const size_t selected_slice = r->in_mip_tail
+                        ? r->mip_tail_bytes
+                        : (r->tile_mode
+                               ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                     static_cast<uint32_t>(guest_texel))
+                               : (r->layer_stride_bytes
+                                      ? linear_array_surface_bytes(
+                                            *r, static_cast<uint32_t>(guest_texel))
+                                      : linear_slice));
+                    const size_t layer_stride = r->layer_stride_bytes
+                        ? r->layer_stride_bytes : selected_slice;
+                    for (uint32_t layer = 0; layer < r->depth; ++layer) {
+                        uint8_t* layer_base = destination + layer_stride * layer;
+                        if (!r->tile_mode) {
+                            const size_t row_pitch = r->layer_stride_bytes
+                                ? linear_array_row_pitch(
+                                      *r, static_cast<uint32_t>(guest_texel))
+                                : static_cast<size_t>(r->width) * guest_texel;
+                            for (uint32_t y = 0; y < r->height; ++y)
+                                std::memcpy(
+                                    layer_base + r->layer_mip_offset_bytes + y * row_pitch,
+                                    layout_source + linear_slice * layer +
+                                        static_cast<size_t>(y) * r->width * guest_texel,
+                                    static_cast<size_t>(r->width) * guest_texel);
+                        } else if (r->in_mip_tail) {
+                            tile_surface_level(
+                                layer_base, r->mip_tail_bytes,
+                                layout_source + linear_slice * layer,
+                                r->width, r->height, r->tile_mode,
+                                static_cast<uint32_t>(guest_texel), r->mip_tail_x, r->mip_tail_y);
+                        } else {
+                            tile_surface(
+                                layer_base + r->layer_mip_offset_bytes,
+                                layout_source + linear_slice * layer,
+                                r->width, r->height, r->tile_mode, 0,
+                                static_cast<uint32_t>(guest_texel));
+                        }
+                    }
+                } else if (r->tile_mode && r->in_mip_tail) {
+                    tile_surface_level(destination, bi.guest_bytes, layout_source,
+                                       r->width, r->height, r->tile_mode,
+                                       static_cast<uint32_t>(guest_texel),
+                                       r->mip_tail_x, r->mip_tail_y);
+                } else if (r->tile_mode) {
+                    tile_surface(destination, layout_source, r->width, r->height, r->tile_mode, 0,
+                                 static_cast<uint32_t>(guest_texel));
+                }
+                const auto layout_done = ComputeClock::now();
+                pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
+                layout_ms += std::chrono::duration<double, std::milli>(layout_done - pack_done).count();
+                if (trace) bi.after_hash = fnv1a(destination, bi.guest_bytes);
+                const auto notify_start = ComputeClock::now();
+                // Name the writer. "a guest write covers this surface" and "prosper's own compute
+                // writeback covers this surface" are different facts, and only the second says the
+                // emulator is invalidating its own caches. Everything reaching the DS invalidation path
+                // used to report the default `gpu`, which cannot distinguish them.
+                set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
+                notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
+                set_guest_gpu_write_origin(nullptr);
+                if (!r->host_data && writer_provenance_enabled())
+                    record_guest_write(GuestWriterKind::ComputeBuffer,
+                                       r->gpu_addr, bi.guest_bytes,
+                                       item.submit_no, item.dispatch_index,
+                                       item.command_order, item.code_addr);
+                if (bi.dcc_metadata && bi.dcc_metadata_bytes) {
+                    const bool leave_compressed_for_test =
+                        g_leave_next_dcc_metadata_compressed_for_test.exchange(
+                            false, std::memory_order_acq_rel);
+                    if (!leave_compressed_for_test) {
+                        std::memset(bi.dcc_metadata, 0xff, bi.dcc_metadata_bytes);
+                        // This announcement lands on `metadata_addr`, which for a DEPTH surface is its
+                        // HTILE base -- and the DS cache treats an HTILE overlap as "may describe both
+                        // aspects" and invalidates depth as well as stencil. So this reset can discard a
+                        // retained depth image. Tagged so that consequence is attributable rather than
+                        // appearing as an anonymous `gpu` write; whether it SHOULD invalidate is a
+                        // separate question that needs the operation's real HTILE semantics proven.
+                        set_guest_gpu_write_origin("compute-writeback(metadata-reset)");
+                        notify_guest_gpu_write(r->metadata_addr, bi.dcc_metadata_bytes);
+                        set_guest_gpu_write_origin(nullptr);
+                        if (!r->dcc_metadata_host_data && writer_provenance_enabled())
+                            record_guest_write(GuestWriterKind::ComputeBuffer,
+                                               r->metadata_addr, bi.dcc_metadata_bytes,
+                                               item.submit_no, item.dispatch_index,
+                                               item.command_order, item.code_addr);
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   DCC uncompressed binding=%u meta=0x%llx "
+                                         "bytes=%zu code=0xff\n",
+                                         bi.binding, (unsigned long long)r->metadata_addr,
+                                         bi.dcc_metadata_bytes);
+                    } else if (trace) {
+                        std::fprintf(stderr,
+                                     "[compute]   injected unresolved DCC writeback binding=%u\n",
+                                     bi.binding);
+                    }
+                }
+                if (bi.mirror_result_to_imported) {
+                    const BoundImage& mirror = images[bi.seed_from_imported];
+                    notify_live_render_target_image_written({
+                        r->gpu_addr, mirror.imported_width, mirror.imported_height,
+                        mirror.imported_pixel_format});
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   mirrored storage result into renderer RTT "
+                                     "binding=%u addr=0x%llx extent=%ux%u\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     mirror.imported_width, mirror.imported_height);
+                }
+                const auto notify_done = ComputeClock::now();
+                bool retain_gpu_result_baseline = false;
+                bool promoted_after_writeback = false;
+                const bool final_dcc_cache_safe = bi.dcc_metadata && bi.dcc_metadata_bytes &&
+                    std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
+                                [](uint8_t value) { return value == 0xff; });
+                if (bi.post_writeback_promotion_candidate && final_dcc_cache_safe) {
+                    const uint8_t* retained_source =
+                        (adaptive_storage_result_validation_enabled() &&
+                         cold_storage_result_snapshot_can_defer(
+                             r->host_data != nullptr, bi.seed_skip, bi.guest_bytes,
+                             cold_storage_result_snapshot_defer_min_bytes()))
+                        ? nullptr : destination;
+                    if (bi.forced_seed_allocation_reused) {
+                        // The exact cache entry was already pinned and forcibly reseeded before this
+                        // dispatch. Successful writeback plus the final all-uncompressed metadata scan
+                        // may now restore source/transfer authority without replacing its allocation.
+                        bi.cache_candidate = true;
+                        g_dcc_post_writeback_promotions.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   promoted reused post-writeback DCC storage "
+                                         "image binding=%u addr=0x%llx allocation=%llu\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         (unsigned long long)bi.allocation_bytes);
+                    } else if (bi.image && bi.memory && bi.allocation_bytes &&
+                        ctx.replace_or_retain_image(
+                            bi.cache_key, bi.image, bi.memory,
+                            bi.allocation_bytes, retained_source)) {
+                        bi.cache_candidate = true;
+                        bi.persistent = true;
+                        promoted_after_writeback = true;
+                        g_dcc_post_writeback_promotions.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   promoted post-writeback DCC storage image "
+                                         "binding=%u addr=0x%llx allocation=%llu\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         (unsigned long long)bi.allocation_bytes);
+                    }
+                }
+                if (bi.forced_seed_allocation_reused && !final_dcc_cache_safe)
+                    ctx.invalidate_cached_image_source(bi.cache_key);
+                if (bi.cache_candidate) {
+                    if (bi.persistent && !promoted_after_writeback) {
+                        // Guest bytes now mirror the retained image again. A changing full-overwrite
+                        // target needs no source snapshot; the first repeated result retains one exact
+                        // baseline, and subsequent identical GPU skips do not recopy it.
+                        ctx.validate_cached_image_source(
+                            bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
+                            bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
+                                native_3d_transfer_enabled());
+                    } else if (bi.image && bi.memory && bi.allocation_bytes &&
+                               ctx.retain_image(bi.cache_key, bi.image, bi.memory,
+                                                bi.allocation_bytes,
+                                                (adaptive_storage_result_validation_enabled() &&
+                                                 cold_storage_result_snapshot_can_defer(
+                                                     r->host_data != nullptr, bi.seed_skip,
+                                                     bi.guest_bytes,
+                                                     cold_storage_result_snapshot_defer_min_bytes()))
+                                                    ? nullptr : destination)) {
+                        bi.persistent = true;
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   retained storage image binding=%u "
+                                         "addr=0x%llx allocation=%llu\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         (unsigned long long)bi.allocation_bytes);
+                    }
+                    // An aligned exact result is retained as the staging buffer immediately below.
+                    // Copying it into a host vector first only to clear that vector after ownership
+                    // transfer is pure churn (66.4 MiB for a native 4K RGBA16F target). Unavailable GPU
+                    // setup keeps the exact current host fallback; a failed ownership attempt invalidates
+                    // any older fallback so the next dispatch takes the ordinary writeback path.
+                    const bool force_host_result_fallback =
+                        bi.persistent && !bi.result_baseline && bi.exact_result_bytes &&
+                        !(bi.exact_result_bytes & 15u) &&
+                        g_force_next_image_result_host_fallback_for_test.exchange(
+                            false, std::memory_order_acq_rel);
+                    retain_gpu_result_baseline = bi.persistent && !bi.result_baseline &&
+                        bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
+                        !force_host_result_fallback && ctx.prepare_compare_pipeline();
+                    if (bi.persistent && !retain_gpu_result_baseline)
+                        ctx.remember_cached_image_result(
+                            bi.cache_key, native_texels,
+                            static_cast<size_t>(bi.exact_result_bytes));
+                }
+                const auto cache_done = ComputeClock::now();
+                ctx.unmap_memory(staging_memory[i]);
+                const VkBuffer retained_result = staging[i];
+                if (retain_gpu_result_baseline &&
+                    ctx.retain_cached_image_result_buffer(
+                        bi.cache_key, staging[i], staging_memory[i],
+                        bi.staging_allocation_bytes, bi.exact_result_bytes)) {
+                    bi.result_baseline = retained_result;
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   retained exact GPU result baseline binding=%u "
+                                     "addr=0x%llx bytes=%zu\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
+                }
+                const auto image_writeback_done = ComputeClock::now();
+                const auto image_milliseconds = [](auto begin, auto end) {
+                    return std::chrono::duration<double, std::milli>(end - begin).count();
+                };
+                image_map_ms += image_milliseconds(map_start, map_done);
+                image_prepare_ms += image_milliseconds(map_done, prepare_done);
+                image_watch_ms += image_milliseconds(prepare_done, watch_done);
+                image_notify_ms += image_milliseconds(notify_start, notify_done);
+                image_cache_ms += image_milliseconds(notify_done, cache_done);
+                if (image_timing)
+                    std::fprintf(stderr,
+                                 "[compute-image-writeback] code=0x%llx hash=0x%016llx "
+                                 "binding=%u addr=0x%llx "
+                                 "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
+                                 "poison=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
+                                 "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
+                                 "total_ms=%.3f\n",
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)timing_program_hash, bi.binding,
+                                 (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
+                                 r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
+                                 bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u,
+                                 image_milliseconds(map_start, map_done),
+                                 image_milliseconds(map_done, prepare_done),
+                                 image_milliseconds(prepare_done, watch_done),
+                                 image_milliseconds(pack_start, pack_done),
+                                 image_milliseconds(pack_done, layout_done),
+                                 image_milliseconds(notify_start, notify_done),
+                                 image_milliseconds(notify_done, cache_done),
+                                 image_milliseconds(image_writeback_start, image_writeback_done));
+            }
+            writeback_images_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - writeback_images_start).count();
+            if (!readback_ok) return false;   // was `break` out of the do-while; the call
+                                              // site turns a false return back into that break
+            const auto writeback_publish_start = ComputeClock::now();
+            // Every storage image is back in GENERAL, all exact guest writebacks/notifications have
+            // completed, and a failed dispatch cannot reach here. Native results may seed a later
+            // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
+            // also be exported directly to graphics. Raw interchange images are compatible with neither.
+            for (const BoundImage& image : images) {
+                if (!image.storage) continue;
+                const bool unique = image.alias_of == SIZE_MAX;
+                const bool native_exact_storage = image.native_float_storage ||
+                    image.native_uint_storage || image.packed_r11_storage;
+                const bool publish_eligible = native_exact_storage && unique &&
+                    image.cache_candidate && image.persistent;
+                const bool authorized = publish_eligible &&
+                    ctx.authorize_cached_image_compute_transfer(image.cache_key);
+                transfer_gate_census.record_storage_publish(
+                    transfer_gate_observation.role, native_exact_storage, unique,
+                    image.cache_candidate, image.persistent, authorized);
+                if (authority_observation.selected && unique && image.resource) {
+                    authority_census.record_selected_storage_output(
+                        item, image.binding,
+                        ShadowComputeAuthorityRange::from(
+                            image.resource->gpu_addr, image.guest_bytes),
+                        authorized);
+                }
+                if (publish_eligible && image.graphics_sampled_usage)
+                    ctx.authorize_cached_image_export(image.cache_key, item.command_order);
+            }
+            writeback_publish_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - writeback_publish_start).count();
+            ok = true;
+            phase_writeback = ComputeClock::now();
             return true;
         };
-        if (!wait_and_consume()) break;
-    } while (false);
+        if (!consume_dispatch()) return false;
+        return true;
+    };
+    // Run it inline for now; a dispatch ring will store it in a slot instead. `ok`
+    // carries the outcome, which is why the result is not re-tested here -- the old
+    // `break` on failure simply left the do-block, which had nothing after it.
+    if (submitted_dispatch) wait_and_consume();
 
     if (trace)
         std::fprintf(stderr, "[compute] execute submit=%llu dispatch=%llu code=0x%llx "
