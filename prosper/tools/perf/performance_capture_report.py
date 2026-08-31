@@ -58,6 +58,29 @@ def validate_capture(records):
             raise CaptureError(f"footer has invalid {key}")
 
 
+def _gpu_present_adopted(post):
+    """Was GPU present adopted? True / False / None when the capture cannot say.
+
+    `rendered_frame_counter` returns nullopt when GPU present is adopted rather than substituting the
+    app's host-present count, so the PRESENCE OF THE FIELD is the signal -- exactly the rule
+    `_resource_breakdown` states below ("Absent and zero are the same number and opposite facts").
+
+    Deliberately NOT derived from `rendered_fps`: that rate is also None for a sample population with
+    fewer than two entries, a non-increasing `t_ns`, or a zero window, so an OFFSCREEN capture (whose
+    samples carry a real counter) would read as adopted and get told its readback is real work --
+    inverting the advice in the one direction this whole note exists to prevent. That inversion was
+    live at 92c27046 and is what this function replaces.
+    """
+    if not post:
+        return None
+    present = [s.get("rendered_frames") is not None for s in post]
+    if all(present):
+        return False        # a real counter on every sample => GPU present was NOT adopted
+    if not any(present):
+        return True         # absent/null throughout => adopted
+    return None             # adopted then lost, or never coherent: say so rather than guess
+
+
 def _counter_rate(samples, field, seconds):
     if len(samples) < 2 or seconds <= 0:
         return None
@@ -285,6 +308,46 @@ def summarize(records):
         reason = (f"the process used {cpu_cores:.2f} CPU cores with no retained renderer/compute "
                   "timing records")
 
+    # A READBACK verdict has two very different meanings, and the capture can tell them apart
+    # rather than guess. `rendered_frame_counter` returns nullopt exactly when GPU present was
+    # adopted (frontends/prosper-app/present_policy.hpp), so a null rendered-frame population IS the
+    # GPU-present signal, serialized on every sample.
+    #
+    #   * GPU present NOT adopted -- prosper-app fell back to copying every scanout frame to the CPU,
+    #     which happens under SDL_VIDEODRIVER=offscreen where the surface needs
+    #     VK_EXT_headless_surface. Then readback is the harness, and optimising it is wasted work.
+    #     Measured on The Forgotten City (#3152): same title, phase and trigger gave readback
+    #     396.9 ms / 51% and "primary evidence: readback" offscreen, against 0.0 ms through a real
+    #     window, where the verdict became renderer-resource and the graphics total halved.
+    #   * GPU present ADOPTED -- the scanout readback is skipped, so a large `readback_ms` is real
+    #     work: non-deferred colour-target readback, storage writeback, or a copy forced by
+    #     `authoritative_readback`, which every ordered DMA copy sets. That is a finding to chase,
+    #     NOT to dismiss, and saying so is the point of splitting the two cases.
+    #
+    # Deliberately not blamed on `tools/screenshot`: it cannot produce a capture at all, since only
+    # prosper-app arms one. The `PROSPER_TILECENSUS` readback trap (instrument trap 237) is a
+    # different instrument that happens to share the mechanism.
+    readback_note = None
+    if classification == "readback":
+        adopted = _gpu_present_adopted(post)
+        if adopted is None:
+            readback_note = (
+                "this capture cannot say whether GPU present was adopted, so it cannot say whether "
+                "the readback is real or the harness copying every scanout frame to the CPU. Check "
+                "the run log for a GPU-present surface failure before acting on this verdict")
+        elif adopted is False:
+            readback_note = (
+                "GPU present was NOT adopted for this capture, so the frontend copied every scanout "
+                "frame to the CPU -- most often prosper-app under SDL_VIDEODRIVER=offscreen, which "
+                "needs VK_EXT_headless_surface. This readback is the harness, not the title. "
+                "Re-measure through a real window before acting on this verdict")
+        else:
+            readback_note = (
+                "GPU present WAS adopted, so scanout readback is skipped and this readback is real "
+                "work -- non-deferred colour-target readback, storage writeback, or a copy forced by "
+                "authoritative_readback (every ordered DMA copy sets it). Chase it rather than "
+                "dismissing it as a harness artifact")
+
     pacing_note = None
     if rates["guest_fps"] is not None and rates["rendered_fps"] is not None:
         if rates["guest_fps"] > max(1.0, rates["rendered_fps"] * 1.5):
@@ -315,6 +378,7 @@ def summarize(records):
         "classification": classification,
         "reason": reason,
         "pacing_note": pacing_note,
+        "readback_note": readback_note,
         "truncation": truncation,
         "counts": {
             "pre": footer["pre_samples"],
@@ -408,6 +472,8 @@ def print_summary(summary):
                   "  [breakdown UNAVAILABLE — this capture predates the backend sub-buckets;"
                   " do NOT subtract the frontend figures above from it, they are a different layer]")
     print(f"primary evidence: {summary['classification']} — {summary['reason']}")
+    if summary.get("readback_note"):
+        print(f"readback: {summary['readback_note']}")
     if summary["pacing_note"]:
         print(f"pacing: {summary['pacing_note']}")
 

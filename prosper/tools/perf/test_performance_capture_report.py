@@ -104,6 +104,91 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertEqual(summary["classification"], "inconclusive")
         self.assertIsNone(summary["seconds"])
 
+    # #3152/#3153. A readback verdict means two opposite things, and the capture can tell them
+    # apart: `rendered_frame_counter` returns nullopt exactly when GPU present was adopted, so a
+    # null rendered-frame population IS the GPU-present signal.
+    READBACK_RENDERER = [{
+        "total_ms": 100, "gpu_device_ms": 5, "gpu_wait_ms": 6,
+        "build_resources_ms": 8, "setup_resources_ms": 7, "readback_ms": 60,
+    }]
+
+    def test_readback_without_gpu_present_is_called_out_as_the_harness(self):
+        # No GPU present -> the frontend copied every scanout frame to the CPU. Optimising that is
+        # optimising the measuring apparatus, which is exactly what the offscreen capture of The
+        # Forgotten City invited.
+        no_gpu_present = [dict(s) for s in SAMPLES]          # rendered_frames present => NOT adopted
+        summary = summarize(capture(no_gpu_present, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIsNotNone(summary["readback_note"])
+        self.assertIn("harness, not the title", summary["readback_note"])
+
+    def test_readback_with_gpu_present_is_called_out_as_real_work(self):
+        # GPU present adopted (rendered_frames unavailable) -> scanout readback is skipped, so this
+        # readback is genuine (ordered-DMA authoritative copies, storage writeback). The note must
+        # push TOWARDS investigating it; a blanket "probably your harness" would teach readers to
+        # dismiss a real signal.
+        gpu_present = [{k: v for k, v in s.items() if k != "rendered_frames"} for s in SAMPLES]
+        summary = summarize(capture(gpu_present, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIsNotNone(summary["readback_note"])
+        self.assertIn("real", summary["readback_note"])
+        self.assertNotIn("harness, not the title", summary["readback_note"])
+
+    def test_degenerate_sample_population_does_not_flip_an_offscreen_capture(self):
+        # THE REGRESSION. The discriminator used to be `rendered_fps is not None`, but that derived
+        # rate is also None for a population with fewer than two samples, a non-increasing t_ns, or a
+        # zero window. An OFFSCREEN capture -- whose samples DO carry a real rendered_frames counter,
+        # so GPU present was not adopted -- then took the GPU-present branch and was told its
+        # readback was real work, sending the reader to optimise the harness. Key on the field.
+        # Asserted, not guarded: `if classification == "readback"` would make these arms silently
+        # vacuous if a future change classified a degenerate capture differently, and a vacuous arm
+        # on the exact regression it was written for is worse than no arm.
+        one_sample = [dict(SAMPLES[0])]
+        summary = summarize(capture(one_sample, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("harness, not the title", summary["readback_note"])
+
+        frozen_clock = [dict(SAMPLES[0]), dict(SAMPLES[0])]     # equal t_ns => rate is None
+        summary = summarize(capture(frozen_clock, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("harness, not the title", summary["readback_note"])
+
+    def test_mixed_gpu_present_population_says_it_cannot_tell(self):
+        # Adopted and then lost mid-capture. Neither branch is honest, so the note must decline
+        # rather than pick one -- a wrong confident answer here is the failure being prevented.
+        mixed = [dict(SAMPLES[0]), {k: v for k, v in SAMPLES[1].items() if k != "rendered_frames"}]
+        summary = summarize(capture(mixed, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("cannot say", summary["readback_note"])
+
+    def test_explicit_null_rendered_frames_is_the_real_wire_shape(self):
+        # `write_optional` serializes an adopted GPU present as the KEY PRESENT WITH A NULL VALUE,
+        # not as an absent key. The other GPU-present arm omits the key, so without this one the
+        # discriminator is never tested against the shape a real capture actually carries.
+        wire = [{**s, "rendered_frames": None} for s in SAMPLES]
+        summary = summarize(capture(wire, renderer=self.READBACK_RENDERER))
+        self.assertEqual(summary["classification"], "readback")
+        self.assertIn("real", summary["readback_note"])
+        self.assertNotIn("harness, not the title", summary["readback_note"])
+
+    def test_no_post_samples_cannot_determine_gpu_present(self):
+        # The one uncovered line in the helper. With no post population there is nothing to read the
+        # field from, so the honest answer is the third state rather than either branch.
+        summary = summarize(capture([], renderer=self.READBACK_RENDERER))
+        if summary["classification"] == "readback":
+            self.assertIn("cannot say", summary["readback_note"])
+        else:
+            self.assertIsNone(summary["readback_note"])
+
+    def test_non_readback_verdict_carries_no_readback_note(self):
+        # The note is specific to the readback verdict; on every report it would be noise.
+        summary = summarize(capture(SAMPLES, renderer=[{
+            "total_ms": 100, "gpu_device_ms": 10, "gpu_wait_ms": 12,
+            "build_resources_ms": 25, "setup_resources_ms": 25, "readback_ms": 2,
+        }]))
+        self.assertEqual(summary["classification"], "renderer-resource")
+        self.assertIsNone(summary["readback_note"])
+
     def test_pacing_gap_is_evidence_not_cause(self):
         summary = summarize(capture(SAMPLES, renderer=[{
             "total_ms": 100, "gpu_device_ms": 60, "gpu_timestamp_samples": 1,
