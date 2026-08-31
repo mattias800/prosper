@@ -328,7 +328,23 @@ def summarize(records):
     # prosper-app arms one. The `PROSPER_TILECENSUS` readback trap (instrument trap 237) is a
     # different instrument that happens to share the mechanism.
     readback_note = None
-    if classification == "readback":
+    # Warn whenever readback is a LEADING component, not only when it wins the classification.
+    # A capture where readback is the largest single component but sits under the evidence
+    # threshold gets classified "inconclusive" -- and then prints the biggest number on the page
+    # with no warning attached, which is the exact shape that sends a reader chasing the harness.
+    # Measured on a Dragon Quest capture: readback=977.7ms was the top component, classification
+    # was "inconclusive", and the note stayed silent.
+    # Ranking is the wrong trigger: on the capture that motivated this, readback was 977.7ms and
+    # merely SECOND to compute's 1134.0ms, so a "is it the max" test stayed silent on a number a
+    # reader would still have chased. If the frontend is copying scanout frames at all, say so.
+    material_readback = False
+    try:
+        _c = components if isinstance(components, dict) else {}
+        _rb = _c.get("readback")
+        material_readback = isinstance(_rb, (int, float)) and _rb > 0.0
+    except Exception:
+        material_readback = False
+    if classification == "readback" or material_readback:
         adopted = _gpu_present_adopted(post)
         if adopted is None:
             readback_note = (
