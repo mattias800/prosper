@@ -1118,6 +1118,14 @@ struct VulkanComputeContext {
     std::filesystem::path pipeline_cache_path;
     std::mutex pipeline_cache_mutex;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    // #3157: the GPU result-comparison pool, owned by the context so it is reset rather than
+    // recreated per dispatch. It contributed about 144 vkCreateDescriptorPool + 144 vkDestroy per
+    // second on The Plucky Squire (whole-process rate 865/s before, 721/s after); the main
+    // descriptor pool above already works this way. The bulk of the remaining rate is NOT this path
+    // and not prepare_descriptor_pool -- see the note on that helper.
+    VkDescriptorPool compare_pool = VK_NULL_HANDLE;
+    uint32_t compare_pool_sets = 0;
+    uint32_t compare_pool_buffers = 0;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence dispatch_fence = VK_NULL_HANDLE;
@@ -1350,6 +1358,7 @@ struct VulkanComputeContext {
             vkDestroyQueryPool(device, dispatch_timestamp_pool, nullptr);
         if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -1370,6 +1379,11 @@ struct VulkanComputeContext {
         if (borrowed) return;                       // renderer owns the device/instance
         if (device) vkDestroyDevice(device, nullptr);
         if (instance) vkDestroyInstance(instance, nullptr);
+    }
+
+    static bool compare_pool_reuse_enabled() {   // opt-out for bisection
+        static const bool enabled = std::getenv("PROSPER_NO_COMPARE_POOL_REUSE") == nullptr;
+        return enabled;
     }
 
     static bool descriptor_pool_reuse_enabled() {
@@ -1426,6 +1440,10 @@ struct VulkanComputeContext {
         return true;
     }
 
+    // NOT the source of the ~700 remaining vkCreateDescriptorPool/s: all three capacities below
+    // grow monotonically and the reuse test is <= on each, so this recreates only on a new maximum.
+    // The renderer creates one pool per RENDER PASS (tests/fixtures/render_runner.h, reached via
+    // render_draws_rgba) -- that is where to look next (#3157 review).
     VkDescriptorPool prepare_descriptor_pool(uint32_t buffers, uint32_t sampled,
                                              uint32_t storage) {
         if (!descriptor_pool_reuse_enabled()) return VK_NULL_HANDLE;
@@ -1458,6 +1476,30 @@ struct VulkanComputeContext {
         if (!count || vkCreateDescriptorPool(device, &info, nullptr, &descriptor_pool) != VK_SUCCESS)
             descriptor_pool = VK_NULL_HANDLE;
         return descriptor_pool;
+    }
+
+    // Reset-and-reuse the comparison descriptor pool. Same contract as prepare_descriptor_pool:
+    // grow capacities monotonically, reset when the request fits, recreate only when it does not.
+    VkDescriptorPool prepare_compare_descriptor_pool(uint32_t sets, uint32_t buffers) {
+        if (!compare_pool_reuse_enabled() || !sets || !buffers) return VK_NULL_HANDLE;
+        if (compare_pool && sets <= compare_pool_sets && buffers <= compare_pool_buffers) {
+            if (vkResetDescriptorPool(device, compare_pool, 0) == VK_SUCCESS) return compare_pool;
+            vkDestroyDescriptorPool(device, compare_pool, nullptr);
+            compare_pool = VK_NULL_HANDLE;
+        } else if (compare_pool) {
+            vkDestroyDescriptorPool(device, compare_pool, nullptr);
+            compare_pool = VK_NULL_HANDLE;
+        }
+        compare_pool_sets = std::max(sets, compare_pool_sets);
+        compare_pool_buffers = std::max(buffers, compare_pool_buffers);
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, compare_pool_buffers};
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = compare_pool_sets;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &size;
+        if (vkCreateDescriptorPool(device, &dpci, nullptr, &compare_pool) != VK_SUCCESS)
+            compare_pool = VK_NULL_HANDLE;
+        return compare_pool;
     }
 
     static bool persistent_mapping_enabled() {
@@ -5314,6 +5356,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     VkBuffer compare_flags = VK_NULL_HANDLE;
     VkDeviceMemory compare_flags_memory = VK_NULL_HANDLE;
     VkDescriptorPool compare_descriptor_pool = VK_NULL_HANDLE;
+    bool compare_pool_owned_by_context = false;
     std::vector<VkDescriptorSet> compare_descriptor_sets;
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
@@ -5380,7 +5423,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     };
 
     auto cleanup = [&] {
-        if (compare_descriptor_pool)
+        if (compare_descriptor_pool && !compare_pool_owned_by_context)
             vkDestroyDescriptorPool(ctx.device, compare_descriptor_pool, nullptr);
         if (compare_flags) vkDestroyBuffer(ctx.device, compare_flags, nullptr);
         if (compare_flags_memory) ctx.release_memory(compare_flags_memory);
@@ -8253,9 +8296,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 dpci.maxSets = static_cast<uint32_t>(compare_targets.size());
                 dpci.poolSizeCount = 1;
                 dpci.pPoolSizes = &size;
-                compare_ready = vk_soft_ok(vkCreateDescriptorPool(
-                    ctx.device, &dpci, nullptr, &compare_descriptor_pool),
-                    "compare-descriptor-pool");
+                compare_descriptor_pool = ctx.prepare_compare_descriptor_pool(
+                    static_cast<uint32_t>(compare_targets.size()), size.descriptorCount);
+                if (compare_descriptor_pool != VK_NULL_HANDLE) {
+                    compare_pool_owned_by_context = true;   // context resets it; do not destroy here
+                    compare_ready = true;
+                } else {
+                    compare_ready = vk_soft_ok(vkCreateDescriptorPool(
+                        ctx.device, &dpci, nullptr, &compare_descriptor_pool),
+                        "compare-descriptor-pool");
+                }
             }
             if (compare_ready) {
                 compare_descriptor_sets.resize(compare_targets.size());
