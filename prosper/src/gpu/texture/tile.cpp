@@ -1235,6 +1235,13 @@ void tile_census_report() {
                      total_bytes ? 100.0 * double(rows[i].second.bytes) / double(total_bytes) : 0.0);
 }
 
+// Row count for a volume, saturating instead of wrapping: this only names a census bucket, so a
+// clamped value groups honestly while an overflowed one silently merges two unrelated geometries.
+uint32_t census_rows(uint32_t height, uint32_t depth) {
+    const uint64_t rows = static_cast<uint64_t>(height) * depth;
+    return rows > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(rows);
+}
+
 void tile_census_note(const char* op, uint32_t w, uint32_t h, uint32_t bpe, uint32_t mode) {
     if (!tile_census_enabled()) return;
     bool due = false;
@@ -1804,7 +1811,10 @@ size_t tiled_volume_bytes(uint32_t width, uint32_t height, uint32_t depth,
 bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                    uint32_t width, uint32_t height, uint32_t depth,
                    uint32_t tile_mode, uint32_t bytes_per_texel) {
-    tile_census_note("detile_volume", width, height * depth, bytes_per_texel, tile_mode);
+    // Saturate rather than wrap: `height * depth` is uint32 arithmetic, and a large
+    // volume would otherwise alias into another row of the census.
+    tile_census_note("detile_volume", width, census_rows(height, depth), bytes_per_texel,
+                     tile_mode);
     const size_t linear_bytes = static_cast<size_t>(width) * height * depth * bytes_per_texel;
     if (tile_mode == (uint32_t)TileMode::Linear) {
         if (src_bytes < linear_bytes) return false;
@@ -1825,7 +1835,10 @@ bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
                  uint32_t width, uint32_t height, uint32_t depth,
                  uint32_t tile_mode, uint32_t bytes_per_texel) {
-    tile_census_note("tile_volume", width, height * depth, bytes_per_texel, tile_mode);
+    // Saturate rather than wrap: `height * depth` is uint32 arithmetic, and a large
+    // volume would otherwise alias into another row of the census.
+    tile_census_note("tile_volume", width, census_rows(height, depth), bytes_per_texel,
+                     tile_mode);
     const size_t need = tiled_volume_bytes(width, height, depth, tile_mode, bytes_per_texel);
     if (!need || dst_bytes < need) return false;
     if (tile_mode == (uint32_t)TileMode::Linear) {

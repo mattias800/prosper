@@ -43,10 +43,16 @@ constexpr bool compute_storage_cache_gate_candidate(
 // base bytes are the whole identity of a cacheable sampled entry, which is what the cache already
 // validates, and requiring an all-0xff plane on top of that only cost hit rate.
 //
-// That last sentence is a live invariant, not a historical note: **if a sampled decode ever starts
-// consulting the DCC metadata plane, this gate has to consult it too**, or the cache will replay a
-// decode whose input it never validated.  Nothing here can assert that mechanically, so it is
-// written where somebody adding such a consumer will be looking.
+// That last sentence is a live invariant, not a historical note, and it cuts both ways:
+//   * if a sampled decode ever starts CONSULTING the DCC metadata plane, this gate has to consult
+//     it too, or the cache will replay a decode whose input it never validated;
+//   * if a sampled decode ever starts DECLINING on metadata state, this gate has to decline with
+//     it.  That seam already exists and is unwired:
+//     `gpu/resources/compressed_source_authority.hpp`'s `sampled_source_decision` has no production
+//     caller today, and the surfaces admitted here are precisely the ones it would return
+//     `DeclinedUnsupportedMetadataState` for.  Wiring it must move this gate in the same commit.
+// Nothing here can assert either mechanically, so both are written where somebody touching that
+// decision will be looking.
 //
 // `dcc_cache_disabled` (PROSPER_NO_DCC_IMAGE_CACHE) restores the older, stricter behaviour exactly,
 // so a rendering report can be bisected against this change with one variable.

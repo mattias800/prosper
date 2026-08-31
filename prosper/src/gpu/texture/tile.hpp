@@ -95,6 +95,10 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
 struct TileCensusScope {
     explicit TileCensusScope(const char* who);
     ~TileCensusScope();
+    // A user-declared destructor does NOT suppress the copy constructor, and a copy would restore
+    // `prev` twice. Deleting it matters more now that this type lives in a widely included header.
+    TileCensusScope(const TileCensusScope&) = delete;
+    TileCensusScope& operator=(const TileCensusScope&) = delete;
     const char* prev;
 };
 

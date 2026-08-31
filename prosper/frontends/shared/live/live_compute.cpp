@@ -6846,10 +6846,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // it answers the wrong question. `dcc_cache_safe` asks whether the metadata plane
                 // reads as all-0xff, i.e. "nothing is actually compressed"; what decides whether an
                 // entry may be reused is whether the metadata can change the bytes this cache
-                // serves. On the sampled path it cannot: every consumer of the metadata plane
-                // reachable from here is `compute_sampled_dcc_fast_clear_rgba8`, and
-                // `!sampled_dcc_fast_clear` excludes every surface that reaches it -- so what a
-                // cacheable entry replays is detile + unpack of the BASE bytes and nothing else.
+                // serves. On the sampled path it cannot. The plane's only consumer here is
+                // `compute_sampled_dcc_fast_clear_rgba8`; the PROBE above runs it for every
+                // compressed sampled surface, and what `!sampled_dcc_fast_clear` excludes is the
+                // MATERIALIZATION that would act on its answer. The operative consequence is the
+                // same and is the sentence to quote: what a cacheable entry replays is detile +
+                // unpack of the BASE bytes and nothing else. (Stated precisely because the revision
+                // this replaced died of a comment that asserted more than its code did.)
                 // (This branch is already inside `compute_sampled_guest_prepare_required`, i.e.
                 // !storage && !renderer_owned, so storage targets keep their own stricter gate.)
                 // Base bytes are precisely what the validation in `acquire_cached_image` already
@@ -6863,6 +6866,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // both sides of this branch, and the cache serves the same pixels the uncached path
                 // would have uploaded. That is what makes the change pixel-neutral by construction,
                 // and what the frame A/B on #3149 measures rather than assumes.
+                //
+                // `cache_candidate` gates TWO things, and the argument above covers only the
+                // first: `acquire_cached_image` (reuse this decode's result) and
+                // `borrow_cached_image_for_compute_transfer` (seed from a retained STORAGE image --
+                // a different source, not this decode). Widening the gate newly admits compressed
+                // sampled descriptors to that borrow. It is safe, but for its own reason: the
+                // borrow demands `compute_transfer_valid && content_valid` plus a journal, watch or
+                // exact proof over the BASE range since the producing writeback, and the storage
+                // entry it borrows could only have been authorized through the STORAGE gate, which
+                // still requires an all-0xff plane. Diverging would need the plane to go non-0xff
+                // while the base bytes stayed byte-identical, which outside a fast clear -- excluded
+                // upstream -- is not producible.
                 //
                 // Kill switch, and it earns its place: this admits a whole class of surface to a
                 // cache it was previously excluded from, so a single variable must restore the old

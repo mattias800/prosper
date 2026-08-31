@@ -179,6 +179,13 @@ int main() {
     sampled_gates.persistent_enabled = false;
     CHECK(!compute_sampled_cache_gate_candidate(sampled_gates),
           "persistent cache disable blocks the sampled cache candidate");
+    // The fourth (dcc_cache_safe, dcc_cache_disabled) corner, and the most common one in
+    // production: an ordinary UNCOMPRESSED sampled surface on the default path.  The other three
+    // corners are covered above; this one was unasserted, which is the wrong one to leave out.
+    sampled_gates = sampled_compressed;
+    sampled_gates.dcc_cache_safe = true;
+    CHECK(compute_sampled_cache_gate_candidate(sampled_gates),
+          "uncompressed sampled surface is a candidate on the default path");
 
     const ComputeStoragePostWritebackPromotionInputs promotion_eligible{
         {false, false, false, true, false, true}, true, true};

@@ -19,6 +19,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-31
+
+### Stray's splash runs 66% faster, and the title screen now holds 65 fps
+
+No picture: the title screen still renders black, so there is nothing new to look at yet. But the
+sequence in front of it stopped crawling.
+
+One 4K surface was being de-swizzled from scratch thousands of times — 241 GiB of tiling work in
+under two minutes — because DCC-compressed textures were barred from the compute image cache. The
+bar was checking the wrong thing: nothing on that path ever reads the compression metadata it
+inspected, so the cache could have held those textures all along. Five detiles now do what 3,860 did.
+
+Splash goes 37 → 62 fps; carried through to the title screen, a run averages 65. ([#3150](https://github.com/mattias800/prosper/pull/3150))
+
 ## 2026-08-30
 
 ### Stray's black title screen is not a loading failure — the data arrives, then leaves
