@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -1163,8 +1165,115 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
     return sw4kb_tiled_bytes(width, height, pitch, bytes_per_texel);
 }
 
+
+// DIAGNOSTIC (PROSPER_TILECENSUS=1): which tiling work actually runs, by geometry.
+//
+// #3149 measured that this file's block copier is ~22% of CPU during Stray's boot while the GPU sits
+// at 4.5%, but no profiler here can name the CALL SITE: at -O3 the callers inline away (folded stacks
+// resolve to `~unique_ptr`) and DWARF unwinding collapses through the guest JIT to `main+0x...`. A
+// counter at the leaf answers the question the profiler cannot -- not which line calls it, but which
+// SURFACE it is called on and how often, which is what identifies the workload.
+//
+// Keyed on (direction, w, h, bytes-per-element, tile_mode) and dumped at exit, so a 3840x2160x8
+// surface running once per frame is immediately distinguishable from a small one running constantly.
+namespace {
+// `who` is part of the KEY, not the value.  Holding it as a value field made attribution
+// last-writer-wins: one geometry reached from two call sites reported whichever ran last, which
+// on #3149 printed the outer `compute` scope for a row whose work is really `smpl-upl`.  Keying on
+// it splits that row instead, so a geometry reached from several sites is visible as several rows
+// and the percentages stay attributable.  Tags and ops are string literals, so pointer identity is
+// the intended comparison.
+struct TileCensusKey {
+    const char* op; const char* who; uint32_t w, h, bpe, mode;
+    bool operator==(const TileCensusKey& o) const {
+        return op == o.op && who == o.who && w == o.w && h == o.h && bpe == o.bpe &&
+               mode == o.mode;
+    }
+};
+struct TileCensusHash {
+    size_t operator()(const TileCensusKey& k) const {
+        // A fixed-width 64-bit accumulator rather than shifts off `size_t`: the previous form
+        // shifted by 33, which is UB rather than a wrap wherever `size_t` is 32-bit.  Nothing here
+        // needs the spread those shifts were reaching for.
+        uint64_t h = std::hash<const void*>{}(k.op);
+        h = h * 1099511628211ull ^ std::hash<const void*>{}(k.who);
+        h = h * 1099511628211ull ^ k.w;
+        h = h * 1099511628211ull ^ k.h;
+        h = h * 1099511628211ull ^ k.bpe;
+        h = h * 1099511628211ull ^ k.mode;
+        return static_cast<size_t>(h);
+    }
+};
+struct TileCensusValue { uint64_t calls = 0, bytes = 0; };
+std::mutex g_tile_census_mx;
+std::unordered_map<TileCensusKey, TileCensusValue, TileCensusHash> g_tile_census;
+
+thread_local const char* g_tile_census_tag = "?";
+
+bool tile_census_enabled() {
+    static const bool on = std::getenv("PROSPER_TILECENSUS") != nullptr;
+    return on;
+}
+
+void tile_census_report() {
+    std::lock_guard<std::mutex> lk(g_tile_census_mx);
+    std::vector<std::pair<TileCensusKey, TileCensusValue>> rows(
+        g_tile_census.begin(), g_tile_census.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    uint64_t total_bytes = 0, total_calls = 0;
+    for (const auto& r : rows) { total_bytes += r.second.bytes; total_calls += r.second.calls; }
+    std::fprintf(stderr, "[tilecensus] %zu geometries, %llu calls, %.1f MiB moved\n",
+                 rows.size(), (unsigned long long)total_calls,
+                 double(total_bytes) / (1024.0 * 1024.0));
+    for (size_t i = 0; i < rows.size() && i < 14; ++i)
+        std::fprintf(stderr,
+                     "[tilecensus]   %-9s %-20s %5ux%-5u bpe=%u mode=%u calls=%llu %.1f MiB (%.1f%%)\n",
+                     rows[i].first.who, rows[i].first.op, rows[i].first.w, rows[i].first.h, rows[i].first.bpe,
+                     rows[i].first.mode, (unsigned long long)rows[i].second.calls,
+                     double(rows[i].second.bytes) / (1024.0 * 1024.0),
+                     total_bytes ? 100.0 * double(rows[i].second.bytes) / double(total_bytes) : 0.0);
+}
+
+// Row count for a volume, saturating instead of wrapping: this only names a census bucket, so a
+// clamped value groups honestly while an overflowed one silently merges two unrelated geometries.
+// Note what saturating does NOT fix: the row's `bytes` weight is derived from the same clamped
+// value, and the report ranks by bytes, so a saturated row would sort high on a fabricated weight.
+// Unreachable for any real surface -- a volume would need >2^32 rows -- and left visible rather
+// than dropped, because a census that silently discards a geometry cannot show its own invalidity.
+uint32_t census_rows(uint32_t height, uint32_t depth) {
+    const uint64_t rows = static_cast<uint64_t>(height) * depth;
+    return rows > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(rows);
+}
+
+void tile_census_note(const char* op, uint32_t w, uint32_t h, uint32_t bpe, uint32_t mode) {
+    if (!tile_census_enabled()) return;
+    bool due = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tile_census_mx);
+        auto& v = g_tile_census[TileCensusKey{op, g_tile_census_tag, w, h, bpe, mode}];
+        ++v.calls;
+        v.bytes += uint64_t(w) * h * bpe;
+        // Dumped PERIODICALLY, not at exit: a bounded capture run is killed with SIGTERM and every
+        // frontend here exits via _exit, so an atexit report would never print -- the same trap that
+        // hid the dmem write trace's output on #3146. A periodic dump always produces evidence.
+        // Threshold on BYTES as well as calls: this workload is a few enormous copies (a 4K FP16
+        // surface is 66 MiB), so a call-count threshold alone never fires and the instrument stays
+        // silent while moving gigabytes -- which is indistinguishable from "nothing happened".
+        static uint64_t since = 0, since_bytes = 0;
+        ++since;
+        since_bytes += uint64_t(w) * h * bpe;
+        if (since >= 20000 || since_bytes >= (1ull << 30)) {
+            since = 0; since_bytes = 0; due = true;
+        }
+    }
+    if (due) tile_census_report();
+}
+} // namespace
+
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
+    tile_census_note("detile_surface", width, height, bytes_per_texel, tile_mode);
     if (!tile_mode_is_tiled(tile_mode)) { warn_unhandled_tile_mode(tile_mode, width, height);
                                           std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     if (tile_mode == (uint32_t)TileMode::Sw256BS) {
@@ -1202,6 +1311,7 @@ std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t wi
 
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                   uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
+    tile_census_note("tile_surface", width, height, bytes_per_texel, tile_mode);
     if (!tile_mode_is_tiled(tile_mode)) { std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     const size_t dst_bytes = tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel);
     std::memset(dst, 0, dst_bytes);   // padding texels (rows beyond height) stay zero
@@ -1604,6 +1714,7 @@ size_t tiled_mip_level_offset(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t t
 
 void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                      uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode) {
+    tile_census_note("detile_elements", ew, eh, bpe, tile_mode);
     if (!tile_mode_is_tiled(tile_mode) || bpe == 0) {
         if (bpe != 0) warn_unhandled_tile_mode(tile_mode, ew, eh);   // bpe==0 is a caller error, not a mode gap
         size_t n = std::min(src_bytes, (size_t)ew * eh * bpe);
@@ -1625,6 +1736,7 @@ void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 void detile_elements_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                            uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
                            uint32_t tail_x, uint32_t tail_y) {
+    tile_census_note("detile_elements_level", ew, eh, bpe, tile_mode);
     const size_t linear_bytes = static_cast<size_t>(ew) * eh * bpe;
     if (!bpe) {
         if (linear_bytes) std::memset(dst, 0, linear_bytes);
@@ -1651,6 +1763,7 @@ void detile_elements_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 void detile_surface_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                           uint32_t width, uint32_t height, uint32_t tile_mode,
                           uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y) {
+    tile_census_note("detile_surface_level", width, height, bytes_per_texel, tile_mode);
     detile_elements_level(dst, src, src_bytes, width, height, bytes_per_texel,
                           tile_mode, tail_x, tail_y);
 }
@@ -1658,6 +1771,7 @@ void detile_surface_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 void tile_surface_level(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
                         uint32_t width, uint32_t height, uint32_t tile_mode,
                         uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y) {
+    tile_census_note("tile_surface_level", width, height, bytes_per_texel, tile_mode);
     if (!bytes_per_texel) return;
     const size_t linear_bytes = static_cast<size_t>(width) * height * bytes_per_texel;
     if (!tile_mode_is_tiled(tile_mode)) {
@@ -1701,6 +1815,10 @@ size_t tiled_volume_bytes(uint32_t width, uint32_t height, uint32_t depth,
 bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                    uint32_t width, uint32_t height, uint32_t depth,
                    uint32_t tile_mode, uint32_t bytes_per_texel) {
+    // Saturate rather than wrap: `height * depth` is uint32 arithmetic, and a large
+    // volume would otherwise alias into another row of the census.
+    tile_census_note("detile_volume", width, census_rows(height, depth), bytes_per_texel,
+                     tile_mode);
     const size_t linear_bytes = static_cast<size_t>(width) * height * depth * bytes_per_texel;
     if (tile_mode == (uint32_t)TileMode::Linear) {
         if (src_bytes < linear_bytes) return false;
@@ -1721,6 +1839,10 @@ bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
                  uint32_t width, uint32_t height, uint32_t depth,
                  uint32_t tile_mode, uint32_t bytes_per_texel) {
+    // Saturate rather than wrap: `height * depth` is uint32 arithmetic, and a large
+    // volume would otherwise alias into another row of the census.
+    tile_census_note("tile_volume", width, census_rows(height, depth), bytes_per_texel,
+                     tile_mode);
     const size_t need = tiled_volume_bytes(width, height, depth, tile_mode, bytes_per_texel);
     if (!need || dst_bytes < need) return false;
     if (tile_mode == (uint32_t)TileMode::Linear) {
@@ -1737,5 +1859,11 @@ bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
                : sw64kb_rx_volume_copy<true>(dst, src, need, width, height, depth,
                                               bytes_per_texel);
 }
+
+
+TileCensusScope::TileCensusScope(const char* who) : prev(g_tile_census_tag) {
+    g_tile_census_tag = who;
+}
+TileCensusScope::~TileCensusScope() { g_tile_census_tag = prev; }
 
 } // namespace prosper::gpu

@@ -146,6 +146,47 @@ int main() {
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
           "persistent cache disable blocks storage cache candidate");
 
+    // #3149: the sampled gate, and specifically the one arm that separates this change from a
+    // no-op.  A DCC-compressed sampled surface (dcc_cache_safe = false) is now a cache candidate;
+    // before #3149 the same inputs were rejected.  If this arm ever passes with the kill switch
+    // set, or fails without it, the gate has stopped doing the thing the PR measured.
+    const ComputeSampledCacheGateInputs sampled_compressed{
+        .sampled_dcc_fast_clear = false,
+        .dcc_cache_safe = false,
+        .dcc_cache_disabled = false,
+        .persistent_enabled = true};
+    CHECK(compute_sampled_cache_gate_candidate(sampled_compressed),
+          "compressed sampled surface is a cache candidate (#3149)");
+    ComputeSampledCacheGateInputs sampled_gates = sampled_compressed;
+    sampled_gates.dcc_cache_disabled = true;
+    CHECK(!compute_sampled_cache_gate_candidate(sampled_gates),
+          "PROSPER_NO_DCC_IMAGE_CACHE restores the pre-#3149 rejection");
+    // The kill switch must restore the OLD behaviour, not disable the cache: an uncompressed
+    // surface was always eligible and must stay eligible with the switch set.
+    sampled_gates.dcc_cache_safe = true;
+    CHECK(compute_sampled_cache_gate_candidate(sampled_gates),
+          "kill switch still admits an uncompressed sampled surface");
+    // Fast clears stay out on both sides of the switch -- they are keyed by the metadata plane,
+    // which is the one sampled consumer of it, and is why ignoring that plane is sound above.
+    sampled_gates = sampled_compressed;
+    sampled_gates.sampled_dcc_fast_clear = true;
+    CHECK(!compute_sampled_cache_gate_candidate(sampled_gates),
+          "DCC fast clear blocks the sampled cache candidate");
+    sampled_gates.dcc_cache_safe = true;
+    CHECK(!compute_sampled_cache_gate_candidate(sampled_gates),
+          "DCC fast clear blocks even an all-0xff metadata plane");
+    sampled_gates = sampled_compressed;
+    sampled_gates.persistent_enabled = false;
+    CHECK(!compute_sampled_cache_gate_candidate(sampled_gates),
+          "persistent cache disable blocks the sampled cache candidate");
+    // The fourth (dcc_cache_safe, dcc_cache_disabled) corner, and the most common one in
+    // production: an ordinary UNCOMPRESSED sampled surface on the default path.  The other three
+    // corners are covered above; this one was unasserted, which is the wrong one to leave out.
+    sampled_gates = sampled_compressed;
+    sampled_gates.dcc_cache_safe = true;
+    CHECK(compute_sampled_cache_gate_candidate(sampled_gates),
+          "uncompressed sampled surface is a candidate on the default path");
+
     const ComputeStoragePostWritebackPromotionInputs promotion_eligible{
         {false, false, false, true, false, true}, true, true};
     CHECK(compute_storage_post_writeback_promotion_candidate(promotion_eligible),

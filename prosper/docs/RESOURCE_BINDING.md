@@ -194,3 +194,21 @@ sits a chain of about ten `continue`s, and without the input side "the front hal
 resource" and "it saw it and rejected it" produce identical evidence while pointing at different
 files. Reach for it before concluding anything about descriptor *recovery*: on Earthion (#1590) it
 overturned exactly that conclusion in one run.
+
+**A DCC-compressed SAMPLED surface's cache identity does NOT include its metadata plane, and folding
+that plane into the key is both unnecessary and — as first attempted — ineffective.** #3150 /
+#3149, 2026-08-31. The persistent compute image cache excluded compressed sampled surfaces on the
+theory that base bytes alone could not determine their content; on Stray that exclusion re-detiled
+one 4K FP16 surface 3,860 times in 110 s (98.9% of all tiling work, `PROSPER_TILECENSUS`). The
+theory is wrong for the *sampled* path: the DCC plane's only consumer there is
+`compute_sampled_dcc_fast_clear_rgba8`, whose materialization the admission gate already excludes
+via `!sampled_dcc_fast_clear`, so a cacheable entry's upload is detile + unpack of the BASE bytes
+alone — which the existing validation already covers. More sharply, `gfx10_dcc_fast_clear_rgba8` is
+the **only** DCC decode function in the tree: prosper has no DCC decompressor, so
+metadata-independence is a property of the codebase rather than of one call graph. **Do not re-derive
+the metadata-in-the-key design**: the first revision of #3150 did, and it was rejected twice over —
+the guard was conjoined into only one of three skip proofs (`watch_unchanged` and `exact_unchanged`
+both examine the base range alone, so the upload was skipped anyway), and the premise was unnecessary
+regardless. The *storage* gate is different and still requires an all-`0xff` plane: a storage
+target's base bytes are not authoritative while a live plane exists. `PROSPER_NO_DCC_IMAGE_CACHE=1`
+restores the old exclusion for bisection.
