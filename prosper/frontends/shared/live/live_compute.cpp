@@ -1184,6 +1184,7 @@ struct VulkanComputeContext {
     bool pending_all_ok = true;
     uint64_t ring_drains_on_alias = 0;
     uint64_t ring_deferred_dispatches = 0;
+    uint64_t ring_consumed_dispatches = 0;
     VkQueryPool dispatch_timestamp_pool = VK_NULL_HANDLE;
     float timestamp_period_ns = 0.0f;
     uint32_t timestamp_valid_bits = 0;
@@ -1494,6 +1495,7 @@ struct VulkanComputeContext {
         auto finish = std::move(slot.finish);
         slot.finish = nullptr;
         slot.writes.clear();
+        ring_consumed_dispatches++;
         const bool ok = finish();
         // execute_item already returned `true` provisionally for this dispatch, so a failure
         // discovered here has to be recorded somewhere the caller still reads.
@@ -9166,7 +9168,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // the BoundBuffer*/BoundImage* inside compare_targets stay valid. Everything else is a
     // handle, a scalar, or a lambda already made copy-safe (#3157).
     auto finish_dispatch = [&authority_census, &ctx, &item, &spirv, &transfer_gate_census, 
-        buffers = std::move(buffers), compare_targets = std::move(compare_targets), dispatch_fence, 
+        buffers = std::move(buffers), compare_targets = std::move(compare_targets), dispatch_fence, buffer_resources = std::move(buffer_resources), 
         images = std::move(images), staging = std::move(staging), 
         staging_bytes = std::move(staging_bytes), staging_memory = std::move(staging_memory), 
         authority_observation, compare_descriptor_pool, compare_flags, compare_flags_memory, 
