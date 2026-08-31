@@ -1196,24 +1196,64 @@ bool rdna2_optional_null_raw_load_shape(const Rdna2Inst& in) {
 }
 
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
-    if (in.fmt != Rdna2Format::MIMG || !in.mimg_unorm || !in.mimg_glc ||
+    // UNORM/GLC used to be checked here, ungated by opcode, on the theory that the two shapes
+    // below share one exact captured encoding. #3134 (Stray) is byte-verified evidence that they
+    // do not: a real `image_load_mip` NSA 2D packet round-trips through llvm-mc gfx1030 with
+    // UNORM=0 and GLC=0 -- the plain-assembly default for the opcode, not a modifier GTA V's
+    // compiler happened to add. Both control bits are irrelevant to which VGPR carries the mip:
+    // UNORM selects normalized-vs-integer COORDINATE interpretation for a SAMPLE, and every path
+    // here is already integer/texel-space by construction (LOAD/STORE, never a filtered sample);
+    // GLC is a cache-coherency policy the per-invocation model does not simulate. So the check
+    // moves into each branch below, admitting exactly the bit pattern each shape was verified
+    // against rather than one pattern for all of them. CONFIDENCE: HIGH -- verified per-branch.
+    if (in.fmt != Rdna2Format::MIMG ||
         in.mimg_dlc || in.mimg_r128 ||
         in.mimg_tfe || in.mimg_lwe || in.mimg_slc || in.mimg_a16 || in.mimg_d16 ||
         in.mimg_reserved || in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0)
         return false;
 
     uint32_t reg = 0;
-    if (in.opcode == 0x01u && (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
+    if (in.opcode == 0x01u && in.mimg_unorm && in.mimg_glc &&
+        (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
         (in.mimg_dim == 1u || in.mimg_dim == 5u) &&
         in.mimg_nsa == 0u && in.len_dwords == 2u) {
         // IMAGE_LOAD_MIP: 2D=[x,y,mip], 2D_ARRAY=[x,y,slice,mip].
         reg = static_cast<uint32_t>(in.src[0].value) +
               (in.mimg_dim == 5u ? 3u : 2u);
-    } else if (in.opcode == 0x09u && (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
+    } else if (in.opcode == 0x09u && in.mimg_unorm && in.mimg_glc &&
+               (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
                in.mimg_dim == 1u &&
                in.mimg_nsa == 1u && in.len_dwords == 3u &&
                (in.words[2] & 0xffff0000u) == 0u) {
         // IMAGE_STORE_MIP NSA 2D: coord0 is VADDR, then word2 bytes name y and mip.
+        reg = (in.words[2] >> 8) & 0xffu;
+    } else if (in.opcode == 0x01u && !in.mimg_unorm && !in.mimg_glc &&
+               in.mimg_dmask == 0x7u && in.mimg_dim == 1u &&
+               in.mimg_nsa == 1u && in.len_dwords == 3u &&
+               (in.words[2] & 0xffff0000u) == 0u) {
+        // IMAGE_LOAD_MIP NSA 2D (#3134, Stray PPSA02101): the same NSA arity/dword the
+        // IMAGE_STORE_MIP NSA branch above already uses, one opcode over -- coord0 is VADDR (x),
+        // word2 byte0 names y, byte1 names the mip VGPR. Byte-identical to llvm-mc gfx1030's
+        // `image_load_mip v[5:7], [v0, v42, v5], s[32:39] dmask:0x7 dim:SQ_RSRC_IMG_2D` with no
+        // unorm/glc modifier in the source assembly (words f004070a,00080500,0000052a).
+        //
+        // NOTE: recognizing this shape alone does not admit the guest program that produced it.
+        // On the live capture the resource this instruction addresses declares SIX real mip
+        // levels (`mips=6 mip_tail=1`) and the guest's mip VGPR is not provably zero at this use
+        // (`proven_zero_mip=0`) -- unlike GTA V's evidenced shapes, this is not a single-
+        // materialized-mip resource whose mip operand can be proven zero and discarded. The
+        // emitter's zero-mip fast path (rdna2_emit_alu.cpp) correctly keeps rejecting it via its
+        // `res->declared_mip_levels != 1u` / `!res->proven_zero_mip` gates; a faithful lowering
+        // needs the guest's own per-level bytes materialized (same root cause as #2818's Sonic
+        // Frontiers finding), which is out of scope here. See RECOMPILER_REMAINING.md and
+        // docs/STRAY_STATUS.md, both § Ruled out. This branch exists so (a) the CPU-side
+        // `proven_zero_mip_at_use` dataflow proof (gpu_executor.cpp) reports an accurate answer
+        // for this shape instead of silently skipping it, and (b) any OTHER draw that shares this
+        // exact compiler-emitted encoding but addresses a genuinely single-mip resource with a
+        // provably-zero mip register is no longer blocked by the unorm/glc mismatch alone.
+        // CONFIDENCE: HIGH on the address layout; CONFIDENCE: MED on admitting UNORM=0/GLC=0
+        // independently of the mip proof -- no title exercises this opcode/NSA/dim shape with
+        // UNORM or GLC set, so that combination remains unevidenced either way.
         reg = (in.words[2] >> 8) & 0xffu;
     } else {
         return false;
