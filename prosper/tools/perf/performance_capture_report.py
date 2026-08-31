@@ -337,11 +337,20 @@ def summarize(records):
     # Ranking is the wrong trigger: on the capture that motivated this, readback was 977.7ms and
     # merely SECOND to compute's 1134.0ms, so a "is it the max" test stayed silent on a number a
     # reader would still have chased. If the frontend is copying scanout frames at all, say so.
+    # Materiality, not presence and not ranking. Presence warns on a capture with 2ms of readback
+    # in 100ms, which is noise on every report. Ranking stays SILENT on the case that motivated
+    # this -- a Dragon Quest capture where readback was 977.7ms and merely second to compute's
+    # 1134.0ms, i.e. ~23% of measured work and the number a reader would have chased.
+    READBACK_NOTE_SHARE = 0.10
     material_readback = False
     try:
-        _c = components if isinstance(components, dict) else {}
-        _rb = _c.get("readback")
-        material_readback = isinstance(_rb, (int, float)) and _rb > 0.0
+        _c = {k: v for k, v in (components or {}).items() if isinstance(v, (int, float))}
+        # NOT `_total`: that is the module-level helper this function calls throughout, and a
+        # local of the same name shadows it for the WHOLE function scope, breaking every earlier
+        # call. Python binds by scope, not by position.
+        _rb = _c.get("readback", 0.0)
+        _measured = sum(v for v in _c.values() if v > 0.0)
+        material_readback = _measured > 0.0 and (_rb / _measured) >= READBACK_NOTE_SHARE
     except Exception:
         material_readback = False
     if classification == "readback" or material_readback:

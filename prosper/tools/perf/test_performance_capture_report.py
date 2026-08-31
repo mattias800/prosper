@@ -189,6 +189,18 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertEqual(summary["classification"], "renderer-resource")
         self.assertIsNone(summary["readback_note"])
 
+    def test_material_readback_is_called_out_even_when_not_the_verdict(self):
+        # The Dragon Quest shape: readback is a large minority of measured work and loses the
+        # classification, so a ranking- or verdict-gated note stays silent on exactly the number
+        # a reader would chase. 300 of 1000ms is 30%.
+        summary = summarize(capture(SAMPLES, renderer=[{
+            "total_ms": 1000, "gpu_device_ms": 100, "gpu_wait_ms": 100,
+            "build_resources_ms": 250, "setup_resources_ms": 250, "readback_ms": 300,
+        }]))
+        self.assertNotEqual(summary["classification"], "readback")
+        self.assertIsNotNone(summary["readback_note"])
+        self.assertIn("NOT adopted", summary["readback_note"])
+
     def test_pacing_gap_is_evidence_not_cause(self):
         summary = summarize(capture(SAMPLES, renderer=[{
             "total_ms": 100, "gpu_device_ms": 60, "gpu_timestamp_samples": 1,
