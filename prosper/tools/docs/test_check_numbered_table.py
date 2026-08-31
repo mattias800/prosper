@@ -117,23 +117,50 @@ run("two blank lines split the same table",
     want_problems=True, want_count=2, want_lines=[4, 6],
     expect_text="blank line splits the table")
 
-# R1: a row that lost its leading pipe ends the table just as a blank line does, and is the more
-# likely lane accident. Everything below it silently leaves the sequence check too, so a duplicate
-# number underneath would pass green -- which is the defect this whole check exists to prevent.
-run("a row that lost its leading pipe ends the table",
+# R1 (SUPERSEDED by #3088; kept as the corrected case rather than deleted, since it is what
+# proves the fix is not merely permissive). A row missing ONLY its leading pipe, whose interior
+# pipes still land on the header's cell count, renders as a completely normal, unbroken 3-row
+# table -- measured against GitHub's renderer (module docstring). The previous version of this
+# test asserted the OPPOSITE ("ends the table... did it lose its leading '|'?"), which was a false
+# positive on correct Markdown: a checker that fires on correct data gets deleted rather than
+# heeded, and this shape is exactly the kind of thing #3088's fix corrects as a side effect of
+# making the wrapped-row blind spot visible (parse_tables absorbs the row into the still-open
+# table instead of ending it; ARITY finds nothing wrong because there is nothing wrong).
+run("a row missing its leading pipe still renders correctly when its arity matches",
     "| # | What |\n|---|---|\n| 1 | a |\n2 | b |\n| 3 | c |\n",
+    want_problems=False)
+
+# The genuine defect hides in the arity, not in the missing pipe by itself: once the row's cell
+# count actually disagrees with the header -- the realistic shape of a lost leading pipe, since a
+# stray edit rarely preserves the exact column count -- ARITY catches it, on the absorbed row
+# itself, the same class that already catches an unescaped pipe in a code span (#2108).
+run("a row missing its leading pipe IS still a defect once its arity disagrees",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | y |\n2 | z |\n| 3 | a | b |\n",
     want_problems=True, want_count=1, want_lines=[4],
-    expect_text="lose its leading")
+    expect_text="has 2 cells but the header")
+
+# --ordered is a narrower residual case worth naming rather than hiding: a leading-pipe loss
+# defeats LEADING_NUMBER (`^\s*\|\s*(\d+)\s*\|`) even when it does not defeat ARITY, so the
+# absorbed row is never counted as numbered and the table fails all_rows_numbered -- reported as
+# "no numbered table found" rather than silently accepted. This is a real behaviour change from R1
+# above (whose --ordered form is want_problems=False, since the plain sweep this repository
+# actually runs on every PR passes no --ordered flag at all), recorded so it is a decision and not
+# a surprise.
+run("--ordered still flags a leading-pipe loss, even when arity is fine",
+    "| # | What |\n|---|---|\n| 1 | a |\n2 | b |\n| 3 | c |\n",
+    ordered=True, want_problems=True, expect_text="no numbered table")
 
 # Structural errors are reported first and the broken remainder leaves the sequence check, the way
 # a compiler stops elaborating a malformed declaration. What matters is that the file CANNOT pass
 # green while hiding a duplicate below the break -- the previous revision reported
 # "contiguous and unbroken", exit 0, on exactly this input. Fix the structure, re-run, get the
-# duplicate.
+# duplicate. (Uses a blank-line break, not a missing leading pipe: since #3088 the latter no longer
+# ends an open table by itself -- see R1 above -- so it can no longer orphan a fragment this way.
+# A blank line still can, and is this project's own real incident for exactly this shape.)
 run("a duplicate hidden below an interruption cannot pass green",
-    "| # | What |\n|---|---|\n| 1 | a |\n2 | b |\n| 5 | c |\n| 5 | d |\n",
+    "| # | What |\n|---|---|\n| 1 | a |\n\n| 5 | c |\n| 5 | d |\n",
     ordered=True, want_problems=True, want_count=1, want_lines=[4],
-    expect_text="drops out of any sequence check")
+    expect_text="blank line splits the table")
 
 # The #1696 collision: two branches append the same number; the merge is textually clean. This is
 # the check that survives the removal of gaplessness, and it is the one that protects the citation
@@ -335,6 +362,63 @@ run("a row that dropped a cell",
 run("a delimiter that disagrees with the header",
     "| # | Instrument | How it lied |\n|---|---|\n| 1 | x | y |\n",
     want_problems=True, expect_text="does NOT render as a table at all")
+
+# ---------------------------------------------------------------------------------------------
+# #3088: a row wrapped onto a second physical line. GFM does not require a table row to start
+# with `|` -- it keeps consuming non-blank lines as rows of the same table regardless. Before this
+# fix, parse_tables required every row to start with `|`, so a continuation line simply fell out
+# of the run: never counted, never arity-checked, and -- when nothing pipe-prefixed happened to
+# follow it -- entirely invisible. Reproduced by hand against current master before the fix
+# (issue #3088): this exact fixture, with the fix reverted, prints
+# "1 table(s), 1 rows, unbroken, every row matching its header" and exits 0.
+#
+# This is the PR #3049 shape reduced to a fixture: a two-column table whose answer cell wraps, so
+# the qualifying clause lands on its own line with nothing to mark it as part of the row. Header
+# and row count intentionally stay small so the mismatch (1 cell vs 2) is unambiguous.
+run("a row wrapped onto a second physical line is caught (#3088)",
+    "| Question | Answer |\n|---|---|\n| Does X leak? | no, bounded by the page count, not the "
+    "wider\ncontext, per the #2790 fix |\n",
+    want_problems=True, want_count=1, want_lines=[4],
+    expect_text="has 1 cells but the header")
+
+# The AGENTS.md:917 shape: a paragraph that forgot the blank line before it, landing directly
+# under a table's last row. GFM absorbs the first line of that paragraph as another row with no
+# pipes at all (a single cell), and every following non-blank line keeps being absorbed too until
+# a real blank line appears -- both physical lines of the two-line paragraph below become rows.
+run("a paragraph directly below a table with no blank line is caught (#3088)",
+    "| # | What |\n|---|---|\n| 1 | a |\nThis paragraph forgot its blank line\nand runs two "
+    "lines besides.\n",
+    want_problems=True, want_count=2, want_lines=[4, 5])
+
+# The discriminating counter-arm, and the reason the fix is not simply "absorb everything": a
+# block construct that legitimately follows a table with no blank line must NOT be swallowed into
+# it. Each shape below was checked against GitHub's renderer (module docstring) and renders as its
+# own block, never as an absorbed row -- so a checker that instead absorbed it would report a
+# false arity mismatch here (1 cell vs the header's 2), which is exactly what makes this arm
+# falsifiable: deleting interrupts_table()'s effect turns every one of these red.
+run("a heading right after a table is not absorbed",
+    "| # | What |\n|---|---|\n| 1 | a |\n## A heading with several words\n",
+    want_problems=False)
+run("a bullet list right after a table is not absorbed",
+    "| # | What |\n|---|---|\n| 1 | a |\n- a list item with several words\n",
+    want_problems=False)
+run("an ordered list right after a table is not absorbed",
+    "| # | What |\n|---|---|\n| 1 | a |\n1. a list item with several words\n",
+    want_problems=False)
+run("a blockquote right after a table is not absorbed",
+    "| # | What |\n|---|---|\n| 1 | a |\n> a quoted line with several words\n",
+    want_problems=False)
+run("a thematic break right after a table is not absorbed",
+    "| # | What |\n|---|---|\n| 1 | a |\n---\n",
+    want_problems=False)
+run("an HTML block right after a table is not absorbed",
+    "| # | What |\n|---|---|\n| 1 | a |\n<div>a whole html block</div>\n",
+    want_problems=False)
+
+# A conflict marker is handled by an earlier, separate scan (see below), but it is also a
+# realistic "line right after a table" shape and must not be absorbed as a row either -- covered
+# by the existing "a conflict marker after the last row is caught" case further down, which still
+# passes unmodified because that scan runs and returns before parse_tables is ever reached.
 
 # A stray conflict marker AFTER the last row. This is the shape that escaped every other class and
 # reached a pushed branch: the marker is not a table row, so it merely ends the table, and with no
