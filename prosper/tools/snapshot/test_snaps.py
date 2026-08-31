@@ -1036,6 +1036,109 @@ def main():
         check(rc_v == 0 and "NOT REACHED" in out_v,
               "...while an unreached known-bad snap is reported without failing the run")
 
+        # ---- 6a1b-iv-d. cmd_check REFUSES a snap set with ZERO snaps -------------------------
+        # cmd_import already refuses to ever STORE a zero-snap set (arm 6a1b-iii-e above); nothing
+        # stopped a hand-edited snaps/<name>.json from holding one anyway. With no per-name guard,
+        # `for snap in entry["snaps"]` iterates zero times, `failures` never moves, and the run
+        # prints "replaying 0 anchor(s)" and exits 0 -- a guard that guards nothing, reporting
+        # success for ever. #3105.
+        nm_empty = "zero-snaps"
+        empty_dir = os.path.join(tmp, nm_empty)
+        os.makedirs(empty_dir, exist_ok=True)
+        entry_empty = {"name": nm_empty, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                       "timeout": 60, "savedata": "none", "snaps": []}
+        with open(snaps.store_path(nm_empty), "w", encoding="utf-8") as handle:
+            json.dump(entry_empty, handle)
+
+        # A flag rather than a raise: without the fix, cmd_check calls run_replay for an empty
+        # entry (it iterates candidate_flips() etc. over nothing and returns cleanly), so a raising
+        # stub would only prove "it was called" by crashing the whole test binary and hiding every
+        # arm after it. Recording the call and asserting on it separately keeps the mutant's actual
+        # symptom -- exit 0 -- visible in the output alongside this one.
+        never_calls = []
+
+        def stub_never(entry_, out_dir_):
+            never_calls.append(entry_.get("name"))
+            return {}, os.path.join(out_dir_, "run.log")
+
+        saved_re, saved_here_e = snaps.run_replay, snaps.HERE
+        snaps.HERE = empty_dir
+        buf_e = io.StringIO(); saved_o_e, sys.stdout = sys.stdout, buf_e
+        try:
+            snaps.run_replay = stub_never
+
+            class EmptyArgs:
+                names = [nm_empty]
+            rc_e = snaps.cmd_check(EmptyArgs())
+            out_e = buf_e.getvalue()
+        finally:
+            snaps.run_replay, snaps.HERE, sys.stdout = saved_re, saved_here_e, saved_o_e
+        check(rc_e != 0, "a snap set with ZERO snaps FAILS the run, not passes it")
+        check(nm_empty in out_e and "ZERO snaps" in out_e,
+              "...and the failure message NAMES the empty set, not just a bare failure code")
+        check(never_calls == [],
+              "...and it is refused BEFORE any replay is launched -- there is nothing to replay")
+
+        # A set with the "snaps" key missing entirely must be refused the same way as one holding
+        # an explicit []. entry.get("snaps") -- not entry["snaps"] -- is what makes that true.
+        nm_missing = "missing-snaps-key"
+        with open(snaps.store_path(nm_missing), "w", encoding="utf-8") as handle:
+            json.dump({"name": nm_missing, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                      "timeout": 60, "savedata": "none"}, handle)
+        saved_re2, saved_here_e2 = snaps.run_replay, snaps.HERE
+        snaps.HERE = empty_dir
+        buf_e2 = io.StringIO(); saved_o_e2, sys.stdout = sys.stdout, buf_e2
+        try:
+            snaps.run_replay = stub_never
+
+            class MissingArgs:
+                names = [nm_missing]
+            rc_e2 = snaps.cmd_check(MissingArgs())
+        finally:
+            snaps.run_replay, snaps.HERE, sys.stdout = saved_re2, saved_here_e2, saved_o_e2
+        check(rc_e2 != 0, "a set with NO 'snaps' key at all is refused too, not just an empty list")
+
+        # A run over SEVERAL names must still fail overall and still check every other name -- the
+        # empty set does not silently swallow the rest of the run or abort it early.
+        nm_ok = "alongside-a-real-one"
+        ok_dir = os.path.join(tmp, nm_ok)
+        os.makedirs(ok_dir, exist_ok=True)
+        ok_ref = os.path.join(ok_dir, "ref.bmp")
+        write_bmp(ok_ref, 64, 36, lambda x, y: same)
+        entry_ok = {"name": nm_ok, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
+                   "timeout": 60, "savedata": "none",
+                   "snaps": [dict(snaps.signature_of(ok_ref), index=0, verdict="correct",
+                                  mode="anchor", pad_flip=900)]}
+        with open(snaps.store_path(nm_ok), "w", encoding="utf-8") as handle:
+            json.dump(entry_ok, handle)
+
+        def stub_ok(entry_, out_dir_):
+            os.makedirs(out_dir_, exist_ok=True)
+            write_bmp(os.path.join(out_dir_, "a.bmp"), 64, 36, lambda x, y: same)
+            return ({900: {"target_flip": 900, "actual_flip": 900, "file": "a.bmp"}},
+                    os.path.join(out_dir_, "run.log"))
+
+        replayed = []
+
+        def stub_mixed(entry_, out_dir_):
+            replayed.append(entry_.get("name"))
+            return stub_ok(entry_, out_dir_)
+
+        saved_re3, saved_here_e3 = snaps.run_replay, snaps.HERE
+        snaps.HERE = ok_dir
+        buf_e3 = io.StringIO(); saved_o_e3, sys.stdout = sys.stdout, buf_e3
+        try:
+            snaps.run_replay = stub_mixed
+
+            class MixedArgs:
+                names = [nm_empty, nm_ok]
+            rc_e3 = snaps.cmd_check(MixedArgs())
+        finally:
+            snaps.run_replay, snaps.HERE, sys.stdout = saved_re3, saved_here_e3, saved_o_e3
+        check(rc_e3 != 0, "a run mixing an empty set with a passing one still fails overall")
+        check(replayed == [nm_ok],
+              "...the empty set is skipped without a replay while the real one is still checked")
+
         # The threshold is read from the ENTRY, so a set can be more or less tolerant than default.
         strict = check_run("correct", same, (12, 22, 32))
         check(strict[0] == 0, "a near-identical frame passes at the default threshold")
