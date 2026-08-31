@@ -308,6 +308,41 @@ namespace {
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
 std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<uint64_t> g_dcc_post_writeback_promotions{0};
+
+// #3157 alias census (PROSPER_COMPUTE_ALIAS_CENSUS=1, default OFF).
+//
+// Measures how often a dispatch seeds from guest bytes the PREVIOUS dispatch wrote back. That
+// overlap is what makes the obvious fix for the per-dispatch fence wait unsound: deferring
+// writebacks to batch the waits would let the later dispatch seed from stale guest memory.
+// The rate bounds the achievable win -- if consecutive dispatches usually alias, a
+// correctness-preserving pipeline drains every time and gains nothing.
+//
+// Compute submits are serialized (one AGC submit executes at a time), so the previous-writeback
+// set needs no lock; the counters are atomic only so the summary can be read from atexit.
+prosper::frontend::ComputeAliasCensusCounters g_alias_census{};
+std::vector<prosper::frontend::ComputeGuestRange> g_alias_prev_writes;
+
+bool alias_census_enabled() {
+    static const bool on = std::getenv("PROSPER_COMPUTE_ALIAS_CENSUS") != nullptr;
+    return on;
+}
+
+void report_alias_census() {
+    const auto& c = g_alias_census;
+    if (c.dispatches == 0) {
+        std::fprintf(stderr, "[alias-census] no dispatch declared a guest seed source\n");
+        return;
+    }
+    std::fprintf(stderr,
+                 "[alias-census] dispatches_with_seeds=%llu aliasing=%llu (%.1f%%) "
+                 "seed_ranges=%llu write_ranges=%llu\n",
+                 static_cast<unsigned long long>(c.dispatches),
+                 static_cast<unsigned long long>(c.aliasing_dispatches),
+                 100.0 * static_cast<double>(c.aliasing_dispatches) /
+                     static_cast<double>(c.dispatches),
+                 static_cast<unsigned long long>(c.seed_ranges),
+                 static_cast<unsigned long long>(c.write_ranges));
+}
 std::atomic<uint64_t> g_dcc_forced_seed_allocation_reuses{0};
 std::atomic<uint64_t> g_dcc_post_writeback_replacements{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
@@ -5350,6 +5385,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     for (size_t i = 0; i < buffers.size(); ++i)
         buffers[i].descriptor_index = buffer_descriptor_indices[i];
     std::vector<BoundImage> images(image_descriptors.size());
+    // #3157: this dispatch's guest seed sources and writeback targets, collected only when the
+    // alias census is armed so a default run pays nothing.
+    std::vector<prosper::frontend::ComputeGuestRange> alias_seeds, alias_writes;
     std::vector<VkBuffer> staging(image_descriptors.size(), VK_NULL_HANDLE);          // upload/readback
     std::vector<VkDeviceMemory> staging_memory(image_descriptors.size(), VK_NULL_HANDLE);
     std::vector<VkDeviceSize> staging_bytes(image_descriptors.size(), 0);
@@ -7187,6 +7225,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.guest_bytes = guest_bytes;
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
+                if (alias_census_enabled()) {
+                    // A binding that reads nothing from guest memory cannot alias: `src` is null
+                    // exactly when the seed is skipped or the source is renderer-owned.
+                    if (src) alias_seeds.push_back({r->gpu_addr, guest_bytes});
+                    // The writeback writes up to guest_bytes at r->gpu_addr (see below).
+                    if (bi.storage) alias_writes.push_back({r->gpu_addr, guest_bytes});
+                }
                 // The writeback still writes up to guest_bytes at r->gpu_addr, so a guest-backed
                 // target must be a valid mapped range even when the SEED read is skipped (#1122
                 // review B2): keep the guard for the writeback target, not the seed source.
@@ -8925,6 +8970,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 5);
         if (!vk_ok(vkEndCommandBuffer(command), "command-end")) break;
+        if (alias_census_enabled() && !alias_seeds.empty()) {
+            g_alias_census.dispatches++;
+            g_alias_census.seed_ranges += alias_seeds.size();
+            g_alias_census.write_ranges += alias_writes.size();
+            bool aliases = false;
+            for (const auto& sd : alias_seeds) {
+                for (const auto& w : g_alias_prev_writes)
+                    if (prosper::frontend::compute_guest_ranges_overlap(sd, w)) { aliases = true; break; }
+                if (aliases) break;
+            }
+            if (aliases) g_alias_census.aliasing_dispatches++;
+            // Report periodically as well as at exit: a bounded run is usually stopped with
+            // SIGTERM, whose default action skips atexit handlers entirely -- so an atexit-only
+            // census yields a clean run and no number.
+            if (g_alias_census.dispatches % 2048 == 0) report_alias_census();
+            static const bool once = [] { std::atexit(report_alias_census); return true; }();
+            (void)once;
+        }
+        if (alias_census_enabled()) g_alias_prev_writes = alias_writes;
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;

@@ -177,4 +177,37 @@ inline bool claim_compute_transfer_gate_selector_summary(
     return true;
 }
 
+// #3157: a guest-memory range, used to measure whether one dispatch's SEED sources overlap the
+// PREVIOUS dispatch's WRITEBACK targets.
+//
+// Why this exists: the per-dispatch `vkWaitForFences` in the live compute path costs ~330 us
+// against ~171 us of GPU execution, so ~160 us per dispatch is scheduling latency. Deferring the
+// waits (pipelining several dispatches before consuming any results) is the obvious fix, but it
+// is only sound where a later dispatch does not seed from guest bytes an earlier one writes
+// back -- both address `r->gpu_addr` for `guest_bytes`, so an overlap is a read-after-write
+// hazard through guest memory that would silently seed from stale bytes.
+//
+// The overlap RATE bounds the achievable win: if consecutive dispatches usually alias, a
+// correctness-preserving pipeline drains constantly and buys nothing. Measure before building.
+struct ComputeGuestRange {
+    uint64_t addr = 0;
+    uint64_t bytes = 0;
+};
+
+// Half-open [addr, addr+bytes) intersection. A zero-length range touches nothing and so can
+// never alias -- that is the `seed_skip`/`renderer_owned` case, where nothing is read from guest
+// memory at all, and counting it as an overlap would overstate the hazard.
+constexpr bool compute_guest_ranges_overlap(const ComputeGuestRange& a,
+                                            const ComputeGuestRange& b) {
+    if (a.bytes == 0 || b.bytes == 0) return false;
+    return a.addr < b.addr + b.bytes && b.addr < a.addr + a.bytes;
+}
+
+struct ComputeAliasCensusCounters {
+    uint64_t dispatches = 0;          // dispatches that declared at least one guest seed source
+    uint64_t aliasing_dispatches = 0; // ...of those, ones seeding from the previous writeback set
+    uint64_t seed_ranges = 0;
+    uint64_t write_ranges = 0;
+};
+
 } // namespace prosper::frontend
