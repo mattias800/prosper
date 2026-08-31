@@ -1185,6 +1185,7 @@ struct VulkanComputeContext {
     uint64_t ring_drains_on_alias = 0;
     uint64_t ring_deferred_dispatches = 0;
     uint64_t ring_consumed_dispatches = 0;
+    uint64_t ring_batches = 0;
     VkQueryPool dispatch_timestamp_pool = VK_NULL_HANDLE;
     float timestamp_period_ns = 0.0f;
     uint32_t timestamp_valid_bits = 0;
@@ -10874,6 +10875,22 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     // Vulkan handles.
     if (!context.dispatch_slots.empty()) {
         context.drain_dispatch_ring();
+        // PROSPER_COMPUTE_RING_STATS=1. Dispatches-per-batch is what decides whether the ring can
+        // help at all on a given title: the end-of-batch drain is mandatory (the guest may read
+        // its memory once the submit returns), so a workload that submits one dispatch per batch
+        // drains every slot immediately after filling it and never overlaps anything. Stray
+        // measures ~1.0, which is why the ring buys it almost nothing.
+        context.ring_batches++;
+        static const bool ring_stats = std::getenv("PROSPER_COMPUTE_RING_STATS") != nullptr;
+        if (ring_stats && context.ring_batches % 256 == 0)
+            std::fprintf(stderr,
+                "[ring] batches=%llu dispatches=%llu per_batch=%.2f consumed=%llu alias_drains=%llu\n",
+                (unsigned long long)context.ring_batches,
+                (unsigned long long)context.ring_deferred_dispatches,
+                static_cast<double>(context.ring_deferred_dispatches) /
+                    static_cast<double>(context.ring_batches),
+                (unsigned long long)context.ring_consumed_dispatches,
+                (unsigned long long)context.ring_drains_on_alias);
         all_ok = all_ok && context.pending_all_ok;
         context.pending_all_ok = true;
     }
