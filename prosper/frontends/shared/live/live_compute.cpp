@@ -5072,6 +5072,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // #3157: free this dispatch's ring slot before touching any cached resource (see the note on
     // reserve_dispatch_slot). No-op unless the ring is enabled.
     if (!ctx.reserve_dispatch_slot()) return false;
+    // Alias guard, and it has to run HERE -- before the dispatch acquires anything. Draining runs
+    // an earlier dispatch's cleanup, which releases cached buffers and images by key; doing that
+    // partway through this dispatch's setup frees resources it is already holding, and the crash
+    // lands inside a libc memory routine with a null argument, nowhere near the cause.
+    //
+    // So the test is over the item's whole resource table rather than over the exact bytes each
+    // binding seeds. That over-approximates -- it counts resources this dispatch will never read
+    // from guest memory -- and so drains more often than the ~6% the census measured. Correctness
+    // first; the tighter test needs the seed set known before acquisition, which it is not.
+    if (ctx.dispatch_ring_depth() > 1 && item.resources) {
+        for (const auto& resource : item.resources->resources) {
+            if (!ctx.drain_ring_if_overlaps(resource.gpu_addr, resource.size)) break;
+        }
+    }
     auto decline = [&item](const char* reason) {
         report_compute_decline(item, reason);
         return false;
@@ -5641,6 +5655,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     };
     std::vector<CompareTarget> compare_targets;
     bool submitted_dispatch = false;
+    // This dispatch's own fence, bound at submit time -- see the note there.
+    VkFence dispatch_fence = VK_NULL_HANDLE;
     bool image_timing = false;
     do {
         std::vector<VkDescriptorSetLayoutBinding> layout_bindings(descriptors.size());
@@ -5757,10 +5773,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (buffers[i].alias_of == SIZE_MAX) {
-                // #3157: an in-flight dispatch may still owe a writeback to exactly these
-                // guest bytes. Reading them now would seed from stale memory, so drain first.
-                // Measured overlap is ~6%, so this is rare enough to leave the pipelining win.
-                (void)ctx.drain_ring_if_overlaps(resource->gpu_addr, buffers[i].guest_bytes);
                 const uint8_t* source = buffers[i].atomic_image
                     ? resource_bytes_for(resource, buffers[i].guest_bytes)
                     : resource_bytes_for(resource, buffers[i].guest_bytes);
@@ -7345,10 +7357,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
-                // #3157: an in-flight dispatch may still owe a writeback to exactly these
-                // guest bytes. Reading them now would seed from stale memory, so drain first.
-                // Measured overlap is ~6%, so this is rare enough to leave the pipelining win.
-                (void)ctx.drain_ring_if_overlaps(r->gpu_addr, guest_bytes);
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
                 if (collect_alias_ranges) {
@@ -9135,6 +9143,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ? VK_ERROR_DEVICE_LOST
                 : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
         }
+        // Bind THIS dispatch's fence now. ctx.dispatch_fence aliases the ring's CURRENT slot, so
+        // reading it again when the deferred phase runs would name a LATER dispatch's fence: the
+        // wait then returns without this dispatch's GPU work having finished, and the writeback
+        // publishes unfinished results into guest memory. It surfaces as the guest following a
+        // pointer it was never given, faulting inside a libc memory routine -- nowhere near here.
+        dispatch_fence = ctx.dispatch_fence;
+        {
+        }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         submitted_dispatch = true;
     } while (false);
@@ -9150,7 +9166,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // the BoundBuffer*/BoundImage* inside compare_targets stay valid. Everything else is a
     // handle, a scalar, or a lambda already made copy-safe (#3157).
     auto finish_dispatch = [&authority_census, &ctx, &item, &spirv, &transfer_gate_census, 
-        buffers = std::move(buffers), compare_targets = std::move(compare_targets), 
+        buffers = std::move(buffers), compare_targets = std::move(compare_targets), dispatch_fence, 
         images = std::move(images), staging = std::move(staging), 
         staging_bytes = std::move(staging_bytes), staging_memory = std::move(staging_memory), 
         authority_observation, compare_descriptor_pool, compare_flags, compare_flags_memory, 
@@ -9228,7 +9244,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
             const auto fence_wait_start = ComputeClock::now();
             const VkResult wait_result = vkWaitForFences(
-                ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
+                ctx.device, 1, &dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
             // Report a LONG wait even when it succeeds.
             //
             // A zero timeout count was read as proof that no compute dispatch hangs. That inference has a
@@ -10816,6 +10832,12 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         runtime_compute_authority_census();
     const bool authority_requested = authority_census.requested();
     for (const auto& item : items) {
+        // #3157: the CPU fast path reads and writes guest memory directly, without going through
+        // execute_item, so none of the ring's drain hooks are on it. A deferred dispatch still
+        // owing a writeback would let this path read stale bytes -- which is what it did: the
+        // guest then followed a pointer it had not been given yet and faulted inside a libc
+        // memory routine with a null argument, nowhere near the compute path.
+        if (!context.dispatch_slots.empty()) context.drain_dispatch_ring();
         if (const std::optional<bool> cpu_result = execute_cpu_fast_path(item)) {
             if (authority_requested) {
                 const uint64_t program_hash = prosper::gpu::gpu_capture_hash(
