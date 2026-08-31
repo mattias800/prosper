@@ -1119,8 +1119,10 @@ struct VulkanComputeContext {
     std::mutex pipeline_cache_mutex;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     // #3157: the GPU result-comparison pool, owned by the context so it is reset rather than
-    // recreated per dispatch. Measured 853 vkCreateDescriptorPool + 853 vkDestroy per second on
-    // The Plucky Squire before this; the main descriptor pool above already works this way.
+    // recreated per dispatch. It contributed about 144 vkCreateDescriptorPool + 144 vkDestroy per
+    // second on The Plucky Squire (whole-process rate 865/s before, 721/s after); the main
+    // descriptor pool above already works this way. The bulk of the remaining rate is NOT this path
+    // and not prepare_descriptor_pool -- see the note on that helper.
     VkDescriptorPool compare_pool = VK_NULL_HANDLE;
     uint32_t compare_pool_sets = 0;
     uint32_t compare_pool_buffers = 0;
@@ -1357,7 +1359,6 @@ struct VulkanComputeContext {
         if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
-        compare_pool = VK_NULL_HANDLE;
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -1378,6 +1379,11 @@ struct VulkanComputeContext {
         if (borrowed) return;                       // renderer owns the device/instance
         if (device) vkDestroyDevice(device, nullptr);
         if (instance) vkDestroyInstance(instance, nullptr);
+    }
+
+    static bool compare_pool_reuse_enabled() {   // opt-out for bisection
+        static const bool enabled = std::getenv("PROSPER_NO_COMPARE_POOL_REUSE") == nullptr;
+        return enabled;
     }
 
     static bool descriptor_pool_reuse_enabled() {
@@ -1434,6 +1440,10 @@ struct VulkanComputeContext {
         return true;
     }
 
+    // NOT the source of the ~700 remaining vkCreateDescriptorPool/s: all three capacities below
+    // grow monotonically and the reuse test is <= on each, so this recreates only on a new maximum.
+    // The renderer creates one pool per RENDER PASS (tests/fixtures/render_runner.h, reached via
+    // render_draws_rgba) -- that is where to look next (#3157 review).
     VkDescriptorPool prepare_descriptor_pool(uint32_t buffers, uint32_t sampled,
                                              uint32_t storage) {
         if (!descriptor_pool_reuse_enabled()) return VK_NULL_HANDLE;
@@ -1471,9 +1481,7 @@ struct VulkanComputeContext {
     // Reset-and-reuse the comparison descriptor pool. Same contract as prepare_descriptor_pool:
     // grow capacities monotonically, reset when the request fits, recreate only when it does not.
     VkDescriptorPool prepare_compare_descriptor_pool(uint32_t sets, uint32_t buffers) {
-        static const bool reuse =
-            std::getenv("PROSPER_NO_COMPARE_POOL_REUSE") == nullptr;   // opt-out for bisection
-        if (!reuse || !sets || !buffers) return VK_NULL_HANDLE;
+        if (!compare_pool_reuse_enabled() || !sets || !buffers) return VK_NULL_HANDLE;
         if (compare_pool && sets <= compare_pool_sets && buffers <= compare_pool_buffers) {
             if (vkResetDescriptorPool(device, compare_pool, 0) == VK_SUCCESS) return compare_pool;
             vkDestroyDescriptorPool(device, compare_pool, nullptr);
