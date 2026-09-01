@@ -1212,8 +1212,13 @@ int main() {
     // the generators above: a padding byte left stale is invisible to a round-trip check, so the
     // sentinel sweep is the half that can actually fail.
     {
+        // All three 64 KiB modes, not just Sw64KbRX: the targeted zero-fill's guard keys on
+        // is_64kb_mode(), so a mode-specific block geometry regression would otherwise be
+        // invisible here. Flagged in review of #3149.
+        const uint32_t modes[] = {(uint32_t)TileMode::Sw64KbS, (uint32_t)TileMode::Sw64KbZX,
+                                  (uint32_t)TileMode::Sw64KbRX};
+        for (const uint32_t M : modes) {
         const uint32_t W = 3840, H = 2160, BPE = 4;
-        const uint32_t M = (uint32_t)TileMode::Sw64KbRX;
         std::vector<uint8_t> lin((size_t)W * H * BPE);
         for (size_t i = 0; i < lin.size(); i++) {
             uint8_t v = (uint8_t)(i * 7 + 1);
@@ -1230,6 +1235,7 @@ int main() {
               "4K block-aligned-width / unaligned-height tile+detile round-trips exactly");
         CHECK(residual == 0,
               "every tiled byte is written by the copy or zeroed -- no stale padding survives");
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
