@@ -439,7 +439,7 @@ def summarize(records):
                 "GPU present WAS adopted, so scanout readback is skipped and this readback is real "
                 "work -- non-deferred colour-target readback, storage writeback, or a copy forced by "
                 "authoritative_readback (every ordered DMA copy sets it). Chase it rather than "
-                "dismissing it as a harness artifact")
+                "dismissing it as a harness artifact.")
 
     pacing_note = None
     if rates["guest_fps"] is not None and rates["rendered_fps"] is not None:

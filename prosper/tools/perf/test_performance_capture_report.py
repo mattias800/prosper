@@ -179,14 +179,24 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         # trailing clause, rendering "...through a real window. before acting on this verdict."
         # `assertIn` on a substring cannot see a break OUTSIDE that substring, so no amount of
         # content assertions would have caught it -- this checks the joins instead of the content.
-        cases = {
-            "readback": capture(SAMPLES, renderer=[self.READBACK_RENDERER[0]]),
-            "compute": capture(SAMPLES, renderer=[{"total_ms": 1500, "readback_ms": 1400}],
-                               compute=[{"total_ms": 3500.0}]),
-            "inconclusive": capture(SAMPLES, renderer=[{"total_ms": 2000, "readback_ms": 977.7}],
-                                    compute=[{"total_ms": 1134.0}]),
-            "cannot-say": capture([], renderer=self.READBACK_RENDERER),
+        # The FULL product of reachable joins: three GPU-present states (each selecting a different
+        # note body) x three verdicts (each selecting a different tail). Enumerated as a product
+        # rather than hand-listed because a hand-listed set is exactly how an arm named "every" ends
+        # up excluding the one case that fails it -- which a first version of this arm did, missing
+        # the `adopted is True` body, the only reachable note that lacked a terminating period.
+        posts = {
+            "not-adopted": SAMPLES,                                            # harness readback
+            "adopted": [{**s, "rendered_frames": None} for s in SAMPLES],      # real readback
+            "cannot-say": [],                                                  # no post population
         }
+        verdicts = {
+            "readback": (self.READBACK_RENDERER, []),
+            "compute": ([{"total_ms": 1500, "readback_ms": 1400}], [{"total_ms": 3500.0}]),
+            "inconclusive": ([{"total_ms": 2000, "readback_ms": 977.7}], [{"total_ms": 1134.0}]),
+        }
+        cases = {f"{pn}/{vn}": capture(post, renderer=r, compute=c)
+                 for pn, post in posts.items() for vn, (r, c) in verdicts.items()}
+        self.assertEqual(len(cases), 9)
         for name, records in cases.items():
             note = summarize(records)["readback_note"]
             self.assertIsNotNone(note, name)
@@ -296,7 +306,9 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             compute=[{"total_ms": 3500.0}]))
         self.assertEqual(decisive["classification"], "compute")          # 70%, decisive
         self.assertIsNotNone(decisive["readback_note"])
-        self.assertNotIn("before acting on this verdict", decisive["readback_note"])
+        # The live discriminator, not the retired phrase: `assertNotIn` on a string that no
+        # longer exists anywhere in the module cannot fail, so it asserts nothing.
+        self.assertNotIn("nothing else here to act on", decisive["readback_note"])
         self.assertIn("does not depend on it", decisive["readback_note"])
 
         # ...while a readback VERDICT says the strongest thing of the five, because there the
