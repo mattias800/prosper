@@ -58,4 +58,26 @@ constexpr uint64_t next_grid_deadline_ns(uint64_t origin_ns, uint64_t now_ns,
     return origin_ns + ((now_ns - origin_ns) / period_ns + 1) * period_ns;
 }
 
+// The number of grid boundaries strictly BETWEEN two successive next_grid_deadline_ns() results on
+// the same (origin, period) grid: 0 for the ordinary case (each call lands exactly one period after
+// the last), and >0 whenever a caller's wait overran far enough to skip boundaries outright (#3075).
+//
+// Deliberately NOT folded into next_grid_deadline_ns() itself, and this split is the actual fix for
+// #3075, not a widened tolerance. next_grid_deadline_ns()'s whole contract -- see its own comment --
+// is that its answer depends only on (origin, now, period) and never on how many boundaries were
+// missed, which is exactly what makes it phase-exact under a stall of any length: correct behaviour
+// for SCHEDULING, because a pacing loop must resume on the next real boundary rather than replay a
+// backlog. But that same contract means the scheduler's return value carries no trace of a drop, so
+// before this function existed there was no second code path to disagree with it either -- nothing
+// anywhere computed "how many boundaries did we just skip", which is why a half-rate pump reported
+// perfect phase and nothing else. This function computes exactly that, from two of the scheduler's
+// own return values, without changing what the scheduler returns or how it is chosen: the schedule
+// stays phase-exact, and the MEASUREMENT of it stops discarding the fault.
+constexpr uint64_t grid_boundaries_missed(uint64_t prev_deadline_ns, uint64_t next_deadline_ns,
+                                           uint64_t period_ns) {
+    if (period_ns == 0 || next_deadline_ns <= prev_deadline_ns) return 0;
+    const uint64_t advanced = (next_deadline_ns - prev_deadline_ns) / period_ns;
+    return advanced > 0 ? advanced - 1 : 0;
+}
+
 }  // namespace prosper::host
