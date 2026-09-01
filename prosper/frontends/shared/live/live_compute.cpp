@@ -7255,7 +7255,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.guest_bytes = guest_bytes;
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
-                if (alias_census_enabled() && r->gpu_addr) {
+                if (alias_census_enabled() && compute_guest_range_is_real({r->gpu_addr, guest_bytes})) {
                     // A binding that reads nothing from guest memory cannot alias: `src` is null
                     // exactly when the seed is skipped or the source is renderer-owned. The
                     // `r->gpu_addr` guard is the same rule the buffer loop applies -- address 0 is
@@ -9058,7 +9058,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // a writable null array entry both produce {0, 4}, which overlaps itself, and the
                 // census would report a FABRICATED alias at a non-address. Not a bias -- a false
                 // positive, and a systematic one on descriptor-array titles.
-                if (!b.resource || !b.resource->gpu_addr) continue;
+                if (!b.resource ||
+                    !prosper::frontend::compute_guest_range_is_real({b.resource->gpu_addr, b.guest_bytes}))
+                    continue;
                 if (b.guest_bytes == 0 || b.alias_of != SIZE_MAX) continue;
                 // NOT `!b.upload_skipped`. That flag means "the cached GPU copy still matches
                 // guest memory" (see its assignment: `submit_unchanged || (watches_complete &&

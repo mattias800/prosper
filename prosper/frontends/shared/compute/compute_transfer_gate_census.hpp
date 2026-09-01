@@ -210,6 +210,25 @@ struct ComputeGuestRange {
     uint64_t bytes = 0;
 };
 
+// Address 0 is never a guest address, so a range at 0 is never a real one.
+//
+// Extracted and named so the rule is PINNED rather than living as a bare `if (r->gpu_addr)` at two
+// call sites. An explicit null V# entry is bound as a 4-byte zero source backed by a stack-local
+// array, and that synthesis deliberately keeps `gpu_addr == 0` -- its own comment says the point is
+// to bind a null buffer "without inventing a guest address". Feeding it to the census invented one:
+// two dispatches each holding a writable null array entry both produce {0, 4}, which overlaps
+// itself, so the census reported a FABRICATED alias at a non-address.
+//
+// `gpu_addr` rather than `host_data` is the right discriminator, and not only because it is
+// simpler: `resource_bytes_for` returns `host_data` for legitimate MIRRORED guest resources too, so
+// a host_data test would drop real guest ranges. The synthesis sets `host_data` and leaves
+// `gpu_addr` at 0 -- one field separates the cases, and it is this one. It is also the predicate the
+// code that performs the writes already uses, at both
+// `notify_guest_gpu_write_preserving_bytes` call sites, which predate this census.
+constexpr bool compute_guest_range_is_real(const ComputeGuestRange& r) {
+    return r.addr != 0;
+}
+
 // Half-open [addr, addr+bytes) intersection. A zero-length range touches nothing and so can
 // never alias -- that is the `seed_skip`/`renderer_owned` case, where nothing is read from guest
 // memory at all, and counting it as an overlap would overstate the hazard.

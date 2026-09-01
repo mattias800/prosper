@@ -300,6 +300,19 @@ int main() {
     CHECK(!compute_guest_ranges_overlap({0x1000, 0}, {0x1000, 0x100}) &&
               !compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0}),
           "a zero-length range reads nothing and never aliases");
+    // #3157/C1: a synthesized null binding is not a guest range. The SECOND arm is the point --
+    // it puts the consequence of deleting the guard in the test file, so a reader sees what the
+    // rule prevents rather than only that it exists. Without `compute_guest_range_is_real`, two
+    // dispatches each holding a writable null V# entry both contribute {0, 4}, and {0,4} overlaps
+    // itself, so the census reports an alias where no guest memory is involved at all.
+    CHECK(!compute_guest_range_is_real({0, 4}),
+          "a range at address 0 is a synthesized null binding, not guest memory");
+    CHECK(compute_guest_range_is_real({0x1000, 4}),
+          "an ordinary guest address is a real range");
+    CHECK(compute_guest_ranges_overlap({0, 4}, {0, 4}),
+          "...and {0,4} DOES overlap itself, which is exactly what the guard above prevents "
+          "the census from reporting");
+
     CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0x100}),
           "identical guest ranges alias");
 
