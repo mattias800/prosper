@@ -3137,16 +3137,20 @@ HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem
 // fix the cadence and blunt the responsiveness in the same change. Short slices for the first few
 // milliseconds keep the wake tight where pacing lives; longer slices afterwards keep a guest parked
 // for seconds from spinning at 2 kHz for no benefit. (An earlier revision of this comment said
-// 5 kHz, which was the 200 us slice that revision used before the floor measurement below
-// replaced it.)
+// 5 kHz, which was the 200 us slice that revision used before the floor measurement replaced it --
+// that measurement, and the three constants it fixes, now live beside poll_slice_ns() in
+// precise_sleep.hpp.)
 HLE(k_sem_timedwait) {
     auto* s = ensure_sem(a0);
     if (!s) return prosper::hle::kSceKernelErrorEINVAL;
     // Saturating, matching guest_ns_from in hle_kernel_time.cpp (#3022): a1 is guest-controlled,
     // and a wrap here would turn a very long timeout into a short one. That file states the rule
     // for the whole family, so this member of it should not be the exception.
-    const uint64_t kNsMax = ~0ull;
-    const uint64_t timeout_ns = a1 > kNsMax / 1000ull ? kNsMax : (uint64_t)a1 * 1000ull;
+    // The arithmetic itself lives in precise_sleep.hpp, beside the deadline sleeper the Windows
+    // loop below calls, so it can be driven by a FAKE CLOCK instead of only by timing the real HLE
+    // -- which test_kernel_sem_timedwait.cpp's header explains at length cannot discriminate here
+    // (#3069). Behaviour is identical; this is an extraction, not a change.
+    const uint64_t timeout_ns = prosper::host::timeout_ns_from_us(a1);
     hle::WaitCensusScope c(hle::WaitKind::SemTimedwait, timeout_ns);
 #ifndef _WIN32
     timespec dl = abs_deadline_us(a1);
@@ -3160,19 +3164,7 @@ HLE(k_sem_timedwait) {
     // Saturating again on the addition: start_ns + timeout_ns can itself wrap for a huge timeout,
     // and a wrapped deadline lands in the past, which would turn a long wait into an instant
     // timeout -- the loud direction, but still wrong.
-    const uint64_t deadline_ns =
-        timeout_ns > kNsMax - start_ns ? kNsMax : start_ns + timeout_ns;
-    // 500 us while the wait is young, 2 ms after 8 ms have passed. The crossover is above one grain
-    // period so an audio pacing wait never leaves the tight regime.
-    //
-    // 500 us and not less, because that is the FLOOR of a short high-resolution-timer sleep on
-    // this host, measured rather than assumed: requests of 0.05, 0.10 and 0.20 ms all cost a
-    // median of 0.52 ms (200 samples each; 0.50 ms -> 1.02, 1.00 -> 1.51, 2.00 -> 2.07). An
-    // earlier revision asked for 200 us, which reads as a tighter loop than the machine can
-    // actually run and would mislead the next person tuning it. What the fine window buys is a
-    // poll interval about 4x shorter than the coarse one (0.52 ms against 2.07), not the 10x the
-    // constants implied.
-    const uint64_t kFineSliceNs = 500000ull, kCoarseSliceNs = 2000000ull, kFineWindowNs = 8000000ull;
+    const uint64_t deadline_ns = prosper::host::deadline_ns_from(start_ns, timeout_ns);
     for (;;) {
         if (sem_trywait(s) == 0) return 0;
         // EAGAIN means "not posted yet", which is the whole point of the loop. Anything else --
@@ -3182,10 +3174,13 @@ HLE(k_sem_timedwait) {
         if (errno != EAGAIN && errno != EINTR) return sce_pthread_rc(fbsd_errno(errno));
         const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (now_ns >= deadline_ns) { errno = ETIMEDOUT; return sce_pthread_rc(fbsd_errno(errno)); }
-        const uint64_t slice = (now_ns - start_ns) < kFineWindowNs ? kFineSliceNs : kCoarseSliceNs;
-        const uint64_t remaining = deadline_ns - now_ns;
-        prosper::host::sleep_until_steady_ns(now_ns + (remaining < slice ? remaining : slice));
+        // The deadline test, the adaptive slice and its clamp against the remaining time, as one
+        // pure decision -- see prosper::host::sem_poll_step for the cadence rationale and for the
+        // two invariants it guarantees (now_ns < sleep_until_ns <= deadline_ns).
+        const prosper::host::SemPollStep step =
+            prosper::host::sem_poll_step(start_ns, deadline_ns, now_ns);
+        if (step.expired) { errno = ETIMEDOUT; return sce_pthread_rc(fbsd_errno(errno)); }
+        prosper::host::sleep_until_steady_ns(step.sleep_until_ns);
     }
 #endif
 }

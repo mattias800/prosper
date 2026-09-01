@@ -97,4 +97,93 @@ constexpr uint64_t grid_boundaries_missed(uint64_t prev_deadline_ns, uint64_t ne
     return advanced > 0 ? advanced - 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// scePthreadSemTimedwait's poll-loop arithmetic (#3069).
+//
+// Extracted UNCHANGED from the Windows poll loop in hle_kernel.cpp's k_sem_timedwait, for the same
+// reason next_grid_deadline_ns and sleep_until_deadline_retry above were extracted: it was inline in
+// an HLE() body, so the only way to reach it was to call the real HLE and time it -- and
+// test_kernel_sem_timedwait.cpp's own header records at length why a wall-clock duration cannot
+// discriminate anything here (a quantized wait returns at the next tick BOUNDARY, so the defect's
+// latency distribution overlaps the fix's, for any tick length, and no single-run bound separates
+// them). Two of the three pieces below are saturating arms guarding guest-controlled input, and no
+// test reached either.
+//
+// Everything here is pure and takes the clock reading as a PARAMETER, so a test drives the whole
+// loop with a fake clock: no _WIN32, no real sleep, no wall time. See test_precise_sleep.cpp.
+
+// Saturating microseconds -> nanoseconds. `timeout_us` arrives straight from the guest, and a wrap
+// here would turn a very long timeout into a short one. Matches guest_ns_from in
+// hle_kernel_time.cpp (#3022), which states the rule for the whole family.
+constexpr uint64_t timeout_ns_from_us(uint64_t timeout_us) {
+    constexpr uint64_t kNsMax = ~0ull;
+    return timeout_us > kNsMax / 1000ull ? kNsMax : timeout_us * 1000ull;
+}
+
+// Saturating start + timeout. A wrapped deadline lands in the PAST, which turns a long wait into an
+// instant timeout -- the loud direction, but still wrong.
+constexpr uint64_t deadline_ns_from(uint64_t start_ns, uint64_t timeout_ns) {
+    constexpr uint64_t kNsMax = ~0ull;
+    return timeout_ns > kNsMax - start_ns ? kNsMax : start_ns + timeout_ns;
+}
+
+// The poll cadence. 500 us while the wait is young, 2 ms after 8 ms have passed; the crossover is
+// above one 5.33 ms audio grain period so a pacing wait never leaves the tight regime.
+//
+// 500 us and not less, because that is the FLOOR of a short high-resolution-timer sleep on this
+// host, measured rather than assumed: requests of 0.05, 0.10 and 0.20 ms all cost a median of
+// 0.52 ms (200 samples each; 0.50 ms -> 1.02, 1.00 -> 1.51, 2.00 -> 2.07). An earlier revision asked
+// for 200 us, which reads as a tighter loop than the machine can actually run and would mislead the
+// next person tuning it. What the fine window buys is a poll interval about 4x shorter than the
+// coarse one (0.52 ms against 2.07), not the 10x the constants imply.
+constexpr uint64_t kSemPollFineSliceNs   =  500000ull;   // 500 us
+constexpr uint64_t kSemPollCoarseSliceNs = 2000000ull;   // 2 ms
+constexpr uint64_t kSemPollFineWindowNs  = 8000000ull;   // 8 ms
+
+// How long to sleep before polling the semaphore again, given how long the wait has already run and
+// how much of its timeout is left.
+//
+// THE CLAMP AGAINST `remaining_ns` IS THE LOAD-BEARING HALF. Without it the loop would sleep past
+// the deadline and report a timeout up to one coarse slice late; and near the representable maximum
+// the caller's `now_ns + slice` would wrap outright, landing the next wake in the past. With it the
+// result is always <= remaining_ns, so `now_ns + poll_slice_ns(...)` can never exceed the deadline
+// and therefore can never overflow.
+//
+// Exposed separately from sem_poll_step() below -- its only caller -- so the clamp can be
+// mutation-tested on its own rather than only through the composed step.
+constexpr uint64_t poll_slice_ns(uint64_t elapsed_ns, uint64_t remaining_ns) {
+    const uint64_t slice =
+        elapsed_ns < kSemPollFineWindowNs ? kSemPollFineSliceNs : kSemPollCoarseSliceNs;
+    return remaining_ns < slice ? remaining_ns : slice;
+}
+
+// One iteration of the poll loop's timing decision, taken after a trywait has already failed.
+struct SemPollStep {
+    bool expired;              // the deadline has passed; the caller reports ETIMEDOUT
+    uint64_t sleep_until_ns;   // otherwise sleep until here, then poll again. Unset if `expired`.
+};
+
+// Two invariants hold for every non-expired result, and they are what the tests assert:
+//
+//     now_ns < sleep_until_ns <= deadline_ns
+//
+// The LOWER bound is strict, so the loop can never busy-spin while time remains (a zero-length sleep
+// would poll at whatever rate the scheduler allows). The UPPER bound is the clamp, so it can never
+// overshoot the deadline nor overflow. Both survive an early wakeup: the decision is recomputed from
+// `now_ns` alone on each iteration and carries nothing forward, so a sleep that returns short simply
+// produces another step from wherever it actually landed.
+constexpr SemPollStep sem_poll_step(uint64_t start_ns, uint64_t deadline_ns, uint64_t now_ns) {
+    if (now_ns >= deadline_ns) return {true, 0};
+    // NOTE: on a clock that went BACKWARDS, `now_ns - start_ns` wraps to a huge value and so selects
+    // the coarse slice. That is the behaviour of the code this was extracted from, preserved
+    // deliberately rather than corrected, because #3069 is a pure extraction. It is unreachable
+    // through the real call site -- start_ns and now_ns are both steady_clock reads, which cannot go
+    // backwards -- and benign if it ever were: the loop polls at 2 ms instead of 500 us and STILL
+    // times out at exactly the right moment, because the deadline check above does not involve
+    // start_ns at all. Pinned by a test arm so a later change to the elapsed computation is a
+    // deliberate one.
+    const uint64_t elapsed_ns = now_ns - start_ns;
+    return {false, now_ns + poll_slice_ns(elapsed_ns, deadline_ns - now_ns)};
+}
+
 }  // namespace prosper::host
