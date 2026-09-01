@@ -454,6 +454,22 @@ struct SpirvCompute {
     std::set<uint32_t> cbuf_coherent_vars;
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_vertex=0;                            // true in every vertex shell
+    // Why an instruction the emitter DECODED could not be lowered in THIS stage. `mode` on the
+    // reject line separates "no lowering exists" (`unknown-encoding`) from "the lowering exists and
+    // an operand/descriptor did not resolve" (`unresolved-operand`), and a cross-lane operation in a
+    // stage with no guest wave is neither: the encoding is known, every operand resolves, and the
+    // stage simply has no lane set to reduce over. Reported as a third mode so a census does not
+    // read it as a descriptor defect and go looking for the resource table (#2412, #3135). Set by
+    // the emitter at the deciding instruction; consumed by the reject site, which appends it to the
+    // one terminal line so the recorded reason names the cause rather than the effect.
+    uint32_t stage_reject_pc = UINT32_MAX;
+    std::string stage_reject_reason;
+    // The first V_MBCNT whose src0 is a general SGPR mask, when the program ALSO builds the
+    // canonical all-ones lane-index pair. That mixture disqualifies the flattened-lane vertex model
+    // for the whole program, so the reject surfaces at the all-ones instruction -- which is
+    // lowerable on its own -- and names a PC that is not the cause. Kept so the reject can say which
+    // instruction actually disqualified it (#3135).
+    uint32_t vertex_general_mask_mbcnt_pc = UINT32_MAX;
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
     bool     ngg_logical_lane=0;                     // proven wave64 no-GS producer uses flattened guest lane

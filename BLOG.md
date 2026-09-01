@@ -83,6 +83,23 @@ loads, so the pointer it reads is the tail of the previous descriptor — the sa
 Stray is the third, and the first where one replay shows both halves. The reject line now says which
 of those two stories it is, so the next reader does not have to re-run the game to find out.
 
+### Stray's missing full-screen draws are not a missing opcode — they are a missing wave
+
+No picture: the shader still does not compile, and a black frame is not progress evidence. But the
+thing it is waiting for turned out to be much larger than the reject line said.
+
+Two of Stray's dropped title-screen draws are full-screen, and both die in one vertex program that
+opens with a cross-lane `v_mbcnt` prosper refuses in a vertex stage. Satisfying just that instruction
+with a throwaway probe moves the failure exactly ten instructions, onto an LDS write: the program is
+not a vertex shader at all but a merged NGG geometry threadgroup, doing vertex compaction with shared
+memory, three barriers, cross-wave prefix scans and lane reads. It needs eight wave/workgroup
+primitives, and `v_mbcnt` is only the first one in program order.
+
+A Vulkan vertex stage has no shared memory and no promise that a subgroup is the guest's wave, so
+there is nothing correct to lower this onto — the honest destination is a mesh shader. The reject now
+says which instruction actually disqualified the program instead of pointing at a lowerable one.
+([#3135](https://github.com/mattias800/prosper/issues/3135))
+
 ## 2026-08-31
 
 ### Stray's splash runs 66% faster, and the title screen now holds 65 fps

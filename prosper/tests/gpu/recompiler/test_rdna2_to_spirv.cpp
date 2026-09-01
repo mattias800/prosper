@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -13009,6 +13010,79 @@ int main() {
     //
     // The block's own delta has neither problem: all 8 of its checks are unconditional, so the
     // number is the same on every host, and it goes to zero the moment the block stops running.
+    // #3135: a cross-lane V_MBCNT in a VERTEX shell has no guest wave to count over, and the
+    // reject must say so. Three arms, because the interesting field is derived and a constant
+    // string would satisfy any one of them alone.
+    //
+    // The guest shape is Stray's PPSA02101 title-screen vertex program 0x300f190000, reduced: an
+    // all-ones LO/HI pair (the canonical "what is my lane id" idiom) followed by a general
+    // SGPR-mask pair (a real prefix population count over a saved wave mask). Its
+    // `ngg_logical_lane` model is disqualified BY the general-mask forms, so the reject surfaces
+    // at the all-ones instruction -- which is lowerable on its own -- and used to name pc=0 with
+    // `mode=unresolved-operand`, i.e. "the lowering exists, the descriptor is the defect" (#2412),
+    // which is the opposite of true.
+    {
+        const uint32_t mixed_mbcnt_vertex[] = {
+            0xd7650003u, 0x000100c1u,   // pc0: v_mbcnt_lo_u32_b32 v3, -1, 0
+            0xd7660003u, 0x000206c1u,   // pc2: v_mbcnt_hi_u32_b32 v3, -1, v3
+            0xd7650001u, 0x00010004u,   // pc4: v_mbcnt_lo_u32_b32 v1, s4, 0
+            0xd7660001u, 0x00020205u,   // pc6: v_mbcnt_hi_u32_b32 v1, s5, v1
+            0xbf810000u,                // pc8: s_endpgm
+        };
+        const uint64_t mixed_address = 0x300f190000ull;
+        CHECK(recompile_vertex(mixed_mbcnt_vertex, std::size(mixed_mbcnt_vertex), nullptr, nullptr,
+                               false, 0, {RecompileDiagnosticStage::Vertex, mixed_address}).empty(),
+              "#3135: a vertex program mixing all-ones and SGPR-mask MBCNT stays fail-visible");
+        const std::string mixed_reason = last_terminal_reject_reason(mixed_address);
+        // Non-empty at all is itself the #3130-for-vertex half: recompile_vertex_impl hardcoded
+        // program address 0, and record_terminal_reject_reason() early-returns on zero, so NO
+        // vertex program has ever had a reject reason recorded.
+        CHECK(!mixed_reason.empty(),
+              "#3135: a vertex reject is recorded against the program address it was given");
+        CHECK(mixed_reason.find("mode=unsupported-in-stage") != std::string::npos &&
+                  mixed_reason.find("reason=mbcnt-cross-lane stage=vertex form=all-ones wave=none "
+                                    "disqualified-by-general-mask-pc=4") != std::string::npos &&
+                  mixed_reason.find(" pc=0 ") != std::string::npos,
+              "#3135: the reject names the general-mask pc that disqualified the lane model");
+
+        // Arm 2 -- the same program with the general-mask pair REMOVED. It still rejects (a generic
+        // vertex shell has no proven lane model even for the all-ones form), but there is now no
+        // disqualifying instruction to name, so the field must be absent. Without this arm the
+        // assertion above is satisfied by a version that appends a constant.
+        const uint32_t all_ones_only_vertex[] = {
+            0xd7650003u, 0x000100c1u,   // pc0: v_mbcnt_lo_u32_b32 v3, -1, 0
+            0xd7660003u, 0x000206c1u,   // pc2: v_mbcnt_hi_u32_b32 v3, -1, v3
+            0xbf810000u,                // pc4: s_endpgm
+        };
+        const uint64_t all_ones_address = 0x300f191000ull;
+        CHECK(recompile_vertex(all_ones_only_vertex, std::size(all_ones_only_vertex), nullptr,
+                               nullptr, false, 0,
+                               {RecompileDiagnosticStage::Vertex, all_ones_address}).empty(),
+              "#3135: an all-ones-only vertex MBCNT is still fail-visible without a lane model");
+        const std::string all_ones_reason = last_terminal_reject_reason(all_ones_address);
+        CHECK(all_ones_reason.find("reason=mbcnt-cross-lane stage=vertex form=all-ones wave=none") !=
+                  std::string::npos &&
+                  all_ones_reason.find("disqualified-by-general-mask-pc") == std::string::npos,
+              "#3135: with no general-mask form present the disqualifying pc is not reported");
+
+        // Arm 3 -- the general-mask form alone. It reports its own form, so the `form=` field is
+        // read off the instruction rather than assumed from the stage.
+        const uint32_t sgpr_mask_only_vertex[] = {
+            0xd7650001u, 0x00010004u,   // pc0: v_mbcnt_lo_u32_b32 v1, s4, 0
+            0xd7660001u, 0x00020205u,   // pc2: v_mbcnt_hi_u32_b32 v1, s5, v1
+            0xbf810000u,                // pc4: s_endpgm
+        };
+        const uint64_t sgpr_mask_address = 0x300f192000ull;
+        CHECK(recompile_vertex(sgpr_mask_only_vertex, std::size(sgpr_mask_only_vertex), nullptr,
+                               nullptr, false, 0,
+                               {RecompileDiagnosticStage::Vertex, sgpr_mask_address}).empty(),
+              "#3135: a general SGPR-mask vertex MBCNT stays fail-visible");
+        CHECK(last_terminal_reject_reason(sgpr_mask_address).find(
+                  "reason=mbcnt-cross-lane stage=vertex form=sgpr-mask wave=none") !=
+                  std::string::npos,
+              "#3135: the general SGPR-mask form is reported as such, not as all-ones");
+    }
+
     const int before_bvh = checks;
     run_bvh_checks();
     if (checks - before_bvh != 8) {
