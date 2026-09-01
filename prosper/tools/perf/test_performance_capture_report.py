@@ -2,7 +2,8 @@
 
 import unittest
 
-from performance_capture_report import CaptureError, summarize, validate_capture
+from performance_capture_report import (CaptureError, READBACK_NOTE_MIN_SHARE,
+                                        summarize, validate_capture)
 
 
 def capture(post=None, renderer=None, compute=None, dropped=(0, 0)):
@@ -198,10 +199,14 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn("harness, not the title", summary["readback_note"])
 
     def test_readback_note_threshold_is_a_share_not_a_ranking(self):
-        # Pins the quiet end against the loud one with the SAME verdict and the same GPU-present
-        # state, so the only variable is readback's share of measured work. Without this pair the
-        # threshold could drift to "any nonzero readback" -- which it briefly was -- and no test
-        # would notice, because every existing readback arm has a large readback.
+        # Holds verdict and GPU-present state constant so the only variable is readback's SHARE.
+        #
+        # It does NOT pin the lower bound, and an earlier version of this comment wrongly claimed it
+        # did ("no test would notice" a drift to any-nonzero). Measured per-arm: a drift to
+        # any-nonzero is caught by the PRE-EXISTING 2% arm below, and this 1% assertion passes at
+        # every threshold down to 0.011. What binds above is this arm's 20% assertion. Keeping the
+        # 1% half is still right -- it is the only arm that varies share alone -- but the reason is
+        # isolation, not coverage of the quiet end.
         def note_for(readback_ms):
             return summarize(capture(
                 SAMPLES,
@@ -210,6 +215,36 @@ class PerformanceCaptureReportTests(unittest.TestCase):
 
         self.assertIsNone(note_for(20.0))        # 1% of measured work -- rounding, stays silent
         self.assertIsNotNone(note_for(400.0))    # 20% -- a reader could mistake it for the answer
+
+    def test_readback_note_threshold_constant_is_pinned_to_its_anchor(self):
+        # The constant is importable precisely so it can be pinned. Without this arm it can move
+        # anywhere inside the (0.020, 0.200] band the behavioural arms allow -- a 10x range -- with
+        # nothing objecting, which is the gap an independent review of this change identified.
+        #
+        # Asserts the ANCHOR, not the literal: the threshold is one quarter of the classification
+        # evidence bar, so a future change to that bar carries this along instead of silently
+        # decoupling from it. A bare `== 0.10` would pass while the relationship it stands for broke.
+        self.assertAlmostEqual(READBACK_NOTE_MIN_SHARE, 0.40 / 4)
+        self.assertLess(READBACK_NOTE_MIN_SHARE, 0.40)
+
+    def test_readback_note_tail_does_not_disown_a_verdict_readback_did_not_decide(self):
+        # A decisive compute verdict with a material readback used to close "...before acting on
+        # this verdict" -- telling the reader to discard a conclusion the readback had no part in.
+        decisive = summarize(capture(
+            SAMPLES,
+            renderer=[{"total_ms": 1000, "readback_ms": 600}],
+            compute=[{"total_ms": 4000.0}]))
+        # readback 600 / 5000 measured = 12%, over the threshold; compute 4000 / 5000 = 80%, a
+        # decisive verdict readback played no part in. That combination is the whole point.
+        self.assertEqual(decisive["classification"], "compute")
+        self.assertIsNotNone(decisive["readback_note"])
+        self.assertNotIn("before acting on this verdict", decisive["readback_note"])
+        self.assertIn("does not affect the compute verdict", decisive["readback_note"])
+
+        # ...while a readback VERDICT still says exactly that, because there it is correct.
+        owned = summarize(capture(SAMPLES, renderer=[self.READBACK_RENDERER[0]]))
+        self.assertEqual(owned["classification"], "readback")
+        self.assertIn("before acting on this verdict", owned["readback_note"])
 
     def test_non_readback_verdict_carries_no_readback_note(self):
         # The note is specific to the readback verdict; on every report it would be noise.

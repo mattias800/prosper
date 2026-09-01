@@ -227,6 +227,45 @@ def _compute_program_groups(records, limit=10, address_limit=8):
     }
 
 
+# Readback must reach this share of measured work before the harness-readback note is emitted.
+#
+# ANCHOR: one quarter of the 0.40 classification evidence bar. The note exists to cover the gap
+# UNDER that bar -- a readback large enough to mislead but too small to win the verdict -- so the
+# threshold belongs well below it, and a quarter is the round fraction that is.
+#
+# WHAT THE TESTS ACTUALLY PIN, measured per-arm rather than by exit code, because the two are not
+# the same question and reading only the exit code gets this wrong:
+#
+#   threshold     failing arm
+#   <= 0.020      test_non_readback_verdict_carries_no_readback_note   (2 ms / 2%, PRE-EXISTING)
+#   0.021-0.200   none
+#   >  0.200      test_readback_note_threshold_is_a_share_not_a_ranking (its 20% assertion)
+#
+# So the pinned band is (0.020, 0.200] and 0.10 is NOT itself pinned -- it can move anywhere in a
+# 10x range with no test objecting. Two corrections worth keeping, because the obvious reading of
+# the arms is wrong in both directions:
+#   * the LOWER bound is held by the pre-existing 2% test, NOT by the 1% arm added alongside this
+#     threshold. That arm passes at 0.011 and at 0.020; it never binds.
+#   * the UPPER bound is held by the 20% assertion, NOT by the 31% motivating arm. That arm's share
+#     is 0.3120 and it does not fail anywhere in the swept range.
+# The 1% and 31% arms still earn their place -- they hold verdict and GPU-present state constant so
+# the only variable is share, and the 31% one reproduces the capture that motivated the change --
+# but neither is what fixes the band, and a comment claiming otherwise sends the next reader to the
+# wrong test when they want to tighten it.
+READBACK_NOTE_MIN_SHARE = 0.10
+
+
+# The note's closing advice depends on whether readback DECIDED the verdict. "before acting on this
+# verdict" is right when the verdict IS readback; on a capture whose verdict is a decisive compute or
+# renderer-resource share it is wrong advice attached to a correct conclusion, which is worse than no
+# advice -- the reader is told to discard a finding the readback had no part in.
+def _readback_note_tail(classification):
+    if classification == "readback":
+        return " before acting on this verdict"
+    return (" before reading the readback line below; it does not affect the "
+            + str(classification) + " verdict above")
+
+
 def summarize(records):
     header = records[0]
     footer = next(record for record in records if record.get("type") == "footer")
@@ -340,14 +379,7 @@ def summarize(records):
     # trigger is readback's SHARE of measured work, with a threshold deliberately well below the
     # 40% classification bar -- the whole point is to cover the gap under that bar.
     #
-    # The threshold is a judgement call, and what the tests pin is a BAND, not this constant: a
-    # 31%-of-measured-work readback must warn and a 1% one must stay silent, so any value in
-    # (0.02, 0.20] passes. 0.10 sits in that band and is not itself pinned -- a later change may
-    # move it within the band without any test noticing, which is the honest limit of the coverage.
-    # The quiet end is the one that earns its keep: a paragraph of warning attached to a
-    # rounding-level number is noise on every report and trains readers to skip the note in the
-    # cases that matter. Any nonzero readback is NOT the right trigger, for that reason.
-    READBACK_NOTE_MIN_SHARE = 0.10
+    # See READBACK_NOTE_MIN_SHARE at module scope for the threshold and what pins it.
     readback_ms = classification_components.get("readback")
     material_readback = (
         isinstance(readback_ms, (int, float)) and measured_total > 0 and
@@ -358,13 +390,13 @@ def summarize(records):
             readback_note = (
                 "this capture cannot say whether GPU present was adopted, so it cannot say whether "
                 "the readback is real or the harness copying every scanout frame to the CPU. Check "
-                "the run log for a GPU-present surface failure before acting on this verdict")
+                "the run log for a GPU-present surface failure" + _readback_note_tail(classification))
         elif adopted is False:
             readback_note = (
                 "GPU present was NOT adopted for this capture, so the frontend copied every scanout "
                 "frame to the CPU -- most often prosper-app under SDL_VIDEODRIVER=offscreen, which "
                 "needs VK_EXT_headless_surface. This readback is the harness, not the title. "
-                "Re-measure through a real window before acting on this verdict")
+                "Re-measure through a real window" + _readback_note_tail(classification))
         else:
             readback_note = (
                 "GPU present WAS adopted, so scanout readback is skipped and this readback is real "
