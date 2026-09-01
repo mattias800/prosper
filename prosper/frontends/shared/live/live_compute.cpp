@@ -20,6 +20,8 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
+#include "gpu/resources/image_identity.hpp"
+#include "gpu/resources/spirv_storage_match.hpp"  // #3204: SPIR-V/guest storage agreement  // #3204: named image-identity predicates
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_write_watch.hpp"
@@ -5987,19 +5989,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->num_components ? r->num_components : 1;
             const VkFormat native_storage_format =
                 native_storage_vk_format(r->format, descriptor_components);
-            const bool spirv_native_float_storage = bi.storage &&
-                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Float;
-            const bool spirv_native_uint_storage = bi.storage &&
-                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Uint &&
-                !image_descriptors[i].atomic_access &&
-                ((r->format == DataFormat::Uint32 && descriptor_components == 1 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatR32ui) ||
-                 (r->format == DataFormat::Uint8 && descriptor_components == 1 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatR8ui) ||
-                 (r->format == DataFormat::Uint8 && descriptor_components == 4 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatRgba8ui) ||
-                 (r->format == DataFormat::Uint16 && descriptor_components == 1 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatR16ui));
+            // #3204: the SPIR-V/guest storage-format agreement lives in spirv_storage_match.hpp,
+            // where the enumerated pairs are named and tested. The format operand VALUES stay here,
+            // passed in, so the header never becomes a second source of truth for them.
+            const prosper::gpu::SpirvStorageDeclaration storage_decl{
+                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Uint,
+                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Float,
+                image_descriptors[i].atomic_access,
+                image_descriptors[i].storage_image_format};
+            const bool spirv_native_float_storage =
+                bi.storage && prosper::gpu::spirv_native_float_storage(storage_decl);
+            const bool spirv_native_uint_storage =
+                bi.storage && prosper::gpu::spirv_native_uint_storage(
+                    storage_decl, r->format, descriptor_components,
+                    kSpirvImageFormatR32ui, kSpirvImageFormatR16ui,
+                    kSpirvImageFormatR8ui, kSpirvImageFormatRgba8ui);
             const bool spirv_native_storage =
                 spirv_native_float_storage || spirv_native_uint_storage;
             bi.packed_r11_storage = bi.storage && !spirv_native_storage &&
@@ -6505,29 +6509,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 }
                 if (renderer_owned && bi.storage) {
-                    const uint32_t nc = r->num_components ? r->num_components : 1;
-                    const bool compatible =
-                        (live_target.format == LiveTargetPixelFormat::Rgba8Unorm &&
-                         r->format == DataFormat::Unorm8 && nc == 4) ||
-                        (live_target.format == LiveTargetPixelFormat::Rgba16Float &&
-                         r->format == DataFormat::Float16 && nc == 4) ||
-                        (live_target.format == LiveTargetPixelFormat::Rg16Float &&
-                         r->format == DataFormat::Float16 && nc == 2) ||
-                        (live_target.format == LiveTargetPixelFormat::R16Float &&
-                         r->format == DataFormat::Float16 && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::R11G11B10Float &&
-                         r->format == DataFormat::Float10_11_11 && nc == 3) ||
-                        (live_target.format == LiveTargetPixelFormat::R8Unorm &&
-                         r->format == DataFormat::Unorm8 && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::Rg8Unorm &&
-                         r->format == DataFormat::Unorm8 && nc == 2) ||
-                        (live_target.format == LiveTargetPixelFormat::R32Uint &&
-                         (r->format == DataFormat::Uint32 ||
-                          r->format == DataFormat::Float32) && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::R32Float &&
-                         r->format == DataFormat::Float32 && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::Rgba32Float &&
-                         r->format == DataFormat::Float32 && nc == 4);
+                    const uint32_t nc = r->num_components ? r->num_components : 1;  // used by the trace below
+                    // #3204: the format-compatibility table now lives in live_target_format.hpp as an
+                    // exhaustive switch, so adding a LiveTargetPixelFormat is a build error there instead
+                    // of silently reporting every binding of that format incompatible.
+                    const bool compatible = prosper::frontend::live_target_format_matches_declaration(
+                        live_target.format, r->format, r->num_components);
                     if (!compatible) {
                         // The same allocation can carry another target view before this compute
                         // operation (Astro Bot uses R8G8 and RGBA16F views at one base). A snapshot
@@ -6572,64 +6559,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (!bi.depth_bits_source ||
                      (prior.depth_bits_image == bi.depth_bits_image &&
                       prior.depth_bits_format == bi.depth_bits_format));
-                const bool same_dcc_identity = p &&
-                    p->max_uncompressed_block_size == r->max_uncompressed_block_size &&
-                    p->max_compressed_block_size == r->max_compressed_block_size &&
-                    p->meta_pipe_aligned == r->meta_pipe_aligned &&
-                    p->write_compress_enabled == r->write_compress_enabled &&
-                    p->compression_enabled == r->compression_enabled &&
-                    p->alpha_is_on_msb == r->alpha_is_on_msb &&
-                    p->color_transform == r->color_transform &&
-                    p->metadata_addr == r->metadata_addr &&
-                    p->dcc_metadata_size == r->dcc_metadata_size &&
-                    p->dcc_metadata_host_data == r->dcc_metadata_host_data &&
-                    p->dcc_metadata_host_data_size == r->dcc_metadata_host_data_size;
-                // Captures materialize each descriptor's bytes into an independently-owned blob,
-                // so pointer equality is not an architectural backing identity. Two exact image
-                // descriptors for the same non-null guest range must still alias one Vulkan image:
-                // GTA V's 4K output shader writes the four 8x8 quadrants of each 16x16 block through
-                // four bindings at the same address. Treating the reconstructed blobs as four
-                // images loses three stores and leaves the red/green checker in Performance mode.
-                const bool same_host_backing = p &&
-                    (p->host_data == r->host_data ||
-                     (p->gpu_addr != 0 && p->gpu_addr == r->gpu_addr &&
-                      p->host_data_size == r->host_data_size));
-                const bool same_view = p && same_backing_representation &&
-                    prior.storage == bi.storage &&
-                    p->gpu_addr == r->gpu_addr && p->size == r->size &&
-                    p->width == r->width && p->height == r->height && p->depth == r->depth &&
-                    prior.texel_depth == bi.texel_depth && prior.array_layers == bi.array_layers &&
-                    p->format == r->format && p->num_components == r->num_components &&
-                    p->tile_mode == r->tile_mode && p->img_dim == r->img_dim &&
-                    p->layer_stride_bytes == r->layer_stride_bytes &&
-                    p->layer_mip_offset_bytes == r->layer_mip_offset_bytes &&
-                    p->in_mip_tail == r->in_mip_tail &&
-                    p->mip_tail_x == r->mip_tail_x && p->mip_tail_y == r->mip_tail_y &&
-                    // The chain length is derived from these six fields (#3048); two descriptors
-                    // that disagree on any of them materialize different images.
-                    p->declared_mip_levels == r->declared_mip_levels &&
-                    // #3205: the derived chain provenance is part of image identity only when a
-                    // chain exists. It is populated on one construction path and left unset on
-                    // another, so comparing it unconditionally split identical single-level
-                    // descriptors into separate images -- which breaks the aliasing the comment
-                    // above requires and renders GTA V's checkerboard.
-                    prosper::gpu::shader_resource_mip_chain_provenance_matches(*p, *r) &&
-                    p->srgb == r->srgb && same_host_backing &&
-                    p->host_data_size == r->host_data_size && same_dcc_identity;
+                // #3204: image identity now lives in gpu/resources/image_identity.hpp, where each
+                // predicate is named and unit-tested. These were unnamed local expressions, which is
+                // why #3205 could add a field that describes nothing for a single-level image and
+                // break the aliasing GTA V's quadrant writes depend on, with no test able to see it.
+                const prosper::gpu::ComputeImageViewShape prior_shape{
+                    prior.storage, prior.texel_depth, prior.array_layers};
+                const prosper::gpu::ComputeImageViewShape this_shape{
+                    bi.storage, bi.texel_depth, bi.array_layers};
+                const bool same_view = p && prosper::gpu::shader_resource_same_view(
+                    *p, *r, prior_shape, this_shape, same_backing_representation);
                 bool same_sampler = true;
-                if (!bi.storage && same_view) {
-                    same_sampler = p->mag_filter == r->mag_filter &&
-                        p->min_filter == r->min_filter && p->mip_filter == r->mip_filter &&
-                        p->addr_uvw[0] == r->addr_uvw[0] && p->addr_uvw[1] == r->addr_uvw[1] &&
-                        p->addr_uvw[2] == r->addr_uvw[2] &&
-                        p->border_color_type == r->border_color_type &&
-                        p->min_lod == r->min_lod && p->max_lod == r->max_lod &&
-                        p->lod_bias == r->lod_bias && p->max_aniso_ratio == r->max_aniso_ratio &&
-                        p->depth_compare_func == r->depth_compare_func &&
-                        p->depth_compare == r->depth_compare && p->unnormalized == r->unnormalized &&
-                        p->swizzle[0] == r->swizzle[0] && p->swizzle[1] == r->swizzle[1] &&
-                        p->swizzle[2] == r->swizzle[2] && p->swizzle[3] == r->swizzle[3];
-                }
+                if (!bi.storage && same_view)
+                    same_sampler = prosper::gpu::shader_resource_same_sampler(*p, *r);
                 if (!same_view || !same_sampler) continue;
                 bi.alias_of = prior.alias_of == SIZE_MAX ? j : prior.alias_of;
                 const BoundImage& owner = images[bi.alias_of];

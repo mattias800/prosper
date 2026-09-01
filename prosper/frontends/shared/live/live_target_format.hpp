@@ -190,4 +190,35 @@ constexpr bool renderer_mip_target_requires_submit_retention(VkFormat format) {
     return format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 }
 
+
+// #3204: does a renderer-owned target's storage format match what this compute binding declares?
+//
+// Extracted from `execute_item`, where it was a 22-line `||` chain -- the exact shape this file
+// exists to eliminate. An `||` chain over an enum answers "no" for a member nobody taught it about,
+// so adding a LiveTargetPixelFormat would silently make every binding of that format incompatible
+// and fall back to a snapshot path, with no build error and no test failure. As a `switch` with no
+// `default:`, adding a member is a compile error here, which is this header's whole contract.
+//
+// Behaviour is otherwise identical to the chain it replaces, including R32Uint accepting a Float32
+// declaration (a guest that stores float bits through a uint view).
+inline bool live_target_format_matches_declaration(prosper::gpu::LiveTargetPixelFormat target,
+                                                   prosper::gpu::DataFormat declared,
+                                                   uint32_t num_components) {
+    using LTF = prosper::gpu::LiveTargetPixelFormat;
+    using DF = prosper::gpu::DataFormat;
+    const uint32_t nc = num_components ? num_components : 1u;
+    switch (target) {
+        case LTF::Rgba8Unorm:     return declared == DF::Unorm8 && nc == 4;
+        case LTF::Rgba16Float:    return declared == DF::Float16 && nc == 4;
+        case LTF::Rg16Float:      return declared == DF::Float16 && nc == 2;
+        case LTF::R16Float:       return declared == DF::Float16 && nc == 1;
+        case LTF::R11G11B10Float: return declared == DF::Float10_11_11 && nc == 3;
+        case LTF::R8Unorm:        return declared == DF::Unorm8 && nc == 1;
+        case LTF::Rg8Unorm:       return declared == DF::Unorm8 && nc == 2;
+        case LTF::R32Uint:        return (declared == DF::Uint32 || declared == DF::Float32) && nc == 1;
+        case LTF::R32Float:       return declared == DF::Float32 && nc == 1;
+        case LTF::Rgba32Float:    return declared == DF::Float32 && nc == 4;
+    }
+    return false;  // fail closed; unreachable while the switch stays exhaustive
+}
 } // namespace prosper::frontend
