@@ -1155,8 +1155,11 @@ namespace {
         // The cost of that property, named because it is real: phase stays exact however
         // many boundaries were skipped, so a pump running at HALF rate has perfect phase
         // and no symptom. The relative sleep this replaces at least drifted visibly, which
-        // is how #3024 was noticed. A dropped-boundary counter would restore the symptom
-        // without giving back the drift -- #3075.
+        // is how #3024 was noticed. #3075 restores the symptom with host::grid_boundaries_missed()
+        // below, WITHOUT giving back the drift: that helper is deliberately a second, separate
+        // computation over next_grid_deadline_ns()'s own return values rather than a change to what
+        // the scheduler returns or how it schedules -- see its comment in precise_sleep.hpp for why
+        // folding the two together would just recreate the drift #3024 removed.
         //
         // One composition caveat, recorded because the helper alone does not cover it (#3074):
         // this loop assumes the wait cannot return EARLY. If it does, the next `now` is still
@@ -1175,12 +1178,78 @@ namespace {
         // registers only a FLIP event still anchors it here.
         const uint64_t origin_ns = prosper_vo_vblank_grid_origin_ns();
         const uint64_t period_ns = prosper_vo_vblank_period_ns();
+
+        // --- #3075: dropped-tick visibility ------------------------------------------------------
+        // `deadline_ns` below is read back and compared against the PREVIOUS iteration's own
+        // deadline via host::grid_boundaries_missed(), which is exactly the history
+        // next_grid_deadline_ns() is required to discard for its phase-exactness guarantee. This is
+        // a SEPARATE computation, not a change to the schedule: `deadline_ns` itself is still fed to
+        // sleep_until_steady_ns() unmodified, so scheduling behaviour (and #3024's fix) is untouched.
+        bool have_prev_deadline = false;
+        uint64_t prev_deadline_ns = 0;
+        // Windowed, not per-boundary: a stall of N periods is ONE iteration reporting `missed=N`,
+        // never N reports, so this cannot flood on a long stall. It IS one report per iteration on a
+        // sustained degraded rate (e.g. every iteration of a half-rate run), which is the case that
+        // must stay loud -- bounded above by the pump's own (halved, in that case) iteration rate.
+        uint64_t win_ticks = 0, win_missed = 0, win_worst_gap = 0;
+        uint64_t lifetime_missed = 0;
+        clk::time_point win_start = clk::now();
+        // "More than a few percent of boundaries over a multi-second window" -- the design question
+        // #3075 posed rather than answered. Answered here: yes, unconditionally (never gated behind
+        // PROSPER_EVLOG, so it is visible on a default run), because a pump silently running at a
+        // fraction of its nominal rate is exactly what this project's fail-visible policy exists for.
+        // A DETAILED per-window line (below, gated) is still useful for a below-threshold trickle of
+        // drops that this warning deliberately does not raise.
+        constexpr double kDropWarnThreshold = 0.05;      // >5% of boundaries dropped in the window
+        constexpr auto   kDropWindow = std::chrono::seconds(2);
+
         for (;;) {
             const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 clk::now().time_since_epoch()).count();
-            prosper::host::sleep_until_steady_ns(
-                prosper::host::next_grid_deadline_ns(origin_ns, now_ns, period_ns));
+            const uint64_t deadline_ns =
+                prosper::host::next_grid_deadline_ns(origin_ns, now_ns, period_ns);
+            prosper::host::sleep_until_steady_ns(deadline_ns);
             frame++;
+
+            if (have_prev_deadline) {
+                const uint64_t missed =
+                    prosper::host::grid_boundaries_missed(prev_deadline_ns, deadline_ns, period_ns);
+                win_ticks++;
+                if (missed) {
+                    win_missed += missed;
+                    lifetime_missed += missed;
+                    if (missed > win_worst_gap) win_worst_gap = missed;
+                }
+            }
+            have_prev_deadline = true;
+            prev_deadline_ns = deadline_ns;
+
+            const clk::time_point report_now = clk::now();
+            if (report_now - win_start >= kDropWindow) {
+                const uint64_t win_boundaries = win_ticks + win_missed;   // ticks observed + skipped
+                const double ratio =
+                    win_boundaries ? (double)win_missed / (double)win_boundaries : 0.0;
+                if (ratio > kDropWarnThreshold) {
+                    fprintf(stderr,
+                            "[vblank] WARNING: pump dropped %llu of %llu expected boundaries in the "
+                            "last %llds (%.1f%%, worst single wait skipped %llu) -- a consumer "
+                            "pacing on the vblank event stream is running slow.\n",
+                            (unsigned long long)win_missed, (unsigned long long)win_boundaries,
+                            (long long)kDropWindow.count(), ratio * 100.0,
+                            (unsigned long long)win_worst_gap);
+                }
+                if (evlog())
+                    fprintf(stderr,
+                            "[ev] vblank-pump interval=%llds ticks=%llu dropped=%llu/%llu (%.2f%%, "
+                            "worst=%llu) | lifetime dropped=%llu\n",
+                            (long long)kDropWindow.count(), (unsigned long long)win_ticks,
+                            (unsigned long long)win_missed, (unsigned long long)win_boundaries,
+                            ratio * 100.0, (unsigned long long)win_worst_gap,
+                            (unsigned long long)lifetime_missed);
+                win_ticks = win_missed = win_worst_gap = 0;
+                win_start = report_now;
+            }
+
             std::vector<FlipReg> vr;
             { std::lock_guard lk(g_eq_mx); vr = g_vblank_regs; }
             // Vblank ticks are periodic by nature — pump them. FLIP events are NOT pumped: a flip

@@ -18,14 +18,23 @@ that log into the numbers that name the failure mode, offline, without listening
     between the guest's budgeted audio clock and the device crystal; no cushion survives it,
     and the fix is drift compensation, not deeper buffering;
   * burst clustering -- the fraction of arrivals that carry more than one grain of audio
-    after a gap of more than two grain periods, which names a quantized mixer wake.
+    after a gap of more than two grain periods. This shape is CONSISTENT WITH a quantized
+    mixer wake, but the cadence alone cannot prove it: a producer simply delivering audio
+    below real time also arrives in clusters, spaced by production rather than by a wait
+    (#3080 -- the verdict named the wrong cause on a title where a `PROSPER_TIMEDWAIT_CENSUS=1`
+    measurement, in the same log, showed the guest's only timed wait resolving at x1.02, i.e.
+    not quantized at all; the -55% delivery-rate deficit already explained the clustering). So
+    if `[timedwait Ns]` census lines are present in the same input, their ratio for the
+    dominant wait primitive SETTLES which cause applies; if they are absent, the report says so
+    and names the census as the discriminator instead of asserting a mechanism it cannot see.
 
 WHAT THIS TOOL DOES NOT SEE
 ---------------------------
 `[audio-dbg]` is emitted per accepted `output()` call from the guest. Grains the guest never
 delivers (a mixer that skipped a period) appear only as a longer gap. Content-level defects
 (a mixer that produced silence or repeated samples) are invisible here; the queue level and
-the delivery rate are the report's whole world.
+the delivery rate are most of the report's world -- the one exception is the wait-primitive
+census below, read from the SAME log when the run captured both diagnostics together.
 
 Usage:
     audio_delivery_report.py [LOG ...] [--port P] [--device-hz H] [--channels C] [--bytes-per-frame N]
@@ -39,6 +48,23 @@ from collections import defaultdict
 RECORD = re.compile(
     r"\[audio-dbg\] port=(\d+) gap=([0-9.]+)ms frames=(\d+) queued_before=(\d+)"
     r"(?: \(grain=(\d+)\))?")
+
+# `report_timedwait_census()` (src/hle/kernel/timedwait_census.hpp) prints one of these per
+# primitive every 5 s when PROSPER_TIMEDWAIT_CENSUS=1. It is a DIRECT measurement of how coarse
+# a wait primitive actually is -- requested vs actual, as a ratio -- which is exactly the
+# question the burst-clustering verdict below cannot answer from cadence alone. A primitive with
+# no requested interval (an absolute-clock deadline, e.g. cond_timedwait) prints "?" instead of a
+# ratio and is skipped: no ratio, no evidence either way.
+TIMEDWAIT_RECORD = re.compile(
+    r"\[timedwait \S+\]\s+(\S+)\s+calls=(\d+)\s+requested=\s*(?:[0-9.]+\s*ms|\?)"
+    r"\s+actual=\s*[0-9.]+\s*ms(?:\s+x([0-9.]+))?")
+
+# A ratio comfortably above 1.0 means the wait genuinely overshot what the guest asked for (the
+# "coarse tick" the burst verdict describes); a ratio near 1.0 means the wait resolved close to
+# on time and cannot be the cause of clustered arrivals. #3013 measured ~x2.9 for a primitive that
+# WAS the cause; #3080 measured x1.02 for one that was not, on a title whose clustering was fully
+# explained by a -55% delivery-rate deficit instead. The threshold sits well clear of both.
+QUANTIZED_RATIO_THRESHOLD = 1.3
 
 # The device consumes `device_hz * channels * bytes_per_frame` bytes per second. The guest's
 # delivery rate against THAT number is the clock-drift measurement; a persistent deficit
@@ -58,9 +84,22 @@ def parse_streams(paths):
 
 def analyze(paths, port_filter, device_hz, channels, bytes_per_frame):
     per_port = {}
+    # name -> {"calls": int, "ratio_calls_sum": float}; mean ratio = ratio_calls_sum / calls.
+    # Weighted by calls (not averaged line-to-line) so a primitive with many more calls in one
+    # 5 s window is not diluted by a quiet window reporting the same primitive.
+    census = {}
     for path, line in parse_streams(paths):
         m = RECORD.search(line)
         if not m:
+            tm = TIMEDWAIT_RECORD.search(line)
+            if tm and tm.group(3):
+                name = tm.group(1)
+                calls = int(tm.group(2))
+                ratio = float(tm.group(3))
+                if calls > 0:
+                    slot = census.setdefault(name, {"calls": 0, "ratio_calls_sum": 0.0})
+                    slot["calls"] += calls
+                    slot["ratio_calls_sum"] += ratio * calls
             continue
         port = int(m.group(1))
         if port_filter is not None and port != port_filter:
@@ -83,7 +122,26 @@ def analyze(paths, port_filter, device_hz, channels, bytes_per_frame):
         slot["gaps"].append(gap_ms)
         slot["frames"].append(frames)
         slot["queued"].append(queued)
-    return per_port
+    return per_port, census
+
+
+def dominant_census(census):
+    """The most-called wait primitive's mean overshoot ratio, or None if no census was present.
+
+    Global to the process, not per port -- the census counts every timed wait regardless of which
+    audio port (if any) it paces -- so this is the best available evidence for a burst-clustering
+    verdict on any port, not a per-port measurement. Most-called rather than worst-ratio: on a
+    title that uses exactly one primitive (the common case -- see #3080, where usleep was the
+    ONLY one that ever appeared), that is the same primitive either way, and on a title using
+    several, the one actually driving the pacing is more likely the one called the most.
+    """
+    if not census:
+        return None
+    name = max(census, key=lambda k: census[k]["calls"])
+    calls = census[name]["calls"]
+    if calls <= 0:
+        return None
+    return {"name": name, "calls": calls, "ratio": census[name]["ratio_calls_sum"] / calls}
 
 
 def percentile(sorted_values, fraction):
@@ -93,7 +151,7 @@ def percentile(sorted_values, fraction):
     return sorted_values[index]
 
 
-def report_port(port, slot, device_hz, channels, bytes_per_frame):
+def report_port(port, slot, device_hz, channels, bytes_per_frame, census=None):
     gaps = sorted(slot["gaps"])
     queued = sorted(slot["queued"])
     frames_total = sum(slot["frames"])
@@ -188,9 +246,34 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame):
     if grain_ms > 0:
         bursts = sum(1 for g in gaps if g > 2 * grain_ms)
         if bursts > len(gaps) * 0.2 and mean_gap > 1.5 * grain_ms:
-            print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods --"
-                  " the mixer's wake is quantized (a timed wait resolving on a coarse tick),"
-                  " not a buffering defect. Fix the wait primitive's resolution.")
+            # This cadence shape (clustering beyond two grain periods) is what a quantized mixer
+            # wake looks like -- but it is also what a producer simply running below real time
+            # looks like, since its arrivals are spaced by production rather than by a wait. #3080:
+            # this exact code path asserted the wait-primitive cause on a title where the census
+            # measured the opposite (x1.02, i.e. not quantized) and a -55% delivery-rate deficit
+            # already explained the clustering. So the verdict is only as strong as the evidence
+            # available for THIS run: earned when a census is present, a named hypothesis when not.
+            if census is not None and census["ratio"] is not None:
+                if census["ratio"] < QUANTIZED_RATIO_THRESHOLD:
+                    print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods,"
+                          f" but the timedwait census RULES OUT a quantized wake -- {census['name']}"
+                          f" resolves at x{census['ratio']:.2f} ({census['calls']} calls), not a"
+                          " coarse tick. The clustering has some other cause -- see the delivery-rate"
+                          " verdict above if it fired -- and the wait primitive is not it.")
+                else:
+                    print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods,"
+                          f" and the timedwait census CONFIRMS a coarse wait -- {census['name']}"
+                          f" resolves at x{census['ratio']:.2f} ({census['calls']} calls) against its"
+                          " requested interval. The mixer's wake is quantized, not a buffering"
+                          " defect. Fix the wait primitive's resolution.")
+            else:
+                print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods --"
+                      " consistent with EITHER a quantized mixer wake (a timed wait resolving on a"
+                      " coarse tick) OR a producer delivering audio below real time (which also"
+                      " arrives in clusters). This cadence alone cannot tell them apart. Re-run with"
+                      " PROSPER_TIMEDWAIT_CENSUS=1 captured into the same log and check the dominant"
+                      " wait primitive's ratio: near 1.0 rules out quantization, well above it"
+                      " confirms the wait is the cause.")
 
 
 def main():
@@ -208,12 +291,14 @@ def main():
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
-    per_port = analyze(paths, args.port, args.device_hz, args.channels, args.bytes_per_frame)
+    per_port, census = analyze(paths, args.port, args.device_hz, args.channels, args.bytes_per_frame)
     if not per_port:
         print("no [audio-dbg] records found (run with PROSPER_AUDIO_DEBUG=1)")
         return 1
+    census_summary = dominant_census(census)
     for port in sorted(per_port):
-        report_port(port, per_port[port], args.device_hz, args.channels, args.bytes_per_frame)
+        report_port(port, per_port[port], args.device_hz, args.channels, args.bytes_per_frame,
+                    census_summary)
     return 0
 
 

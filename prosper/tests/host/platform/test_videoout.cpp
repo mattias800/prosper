@@ -933,6 +933,103 @@ int main() {
               "the exported origin IS the status grid's epoch (within ABI us quantisation)");
     }
 
+    // ---- #3075: the grid snap hides a dropped tick from PHASE; grid_boundaries_missed must not ---
+    // next_grid_deadline_ns() is phase-exact BY DESIGN under a stall of any length (see the #3024
+    // arms above), and that is the correct behaviour for scheduling. The cost is that its return
+    // value alone cannot tell a healthy pump from one silently running at a fraction of its rate:
+    // both land on real grid boundaries every single call. Reproduced BY HAND first, against the
+    // UNMODIFIED next_grid_deadline_ns(), before trusting that host::grid_boundaries_missed() (the
+    // fix) actually recovers what phase alone hides.
+    {
+        using prosper::host::next_grid_deadline_ns;
+        using prosper::host::grid_boundaries_missed;
+        const uint64_t P  = 16683350;      // the shared 59.94 Hz period
+        const uint64_t T0 = 1000000000;
+
+        // Reproduction: a SUSTAINED half-rate pump, built the same way vblank_pump() is -- each
+        // iteration feeds the previous call's own returned deadline back in as `now` for the next
+        // -- except every wait is made to overshoot by 1.5 periods, the #3074 Win32SleepFallback
+        // regime the issue names (a wait that does not re-check the clock overshoots past the very
+        // next boundary). This is not a one-off stall: it is the steady state of a pump running at
+        // half its nominal rate for its entire life.
+        uint64_t d = T0;
+        bool every_result_on_grid = true;
+        for (int i = 0; i < 40; i++) {
+            d = next_grid_deadline_ns(T0, d + P + P / 2, P);
+            every_result_on_grid &= (d - T0) % P == 0;
+        }
+        CHECK(every_result_on_grid,
+              "PRE-FIX SYMPTOM (#3075): a sustained half-rate pump still lands on-grid EVERY time");
+        CHECK(d == T0 + 80 * P,
+              "PRE-FIX SYMPTOM (#3075): after 40 half-rate iterations, phase alone reports exactly "
+              "80 periods elapsed -- indistinguishable, from the deadline alone, from a HEALTHY "
+              "80-tick pump reading the same field back. Nothing above this line can tell the two "
+              "apart, which is the entire defect");
+
+        // The fix: grid_boundaries_missed() reads the SAME sequence of deadlines the healthy-phase
+        // check above just used, and recovers the drop count next_grid_deadline_ns() necessarily
+        // discards -- without changing a single one of those returned deadlines.
+        uint64_t prev = T0, total_missed = 0, worst_gap = 0;
+        for (int i = 0; i < 40; i++) {
+            const uint64_t nxt = next_grid_deadline_ns(T0, prev + P + P / 2, P);
+            const uint64_t missed = grid_boundaries_missed(prev, nxt, P);
+            total_missed += missed;
+            worst_gap = std::max(worst_gap, missed);
+            prev = nxt;
+        }
+        CHECK(total_missed == 40,
+              "grid_boundaries_missed recovers exactly the 40 dropped ticks phase alone hid");
+        CHECK(worst_gap == 1,
+              "a sustained half-rate pump drops exactly one boundary per step, never a burst");
+
+        // Negative control, and the one that actually proves the discriminator: the SAME 60-tick
+        // ordinary-overshoot sequence the #3024 arms above already proved is a HEALTHY 60 Hz pump
+        // must report zero drops through this new path too. A measurement that fires on the healthy
+        // case as well would be worthless noise on every default run.
+        prev = T0; uint64_t healthy_missed = 0, healthy_worst = 0;
+        for (int i = 0; i < 60; i++) {
+            const uint64_t nxt = next_grid_deadline_ns(T0, prev + 120000, P);
+            const uint64_t missed = grid_boundaries_missed(prev, nxt, P);
+            healthy_missed += missed;
+            healthy_worst = std::max(healthy_worst, missed);
+            prev = nxt;
+        }
+        CHECK(healthy_missed == 0 && healthy_worst == 0,
+              "an ordinary 120us-overshoot run at full rate reports zero drops, ever");
+
+        // An isolated stall -- the #3024 arm's own five-period stall -- is reported as exactly the
+        // boundaries it skipped: not one (it is not a single missed tick), not zero (it is not free).
+        const uint64_t stall_prev = T0 + 3 * P;
+        const uint64_t stall_next = next_grid_deadline_ns(T0, stall_prev + 5 * P + 1000, P);
+        CHECK(grid_boundaries_missed(stall_prev, stall_next, P) == 5,
+              "an isolated five-period stall between two ticks is reported as five dropped "
+              "boundaries, matching its actual size");
+
+        // A THIRD of the rate (drop two of every three) must report 2 missed per step, not 1 -- a
+        // discriminator that only distinguishes "some drop" from "none" would still hide HOW BAD the
+        // degradation is, and the pump's own diagnostic reports a worst-gap figure for exactly this.
+        prev = T0; uint64_t third_missed = 0, third_worst = 0;
+        for (int i = 0; i < 30; i++) {
+            const uint64_t nxt = next_grid_deadline_ns(T0, prev + 2 * P + P / 2, P);
+            const uint64_t missed = grid_boundaries_missed(prev, nxt, P);
+            third_missed += missed;
+            third_worst = std::max(third_worst, missed);
+            prev = nxt;
+        }
+        CHECK(third_missed == 60 && third_worst == 2,
+              "a third-rate pump reports 2 dropped boundaries per step, distinguishing it from "
+              "half-rate rather than collapsing every degraded rate into one signal");
+
+        // Degenerate inputs must not crash, underflow, or divide by zero.
+        CHECK(grid_boundaries_missed(T0, T0, P) == 0,
+              "equal deadlines (no time passed) report zero");
+        CHECK(grid_boundaries_missed(T0 + P, T0, P) == 0,
+              "a 'next' earlier than 'prev' (should never happen) reports zero rather than "
+              "underflowing to a huge unsigned value");
+        CHECK(grid_boundaries_missed(T0, T0 + P, 0) == 0,
+              "a zero period reports zero rather than dividing by zero");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
