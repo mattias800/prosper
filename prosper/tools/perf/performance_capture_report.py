@@ -340,11 +340,13 @@ def summarize(records):
     # trigger is readback's SHARE of measured work, with a threshold deliberately well below the
     # 40% classification bar -- the whole point is to cover the gap under that bar.
     #
-    # The threshold is a judgement call and both ends of it are pinned by tests: a ~39% readback
-    # must warn (the motivating capture), and a 2%-of-total readback must stay silent, because a
-    # paragraph of warning attached to a rounding-level number is noise on every report and trains
-    # readers to skip the note in the cases that matter. Any nonzero readback is NOT the right
-    # trigger for that reason.
+    # The threshold is a judgement call, and what the tests pin is a BAND, not this constant: a
+    # 31%-of-measured-work readback must warn and a 1% one must stay silent, so any value in
+    # (0.02, 0.20] passes. 0.10 sits in that band and is not itself pinned -- a later change may
+    # move it within the band without any test noticing, which is the honest limit of the coverage.
+    # The quiet end is the one that earns its keep: a paragraph of warning attached to a
+    # rounding-level number is noise on every report and trains readers to skip the note in the
+    # cases that matter. Any nonzero readback is NOT the right trigger, for that reason.
     READBACK_NOTE_MIN_SHARE = 0.10
     readback_ms = classification_components.get("readback")
     material_readback = (
