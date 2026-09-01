@@ -143,6 +143,12 @@ const std::vector<std::string>& builtin_symbol_names() {
         "pthread_cond_wait","pthread_cond_signal","pthread_condattr_setclock","pthread_condattr_getclock",
         "pthread_condattr_setpshared","pthread_condattr_getpshared","pthread_self","pthread_once",
         // libkernel memory
+        // libSceSystemService. Registering a handler names a NID only inside the HLE registry; the
+        // NidDb this list feeds is what self_dump, nid_census and every other NID-resolving
+        // diagnostic read, so a name absent here still prints as a bare hash everywhere else. This
+        // one mattered: a title reporting its own crash showed up as `3s8cHiCBKBE` and needed a hand
+        // lookup against the PS5 3.20 stub table to read at all (#3119).
+        "sceSystemServiceReportAbnormalTermination",
         "sceKernelAllocateDirectMemory","sceKernelReleaseDirectMemory","sceKernelMapDirectMemory",
         "sceKernelMapNamedFlexibleMemory","sceKernelMapFlexibleMemory","sceKernelReserveVirtualRange",
         "sceKernelMunmap","sceKernelMmap","sceKernelAvailableDirectMemorySize","sceKernelGetDirectMemorySize",
