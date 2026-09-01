@@ -3656,7 +3656,8 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                                                    uint32_t virtual_lds_dwords,
                                                    const NggPassthroughLayout* passthrough,
                                                    bool allow_test_ngg_output_gate,
-                                                   bool allow_test_ngg_one_lane) {
+                                                   bool allow_test_ngg_one_lane,
+                                                   RecompileDiagnosticContext diagnostic) {
     const uint32_t passthrough_mask =
         pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
     std::vector<Rdna2Inst> ins;
@@ -3664,7 +3665,11 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
 
     SpirvCompute b;
-    b.diagnostic = {RecompileDiagnosticStage::Vertex, 0};
+    // The vertex stage recorded its rejects at address 0, and record_terminal_reject_reason()
+    // early-returns on a zero address -- so `last_terminal_reject_reason()` came back empty for
+    // EVERY vertex program and the unconditional skip line could only print `reason=unrecorded`.
+    // #3130 fixed exactly this for the fragment stage; the vertex half was left behind.
+    b.diagnostic = diagnostic;
     b.capture_position = capture_position;   // geometry-probe: mark gl_Position for xfb capture (gated)
     b.vertex_lds_dwords = std::min(virtual_lds_dwords, 16384u);
     b.vertices_per_instance = rt ? rt->vertices_per_instance : 0u;
@@ -3709,6 +3714,12 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             continue;
         const bool all_ones = in.src[0].kind == OperandKind::InlineInt &&
                               in.src[0].value == -1;
+        // Which instruction disqualified the model, not just that something did. The all-ones pair
+        // is lowerable on its own, so on a mixed program the reject surfaces at IT and names a pc
+        // that is not the cause -- Stray's 0x300f190000 rejects at pc=4 while the general-mask
+        // forms that disqualified it are at pc 277-286 (#3135).
+        if (!all_ones && b.vertex_general_mask_mbcnt_pc == UINT32_MAX)
+            b.vertex_general_mask_mbcnt_pc = in.pc;
         logical_mbcnt_invalid |= !all_ones;
         logical_mbcnt_lo |= all_ones && in.opcode == 0x365;
         logical_mbcnt_hi |= all_ones && in.opcode == 0x366;
@@ -4137,19 +4148,22 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt,
                                        const PixelInputMapping* pixel_inputs,
                                        bool capture_position,
-                                       uint32_t virtual_lds_dwords) {
+                                       uint32_t virtual_lds_dwords,
+                                       RecompileDiagnosticContext diagnostic) {
     return recompile_vertex_impl(code, dwords, rt, pixel_inputs, capture_position,
-                                 virtual_lds_dwords, nullptr, false, false);
+                                 virtual_lds_dwords, nullptr, false, false, diagnostic);
 }
 
 std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
     const uint32_t* code, size_t dwords) {
-    return recompile_vertex_impl(code, dwords, nullptr, nullptr, false, 0, nullptr, true, false);
+    return recompile_vertex_impl(code, dwords, nullptr, nullptr, false, 0, nullptr, true, false,
+                                 {RecompileDiagnosticStage::Vertex, 0});
 }
 
 std::vector<uint32_t> recompile_vertex_ngg_one_lane_for_test(
     const uint32_t* code, size_t dwords) {
-    return recompile_vertex_impl(code, dwords, nullptr, nullptr, false, 0, nullptr, false, true);
+    return recompile_vertex_impl(code, dwords, nullptr, nullptr, false, 0, nullptr, false, true,
+                                 {RecompileDiagnosticStage::Vertex, 0});
 }
 
 std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prolog_dwords,
@@ -4157,7 +4171,8 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
                                              const ShaderResourceTable* rt,
                                              const PixelInputMapping* pixel_inputs,
                                              bool capture_position,
-                                             uint32_t virtual_lds_dwords) {
+                                             uint32_t virtual_lds_dwords,
+                                             RecompileDiagnosticContext diagnostic) {
     const VertexPrologInfo info = rdna2_vertex_prolog_info(prolog, prolog_dwords);
     if (!info.valid || !main || !main_dwords) return {};
 
@@ -4167,14 +4182,15 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
         analyze_ngg_passthrough(prolog, info.prefix_dwords, main, main_span);
     if (passthrough.valid) {
         return recompile_vertex_impl(prolog, info.prefix_dwords, rt, pixel_inputs,
-                                     capture_position, virtual_lds_dwords, &passthrough, false, false);
+                                     capture_position, virtual_lds_dwords, &passthrough, false,
+                                     false, diagnostic);
     }
     std::vector<uint32_t> linked;
     linked.reserve(info.prefix_dwords + main_span);
     linked.insert(linked.end(), prolog, prolog + info.prefix_dwords);
     linked.insert(linked.end(), main, main + main_span);
     return recompile_vertex_impl(linked.data(), linked.size(), rt, pixel_inputs, capture_position,
-                                 virtual_lds_dwords, nullptr, false, false);
+                                 virtual_lds_dwords, nullptr, false, false, diagnostic);
 }
 
 } // namespace prosper::gpu

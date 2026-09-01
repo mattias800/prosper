@@ -582,7 +582,9 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt = nullptr,
                                        const PixelInputMapping* pixel_inputs = nullptr,
                                        bool capture_position = false,
-                                       uint32_t virtual_lds_dwords = 0);
+                                       uint32_t virtual_lds_dwords = 0,
+                                       RecompileDiagnosticContext diagnostic = {
+                                           RecompileDiagnosticStage::Vertex, 0});
 
 // Recompile a separately-installed vertex-fetch prolog and its main shader as one architectural
 // program. The validated tail transfer is replaced by fallthrough, preserving every SGPR/VGPR value
@@ -593,7 +595,9 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
                                              const ShaderResourceTable* rt = nullptr,
                                              const PixelInputMapping* pixel_inputs = nullptr,
                                              bool capture_position = false,
-                                             uint32_t virtual_lds_dwords = 0);
+                                             uint32_t virtual_lds_dwords = 0,
+                                             RecompileDiagnosticContext diagnostic = {
+                                                 RecompileDiagnosticStage::Vertex, 0});
 
 // Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
 // Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that

@@ -1676,16 +1676,21 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     if (stage == ShaderProgramStage::Vertex)
         // Geometry probe: decorate gl_Position only when the caller proved the VS is the last
         // pre-rasterization stage. Generated interpolation geometry stages own XFB themselves.
+        // Same provenance the fragment stage received in #3130: without the guest address the
+        // vertex stage's terminal reject is never RECORDED (record_terminal_reject_reason()
+        // early-returns on zero), so every vertex skip printed `reason=unrecorded`.
         return key.chain_code
             ? recompile_vertex_chain(code, code_size, key.chain_code->data(),
                                      key.chain_code->size(), resources,
                                      key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
                                      key.capture_position,
-                                     key.vertex_lds_dwords)
+                                     key.vertex_lds_dwords,
+                                     {RecompileDiagnosticStage::Vertex, program_address})
             : recompile_vertex(code, code_size, resources,
                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
                                key.capture_position,
-                               key.vertex_lds_dwords);
+                               key.vertex_lds_dwords,
+                               {RecompileDiagnosticStage::Vertex, program_address});
     if (stage == ShaderProgramStage::Fragment) {
         const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
             code, code_size,
