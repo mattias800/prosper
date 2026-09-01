@@ -227,6 +227,81 @@ def _compute_program_groups(records, limit=10, address_limit=8):
     }
 
 
+# The share a component must reach to WIN the classification. Named because two things depend on
+# it and it was previously a bare literal in one of them, so neither the dependency nor the value
+# was pinned by anything -- moving it passed the whole suite.
+CLASSIFICATION_EVIDENCE_SHARE = 0.40
+
+# Readback must reach this share of measured work before the harness-readback note is emitted.
+#
+# It sits BELOW the evidence bar by construction: the note exists to cover the gap under that bar,
+# a readback large enough to mislead but too small to win the verdict. That inequality is the real
+# invariant and is what the tests assert.
+#
+# One quarter of the bar is a CHOSEN fraction, not a derived one -- it came out of review as a
+# rationalisation for 0.10 rather than from anything about the data, and pinning it as an equality
+# would give a reviewer's off-hand ratio the authority of an invariant. Recorded as the reason the
+# value is what it is; the tests deliberately do not enforce the ratio.
+#
+# WHAT THE TESTS ACTUALLY PIN, measured per-arm rather than by exit code, because the two are not
+# the same question and reading only the exit code gets this wrong:
+#
+#   threshold     failing arm
+#   <= 0.020      test_non_readback_verdict_carries_no_readback_note   (2 ms / 2%, PRE-EXISTING)
+#   0.021-0.200   none
+#   >  0.200      test_readback_note_threshold_is_a_share_not_a_ranking (its 20% assertion)
+#
+# So the pinned band is (0.020, 0.200] and 0.10 is NOT itself pinned -- it can move anywhere in a
+# 10x range with no test objecting. Two corrections worth keeping, because the obvious reading of
+# the arms is wrong in both directions:
+#   * the LOWER bound is held by the pre-existing 2% test, NOT by the 1% arm added alongside this
+#     threshold. That arm passes at 0.011 and at 0.020; it never binds.
+#   * the UPPER bound is held by the 20% assertion, NOT by the 31% motivating arm. That arm's share
+#     is 0.3120 and it does not fail anywhere in the swept range.
+# The 1% and 31% arms still earn their place -- they hold verdict and GPU-present state constant so
+# the only variable is share, and the 31% one reproduces the capture that motivated the change --
+# but neither is what fixes the band, and a comment claiming otherwise sends the next reader to the
+# wrong test when they want to tighten it.
+# Deriving this FROM the bar means a bar mutation is a COMPOUND mutation: the threshold moves with
+# it, so at a bar of 0.80 or more the threshold leaves the (0.020, 0.200] band its own arms pin and
+# readback tests start failing for reasons that have nothing to do with the bar. Harmless for any
+# plausible bar value, and worth knowing before reading a wide sweep's failures.
+READBACK_NOTE_MIN_SHARE = CLASSIFICATION_EVIDENCE_SHARE / 4
+
+
+# The note's closing advice depends on whether readback DECIDED the verdict. "before acting on this
+# verdict" is right when the verdict IS readback; on a capture whose verdict is a decisive compute or
+# renderer-resource share it is wrong advice attached to a correct conclusion, which is worse than no
+# advice -- the reader is told to discard a finding the readback had no part in.
+# Verdicts that CANNOT flip when the readback is removed. Removing readback scales every other
+# component's share up by the same factor, so a component that already won still wins. A verdict
+# that exists precisely BECAUSE nothing won ("inconclusive"), or because measured work was small
+# against the wall window ("cpu-outside-renderer"), can and does flip -- measured on this change's
+# own motivating capture, where dropping the harness readback turns "inconclusive" into "compute
+# (1134.0 ms, 53%)". This module already records the same effect from hardware: #3152 saw a verdict
+# become renderer-resource with the graphics total halved once the capture ran through a real window.
+_VERDICTS_READBACK_CANNOT_FLIP = frozenset({
+    "compute", "renderer-resource", "gpu-device", "gpu-wait", "gpu-wait-overhead",
+})
+
+
+def _readback_note_tail(classification):
+    if classification == "readback":
+        # A full sentence, like the other four. It was a trailing subordinate clause until the
+        # callers grew their own terminating period, at which point it rendered as
+        # "...through a real window. before acting on this verdict." -- and no assertion could see
+        # it, because every arm used `assertIn` on a substring the break left intact.
+        return " Readback IS this capture's verdict, so there is nothing else here to act on."
+    if classification in _VERDICTS_READBACK_CANNOT_FLIP:
+        # Safe to reassure: this verdict survives the readback being removed.
+        return (f" The {classification} verdict above does not depend on it: removing the readback "
+                "raises every other share, so a component that already won still wins.")
+    # Not safe. Saying "the verdict is unaffected" here would invite trust in a verdict the harness
+    # may have produced, which is the opposite of what this note exists to prevent.
+    return (f" The {classification} verdict above may itself be an artefact of that readback -- it "
+            "is not a verdict some component won, so removing the readback can change it.")
+
+
 def summarize(records):
     header = records[0]
     footer = next(record for record in records if record.get("type") == "footer")
@@ -294,7 +369,7 @@ def summarize(records):
     if measured_total > 0:
         largest, cost = max(classification_components.items(), key=lambda item: item[1])
         share = cost / measured_total
-        if share >= 0.40:
+        if share >= CLASSIFICATION_EVIDENCE_SHARE:
             classification = largest
             reason = f"{largest} is the largest measured component ({cost:.1f} ms, {share:.0%})"
         elif cpu_cores is not None and cpu_cores >= 0.80 and wall_ms and measured_total < wall_ms * 0.40:
@@ -302,7 +377,8 @@ def summarize(records):
             reason = (f"the process used {cpu_cores:.2f} CPU cores while measured renderer/compute "
                       f"work covered only {measured_total / wall_ms:.0%} of the sampled wall window")
         else:
-            reason = "measured work is split across components; no component reaches the 40% evidence threshold"
+            reason = ("measured work is split across components; no component reaches the "
+                      f"{CLASSIFICATION_EVIDENCE_SHARE:.0%} evidence threshold")
     elif cpu_cores is not None and cpu_cores >= 0.80:
         classification = "cpu-outside-renderer"
         reason = (f"the process used {cpu_cores:.2f} CPU cores with no retained renderer/compute "
@@ -328,25 +404,42 @@ def summarize(records):
     # prosper-app arms one. The `PROSPER_TILECENSUS` readback trap (instrument trap 237) is a
     # different instrument that happens to share the mechanism.
     readback_note = None
-    if classification == "readback":
+    # Warn whenever readback is a LEADING component, not only when it wins the classification.
+    # A capture where readback is large but sits under the 40% evidence threshold is classified
+    # "inconclusive" -- and then prints a big number with no warning attached, which is the exact
+    # shape that sends a reader chasing the harness instead of the title. Measured on a Dragon
+    # Quest VII capture: readback=977.7ms against compute=1134.0ms, classified "inconclusive",
+    # note silent.
+    #
+    # Ranking is the wrong trigger and was the first attempt: a "is readback the max component"
+    # test stays silent at 977.7 vs 1134.0, which is precisely the case that misleads. So the
+    # trigger is readback's SHARE of measured work, with a threshold deliberately well below the
+    # 40% classification bar -- the whole point is to cover the gap under that bar.
+    #
+    # See READBACK_NOTE_MIN_SHARE at module scope for the threshold and what pins it.
+    readback_ms = classification_components.get("readback")
+    material_readback = (
+        isinstance(readback_ms, (int, float)) and measured_total > 0 and
+        readback_ms / measured_total >= READBACK_NOTE_MIN_SHARE)
+    if classification == "readback" or material_readback:
         adopted = _gpu_present_adopted(post)
         if adopted is None:
             readback_note = (
                 "this capture cannot say whether GPU present was adopted, so it cannot say whether "
                 "the readback is real or the harness copying every scanout frame to the CPU. Check "
-                "the run log for a GPU-present surface failure before acting on this verdict")
+                "the run log for a GPU-present surface failure." + _readback_note_tail(classification))
         elif adopted is False:
             readback_note = (
                 "GPU present was NOT adopted for this capture, so the frontend copied every scanout "
                 "frame to the CPU -- most often prosper-app under SDL_VIDEODRIVER=offscreen, which "
                 "needs VK_EXT_headless_surface. This readback is the harness, not the title. "
-                "Re-measure through a real window before acting on this verdict")
+                "Re-measure through a real window." + _readback_note_tail(classification))
         else:
             readback_note = (
                 "GPU present WAS adopted, so scanout readback is skipped and this readback is real "
                 "work -- non-deferred colour-target readback, storage writeback, or a copy forced by "
                 "authoritative_readback (every ordered DMA copy sets it). Chase it rather than "
-                "dismissing it as a harness artifact")
+                "dismissing it as a harness artifact.")
 
     pacing_note = None
     if rates["guest_fps"] is not None and rates["rendered_fps"] is not None:
