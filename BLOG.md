@@ -21,6 +21,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-01
 
+### The shader that hangs Astro Bot's world map can now be pulled out of a run by name
+
+No picture — this one is a tool. Astro Bot's GPU reset was narrowed to one vertex program,
+`0x5008efd00` ([#3193][i3193]), and then the obvious next step turned out to be impossible: the
+successful-shader dump named its files by content hash, so "give me the shader at that address" had
+no answer. It does now — the guest address is in the filename, and `PROSPER_SHADER_DUMP_PROGRAM`
+narrows a 4K run to one program ([#3196][i3196]).
+
+Pointed at Astro Bot, it produced that program's raw RDNA2 and four SPIR-V variants over a single
+guest stream. All four validate, so whatever hangs the GPU is not malformed SPIR-V. Why it hangs is
+still open; the bytes to answer it with are one command away instead of unavailable.
+
+[i3193]: https://github.com/mattias800/prosper/issues/3193
+[i3196]: https://github.com/mattias800/prosper/issues/3196
+
 ### The three getenv calls the profiler pointed at were the three we could not fix
 
 No picture — this one is pure CPU time. `getenv` costs 1.24% of Blue Prince's gameplay frame
