@@ -7806,8 +7806,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // consumer here — a sampled use with an unmapped format was already dropped.)
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
-                        : DecodedImageView{d.base, d.width, d.height, 0, false, 0, 0, 0,
-                                           0, 0, d.base_level == 0 && d.base_array == 0};
+                        : unmapped_format_image_view(d);
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
                         continue;

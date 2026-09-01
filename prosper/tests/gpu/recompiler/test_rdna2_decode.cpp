@@ -744,6 +744,49 @@ int main() {
               !rdna2_mimg_zero_mip_shape(
                   rdna2_decode_one(stray_load_mip_2d_nsa_dmask3_words, 3)),
           "Stray IMAGE_LOAD_MIP NSA shape rejects UNORM/GLC-set and dmask mutations");
+    // #3048: `rdna2_mimg_dynamic_mip_shape` is the GENERAL consecutive-address IMAGE_LOAD_MIP form,
+    // whose mip operand is a runtime value rather than something a proof may discard. It is
+    // deliberately free of the UNRM/GLC requirement -- Sonic Frontiers' stage kernels issue
+    // `f0040308` with both CLEAR and dmask 0x3, which is why the zero-mip shape above reports
+    // `shape=0` on them -- and it accepts any DMASK while still rejecting every modifier that moves
+    // the operand.
+    {
+        // dim:2D, dmask:0x3, UNRM/GLC clear, VADDR=v1: [x, y, mip] -> mip is v3.
+        const uint32_t frontiers_words[] = {0xf0040308u, 0x00000101u};
+        // The same op at dim:2D_ARRAY, VADDR=v1: [x, y, slice, mip] -> mip is v4. Consumed by no
+        // lowering yet; covered here so the header's advertised arm is exercised rather than dead.
+        const uint32_t dim5_words[] = {0xf0040328u, 0x00000101u};
+        uint32_t dynamic_vgpr = UINT32_MAX;
+        const Rdna2Inst frontiers = rdna2_decode_one(frontiers_words, 2);
+        CHECK(frontiers.opcode == 0x01u && frontiers.mimg_dim == 1u &&
+                  frontiers.mimg_dmask == 0x3u && !frontiers.mimg_unorm && !frontiers.mimg_glc &&
+                  !rdna2_mimg_zero_mip_shape(frontiers) &&
+                  rdna2_mimg_dynamic_mip_shape(frontiers, &dynamic_vgpr) && dynamic_vgpr == 3u,
+              "#3048: Sonic Frontiers' dmask:0x3 UNRM/GLC-clear IMAGE_LOAD_MIP 2D names v3 as its mip");
+        const Rdna2Inst dim5 = rdna2_decode_one(dim5_words, 2);
+        CHECK(dim5.opcode == 0x01u && dim5.mimg_dim == 5u &&
+                  rdna2_mimg_dynamic_mip_shape(dim5, &dynamic_vgpr) && dynamic_vgpr == 4u,
+              "#3048: the 2D_ARRAY form names the mip AFTER its preserved slice coordinate");
+        // Every rejection below is a modifier that moves the operand or changes its width, so the
+        // VGPR this function reports would not be the mip.
+        const uint32_t d16_words[] = {0xf0040308u, 0x80000101u};   // D16 packs the result
+        const uint32_t a16_words[] = {0xf0040308u, 0x40000101u};   // A16 packs the address
+        const uint32_t tfe_words[] = {0xf0050308u, 0x00000101u};   // TFE appends a status dword
+        const uint32_t lwe_words[] = {0xf0060308u, 0x00000101u};
+        const uint32_t plain_load_words[] = {0xf0000308u, 0x00000101u};  // opcode 0: IMAGE_LOAD
+        const uint32_t dim3d_words[] = {0xf0040310u, 0x00000101u};       // dim:3D
+        CHECK(!rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(d16_words, 2)) &&
+                  !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(a16_words, 2)) &&
+                  !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(tfe_words, 2)) &&
+                  !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(lwe_words, 2)) &&
+                  !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(plain_load_words, 2)) &&
+                  !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(dim3d_words, 2)),
+              "#3048: the dynamic-mip shape rejects D16/A16/TFE/LWE, a plain IMAGE_LOAD, and dim:3D");
+        // An NSA packet spells its addresses in the extra dwords, so the consecutive-VGPR
+        // arithmetic this function does would name the wrong register.
+        CHECK(!rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(stray_load_mip_2d_nsa_words, 3)),
+              "#3048: the dynamic-mip shape rejects the NSA address form");
+    }
     const uint32_t gta_pc10_vop2_word[] = {0x4a000804u};
     const uint32_t wide_vop3_words[] = {0xd5761e01u, 0x040a0100u};
     const uint32_t wide_mimg_words[] = {0xf0003f08u, 0x00050000u};

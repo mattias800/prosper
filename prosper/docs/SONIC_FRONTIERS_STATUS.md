@@ -570,11 +570,21 @@ changes nothing.
   `BASE_LEVEL` (`mip_chain_*`), because `gpu_addr`/`width`/`height` have already been shifted onto
   the selected level and nothing downstream could recover the rest. Captures serialize them at
   format v57; a pre-v57 file reads as "not modelled" and fails closed to one level.
+  **`gpu_replay` still declines this op**, and v57 does not change that: a replayed resource is
+  `host_data`-backed and its blob covers only the selected level, so the derivation fails closed
+  there. Materializing the chain on replay needs the capture to own the whole allocation's bytes —
+  a separate change. Do not take a capsule expecting to study the fetch offline yet.
 * **Reject-by-default.** Linear chains, a selected level packed in the tail, layered or volume
   views, DCC, block-compressed and converting formats, a shifted `BASE_LEVEL`, and `host_data`
   backing all keep the historical single-level image. A binding whose shape cannot carry the chain
   (imported/renderer-owned surfaces above all) is declined **fail-visibly** rather than silently
-  built with fewer levels than its compiled module addresses.
+  built with fewer levels than its compiled module addresses. **That decline is wider than it
+  needs to be** — it does not depend on the module actually issuing `IMAGE_LOAD_MIP`, because the
+  backend cannot see which ops a compiled module contains, so a sampling-only use of such a
+  resource on an RTT-aliased binding would be dropped for nothing. It reports as
+  `[compute-mip-chain] declined …` on a geometric schedule (`skip_image` alone warns once per
+  address for the whole process while the dispatch is dropped every frame, which reads as a
+  one-off when it is not).
 * **The LOD is clamped** to the materialized level count, which is what hardware does with a T#'s
   `LAST_LEVEL`.
 

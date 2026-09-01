@@ -239,6 +239,29 @@ struct DecodedImageView {
     // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
     bool supported = true;
 };
+// The view for a descriptor whose Gen5 format prosper cannot map. Such a binding can still
+// recompile as a format-free storage image, but no mip or slice placement is derivable for it, so
+// this builds the allocation base by hand and fails closed on any descriptor that selects something
+// other than level zero of slice zero: an unshifted base under a selected slice binds slice ZERO's
+// texels silently, and for a STORAGE image it also writes slice N's results into slice zero's guest
+// bytes.
+//
+// This exists as a function, rather than as a braced initializer at its one call site, because that
+// initializer was POSITIONAL: adding a field to DecodedImageView re-bound its last value and made
+// `supported` fall back to its default `true`, killing the guard with no compiler diagnostic
+// (`bool -> uint32_t` is a promotion, not a narrowing). Every field below is named. Do not convert
+// this back to an aggregate initializer, and do not add a positional one elsewhere.
+inline DecodedImageView unmapped_format_image_view(const DecodedImageDescriptor& d) {
+    DecodedImageView view;
+    view.base = d.base;
+    view.width = d.width;
+    view.height = d.height;
+    view.supported = d.base_level == 0 && d.base_array == 0;
+    // Everything else stays at its default: no mip offset, no tail, no layer stride, and no
+    // allocation-wide mip placement (zero element extent = not modelled, #3048).
+    return view;
+}
+
 // Copy the allocation-wide mip placement from a decoded view onto the resource it produced. Three
 // separate sites build a Texture/StorageImage ShaderResource from a (descriptor, view) pair; they
 // have drifted before (#2265), so the provenance travels through one function rather than three

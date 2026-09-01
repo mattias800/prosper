@@ -6826,6 +6826,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     volume_texels == static_cast<uint64_t>(r->width) * r->height &&
                     texel_bytes == r->mip_chain_bytes_per_block;
                 if (!chain_binding_shape) {
+                    // BLAST RADIUS, stated plainly: this decline is NOT conditional on the module
+                    // actually issuing IMAGE_LOAD_MIP. A module that only samples this resource
+                    // behaves identically at one level or N, so declining it is pure loss -- but
+                    // the backend cannot see which ops the compiled module contains, and the
+                    // alternative (build one level while the module may address N) is SPIR-V
+                    // undefined behaviour. The reachable case is a guest texture that declares a
+                    // placeable chain AND aliases a live render target, which the imported/
+                    // renderer-owned terms above exclude.
+                    //
+                    // `skip_image` warns once per address for the whole process while this drops
+                    // the dispatch EVERY frame, so a lane reading a black frame would find one
+                    // line from an hour ago and nothing since. Count it and re-report on a
+                    // geometric schedule: loud early, bounded later.
+                    static std::atomic<uint64_t> chain_shape_declines{0};
+                    const uint64_t occurrence =
+                        chain_shape_declines.fetch_add(1, std::memory_order_relaxed) + 1u;
+                    if ((occurrence & (occurrence - 1u)) == 0u)
+                        std::fprintf(stderr,
+                                     "[compute-mip-chain] declined binding=%u addr=0x%llx "
+                                     "levels=%u imported=%u rtt=%u (occurrence %llu; this "
+                                     "dispatch is dropped every frame)\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     declared_chain_levels, bi.imported ? 1u : 0u,
+                                     renderer_owned ? 1u : 0u,
+                                     (unsigned long long)occurrence);
                     skip_image(r, "declared mip chain not materializable for this binding shape");
                     break;
                 }
@@ -7877,6 +7902,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // could not see B's read at all, so that pair scored as no alias.
                         alias_seeds.push_back({r->gpu_addr, need});
                     }
+                    // Set only by the native straight-copy branch below, which is the only one that
+                    // can produce levels 1..N-1. See the detector after the conversion chain.
+                    bool mip_chain_levels_written = false;
                     const bool needs_sampled_upload = !bi.upload_skipped &&
                         !bi.compute_transfer_seed_borrowed;
                     if (needs_sampled_upload && sampled_dcc_fast_clear) {
@@ -8037,11 +8065,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             sampled_uint32_native || sampled_float32_native ||
                             sampled_float16_native || sampled_depth) {  // Native sampled texels
                             std::memcpy(upload, sampled_source, linear_bytes);
-                            if (bi.mip_levels > 1u)
+                            if (bi.mip_levels > 1u) {
                                 upload_guest_mip_chain_levels(
                                     mip_chain, bi.mip_staging_offsets,
                                     src - mip_chain.levels[0].byte_offset, r->tile_mode,
                                     bpt, upload);
+                                mip_chain_levels_written = true;
+                            }
                         } else if (f32) {                           // Native float channels + default fill
                             parallel_compute_texels(texels, linear_bytes + texels * 16u,
                                 [&](size_t begin, size_t end) {
@@ -8071,6 +8101,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         } else {                                    // Float16: half -> UNORM8 + default fill
                             sampled_float16_to_unorm8_range(
                                 sampled_source, nc, texels, upload);
+                        }
+                        // Two predicates decide "is this upload a straight per-texel copy": the
+                        // whitelist inside `shader_resource_compute_mip_chain_levels`, which chose
+                        // the level COUNT, and the branch condition above, which does the copying.
+                        // They agree today, and a one-line widening of either would leave levels
+                        // 1..N-1 as whatever the staging allocation happened to contain -- copied
+                        // into the image and sampled as if it were guest data. So rather than a
+                        // third copy of the predicate, this is a detector: the branch that can
+                        // write those levels is the only one that sets the flag, and a chain that
+                        // reaches here unwritten declines instead of uploading garbage.
+                        if (bi.mip_levels > 1u && !mip_chain_levels_written) {
+                            skip_image(r,
+                                       "declared mip chain levels not written by the sampled "
+                                       "conversion that ran (straight-copy predicates disagree)");
+                            break;
                         }
                     }
                 }

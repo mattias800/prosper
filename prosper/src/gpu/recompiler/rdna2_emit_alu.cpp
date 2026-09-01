@@ -7913,10 +7913,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv,
                         vread(cvg(in.mimg_dim == 5u && res->img_dim == 5u ? 3u : 2u)), out);
                     else if (dynamic_mip_load) {
-                        // Hardware clamps a MIMG mip selector to the descriptor's LAST_LEVEL. The
-                        // host image carries `materialized_mip_levels` of them, so clamp to that:
-                        // an out-of-range Lod in SPIR-V is undefined, and the guest is entitled to
-                        // the same saturating answer the console gives it.
+                        // Clamp the selector to the levels the host image actually has.
+                        //
+                        // The half that is certain: an out-of-range `Lod` operand is UNDEFINED in
+                        // SPIR-V, so some clamp is mandatory whatever the hardware does.
+                        //
+                        // The half that is inference: RDNA 2 ISA doc 70648 gives the image
+                        // descriptor BASE_LEVEL/LAST_LEVEL fields as the addressable level range,
+                        // and prosper reads `declared_mip_levels` off exactly that pair -- but the
+                        // guide's MIMG section does not spell out the saturating behaviour for an
+                        // out-of-range IMAGE_LOAD_MIP operand, and no live capture here exercises
+                        // one. Saturating to the last level is the reading consistent with the
+                        // field's purpose; returning zeros would be the other candidate.
+                        // CONFIDENCE: MED -- revisit if a title is measured issuing an
+                        // out-of-range mip.
                         // The register the shape predicate itself identified, not a second
                         // derivation of it: for this packet family they are the same VGPR, and
                         // reading it from one place keeps them that way.

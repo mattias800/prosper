@@ -1177,6 +1177,14 @@ int main(int argc, char** argv) {
     tail_resource.mip_tail_bytes = 65536; tail_resource.mip_tail_x = 64;
     tail_resource.mip_tail_y = 0;
     tail_resource.declared_mip_levels = 5;   // #1280: a non-default T#-declared mip-chain length
+    // #3048 v57: five DISTINCT, non-default values, so a transposition inside the tail is caught
+    // rather than merely a missing tail. Finding a field-ordering defect in this very change is why
+    // "the version constant round-trips" is not coverage.
+    tail_resource.mip_chain_element_width = 60;
+    tail_resource.mip_chain_element_height = 33;
+    tail_resource.mip_chain_bytes_per_block = 4;
+    tail_resource.mip_chain_max_level = 5;
+    tail_resource.mip_chain_base_level = 2;
     auto tail_table = std::make_shared<ShaderResourceTable>();
     tail_table->resources = {tail_resource};
     DrawItem tail_draw = draw; tail_draw.vrt = tail_table;
@@ -1196,6 +1204,51 @@ int main(int argc, char** argv) {
           "v16 capture round-trips packed-tail byte and coordinate placement exactly");
     CHECK(tail_loaded.draws[0].vrt.resources[0].resource.declared_mip_levels == 5,
           "#1280: v24 capture round-trips the T#-declared mip-chain length (was silently defaulting to 1)");
+    {
+        const ShaderResource& tail_chain = tail_loaded.draws[0].vrt.resources[0].resource;
+        CHECK(tail_chain.mip_chain_element_width == 60 &&
+                  tail_chain.mip_chain_element_height == 33 &&
+                  tail_chain.mip_chain_bytes_per_block == 4 &&
+                  tail_chain.mip_chain_max_level == 5 &&
+                  tail_chain.mip_chain_base_level == 2,
+              "#3048: v57 capture round-trips each allocation-wide mip placement field in order");
+        // A pre-v57 file has no placement at all, and every consumer must read that as "not
+        // modelled" rather than as a zero-extent allocation it could try to place levels in.
+        std::vector<uint8_t> v56_tail_bytes = tail_bytes;
+        const size_t v57_bytes = tail_loaded.draws[0].vrt.resources.size() * 5u * sizeof(uint32_t);
+        GpuCaptureFile v56_tail_loaded;
+        CHECK(v56_tail_bytes.size() > v57_bytes, "v57 mip-placement tail is removable");
+        if (v56_tail_bytes.size() > v57_bytes) {
+            v56_tail_bytes.resize(v56_tail_bytes.size() - v57_bytes);
+            v56_tail_bytes[8] = 56u;
+            v56_tail_bytes[9] = v56_tail_bytes[10] = v56_tail_bytes[11] = 0u;
+        }
+        CHECK(deserialize_gpu_capture(v56_tail_bytes, v56_tail_loaded, error) &&
+                  v56_tail_loaded.format_version == 56u &&
+                  v56_tail_loaded.draws[0].vrt.resources[0].resource
+                          .mip_chain_element_width == 0u &&
+                  v56_tail_loaded.draws[0].vrt.resources[0].resource
+                          .mip_chain_bytes_per_block == 0u &&
+                  v56_tail_loaded.draws[0].vrt.resources[0].resource
+                          .mip_chain_base_level == 0u,
+              "#3048: a v56 capture reopens with its mip placement explicitly not modelled");
+        // A half-written placement cannot locate a level, and reading one as if it could is the
+        // silent wrong-offset failure the provenance exists to prevent.
+        std::vector<uint8_t> partial_tail_bytes = tail_bytes;
+        CHECK(partial_tail_bytes.size() >= v57_bytes,
+              "v57 partial-placement fixture has a tail to corrupt");
+        if (partial_tail_bytes.size() >= v57_bytes) {
+            const size_t element_width_offset = partial_tail_bytes.size() - v57_bytes;
+            partial_tail_bytes[element_width_offset] = 0u;      // width 60 -> 0, height still 33
+            partial_tail_bytes[element_width_offset + 1u] = 0u;
+            partial_tail_bytes[element_width_offset + 2u] = 0u;
+            partial_tail_bytes[element_width_offset + 3u] = 0u;
+        }
+        GpuCaptureFile partial_tail_loaded;
+        CHECK(!deserialize_gpu_capture(partial_tail_bytes, partial_tail_loaded, error) &&
+                  error == "invalid mip-chain placement state",
+              "#3048: v57 reader rejects a partially present mip placement");
+    }
 
     ShaderResource msaa_resource{};
     msaa_resource.cls = ResourceClass::Texture; msaa_resource.binding = 4;

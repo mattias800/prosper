@@ -137,10 +137,16 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v56: extend the append-only RTT-seed format enum with native RGBA32F surfaces.
 // v57 (#3048): each resource's allocation-wide mip placement -- the level-zero element extent, the
 // bytes per block, the effective MAX_MIP, and the view's BASE_LEVEL. `declared_mip_levels` says how
-// MANY levels a T# declares; without these a replayed capture cannot say WHERE any level but the
-// selected one lives, so the compute backend would build a single-level image where the live run
-// built the declared chain and the recompiler would decline the very IMAGE_LOAD_MIP the capture was
-// taken to study. Pre-v57 files leave all five zero, read everywhere as "not modelled".
+// MANY levels a T# declares; these say WHERE they are, which nothing else preserves once
+// image_base_level_view has shifted gpu_addr/width/height onto the SELECTED level.
+//
+// What this does NOT yet do, so nobody plans around it: a replayed resource is host_data-backed and
+// its blob covers only the selected level's footprint, and the chain derivation declines any
+// host_data resource -- so gpu_replay still refuses IMAGE_LOAD_MIP exactly as it did before v57.
+// Making replay materialize the chain needs the capture to own the whole ALLOCATION's bytes, which
+// is a separate change. This tail is the descriptor half of it, recorded now so the placement is
+// not lost from every capsule taken in the meantime. Pre-v57 files leave all five zero, read
+// everywhere as "not modelled".
 constexpr uint32_t kVersion = 57;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;

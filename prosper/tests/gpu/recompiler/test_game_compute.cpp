@@ -2413,8 +2413,120 @@ int main() {
                   "live backend executes a dynamic-mip IMAGE_LOAD_MIP dispatch");
             CHECK(std::equal(chain_dst.begin(), chain_dst.end(), chain_level1_linear.begin()),
                   "IMAGE_LOAD_MIP at a runtime mip returns LEVEL ONE's own guest texels");
+            // The real anti-coincidence guard is that recompilation only succeeds through the
+            // dynamic-LOD path at all: with the backend reverted to one level the assertion above
+            // reddens while this one stays green, because an UNWRITTEN destination also differs
+            // from level zero. Keep both, and do not read the second as the discriminator.
             CHECK(!std::equal(chain_dst.begin(), chain_dst.end(), chain_level0_linear.begin()),
                   "level one is distinguishable from level zero in this fixture");
+            CHECK(std::none_of(chain_dst.begin(), chain_dst.end(),
+                               [](uint32_t value) { return value == 0x77777777u; }),
+                  "every destination texel was actually written by the dispatch");
+        }
+    }
+
+    // #3048: the SAME dynamic-mip lowering at DMASK 0x3. `rdna2_mimg_dynamic_mip_shape` widened
+    // DMASK from the zero-mip shape's {0x1, 0xf} to anything, and Sonic Frontiers' kernels issue
+    // exactly 0x3 against a two-channel surface -- so the two-component result mask, and the
+    // register the second component lands in, need their own executed arm. Word0 here is byte-equal
+    // to the word the [mimg-mip] diagnostic reports for `0x2005714000`: `f0040308`.
+    {
+        constexpr uint32_t RG_W = 256, RG_H = 256, RG_BPE = 8, RG_MAX_MIP = 8;
+        const uint32_t rg_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        const TiledMipLevelLayout rg_level0 = tiled_mip_level_layout(
+            RG_W, RG_H, RG_BPE, rg_tile, RG_MAX_MIP, 0);
+        const TiledMipLevelLayout rg_level1 = tiled_mip_level_layout(
+            RG_W, RG_H, RG_BPE, rg_tile, RG_MAX_MIP, 1);
+        const size_t rg_bytes = tiled_mip_chain_bytes(
+            RG_W, RG_H, RG_BPE, rg_tile, RG_MAX_MIP);
+        CHECK(rg_level0.supported && !rg_level0.in_tail && rg_level1.supported &&
+                  !rg_level1.in_tail && rg_bytes != 0,
+              "the dmask:0x3 fixture places levels zero and one outside the shared mip tail");
+
+        std::vector<uint8_t> rg_allocation(rg_bytes, 0x3c);
+        std::vector<uint32_t> rg_level0_linear(static_cast<size_t>(RG_W) * RG_H * 2u);
+        std::vector<uint32_t> rg_level1_linear(
+            static_cast<size_t>(RG_W / 2u) * (RG_H / 2u) * 2u);
+        for (size_t i = 0; i < rg_level0_linear.size(); ++i)
+            rg_level0_linear[i] = static_cast<uint32_t>(i * 2246822519u + 0x22222222u);
+        for (size_t i = 0; i < rg_level1_linear.size(); ++i)
+            rg_level1_linear[i] = static_cast<uint32_t>(i * 668265263u + 0x5c5c0000u);
+        tile_surface(rg_allocation.data() + rg_level0.byte_offset,
+                     reinterpret_cast<const uint8_t*>(rg_level0_linear.data()),
+                     RG_W, RG_H, rg_tile, 0, RG_BPE);
+        tile_surface(rg_allocation.data() + rg_level1.byte_offset,
+                     reinterpret_cast<const uint8_t*>(rg_level1_linear.data()),
+                     RG_W / 2u, RG_H / 2u, rg_tile, 0, RG_BPE);
+
+        // VDATA is v[0:1] for dmask 0x3, so the coordinates live at v2 upward and the store reads
+        // the SECOND returned component -- the one a dmask-0x1 arm can never observe.
+        const uint32_t dmask3_program[] = {
+            0x7e040300u,                     // v2 = x (VADDR base)
+            0x7e060280u,                     // v3 = y = 0
+            0x7e080281u,                     // v4 = mip = inline constant 1
+            0x7e0a0300u,                     // v5 = destination x
+            0x7e0c0280u,                     // v6 = destination y = 0
+            0xf0040308u, 0x00050002u,        // IMAGE_LOAD_MIP dmask:0x3 v[0:1], [v2,v3,v4], s[20:27]
+            0xbf8c3f70u,                     // s_waitcnt
+            0xf0200108u, 0x00020105u,        // IMAGE_STORE dmask:0x1 v1, [v5,v6], s[8:15]
+            0xbf810000u,                     // s_endpgm
+        };
+        std::vector<uint32_t> rg_dst(W, 0x66666666u);
+        ShaderResourceTable rg_rt = irt;
+        for (ShaderResource& resource : rg_rt.resources) {
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.sgpr_base = 20;
+                resource.fetch_pc = 5;
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 2;      // Sonic's surface is two-channel at 8 B/texel
+                resource.width = RG_W;
+                resource.height = RG_H;
+                resource.depth = 1;
+                resource.tile_mode = rg_tile;
+                resource.declared_mip_levels = RG_MAX_MIP + 1u;
+                resource.mip_chain_element_width = RG_W;
+                resource.mip_chain_element_height = RG_H;
+                resource.mip_chain_bytes_per_block = RG_BPE;
+                resource.mip_chain_max_level = RG_MAX_MIP;
+                resource.mip_chain_base_level = 0;
+                resource.proven_zero_mip = false;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(
+                    rg_allocation.data() + rg_level0.byte_offset);
+                resource.size = static_cast<uint32_t>(
+                    tiled_surface_bytes(RG_W, RG_H, rg_tile, 0, RG_BPE));
+            } else if (resource.binding == 5) {
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(rg_dst.data());
+                resource.size = static_cast<uint32_t>(rg_dst.size() * sizeof(uint32_t));
+            }
+        }
+        const std::vector<uint32_t> rg_spirv = recompile_valu(
+            dmask3_program, std::size(dmask3_program), 1, 0, &rg_rt);
+        CHECK(!rg_spirv.empty(),
+              "#3048: a dmask:0x3 IMAGE_LOAD_MIP with a runtime mip recompiles");
+        if (!rg_spirv.empty()) {
+            ComputeItem item;
+            item.spirv = rg_spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(rg_rt);
+            item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x200571bd00ull;
+            CHECK(prosper::frontend::execute_live_compute_items({item}),
+                  "#3048: live backend executes the dmask:0x3 dynamic-mip dispatch");
+            bool second_component_exact = true;
+            for (uint32_t x = 0; x < W; ++x)
+                second_component_exact &=
+                    rg_dst[x] == rg_level1_linear[static_cast<size_t>(x) * 2u + 1u];
+            CHECK(second_component_exact,
+                  "#3048: dmask:0x3 returns level one's SECOND component in the second VGPR");
+            CHECK(std::none_of(rg_dst.begin(), rg_dst.end(),
+                               [](uint32_t value) { return value == 0x66666666u; }),
+                  "#3048: every dmask:0x3 destination texel was actually written");
         }
     }
 

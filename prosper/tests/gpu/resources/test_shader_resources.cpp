@@ -1162,9 +1162,12 @@ int main() {
         ShaderResource over_declared = chain;
         over_declared.declared_mip_levels = 12;
         over_declared.mip_chain_max_level = 11;
-        CHECK(shader_resource_compute_mip_chain_levels(over_declared) <=
-                  full_mip_chain_levels(kWidth, kHeight),
-              "the materialized chain never exceeds the levels the extent can hold");
+        // Equality, not `<=`: a DECLINE (1) also satisfies "does not exceed the full chain", so the
+        // inequality would have passed without the clamp ever running.
+        CHECK(shader_resource_compute_mip_chain_levels(over_declared) ==
+                  full_mip_chain_levels(kWidth, kHeight) &&
+              full_mip_chain_levels(kWidth, kHeight) == 9u,
+              "a T# declaring more levels than the extent can hold is CLAMPED to the full chain");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
