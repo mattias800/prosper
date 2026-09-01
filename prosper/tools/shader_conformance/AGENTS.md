@@ -68,33 +68,41 @@ those counts alongside any clean result** — an exit code alone is not falsifia
 
 ### What a finding is, and what a clean result is
 
-These two directions do **not** carry the same weight, and the difference is structural.
+**The ISA walk is length-aware (#3040).** `decode_mimg_sites` decodes each instruction's real
+per-instruction length — mirroring the format dispatch and length rules in prosper's own
+`rdna2_decode.cpp` (`rdna2_decode_one` / `rdna2_walk`) — and only ever tests a dword for the MIMG
+top-6-bit encoding when it is genuinely the first dword of an instruction. An operand or trailing
+literal dword can no longer be misread as an instruction start, and a real MIMG's own address/NSA
+dwords can no longer be misread as separate instructions either.
 
-The ISA walk is **not length-aware**. A correct walk needs per-instruction lengths (prosper's own
-`rdna2_decode.cpp` has them, and records what mis-sizing costs: a phantom instruction that derails
-the stream walk). Without them, a literal constant whose top six bits happen to read as the MIMG
-encoding looks like an instruction.
+Before #3040 the walk tested *every* dword unconditionally, which was deliberately over-approximating
+in one direction (never hide a real MIMG) but paid for that by inventing MIMG instructions from
+operand and literal dwords whose top bits happened to alias the encoding — a finding for a defect
+that did not exist. Review of #3039 had already found the opposite failure mode in the pre-#3039
+walk (a phantom swallowing a real MIMG that followed it, scanning CLEAN); the length-aware walk fixes
+both directions at once, because both come from the same root cause — testing a dword that is not
+actually an instruction boundary. `self_test` pins both: a hand-built literal aliasing an arrayed DIM
+that must NOT be found, and the #3039 swallow sequence whose real MIMG must still be found (and, now,
+found *alone*).
 
-**Every dword is tested, including the one after a match.** Skipping it looks free — a real MIMG is
-at minimum two dwords, so its dword1 cannot start an instruction — but that is true of a *real*
-MIMG and false of a *phantom*, and a phantom that swallows the next dword can hide a genuine
-instruction. Review of #3039 demonstrated exactly that: an aliasing literal followed by a real
-`image_sample dim:2D_ARRAY` against a non-arrayed image scanned CLEAN. `--json` reports
-`phantom_risk` per shader (candidates sitting immediately after another candidate) so the suspicion
-is visible; it never suppresses a finding.
+Residual risk is different in kind, not degree: this Python walk is a **second, independent
+implementation** of `rdna2_decode_one`'s length dispatch rather than a call into it, so a future
+change to the real decoder's length rules needs a matching update here or the two can drift apart
+silently. #3040's own suggested fix — teaching `shader_histo` to emit real per-instruction `(pc,
+opcode, dim)` and having `scan.py` consume that instead — removes the duplication entirely and
+remains the more robust direction; it just was not required to fix the length-awareness defect
+itself. Until it lands:
 
-So the error is **one-directional**: the finder can invent an MIMG that is not there, and cannot hide
-one that is.
+- **A finding is still a candidate**, not a defect — confirm it against the shader before acting on
+  it. The remaining reason is `classify()`'s module-wide match (below), not the ISA walk.
+- **A clean result is sound for the classes it checks** — the walk can neither invent an instruction
+  nor miss a real one it can decode.
 
-- **A finding is a candidate**, not a defect. Confirm it against the shader before acting on it.
-- **A clean result is sound for the classes it checks** — a superset that found nothing means there
-  was nothing to find.
-
-Two further recall limits, both deliberate: `OpTypeImage` is parsed module-wide, so a shader that
-declares *any* arrayed image clears *every* arrayed sample in it (without per-binding attribution,
-claiming otherwise would report shaders that are actually correct); and `max_coord_arity` is
-reported for information only — it feeds no decision, and reads 0 when a coordinate is not built by
-`OpCompositeConstruct`.
+Two further recall limits, both deliberate and unrelated to the ISA walk: `OpTypeImage` is parsed
+module-wide, so a shader that declares *any* arrayed image clears *every* arrayed sample in it
+(without per-binding attribution, claiming otherwise would report shaders that are actually correct);
+and `max_coord_arity` is reported for information only — it feeds no decision, and reads 0 when a
+coordinate is not built by `OpCompositeConstruct`.
 
 ## Self-test
 
