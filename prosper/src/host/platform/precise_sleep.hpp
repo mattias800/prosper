@@ -22,6 +22,23 @@ enum class SleepBackend {
 // immediately if the deadline has already passed.
 void sleep_until_steady_ns(uint64_t deadline_ns);
 
+// The post-condition sleep_until_steady_ns() promises on EVERY backend: never return before
+// `now_ns() >= deadline_ns`. A single OS sleep primitive is not trusted to hit this on its own -- a
+// waitable timer can signal marginally early, and so can the ::Sleep()-backed fallback used when no
+// waitable timer is available (#3074) -- so a backend that cannot prove its own precision composes
+// this retry loop instead of calling its one-shot sleep directly and returning.
+//
+// `now_ns` and `sleep_once` are function pointers rather than the real clock/sleep calls so the
+// LOOP'S TERMINATION CONDITION is a pure function, testable on any host platform without executing
+// a real sleep or depending on _WIN32: a test supplies a fake clock and a fake "sleep" that just
+// advances it by a fixed amount, and asserts the loop keeps calling sleep_once until the fake clock
+// reaches the deadline -- never a wall-clock duration, which is a flake by construction on a loaded
+// host (see test_videoout.cpp's note on #1770/#1793, and next_grid_deadline_ns above for the same
+// pure-function-over-real-time precedent from #3075).
+void sleep_until_deadline_retry(uint64_t deadline_ns,
+                                 uint64_t (*now_ns)(),
+                                 void (*sleep_once)(uint64_t deadline_ns));
+
 SleepBackend sleep_backend();
 
 // A stable spelling of sleep_backend() for assertions and logs. Never null.

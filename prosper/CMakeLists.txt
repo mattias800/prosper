@@ -2045,6 +2045,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_videoout PRIVATE prosper_core)
   add_test(NAME videoout_queries COMMAND test_videoout)
 
+  # precise_sleep's deadline post-condition (#3074): every sleep_until_steady_ns() backend must
+  # never return before now_ns() >= deadline_ns. Win32SleepFallback did not re-check after its one
+  # OS sleep call, unlike the sibling high-resolution-timer path. CROSS-PLATFORM like test_videoout
+  # above and for the same reason: sleep_until_deadline_retry() is the pure-function loop the fix
+  # composes, deliberately extracted so its termination condition is testable with a fake clock and
+  # a fake sleep on any host, without executing the Windows-only code path or measuring wall time.
+  add_executable(test_precise_sleep tests/host/platform/test_precise_sleep.cpp)
+  target_link_libraries(test_precise_sleep PRIVATE prosper_core)
+  add_test(NAME precise_sleep_deadline_retry COMMAND test_precise_sleep)
+
   # Windows guest-execution substrate (exec_image_win.cpp): build boot_trace so the whole boot path
   # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
   # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
