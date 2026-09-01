@@ -76,7 +76,37 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return proc
 
 
+def _make_own_output_utf8() -> None:
+    """Reconfigure THIS process's own stdout/stderr to UTF-8, so what this tool prints is safe
+    regardless of the ambient locale of whoever launched it.
+
+    A THIRD locale boundary, found in review of #3079 by a test that runs this tool as a real
+    subprocess on real Windows Python: the checker-invocation fix (encoding="utf-8" on the parent
+    decode, PYTHONIOENCODING=utf-8 forced into the checker's own environment) makes what THIS
+    process reads from the checker always well-formed text -- verified directly against a genuine
+    Windows Python build, not reasoned about. But this process then re-prints that text to ITS OWN
+    sys.stdout/sys.stderr (the loop a few lines below), and nothing made THOSE safe: on an
+    unconfigured Windows host, absent PYTHONIOENCODING/PYTHONUTF8 in the environment of whoever
+    ran THIS tool, they still fall back to the ANSI codepage (cp1252). Measured on real Windows
+    Python (embeddable 3.12.7, run under Wine -- close enough to a genuine Win32 process to trust
+    for this): printing an arrow (U+2192, unrepresentable in cp1252) to an unforced stdout raises
+    UnicodeEncodeError (stdout's error handler is 'strict'); the identical content on stderr does
+    NOT raise (stderr defaults to 'backslashreplace') but is silently rewritten to the literal
+    7-character text `\\u2192` instead of the glyph -- content corruption with no error at all.
+
+    Fixing the checker boundary alone therefore does not fix the whole pipeline: a message that
+    survives decode intact can still be mangled or crash on the way back OUT. `reconfigure` is
+    tolerant of streams that are not real TextIOWrapper objects (a test redirecting stdout/stderr
+    to io.StringIO has no such method) so it is a no-op there rather than an AttributeError.
+    """
+    for name in ("stdout", "stderr"):
+        reconfigure = getattr(getattr(sys, name), "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def main() -> int:
+    _make_own_output_utf8()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base", default="origin/master", help="branch to merge into (default origin/master)")
     ap.add_argument("--head", default="HEAD", help="what to merge (default HEAD)")

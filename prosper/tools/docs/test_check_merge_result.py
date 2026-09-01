@@ -203,7 +203,7 @@ sys.exit(1)
 '''
 
 
-def checker_locale_mismatch(name: str) -> None:
+def checker_locale_mismatch(name: str, *, extra_env: dict[str, str] | None = None) -> None:
     with tempfile.TemporaryDirectory() as d:
         repo = scenario(BASE, table("1:a", "2:b", "3:c", "4:master's row"),
                          table("1:a", "5:the lane's row", "2:b", "3:c"), d)
@@ -213,10 +213,35 @@ def checker_locale_mismatch(name: str) -> None:
         (lone / "check_numbered_table.py").write_text(FAKE_LOCALE_CHECKER, encoding="utf-8")
         env = dict(os.environ)
         env.pop("PYTHONIOENCODING", None)  # deterministic regardless of the invoking shell
+        # Force the AMBIENT locale away from UTF-8 without depending on which extra locales the
+        # host happens to have installed: "C" is the one locale POSIX guarantees exists
+        # everywhere (no package to install), and PYTHONCOERCECLOCALE=0 stops Python from
+        # silently promoting it back to a UTF-8 one (PEP 538); PYTHONUTF8=0 rules out UTF-8 mode
+        # too. This is what lets this ONE case catch BOTH halves of the checker-invocation fix
+        # going missing, not just one (found in review of #3169): on a host whose own ambient
+        # default already happens to be UTF-8 -- this Linux box, and most modern hosts --
+        # removing ONLY check_merge_result.py's PARENT-side `encoding="utf-8"` was invisible,
+        # because the implicit fallback (`locale.getencoding()`) landed on UTF-8 anyway by
+        # coincidence. With the ambient default forced away from UTF-8 here, that fallback
+        # lands on ASCII instead, so the mutation is caught the same way removing the
+        # CHILD-side `PYTHONIOENCODING` override already was. (On Windows this block of env
+        # vars is a no-op for the same reason it doesn't need to do anything there -- the ANSI
+        # codepage is a system setting `LC_ALL` cannot reach, and Windows CI already defaults
+        # away from UTF-8 on its own; that default is what originally surfaced #3079.)
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+        env["PYTHONCOERCECLOCALE"] = "0"
+        env["PYTHONUTF8"] = "0"
+        if extra_env:
+            env.update(extra_env)
         proc = subprocess.run(
             [sys.executable, str(lone / TOOL.name), "--no-fetch", "--base", "master",
              "--head", "lane"],
-            cwd=repo, capture_output=True, text=True, env=env,
+            # encoding="utf-8" on THIS decode too: check_merge_result.py now guarantees its own
+            # stdout/stderr are UTF-8 regardless of ambient locale (the reprint fix below), so
+            # the caller reading it back should rely on that guarantee explicitly rather than
+            # hoping the machine running this very test ALSO happens to default to UTF-8.
+            cwd=repo, capture_output=True, text=True, encoding="utf-8", env=env,
         )
     out = (proc.stdout or "") + (proc.stderr or "")
     if proc.stdout is None or proc.stderr is None or "UnicodeDecodeError" in out:
