@@ -323,6 +323,13 @@ struct GpuState {
     }
 
 private:
+    // Rebuild `last_snapshot_` if a register write has dirtied it, and hand the (possibly reused)
+    // snapshot to the caller. Every draw/dispatch packet case in apply() calls this instead of
+    // carrying its own copy of the field list: five identical copies used to sit inline, so adding a
+    // field to GpuState meant remembering all five, and a snapshot that silently omits one reports
+    // the RESET DEFAULT for it at every draw (#3009).
+    const std::shared_ptr<const GpuState>& refresh_state_snapshot();
+
     // Snapshot sharing: one snapshot is reused by consecutive draws until a register write dirties it.
     std::shared_ptr<const GpuState> last_snapshot_;
     bool state_dirty_ = true;
