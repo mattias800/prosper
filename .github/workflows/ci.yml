@@ -63,6 +63,32 @@ jobs:
           echo "Vulkan-gated suite present; total registered: \
             $(ctest --test-dir prosper/build-ci -N | tail -1 | grep -oE '[0-9]+$')"
 
+      # Same defect class as the guard above, different gate — and deliberately a SEPARATE step so
+      # the error names the right cause. `vkprobe_hand_written_controls` is registered only when
+      # both `spirv-as` and `spirv-val` are found; CMake says so with `message(STATUS ...)`, which
+      # is honest and not load-bearing, because nothing fails when the case disappears.
+      #
+      # What is lost when it disappears is a CONTROL. `tools/vkprobe/shaders/` holds hand-written
+      # SPIR-V whose entire value is being valid by construction: it does the same storage-buffer
+      # loads as prosper's generated modules without being prosper's output, which is what let it
+      # decide #2945. An unvalidated control is worse than no control, because it still reads as
+      # one — the same shape as #1711, where a `spirv-val` gate reported PASS with no validator
+      # present.
+      #
+      # What actually stays green is NARROWER than "the spirv-tools install is dropped", and the
+      # distinction matters because the broad version makes this guard look redundant. Dropping the
+      # whole package turns the job red anyway: `spv_validate` is registered unconditionally and
+      # hard-fails when `spirv-val` is missing (tools/spv_validate/spv_validate.cpp:306-315 -- a
+      # deliberate fix, since it once printed PASS with no validator). The cases this guard is the
+      # only cover for are the ones that leave `spirv-val` present: `spirv-as` alone disappearing
+      # or being renamed, `python3` absent, or the CMake gate itself being edited.
+      - name: Verify the spirv-tools-gated control check is actually registered
+        run: |
+          if ! ctest --test-dir prosper/build-ci -N -R '^vkprobe_hand_written_controls$' | grep -q "Test *#"; then
+            echo "::error::vkprobe_hand_written_controls is not registered — spirv-as/spirv-val were not found, so the hand-written SPIR-V controls in tools/vkprobe/shaders are unvalidated (see #2960)"
+            exit 1
+          fi
+
       - name: Build
         run: cmake --build prosper/build-ci
 
