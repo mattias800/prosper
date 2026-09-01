@@ -6375,6 +6375,29 @@ int main() {
         return 1;
     }
     printf("  [ok]   v_interp_p2-only attribute stays smooth (no Flat decoration)\n");
+    // #3051: the guest's own PS_INPUT_CNTL FLAT_SHADE bit (0x400) must force Flat on attr0 even
+    // though THIS program reads it with ordinary v_interp_p1/p2, not v_interp_mov. On hardware,
+    // FLAT_SHADE makes the parameter cache deliver only the provoking vertex's value for that slot
+    // (P10=P20=0), so any VINTRP read of it -- smooth-opcode included -- yields a constant across
+    // the primitive. Before the fix, is_flat_shaded() was decoded into the guest's PS_INPUT_CNTL
+    // control word (agc_shader_layout.cpp) and never reached the recompiler: flat_attrs was
+    // populated ONLY from a v_interp_mov opcode scan, so this exact shader -- same bytes as
+    // ps_smooth above -- stayed un-Flat regardless of what the guest declared.
+    PixelInputMapping flat_control_inputs;
+    flat_control_inputs.controls[0] = 0x400u;   // FLAT_SHADE alone -- not the 0x420 passthrough form
+    flat_control_inputs.valid_mask = 1u << 0;
+    FragmentInterpolationLayout smooth_flat_layout = fragment_interpolation_layout(
+        ps_smooth, sizeof(ps_smooth)/sizeof(ps_smooth[0]), nullptr, &flat_control_inputs);
+    std::vector<uint32_t> smooth_flat_spv = recompile_fragment(
+        ps_smooth, sizeof(ps_smooth)/sizeof(ps_smooth[0]), nullptr, nullptr, UINT32_MAX,
+        &smooth_flat_layout);
+    if (smooth_flat_layout.flat_mask != 1u || smooth_flat_spv.empty() ||
+        !has_decoration(smooth_flat_spv, DecFlat)) {
+        printf("  [FAIL] guest FLAT_SHADE control word (#3051) did not force Flat on a v_interp_p1/p2 "
+               "varying (layout.flat_mask=%08x)\n", smooth_flat_layout.flat_mask);
+        return 1;
+    }
+    printf("  [ok]   guest PS_INPUT_CNTL FLAT_SHADE forces Flat on an ordinary VINTRP read (#3051)\n");
     // Mixed: attr0 read via BOTH P0 and smooth interpolation needs separate interface locations.
     const uint32_t ps_mixed[] = { 0xc80e0002u, 0xc8110002u, 0xf800000fu, 0x03030303u, 0xbf810000u };
     FragmentInterpolationLayout mixed_layout = fragment_interpolation_layout(

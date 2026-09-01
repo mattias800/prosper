@@ -399,6 +399,34 @@ instruction later, at `bf8a0000` (`s_barrier`, pc=8) — the **generic NGG merge
 which is item 2 of the Recommendation list above and a frontier rather than a missing opcode. See
 `YAKUZA_JUDGMENT_BRINGUP.md`.
 
+## Fragment varyings never got SPIR-V `Flat` from the guest's own FLAT_SHADE bit — **FIXED** (2026-09-01)
+
+`AgcShaderSemantic::is_flat_shaded()` was decoded into the guest's PS_INPUT_CNTL control word
+(`agc_shader_layout.cpp:98`/`:123`, the `0x400` FLAT_SHADE bit) and then discarded: `flat_attrs`, the
+only thing that decorated a fragment Input variable `Flat`, was populated from exactly one source —
+`VINTRP opcode == 2` (`v_interp_mov`, #152/#897) — so an attribute the guest declared flat-shaded but
+the shader happened to read with an ordinary `v_interp_p1`/`v_interp_p2` pair stayed
+smooth-interpolated. On hardware FLAT_SHADE makes the parameter cache deliver only the provoking
+vertex's value for that slot (P10=P20=0), so *every* VINTRP read of it is a constant across the
+primitive regardless of opcode; Vulkan needs the `Flat` decoration to reproduce that.
+
+`FragmentInterpolationLayout` now carries `flat_mask`, from the new
+`PixelInputMapping::effective_flat_mask()` (mirrors `effective_passthrough_mask()`'s shape),
+computed in `fragment_interpolation_layout()` alongside `passthrough_mask` and unioned with the
+existing `flat_attrs` set in `frag_input()` — the two sources are unioned, not one substituted for
+the other, since either alone misses cases the other catches. It also had to be threaded into the
+`InterpolationCacheKey` memo (`gpu_executor.cpp`), which keyed on shader identity plus
+`passthrough_mask` alone: without `flat_mask` in that key, two draws sharing one fragment shader's
+bytes but different guest FLAT_SHADE state could answer from a stale layout computed for the other
+draw's flat-ness — a caching defect the fix itself would have introduced silently.
+
+No title in the corpus was found to exercise the bit before this fix — #3051's own investigation
+measured 224,363 live `[interp]` control words on *Tomb Raider I-III Remastered* with none setting
+`0x400` — so this closes a latent correctness gap rather than a live regression. `test_rdna2_spirv_struct`
+pins it: the same smooth-only bytes as the pre-existing "stays smooth" negative case are recompiled
+again with a synthetic `PixelInputMapping` control word carrying only `0x400`, and the emitted module
+must now carry a `Flat` decoration it did not have before. #3051
+
 ## Ruled out
 
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead

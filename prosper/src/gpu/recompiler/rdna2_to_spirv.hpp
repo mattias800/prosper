@@ -244,6 +244,24 @@ struct PixelInputMapping {
         return mask & valid_mask;
     }
 
+    // Slots whose SPI_PS_INPUT_CNTL.FLAT_SHADE bit (0x400, GFX10/RDNA2 doc 70648) is set (#3051).
+    // On hardware this makes the parameter cache deliver only the provoking vertex's value for that
+    // slot (P10=P20=0), so EVERY read of it -- including an ordinary v_interp_p1/p2 pair, not only
+    // v_interp_mov -- yields a constant across the primitive. This is a property of the SLOT the
+    // guest declared, independent of which VINTRP opcode the shader happens to use to read it; the
+    // recompiler's separate v_interp_mov detection (rdna2_to_spirv.cpp) recognises flat-ness from
+    // the shader's own instruction choice; this recognises it from the guest's declared semantic.
+    // The two must be unioned, not one substituted for the other, because either alone misses cases
+    // the other catches.
+    uint32_t effective_flat_mask() const {
+        uint32_t mask = 0;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            if (!(valid_mask & (1u << input))) continue;
+            if (controls[input] & 0x400u) mask |= 1u << input;
+        }
+        return mask;
+    }
+
     uint32_t ambiguous_passthrough_mask() const {
         uint32_t mask = 0;
         for (uint32_t input = 0; input < controls.size(); ++input) {
@@ -317,6 +335,11 @@ struct FragmentInterpolationLayout {
     uint32_t attribute_mask = 0;                                  // attributes consumed by VINTRP
     uint32_t smooth_mask = 0;                                     // attributes consumed by P1/P2
     uint32_t passthrough_mask = 0;                                // explicit inputs exposing raw vertex values
+    // Attributes the guest's PS_INPUT_CNTL declares FLAT_SHADE for (#3051), from
+    // PixelInputMapping::effective_flat_mask(). Every such attribute's SPIR-V Input variable is
+    // decorated Flat in recompile_fragment regardless of which VINTRP opcode reads it -- see that
+    // helper's comment for why this must be unioned with, not replace, the v_interp_mov detection.
+    uint32_t flat_mask = 0;
     bool requires_geometry = false;
     bool valid = true;
 
