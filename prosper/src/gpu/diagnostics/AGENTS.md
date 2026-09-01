@@ -4,7 +4,7 @@
 with nothing armed, code in this folder can be removed or rate-limited without changing a single
 rendered pixel.
 
-**One entry breaks the stronger form of that rule and you must know about it.**
+**Two entries break the stronger form of that rule and you must know about them.**
 `compute_parent_walk_suspicious()` in `compute_parent_walk.cpp` reaches the site in
 `execute/gpu_executor.cpp` that prints `[compute-parent-walk] DIAGNOSTIC-ONLY skip suspicious`
 and then **does not run the dispatch** — grep `DIAGNOSTIC-ONLY skip suspicious`, which is unique
@@ -13,11 +13,21 @@ there, so the longer form matches nothing. It is env-gated, so a default boot is
 merely observing. `compute_parent_walk.hpp` states this boundary; do not read the folder name as a
 guarantee.
 
+`draw_program_skip` is the second, and it is deliberate rather than incidental: armed with
+`PROSPER_SKIP_DRAW_PROGRAM=0xADDR`, the live renderer withholds every draw using that shader program
+from the GPU. It is the graphics counterpart of `PROSPER_COMPUTE_SKIP_PROGRAM`, and it exists
+because a draw that hangs the device cannot be studied any other way — the context is gone before
+any other instrument reports. Unset, it costs one `empty()` test per draw and changes nothing.
+`draw_program_skip.hpp` states the four limits a reader of a skipped run cannot see in the output;
+read them before quoting a result. Its companion `PROSPER_DRAW_PROGRAM_CENSUS` is observation only.
+
 - `diagnostic_selectors` — choosing what to observe.
 - `diag_ratelimit` — rate limiting. **Check a diagnostic's rate limit before quoting its volume as a
   frequency**; several phantom findings came from reading a capped count as a real one.
 - `watch_list`, `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute
   parentage.
+- `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw
+  that uses it.
 
 Two standing cautions, both learned expensively:
 

@@ -1183,6 +1183,49 @@ It is ordered **after** `trace_compute_item` and `maybe_dump_traced_compute_spir
 a program that hangs the GPU without losing the device. Combined with `PROSPER_COMPUTELOG_CODE` /
 `PROSPER_COMPUTELOG_SPIRV`, a recompiler change can be A/B'd by module hash at zero device cost.
 
+**`PROSPER_SKIP_DRAW_PROGRAM=0xADDR[,0xADDR...]` — decline GRAPHICS draws by shader PROGRAM
+identity.** The counterpart of the compute selector above, and it exists for the same reason: one
+draw can hang the GPU, RADV then cancels the whole context, and every later submit fails with
+`VK_ERROR_DEVICE_LOST` naming a *victim*. Astro Bot's world-map reset was misattributed to compute
+for exactly that reason — the `RADV_DEBUG=hang` dump puts the last command-processor trace point
+immediately before a `DRAW_INDEX_2`.
+
+An address is matched against a draw's vertex/ES program, its NGG main continuation, and its pixel
+program, and the matched stage is reported. Parsing is the strict `0x`-only list parser, so a bare
+decimal or a stray comma arms **nothing** and says so rather than producing a confident negative
+about a program nobody selected. Armed, it announces itself once and prints each decline as
+`[draw-decline] program=0x… stage=vs|vs-chain|ps reason=skipped-by-selector count=N …` — first eight
+per (program, stage), then powers of two, with the ordinal on every line.
+
+**Do not read a skipped run as "the frame minus that draw".** Four limits, none visible in the
+output:
+
+- **Later passes sample the hole.** The renderer caches a pass's pixels under `CB_COLOR0_BASE` and
+  injects them when a later draw samples that address. Decline the draw that fills a target and the
+  composite that reads it does not fail — it succeeds against stale or empty pixels.
+- **A pass whose every draw is declined renders nothing, not even its clear.** The backend returns
+  an empty image for an empty draw list, and a group's clear colour comes from its first item
+  whether or not that item was declined. The present layer then serves the previously retained
+  frame, which on screen looks like the frame rendered.
+- **Only draws that reach the live renderer can be declined** — not one the recompiler rejected or
+  whose descriptor contract failed. Naming such a program produces no line, and silence is not proof
+  the selector matched.
+- **An address names a PROGRAM, not a draw.** Every draw using it goes, routinely thousands a frame.
+
+It is ordered **last** in the per-draw build — after resource resolution and after the
+`[render]`/`[rtt]`/`[draw-program]` per-draw lines (instrument trap 166). A declined draw is
+therefore still fully realized, validated and logged; only the Vulkan draw call is withheld.
+
+**`PROSPER_DRAW_PROGRAM_CENSUS=1` is where its input comes from.** One `[draw-program] NEW …` line
+per distinct (vs, vs-chain, ps) triple, then that triple at powers of two — bounded by the program
+count rather than the draw count, so it is usable on a 4K title where `PROSPER_RTTLOG` is a
+firehose. It is not a teardown report on purpose: the run it exists for ends in a device loss.
+
+The older **`PROSPER_SKIP_DRAW="N[,N...]"`** drops draws by the submit-local semantic `draw_index`.
+That ordinal is not stable across frames, so it cannot name "every draw that runs this shader" —
+use it to test a specific suspected draw within one captured submit, and the program selector above
+for anything that has to hold across frames.
+
 `PROSPER_PROVENANCE_DIM=WxH` retains every decoded `CB_COLOR0_BASE` write across submits, then reports
 the last matching writer whenever a draw samples an image of that size. Descriptor resolution can be
 limited to likely target submits with `PROSPER_PROVENANCE_MIN_DRAWS=N`; color-target history is still

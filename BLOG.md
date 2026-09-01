@@ -21,6 +21,19 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-01
 
+### Astro Bot's world map stops killing the GPU, and the draw that does it has a name
+
+No picture: what the world map renders is still the nebula backdrop we already published. What
+changed is that the run no longer dies there.
+
+Loading the world map took the whole GPU down — a driver-level hard recovery, after which every
+frame was the same frozen picture for the rest of the run. The message blamed a compute program,
+but that program was just the first thing to fail *after* the device was already gone. It was a
+single **draw**, and there was no way to ask which one: prosper could decline a compute program by
+name but not a graphics one. It can now, and bisecting thirty-two candidates took four runs — with
+one draw declined, a five-minute run has zero device losses and keeps producing new frames the whole
+way. ([#3193](https://github.com/mattias800/prosper/issues/3193))
+
 ### The three getenv calls the profiler pointed at were the three we could not fix
 
 No picture — this one is pure CPU time. `getenv` costs 1.24% of Blue Prince's gameplay frame
