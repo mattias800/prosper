@@ -52,6 +52,24 @@ the render test suite, and the sites are pinned so they cannot quietly grow back
 
 [i3094]: https://github.com/mattias800/prosper/issues/3094
 
+### The compute path waits 19-38% of its wall clock on a fence, and pipelining it cannot help
+
+No picture — this is a negative, and an expensive one to have found the slow way.
+
+Three UE titles spend a fifth to a third of their wall clock inside `vkWaitForFences` on the compute
+path, with `vkQueueSubmit` at about 1% everywhere. That reads as an obvious win: stop waiting on each
+dispatch, overlap them, take the time back. A dispatch ring was built for it and works correctly.
+
+It buys nothing, for a reason no tuning changes. On these routes the guest submits roughly **one
+dispatch per batch** — 23,294 dispatches across ~23,400 batches on *Stray* — and the drain at the end
+of each batch is mandatory, because the guest may read its own memory as soon as the submit returns.
+Every slot is emptied immediately after it is filled, so the ring never overlaps anything. Throughput
+moved 67.5 → 68.5 fps, which is noise; the only real effect was less variance.
+
+The falsification is written down rather than the code being merged, because a default-off switch
+whose own measurement says it can never fire is worse than no switch. What is *not* ruled out is
+deferring across batches — that is where the sized win still lives, and nobody has tried it.
+
 ## 2026-08-31
 
 ### Stray's splash runs 66% faster, and the title screen now holds 65 fps
