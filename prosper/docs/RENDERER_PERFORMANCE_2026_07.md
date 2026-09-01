@@ -1144,6 +1144,27 @@ resource-ownership scheduling rather than reordering by operation type.
   render passes and layouts, so stable application-level pipeline keys/lifetimes are needed first.
 - Reordering compute and graphics by type is not valid. The corrected capture graph proves real
   producer/consumer edges in the representative frame.
+- **A dispatch ring cannot overlap anything WITHIN a batch, because the end-of-batch drain is
+  mandatory** (2026-09-01, [#3157](https://github.com/mattias800/prosper/issues/3157),
+  implementation [#3161](https://github.com/mattias800/prosper/pull/3161), closed unmerged). The
+  hypothesis was well motivated and the sizing was real: an `LD_PRELOAD` interposer put
+  `vkWaitForFences` at **19.6-37.9% of wall** across three UE titles (Stray `PPSA02101` 37.9%,
+  Little Nightmares III `PPSA05143` 33.0%, Dragon Quest VII `PPSA17942` 19.6%), with `vkQueueSubmit`
+  at ~1% everywhere -- so batching *submits* is dead, and ~160 us per dispatch is scheduling latency
+  with the GPU idle. An alias-guarded ring was built and is correct: 315/315 at depths 1, 3 and 8,
+  zero faults across five interleaved 55 s Stray runs.
+  It does not deliver the sized win, and the reason is structural rather than a tuning failure. On
+  this route the guest submits roughly **one dispatch per batch** -- **23,294 dispatches across
+  ~23,400 batches** on Stray -- and the drain at the end of each batch is **mandatory**, because the
+  guest may read its memory as soon as the submit returns. Every slot is therefore drained
+  immediately after it is filled, so the ring never overlaps anything. Measured throughput: medians
+  67.5 -> 68.5 fps, within noise; the only clear effect is **reduced variance**, and what little
+  gain exists comes from per-slot command pools, not from pipelining.
+  **What this does NOT rule out:** deferring **across** batches. That is where the sized win still
+  lives, and it is untried -- it needs a guest-visibility contract the ring does not have. Do not
+  read this row as "pipelining the compute path is dead"; read it as "a within-batch ring is dead,
+  and the dispatches-per-batch ratio is the number to measure before building the next one."
+
 
 ## Windows cross-submit texture write watch
 
