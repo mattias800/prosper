@@ -8,6 +8,7 @@ using prosper::frontend::should_report_texture_decode_miss;
 using prosper::frontend::should_report_texture_decode_hit;
 using prosper::frontend::block_compressed_cube_source_size;
 using prosper::frontend::layered_array_source_size;
+using prosper::frontend::texcommit_scan_extent;
 using prosper::frontend::texture_decode_cache_candidate;
 using prosper::frontend::texture_decode_miss_reason;
 using prosper::frontend::texture_decode_miss_is_expensive_block;
@@ -130,6 +131,41 @@ int main() {
                 layered_array_source_size(0u, 352256u, 256u) == 0u);
     CHECK_NAMED("array_span_fails_closed_on_overflow",
                 layered_array_source_size(4096u, UINT64_MAX / 2u, 8u) == 0u);
+
+    // #3053: PROSPER_TEXCOMMIT scanned the DECODED byte count (`nb`) over the SOURCE address,
+    // overshooting on any block-compressed texture (BC7 decodes 1 source byte/texel to 4 RGBA8
+    // bytes) and further on an array (multiplied again by the layer count). These are the reported
+    // real numbers: Tomb Raider I-III Remastered's 512x512 BC7 world atlas, 256 tiled layers
+    // (tile_mode 5 == SW_4KB_S, matching the issue's own "tile=5" log line).
+    prosper::gpu::ShaderResource tomb_raider_bc7_array{};
+    tomb_raider_bc7_array.cls = prosper::gpu::ResourceClass::Texture;
+    tomb_raider_bc7_array.gpu_addr = 0x20491cc000ull;
+    tomb_raider_bc7_array.format = prosper::gpu::DataFormat::Bc7;
+    tomb_raider_bc7_array.num_components = 4u;
+    tomb_raider_bc7_array.img_dim = 5u;   // graphics 2D-array base-slice view
+    tomb_raider_bc7_array.width = tomb_raider_bc7_array.height = 512u;
+    tomb_raider_bc7_array.depth = 256u;
+    tomb_raider_bc7_array.tile_mode = 5u;
+    const uint64_t tomb_raider_footprint =
+        prosper::gpu::gpu_capture_resource_footprint(tomb_raider_bc7_array);
+    // What the OLD (buggy) TEXCOMMIT scanned: nb = tw * th * decoded_bpp(RGBA8 == 4) * layers --
+    // exactly the 268,435,456 the issue reports for this texture.
+    constexpr uint64_t tomb_raider_decoded_nb = 512ull * 512ull * 4ull * 256ull;
+    CHECK_NAMED("tomb_raider_bc7_array_decoded_nb_matches_the_reported_overshoot",
+                tomb_raider_decoded_nb == 268435456ull);
+    CHECK_NAMED("tomb_raider_bc7_array_source_footprint_matches_the_reported_extent",
+                tomb_raider_footprint == 67108864ull);
+    CHECK_NAMED("tomb_raider_bc7_array_source_footprint_is_a_quarter_of_decoded_nb",
+                tomb_raider_decoded_nb == 4u * tomb_raider_footprint);
+    // The actual regression guard: PROSPER_TEXCOMMIT must scan the SOURCE footprint, never `nb`.
+    // This fails if `texcommit_scan_extent()` (or its live_renderer.cpp caller) is ever reverted to
+    // pass the decoded byte count instead of `gpu_capture_resource_footprint()`.
+    CHECK_NAMED("texcommit_scans_the_source_footprint",
+                texcommit_scan_extent(tomb_raider_footprint) == tomb_raider_footprint);
+    CHECK_NAMED("texcommit_never_scans_the_decoded_byte_count",
+                texcommit_scan_extent(tomb_raider_footprint) != tomb_raider_decoded_nb);
+    // A non-array, non-BC texture's declared size is unaffected: nothing to overshoot.
+    CHECK(texcommit_scan_extent(65536u) == 65536u);
 
     if (!failures) std::printf("texture_decode_diagnostic: OK\n");
     return failures ? 1 : 0;

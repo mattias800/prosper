@@ -4843,27 +4843,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // level's backgrounds read ~0% committed, they're GPU-DMA'd pages the CPU never
                         // touched, so we read zeros -> the scene samples black (#300 black-gameplay probe).
                         if (PROSPER_ENV_ON("PROSPER_TEXCOMMIT")) {
+                            // Walk the SOURCE extent, never `nb` (the DECODED byte count computed just
+                            // above for `texture_pixels`): for a block-compressed format `nb` is 4x+ the
+                            // real guest bytes (BC7 decodes 1 source byte/texel to 4 RGBA8 bytes), and an
+                            // array multiplies that again by the layer count. Scanning `nb` over
+                            // `sampled_source_addr` both mis-measured "committed" (it counted whatever
+                            // guest memory happened to follow the real texture) and read guest memory
+                            // past the real allocation (#3053). `gpu_capture_resource_footprint()` is the
+                            // same T#-driven source-byte computation the capture/replay path already uses
+                            // for this resource, so it is correct here too regardless of format.
+                            const size_t src_bytes = texcommit_scan_extent(
+                                prosper::gpu::gpu_capture_resource_footprint(r));
                             const size_t PG = 0x10000; size_t committed = 0;
                             for (uint64_t a = sampled_source_addr;
-                                 a < sampled_source_addr + nb; a += PG)
+                                 a < sampled_source_addr + src_bytes; a += PG)
                                 if (a >= 0x1000 && prosper_reserved_range_state(a) != 0) committed += PG;
                             static std::set<uint64_t> tcseen;
                             if (tcseen.insert(r.gpu_addr).second) {
                                 // Also sample the first 8 dwords and count non-zero bytes over the whole
-                                // surface: zero content => the texture was allocated but never filled (a
-                                // GPU-side upload/copy we don't execute); non-zero => it's a decode/tiling
-                                // problem. tile_mode tells tiled vs linear.
+                                // SOURCE surface (src_bytes, not nb): zero content => the texture was
+                                // allocated but never filled (a GPU-side upload/copy we don't execute);
+                                // non-zero => it's a decode/tiling problem. tile_mode tells tiled vs linear.
                                 uint32_t w0[8] = {0}; size_t nzb = 0;
                                 if (committed) {
                                     const uint8_t* p =
                                         (const uint8_t*)(uintptr_t)sampled_source_addr;
                                     for (int i = 0; i < 8; i++) w0[i] = ((const uint32_t*)p)[i];
-                                    for (size_t i = 0; i < nb; i += 997) nzb += (p[i] != 0);   // sparse scan
+                                    for (size_t i = 0; i < src_bytes; i += 997) nzb += (p[i] != 0);   // sparse scan
                                 }
-                                fprintf(stderr, "[texcommit] tex 0x%llx %ux%u f%u tile=%u nb=%zu committed=%zu%% "
-                                        "nz~%zu/%zu first=%08x %08x %08x %08x\n",
-                                        (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format, r.tile_mode, nb,
-                                        nb ? (size_t)(100 * committed / nb) : 100, nzb, nb/997,
+                                fprintf(stderr, "[texcommit] tex 0x%llx %ux%u f%u tile=%u nb=%zu src=%zu "
+                                        "committed=%zu%% nz~%zu/%zu first=%08x %08x %08x %08x\n",
+                                        (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format, r.tile_mode,
+                                        nb, src_bytes,
+                                        src_bytes ? (size_t)(100 * committed / src_bytes) : 100, nzb,
+                                        src_bytes / 997,
                                         w0[0], w0[1], w0[2], w0[3]);
                             }
                         }
