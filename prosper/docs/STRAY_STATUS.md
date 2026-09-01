@@ -159,7 +159,7 @@ investigation down the `no-effect` path.
 
 | failure | stage | reject |
 | --- | --- | --- |
-| 1, 2 | vertex `0x300f190000` | `v_mbcnt_lo/hi_u32_b32` with **SGPR masks** (`s4`/`s5`, `s6`/`s7`) at pc 277-286 |
+| 1, 2 | vertex `0x300f190000` | `v_mbcnt_lo/hi_u32_b32` cross-lane, rejected at **pc=4** -- see the correction below |
 | 3 | fragment `0x30be800000` | MIMG `op=0x1`, `recompile-reject-mimg-address extra=1` at pc=134 |
 | 6-9 | fragment `0x300c010000` | `s_mov_b32 s0, m0` — `scalar-data-reject pc=37 special=s124 tracked=0` |
 | 10 | compute `0x300e390000` | the same `s_mov_b32 sX, m0` at pc=157, behind a `nested-backedge-in-body` loop reject at pc=688 |
@@ -167,13 +167,29 @@ investigation down the `no-effect` path.
 Two more fragment programs fail in other draws of the same frame: `0x300e500000` (`unsupported=29`,
 first reject pc=20) and `0x3011560000` (`unsupported=1`, first reject pc=383).
 
-The vertex one is the deepest. `0x300f190000` contains **both** MBCNT forms: the canonical all-ones
-lane-id pair at pc 4/7, which prosper can lower, *and* four general **SGPR-mask** MBCNTs at pc 277-286,
-which need real cross-lane mask state in a vertex stage. `rdna2_to_spirv.cpp` fails those closed on
-purpose — its comment says the wave approximations are "an exception for the one captured Astro
-wrapper, not a property of the GS_ALLOC_REQ opcode" — and the presence of a non-all-ones form is
-exactly what sets `logical_mbcnt_invalid` and disqualifies the `ngg_logical_lane` model. So this is a
-wave-semantics-in-vertex frontier, not a missing opcode.
+The vertex one is the deepest, and **two things recorded here were wrong**; both were re-measured on
+2026-09-01 against the same capsule (#3135).
+
+`0x300f190000` contains **both** MBCNT forms: the canonical all-ones lane-id pair at pc 4/7 *and* four
+general **SGPR-mask** MBCNTs at pc 277-286. The reject is at **pc=4**, not at 277-286 -- the all-ones
+pair is lowerable on its own, and the presence of a non-all-ones form anywhere in the program is
+exactly what sets `logical_mbcnt_invalid` and disqualifies the whole-program `ngg_logical_lane` model,
+so the failure surfaces at an instruction that is not the cause. The reject line now names the
+disqualifying pc (`mode=unsupported-in-stage reason=mbcnt-cross-lane stage=vertex form=all-ones
+wave=none disqualified-by-general-mask-pc=277`).
+
+**And MBCNT is not the frontier.** With the MBCNT satisfied by a throwaway probe, the live-config
+`gpu_replay --retry-failed-stage 1:1` reject moves ten instructions, to `pc=14 ds_write_b32`
+(`--retry-failed-chain 1`: `pc=116 ds_read2_b32`). The program is a **merged NGG ES+GS threadgroup**,
+not a vertex shader: 288 instructions carrying LDS traffic at four offsets, three `s_barrier`s,
+`s_bcnt1_i32_b64` x2, `s_pack_ll_b32_b16`, two `v_add_nc_u32_dpp row_shr` cross-wave scans,
+`v_readlane_b32` x2, `s_sendmsg(MSG_GS_ALLOC_REQ)` and `exp prim`. It computes an NGG
+vertex/primitive compaction: per-wave popcounts published to LDS, a DPP prefix sum across waves, and
+`v_mbcnt` for the within-wave prefix. `rdna2_to_spirv.cpp` fails all of it closed on purpose -- its
+comment says the wave approximations are "an exception for the one captured Astro wrapper, not a
+property of the GS_ALLOC_REQ opcode". **The gap is a missing WAVE, not a missing lowering**: a Vulkan
+vertex stage has neither shared memory nor any promise that a subgroup is the guest wave, so the
+honest home for this program is a mesh shader. See `RECOMPILER_REMAINING.md` § Ruled out.
 
 **Reproducing any of it takes seconds, not a boot:**
 
@@ -311,6 +327,19 @@ drops still discard the background.
     V# — the `0x0004dfac…` constant family `RESOURCE_BINDING.md` already names. Do not restart this
     from the recompiler. See `RESOURCE_BINDING.md` § Ruled out, and note the row there recording why
     the `[udcand]` "implied seed" offset is *not* a safe fix.
+
+- **"Vertex `0x300f190000` is blocked on `v_mbcnt` having no vertex-stage lowering, so giving the
+  vertex shell a general SGPR-mask MBCNT path recompiles it."** **Half falsified, and the surviving
+  half is not implementable in the vertex shell.** With MBCNT satisfied by a throwaway probe the
+  live-config reject moves ten instructions -- `--retry-failed-stage 1:1` to `pc=14 ds_write_b32`,
+  `--retry-failed-chain 1` to `pc=116 ds_read2_b32`. The program is a merged **NGG ES+GS
+  threadgroup**: LDS at four offsets, three `s_barrier`s, `s_bcnt1_i32_b64` x2,
+  `s_pack_ll_b32_b16`, two `v_add_nc_u32_dpp row_shr` scans, `v_readlane_b32` x2,
+  `s_sendmsg(MSG_GS_ALLOC_REQ)` and `exp prim` -- MBCNT is one of eight wave/workgroup primitives it
+  needs, first only in program order. And a subgroup-based lowering would not be exact anyway: the
+  vertex shell's guest lane is MODELLED as the flattened invocation index, and Vulkan does not
+  promise a subgroup is that set of lanes. **The gap is a missing wave, not a missing lowering.**
+  #3135, and `RECOMPILER_REMAINING.md` § Ruled out for the full argument.
 
 - **"The 4K title background is black because its asset never loads, or loads late."** Falsified, and
   by three sources that share no code. The pak read delivers the bytes: `PROSPER_APR_VERIFY`

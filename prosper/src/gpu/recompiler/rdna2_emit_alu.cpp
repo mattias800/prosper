@@ -4910,6 +4910,58 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ? b.sel(high, b.uconst(32), lane)
                     : b.sel(high, b.ibin(Op_ISub, lane, b.uconst(32)), b.uconst(0));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, val(in.src[1]), count);
+            } else if (in.opcode == 0x365 || in.opcode == 0x366) {
+                // Cross-lane V_MBCNT that none of the four lowerings above covers. RDNA2 ISA
+                // (doc 70648) defines it as
+                //     ThreadMask = (1 << lane) - 1
+                //     dst = countbits(src0 & ThreadMask[31:0 | 63:32]) + src1
+                // -- a prefix population count over the lanes of THIS wave. Every arm above needs a
+                // lane set to count over, and gets one a different way:
+                //   * the all-ones arms need only THIS lane's index, because the count of set bits
+                //     below lane L in an all-ones mask is L;
+                //   * `ngg_one_lane`'s wave is one lane, so no lane precedes and either half
+                //     contributes zero for ANY mask;
+                //   * compute and fragment reduce over a real peer set -- LDS + barriers, or a
+                //     subgroup whose exact width the module declares.
+                //
+                // A generic vertex shell has none of those. Its guest lane id is MODELLED as the
+                // flattened vertex/instance invocation index (`guest_lane_id()` in
+                // rdna2_to_spirv_internal.hpp), and nothing in Vulkan promises that the invocations
+                // sharing a subgroup are the wave_size consecutive flattened indices that model
+                // calls one guest wave. A subgroup reduction here would therefore count over a
+                // DIFFERENT set of lanes and return a well-formed wrong slot index, which is the
+                // silent-miscompile shape this file exists to avoid -- so it stays fail-visible.
+                //
+                // What changes here is only that the failure NAMES itself. The reject line's `mode`
+                // otherwise reports `unresolved-operand`, whose own contract at the reject site is
+                // "the lowering exists and the descriptor is the defect" (#2412) -- the opposite of
+                // the truth for a stage-unsupported cross-lane op, and a census reads it as a
+                // resource-table problem. #3135.
+                const char* form = "other-mask";
+                if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1)
+                    form = "all-ones";
+                else if (in.src[0].value == 126 || in.src[0].value == 127) form = "exec";
+                else if (in.src[0].value == 106 || in.src[0].value == 107) form = "vcc";
+                else if (in.src[0].kind == OperandKind::SGPR) form = "sgpr-mask";
+                char reason[192];
+                if (b.is_vertex && b.vertex_general_mask_mbcnt_pc != UINT32_MAX &&
+                    std::strcmp(form, "all-ones") == 0)
+                    // The instruction that failed is lowerable on its own; what disqualified the
+                    // whole-program flattened-lane model is a general-mask MBCNT further down. Name
+                    // THAT pc, or the next reader spends the investigation at this one.
+                    std::snprintf(reason, sizeof reason,
+                                  "mbcnt-cross-lane stage=vertex form=all-ones wave=none "
+                                  "disqualified-by-general-mask-pc=%u",
+                                  b.vertex_general_mask_mbcnt_pc);
+                else
+                    std::snprintf(reason, sizeof reason,
+                                  "mbcnt-cross-lane stage=%s form=%s wave=none",
+                                  b.is_vertex ? "vertex"
+                                              : (b.is_fragment ? "fragment" : "compute"),
+                                  form);
+                b.stage_reject_pc = in.pc;
+                b.stage_reject_reason = reason;
+                ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)

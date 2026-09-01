@@ -5986,14 +5986,28 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // else, so a census cannot group them by SHADER -- which is the unit that matters,
                     // since 24,485 skipped GTA V draws turned out to be 43 distinct shaders. The first
                     // code dword plus the span identifies one cheaply and stably.
+                    // A third `mode`. The emitter sets `stage_reject_*` when it DECODED the
+                    // instruction, resolved every operand, and still cannot lower it in THIS stage
+                    // -- a cross-lane operation in a shell with no guest wave. Neither existing
+                    // value describes that: `unknown-encoding` sends the reader to write an
+                    // emitter that already exists, and `unresolved-operand` sends them to the
+                    // resource table, which is not involved. The reason itself is appended so the
+                    // ONE terminal line records the cause; a second line would be recorded after
+                    // this one and overwrite it (#3135).
+                    const bool stage_unsupported =
+                        b.stage_reject_pc == in.pc && !b.stage_reject_reason.empty();
                     log_recompile_diagnostic(
                         b.diagnostic, "recompile-reject", "terminal",
-                        "sh=%08x/%zu mode=%s pc=%u words=%s fmt=%d op=0x%x "
+                        "sh=%08x/%zu mode=%s%s%s pc=%u words=%s fmt=%d op=0x%x "
                         "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
                         "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
                         "sext=%d/%d",
                         dwords ? code[0] : 0u, dwords,
-                        handled ? "unresolved-operand" : "unknown-encoding",
+                        stage_unsupported
+                            ? "unsupported-in-stage"
+                            : (handled ? "unresolved-operand" : "unknown-encoding"),
+                        stage_unsupported ? " reason=" : "",
+                        stage_unsupported ? b.stage_reject_reason.c_str() : "",
                         in.pc, reject_words_text(in).c_str(), (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
                         in.src[0].value, (int)in.src[0].kind,
