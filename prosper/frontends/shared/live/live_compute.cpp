@@ -308,6 +308,41 @@ namespace {
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
 std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<uint64_t> g_dcc_post_writeback_promotions{0};
+
+// #3157 alias census (PROSPER_COMPUTE_ALIAS_CENSUS=1, default OFF).
+//
+// Measures how often a dispatch seeds from guest bytes the PREVIOUS dispatch wrote back. That
+// overlap is what makes the obvious fix for the per-dispatch fence wait unsound: deferring
+// writebacks to batch the waits would let the later dispatch seed from stale guest memory.
+// The rate bounds the achievable win -- if consecutive dispatches usually alias, a
+// correctness-preserving pipeline drains every time and gains nothing.
+//
+// Compute submits are serialized (one AGC submit executes at a time), so the previous-writeback
+// set needs no lock; the counters are atomic only so the summary can be read from atexit.
+prosper::frontend::ComputeAliasCensusCounters g_alias_census{};
+std::vector<prosper::frontend::ComputeGuestRange> g_alias_prev_writes;
+
+bool alias_census_enabled() {
+    static const bool on = std::getenv("PROSPER_COMPUTE_ALIAS_CENSUS") != nullptr;
+    return on;
+}
+
+void report_alias_census() {
+    const auto& c = g_alias_census;
+    if (c.dispatches == 0) {
+        std::fprintf(stderr, "[alias-census] no dispatch declared a guest seed source\n");
+        return;
+    }
+    std::fprintf(stderr,
+                 "[alias-census] dispatches_with_seeds=%llu aliasing=%llu (%.1f%%) "
+                 "seed_ranges=%llu write_ranges=%llu\n",
+                 static_cast<unsigned long long>(c.dispatches),
+                 static_cast<unsigned long long>(c.aliasing_dispatches),
+                 100.0 * static_cast<double>(c.aliasing_dispatches) /
+                     static_cast<double>(c.dispatches),
+                 static_cast<unsigned long long>(c.seed_ranges),
+                 static_cast<unsigned long long>(c.write_ranges));
+}
 std::atomic<uint64_t> g_dcc_forced_seed_allocation_reuses{0};
 std::atomic<uint64_t> g_dcc_post_writeback_replacements{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
@@ -5385,6 +5420,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     for (size_t i = 0; i < buffers.size(); ++i)
         buffers[i].descriptor_index = buffer_descriptor_indices[i];
     std::vector<BoundImage> images(image_descriptors.size());
+    // #3157: this dispatch's guest seed sources and writeback targets, collected only when the
+    // alias census is armed so a default run pays nothing.
+    std::vector<prosper::frontend::ComputeGuestRange> alias_seeds, alias_writes;
     std::vector<VkBuffer> staging(image_descriptors.size(), VK_NULL_HANDLE);          // upload/readback
     std::vector<VkDeviceMemory> staging_memory(image_descriptors.size(), VK_NULL_HANDLE);
     std::vector<VkDeviceSize> staging_bytes(image_descriptors.size(), 0);
@@ -7222,6 +7260,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.guest_bytes = guest_bytes;
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
+                if (alias_census_enabled() && compute_guest_range_is_real({r->gpu_addr, guest_bytes})) {
+                    // A binding that reads nothing from guest memory cannot alias: `src` is null
+                    // exactly when the seed is skipped or the source is renderer-owned. The
+                    // `r->gpu_addr` guard is the same rule the buffer loop applies -- address 0 is
+                    // a synthesized null binding, not a guest range.
+                    if (src) alias_seeds.push_back({r->gpu_addr, guest_bytes});
+                    // The writeback writes up to guest_bytes at r->gpu_addr (see below). This arm
+                    // is unconditional inside the `bi.storage` branch that encloses it; the old
+                    // `if (bi.storage)` here was dead and read as if it discriminated something.
+                    alias_writes.push_back({r->gpu_addr, guest_bytes});
+                }
                 // The writeback still writes up to guest_bytes at r->gpu_addr, so a guest-backed
                 // target must be a valid mapped range even when the SEED read is skipped (#1122
                 // review B2): keep the guard for the writeback target, not the seed source.
@@ -7711,6 +7760,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 } else {
                     const size_t need = sampled_guest_need;
                     const uint8_t* src = sampled_guest_source;
+                    // KNOWN GAP, recorded rather than papered over: the DCC fast-clear path is
+                    // NOT covered, and it is excluded by accident rather than by argument.
+                    // `sampled_guest_source` is assigned only inside `if (!sampled_dcc_fast_clear)`,
+                    // so a fast-clear sample never reaches here -- yet it does read guest memory,
+                    // through `r->metadata_addr`, and materializes the whole surface from it, while
+                    // the writeback writes that same plane. That is a real producer->consumer
+                    // channel missing from BOTH sides of the census, so the rate is a lower bound.
+                    // Covering it needs the metadata range, not `gpu_addr`, which is a larger
+                    // change than this instrument warrants; #3157 carries it.
+                    if (alias_census_enabled() && src && need) {
+                        // A SAMPLED binding reads guest memory and never writes back, so it
+                        // contributes a seed range and no write range. Omitting these was the
+                        // census's blind spot and it hid the archetypal case: dispatch A writes a
+                        // storage image at X, dispatch B *samples* X. The storage-only census
+                        // could not see B's read at all, so that pair scored as no alias.
+                        alias_seeds.push_back({r->gpu_addr, need});
+                    }
                     const bool needs_sampled_upload = !bi.upload_skipped &&
                         !bi.compute_transfer_seed_borrowed;
                     if (needs_sampled_upload && sampled_dcc_fast_clear) {
@@ -8984,6 +9050,54 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 5);
         if (!vk_ok(vkEndCommandBuffer(command), "command-end")) break;
+        if (alias_census_enabled()) {
+            // Storage buffers alias through guest memory exactly as images do, so a guard that
+            // saw only the image path would be a correctness hole rather than a tradeoff. An
+            // `alias_of` entry shares an earlier entry's guest range and would double-count.
+            for (const auto& b : buffers) {
+                // Address 0 is not a guest address. An explicit null V# entry is bound as a
+                // 4-byte zero source backed by a STACK-LOCAL array (see `null_buffer_seed`), and
+                // that synthesis deliberately keeps `gpu_addr == 0` -- its own comment says the
+                // point is to bind a null buffer "without inventing a guest address". Letting it
+                // through here would invent one anyway: two consecutive dispatches that each hold
+                // a writable null array entry both produce {0, 4}, which overlaps itself, and the
+                // census would report a FABRICATED alias at a non-address. Not a bias -- a false
+                // positive, and a systematic one on descriptor-array titles.
+                if (!b.resource ||
+                    !prosper::frontend::compute_guest_range_is_real({b.resource->gpu_addr, b.guest_bytes}))
+                    continue;
+                if (b.guest_bytes == 0 || b.alias_of != SIZE_MAX) continue;
+                // NOT `!b.upload_skipped`. That flag means "the cached GPU copy still matches
+                // guest memory" (see its assignment: `submit_unchanged || (watches_complete &&
+                // dirty_chunks.empty())`), not "this binding does not read guest bytes". A bound
+                // buffer with a guest range reads that range whether or not the copy needed
+                // refreshing -- and under a deferred writeback the watch reports CLEAN precisely
+                // because the writeback has not landed yet, so gating on it would score the exact
+                // hazard being measured as "not a seed" and bias the rate down.
+                alias_seeds.push_back({b.resource->gpu_addr, b.guest_bytes});
+                if (b.writable)
+                    alias_writes.push_back({b.resource->gpu_addr, b.guest_bytes});
+            }
+        }
+        if (alias_census_enabled() && !alias_seeds.empty()) {
+            g_alias_census.dispatches++;
+            g_alias_census.seed_ranges += alias_seeds.size();
+            g_alias_census.write_ranges += alias_writes.size();
+            bool aliases = false;
+            for (const auto& sd : alias_seeds) {
+                for (const auto& w : g_alias_prev_writes)
+                    if (prosper::frontend::compute_guest_ranges_overlap(sd, w)) { aliases = true; break; }
+                if (aliases) break;
+            }
+            if (aliases) g_alias_census.aliasing_dispatches++;
+            // Report periodically as well as at exit: a bounded run is usually stopped with
+            // SIGTERM, whose default action skips atexit handlers entirely -- so an atexit-only
+            // census yields a clean run and no number.
+            if (g_alias_census.dispatches % 2048 == 0) report_alias_census();
+            static const bool once = [] { std::atexit(report_alias_census); return true; }();
+            (void)once;
+        }
+        if (alias_census_enabled()) g_alias_prev_writes = alias_writes;
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;

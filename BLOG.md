@@ -35,6 +35,18 @@ still open; the bytes to answer it with are one command away instead of unavaila
 
 [i3193]: https://github.com/mattias800/prosper/issues/3193
 [i3196]: https://github.com/mattias800/prosper/issues/3196
+### Astro Bot's world map stops killing the GPU, and the draw that does it has a name
+
+No picture: what the world map renders is still the nebula backdrop we already published. What
+changed is that the run no longer dies there.
+
+Loading the world map took the whole GPU down — a driver-level hard recovery, after which every
+frame was the same frozen picture for the rest of the run. The message blamed a compute program,
+but that program was just the first thing to fail *after* the device was already gone. It was a
+single **draw**, and there was no way to ask which one: prosper could decline a compute program by
+name but not a graphics one. It can now, and bisecting thirty-two candidates took four runs — with
+one draw declined, a five-minute run has zero device losses and keeps producing new frames the whole
+way. ([#3193](https://github.com/mattias800/prosper/issues/3193))
 
 ### The three getenv calls the profiler pointed at were the three we could not fix
 
@@ -53,6 +65,24 @@ the live frontend now read once instead of per draw, measured at 30% fewer `gete
 the render test suite, and the sites are pinned so they cannot quietly grow back.
 
 [i3094]: https://github.com/mattias800/prosper/issues/3094
+
+### The compute path waits 19-38% of its wall clock on a fence, and pipelining it cannot help
+
+No picture — this is a negative, and an expensive one to have found the slow way.
+
+Three UE titles spend a fifth to a third of their wall clock inside `vkWaitForFences` on the compute
+path, with `vkQueueSubmit` at about 1% everywhere. That reads as an obvious win: stop waiting on each
+dispatch, overlap them, take the time back. A dispatch ring was built for it and works correctly.
+
+It buys nothing, for a reason no tuning changes. On these routes the guest submits roughly **one
+dispatch per batch** — 23,294 dispatches across ~23,400 batches on *Stray* — and the drain at the end
+of each batch is mandatory, because the guest may read its own memory as soon as the submit returns.
+Every slot is emptied immediately after it is filled, so the ring never overlaps anything. Throughput
+moved 67.5 → 68.5 fps, which is noise; the only real effect was less variance.
+
+The falsification is written down rather than the code being merged, because a default-off switch
+whose own measurement says it can never fire is worse than no switch. What is *not* ruled out is
+deferring across batches — that is where the sized win still lives, and nobody has tried it.
 
 ## 2026-08-31
 

@@ -230,6 +230,46 @@ int main() {
     CHECK(!detect_hi({0, 0, 1, 0, 2, 0, 17, 0}, {0, 1, 2, 17, 0, 1, 2, 17}, 8, kTrPool),
           "DOLL zero-high-half quad -> declined here, still owned by the original detector");
 
+    // ---------------------------------------------------------------------------------------
+    // #3009: WHETHER either detector may be consulted at all.
+    //
+    // Both are named for what they do -- recover an element size the guest NEVER ANNOUNCED -- but the
+    // executor could not tell an announcement from a reset default, because `index_type == 0` was
+    // both "the guest announced 16-bit" and "the guest never announced anything". So every title got
+    // the heuristics, including titles that had already told prosper the answer.
+    printf("-- #3009: the announcement gate --\n");
+
+    CHECK(index_size_detection_permitted(0, /*announced*/false),
+          "never announced, reset default 16-bit -> the detectors may run (DOLL / Tomb Raider)");
+    CHECK(!index_size_detection_permitted(0, /*announced*/true),
+          "#3009: ANNOUNCED 16-bit -> declined, though index_type is byte-identical to the case above");
+    CHECK(!index_size_detection_permitted(1, /*announced*/true),
+          "announced 32-bit -> declined (already reading at 4 bytes)");
+    CHECK(!index_size_detection_permitted(1, /*announced*/false),
+          "a 32-bit reading is never a candidate, announced or not");
+    CHECK(!index_size_detection_permitted(7, /*announced*/false),
+          "an unknown encoding is not a 16-bit reading -> declined, as the loud fallback expects");
+
+    // The arm that carries the fix, and the reason the two above are not enough on their own: take
+    // a buffer whose BYTES both detectors accept, and show the gate is what decides. Before #3009
+    // the byte verdict WAS the decision, so an announcing title's genuine 16-bit buffer with this
+    // shape was silently re-read at 4 bytes.
+    {
+        const std::vector<uint32_t> quad = {0, 1, 2, 2, 1, 3};          // the live DOLL banner quad
+        CHECK(detect32(quad, 6), "control: the byte fingerprint still fires on the DOLL quad");
+        CHECK(index_size_detection_permitted(0, false) && detect32(quad, 6),
+              "#3009: unannounced + matching bytes -> re-read as 32-bit, exactly as before");
+        CHECK(!index_size_detection_permitted(0, true),
+              "#3009: the SAME bytes are left alone once the guest announced 16-bit");
+
+        std::vector<uint16_t> spokes;    // the period-2 residual named in the issue
+        for (uint16_t i = 0; i < 64; i++) { spokes.push_back(100 + i); spokes.push_back(7); }
+        CHECK(detect_alias(spokes, 64, 1u << 20),
+              "control: the period-2 residual is accepted by the byte fingerprint given a large pool");
+        CHECK(!index_size_detection_permitted(0, true),
+              "#3009: ...and is unreachable for a title that announced its index size");
+    }
+
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }

@@ -1677,6 +1677,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_watch_list PRIVATE prosper_core)
   add_test(NAME watch_list COMMAND test_watch_list)
 
+  # PROSPER_SKIP_DRAW_PROGRAM: decline graphics draws by shader PROGRAM identity (the graphics
+  # counterpart of PROSPER_COMPUTE_SKIP_PROGRAM). Pure selector logic -- no Vulkan; the wiring into
+  # the live renderer is pinned separately by draw_program_skip_render below.
+  add_executable(test_draw_program_skip tests/gpu/diagnostics/test_draw_program_skip.cpp)
+  target_link_libraries(test_draw_program_skip PRIVATE prosper_core)
+  add_test(NAME draw_program_skip COMMAND test_draw_program_skip)
+
   add_executable(test_shader_dump_filter tests/gpu/diagnostics/test_shader_dump_filter.cpp)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
@@ -2455,6 +2462,22 @@ if(TARGET prosper_core)
       target_include_directories(test_gpu_capture_render PRIVATE src tests tools/boot_trace)
       target_link_libraries(test_gpu_capture_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME gpu_capture_render_replay COMMAND test_gpu_capture_render)
+
+      # PROSPER_SKIP_DRAW_PROGRAM through the REAL live renderer: an unnamed program renders, the
+      # named one is withheld, and a mixed submit loses only the named draw. Needs the live renderer
+      # (and therefore Vulkan) because the wiring, not the selector logic, is what is under test.
+      add_executable(test_draw_program_skip_render tests/gpu/diagnostics/test_draw_program_skip_render.cpp)
+      target_include_directories(test_draw_program_skip_render PRIVATE frontends)
+      target_include_directories(test_draw_program_skip_render PRIVATE src tests tools/boot_trace)
+      target_link_libraries(test_draw_program_skip_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME draw_program_skip_render COMMAND test_draw_program_skip_render)
+      # Armed from the ENVIRONMENT rather than by a setenv inside the test. The persistent-target
+      # opt-out is read through PROSPER_ENV_VALUE, which caches, so arming it from inside the process
+      # is exactly the vacuous-arm defect cached_env_arming_logic exists to catch; and the selector
+      # itself is read once into a function-local static, so environment arming removes the ordering
+      # argument for it too.
+      set_tests_properties(draw_program_skip_render PROPERTIES ENVIRONMENT
+        "PROSPER_SKIP_DRAW_PROGRAM=0x5006c6a00;PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1")
 
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)

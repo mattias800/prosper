@@ -276,6 +276,46 @@ int main() {
               !claim_compute_transfer_gate_selector_summary(missing_consumer),
           "transfer selector summary is claimed exactly once");
 
+    // #3157: the guest-range overlap test that decides whether a dispatch may be pipelined
+    // past the previous one. A false negative here would let a dispatch seed from stale guest
+    // bytes, so the boundary cases are the point.
+    CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1080, 0x100}),
+          "partially overlapping guest ranges alias");
+    CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1040, 0x10}),
+          "a contained guest range aliases");
+    CHECK(compute_guest_ranges_overlap({0x1040, 0x10}, {0x1000, 0x100}),
+          "containment aliases in either argument order");
+    CHECK(!compute_guest_ranges_overlap({0x1000, 0x100}, {0x1100, 0x100}),
+          "adjacent half-open guest ranges do NOT alias");
+    CHECK(!compute_guest_ranges_overlap({0x1100, 0x100}, {0x1000, 0x100}),
+          "adjacency is symmetric");
+    // INTERIOR zero-length, not a boundary one. A zero-length range that starts where the other
+    // one starts is rejected by half-open arithmetic alone (`b.addr < a.addr + 0` is false), so a
+    // boundary arm passes whether or not the explicit `bytes == 0` guard exists -- it pins nothing.
+    // An address strictly INSIDE the other range is the case that needs the guard: without it,
+    // 0x1080 < 0x1100 and 0x1000 < 0x1080 both hold and the predicate would report an alias.
+    CHECK(!compute_guest_ranges_overlap({0x1080, 0}, {0x1000, 0x100}) &&
+              !compute_guest_ranges_overlap({0x1000, 0x100}, {0x1080, 0}),
+          "an interior zero-length range still never aliases");
+    CHECK(!compute_guest_ranges_overlap({0x1000, 0}, {0x1000, 0x100}) &&
+              !compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0}),
+          "a zero-length range reads nothing and never aliases");
+    // #3157/C1: a synthesized null binding is not a guest range. The SECOND arm is the point --
+    // it puts the consequence of deleting the guard in the test file, so a reader sees what the
+    // rule prevents rather than only that it exists. Without `compute_guest_range_is_real`, two
+    // dispatches each holding a writable null V# entry both contribute {0, 4}, and {0,4} overlaps
+    // itself, so the census reports an alias where no guest memory is involved at all.
+    CHECK(!compute_guest_range_is_real({0, 4}),
+          "a range at address 0 is a synthesized null binding, not guest memory");
+    CHECK(compute_guest_range_is_real({0x1000, 4}),
+          "an ordinary guest address is a real range");
+    CHECK(compute_guest_ranges_overlap({0, 4}, {0, 4}),
+          "...and {0,4} DOES overlap itself, which is exactly what the guard above prevents "
+          "the census from reporting");
+
+    CHECK(compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0x100}),
+          "identical guest ranges alias");
+
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;
