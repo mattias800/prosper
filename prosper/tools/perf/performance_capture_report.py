@@ -329,21 +329,27 @@ def summarize(records):
     # different instrument that happens to share the mechanism.
     readback_note = None
     # Warn whenever readback is a LEADING component, not only when it wins the classification.
-    # A capture where readback is the largest single component but sits under the evidence
-    # threshold gets classified "inconclusive" -- and then prints the biggest number on the page
-    # with no warning attached, which is the exact shape that sends a reader chasing the harness.
-    # Measured on a Dragon Quest capture: readback=977.7ms was the top component, classification
-    # was "inconclusive", and the note stayed silent.
-    # Ranking is the wrong trigger: on the capture that motivated this, readback was 977.7ms and
-    # merely SECOND to compute's 1134.0ms, so a "is it the max" test stayed silent on a number a
-    # reader would still have chased. If the frontend is copying scanout frames at all, say so.
-    material_readback = False
-    try:
-        _c = components if isinstance(components, dict) else {}
-        _rb = _c.get("readback")
-        material_readback = isinstance(_rb, (int, float)) and _rb > 0.0
-    except Exception:
-        material_readback = False
+    # A capture where readback is large but sits under the 40% evidence threshold is classified
+    # "inconclusive" -- and then prints a big number with no warning attached, which is the exact
+    # shape that sends a reader chasing the harness instead of the title. Measured on a Dragon
+    # Quest VII capture: readback=977.7ms against compute=1134.0ms, classified "inconclusive",
+    # note silent.
+    #
+    # Ranking is the wrong trigger and was the first attempt: a "is readback the max component"
+    # test stays silent at 977.7 vs 1134.0, which is precisely the case that misleads. So the
+    # trigger is readback's SHARE of measured work, with a threshold deliberately well below the
+    # 40% classification bar -- the whole point is to cover the gap under that bar.
+    #
+    # The threshold is a judgement call and both ends of it are pinned by tests: a ~39% readback
+    # must warn (the motivating capture), and a 2%-of-total readback must stay silent, because a
+    # paragraph of warning attached to a rounding-level number is noise on every report and trains
+    # readers to skip the note in the cases that matter. Any nonzero readback is NOT the right
+    # trigger for that reason.
+    READBACK_NOTE_MIN_SHARE = 0.10
+    readback_ms = classification_components.get("readback")
+    material_readback = (
+        isinstance(readback_ms, (int, float)) and measured_total > 0 and
+        readback_ms / measured_total >= READBACK_NOTE_MIN_SHARE)
     if classification == "readback" or material_readback:
         adopted = _gpu_present_adopted(post)
         if adopted is None:

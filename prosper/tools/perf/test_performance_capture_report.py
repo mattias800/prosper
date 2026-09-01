@@ -180,6 +180,37 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         else:
             self.assertIsNone(summary["readback_note"])
 
+    def test_large_sub_threshold_readback_warns_even_though_it_lost_classification(self):
+        # The gap this closes, and the shape of the capture that motivated it (Dragon Quest VII):
+        # readback 977.7 ms against compute 1134.0 ms. Neither reaches the 40% evidence bar, so
+        # the verdict is "inconclusive" -- and the old trigger, which fired only on a readback
+        # VERDICT, printed the second-largest number on the page with nothing attached.
+        #
+        # Note the arm would also pass under a "is readback the max component" trigger only if
+        # readback won, which it does NOT here (977.7 < 1134.0). That is deliberate: ranking was
+        # the first attempt at this fix and is silent on exactly this capture.
+        summary = summarize(capture(
+            SAMPLES,
+            renderer=[{"total_ms": 2000, "readback_ms": 977.7}],
+            compute=[{"total_ms": 1134.0}]))
+        # Neither component clears 40% of the 3134 ms measured total: compute is 36%, readback 31%.
+        self.assertEqual(summary["classification"], "inconclusive")
+        self.assertIn("harness, not the title", summary["readback_note"])
+
+    def test_readback_note_threshold_is_a_share_not_a_ranking(self):
+        # Pins the quiet end against the loud one with the SAME verdict and the same GPU-present
+        # state, so the only variable is readback's share of measured work. Without this pair the
+        # threshold could drift to "any nonzero readback" -- which it briefly was -- and no test
+        # would notice, because every existing readback arm has a large readback.
+        def note_for(readback_ms):
+            return summarize(capture(
+                SAMPLES,
+                renderer=[{"total_ms": 1000, "readback_ms": readback_ms}],
+                compute=[{"total_ms": 1000.0}]))["readback_note"]
+
+        self.assertIsNone(note_for(20.0))        # 1% of measured work -- rounding, stays silent
+        self.assertIsNotNone(note_for(400.0))    # 20% -- a reader could mistake it for the answer
+
     def test_non_readback_verdict_carries_no_readback_note(self):
         # The note is specific to the readback verdict; on every report it would be noise.
         summary = summarize(capture(SAMPLES, renderer=[{
