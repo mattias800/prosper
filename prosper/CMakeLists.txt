@@ -2030,6 +2030,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_descriptor_clamp PRIVATE prosper_core)
   add_test(NAME descriptor_clamp COMMAND test_descriptor_clamp)
 
+  # #3205: mip-chain provenance participates in image IDENTITY only when a chain exists. The fields
+  # are populated on one construction path and left unset on another, so comparing them
+  # unconditionally split identical single-level descriptors into separate Vulkan images -- which
+  # dropped three of four quadrant stores in GTA V and rendered a checkerboard. Pure predicate.
+  add_executable(test_mip_provenance_identity tests/gpu/agc/test_mip_provenance_identity.cpp)
+  target_link_libraries(test_mip_provenance_identity PRIVATE prosper_core)
+  add_test(NAME mip_provenance_identity COMMAND test_mip_provenance_identity)
+
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
   add_executable(test_convention_bindings tests/gpu/test_convention_bindings.cpp)
