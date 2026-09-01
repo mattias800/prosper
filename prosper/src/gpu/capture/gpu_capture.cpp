@@ -135,7 +135,19 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // independent vector footprint; replay cannot reconstruct one from the other when STRIDE < 4.
 // v55: append each depth/stencil seed's optional stencil bytes and stencil-presence marker.
 // v56: extend the append-only RTT-seed format enum with native RGBA32F surfaces.
-constexpr uint32_t kVersion = 56;
+// v57 (#3048): each resource's allocation-wide mip placement -- the level-zero element extent, the
+// bytes per block, the effective MAX_MIP, and the view's BASE_LEVEL. `declared_mip_levels` says how
+// MANY levels a T# declares; these say WHERE they are, which nothing else preserves once
+// image_base_level_view has shifted gpu_addr/width/height onto the SELECTED level.
+//
+// What this does NOT yet do, so nobody plans around it: a replayed resource is host_data-backed and
+// its blob covers only the selected level's footprint, and the chain derivation declines any
+// host_data resource -- so gpu_replay still refuses IMAGE_LOAD_MIP exactly as it did before v57.
+// Making replay materialize the chain needs the capture to own the whole ALLOCATION's bytes, which
+// is a separate change. This tail is the descriptor half of it, recorded now so the placement is
+// not lost from every capsule taken in the meantime. Pre-v57 files leave all five zero, read
+// everywhere as "not modelled".
+constexpr uint32_t kVersion = 57;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -3607,6 +3619,26 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // the version is downgraded -- eleven legacy-reopen assertions failed that way when this field
     // was first placed next to the seed records.
     for (const auto& seed : c.ds_seeds) w.u32(seed.slice);
+    // v57 tail: allocation-wide mip placement per resource, in the same table order every other
+    // per-resource tail uses (#3048).
+    auto write_mip_chain_provenance = [&](const GpuCapturedTable& table) {
+        for (const GpuCapturedResource& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            w.u32(resource.mip_chain_element_width);
+            w.u32(resource.mip_chain_element_height);
+            w.u32(resource.mip_chain_bytes_per_block);
+            w.u32(resource.mip_chain_max_level);
+            w.u32(resource.mip_chain_base_level);
+        }
+    };
+    for (const auto& draw : c.draws) {
+        write_mip_chain_provenance(draw.vrt);
+        write_mip_chain_provenance(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_mip_chain_provenance(compute.resources);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            write_mip_chain_provenance(stage.resource_table);
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces
@@ -5006,6 +5038,49 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
     if (version >= 55)
         for (auto& seed : c.ds_seeds)
             if (!r.u32(seed.slice)) return false;
+    // v57 trailing tail: allocation-wide mip placement per resource (#3048). See the writer.
+    if (version >= 57) {
+        auto read_mip_chain_provenance = [&](GpuCapturedTable& table) {
+            for (GpuCapturedResource& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                if (!r.u32(resource.mip_chain_element_width) ||
+                    !r.u32(resource.mip_chain_element_height) ||
+                    !r.u32(resource.mip_chain_bytes_per_block) ||
+                    !r.u32(resource.mip_chain_max_level) ||
+                    !r.u32(resource.mip_chain_base_level))
+                    return false;
+                // A modelled placement is completely present or completely absent. A partial record
+                // cannot place a level, and reading one as if it could is exactly the silent
+                // wrong-offset failure this provenance exists to prevent.
+                const bool any = resource.mip_chain_element_width ||
+                                 resource.mip_chain_element_height ||
+                                 resource.mip_chain_bytes_per_block;
+                if (any && (!resource.mip_chain_element_width ||
+                            !resource.mip_chain_element_height ||
+                            !resource.mip_chain_bytes_per_block ||
+                            resource.mip_chain_max_level >= 16u))
+                    return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_mip_chain_provenance(draw.vrt) ||
+                !read_mip_chain_provenance(draw.prt)) {
+                error = "invalid mip-chain placement state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_mip_chain_provenance(compute.resources)) {
+                error = "invalid mip-chain placement state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_mip_chain_provenance(stage.resource_table)) {
+                    error = "invalid mip-chain placement state";
+                    return false;
+                }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

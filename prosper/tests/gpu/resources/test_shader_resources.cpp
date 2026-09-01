@@ -1,8 +1,11 @@
 // test_shader_resources — fixes the resource-binding contract (shader_resources.hpp): format sizing
 // and the recompiler/pipeline lookups both halves rely on. Pure (no Vulkan), runs in CI.
+#include "gpu/resources/mip_chain_plan.hpp"
+#include "gpu/texture/tile.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "shared/live/live_compute.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
@@ -1046,6 +1049,126 @@ int main() {
     CHECK(!validate_runtime_descriptor_contract("test", spv, &missing, 0, SpirvShaderStage::Vertex),
           "strict runtime gate rejects a missing binding before backend submission");
     set_descriptor_mode("off");
+
+    // ---- #3048: the declared mip chain a compute image must materialize -------------------
+    // A T# declares how MANY levels exist; the allocation-wide placement says WHERE they are. The
+    // backend that creates the image and the recompiler that emits IMAGE_LOAD_MIP's explicit LOD
+    // both read shader_resource_compute_mip_chain_levels, so these arms fix that one contract.
+    {
+        // Level zero must not itself be packed in the shared mip tail, or `gpu_addr` and the plan
+        // would name different bytes. Assert that precondition rather than assuming the geometry.
+        constexpr uint32_t kWidth = 256, kHeight = 256, kBytesPerBlock = 4;
+        constexpr uint32_t kTile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        constexpr uint32_t kMaxMip = 8;   // 256 -> 1 is nine levels
+        const TiledMipLevelLayout level0 = tiled_mip_level_layout(
+            kWidth, kHeight, kBytesPerBlock, kTile, kMaxMip, 0);
+        CHECK(level0.supported && !level0.in_tail,
+              "the mip-chain fixture's level zero is a placed, non-tail level");
+
+        ShaderResource chain{};
+        chain.cls = ResourceClass::Texture;
+        chain.format = DataFormat::Uint32;
+        chain.num_components = 1;
+        chain.img_dim = 1;
+        chain.width = kWidth;
+        chain.height = kHeight;
+        chain.depth = 1;
+        chain.tile_mode = kTile;
+        chain.declared_mip_levels = kMaxMip + 1;
+        chain.mip_chain_element_width = kWidth;
+        chain.mip_chain_element_height = kHeight;
+        chain.mip_chain_bytes_per_block = kBytesPerBlock;
+        chain.mip_chain_max_level = kMaxMip;
+        chain.mip_chain_base_level = 0;
+        chain.gpu_addr = 0x2026900000ull + level0.byte_offset;
+
+        const MipChainPlan plan = shader_resource_mip_chain_plan(chain);
+        CHECK(plan.valid && plan.level_count == kMaxMip + 1 &&
+              plan.levels.size() == kMaxMip + 1,
+              "a fully declared tiled 2D chain places every level it declares");
+        CHECK(shader_resource_compute_mip_chain_levels(chain) == kMaxMip + 1,
+              "the compute backend materializes the declared chain for a native sampled format");
+
+        bool extents_halve = plan.valid;
+        bool inside_allocation = plan.valid;
+        bool disjoint = plan.valid;
+        for (size_t level = 0; plan.valid && level < plan.levels.size(); ++level) {
+            const MipChainLevel& entry = plan.levels[level];
+            const uint32_t expect_w = kWidth >> level ? kWidth >> level : 1u;
+            const uint32_t expect_h = kHeight >> level ? kHeight >> level : 1u;
+            extents_halve &= entry.width == expect_w && entry.height == expect_h;
+            inside_allocation &= entry.byte_offset + entry.byte_size <= plan.allocation_bytes;
+            // Non-tail levels own disjoint byte ranges; tail levels deliberately share the
+            // allocation's first block and are addressed by element coordinate instead.
+            for (size_t other = 0; other < level; ++other) {
+                const MipChainLevel& earlier = plan.levels[other];
+                if (entry.in_tail || earlier.in_tail) continue;
+                disjoint &= entry.byte_offset + entry.byte_size <= earlier.byte_offset ||
+                            earlier.byte_offset + earlier.byte_size <= entry.byte_offset;
+            }
+        }
+        CHECK(extents_halve, "each planned level carries its own halved extent");
+        CHECK(inside_allocation, "every planned level lies inside the allocation it names");
+        CHECK(disjoint, "planned non-tail levels never overlap one another");
+        CHECK(plan.valid && !plan.levels[0].in_tail &&
+              plan.levels[0].byte_offset == level0.byte_offset,
+              "level zero of the plan is the level the resource's own gpu_addr names");
+        CHECK(plan.valid &&
+              std::any_of(plan.levels.begin(), plan.levels.end(),
+                          [](const MipChainLevel& entry) { return entry.in_tail; }),
+              "the fixture exercises the packed mip tail as well as the placed levels");
+
+        // Reject-by-default. Every one of these leaves the historical single-level image, because a
+        // guessed offset is worse than the operation staying unimplemented.
+        const auto levels_after = [&](void (*mutate)(ShaderResource&)) {
+            ShaderResource copy = chain;
+            mutate(copy);
+            return shader_resource_compute_mip_chain_levels(copy);
+        };
+        CHECK(levels_after([](ShaderResource& r) { r.tile_mode = 0; }) == 1,
+              "a LINEAR chain is declined: its per-level 256-byte pitch is not reproduced yet");
+        CHECK(levels_after([](ShaderResource& r) { r.in_mip_tail = true; }) == 1,
+              "a selected level packed in the tail is declined");
+        CHECK(levels_after([](ShaderResource& r) { r.depth = 3; }) == 1,
+              "a multi-layer view is declined: each slice owns its own chain");
+        CHECK(levels_after([](ShaderResource& r) { r.layer_stride_bytes = 4096; }) == 1,
+              "a strided array slice is declined");
+        CHECK(levels_after([](ShaderResource& r) { r.compression_enabled = true; }) == 1,
+              "a DCC-compressed base is not ordinary tiled texels at any level");
+        CHECK(levels_after([](ShaderResource& r) { r.mip_chain_base_level = 1; }) == 1,
+              "a shifted BASE_LEVEL view is declined rather than rebased on a guess");
+        CHECK(levels_after([](ShaderResource& r) { r.mip_chain_element_width = 0; }) == 1,
+              "an unmodelled placement (zero element extent) is declined");
+        CHECK(levels_after([](ShaderResource& r) { r.mip_chain_element_width = 128; }) == 1,
+              "an element extent that disagrees with the texel extent is declined");
+        CHECK(levels_after([](ShaderResource& r) { r.declared_mip_levels = 1; }) == 1,
+              "a single-level T# keeps the historical single-level image");
+        CHECK(levels_after([](ShaderResource& r) { r.format = DataFormat::Float16; }) == 1,
+              "a format whose sampled upload converts rather than copies is declined");
+        CHECK(levels_after([](ShaderResource& r) { r.mip_chain_bytes_per_block = 8; }) == 1,
+              "a bytes-per-block that disagrees with format x components is declined");
+        CHECK(levels_after([](ShaderResource& r) { r.cls = ResourceClass::StorageImage; }) == 1,
+              "a storage image keeps one level: its writeback contract is per selected level");
+        CHECK(levels_after([](ShaderResource& r) { r.sample_count = 4; }) == 1,
+              "a multisample resource has no mip chain to place");
+        uint8_t host_bytes[4]{};
+        ShaderResource host_backed = chain;
+        host_backed.host_data = host_bytes;
+        host_backed.host_data_size = sizeof host_bytes;
+        CHECK(shader_resource_compute_mip_chain_levels(host_backed) == 1,
+              "a host_data-backed resource exposes only its selected level and is declined");
+        // The chain is bounded by the extent as well as by the declaration: a T# may not name more
+        // levels than 256x256 can have.
+        ShaderResource over_declared = chain;
+        over_declared.declared_mip_levels = 12;
+        over_declared.mip_chain_max_level = 11;
+        // Equality, not `<=`: a DECLINE (1) also satisfies "does not exceed the full chain", so the
+        // inequality would have passed without the clamp ever running.
+        CHECK(shader_resource_compute_mip_chain_levels(over_declared) ==
+                  full_mip_chain_levels(kWidth, kHeight) &&
+              full_mip_chain_levels(kWidth, kHeight) == 9u,
+              "a T# declaring more levels than the extent can hold is CLAMPED to the full chain");
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

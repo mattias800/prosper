@@ -1263,6 +1263,22 @@ bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
     return true;
 }
 
+bool rdna2_mimg_dynamic_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
+    if (in.fmt != Rdna2Format::MIMG || in.opcode != 0x01u) return false;
+    // Every modifier here changes the ADDRESS or DATA layout, so the mip operand would not be where
+    // this function says it is. GLC/SLC/DLC and UNRM do not, and are admitted.
+    if (in.mimg_r128 || in.mimg_tfe || in.mimg_lwe || in.mimg_a16 || in.mimg_d16 ||
+        in.mimg_reserved)
+        return false;
+    if (in.mimg_nsa != 0u || in.len_dwords != 2u) return false;
+    if (in.mimg_dim != 1u && in.mimg_dim != 5u) return false;
+    if (in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0) return false;
+    const uint32_t reg = static_cast<uint32_t>(in.src[0].value) + (in.mimg_dim == 5u ? 3u : 2u);
+    if (reg >= 256u) return false;
+    if (mip_vgpr) *mip_vgpr = reg;
+    return true;
+}
+
 uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_t sgpr_base) {
     std::vector<Rdna2Inst> instructions;
     rdna2_walk(code, dwords, instructions);

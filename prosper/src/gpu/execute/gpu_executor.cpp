@@ -13,6 +13,7 @@
 #include "gpu/diagnostics/compute_tree_watch.hpp"
 #include "gpu/present/videoout_present.hpp"   // present_write_frame
 #include "gpu/agc/agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
+#include "gpu/resources/mip_chain_plan.hpp"  // shader_resource_compute_mip_chain_levels (#3048)
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -565,6 +566,10 @@ struct ShaderResourceCompileKey {
     uint32_t img_dim = 0;
     uint32_t sample_count = 1;
     uint32_t declared_mip_levels = 1;
+    // #3048: how many levels the compute backend materializes for this resource. The emitted module
+    // bakes it in (the IMAGE_LOAD_MIP LOD clamp is a literal), so two descriptors that differ only
+    // in their allocation-wide mip placement must not share a compiled module.
+    uint32_t materialized_mip_levels = 1;
     bool in_mip_tail = false;
     bool compression_enabled = false;
     bool proven_zero_mip = false;
@@ -803,6 +808,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.img_dim);
             hash = hash_mix(hash, resource.sample_count);
             hash = hash_mix(hash, resource.declared_mip_levels);
+            hash = hash_mix(hash, resource.materialized_mip_levels);
             hash = hash_mix(hash, resource.in_mip_tail);
             hash = hash_mix(hash, resource.compression_enabled);
             hash = hash_mix(hash, resource.proven_zero_mip);
@@ -1563,6 +1569,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.sample_count = (texture || storage_image) ? resource.sample_count : 1u;
             compiled.declared_mip_levels = (texture || storage_image)
                 ? resource.declared_mip_levels : 1u;
+            compiled.materialized_mip_levels = texture
+                ? shader_resource_compute_mip_chain_levels(resource) : 1u;
             compiled.in_mip_tail = (texture || storage_image) && resource.in_mip_tail;
             compiled.compression_enabled =
                 (texture || storage_image) && resource.compression_enabled;
@@ -7316,6 +7324,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.declared_mip_levels = d.sample_count > 1u ? 1u :
                         (d.last_level >= d.base_level ?
                             (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
+                    shader_resource_apply_mip_chain_provenance(r, view);
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     r.in_mip_tail = view.in_mip_tail;
                     r.mip_tail_offset = view.in_mip_tail
@@ -7797,8 +7806,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // consumer here — a sampled use with an unmapped format was already dropped.)
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
-                        : DecodedImageView{d.base, d.width, d.height, 0, false, 0, 0, 0,
-                                           0, 0, d.base_level == 0 && d.base_array == 0};
+                        : unmapped_format_image_view(d);
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
                         continue;
@@ -7866,6 +7874,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.sample_count = d.sample_count;
+                    shader_resource_apply_mip_chain_provenance(r, view);
                     r.tile_mode = d.tile_mode;
                     r.declared_mip_levels = d.sample_count > 1u ? 1u :
                         (d.last_level >= d.base_level ?

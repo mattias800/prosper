@@ -512,6 +512,11 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
         view.supported = unshifted_view_supported();
         return view;
     }
+    view.chain_element_width = element_width;
+    view.chain_element_height = element_height;
+    view.chain_bytes_per_block = fi.bytes_per_block;
+    view.chain_max_mip = effective_max_mip;
+    view.chain_base_level = d.base_level;
     view.mip_offset = layout.byte_offset;
     view.in_mip_tail = layout.in_tail;
     view.mip_tail_bytes = layout.tail_block_bytes;
@@ -1185,6 +1190,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.sample_count  = d.sample_count;
             r.declared_mip_levels = d.sample_count > 1u ? 1u :
                 (d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
+            shader_resource_apply_mip_chain_provenance(r, view);
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.in_mip_tail   = view.in_mip_tail;
             r.mip_tail_offset = view.in_mip_tail

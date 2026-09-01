@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace prosper::gpu {
 
@@ -214,6 +215,18 @@ struct Gen5ImageFormatInfo {
 // The single mip level Prosper uploads for a T# view. GFX10 descriptor BASE_ADDRESS names the
 // entire allocation, whose mip-tail-first layout can put BASE_LEVEL at a non-zero byte offset.
 struct DecodedImageView {
+    // NOT redundant, and do not delete it as noise. A user-declared default constructor makes this
+    // a non-aggregate under C++20 (P1008R1), which turns every POSITIONAL braced initialization of
+    // it into a compile error while `V v;`, `V v{};` and `return {};` keep working. That is the
+    // point: this struct grew five fields in #3048, and the tree's one positional initializer
+    // silently re-bound its last value onto a new field -- leaving `supported` at its default
+    // `true` and killing a BASE_ARRAY guard with no diagnostic, because `bool -> uint32_t` is a
+    // promotion rather than a narrowing. A test can pin the function that used to hold that
+    // initializer; only this line stops the same shape appearing at a NEW call site. Verified on
+    // gcc 16 -Wall -Wextra: named/value/`{}` initialization compiles, `DecodedImageView{a, b, ...}`
+    // does not. Assign by name, or add designators.
+    DecodedImageView() = default;
+
     uint64_t base = 0;
     uint32_t width = 0, height = 0;
     size_t mip_offset = 0;
@@ -227,10 +240,60 @@ struct DecodedImageView {
     // base + layer*layer_stride + layer_mip_offset (or use the tail coordinates for a packed tail).
     size_t layer_stride = 0;
     size_t layer_mip_offset = 0;
+    // The exact inputs tiled_mip_level_layout needs to place ANY level of this allocation, kept
+    // beside the selected level's own placement so a backend that must materialize the declared
+    // chain does not have to re-decode the T#. Zero element extent = not modelled (#3048).
+    uint32_t chain_element_width = 0;
+    uint32_t chain_element_height = 0;
+    uint32_t chain_bytes_per_block = 0;
+    uint32_t chain_max_mip = 0;
+    uint32_t chain_base_level = 0;
     // False when BASE_LEVEL selects a mip whose layout this helper cannot prove. Callers must reject
     // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
     bool supported = true;
 };
+// The guard above, made self-defending: deleting the defaulted constructor to "tidy up" would make
+// this an aggregate again and silently re-open positional initialization. This fails the build
+// instead.
+static_assert(!std::is_aggregate_v<DecodedImageView>,
+              "DecodedImageView must stay a non-aggregate so positional braced initialization "
+              "cannot silently re-bind its fields when the struct grows (#3048/#3197)");
+// The view for a descriptor whose Gen5 format prosper cannot map. Such a binding can still
+// recompile as a format-free storage image, but no mip or slice placement is derivable for it, so
+// this builds the allocation base by hand and fails closed on any descriptor that selects something
+// other than level zero of slice zero: an unshifted base under a selected slice binds slice ZERO's
+// texels silently, and for a STORAGE image it also writes slice N's results into slice zero's guest
+// bytes.
+//
+// This exists as a function, rather than as a braced initializer at its one call site, because that
+// initializer was POSITIONAL: adding a field to DecodedImageView re-bound its last value and made
+// `supported` fall back to its default `true`, killing the guard with no compiler diagnostic
+// (`bool -> uint32_t` is a promotion, not a narrowing). Every field below is named. Do not convert
+// this back to an aggregate initializer, and do not add a positional one elsewhere.
+inline DecodedImageView unmapped_format_image_view(const DecodedImageDescriptor& d) {
+    DecodedImageView view;
+    view.base = d.base;
+    view.width = d.width;
+    view.height = d.height;
+    view.supported = d.base_level == 0 && d.base_array == 0;
+    // Everything else stays at its default: no mip offset, no tail, no layer stride, and no
+    // allocation-wide mip placement (zero element extent = not modelled, #3048).
+    return view;
+}
+
+// Copy the allocation-wide mip placement from a decoded view onto the resource it produced. Three
+// separate sites build a Texture/StorageImage ShaderResource from a (descriptor, view) pair; they
+// have drifted before (#2265), so the provenance travels through one function rather than three
+// copies of five assignments.
+inline void shader_resource_apply_mip_chain_provenance(ShaderResource& r,
+                                                       const DecodedImageView& view) {
+    r.mip_chain_element_width = view.chain_element_width;
+    r.mip_chain_element_height = view.chain_element_height;
+    r.mip_chain_bytes_per_block = view.chain_bytes_per_block;
+    r.mip_chain_max_level = view.chain_max_mip;
+    r.mip_chain_base_level = view.chain_base_level;
+}
+
 DecodedImageView image_base_level_view(const DecodedImageDescriptor& descriptor,
                                        const Gen5ImageFormatInfo& format);
 // Emit one diagnostic per unsupported layout signature. Callers use this immediately before
