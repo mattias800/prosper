@@ -289,6 +289,14 @@ int main() {
           "adjacent half-open guest ranges do NOT alias");
     CHECK(!compute_guest_ranges_overlap({0x1100, 0x100}, {0x1000, 0x100}),
           "adjacency is symmetric");
+    // INTERIOR zero-length, not a boundary one. A zero-length range that starts where the other
+    // one starts is rejected by half-open arithmetic alone (`b.addr < a.addr + 0` is false), so a
+    // boundary arm passes whether or not the explicit `bytes == 0` guard exists -- it pins nothing.
+    // An address strictly INSIDE the other range is the case that needs the guard: without it,
+    // 0x1080 < 0x1100 and 0x1000 < 0x1080 both hold and the predicate would report an alias.
+    CHECK(!compute_guest_ranges_overlap({0x1080, 0}, {0x1000, 0x100}) &&
+              !compute_guest_ranges_overlap({0x1000, 0x100}, {0x1080, 0}),
+          "an interior zero-length range still never aliases");
     CHECK(!compute_guest_ranges_overlap({0x1000, 0}, {0x1000, 0x100}) &&
               !compute_guest_ranges_overlap({0x1000, 0x100}, {0x1000, 0}),
           "a zero-length range reads nothing and never aliases");

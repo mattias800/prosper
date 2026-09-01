@@ -7751,6 +7751,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 } else {
                     const size_t need = sampled_guest_need;
                     const uint8_t* src = sampled_guest_source;
+                    if (alias_census_enabled() && src && need) {
+                        // A SAMPLED binding reads guest memory and never writes back, so it
+                        // contributes a seed range and no write range. Omitting these was the
+                        // census's blind spot and it hid the archetypal case: dispatch A writes a
+                        // storage image at X, dispatch B *samples* X. The storage-only census
+                        // could not see B's read at all, so that pair scored as no alias.
+                        alias_seeds.push_back({r->gpu_addr, need});
+                    }
                     const bool needs_sampled_upload = !bi.upload_skipped &&
                         !bi.compute_transfer_seed_borrowed;
                     if (needs_sampled_upload && sampled_dcc_fast_clear) {
@@ -9030,8 +9038,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // `alias_of` entry shares an earlier entry's guest range and would double-count.
             for (const auto& b : buffers) {
                 if (!b.resource || b.guest_bytes == 0 || b.alias_of != SIZE_MAX) continue;
-                if (!b.upload_skipped)
-                    alias_seeds.push_back({b.resource->gpu_addr, b.guest_bytes});
+                // NOT `!b.upload_skipped`. That flag means "the cached GPU copy still matches
+                // guest memory" (see its assignment: `submit_unchanged || (watches_complete &&
+                // dirty_chunks.empty())`), not "this binding does not read guest bytes". A bound
+                // buffer with a guest range reads that range whether or not the copy needed
+                // refreshing -- and under a deferred writeback the watch reports CLEAN precisely
+                // because the writeback has not landed yet, so gating on it would score the exact
+                // hazard being measured as "not a seed" and bias the rate down.
+                alias_seeds.push_back({b.resource->gpu_addr, b.guest_bytes});
                 if (b.writable)
                     alias_writes.push_back({b.resource->gpu_addr, b.guest_bytes});
             }

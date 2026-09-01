@@ -203,6 +203,10 @@ constexpr bool compute_guest_ranges_overlap(const ComputeGuestRange& a,
     return a.addr < b.addr + b.bytes && b.addr < a.addr + a.bytes;
 }
 
+// Plain (non-atomic) counters, deliberately: the census is read and written only from the thread
+// that runs `execute_live_compute_items`, and making them atomic would put a lock-prefixed RMW on
+// a path whose cost this instrument exists to measure. If a second producer thread is ever added,
+// these need revisiting -- they are not thread-safe and do not claim to be.
 struct ComputeAliasCensusCounters {
     uint64_t dispatches = 0;          // dispatches that declared at least one guest seed source
     uint64_t aliasing_dispatches = 0; // ...of those, ones seeding from the previous writeback set
