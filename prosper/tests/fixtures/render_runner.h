@@ -7,6 +7,7 @@
 #include <vulkan/vulkan.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -3016,7 +3017,7 @@ inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelin
     // exists to answer is whether any title programs 0x17 at all on a gfx10 part, and a decode
     // printed beside the raw value would pre-judge exactly that. Observation is evidence; a decode
     // is a claim. (#2669)
-    if (getenv("PROSPER_DS_SLICE_CENSUS")) {
+    if (PROSPER_ENV_ON("PROSPER_DS_SLICE_CENSUS")) {
         static std::mutex mutex;
         // (base, width, HEIGHT, raw) -- height was missing, so two surfaces sharing a base and width
         // but differing in height collapsed to one line and the second never printed. A census that
@@ -3527,7 +3528,7 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
         ++invalidated;
     }
-    if (invalidated && getenv("PROSPER_DSLOG"))
+    if (invalidated && PROSPER_ENV_ON("PROSPER_DSLOG"))
         fprintf(stderr, "[ds] guest-write addr=%llx size=%llu invalidated=%zu\n",
                 (unsigned long long)addr, (unsigned long long)size, invalidated);
     return invalidated;
@@ -4440,7 +4441,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // real work is supporting writable portable-uvec4 storage images. It exists to make the blast
     // radius measurable.
     const bool drop_only_unproven_draw =
-        getenv("PROSPER_RENDER_DROP_UNPROVEN_DRAW") != nullptr;
+        PROSPER_ENV_ON("PROSPER_RENDER_DROP_UNPROVEN_DRAW");
     std::vector<const BackendDraw*> proven_draws;
     proven_draws.reserve(draws.size());
     for (const BackendDraw& draw : draws) {
@@ -4640,7 +4641,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // wrong reverse-Z depth value); this reports whether it is happening again on the depth side,
     // which the derived float alone cannot show. A pass whose draws are predominantly GREATER but
     // whose value came out 1.0 is rejecting its own geometry.
-    if (getenv("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
+    if (PROSPER_ENV_ON("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
         uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
         uint32_t greater_colour = 0, less_colour = 0;
         uint32_t reversed_viewports = 0, forward_viewports = 0;
@@ -4701,7 +4702,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     greater_colour, less_colour, vp_min, vp_max, reversed_viewports,
                     forward_viewports, logical_draws.size(), (unsigned long long)n);
     }
-    if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))
+    if (const char* v = PROSPER_ENV_VALUE("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
@@ -4820,7 +4821,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const VkImageLayout self_depth_layout = format_has_stencil && stencil_may_be_written
         ? VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
         : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    if (getenv("PROSPER_DSLOG")) {
+    if (PROSPER_ENV_ON("PROSPER_DSLOG")) {
         static uint64_t call_id = 0;
         const uint64_t id = ++call_id;
         fprintf(stderr,
@@ -4974,7 +4975,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         ++color_target_stats.writes;
         color_target_stats.write_hits = load_cached_color ? 1 : 0;
     }
-    if (color_target && color_target->persistent_id && getenv("PROSPER_BACKEND_LOAD_LOG"))
+    if (color_target && color_target->persistent_id && PROSPER_ENV_ON("PROSPER_BACKEND_LOAD_LOG"))
         fprintf(stderr,
                 "[backend-load] id=0x%llx %ux%u fmt=%d cached=%d valid=%d load_existing=%d "
                 "seed=%d readback=%d -> load=%d\n",
@@ -5197,7 +5198,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (uint32_t slot = 2; slot < color_count; ++slot)
         load_extra[slot] = cached_extra[slot] && cached_extra[slot]->valid &&
                            color_target && color_target->load_existing_slots[slot];
-    if (color_target && getenv("PROSPER_BACKEND_LOAD_LOG")) {
+    if (color_target && PROSPER_ENV_ON("PROSPER_BACKEND_LOAD_LOG")) {
         if (use_color1)
             fprintf(stderr,
                     "[backend-load] slot=1 id=0x%llx %ux%u fmt=%d cached=%d valid=%d "
@@ -5662,7 +5663,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const uint32_t zero_buffer_word = 0;
     const VkDeviceSize storage_buffer_alignment = ctx.storage_buffer_alignment;
     const bool use_buffer_arena = reuse_host_buffers &&
-        getenv("PROSPER_NO_BACKEND_BUFFER_ARENA") == nullptr;
+        !PROSPER_ENV_ON("PROSPER_NO_BACKEND_BUFFER_ARENA");
     auto align_storage_offset = [storage_buffer_alignment](VkDeviceSize value) {
         const VkDeviceSize remainder = value % storage_buffer_alignment;
         if (!remainder) return value;
@@ -5861,7 +5862,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
-    const bool backend_trace = getenv("PROSPER_BACKEND_TRACE") != nullptr;
+    const bool backend_trace = PROSPER_ENV_ON("PROSPER_BACKEND_TRACE");
     // PROSPER_WAVE64_SKIP_CENSUS=1 -- which DRAWS the required-subgroup-size gate drops, at which
     // render target, and WHY (#2429, #2448). The existing "requires subgroup size 64" line sits inside
     // a dedupe guard keyed on shader identity while the `continue` that drops the draw is outside it,
@@ -6308,7 +6309,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // acne. Clamp requires the depthBiasClamp device feature; without it a non-zero clamp is
         // dropped to 0 (bias still applies, unclamped — the safe direction). PROSPER_NO_DEPTH_BIAS
         // is the A/B diagnostic, symmetric with PROSPER_NO_CULL above.
-        if (ps && ps->depth_bias_enable && !getenv("PROSPER_NO_DEPTH_BIAS")) {
+        if (ps && ps->depth_bias_enable && !PROSPER_ENV_ON("PROSPER_NO_DEPTH_BIAS")) {
             rs.depthBiasEnable         = VK_TRUE;
             rs.depthBiasConstantFactor = ps->depth_bias_constant;
             rs.depthBiasSlopeFactor    = ps->depth_bias_slope;
@@ -6394,7 +6395,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 ps->has_depth_clear && ps->depth_clear_value <= 0.5f;
             if (reverse_z_equal_compat) {
                 dss.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
-                if (getenv("PROSPER_DSLOG"))
+                if (PROSPER_ENV_ON("PROSPER_DSLOG"))
                     fprintf(stderr, "[ds] reverse-Z read-only EQUAL -> GEQUAL compatibility\n");
             }
         }
@@ -6415,7 +6416,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // from hardware — its use is isolating whether a suspect draw's coverage is
                 // stencil-gated (flipping GREATER<->LESS suppresses/expands it) without touching
                 // any other state. Symmetric ops (EQUAL/NOTEQUAL/ALWAYS/NEVER) are unaffected.
-                if (getenv("PROSPER_STENCIL_MIRROR")) {
+                if (PROSPER_ENV_ON("PROSPER_STENCIL_MIRROR")) {
                     switch (s.compareOp) {
                         case VK_COMPARE_OP_LESS:             s.compareOp = VK_COMPARE_OP_GREATER; break;
                         case VK_COMPARE_OP_GREATER:          s.compareOp = VK_COMPARE_OP_LESS; break;
@@ -6442,7 +6443,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 return s;
             };
             dss.front = mkop(0); dss.back = mkop(1);
-            if (getenv("PROSPER_STENCILLOG"))
+            if (PROSPER_ENV_ON("PROSPER_STENCILLOG"))
                 fprintf(stderr, "[stencil] front{cmp=%u ref=%u opval=%u cmask=0x%x wmask=0x%x fail=%u pass=%u zfail=%u} back{cmp=%u ref=%u fail=%u pass=%u zfail=%u} vkref=%u/%u cull=%u depth_test=%d\n",
                         ps->stencil_compare_op[0], ps->stencil_ref[0], ps->stencil_op_val[0], ps->stencil_compare_mask[0], ps->stencil_write_mask[0],
                         ps->stencil_fail_op[0], ps->stencil_pass_op[0], ps->stencil_depth_fail_op[0],
@@ -7250,7 +7251,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         SharedTextureBinding binding;
                         const bool persistent_bindings_enabled = share_backend_resources &&
                             persistent_textures_enabled &&
-                            getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS") == nullptr;
+                            !PROSPER_ENV_ON("PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS");
                         auto persistent_image = persistent_texture_images.end();
                         if (persistent_bindings_enabled &&
                             (upload.persistent_hit || upload.persistent_refresh) &&
@@ -8364,7 +8365,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}};
     rpbi.clearValueCount = color_count + (use_ds ? 1u : 0u);
     rpbi.pClearValues = clear.data();
-    if (getenv("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded
+    if (PROSPER_ENV_ON("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded
         int nok = 0; for (auto& v : dv) if (v.ok) nok++;
         fprintf(stderr, "[pipe] %zu draws, %d pipelines OK, use_depth=%d use_stencil=%d; counts:", dv.size(), nok, (int)use_depth, (int)use_stencil);
         for (auto& v : dv) fprintf(stderr, " %s%u", v.ok ? "" : "SKIP", v.icount ? v.icount : v.vcount);
@@ -8376,7 +8377,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // only active with the env var AND a real flush in THIS call (so the results are ready to read back).
     // Query-pool RESET must be recorded outside a render pass, so it happens here.
     const RenderVkCtx& ds_ctx = render_vk_ctx();
-    const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled &&
+    const bool draw_stats = PROSPER_ENV_ON("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled &&
                             !dv.empty() && flush_now;
     VkQueryPool ds_stats_pool = VK_NULL_HANDLE, ds_occ_pool = VK_NULL_HANDLE;
     if (draw_stats) {
@@ -8405,7 +8406,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // transform feedback and report where they land (degenerate / off-screen / behind-camera / NaN).
     // Requires VK_EXT_transform_feedback + the last pre-rasterization shader xfb-decorated (gated on
     // the same env var in gpu_executor). Only active with the env var, TF support, AND a flush here.
-    const char* geom_env = getenv("PROSPER_GEOM_PROBE");
+    const char* geom_env = PROSPER_ENV_VALUE("PROSPER_GEOM_PROBE");
     uint64_t geom_target = 0;
     const bool geom_target_valid = geom_env && gpu::parse_diagnostic_draw_id(geom_env, geom_target);
     const auto geom_target_label = static_cast<unsigned long long>(geom_target);
@@ -8894,7 +8895,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // valid is either never really written or is having its write disclaimed here, and those
         // are different defects. GTA V's cube shadows show exactly that shape: every face has a
         // cache entry, and slice 0 is never valid.
-        if (getenv("PROSPER_DS_SLICE_CENSUS")) {
+        if (PROSPER_ENV_ON("PROSPER_DS_SLICE_CENSUS")) {
             static std::mutex mutex;
             struct SliceTally { uint64_t passes = 0, claimed = 0, used_depth = 0, meaningful = 0; };
             static std::map<std::pair<uint64_t, uint32_t>, SliceTally> tally;
@@ -9082,7 +9083,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // `[shader-tap] NOT APPLIED ...` naming the PC in that case, so the two lines
                 // must be read together: this header states what was ASKED FOR, and the ABSENCE
                 // of a NOT APPLIED line is what says it was delivered.
-                const bool is_tap = getenv("PROSPER_SHADER_TAP") != nullptr;
+                const bool is_tap = PROSPER_ENV_ON("PROSPER_SHADER_TAP");
                 if (is_tap)
                     fprintf(stderr, "[geom-probe] draw=%llu SHADER-TAP REQUESTED (see any [shader-tap] NOT APPLIED line for this shader, which means these are the REAL clip positions -- #2064): values below are the tapped VGPR "
                                     "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n",
@@ -9176,7 +9177,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // (x,y,z,w in primitive-assembly order — for a triangle list, consecutive triples are the
                 // rasterized triangles) as CSV, so per-triangle overlap/degeneracy can be analyzed offline
                 // (e.g. GTA #1163's stencil over-count from self-overlapping mask triangles).
-                if (const char* dp = getenv("PROSPER_GEOM_PROBE_DUMP")) {
+                if (const char* dp = PROSPER_ENV_VALUE("PROSPER_GEOM_PROBE_DUMP")) {
                     if (FILE* f = fopen(dp, "w")) {
                         fprintf(f, "i,x,y,z,w\n");
                         for (uint32_t i = 0; i < written; i++)

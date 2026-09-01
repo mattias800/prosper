@@ -11,6 +11,7 @@
 #include <map>
 #include <atomic>
 #include <string>
+#include "diagnostics/env_cache.hpp"        // PROSPER_ENV_ON / _VALUE: cached reads on the per-draw path
 #include "gpu/pm4/command_processor.hpp"   // GpuState
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
@@ -1654,7 +1655,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         resolved_pipeline.color_targets.begin(), resolved_pipeline.color_targets.end(),
         [](const auto& target) { return target.write_mask != 0; });
     if (!preexport_color_effect && !has_depth_stencil_side_effect(resolved_pipeline) &&
-        !getenv("PROSPER_FORCE_COLORWRITE") && !getenv("PROSPER_NO_EARLY_NO_EFFECT")) {
+        !PROSPER_ENV_ON("PROSPER_FORCE_COLORWRITE") && !PROSPER_ENV_ON("PROSPER_NO_EARLY_NO_EFFECT")) {
         // PROSPER_DROPPED_DRAW_CENSUS=1 — which colour targets lose draws before they ever reach the
         // renderer, and why. A target census counts draws that ARRIVE; a surface whose draws are all
         // discarded here reads as "written by nothing" in that census and in every write-path watch,
@@ -1683,7 +1684,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // a whole route in ONE run. Painting one shader at a time answers the same question one
     // candidate per run; on a title with 66 fragment stages that is the difference between one run
     // and a bisect. It is what identified Stray's full-screen composite (#3126).
-    if (getenv("PROSPER_DRAWMAP")) {
+    if (PROSPER_ENV_ON("PROSPER_DRAWMAP")) {
         static std::mutex dmx; static std::map<std::string, uint64_t> dseen;
         char k[192];
         snprintf(k, sizeof k, "ps=0x%llx target=0x%llx %ux%u scissor=%u,%u..%u,%u tm=0x%x",
@@ -1772,7 +1773,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // Keep this diagnostic narrow enough for a routed title run.  PROSPER_DBG/GFXLOG both perturb
     // GTA V heavily and generate enormous logs; this switch proves that the post-VS RectList path
     // actually armed, and names the exact producer/consumer pair, without changing execution.
-    if (rect_list_synthesis && getenv("PROSPER_RECTLOG")) {
+    if (rect_list_synthesis && PROSPER_ENV_ON("PROSPER_RECTLOG")) {
         static std::atomic<uint32_t> logged{0};
         const uint32_t ordinal = logged.fetch_add(1, std::memory_order_relaxed);
         if (ordinal < 64u)
@@ -1787,7 +1788,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // PROSPER_RTLOG: correlate this draw's render-target address (CB_COLOR0_BASE) with the addresses of
     // the textures it SAMPLES. If a sampled texture's base equals some draw's color0_base, that surface is
     // a GPU render target (the game renders into it then samples it) -> render-to-texture (#83/#101).
-    if (getenv("PROSPER_RTLOG")) {
+    if (PROSPER_ENV_ON("PROSPER_RTLOG")) {
         fprintf(stderr, "[rt] color0=0x%llx %ux%u cf=0x%x nt=%u cs=%u",
                 (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
                 rs.color0_format, rs.color0_number_type, rs.color0_comp_swap);
@@ -1817,7 +1818,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         pixel_inputs = resolve_pixel_input_mapping(
             pixel_inputs, metadata_inputs, &interpolants_from_metadata);
     }
-    if (getenv("PROSPER_INTERPLOG")) {
+    if (PROSPER_ENV_ON("PROSPER_INTERPLOG")) {
         fprintf(stderr, "[interp] es=0x%llx ps=0x%llx source=%s valid=%08x ena=%08x addr=%08x",
                 (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
                 interpolants_from_metadata ? "metadata" : "registers",
@@ -1853,7 +1854,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
         max_shader_dwords, system_input_ptr, pixel_input_ptr);
-    const bool capture_vertex_position = getenv("PROSPER_GEOM_PROBE") != nullptr &&
+    const bool capture_vertex_position = PROSPER_ENV_ON("PROSPER_GEOM_PROBE") &&
                                          !interpolation.requires_geometry &&
                                          !rect_list_synthesis;
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -1932,7 +1933,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                        resolved_pipeline.topology <= 5u;
         if (triangle_topology)
             gs = recompile_interpolation_geometry(
-                interpolation, getenv("PROSPER_GEOM_PROBE") != nullptr,
+                interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
                 rect_list_synthesis);
     }
     if (phase_timing) {
@@ -1948,7 +1949,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     if (vertex_chain)
         add_stage_diagnostic(ShaderProgramStage::Vertex, chain_addr, vrt, vs_words);
     add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs_words);
-    if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
+    if (const char* dd = PROSPER_ENV_VALUE("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
         static int nd = 0;
         if (nd < 3 && !vs_words.empty()) {
             char fn[512];
@@ -1964,7 +1965,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     if (vs_words.empty() || fs_words.empty() ||
         ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty())) {
-        if (getenv("PROSPER_PROLOGLOG")) {
+        if (PROSPER_ENV_ON("PROSPER_PROLOGLOG")) {
             // #3126: name the FAILING program by the same content hash the prolog recogniser uses,
             // so the reject and the chain decision can be joined inside ONE run.
             const uint32_t* fc = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr));
@@ -2020,7 +2021,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                     rs.ps_input_ena, rs.ps_input_addr,
                     (unsigned long long)(draw ? draw->command_order : 0),
                     (unsigned long long)reject_occurrence);
-        if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
+        if (const char* dd = PROSPER_ENV_VALUE("PROSPER_SHADER_DUMP")) {
             for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
                 if (!addr || !guest_readable(addr, sizeof(uint32_t))) continue;
                 const size_t dump_dwords = rdna2_recompile_code_span(
@@ -2108,7 +2109,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const bool color_effect = std::any_of(
         ps.color_targets.begin(), ps.color_targets.end(),
         [](const auto& target) { return target.write_mask != 0; });
-    if (!color_effect && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+    if (!color_effect && !ds_effect && !PROSPER_ENV_ON("PROSPER_FORCE_COLORWRITE")) {
         report_dropped_draw_target(rs.color0_base, "no-effect", rs.cb_target_mask,
                                    rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::NoEffect;
@@ -2119,10 +2120,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // PROSPER_FORCE_COLORWRITE: diagnostic — render color_write_mask==0 draws anyway (force mask to RGBA).
     // The cutscene submits ~66 draws/frame that resolve to mask==0; if that is a mis-decode (not a genuine
     // depth-only pass), rendering them reveals whether they are the cutscene content.
-    if (ps.color_write_mask == 0 && getenv("PROSPER_FORCE_COLORWRITE")) ps.color_write_mask = 0xf;
+    if (ps.color_write_mask == 0 && PROSPER_ENV_ON("PROSPER_FORCE_COLORWRITE")) ps.color_write_mask = 0xf;
     // PROSPER_DRAWDIAG: per-RENDERED-draw geometry/position/texture — to LOCATE specific draws (e.g. the
     // cutscene caption text: small indexed quads, bottom viewport, blended, sampling a font atlas).
-    if (getenv("PROSPER_DRAWDIAG")) {
+    if (PROSPER_ENV_ON("PROSPER_DRAWDIAG")) {
         uint32_t ic = (draw && draw->indexed) ? draw->index_count : vcount_hint;
         fprintf(stderr, "[draw] idx=%u vp=%d y=%.0f h=%.0f blend=%d cwm=0x%x "
                         "target=0x%x shader=0x%x exp=0x%x es=0x%llx ps=0x%llx", ic,
@@ -2322,7 +2323,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // PROSPER_ONLY_ATLAS: render ONLY the caption text draw (samples the 2048x1024 font atlas), skipping
     // every other draw — so the caption geometry renders alone onto a clear frame. With TESTPS this shows
     // whether the caption rasterizes at all (magenta glyphs) or is culled/degenerate/clipped. #257.
-    if (getenv("PROSPER_ONLY_ATLAS")) {
+    if (PROSPER_ENV_ON("PROSPER_ONLY_ATLAS")) {
         bool sa = false;
         if (prt) for (const auto& r : prt->resources)
             if (r.cls == ResourceClass::Texture && r.width == 2048 && r.height == 1024) sa = true;
@@ -2332,7 +2333,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
         // PROSPER_ONLY_IC=<n>: further restrict to draws whose index count == n (isolate one atlas mesh,
         // e.g. the main glyph batch idx=1566 vs a fullscreen atlas draw).
-        if (const char* ic_s = getenv("PROSPER_ONLY_IC")) {
+        if (const char* ic_s = PROSPER_ENV_VALUE("PROSPER_ONLY_IC")) {
             uint32_t want = (uint32_t)atoi(ic_s);
             uint32_t ic = (draw && draw->indexed) ? draw->index_count : vcount_hint;
             if (ic != want) {
@@ -2341,7 +2342,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
     }
-    if (getenv("PROSPER_CAPTION_DIAG") && prt) {
+    if (PROSPER_ENV_ON("PROSPER_CAPTION_DIAG") && prt) {
         bool samples_atlas = false;
         for (const auto& r : prt->resources)
             if (r.cls == ResourceClass::Texture && r.width == 2048 && r.height == 1024) samples_atlas = true;
@@ -2467,7 +2468,7 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
     // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
     // firehose (which is GBs over a minutes-long run) — for "which draws skip and why" surveys (#319).
     const bool log = getenv("PROSPER_GFXLOG") != nullptr ||
-                     getenv("PROSPER_EXECLOG") != nullptr;   // bail-point visibility (why no frame?)
+                     PROSPER_ENV_ON("PROSPER_EXECLOG");   // bail-point visibility (why no frame?)
     // Render each draw from its OWN register snapshot when the submit has MULTIPLE draws — a real
     // multi-geometry scene (the game's in-game/cutscene submits carry 8-11 distinct draws with per-draw
     // shaders/textures/blends). Folding those to just the last draw drops the rest and the frame comes out
@@ -2537,7 +2538,7 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
             failures->push_back(std::move(failure));
         }
     }
-    if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s): raw index_counts=[",
+    if (PROSPER_ENV_ON("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s): raw index_counts=[",
         st.draws.size(), (int)perdraw, items.size());
         for (size_t i = 0; i < st.draws.size(); i++) fprintf(stderr, "%s%u%s", i?",":"", st.draws[i].index_count,
                                                              st.draws[i].indexed ? "i" : "");
