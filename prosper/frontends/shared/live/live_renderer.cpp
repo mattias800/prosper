@@ -4,6 +4,7 @@
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
+#include "gpu/diagnostics/draw_program_skip.hpp"          // PROSPER_SKIP_DRAW_PROGRAM / census
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/rtt/rtt_injection.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -7222,6 +7223,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
                 return false;
             };
+            // PROSPER_SKIP_DRAW_PROGRAM / PROSPER_DRAW_PROGRAM_CENSUS: decline draws by shader
+            // PROGRAM identity, and enumerate the programs a title draws with. Both are process
+            // singletons configured once from the environment (see draw_program_skip.hpp for the
+            // contract and the four limits a reader of a skipped run cannot see in the output).
+            // Hoisted here for the same reason descriptor_validate_mode is: the accessor is one
+            // function-local-static test, but calling it per draw on a 2,100-draw submit is a
+            // measurable cost for a variable nobody set.
+            auto& program_skip = prosper::gpu::draw_program_skip_selector();
+            const bool program_skip_armed = program_skip.armed();
+            const bool program_census = prosper::gpu::draw_program_census_enabled();
             auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group) {
                 std::vector<prosper::test::BackendDraw> bds;
                 // Once per call, not once per draw -- see the note on descriptor_validate_mode above
@@ -7354,6 +7365,57 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 fprintf(stderr, " tex@%u=0x%llx(%ux%u f%u)", r.binding,
                                         (unsigned long long)r.gpu_addr, r.width, r.height, (unsigned)r.format);
                         fprintf(stderr, "\n");
+                    }
+                    // PROSPER_DRAW_PROGRAM_CENSUS: which programs does this title actually draw
+                    // with? One line per distinct (vs, vs-chain, ps) triple, then powers of two --
+                    // bounded by the program count, not the draw count. This is the census that
+                    // supplies PROSPER_SKIP_DRAW_PROGRAM's input.
+                    if (program_census) {
+                        const auto sighting = prosper::gpu::draw_program_census().observe(
+                            it.vs_guest_addr, it.vs_chain_guest_addr, it.fs_guest_addr);
+                        if (sighting.print)
+                            fprintf(stderr, "[draw-program] %s vs=0x%llx chain=0x%llx ps=0x%llx "
+                                    "draws=%llu distinct=%llu vcount=%u nidx=%zu topo=%u tgt=0x%llx\n",
+                                    sighting.first ? "NEW " : "    ",
+                                    (unsigned long long)it.vs_guest_addr,
+                                    (unsigned long long)it.vs_chain_guest_addr,
+                                    (unsigned long long)it.fs_guest_addr,
+                                    (unsigned long long)sighting.ordinal,
+                                    (unsigned long long)sighting.distinct,
+                                    bd.vcount, bd.indices.size(), it.ps.topology,
+                                    (unsigned long long)it.color0_base);
+                    }
+                    // PROSPER_SKIP_DRAW_PROGRAM: withhold this draw from the GPU because one of its
+                    // programs is named. LAST in the per-draw build on purpose -- instrument trap
+                    // 166: a diagnostic skip ordered before the dump blinds every other instrument
+                    // to the thing under suspicion, and the program worth declining is precisely the
+                    // one that hangs the GPU. So the draw is fully realized, fully validated and
+                    // fully logged by [render]/[rtt]/[draw-program] first; only the Vulkan draw call
+                    // is withheld. Its CPU-side cost is therefore real, and the timing partition
+                    // above has already counted it in build_draws, which is arithmetically right --
+                    // it did spend build_R, validation, poison and indices.
+                    if (program_skip_armed) {
+                        const auto decision = program_skip.evaluate(
+                            it.vs_guest_addr, it.vs_chain_guest_addr, it.fs_guest_addr);
+                        if (decision.skip) {
+                            if (decision.print)
+                                fprintf(stderr,
+                                        "[draw-decline] program=0x%llx stage=%s "
+                                        "reason=skipped-by-selector count=%llu draw#%llu order=%llu "
+                                        "vs=0x%llx chain=0x%llx ps=0x%llx vcount=%u nidx=%zu "
+                                        "tgt=0x%llx\n",
+                                        (unsigned long long)decision.address,
+                                        prosper::gpu::draw_program_stage_name(decision.stage),
+                                        (unsigned long long)decision.ordinal,
+                                        (unsigned long long)it.draw_index,
+                                        (unsigned long long)it.command_order,
+                                        (unsigned long long)it.vs_guest_addr,
+                                        (unsigned long long)it.vs_chain_guest_addr,
+                                        (unsigned long long)it.fs_guest_addr,
+                                        bd.vcount, bd.indices.size(),
+                                        (unsigned long long)it.color0_base);
+                            continue;
+                        }
                     }
                     bds.push_back(std::move(bd));
                 }
