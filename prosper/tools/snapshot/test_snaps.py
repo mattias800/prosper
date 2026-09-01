@@ -189,6 +189,11 @@ def main():
             name = "unit2"
             det_fps = snaps.DEFAULT_DET_FPS      # the CLI default, NOT what was authored
             det_clock = "on"                     # ditto
+            # Distinct from Args.min_ssim (snaps.DEFAULT_MIN_SSIM) on purpose -- #3164's second
+            # route is `cmd_import` hardcoding `min_structural_similarity` instead of recording
+            # `args.min_ssim` verbatim. A value equal to the default could not tell "recorded
+            # correctly" apart from "silently replaced with the default".
+            min_ssim = 0.42
 
         snaps.cmd_import(Args2())
         authored = snaps.load_entry("unit2")
@@ -196,6 +201,8 @@ def main():
               "import records the rate the session was AUTHORED at, not its own default")
         check(authored.get("det_clock") == "off",
               "...and the clock stance the session was authored under")
+        check(authored.get("min_structural_similarity") == 0.42,
+              "import records the caller's --min-ssim value VERBATIM, not a hardcoded constant")
         # The whole point is that both halves then agree.
         env2 = snaps.replay_env(authored, tmp, base={})
         check(env2.get("PROSPER_FLIP_PACE_FPS") == "30",
@@ -935,17 +942,19 @@ def main():
         # asymmetry IS the design: a correct snap that stops matching is a FAILURE; an incorrect one
         # that stops matching is INFO, because a known-bad frame may have been fixed and this is the
         # only signal that would ever say so. None of it was asserted.
-        def check_run(verdict, ref_pixel, actual_pixel, mode="anchor", flip=900):
+        def check_run(verdict, ref_pixel, actual_pixel, mode="anchor", flip=900, min_ssim=None):
             """Run cmd_check over one snap with a controlled reference/actual pair.
 
             Returns (exit_code, output). The reference is what was approved; the actual is what the
-            stubbed replay produced, so the two pixels decide whether it matches.
+            stubbed replay produced, so the two pixels decide whether it matches. `min_ssim`, when
+            given, is stored on the entry as `min_structural_similarity` -- the per-set threshold
+            `cmd_check` is supposed to compare against instead of its own compiled-in default.
             """
             # Deterministic, so repeated runs reuse one directory instead of seeding a new one
             # each time. hash() is randomised per process, which made this a slow leak into
             # ~/.cache on every machine that runs ctest.
-            nm = "vc-{}-{}-{}-{}".format(verdict, "".join(str(c) for c in ref_pixel),
-                                         "".join(str(c) for c in actual_pixel), mode)
+            nm = "vc-{}-{}-{}-{}-{}".format(verdict, "".join(str(c) for c in ref_pixel),
+                                            "".join(str(c) for c in actual_pixel), mode, min_ssim)
             vdir = os.path.join(tmp, nm)
             os.makedirs(vdir, exist_ok=True)
             ref_bmp = os.path.join(vdir, "ref.bmp")
@@ -956,6 +965,8 @@ def main():
             entry_v = {"name": nm, "dump": "D-app0", "route": "r.pad", "det_fps": 60,
                        "timeout": 60, "savedata": "none",
                        "snaps": [dict(sig, index=0, verdict=verdict, mode=mode, pad_flip=flip)]}
+            if min_ssim is not None:
+                entry_v["min_structural_similarity"] = min_ssim
             with open(snaps.store_path(nm), "w", encoding="utf-8") as handle:
                 json.dump(entry_v, handle)
 
@@ -1035,6 +1046,40 @@ def main():
         rc_v, out_v = check_unreached("incorrect")
         check(rc_v == 0 and "NOT REACHED" in out_v,
               "...while an unreached known-bad snap is reported without failing the run")
+
+        # ---- 6a1b-iv-c-2. cmd_check's THRESHOLD comes from the ENTRY, not a stale default -----
+        # #3164: `threshold = entry.get("min_structural_similarity", DEFAULT_MIN_SSIM)` can be
+        # computed and then never actually reach `matched = ssim >= threshold` -- a stale local
+        # default substituted instead -- or the read can be dropped entirely. Every arm above
+        # never sets a custom threshold, so none of them can tell an entry's own
+        # min_structural_similarity apart from the compiled-in DEFAULT_MIN_SSIM; both routes
+        # would leave this whole suite green.
+        thresh_lo_bmp, thresh_hi_bmp = (os.path.join(tmp, "thresh_lo.bmp"),
+                                        os.path.join(tmp, "thresh_hi.bmp"))
+        write_bmp(thresh_lo_bmp, 64, 36, lambda x, y: (60, 60, 60))
+        write_bmp(thresh_hi_bmp, 64, 36, lambda x, y: (90, 90, 90))
+        mid_pair_ssim = snaps.structural_similarity(
+            snaps.decode_luma(snaps.signature_of(thresh_lo_bmp)["luma16x9"]),
+            snaps.decode_luma(snaps.signature_of(thresh_hi_bmp)["luma16x9"]))
+        # The fixture must sit strictly between the default and a stricter custom threshold, or
+        # the arms below prove nothing.
+        check(snaps.DEFAULT_MIN_SSIM < mid_pair_ssim < 0.99,
+              f"fixture pair scores {mid_pair_ssim:.4f} -- strictly between the {snaps.DEFAULT_MIN_SSIM} "
+              f"default and a stricter 0.99 -- so the arms below can tell them apart")
+
+        # A threshold STRICTER than the default: the default (0.85) would PASS this pair, so only
+        # an entry whose OWN 0.99 threshold actually reached the comparison makes it FAIL.
+        rc_v, out_v = check_run("correct", (60, 60, 60), (90, 90, 90), min_ssim=0.99)
+        check(rc_v != 0 and "FAIL" in out_v,
+              "a stored min_structural_similarity STRICTER than the default is honoured -- proof "
+              "the entry's own threshold, not the compiled-in default, decided the verdict")
+
+        # A threshold LOOSER than the default: the default would FAIL this wildly different pair,
+        # so only an entry whose OWN 0.0 threshold actually reached the comparison makes it PASS.
+        rc_v, out_v = check_run("correct", (10, 20, 30), (240, 250, 200), min_ssim=0.0)
+        check(rc_v == 0 and "OK" in out_v,
+              "a stored min_structural_similarity of 0.0 makes even a wildly different frame "
+              "pass -- proof the ENTRY's threshold reached the comparison, not a hardcoded 0.85")
 
         # ---- 6a1b-iv-d. cmd_check REFUSES a snap set with ZERO snaps -------------------------
         # cmd_import already refuses to ever STORE a zero-snap set (arm 6a1b-iii-e above); nothing
@@ -1302,6 +1347,22 @@ def main():
                   f"`{sub}` defaults to isolated saves, so a run cannot touch real ones by default")
             forced = parser.parse_args(base_argv + ["--det-clock", "on"])
             check(forced.det_clock == "on", f"`{sub}` still accepts --det-clock on explicitly")
+
+        # ---- 6a1b-v-c. The --min-ssim CLI default is 0.85, wired to DEFAULT_MIN_SSIM -----------
+        # #3164's third route: the constant itself (`DEFAULT_MIN_SSIM = 0.85`) can be weakened --
+        # e.g. to 0.0, which would make every future check pass regardless of what the frame looks
+        # like. That constant is also `cmd_check`'s own fallback when an entry has no stored
+        # threshold, so pinning the LITERAL value (not merely equality to the constant, which a
+        # weakened constant would still satisfy) is the point.
+        check(snaps.DEFAULT_MIN_SSIM == 0.85,
+              "DEFAULT_MIN_SSIM is the failure threshold every existing snap set was authored "
+              "under; weakening it silently loosens every guard that never overrides it")
+        ssim_defaults = parser.parse_args(["import", "somedir", "--name", "n"])
+        check(ssim_defaults.min_ssim == snaps.DEFAULT_MIN_SSIM,
+              "`import`'s --min-ssim default is WIRED to the module constant, not a separate "
+              "hardcoded literal that could drift from it")
+        ssim_forced = parser.parse_args(["import", "somedir", "--name", "n", "--min-ssim", "0.42"])
+        check(ssim_forced.min_ssim == 0.42, "...and an explicit --min-ssim still overrides it")
 
         # ---- 6a1b-vi. _flag_was_passed sees argparse ABBREVIATIONS -----------------------------
         # argparse accepts any unambiguous prefix, so `--det-f 30` sets det_fps. An exact-match
