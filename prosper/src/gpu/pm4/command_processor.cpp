@@ -4174,6 +4174,22 @@ void apply_retained_dma_copies(std::vector<GpuState::DmaCopy>& copies) {
     copies.clear();
 }
 
+// State-at-draw snapshot (see the declaration). One snapshot is shared by consecutive work items
+// with no register write between them, so this is a pointer copy in the common case.
+const std::shared_ptr<const GpuState>& GpuState::refresh_state_snapshot() {
+    if (state_dirty_ || !last_snapshot_) {
+        auto snap = std::make_shared<GpuState>();
+        snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+        snap->index_type_announced = index_type_announced;
+        snap->num_instances = num_instances;
+        snap->command_order = command_order;   // #305 instrument: order at snapshot
+        if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
+        last_snapshot_ = std::move(snap);
+        state_dirty_ = false;
+    }
+    return last_snapshot_;
+}
+
 void GpuState::apply(const Pm4Command& c) {
     using K = Pm4Command::Kind;
     command_order = c.stream_order ? c.stream_order : command_order + 1;
@@ -4442,6 +4458,11 @@ void GpuState::apply(const Pm4Command& c) {
         }
         case K::SetIndexType:
             index_type = c.index_size;
+            // #3009: record the ANNOUNCEMENT, not just the value. A type-3 packet is at least two
+            // dwords (pm4_decode.cpp hdr_len adds 2), so a decoded SetIndexType always carried its
+            // payload dword and this is unconditional -- the `npl >= 1` guard on c.index_size is
+            // defensive, not a reachable "announced nothing" case.
+            index_type_announced = true;
             state_dirty_ = true;
             break;
         case K::SetNumInstances:
@@ -4528,15 +4549,7 @@ void GpuState::apply(const Pm4Command& c) {
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
-            if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
-                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
-                snap->num_instances = num_instances;
-                snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
-                last_snapshot_ = std::move(snap);
-                state_dirty_ = false;
-            }
+            refresh_state_snapshot();
             uint32_t elem = index_type ? 4u : 2u;
             Draw d;
             d.index_count = c.index_count ? c.index_count : index_num;
@@ -4579,15 +4592,7 @@ void GpuState::apply(const Pm4Command& c) {
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
-            if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
-                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
-                snap->num_instances = num_instances;
-                snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
-                last_snapshot_ = std::move(snap);
-                state_dirty_ = false;
-            }
+            refresh_state_snapshot();
             Draw d;
             d.index_count = c.index_count;
             d.instance_count = num_instances;
@@ -4622,15 +4627,7 @@ void GpuState::apply(const Pm4Command& c) {
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
-            if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
-                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
-                snap->num_instances = num_instances;
-                snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
-                last_snapshot_ = std::move(snap);
-                state_dirty_ = false;
-            }
+            refresh_state_snapshot();
             Draw d;
             d.state = last_snapshot_;
             d.indexed = true;
@@ -4874,15 +4871,7 @@ void GpuState::apply(const Pm4Command& c) {
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
-            if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
-                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
-                snap->num_instances = num_instances;
-                snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
-                last_snapshot_ = std::move(snap);
-                state_dirty_ = false;
-            }
+            refresh_state_snapshot();
             dispatches.push_back({c.threads_x, c.threads_y, c.threads_z,
                                   c.dispatch_modifier, last_snapshot_, command_order});
             dispatch_count++;
@@ -4906,15 +4895,7 @@ void GpuState::apply(const Pm4Command& c) {
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
-            if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
-                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
-                snap->num_instances = num_instances;
-                snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
-                last_snapshot_ = std::move(snap);
-                state_dirty_ = false;
-            }
+            refresh_state_snapshot();
             Dispatch d;
             d.modifier = c.dispatch_modifier;
             d.state = last_snapshot_;

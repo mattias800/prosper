@@ -849,6 +849,44 @@ int main() {
               "#1256: realize_draw_item records the raw indexed draw-packet count (3) + indexed flag");
     }
 
+    // #3009: the announcement gate, end to end through realize_draw_item.
+    //
+    // ONE buffer, ONE index_type (0), TWO announcement states. The bytes are the live DOLL banner
+    // quad stored 32-bit, so the #304 zero-high-half fingerprint matches them: read as 16-bit they
+    // are the degenerate [0,0,1,0,2,0], read as 32-bit the real [0,1,2,2,1,3].
+    //
+    // Before #3009 the executor had only `index_type == 0` to go on, so BOTH calls below produced
+    // the 32-bit reading -- an announced 16-bit buffer of this shape was silently reinterpreted, and
+    // no fixture could tell the two states apart because they were the same state. The arms are a
+    // matched pair on purpose: the unannounced one is the control proving the detector still fires,
+    // and without it the announced arm would pass just as well against a detector that never runs.
+    {
+        alignas(4) static const uint32_t kQuad32[6] = { 0, 1, 2, 2, 1, 3 };
+        auto realize_with = [&](bool announced, DrawItem& out) {
+            GpuState sq = st;
+            sq.index_type = 0;                       // 16-bit reading, both times
+            sq.index_type_announced = announced;
+            GpuState::Draw dq;
+            dq.index_count = 6; dq.indexed = true;
+            dq.index_addr = (uint64_t)(uintptr_t)kQuad32;
+            sq.draws.clear(); sq.draws.push_back(dq);
+            return realize_draw_item(sq, &sq.draws[0], 6u, 0x10000u, /*log*/false, out);
+        };
+        DrawItem unannounced_item, announced_item;
+        const bool made_unannounced = realize_with(/*announced*/false, unannounced_item);
+        const bool made_announced   = realize_with(/*announced*/true,  announced_item);
+        const std::vector<uint32_t> as32 = { 0, 1, 2, 2, 1, 3 };
+        const std::vector<uint32_t> as16 = { 0, 0, 1, 0, 2, 0 };
+        CHECK(made_unannounced && unannounced_item.indices == as32,
+              "#3009 control: with NO announcement the #304 detector still recovers the 32-bit quad");
+        CHECK(made_announced && announced_item.indices == as16,
+              "#3009: the SAME bytes at the SAME index_type are read as announced 16-bit once the "
+              "guest announced -- the heuristic no longer overrules what the guest said");
+        CHECK(made_unannounced && made_announced &&
+              unannounced_item.indices != announced_item.indices,
+              "#3009: the two previously-indistinguishable states now produce different index data");
+    }
+
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     // #189: production submit execution must realize an indexed draw only after a preceding DMA
     // supplies its index buffer. Callback ordering alone is insufficient because realization owns
