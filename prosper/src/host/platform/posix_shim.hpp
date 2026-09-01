@@ -69,6 +69,7 @@ static inline int prosper_mincore(const void* addr, size_t len, unsigned char* v
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <ctime>
 #include <csignal>
@@ -167,6 +168,15 @@ struct prosper_sem_t {
     int             count;
 };
 static inline int prosper_sem_init(prosper_sem_t* s, int /*pshared*/, unsigned value) {
+    // POSIX: sem_init() must fail EINVAL when `value` exceeds {SEM_VALUE_MAX} (sem_init(3)). `count`
+    // is a plain `int` here, so INT_MAX is the real bound this representation can hold -- accepting
+    // more would silently truncate the cast below into a negative count, and every subsequent
+    // wait/trywait/timedwait would then see "not ready" (`count <= 0`) even after enough posts to
+    // reach the value the guest actually asked for. Found in review of #3068: the out-of-range probe
+    // that test proved failed on Linux (real sem_init's own SEM_VALUE_MAX check) fell straight
+    // through this shim's unconditional `return 0` on Darwin, so the one platform this whole shim
+    // exists for was the one platform where SemInit could never report a real failure.
+    if (value > (unsigned)INT_MAX) { errno = EINVAL; return -1; }
     pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr);
     s->count = (int)value; return 0;
 }
