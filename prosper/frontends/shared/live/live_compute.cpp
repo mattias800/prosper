@@ -20,7 +20,8 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
-#include "gpu/resources/image_identity.hpp"  // #3204: named image-identity predicates
+#include "gpu/resources/image_identity.hpp"
+#include "gpu/resources/spirv_storage_match.hpp"  // #3204: SPIR-V/guest storage agreement  // #3204: named image-identity predicates
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_write_watch.hpp"
@@ -5988,19 +5989,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->num_components ? r->num_components : 1;
             const VkFormat native_storage_format =
                 native_storage_vk_format(r->format, descriptor_components);
-            const bool spirv_native_float_storage = bi.storage &&
-                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Float;
-            const bool spirv_native_uint_storage = bi.storage &&
-                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Uint &&
-                !image_descriptors[i].atomic_access &&
-                ((r->format == DataFormat::Uint32 && descriptor_components == 1 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatR32ui) ||
-                 (r->format == DataFormat::Uint8 && descriptor_components == 1 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatR8ui) ||
-                 (r->format == DataFormat::Uint8 && descriptor_components == 4 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatRgba8ui) ||
-                 (r->format == DataFormat::Uint16 && descriptor_components == 1 &&
-                  image_descriptors[i].storage_image_format == kSpirvImageFormatR16ui));
+            // #3204: the SPIR-V/guest storage-format agreement lives in spirv_storage_match.hpp,
+            // where the enumerated pairs are named and tested. The format operand VALUES stay here,
+            // passed in, so the header never becomes a second source of truth for them.
+            const prosper::gpu::SpirvStorageDeclaration storage_decl{
+                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Uint,
+                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Float,
+                image_descriptors[i].atomic_access,
+                image_descriptors[i].storage_image_format};
+            const bool spirv_native_float_storage =
+                bi.storage && prosper::gpu::spirv_native_float_storage(storage_decl);
+            const bool spirv_native_uint_storage =
+                bi.storage && prosper::gpu::spirv_native_uint_storage(
+                    storage_decl, r->format, descriptor_components,
+                    kSpirvImageFormatR32ui, kSpirvImageFormatR16ui,
+                    kSpirvImageFormatR8ui, kSpirvImageFormatRgba8ui);
             const bool spirv_native_storage =
                 spirv_native_float_storage || spirv_native_uint_storage;
             bi.packed_r11_storage = bi.storage && !spirv_native_storage &&

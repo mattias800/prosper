@@ -2052,6 +2052,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_live_target_format_match PRIVATE prosper_core prosper_live_renderer)
   add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
 
+  # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
+  # direction binds the guest image with the wrong element type, so every arm has a rejection
+  # partner -- including atomics, which are never a native storage image however well formats match.
+  add_executable(test_spirv_storage_match tests/gpu/agc/test_spirv_storage_match.cpp)
+  target_link_libraries(test_spirv_storage_match PRIVATE prosper_core)
+  add_test(NAME spirv_storage_match COMMAND test_spirv_storage_match)
+
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
   add_executable(test_convention_bindings tests/gpu/test_convention_bindings.cpp)
