@@ -285,6 +285,33 @@ drops still discard the background.
 
 ## Ruled out
 
+- **"The title-screen vertex stages die because the recompiler cannot lower
+  `buffer_load_format_* … idxen`, or because they arrive with no resource table."** Both falsified
+  (#3137). The census line that raised them names an INSTRUCTION —
+  `[recompile-reject] sh=…/77 mode=unresolved-operand pc=57 words=e00c2000,6a010000 … stage=vertex` —
+  and that is not where the defect is. MUBUF `0x0`–`0x3` are implemented, and the disposition line
+  from the same run says which arm fired: `[buf-op] … pc=57 MUBUF op=0x3 n=4 … rt=1
+  reject-unresolved`. `rt=1` with five resources kills the no-resource-table candidate outright, and
+  the `VCC_LO`/`VCC_HI` SOFFSET is not it either — `operand_bits` has a vertex-stage branch for
+  exactly that, and the reject happens before the address is ever formed.
+  What actually fails is SRSRC provenance. Disassembled (`llvm-mc -mcpu=gfx1030`), both failing
+  stages build their own descriptor:
+  `s_load_dwordx4 s[4:7], s[12:13], vcc_hi` with a register offset, then a `s_and`/`s_or`/
+  `s_cselect_b32 s7, …` patch of dword 3. That leaves no SRT key and rewrites the SRSRC range, so the
+  direct-SGPR fallbacks are correctly suppressed and only the const-fold's per-fetch entry could
+  resolve it — and it has none.
+  - **The const-fold is not the defect either; it is refusing correctly.** `PROSPER_DYNTRACE_FAIL=1`
+    shows the whole chain hanging off `s_load_dwordx4 s[16:19], s[14:15]`, whose base reads
+    `0x0004dfac00000001` — `addr … unreadable` — after which every scalar is `ok=0` and the fetch is
+    "left unresolved (not folded to 0)".
+  - **This is #305, on a third title.** `PROSPER_UDPROV=1` shows the draw's own bind writing twelve
+    contiguous user dwords in one direct `SET_SH_REG`, while `RSRC2_GS.USER_SGPR = 8` equals the
+    shader's `user_data_range_end = 8`. The two mapped 64-bit pointers the shader wants sit at dwords
+    8 and 10, outside that window; dwords 6:7 hold the `num_records`/`dword3` tail of the preceding
+    V# — the `0x0004dfac…` constant family `RESOURCE_BINDING.md` already names. Do not restart this
+    from the recompiler. See `RESOURCE_BINDING.md` § Ruled out, and note the row there recording why
+    the `[udcand]` "implied seed" offset is *not* a safe fix.
+
 - **"The 4K title background is black because its asset never loads, or loads late."** Falsified, and
   by three sources that share no code. The pak read delivers the bytes: `PROSPER_APR_VERIFY`
   re-reads each guest destination through `process_vm_readv` immediately after the write and

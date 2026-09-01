@@ -70,6 +70,19 @@ The falsification is written down rather than the code being merged, because a d
 whose own measurement says it can never fire is worse than no switch. What is *not* ruled out is
 deferring across batches — that is where the sized win still lives, and nobody has tried it.
 
+### The Stray vertex shaders that "the recompiler can't compile" compile fine
+
+No picture — this one is a correction, not a rung.
+
+Two of Stray's title-screen vertex shaders are dropped at a vertex attribute fetch, which reads like
+a missing shader lowering. It is not: the instruction is implemented, the stage has its resource
+table, and the fetch's descriptor is the only thing missing. The shader builds that descriptor by
+dereferencing a user-data pointer that is outside the eight-register window the pipeline actually
+loads, so the pointer it reads is the tail of the previous descriptor — the same `0x0004dfac…` value
+[#305](https://github.com/mattias800/prosper/issues/305) has been chasing on two other UE4 titles.
+Stray is the third, and the first where one replay shows both halves. The reject line now says which
+of those two stories it is, so the next reader does not have to re-run the game to find out.
+
 ## 2026-08-31
 
 ### Stray's splash runs 66% faster, and the title screen now holds 65 fps
