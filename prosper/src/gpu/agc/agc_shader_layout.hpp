@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace prosper::gpu {
 
@@ -214,6 +215,18 @@ struct Gen5ImageFormatInfo {
 // The single mip level Prosper uploads for a T# view. GFX10 descriptor BASE_ADDRESS names the
 // entire allocation, whose mip-tail-first layout can put BASE_LEVEL at a non-zero byte offset.
 struct DecodedImageView {
+    // NOT redundant, and do not delete it as noise. A user-declared default constructor makes this
+    // a non-aggregate under C++20 (P1008R1), which turns every POSITIONAL braced initialization of
+    // it into a compile error while `V v;`, `V v{};` and `return {};` keep working. That is the
+    // point: this struct grew five fields in #3048, and the tree's one positional initializer
+    // silently re-bound its last value onto a new field -- leaving `supported` at its default
+    // `true` and killing a BASE_ARRAY guard with no diagnostic, because `bool -> uint32_t` is a
+    // promotion rather than a narrowing. A test can pin the function that used to hold that
+    // initializer; only this line stops the same shape appearing at a NEW call site. Verified on
+    // gcc 16 -Wall -Wextra: named/value/`{}` initialization compiles, `DecodedImageView{a, b, ...}`
+    // does not. Assign by name, or add designators.
+    DecodedImageView() = default;
+
     uint64_t base = 0;
     uint32_t width = 0, height = 0;
     size_t mip_offset = 0;
@@ -239,6 +252,12 @@ struct DecodedImageView {
     // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
     bool supported = true;
 };
+// The guard above, made self-defending: deleting the defaulted constructor to "tidy up" would make
+// this an aggregate again and silently re-open positional initialization. This fails the build
+// instead.
+static_assert(!std::is_aggregate_v<DecodedImageView>,
+              "DecodedImageView must stay a non-aggregate so positional braced initialization "
+              "cannot silently re-bind its fields when the struct grows (#3048/#3197)");
 // The view for a descriptor whose Gen5 format prosper cannot map. Such a binding can still
 // recompile as a format-free storage image, but no mip or slice placement is derivable for it, so
 // this builds the allocation base by hand and fails closed on any descriptor that selects something

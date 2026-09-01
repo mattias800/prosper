@@ -20,6 +20,16 @@ namespace {
 // narrowing of FP16, packed R11G11B10, block-compressed decode, a depth view) is deliberately not
 // here: a per-level upload would have to reproduce that conversion at every extent, and this first
 // landing keeps the level-0 bytes byte-identical to what the single-level path already produces.
+//
+// IF YOU WIDEN THIS LIST, read `live_compute.cpp`'s conversion cascade first. This whitelist picks
+// the level COUNT; a separate branch condition there does the copying, and only that branch can
+// write levels 1..N-1. Adding a format here that the branch does not take would otherwise leave
+// those levels as whatever the staging allocation held. That case is caught -- the cascade ends in
+// a drift detector that declines instead of uploading it -- so the failure is a declined dispatch,
+// not corrupt texels; but the fix is to teach the cascade, not to widen only this list. The two are
+// deliberately NOT collapsed: this function has callers (the emitter, the compile key) that have no
+// BoundImage, no reflected descriptor and no live target, so the count must stay derivable from the
+// descriptor alone.
 bool native_straight_copy_sampled_format(DataFormat format, uint32_t components) {
     switch (format) {
         case DataFormat::Float32:

@@ -2413,10 +2413,15 @@ int main() {
                   "live backend executes a dynamic-mip IMAGE_LOAD_MIP dispatch");
             CHECK(std::equal(chain_dst.begin(), chain_dst.end(), chain_level1_linear.begin()),
                   "IMAGE_LOAD_MIP at a runtime mip returns LEVEL ONE's own guest texels");
-            // The real anti-coincidence guard is that recompilation only succeeds through the
-            // dynamic-LOD path at all: with the backend reverted to one level the assertion above
-            // reddens while this one stays green, because an UNWRITTEN destination also differs
-            // from level zero. Keep both, and do not read the second as the discriminator.
+            // The two arms below are FIXTURE-VALIDITY guards, not discriminators, and the
+            // difference is measured rather than argued: with the backend reverted to
+            // `ici.mipLevels = 1` the assertion above reddens while BOTH of these stay green.
+            // So the destination is not left unwritten under that mutant -- it is written with
+            // something that is neither level one nor the sentinel. What they rule out is a
+            // fixture that could pass vacuously: level one being byte-identical to level zero,
+            // and the dispatch never running at all. The discriminator is the level-one equality
+            // itself, and behind it the fact that this program only recompiles through the
+            // dynamic-LOD path. Do not read either arm as evidence about the mutant.
             CHECK(!std::equal(chain_dst.begin(), chain_dst.end(), chain_level0_linear.begin()),
                   "level one is distinguishable from level zero in this fixture");
             CHECK(std::none_of(chain_dst.begin(), chain_dst.end(),

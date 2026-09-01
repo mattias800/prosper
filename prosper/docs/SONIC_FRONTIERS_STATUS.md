@@ -586,8 +586,12 @@ changes nothing.
   `[compute-mip-chain] declined …` on a geometric schedule (`skip_image` alone warns once per
   address for the whole process while the dispatch is dropped every frame, which reads as a
   one-off when it is not).
-* **The LOD is clamped** to the materialized level count, which is what hardware does with a T#'s
-  `LAST_LEVEL`.
+* **The LOD is clamped** to the materialized level count. Half of that is certain and half is
+  inference, and the code says so at the site (`CONFIDENCE: MED`): an out-of-range `Lod` operand is
+  UNDEFINED in SPIR-V, so *some* clamp is mandatory whatever the hardware does — but *saturating to
+  the last level* is read from doc 70648's BASE_LEVEL/LAST_LEVEL fields, whose MIMG section does not
+  spell out the out-of-range behaviour, and no capture here exercises one. Returning zeros is the
+  other candidate.
 
 **Not yet measured on this title.** The change is covered by a registered execution test — a real
 tiled nine-level guest chain, dispatched through the production compute backend, asserting the
