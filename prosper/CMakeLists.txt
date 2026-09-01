@@ -1497,6 +1497,23 @@ if(TARGET prosper_core)
   target_include_directories(test_dmem_caller_chain PRIVATE src)
   add_test(NAME dmem_caller_chain COMMAND test_dmem_caller_chain)
 
+  # #3057: test_dmem_caller_chain above covers format_dmem_caller_chain_definition (the formatter)
+  # only -- it never calls k_alloc_dmem/k_alloc_main_dmem, so deleting the actual
+  # attribute_dmem_allocation(...) call sites #3055 added left that suite green. These two bind to
+  # the real call sites through the NID dispatch table, one process each (see the header comment in
+  # the first file for why they cannot share a process).
+  add_executable(test_dmem_caller_attribution_alloc_dmem
+                 tests/hle/memory/test_dmem_caller_attribution_alloc_dmem.cpp)
+  target_link_libraries(test_dmem_caller_attribution_alloc_dmem PRIVATE prosper_core)
+  add_test(NAME dmem_caller_attribution_alloc_dmem
+           COMMAND test_dmem_caller_attribution_alloc_dmem)
+
+  add_executable(test_dmem_caller_attribution_alloc_main_dmem
+                 tests/hle/memory/test_dmem_caller_attribution_alloc_main_dmem.cpp)
+  target_link_libraries(test_dmem_caller_attribution_alloc_main_dmem PRIVATE prosper_core)
+  add_test(NAME dmem_caller_attribution_alloc_main_dmem
+           COMMAND test_dmem_caller_attribution_alloc_main_dmem)
+
   # Capped-diagnostic rate limit (issue #1761): a print budget must never be readable as a
   # population. Pins the sparse tail and the per-key budget; header-only, no GPU state.
   add_executable(test_diag_ratelimit tests/gpu/diagnostics/test_diag_ratelimit.cpp)
