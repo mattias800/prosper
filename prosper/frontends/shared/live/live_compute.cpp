@@ -19,6 +19,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_write_watch.hpp"
@@ -881,6 +882,11 @@ struct ComputeImageCacheKey {
     bool in_mip_tail = false;
     bool srgb = false;
     bool depth_compare = false;
+    // #3048: a cached image is created with exactly this many mip levels. Two T#s over the same
+    // allocation can agree on every field above and declare different chain lengths, and handing a
+    // one-level image to a binding whose module fetches level three is not a miss but a fault.
+    // Appended LAST so `storage_image_cache_key`'s positional aggregate init keeps its meaning.
+    uint32_t mip_levels = 1;
 
     bool operator==(const ComputeImageCacheKey& other) const = default;
 };
@@ -899,13 +905,15 @@ struct ComputeImageCacheKeyHash {
         mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
         mix(key.mip_tail_x); mix(key.mip_tail_y); mix(key.vk_format);
         mix(key.storage); mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
+        mix(key.mip_levels);
         return result;
     }
 };
 
 ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource& resource,
                                               uint32_t guest_bytes,
-                                              VkFormat native_format) {
+                                              VkFormat native_format,
+                                              uint32_t mip_levels = 1) {
     return {
         resource.gpu_addr, reinterpret_cast<uintptr_t>(resource.host_data),
         guest_bytes, resource.size,
@@ -917,7 +925,7 @@ ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource&
         resource.mip_tail_offset, resource.mip_tail_bytes,
         resource.mip_tail_x, resource.mip_tail_y,
         static_cast<uint32_t>(native_format), true, resource.in_mip_tail,
-        resource.srgb, resource.depth_compare};
+        resource.srgb, resource.depth_compare, mip_levels};
 }
 
 struct CachedComputeImage {
@@ -2988,6 +2996,11 @@ struct BoundImage {
     }
     uint32_t texel_depth = 1;           // logical Z/layer count represented in the staging buffer
     uint32_t array_layers = 1;           // Vulkan array-layer count (3D depth remains one layer)
+    // #3048: the guest-declared mip chain this image materializes, and where each level past zero
+    // begins in the staging buffer. 1 (with an empty offset table) is the historical single-level
+    // image; the recompiler reads the same derivation before emitting an explicit LOD.
+    uint32_t mip_levels = 1;
+    std::vector<VkDeviceSize> mip_staging_offsets;
     bool arrayed_2d = false;            // SPIR-V requires a real 2D-array view (not base-slice fallback)
     bool stacked_cube = false;          // cube lowering addresses six faces as one w x 6h 2D image
     bool depth_view = false;             // reflected SPIR-V uses a true depth image/sampler contract
@@ -4951,6 +4964,31 @@ void parent_scan_dump_pair(uint64_t addr, const uint8_t* after, size_t count,
     }
 }
 
+// Detile levels 1..N-1 of a guest mip chain straight into the staging buffer (#3048). Level zero is
+// written by the ordinary single-level path and is deliberately not touched here, so a resource that
+// gains a chain keeps producing byte-identical level-zero texels.
+//
+// `allocation_base` is the FIRST byte of the guest allocation, which sits below the resource's own
+// `gpu_addr` whenever the selected level is not the allocation's first stored byte -- tiled GFX10
+// chains store the shared mip-tail block first and then the remaining levels smallest-to-largest.
+void upload_guest_mip_chain_levels(const prosper::gpu::MipChainPlan& plan,
+                                   const std::vector<VkDeviceSize>& staging_offsets,
+                                   const uint8_t* allocation_base, uint32_t tile_mode,
+                                   uint32_t texel_bytes, uint8_t* upload) {
+    for (uint32_t level = 1; level < plan.level_count; ++level) {
+        const prosper::gpu::MipChainLevel& source = plan.levels[level];
+        uint8_t* destination = upload + staging_offsets[level];
+        const uint8_t* bytes = allocation_base + source.byte_offset;
+        if (source.in_tail)
+            prosper::gpu::detile_surface_level(destination, bytes, source.byte_size,
+                                               source.width, source.height, tile_mode,
+                                               texel_bytes, source.tail_x, source.tail_y);
+        else
+            prosper::gpu::detile_surface(destination, bytes, source.width, source.height,
+                                         tile_mode, 0, texel_bytes);
+    }
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -6562,6 +6600,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     p->layer_mip_offset_bytes == r->layer_mip_offset_bytes &&
                     p->in_mip_tail == r->in_mip_tail &&
                     p->mip_tail_x == r->mip_tail_x && p->mip_tail_y == r->mip_tail_y &&
+                    // The chain length is derived from these six fields (#3048); two descriptors
+                    // that disagree on any of them materialize different images.
+                    p->declared_mip_levels == r->declared_mip_levels &&
+                    p->mip_chain_element_width == r->mip_chain_element_width &&
+                    p->mip_chain_element_height == r->mip_chain_element_height &&
+                    p->mip_chain_bytes_per_block == r->mip_chain_bytes_per_block &&
+                    p->mip_chain_max_level == r->mip_chain_max_level &&
+                    p->mip_chain_base_level == r->mip_chain_base_level &&
                     p->srgb == r->srgb && same_host_backing &&
                     p->host_data_size == r->host_data_size && same_dcc_identity;
                 bool same_sampler = true;
@@ -6585,6 +6631,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.sampler = owner.sampler; bi.guest_bytes = owner.guest_bytes;
                 bi.texel_depth = owner.texel_depth;
                 bi.array_layers = owner.array_layers;
+                bi.mip_levels = owner.mip_levels;
+                bi.mip_staging_offsets = owner.mip_staging_offsets;
                 bi.dcc_metadata = owner.dcc_metadata;
                 bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
                 staging_bytes[i] = staging_bytes[bi.alias_of];
@@ -6758,7 +6806,46 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                   : VK_FORMAT_R8G8B8A8_UNORM;
             // Most storage images use raw uvec4 channels; reflected exact paths keep native-width
             // bytes. Most sampled formats normalize to RGBA8, while HDR/integer formats stay native.
-            const VkDeviceSize sbytes = volume_texels * texel_bytes;
+            // #3048: the T#-declared mip chain. `shader_resource_compute_mip_chain_levels` is the
+            // ONE derivation the recompiler also reads before it lowers IMAGE_LOAD_MIP with an
+            // explicit LOD, so this backend must materialize exactly what that function reports.
+            // A binding shape that cannot carry the chain is declined fail-visibly rather than
+            // quietly creating fewer levels than the compiled module addresses.
+            const uint32_t declared_chain_levels =
+                prosper::gpu::shader_resource_compute_mip_chain_levels(*r);
+            prosper::gpu::MipChainPlan mip_chain;
+            VkDeviceSize mip_chain_extra_bytes = 0;
+            if (declared_chain_levels > 1u) {
+                mip_chain = prosper::gpu::shader_resource_mip_chain_plan(*r);
+                const bool chain_binding_shape =
+                    mip_chain.valid && mip_chain.level_count == declared_chain_levels &&
+                    !bi.storage && !bi.imported && !renderer_owned &&
+                    !bi.depth_bits_source && !bi.unorm_rtt_value_reuse && !bi.depth_view &&
+                    !dim_1d && !dim_3d && !dim_cube_stacked && !cube_face_as_2d &&
+                    sampled_layers == 1u && bi.array_layers == 1u && !bi.stacked_cube &&
+                    volume_texels == static_cast<uint64_t>(r->width) * r->height &&
+                    texel_bytes == r->mip_chain_bytes_per_block;
+                if (!chain_binding_shape) {
+                    skip_image(r, "declared mip chain not materializable for this binding shape");
+                    break;
+                }
+                // Vulkan requires each region's bufferOffset to be a multiple of four AND of the
+                // texel block size; every width here is a power of two, so one alignment covers both.
+                const VkDeviceSize alignment = texel_bytes < 4u ? 4u : texel_bytes;
+                const VkDeviceSize level_zero_bytes = volume_texels * texel_bytes;
+                bi.mip_staging_offsets.assign(mip_chain.level_count, 0);
+                VkDeviceSize offset = (level_zero_bytes + alignment - 1u) / alignment * alignment;
+                for (uint32_t level = 1; level < mip_chain.level_count; ++level) {
+                    bi.mip_staging_offsets[level] = offset;
+                    const VkDeviceSize level_bytes =
+                        static_cast<VkDeviceSize>(mip_chain.levels[level].width) *
+                        mip_chain.levels[level].height * texel_bytes;
+                    offset = (offset + level_bytes + alignment - 1u) / alignment * alignment;
+                }
+                mip_chain_extra_bytes = offset - level_zero_bytes;
+                bi.mip_levels = mip_chain.level_count;
+            }
+            const VkDeviceSize sbytes = volume_texels * texel_bytes + mip_chain_extra_bytes;
             if (!sbytes || sbytes > kMaxComputeImageBytes) {
                 skip_image(r, "expanded image exceeds the 512 MiB backend bound"); break;
             }
@@ -6930,6 +7017,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         (r->host_data && r->host_data_size >= sampled_guest_need) ||
                         guest_readable(r->gpu_addr, static_cast<uint32_t>(sampled_guest_need));
                     if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
+                    // The chain's other levels live in the SAME allocation, below and above the
+                    // selected level. Bound the whole span before any of it is dereferenced.
+                    if (bi.mip_levels > 1u) {
+                        const uint64_t level_zero_offset = mip_chain.levels[0].byte_offset;
+                        if (r->host_data || level_zero_offset > r->gpu_addr ||
+                            mip_chain.allocation_bytes > UINT32_MAX ||
+                            !guest_readable(r->gpu_addr - level_zero_offset,
+                                            static_cast<uint32_t>(mip_chain.allocation_bytes))) {
+                            skip_image(r, "declared mip chain allocation unreadable");
+                            break;
+                        }
+                    }
                 }
 
                 static const bool dcc_cache_disabled =
@@ -7004,6 +7103,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     .persistent_enabled = persistent_compute_image_enabled(
                         sbytes, ComputeImageCacheClass::sampled),
                 });
+                // #3048: a cached sampled image is revalidated against the SELECTED level's guest
+                // bytes only. A multi-level image's higher levels live elsewhere in the same
+                // allocation, so an unchanged level zero would wrongly certify a stale level three.
+                // Fail closed and re-upload every dispatch until the validated span covers the whole
+                // chain; this costs upload time, never correctness.
+                if (bi.mip_levels > 1u) bi.cache_candidate = false;
                 const VkFormat transfer_native_format =
                     compute_transfer_storage_vk_format(r->format, sampled_components);
                 const bool float32_uint32_transfer_alias =
@@ -7055,7 +7160,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
-                        r->srgb, r->depth_compare};
+                        r->srgb, r->depth_compare, bi.mip_levels};
                     // An ordinary native typed 2D image or native typed 3D volume is byte- and
                     // format-identical to the sampled upload that follows it. Borrow that retained
                     // result only as a TRANSFER source: the sampled cache remains a separate image so
@@ -7932,6 +8037,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             sampled_uint32_native || sampled_float32_native ||
                             sampled_float16_native || sampled_depth) {  // Native sampled texels
                             std::memcpy(upload, sampled_source, linear_bytes);
+                            if (bi.mip_levels > 1u)
+                                upload_guest_mip_chain_levels(
+                                    mip_chain, bi.mip_staging_offsets,
+                                    src - mip_chain.levels[0].byte_offset, r->tile_mode,
+                                    bpt, upload);
                         } else if (f32) {                           // Native float channels + default fill
                             parallel_compute_texels(texels, linear_bytes + texels * 16u,
                                 [&](size_t begin, size_t end) {
@@ -7991,7 +8101,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ici.format = image_format;
             ici.extent = {r->width, dim_cube_stacked ? r->height * 6u : r->height,
                           dim_3d ? bi.texel_depth : 1u};
-            ici.mipLevels = 1;
+            ici.mipLevels = bi.mip_levels;
             ici.arrayLayers = bi.array_layers;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -8045,7 +8155,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             const VkImageAspectFlags image_aspect = (sampled_depth || bi.imported_depth)
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange = {image_aspect, 0, 1, 0, ici.arrayLayers};
+            vci.subresourceRange = {image_aspect, 0, ici.mipLevels, 0, ici.arrayLayers};
             const auto view_start = ComputeClock::now();
             if (!vk_ok(vkCreateImageView(ctx.device, &vci, nullptr, &bi.view),
                        "image-view")) { images_ready = false; break; }
@@ -8791,17 +8901,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_dst.image = bi.image;
             const VkImageAspectFlags aspect = bi.depth_view
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            to_dst.subresourceRange = {aspect, 0, 1, 0, bi.array_layers};
+            to_dst.subresourceRange = {aspect, 0, bi.mip_levels, 0, bi.array_layers};
             vkCmdPipelineBarrier(command,
                                  bi.persistent ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
                                                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
-            VkBufferImageCopy region{};
-            region.imageSubresource = {aspect, 0, 0, bi.array_layers};
-            region.imageExtent = {r->width, bi.stacked_cube ? r->height * 6u : r->height,
-                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
+            // One region per materialized level. Level zero keeps the exact extent and offset the
+            // single-level path always used; levels above it read the staging offsets computed
+            // beside the chain plan (#3048).
+            std::vector<VkBufferImageCopy> mip_regions(bi.mip_levels);
+            for (uint32_t level = 0; level < bi.mip_levels; ++level) {
+                VkBufferImageCopy& region = mip_regions[level];
+                region = {};
+                region.bufferOffset = level ? bi.mip_staging_offsets[level] : VkDeviceSize{0};
+                region.imageSubresource = {aspect, level, 0, bi.array_layers};
+                region.imageExtent = level
+                    ? VkExtent3D{r->width >> level ? r->width >> level : 1u,
+                                 r->height >> level ? r->height >> level : 1u, 1u}
+                    : VkExtent3D{r->width, bi.stacked_cube ? r->height * 6u : r->height,
+                                 bi.array_layers > 1 ? 1u : bi.texel_depth};
+            }
             vkCmdCopyBufferToImage(command, staging[i], bi.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   static_cast<uint32_t>(mip_regions.size()), mip_regions.data());
             VkImageMemoryBarrier to_general = to_dst;
             to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |

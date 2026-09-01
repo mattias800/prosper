@@ -11,6 +11,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <bit>
@@ -7527,10 +7528,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                  !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
                 (!dim2d && !dim3d && !dimcube && !dim_msaa)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
+            // #3048: the guest's mip selector no longer has to be discarded. When the compute
+            // backend materializes this resource's whole declared chain -- one derivation,
+            // `shader_resource_compute_mip_chain_levels`, read by BOTH this lowering and
+            // live_compute's image creation so the two cannot disagree about how many levels exist
+            // -- the operand reaches OpImageFetch's Lod. This is the only honest answer for the
+            // dynamic case: Sonic Frontiers' three scene-width stage kernels issue IMAGE_LOAD_MIP
+            // against a 12-level 2048x2048 R32G32_FLOAT surface with the mip NOT provably zero, so
+            // the specialization below can never admit them.
+            //
+            // Compute only, deliberately: the graphics texture path still uploads one level (its
+            // generated-chain gate in the render backend is narrower than this one), so a fragment
+            // stage reaching here would fetch a level that does not exist.
+            uint32_t dynamic_mip_vgpr = 0;
+            const uint32_t materialized_mip_levels =
+                prosper::gpu::shader_resource_compute_mip_chain_levels(*res);
+            const bool dynamic_mip_load =
+                is_zero_mip_load && b.is_compute && materialized_mip_levels > 1u &&
+                rdna2_mimg_dynamic_mip_shape(in, &dynamic_mip_vgpr) &&
+                in.mimg_dim == SQ_DIM_2D &&
+                prosper::gpu::shader_resource_uses_ordinary_2d_image(*res, true, false, false) &&
+                !res->unnormalized && !res->depth_compare && !res->in_mip_tail &&
+                res->sample_count == 1u && !res->compression_enabled;
             // IMAGE_LOAD_MIP's final address is a real guest mip selector. Specialize it away only
             // after the per-use fold and the materialized-resource checks agree. The 2D_ARRAY form
             // retains its slice coordinate; only the separately proven mip operand is discarded.
-            if (is_zero_mip_load &&
+            if (is_zero_mip_load && !dynamic_mip_load &&
                 (!rdna2_mimg_zero_mip_shape(in) || !res->proven_zero_mip ||
                  res->img_dim != in.mimg_dim || res->sample_count != 1u ||
                  res->declared_mip_levels != 1u || res->in_mip_tail ||
@@ -7889,6 +7912,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // base-slice view for DIM=5, whose address is [u,v,slice,lod].
                     else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv,
                         vread(cvg(in.mimg_dim == 5u && res->img_dim == 5u ? 3u : 2u)), out);
+                    else if (dynamic_mip_load) {
+                        // Hardware clamps a MIMG mip selector to the descriptor's LAST_LEVEL. The
+                        // host image carries `materialized_mip_levels` of them, so clamp to that:
+                        // an out-of-range Lod in SPIR-V is undefined, and the guest is entitled to
+                        // the same saturating answer the console gives it.
+                        // The register the shape predicate itself identified, not a second
+                        // derivation of it: for this packet family they are the same VGPR, and
+                        // reading it from one place keeps them that way.
+                        const uint32_t requested = vread(static_cast<int>(dynamic_mip_vgpr));
+                        const uint32_t lod = b.uext2(
+                            Glsl_UMin, requested, b.uconst(materialized_mip_levels - 1u));
+                        b.image_fetch_2d_lod(res->binding, cu, cv, lod, out);
+                    }
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
                 }
             }

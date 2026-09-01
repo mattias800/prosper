@@ -479,6 +479,15 @@ bool rdna2_program_is_terminator_only(const uint32_t* code, size_t dwords);
 // materialized, uncompressed mip.
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
+// The GENERAL IMAGE_LOAD_MIP address shape, whose mip operand is a real runtime value rather than
+// something a proof may discard: consecutive (non-NSA) 2D [x,y,mip] or 2D_ARRAY [x,y,slice,mip],
+// any DMASK, and no operand-shape modifier (A16/D16/R128/TFE/LWE). Unlike
+// `rdna2_mimg_zero_mip_shape` this deliberately does NOT require UNRM/GLC: those are addressing and
+// cache hints, and Sonic Frontiers' stage kernels issue the op with both clear (#3048). Returns the
+// dimension-specific mip VGPR when requested. The caller must still establish that the resource's
+// image is materialized with the levels that operand can select.
+bool rdna2_mimg_dynamic_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
+
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers
 // use this to size pointer-backed user-data tables from the shader's actual accesses.

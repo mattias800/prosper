@@ -361,6 +361,17 @@ struct ShaderResource {
     // WORD3 [19:16]/[15:12]). 1 = single level (the historical behavior). The backend uses this to
     // bound generated-mip uploads (#1272) — it never invents levels a T# does not declare.
     uint32_t      declared_mip_levels = 1;
+    // Placement provenance for the WHOLE allocation this view selects from, not just the selected
+    // level. `declared_mip_levels` says how many levels the T# declares; these four say where each
+    // of them lives, because tiled_mip_level_layout needs the allocation's own level-zero element
+    // extent and its final mip -- neither of which is recoverable from the fields above once
+    // gpu_addr/width/height have been shifted to the selected base level. Zero element extent means
+    // "not modelled"; every consumer must fail closed on it (#3048).
+    uint32_t      mip_chain_element_width  = 0;
+    uint32_t      mip_chain_element_height = 0;
+    uint32_t      mip_chain_bytes_per_block = 0;
+    uint32_t      mip_chain_max_level      = 0;   // effective MAX_MIP of the allocation
+    uint32_t      mip_chain_base_level     = 0;   // the T#'s BASE_LEVEL for this view
     bool          in_mip_tail       = false;
     uint32_t      mip_tail_offset   = 0;
     uint32_t      mip_tail_bytes    = 0;

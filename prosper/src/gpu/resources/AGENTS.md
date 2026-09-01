@@ -16,6 +16,12 @@ Turns descriptors into resolved, bindable resources, and answers questions about
   them live — `grep -rn by_fetch_pc src/gpu/recompiler/` finds the call sites, including the
   `by_fetch_pc(153u)` selected-descriptor lookup. `by_binding` matches anything in the table at
   all.
+- `mip_chain_plan` — where every level of a declared mip chain lives, and how many of them a
+  compute image materializes. `ShaderResource` describes the SELECTED level (`image_base_level_view`
+  shifts `gpu_addr`/`width`/`height` onto it), so the other levels have no placement anywhere else;
+  this is the one derivation that recovers them. It is deliberately read by **both** the backend
+  that creates the image and the recompiler that lowers `IMAGE_LOAD_MIP` — if those two ever answer
+  the level count differently, a shader fetches a level that was never created.
 - `gpu_resources` — the resolved resource layer over guest memory.
 - `compressed_source_authority` — who is authoritative for a compressed surface's bytes.
 - `metadata_kind_correlation` — correlating a surface's metadata kind with how it is used.

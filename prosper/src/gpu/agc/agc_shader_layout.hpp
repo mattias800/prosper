@@ -227,10 +227,31 @@ struct DecodedImageView {
     // base + layer*layer_stride + layer_mip_offset (or use the tail coordinates for a packed tail).
     size_t layer_stride = 0;
     size_t layer_mip_offset = 0;
+    // The exact inputs tiled_mip_level_layout needs to place ANY level of this allocation, kept
+    // beside the selected level's own placement so a backend that must materialize the declared
+    // chain does not have to re-decode the T#. Zero element extent = not modelled (#3048).
+    uint32_t chain_element_width = 0;
+    uint32_t chain_element_height = 0;
+    uint32_t chain_bytes_per_block = 0;
+    uint32_t chain_max_mip = 0;
+    uint32_t chain_base_level = 0;
     // False when BASE_LEVEL selects a mip whose layout this helper cannot prove. Callers must reject
     // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
     bool supported = true;
 };
+// Copy the allocation-wide mip placement from a decoded view onto the resource it produced. Three
+// separate sites build a Texture/StorageImage ShaderResource from a (descriptor, view) pair; they
+// have drifted before (#2265), so the provenance travels through one function rather than three
+// copies of five assignments.
+inline void shader_resource_apply_mip_chain_provenance(ShaderResource& r,
+                                                       const DecodedImageView& view) {
+    r.mip_chain_element_width = view.chain_element_width;
+    r.mip_chain_element_height = view.chain_element_height;
+    r.mip_chain_bytes_per_block = view.chain_bytes_per_block;
+    r.mip_chain_max_level = view.chain_max_mip;
+    r.mip_chain_base_level = view.chain_base_level;
+}
+
 DecodedImageView image_base_level_view(const DecodedImageDescriptor& descriptor,
                                        const Gen5ImageFormatInfo& format);
 // Emit one diagnostic per unsupported layout signature. Callers use this immediately before

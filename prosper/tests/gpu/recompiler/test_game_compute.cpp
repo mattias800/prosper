@@ -2316,6 +2316,108 @@ int main() {
               "IMAGE_LOAD_MIP 2D_ARRAY fetches distinct slice one instead of dropping the layer");
     }
 
+    // #3048: the DYNAMIC mip operand. Sonic Frontiers' three scene-target-width stage kernels issue
+    // IMAGE_LOAD_MIP against a 12-level 2048x2048 surface with the mip NOT provably zero, so the
+    // zero-specialization arms above can never admit them -- and emitting a Lod against the old
+    // hard-coded `mipLevels = 1` image would have fetched a level that does not exist. The compute
+    // backend now materializes the chain the T# declares, uploading each level from the guest's own
+    // tiled mip offsets, and the operand reaches OpImageFetch's Lod. The discriminator is that the
+    // dispatch returns LEVEL ONE's texels: a single-level image cannot produce them.
+    {
+        constexpr uint32_t CHAIN_W = 256, CHAIN_H = 256, CHAIN_BPE = 4, CHAIN_MAX_MIP = 8;
+        const uint32_t chain_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        const TiledMipLevelLayout chain_level0 = tiled_mip_level_layout(
+            CHAIN_W, CHAIN_H, CHAIN_BPE, chain_tile, CHAIN_MAX_MIP, 0);
+        const TiledMipLevelLayout chain_level1 = tiled_mip_level_layout(
+            CHAIN_W, CHAIN_H, CHAIN_BPE, chain_tile, CHAIN_MAX_MIP, 1);
+        const size_t chain_bytes = tiled_mip_chain_bytes(
+            CHAIN_W, CHAIN_H, CHAIN_BPE, chain_tile, CHAIN_MAX_MIP);
+        CHECK(chain_level0.supported && !chain_level0.in_tail && chain_level1.supported &&
+                  !chain_level1.in_tail && chain_bytes != 0,
+              "the dynamic-mip fixture places levels zero and one outside the shared mip tail");
+
+        std::vector<uint8_t> chain_allocation(chain_bytes, 0x5a);
+        std::vector<uint32_t> chain_level0_linear(static_cast<size_t>(CHAIN_W) * CHAIN_H);
+        std::vector<uint32_t> chain_level1_linear(
+            static_cast<size_t>(CHAIN_W / 2u) * (CHAIN_H / 2u));
+        for (size_t i = 0; i < chain_level0_linear.size(); ++i)
+            chain_level0_linear[i] = static_cast<uint32_t>(i * 2654435761u + 0x11111111u);
+        for (size_t i = 0; i < chain_level1_linear.size(); ++i)
+            chain_level1_linear[i] = static_cast<uint32_t>(i * 40503u + 0xa5a50000u);
+        tile_surface(chain_allocation.data() + chain_level0.byte_offset,
+                     reinterpret_cast<const uint8_t*>(chain_level0_linear.data()),
+                     CHAIN_W, CHAIN_H, chain_tile, 0, CHAIN_BPE);
+        tile_surface(chain_allocation.data() + chain_level1.byte_offset,
+                     reinterpret_cast<const uint8_t*>(chain_level1_linear.data()),
+                     CHAIN_W / 2u, CHAIN_H / 2u, chain_tile, 0, CHAIN_BPE);
+
+        // word0 f0040108 = IMAGE_LOAD_MIP (opcode 1) dmask:x dim:2D with UNRM and GLC CLEAR -- the
+        // exact modifier shape Sonic Frontiers emits, which `rdna2_mimg_zero_mip_shape` rejects.
+        const uint32_t dynamic_mip_program[] = {
+            0x7e080300u,                     // v4 = x (save the shell input before v0 is reused)
+            0x7e020280u,                     // v1 = y = 0
+            0x7e040281u,                     // v2 = mip = inline constant 1 (never provably zero)
+            0x7e0a0280u,                     // v5 = destination y = 0
+            0xf0040108u, 0x00050000u,        // IMAGE_LOAD_MIP v0, [v0,v1,v2], s[20:27]
+            0xbf8c3f70u,                     // s_waitcnt
+            0xf0200108u, 0x00020004u,        // IMAGE_STORE v0, [v4,v5], s[8:15]
+            0xbf810000u,                     // s_endpgm
+        };
+        std::vector<uint32_t> chain_dst(W, 0x77777777u);
+        ShaderResourceTable chain_rt = irt;
+        for (ShaderResource& resource : chain_rt.resources) {
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.sgpr_base = 20;
+                resource.fetch_pc = 4;
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                resource.width = CHAIN_W;
+                resource.height = CHAIN_H;
+                resource.depth = 1;
+                resource.tile_mode = chain_tile;
+                resource.declared_mip_levels = CHAIN_MAX_MIP + 1u;
+                resource.mip_chain_element_width = CHAIN_W;
+                resource.mip_chain_element_height = CHAIN_H;
+                resource.mip_chain_bytes_per_block = CHAIN_BPE;
+                resource.mip_chain_max_level = CHAIN_MAX_MIP;
+                resource.mip_chain_base_level = 0;
+                resource.proven_zero_mip = false;   // the whole point: the operand is a real value
+                resource.gpu_addr = reinterpret_cast<uint64_t>(
+                    chain_allocation.data() + chain_level0.byte_offset);
+                resource.size = static_cast<uint32_t>(
+                    tiled_surface_bytes(CHAIN_W, CHAIN_H, chain_tile, 0, CHAIN_BPE));
+            } else if (resource.binding == 5) {
+                resource.img_dim = 1;   // exact destination IMAGE_STORE has DIM=2D
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(chain_dst.data());
+                resource.size = static_cast<uint32_t>(chain_dst.size() * sizeof(uint32_t));
+            }
+        }
+        const std::vector<uint32_t> chain_spirv = recompile_valu(
+            dynamic_mip_program, std::size(dynamic_mip_program), 1, 0, &chain_rt);
+        CHECK(!chain_spirv.empty(),
+              "IMAGE_LOAD_MIP with a runtime mip operand recompiles once the declared chain is "
+              "materialized (#3048)");
+        if (!chain_spirv.empty()) {
+            ComputeItem item;
+            item.spirv = chain_spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(chain_rt);
+            item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x2005714000ull;
+            CHECK(prosper::frontend::execute_live_compute_items({item}),
+                  "live backend executes a dynamic-mip IMAGE_LOAD_MIP dispatch");
+            CHECK(std::equal(chain_dst.begin(), chain_dst.end(), chain_level1_linear.begin()),
+                  "IMAGE_LOAD_MIP at a runtime mip returns LEVEL ONE's own guest texels");
+            CHECK(!std::equal(chain_dst.begin(), chain_dst.end(), chain_level0_linear.begin()),
+                  "level one is distinguishable from level zero in this fixture");
+        }
+    }
+
     const uint32_t gta_store_mip_2d[] = {
         0x7e080300u,                         // v4 = x, while v0 remains stored data
         0x7e060280u,                         // v3 = y = 0

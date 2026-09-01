@@ -535,8 +535,9 @@ investigation to the wrong file:
   (`tests/fixtures/render_runner.h:6044-6055` — that file is the live offscreen Vulkan backend,
   included by `frontends/shared/live/live_renderer.cpp:39`). `tests/gpu/test_texture_mip_render.cpp`
   is a registered ctest asserting a declared 3-level chain samples level 2.
-* The **compute** path does not: its single `VkImageCreateInfo` for guest images sets
-  `ici.mipLevels = 1` unconditionally (`frontends/shared/live/live_compute.cpp:7089`).
+* The **compute** path did not: its single `VkImageCreateInfo` for guest images set
+  `ici.mipLevels = 1` unconditionally. **Fixed by #3048** — see the next section; the sentence is
+  kept because everything else in this bullet list is still current.
 * **And the graphics chain is GENERATED, not uploaded.** Staging carries level 0 only; levels
   1..N-1 come from a linear-filtered `vkCmdBlitImage` cascade at upload time
   (`render_runner.h:6257-6259`, `:7245`).
@@ -549,6 +550,43 @@ rule exists to prevent.
 
 **The census did not move when the MUST defect was fixed** — 14 programs, all `executed=0`, before
 and after at the same denominator — and neither did the composite. Both were measured, not assumed.
+
+### Compute images now carry the declared chain, and the LOD operand is emitted (#3048)
+
+Both halves of #3048 landed together, because neither works alone: emitting a `Lod` against a
+one-level image fetches a level that does not exist, and materializing levels nobody addresses
+changes nothing.
+
+* **One derivation, two consumers.** `src/gpu/resources/mip_chain_plan.{hpp,cpp}` answers "how many
+  levels does this resource's compute image have, and where does each level's guest data live".
+  `live_compute`'s image creation and the recompiler's MIMG lowering both call
+  `shader_resource_compute_mip_chain_levels`, so they cannot disagree — the drift that #2265
+  recorded (three copies of one predicate) is what this shape exists to prevent.
+* **Real guest bytes, not a generated cascade.** Each level is detiled from the guest's own
+  `tiled_mip_level_layout` offset, tail levels included, straight into the staging buffer. The
+  graphics path's blit cascade is deliberately not reused here: this section's own analysis is why.
+* **The provenance the placement needs is now carried.** `ShaderResource` gained the allocation's
+  level-zero element extent, its bytes-per-block, its effective `MAX_MIP` and the view's
+  `BASE_LEVEL` (`mip_chain_*`), because `gpu_addr`/`width`/`height` have already been shifted onto
+  the selected level and nothing downstream could recover the rest. Captures serialize them at
+  format v57; a pre-v57 file reads as "not modelled" and fails closed to one level.
+* **Reject-by-default.** Linear chains, a selected level packed in the tail, layered or volume
+  views, DCC, block-compressed and converting formats, a shifted `BASE_LEVEL`, and `host_data`
+  backing all keep the historical single-level image. A binding whose shape cannot carry the chain
+  (imported/renderer-owned surfaces above all) is declined **fail-visibly** rather than silently
+  built with fewer levels than its compiled module addresses.
+* **The LOD is clamped** to the materialized level count, which is what hardware does with a T#'s
+  `LAST_LEVEL`.
+
+**Not yet measured on this title.** The change is covered by a registered execution test — a real
+tiled nine-level guest chain, dispatched through the production compute backend, asserting the
+result is *level one's own texels* — but no routed arm has been run since, so nothing here claims
+the Cyber Space world renders. Two things are worth measuring next, in this order: whether the three
+scene-width programs now leave the census skip list on a **default** build (they did on the
+measurement-only LOD-0 build, which is a weaker statement), and only then the composite's non-black
+percentage and bounding box. The `## Ruled out` row above — "fixing a recompiler decline that
+unblocks these programs will change the frame" — is **not established**, and has now failed four
+times; do not assume the fifth.
 
 ## Ruled out
 
