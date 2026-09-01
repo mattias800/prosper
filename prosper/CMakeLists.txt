@@ -881,6 +881,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_addcontent_unmount PRIVATE prosper_core)
   add_test(NAME addcontent_unmount COMMAND test_addcontent_unmount)
 
+  add_executable(test_abnormal_termination_stops tests/hle/service/test_abnormal_termination_stops.cpp)
+  target_include_directories(test_abnormal_termination_stops PRIVATE tests)
+  target_link_libraries(test_abnormal_termination_stops PRIVATE prosper_core)
+  add_test(NAME abnormal_termination_stops COMMAND test_abnormal_termination_stops)
+
   add_executable(test_addcontent_mount_report tests/hle/service/test_addcontent_mount_report.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_addcontent_mount_report PRIVATE tests)
