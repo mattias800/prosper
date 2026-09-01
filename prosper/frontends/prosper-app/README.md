@@ -270,8 +270,12 @@ an optional new-save item; prosper never exposes a host path or opens an arbitra
 Progress uses a non-focusable utility window updated from the app's main thread, so the title keeps
 presenting and retains keyboard/controller focus.
 
-- Two Vulkan contexts by design (`docs/FRONTEND_APP.md`): the core renders headless; the app owns a
-  separate presentation device; frames cross as CPU pixels via `present_readback`.
+- Two Vulkan contexts by design (`docs/FRONTEND_APP.md`), but since #1270 (2026-07-24) that is the
+  **fallback**, not the default: for a real game boot the app adopts the renderer's own device and
+  GPU-blits its front-buffer image straight to the swapchain, with no CPU round-trip
+  (`PROSPER_APP_GPU_PRESENT=0` opts out). The private-device path — the core renders headless, the app
+  owns a separate presentation device, frames cross as CPU pixels via `present_readback` — is still what
+  `--test-pattern`, `tools/screenshot`, and any failed device adoption use.
 - On window-close the guest thread is detached and reclaimed by process exit (a cooperative
   flip-boundary stop is a documented follow-up).
 - `PROSPER_APP_STALL_DUMP_MS=<milliseconds>` prints the recent Windows guest-exception ring when no new
