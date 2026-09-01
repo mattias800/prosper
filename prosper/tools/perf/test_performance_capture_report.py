@@ -2,7 +2,9 @@
 
 import unittest
 
-from performance_capture_report import CaptureError, summarize, validate_capture
+from performance_capture_report import (CaptureError, CLASSIFICATION_EVIDENCE_SHARE,
+                                        READBACK_NOTE_MIN_SHARE, summarize,
+                                        validate_capture)
 
 
 def capture(post=None, renderer=None, compute=None, dropped=(0, 0)):
@@ -171,14 +173,171 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn("real", summary["readback_note"])
         self.assertNotIn("harness, not the title", summary["readback_note"])
 
+    def test_every_readback_note_is_well_formed_prose(self):
+        # A structural guard, added because the previous commit shipped a visible break that every
+        # existing arm was blind to: the tails became full sentences while one branch stayed a
+        # trailing clause, rendering "...through a real window. before acting on this verdict."
+        # `assertIn` on a substring cannot see a break OUTSIDE that substring, so no amount of
+        # content assertions would have caught it -- this checks the joins instead of the content.
+        # The FULL product of reachable joins: three GPU-present states (each selecting a different
+        # note body) x three verdicts (each selecting a different tail). Enumerated as a product
+        # rather than hand-listed because a hand-listed set is exactly how an arm named "every" ends
+        # up excluding the one case that fails it -- which a first version of this arm did, missing
+        # the `adopted is True` body, the only reachable note that lacked a terminating period.
+        posts = {
+            "not-adopted": SAMPLES,                                            # harness readback
+            "adopted": [{**s, "rendered_frames": None} for s in SAMPLES],      # real readback
+            "cannot-say": [],                                                  # no post population
+        }
+        verdicts = {
+            "readback": (self.READBACK_RENDERER, []),
+            "compute": ([{"total_ms": 1500, "readback_ms": 1400}], [{"total_ms": 3500.0}]),
+            "inconclusive": ([{"total_ms": 2000, "readback_ms": 977.7}], [{"total_ms": 1134.0}]),
+        }
+        cases = {f"{pn}/{vn}": capture(post, renderer=r, compute=c)
+                 for pn, post in posts.items() for vn, (r, c) in verdicts.items()}
+        self.assertEqual(len(cases), 9)
+        for name, records in cases.items():
+            note = summarize(records)["readback_note"]
+            self.assertIsNotNone(note, name)
+            self.assertNotRegex(note, r"\.\s+[a-z]", f"{name}: lowercase clause after a period")
+            self.assertNotRegex(note, r"\s\.", f"{name}: space before a period")
+            self.assertNotRegex(note, r"\.\.", f"{name}: doubled period")
+            self.assertTrue(note.endswith("."), f"{name}: note does not end in a period")
+
     def test_no_post_samples_cannot_determine_gpu_present(self):
         # The one uncovered line in the helper. With no post population there is nothing to read the
         # field from, so the honest answer is the third state rather than either branch.
+        #
+        # The note assertion is UNCONDITIONAL: this fixture's readback share clears the trigger, so
+        # the note fires whatever the verdict turns out to be. Only the classification is left
+        # tolerant, because that is the part this arm does not care about. The previous shape had a
+        # defensive `else` asserting the note is None -- which became both unreachable and false
+        # once the trigger stopped depending on the verdict, i.e. a branch that would have silently
+        # stopped testing anything.
         summary = summarize(capture([], renderer=self.READBACK_RENDERER))
-        if summary["classification"] == "readback":
-            self.assertIn("cannot say", summary["readback_note"])
-        else:
-            self.assertIsNone(summary["readback_note"])
+        self.assertIn("cannot say", summary["readback_note"])
+
+    def test_large_sub_threshold_readback_warns_even_though_it_lost_classification(self):
+        # The gap this closes, and the shape of the capture that motivated it (Dragon Quest VII):
+        # readback 977.7 ms against compute 1134.0 ms. Neither reaches the 40% evidence bar, so
+        # the verdict is "inconclusive" -- and the old trigger, which fired only on a readback
+        # VERDICT, printed the second-largest number on the page with nothing attached.
+        #
+        # Note the arm would also pass under a "is readback the max component" trigger only if
+        # readback won, which it does NOT here (977.7 < 1134.0). That is deliberate: ranking was
+        # the first attempt at this fix and is silent on exactly this capture.
+        summary = summarize(capture(
+            SAMPLES,
+            renderer=[{"total_ms": 2000, "readback_ms": 977.7}],
+            compute=[{"total_ms": 1134.0}]))
+        # Neither component clears 40% of the 3134 ms measured total: compute is 36%, readback 31%.
+        self.assertEqual(summary["classification"], "inconclusive")
+        self.assertIn("harness, not the title", summary["readback_note"])
+
+    def test_readback_note_threshold_is_a_share_not_a_ranking(self):
+        # Holds verdict and GPU-present state constant so the only variable is readback's SHARE.
+        #
+        # It does NOT pin the lower bound, and an earlier version of this comment wrongly claimed it
+        # did ("no test would notice" a drift to any-nonzero). Measured per-arm: a drift to
+        # any-nonzero is caught by the PRE-EXISTING 2% arm below, and this 1% assertion passes at
+        # every threshold down to 0.011. What binds above is this arm's 20% assertion. Keeping the
+        # 1% half is still right -- it is the only arm that varies share alone -- but the reason is
+        # isolation, not coverage of the quiet end.
+        def note_for(readback_ms):
+            return summarize(capture(
+                SAMPLES,
+                renderer=[{"total_ms": 1000, "readback_ms": readback_ms}],
+                compute=[{"total_ms": 1000.0}]))["readback_note"]
+
+        self.assertIsNone(note_for(20.0))        # 1% of measured work -- rounding, stays silent
+        self.assertIsNotNone(note_for(400.0))    # 20% -- a reader could mistake it for the answer
+
+    def test_readback_note_threshold_stays_under_the_evidence_bar(self):
+        # The INEQUALITY is the invariant, and it is all this asserts. The note exists to cover the
+        # gap under the classification bar, so a threshold at or above the bar would make it
+        # unreachable in exactly the cases it is for.
+        #
+        # It deliberately does NOT assert the one-quarter ratio. A previous version did, on the
+        # grounds that a future change to the bar would then "carry the threshold along" -- but the
+        # bar was a bare inline literal, so `0.40 / 4` in the test was a second disconnected copy
+        # and the assert only ever pinned `== 0.1` in longer notation. The mutation offered as proof
+        # (moving the threshold) was drawn from the same source as the claim and could not have
+        # failed: it showed the assert fires when the CONSTANT moves, never in doubt, not when the
+        # BAR moves, which was the claim. One quarter is a chosen fraction, not a derived one.
+        self.assertGreater(READBACK_NOTE_MIN_SHARE, 0)
+        self.assertLess(READBACK_NOTE_MIN_SHARE, CLASSIFICATION_EVIDENCE_SHARE)
+
+    def test_classification_evidence_bar_is_pinned(self):
+        # Nothing pinned this at all: moving the tool's primary classification threshold from 0.40
+        # to 0.50 passed the entire suite.
+        #
+        # The two halves below are COMPLEMENTARY, not redundant, and the measured split is not what
+        # "both arms fail if it moves" would suggest -- swept with the literal assert neutralised,
+        # the behavioural pair alone tolerates (0.375, 0.4444]:
+        #
+        #   bar        0.375   0.376   0.42   0.4444   0.445   0.50
+        #   behavioural  FAIL    pass   pass     pass    FAIL   FAIL
+        #
+        # So inside that window only the literal catches a value change -- while reverting the USE
+        # SITE to an inline literal (decoupling the constant from the code it governs) is caught
+        # only by the behavioural pair, which is the failure the whole finding was about. Each
+        # covers what the other cannot.
+        self.assertAlmostEqual(CLASSIFICATION_EVIDENCE_SHARE, 0.40)
+        # Totals are scaled so measured work clears 40% of the 1000 ms wall window in SAMPLES --
+        # otherwise both arms land in `cpu-outside-renderer` and neither exercises the bar at all,
+        # which is what a first draft of this test did.
+        just_under = summarize(capture(SAMPLES, renderer=[{"total_ms": 1000}],
+                                       compute=[{"total_ms": 600}]))         # 37.5% -- under
+        self.assertEqual(just_under["classification"], "inconclusive")
+        just_over = summarize(capture(SAMPLES, renderer=[{"total_ms": 1000}],
+                                      compute=[{"total_ms": 800}]))          # 44.4% -- over
+        self.assertEqual(just_over["classification"], "compute")
+
+    def test_readback_note_tail_does_not_disown_a_verdict_readback_did_not_decide(self):
+        # A decisive compute verdict with a material readback used to close "...before acting on
+        # this verdict" -- telling the reader to discard a conclusion the readback had no part in.
+        # readback 1400 / 5000 measured = 28%, comfortably over the 10% threshold rather than the
+        # 2 points of headroom a first draft had -- a fixture that only just clears the trigger
+        # fails for a threshold reason under any threshold mutation, which is not what it tests.
+        decisive = summarize(capture(
+            SAMPLES,
+            renderer=[{"total_ms": 1500, "readback_ms": 1400}],
+            compute=[{"total_ms": 3500.0}]))
+        self.assertEqual(decisive["classification"], "compute")          # 70%, decisive
+        self.assertIsNotNone(decisive["readback_note"])
+        # The live discriminator, not the retired phrase: `assertNotIn` on a string that no
+        # longer exists anywhere in the module cannot fail, so it asserts nothing.
+        self.assertNotIn("nothing else here to act on", decisive["readback_note"])
+        self.assertIn("does not depend on it", decisive["readback_note"])
+
+        # ...while a readback VERDICT says the strongest thing of the five, because there the
+        # readback is not a caveat on the verdict -- it IS the verdict.
+        owned = summarize(capture(SAMPLES, renderer=[self.READBACK_RENDERER[0]]))
+        self.assertEqual(owned["classification"], "readback")
+        self.assertIn("nothing else here to act on", owned["readback_note"])
+        self.assertNotIn("does not depend on it", owned["readback_note"])
+
+    def test_readback_note_does_not_vouch_for_a_verdict_the_readback_can_flip(self):
+        # The case the previous version got WRONG, and it is this change's own motivating capture:
+        # readback 977.7 against compute 1134.0 with a 2000 ms renderer total is "inconclusive"
+        # only because nothing reaches the bar. Remove the readback and compute wins outright at
+        # 53% -- so "the verdict above does not depend on it" would be a false statement printed on
+        # the exact capture this feature exists for, inviting trust in a verdict the harness made.
+        contaminated = summarize(capture(
+            SAMPLES,
+            renderer=[{"total_ms": 2000, "readback_ms": 977.7}],
+            compute=[{"total_ms": 1134.0}]))
+        self.assertEqual(contaminated["classification"], "inconclusive")
+        self.assertIn("may itself be an artefact", contaminated["readback_note"])
+        self.assertNotIn("does not depend on it", contaminated["readback_note"])
+
+        # And the flip is real, not asserted: drop the readback and the verdict changes.
+        without = summarize(capture(
+            SAMPLES,
+            renderer=[{"total_ms": 2000 - 977.7}],
+            compute=[{"total_ms": 1134.0}]))
+        self.assertEqual(without["classification"], "compute")
 
     def test_non_readback_verdict_carries_no_readback_note(self):
         # The note is specific to the readback verdict; on every report it would be noise.
