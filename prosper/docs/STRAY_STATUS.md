@@ -341,6 +341,20 @@ drops still discard the background.
   promise a subgroup is that set of lanes. **The gap is a missing wave, not a missing lowering.**
   #3135, and `RECOMPILER_REMAINING.md` § Ruled out for the full argument.
 
+- **"Modelling entry-M0 as a constant is fine, because the shader only saves and restores it."**
+  Falsified for the general case, and the falsification is what shaped the fix. `0x300c010000`
+  itself does only save and restore (dw37/38/88/92 and dw305/306/356/359, no VINTRP, no
+  `s_sendmsg`, no `s_movrel`, and every DS op runs under an M0 the shader wrote to 0), so any
+  consistent value round-trips there. But the arm applies to every shader, and a constant makes
+  the destination an ordinary tracked scalar: one `s_mov_b32 s0, m0` in front of
+  `v_add_nc_u32 v1, s0, v0` then defeats the guard that rejects the direct form, and the restore
+  makes M0 itself *tracked*, silently defeating seven guards that require it untracked. Zero is
+  additionally the worst constant available: the shader's own LDS base is `s_movk_i32 m0, 0`,
+  `uconst` is interned, so post-restore ADDTID slot keys alias pre-restore ones exactly and the
+  restore becomes a model-level no-op. The shipped model is an opaque token instead; see
+  `docs/RECOMPILER_REMAINING.md` § Ruled out for the two ways a token-with-no-value is NOT
+  self-containing (CFG merges and the dispatcher spill both fabricate a zero for it). #3133, #3136.
+
 - **"The 4K title background is black because its asset never loads, or loads late."** Falsified, and
   by three sources that share no code. The pak read delivers the bytes: `PROSPER_APR_VERIFY`
   re-reads each guest destination through `process_vm_readv` immediately after the write and

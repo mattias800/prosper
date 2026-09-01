@@ -4542,6 +4542,13 @@ struct RegState {
     // provenance is independent of `sreg`: an unrepresentable write deliberately erases its SSA
     // value, but must still invalidate an entry-time direct descriptor stored in that register.
     std::unordered_set<int> sreg_written;
+    // Scalar registers currently holding the ENTRY value of M0 -- the value the driver left before
+    // this shader wrote M0 -- as an OPAQUE token rather than as data (#3133). Membership is not a
+    // value: the register has no `sreg` entry, so every ordinary consumer still rejects it exactly
+    // as an untracked read does. Only `s_mov_b32 m0, sSRC` may consume it, and consuming it returns
+    // M0 to untracked. That is what makes the containment structural instead of a promise: there is
+    // no fabricated number anywhere for arithmetic, a V_WRITELANE source, or an LDS index to pick up.
+    std::unordered_set<int> sreg_entry_m0;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     // One restored physical dword of a Wave64 mask is not a complete B64 predicate. Keep its Bool
@@ -4905,6 +4912,56 @@ inline void merge_ud_alias(RegState& rs, const std::unordered_map<int, int>& oth
         if (edge == other.end() || edge->second != it->second) it = rs.sreg_ud_alias.erase(it);
         else ++it;
     }
+}
+
+// Is `r` carrying a LIVE entry-M0 token (#3133)? Set membership alone is not the predicate: the
+// token is the ABSENCE of a value, so a register that has since been given a real word is an
+// ordinary tracked scalar with a stale set entry. `operand_bits` asks exactly this question, and
+// every control-flow join has to ask the same one or the two disagree about what the register is.
+inline bool entry_m0_live(const RegState& rs, int r) {
+    return rs.sreg_entry_m0.contains(r) && !rs.sreg.contains(r);
+}
+
+// Join for the entry-M0 token at a two-edge scalar merge (#3133). `rs` holds one incoming edge;
+// `other_edge_token` is whether the OTHER edge had a live token for `r`.
+//
+// This exists because the token is the ABSENCE of a value, and that is what makes a join dangerous
+// rather than merely imprecise. Every scalar merge in the CFG emitter reads its inputs through a
+// `sget` lambda that renders an absent scalar as `uconst(0)`, and then stores the resulting phi back
+// into `rs.sreg` -- so without this, a save inside a branch arm comes out of the merge as an
+// ordinary TRACKED zero. That is the fabricated word the token exists to withhold, and it also
+// silences the `operand_bits` barrier for the rest of the shader, since that barrier is
+// `token AND untracked`.
+//
+// The join is a UNION, not the intersection `merge_ud_alias` uses, and the asymmetry is deliberate.
+// A copy alias is a positive claim ("these bits are still the driver's"), so one edge failing to
+// assert it must drop it. The token is the opposite: it is a claim that the register has NO usable
+// data value, and one edge holding entry-M0 is exactly as unusable as both. The tempting third
+// option -- drop the register to plain untracked -- is the one that must NOT be taken: an untracked
+// ordinary SGPR is not an error in this model, `operand_bits` returns `uconst(0)` for it with `ok`
+// left true, so "untracked" would fabricate the same zero silently instead of rejecting. Measured,
+// not assumed (`rdna2_alu_support.hpp`, the SGPR case's final `return b.uconst(0)`).
+//
+// Returns true when the caller should emit its ordinary value phi. When it returns false, `rs`
+// already holds the correct post-join state and NO phi may be emitted for `r`:
+//
+//   * a live token on EITHER edge -> the register carries the token out of the join and holds no
+//     value. A later read rejects loudly, which is right: on one path the word is entry-M0 and on
+//     the other it is whatever the register held before, and neither is data this model can supply.
+//     A later ordinary write starts a fresh lifetime and ends the token, as it does anywhere else.
+//     Marking a maybe-token register token-live can only over-reject, never fabricate -- and the one
+//     consumer that is allowed to eat a token, `s_mov_b32 m0, sSRC`, returns M0 to UNTRACKED, which
+//     is the strictest state M0 has and the one every movrel/ADDTID/ds_append guard demands.
+//   * a live token on NEITHER edge -> the ordinary phi, plus any stale set membership dropped so it
+//     cannot over-reject a legitimate later read of the merged value.
+inline bool join_entry_m0(RegState& rs, int r, bool other_edge_token) {
+    if (entry_m0_live(rs, r) || other_edge_token) {
+        rs.sreg.erase(r);                 // the other edge's word cannot speak for this one
+        rs.sreg_entry_m0.insert(r);
+        return false;
+    }
+    rs.sreg_entry_m0.erase(r);
+    return true;
 }
 
 inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
