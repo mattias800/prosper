@@ -306,6 +306,71 @@ int main() {
         }
     }
 
+    // #3009: "the guest announced 16-bit" and "the guest never announced anything" are BOTH
+    // index_type == 0, and before index_type_announced they were the same state. Downstream they
+    // are not: the #304 element-size detectors exist to recover a size the guest never announced,
+    // and running them against a title that DID announce lets a byte heuristic overrule a fact.
+    //
+    // Every arm here folds a REAL stream through the real sceAgcDcb builders, so what is asserted is
+    // what the command processor actually derives from guest bytes -- not a hand-set field.
+    if (auto drawi = Hle::lookup("q88lQ+GP5Yk")) {
+        static uint16_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+        auto fold = [&](bool announce, uint32_t size, GpuState& out) {
+            uint32_t ibuf[64]; memset(ibuf, 0, sizeof ibuf);
+            Dcb id{}; id.bottom = ibuf; id.top = ibuf + 64; id.cursor_up = ibuf; id.cursor_down = ibuf + 64;
+            auto ID = (uint64_t)(uintptr_t)&id;
+            if (announce) idx(ID, size, 0, 0, 0, 0);
+            drawi(ID, 6, (uint64_t)(uintptr_t)indices, 0, 0, 0);
+            run_cb(ibuf, 64, out);
+        };
+
+        // (a) Never announced -- DOLL / Tomb Raider. index_type is the reset default.
+        GpuState quiet;
+        fold(/*announce*/false, 0, quiet);
+        CHECK(quiet.index_type == 0 && !quiet.index_type_announced,
+              "#3009: a stream with no SetIndexSize leaves index_type 0 and announced FALSE");
+        CHECK(quiet.draws.size() == 1 && quiet.draws[0].state &&
+              !quiet.draws[0].state->index_type_announced,
+              "#3009: the per-draw snapshot carries 'never announced' to the executor");
+
+        // (b) Announced 16-bit. IDENTICAL index_type to (a) -- this is the arm the sentinel could
+        // not express, and the ONLY thing that separates the two states.
+        GpuState announced16;
+        fold(/*announce*/true, 0, announced16);
+        CHECK(announced16.index_type == 0 && announced16.index_type_announced,
+              "#3009: sceAgcDcbSetIndexSize(0) leaves index_type 0 but announced TRUE");
+        CHECK(announced16.draws.size() == 1 && announced16.draws[0].state &&
+              announced16.draws[0].state->index_type_announced,
+              "#3009: the per-draw snapshot carries the announcement (not just its value)");
+        CHECK(quiet.index_type == announced16.index_type &&
+              quiet.index_type_announced != announced16.index_type_announced,
+              "#3009: the two states agree on index_type and DISAGREE on announced -- the whole point");
+
+        // (c) Announced 32-bit: the value still folds, and the flag is not a value.
+        GpuState announced32;
+        fold(/*announce*/true, 1, announced32);
+        CHECK(announced32.index_type == 1 && announced32.index_type_announced,
+              "#3009: an announced 32-bit size folds its value AND sets announced");
+
+        // (d) Sticky across a later re-announcement back to 16-bit, on ONE process-lifetime state
+        // (agc_graphics_state() is a static, so this is the shape the live fold has). "Ever
+        // announced" is the question a draw in a later submit needs answered, and a 32->16 sequence
+        // is precisely the state a non-zero sentinel on index_type could not have represented.
+        {
+            GpuState seq;
+            uint32_t b1[64]; memset(b1, 0, sizeof b1);
+            Dcb d1{}; d1.bottom = b1; d1.top = b1 + 64; d1.cursor_up = b1; d1.cursor_down = b1 + 64;
+            idx((uint64_t)(uintptr_t)&d1, 1, 0, 0, 0, 0);
+            run_cb(b1, 64, seq);
+            uint32_t b2[64]; memset(b2, 0, sizeof b2);
+            Dcb d2{}; d2.bottom = b2; d2.top = b2 + 64; d2.cursor_up = b2; d2.cursor_down = b2 + 64;
+            idx((uint64_t)(uintptr_t)&d2, 0, 0, 0, 0, 0);
+            run_cb(b2, 64, seq);
+            CHECK(seq.index_type == 0 && seq.index_type_announced,
+                  "#3009: announcing 32-bit then 16-bit ends at index_type 0 with announced still TRUE");
+        }
+    }
+
     // Per-draw register snapshots: each DrawIndexAuto captures the register state AT the draw, so a
     // register changed between two draws is visible in the first draw's snapshot at its old value.
     // (Consecutive draws with no writes in between share one snapshot.)

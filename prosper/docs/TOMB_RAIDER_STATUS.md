@@ -384,7 +384,20 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   `index_buffer_is_unannounced_32bit_high`. **No further test over those two pointers can separate
   them** — do not try to tighten the pattern. The deciding evidence has to come from outside the
   buffer, and today that is the bound vertex buffer's record count. Residual, measured: a bound of
-  65,602 records still admits the case; #3009 is the real fix. Found by independent review of PR #3006.
+  65,602 records still admits the case. Found by independent review of PR #3006.
+  **#3009 has since bounded that residual from the other side**: `index_type == 0` no longer means
+  both "announced 16-bit" and "never announced", so a title that announced an index size never
+  reaches either detector at all. **This title's own exposure is unchanged, and that is now
+  established statically rather than inferred**: the 508,688 `index_type=0` draws never proved
+  "announces never" — that is exactly the reading `index_type == 0` cannot support — but the dump's
+  modules do not import `sceAgcDcbSetIndexSize` (NID `GIIW2J37e70`, `libSceAgc`) at all, so the
+  title **cannot** announce. Positive control on the same scan: `sceAgcDcbSetIndexBuffer`
+  (`l4fM9K-Lyks`) and `sceAgcDcbDrawIndexOffset` (`B+aG9DUnTKA`) ARE present in `eboot.bin`, so the
+  scan can see this dump's AGC NIDs and the absence is a real negative rather than a blind
+  instrument. (This title imports neither `DrawIndexAuto` nor `DrawIndex`: it draws through the Gen5
+  `SetIndexBuffer`/`SetIndexCount`/`DrawIndexOffset` path, which is why a control built from the
+  first two read as void on it.) The vertex-range bound therefore remains its only guard and the
+  period-2 residual above still stands for it.
 
 - **The renderer is not rejecting anything, and never was.** A full boot-to-gameplay run produces
   **zero** `[recompile-reject]` lines and **zero** `[compute] skip` lines. Neither the shattered

@@ -1291,6 +1291,40 @@ inline uint32_t index_elem_bytes(uint32_t index_type) {
     return index_type == 0 ? 2u : index_type == 1 ? 4u : 0u;
 }
 
+// May the two #304 detectors below speak for this draw at all (#3009)?
+//
+// Both are named for what they do: recover an element size the guest NEVER ANNOUNCED. They are
+// heuristics over guest bytes, and the second one carries a measured residual (see its own header) --
+// so running them against a title that DID announce lets a byte pattern overrule a fact prosper was
+// told by the guest, which is the one input that cannot be wrong. Hardware fetches indices at the
+// size VGT_INDEX_TYPE holds; a detector that overrides an announced size is emulating something the
+// hardware does not do.
+//
+// The reason they used to run everywhere is that `index_type == 0` meant two things at once -- "the
+// guest announced 16-bit" and "the guest never announced anything" -- so the executor could not tell
+// an announcement from a reset default. GpuState::index_type_announced now records that separately,
+// and this predicate is the only place the distinction is consumed.
+//
+// Neither known case regresses, and the evidence for that is deliberately NOT `index_type == 0` on a
+// live run -- that reading is the very thing this flag exists because it cannot support. Both dumps
+// were checked statically instead: neither PPSA17942 (DOLL) nor PPSA16901 (Tomb Raider I-III
+// Remastered) imports `sceAgcDcbSetIndexSize` (NID GIIW2J37e70, libSceAgc) in any module, so neither
+// CAN announce, and `announced` is false for them however they are routed. Positive control on the
+// same scan: other libSceAgc indexed-draw NIDs are present in both dumps, so the scan sees their
+// symbols and the absence is a real negative rather than a blind instrument. Corpus-wide, 21 of 55
+// local dumps import the entry point and 34 do not, with the control firing on all 34 (#3009).
+//
+// LIMIT, stated because its failure direction matters: this records announcements made through
+// IT_INDEX_TYPE, which is what sceAgcDcbSetIndexSize emits (hle_agc.cpp, agc_dcb_set_index_size). If
+// a title instead programs an index-type UCONFIG register directly, prosper does not read that
+// register for the element size ANYWHERE today, so such a title looks unannounced here -- and gets
+// exactly the pre-#3009 behaviour, detectors and all. Missing that path costs the fix, never
+// correctness. PROSPER_INDEXTYPE_LOG prints `announced` per indexed draw so the corpus question
+// ("how many titles announce at all?") is one run away.
+inline bool index_size_detection_permitted(uint32_t index_type, bool index_type_announced) {
+    return !index_type_announced && index_elem_bytes(index_type) == 2u;
+}
+
 // Detect an UNANNOUNCED 32-bit index buffer (#304). DOLL's UE4 Slate/UMG quad index buffers are
 // 32-bit, but the title never calls sceAgcDcbSetIndexSize and programs no VGT_INDEX_TYPE register,
 // so index_type defaults to 16-bit — which misreads each 32-bit index as TWO 16-bit ones (the low
@@ -1382,9 +1416,10 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 // which is the point. The executor's
 // own clamp constant three lines above `vb_records_unclamped` is 65,536, i.e. vertex buffers of about
 // that size are routine, so a title with a modest pool AND fan/cone geometry whose apex index is small
-// can still satisfy every clause here. The real fix is knowing whether the guest ever announced an
-// index size at all -- today `index_type == 0` means "16-bit" and "never told" indistinguishably, and
-// that distinction would let both detectors decline outright for any title that announces (#3009).
+// can still satisfy every clause here. That residual is now bounded on the OTHER side by
+// index_size_detection_permitted() (#3009): a title that announced an index size never reaches this
+// function at all, so the exposure is titles that announce nothing -- which is still the exposure for
+// the two known cases, and the vertex-range bound remains their only guard.
 inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const uint32_t* p32,
                                                    uint32_t n, uint32_t vertex_upper_bound) {
     constexpr uint32_t kMinSamples = 8;     // >= 4 words per parity before "all equal" means anything
@@ -2163,19 +2198,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         uint32_t esz = index_elem_bytes(ds.index_type);
         uint32_t n = std::min(draw->index_count, kMaxIndices);
         uint64_t index_addr = draw->index_addr;
-        // Auto-detect a 32-bit index buffer that the guest never announced (#304). DOLL's UE4 Slate/UMG
-        // quads use 32-bit index buffers but the title never calls sceAgcDcbSetIndexSize and sets no
-        // VGT_INDEX_TYPE register, so index_type defaults to 16-bit — misreading each 32-bit index as
-        // two 16-bit ones. The fingerprint is unmistakable: a 32-bit index buffer read as 16-bit has
-        // every ODD 16-bit word (the zero high half of a small index) == 0, while reading it as 32-bit
-        // yields small, valid indices. Genuine 16-bit buffers (DOLL's scene/text meshes, all of the
-        // Messenger's quads) have non-zero odd words and are left untouched. When detected, use the
-        // 32-bit element size AND recompute a DrawIndexOffset's address at that stride (index_base +
-        // index_offset*4) so it lands on the correct quad. CONFIDENCE: HIGH — the banner index buffer
-        // decodes to a clean [0,1,2,2,1,3] quad this way vs a degenerate [0,0,1,0,2,0] as 16-bit.
-        if (esz == 2 && n >= 2) {
-            uint64_t addr32 = draw->from_offset ? (draw->index_base + (uint64_t)draw->index_offset * 4u)
-                                                : draw->index_addr;
+        // The address the same buffer would be read from at a 4-byte stride. For a DrawIndexOffset
+        // the two differ (index_base + offset*2 against index_base + offset*4); otherwise they are
+        // the same bytes. Computed for every indexed draw so the instrument below can print both
+        // readings whatever the announced size says -- it is arithmetic, nothing is dereferenced.
+        const uint64_t addr32 = draw->from_offset
+                                    ? (draw->index_base + (uint64_t)draw->index_offset * 4u)
+                                    : draw->index_addr;
+        {
             // PROSPER_INDEXTYPE_LOG=1 -- what the guest ANNOUNCED against what its bytes actually
             // hold. Without it, "the title never set an index size" and "it set one and we dropped
             // it" produce identical evidence and point at different files; #304 and its part-two
@@ -2184,6 +2214,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             // hundreds of thousands of indexed draws (508,688 measured on one Tomb Raider run), and
             // an unbounded line-per-draw log is a multi-gigabyte file that fills the disk before it
             // answers anything. The cap is announced so a truncated log is never read as a count.
+            //
+            // #3009: prints `announced` (did an IT_INDEX_TYPE packet ever fold?) and runs for EVERY
+            // indexed draw, not only the ones the detectors may touch. Both halves are needed for
+            // the corpus census the gate's value depends on -- "how many titles announce an index
+            // size at all?" cannot be answered by an instrument that only fires on draws whose
+            // announced size is 16-bit, and gating the log alongside the detectors would have made
+            // the fix hide its own measurement. Widening it does spend the 64-line cap faster.
             static const bool indextype_log = getenv("PROSPER_INDEXTYPE_LOG") != nullptr;
             if (indextype_log) {
                 static std::atomic<uint32_t> printed{0};
@@ -2192,8 +2229,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 if (seq < kMaxLines) {
                     char line[512]; int off = 0;
                     off += snprintf(line + off, sizeof(line) - off,
-                                    "[idxtype] index_type=%u esz=%u n=%u from_offset=%u addr=0x%llx addr32=0x%llx",
-                                    ds.index_type, esz, n, (unsigned)draw->from_offset,
+                                    "[idxtype] index_type=%u announced=%u esz=%u n=%u from_offset=%u "
+                                    "addr=0x%llx addr32=0x%llx",
+                                    ds.index_type, (unsigned)ds.index_type_announced, esz, n,
+                                    (unsigned)draw->from_offset,
                                     (unsigned long long)draw->index_addr, (unsigned long long)addr32);
                     if (guest_readable(draw->index_addr, 16u)) {
                         off += snprintf(line + off, sizeof(line) - off, " u16=");
@@ -2215,6 +2254,22 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                         "printed (this is a CAP, not a draw count)\n", kMaxLines);
                 }
             }
+        }
+        // Auto-detect a 32-bit index buffer that the guest never announced (#304). DOLL's UE4 Slate/UMG
+        // quads use 32-bit index buffers but the title never calls sceAgcDcbSetIndexSize and sets no
+        // VGT_INDEX_TYPE register, so index_type defaults to 16-bit — misreading each 32-bit index as
+        // two 16-bit ones. The fingerprint is unmistakable: a 32-bit index buffer read as 16-bit has
+        // every ODD 16-bit word (the zero high half of a small index) == 0, while reading it as 32-bit
+        // yields small, valid indices. Genuine 16-bit buffers (DOLL's scene/text meshes, all of the
+        // Messenger's quads) have non-zero odd words and are left untouched. When detected, use the
+        // 32-bit element size AND recompute a DrawIndexOffset's address at that stride (index_base +
+        // index_offset*4) so it lands on the correct quad. CONFIDENCE: HIGH — the banner index buffer
+        // decodes to a clean [0,1,2,2,1,3] quad this way vs a degenerate [0,0,1,0,2,0] as 16-bit.
+        //
+        // #3009 gates the whole thing on the guest NOT having announced a size. `esz == 2` used to
+        // stand in for that and could not: it is true both for an announced 16-bit buffer and for a
+        // title that never announced anything.
+        if (index_size_detection_permitted(ds.index_type, ds.index_type_announced) && n >= 2) {
             if (guest_readable(draw->index_addr, n * 2u) && guest_readable(addr32, n * 4u)) {
                 const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw->index_addr;
                 const uint32_t* p32 = (const uint32_t*)(uintptr_t)addr32;
