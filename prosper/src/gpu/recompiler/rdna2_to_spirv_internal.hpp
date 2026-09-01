@@ -4094,13 +4094,20 @@ struct SpirvCompute {
     // pre-scan; an attribute read via BOTH v_interp_mov (flat) and v_interp_p2 (smooth) is rejected
     // there (a varying can't be both), so this set never contradicts a smooth read.
     std::unordered_set<uint32_t> flat_attrs;
-    // FS: an Input vec4 at Location=attr, rasterizer-interpolated (or Flat if flat_attrs says so).
+    // FS: an Input vec4 at Location=attr, rasterizer-interpolated (or Flat if flat_attrs says so, OR
+    // if the guest's own PS_INPUT_CNTL declared FLAT_SHADE for this slot -- #3051. Both sources feed
+    // the same SPIR-V property and are unioned: flat_attrs recognises flat-ness from the shader's own
+    // choice of VINTRP opcode (v_interp_mov), while fragment_interpolation->flat_mask recognises it
+    // from the guest's declared semantic, which still applies to an ordinary v_interp_p1/p2 read).
     uint32_t frag_input(uint32_t attr) {
         auto it = in_varying.find(attr); if (it != in_varying.end()) return it->second;
         if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
         uint32_t v = id(); put(types, Op_Variable, {t_ptr_in_v4f, v, SC_Input});
         put(deco, Op_Decorate, {v, Dec_Location, attr});
-        if (flat_attrs.count(attr)) put(deco, Op_Decorate, {v, Dec_Flat});   // un-interpolated (v_interp_mov)
+        const bool flat = flat_attrs.count(attr) != 0 ||
+            (fragment_interpolation && attr < 32 &&
+             (fragment_interpolation->flat_mask & (1u << attr)) != 0);
+        if (flat) put(deco, Op_Decorate, {v, Dec_Flat});
         in_varying[attr] = v; iface.push_back(v); return v;
     }
     // Read component `chan` (0..3) of interpolated attribute `attr` -> float bits (v_interp_p2 / mov).
