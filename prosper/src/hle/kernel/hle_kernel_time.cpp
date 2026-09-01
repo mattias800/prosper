@@ -990,9 +990,11 @@ namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; retur
 // --- Real event-queue backend (kqueue/kevent model). Registered flip/vblank sources post events into
 // their equeue; WaitEqueue blocks until an event is ready (or timeout) and returns it. A single ~60 Hz
 // pump thread drives vblank + flip-completion events so Unity's render/timing threads pace frames. ---
-// The shared 59.94 Hz vblank grid, defined in hle/graphics/hle_graphics.cpp. Declared here
-// rather than in a header because that file deliberately keeps the grid internal, and these
-// two accessors are the whole of what it publishes (#3024).
+// The shared vblank grid, defined in hle/graphics/hle_graphics.cpp. Declared here rather than
+// in a header because that file deliberately keeps the grid internal, and these two accessors
+// are the whole of what it publishes (#3024). The PERIOD is not a constant: since #3017 it comes
+// from the display mode prosper advertises to the guest, so this pump paces at whatever rate the
+// title was told it is running at -- which is the point, and why it is read rather than assumed.
 extern "C" uint64_t prosper_vo_vblank_grid_origin_ns();
 extern "C" uint64_t prosper_vo_vblank_period_ns();
 
