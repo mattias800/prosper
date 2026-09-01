@@ -1682,6 +1682,161 @@ int main() {
         return 1;
     }
     printf("  [ok]   #3133: the saved entry-M0 is opaque -- consuming it as data still rejects\n");
+    // The positive control the two arms above need: the containment arm must be rejecting for the
+    // READ of the token, not because SOP2 cannot write M0 at all. Same shape, a tracked scalar in
+    // place of the save.
+    const uint32_t m0_leak_control[] = {
+        0xBE800385u,                            // s_mov_b32 s0, 5           (ordinary scalar data)
+        0x807C8100u,                            // s_add_u32 m0, s0, 1
+        0xd8f80010u, 0x00000000u,               // ds_append v0 offset:0x10
+        0xbf810000u,
+    };
+    if (recompile_compute(m0_leak_control, std::size(m0_leak_control), nullptr, m0_config).empty()) {
+        printf("  [FAIL] #3133: control -- a TRACKED scalar into M0 must still compile\n");
+        return 1;
+    }
+    printf("  [ok]   #3133: control -- a tracked scalar feeding M0 compiles, so the reject is the token\n");
+
+    // #3133 / #3136 review finding 2: the save gate must constrain its DESTINATION, not only its
+    // source. `in.dst.value` is the raw SOP1 DST field, so it also names VCC_LO (106). Tokenising
+    // VCC_LO erases `rs.sreg[106]` while leaving the live ballot in `rs.vcc` untouched, and the
+    // later data read of VCC_LO then materialises that STALE BALLOT as though it were entry-M0 --
+    // the module came out byte-identical to one with the save deleted. With the destination gated
+    // to an ordinary SGPR this move falls through to the normal path, where an untracked M0 source
+    // rejects, which is what it did before the token existed.
+    const uint32_t m0_into_vcc_lo[] = {
+        0x7d840000u,                            // v_cmp_eq_u32 vcc, v0, v0  (a live ballot)
+        0xBEEA037Cu,                            // s_mov_b32 vcc_lo, m0
+        0x4A02006Au,                            // v_add_nc_u32 v1, vcc_lo, v0  (read it as DATA)
+        0xbf810000u,
+    };
+    const uint32_t m0_into_vcc_lo_control[] = {
+        0x7d840000u,                            // v_cmp_eq_u32 vcc, v0, v0
+        0xbeea0385u,                            // s_mov_b32 vcc_lo, 5       (ordinary scalar data)
+        0x4A02006Au,                            // v_add_nc_u32 v1, vcc_lo, v0
+        0xbf810000u,
+    };
+    ComputeShaderConfig m0_vcc_config;           // exact native wave: the VCC data read is available
+    m0_vcc_config.wave_size = 64;
+    m0_vcc_config.native_subgroup_size = 64;
+    m0_vcc_config.local_x = 64;
+    if (!recompile_compute(m0_into_vcc_lo, std::size(m0_into_vcc_lo), nullptr,
+                           m0_vcc_config).empty()) {
+        printf("  [FAIL] #3133: s_mov_b32 vcc_lo, m0 was accepted as an entry-M0 save\n");
+        return 1;
+    }
+    printf("  [ok]   #3133: s_mov_b32 vcc_lo, m0 is not an entry-M0 save -- it rejects\n");
+    if (recompile_compute(m0_into_vcc_lo_control, std::size(m0_into_vcc_lo_control), nullptr,
+                          m0_vcc_config).empty()) {
+        printf("  [FAIL] #3133: control -- an ordinary scalar write to VCC_LO must still compile\n");
+        return 1;
+    }
+    printf("  [ok]   #3133: control -- VCC_LO scalar data still compiles, so that reject is the M0 read\n");
+
+    // #3133 / #3136 review finding 1: the token must survive a CONTROL-FLOW MERGE. Every scalar
+    // merge reads its inputs through a `sget` that renders an absent scalar as `uconst(0)` and then
+    // stores the phi back into `rs.sreg`, so a save inside a branch arm used to come out of the
+    // merge as an ordinary tracked zero -- `OpPhi %uint_0 ... -> OpIAdd`, the exact fabrication the
+    // token exists to prevent, and it silenced the barrier (which is `token AND untracked`) for the
+    // rest of the shader. `join_entry_m0` carries the token out of the join instead, so the read
+    // after the merge rejects.
+    //
+    // Each arm has its own control with an ordinary scalar write in the same place, because both
+    // the region shape and the post-merge read have to be representable for the reject to mean
+    // anything. Note the controls also prove these encodings really do form a structured region --
+    // a mis-encoded branch rejects for the shape and would make the arms pass for the wrong reason.
+    const uint32_t m0_save_in_if[] = {
+        0xBE800385u,                            // pc0: s_mov_b32 s0, 5   (a real value on the skipped edge)
+        0xbf068004u,                            // pc1: s_cmp_eq_u32 s4, 0
+        0xbf840001u,                            // pc2: s_cbranch_scc0 -> pc4
+        0xBE80037Cu,                            // pc3: s_mov_b32 s0, m0  (arm-local save)
+        0x4A020000u,                            // pc4: v_add_nc_u32 v1, s0, v0   (read after the merge)
+        0xbf810000u,
+    };
+    const uint32_t m0_save_in_if_control[] = {
+        0xBE800385u, 0xbf068004u, 0xbf840001u,
+        0xBE800387u,                            // pc3: s_mov_b32 s0, 7   (ordinary arm-local write)
+        0x4A020000u,
+        0xbf810000u,
+    };
+    const uint32_t m0_save_in_if_else[] = {
+        0xBE800385u,                            // pc0: s_mov_b32 s0, 5
+        0xbf068004u,                            // pc1: s_cmp_eq_u32 s4, 0
+        0xbf840002u,                            // pc2: s_cbranch_scc0 -> pc5
+        0xBE80037Cu,                            // pc3: then: s_mov_b32 s0, m0
+        0xbf820001u,                            // pc4: s_branch -> pc6
+        0xBE800387u,                            // pc5: else: s_mov_b32 s0, 7
+        0x4A020000u,                            // pc6: v_add_nc_u32 v1, s0, v0
+        0xbf810000u,
+    };
+    const uint32_t m0_save_in_if_else_control[] = {
+        0xBE800385u, 0xbf068004u, 0xbf840002u,
+        0xBE800386u,                            // pc3: then: s_mov_b32 s0, 6
+        0xbf820001u, 0xBE800387u, 0x4A020000u,
+        0xbf810000u,
+    };
+    // A loop is different from an if and is guarded differently: its header phi is built BEFORE the
+    // body is emitted and its back-edge operand is patched from whatever the body left, so there is
+    // no "carry the token out of the join" for it -- both phi operands would have to be fabricated.
+    // The region is rejected instead, which is what every shader containing this instruction got
+    // before #3133.
+    const uint32_t m0_save_in_loop[] = {
+        0xbe810380u,                            // pc0: s_mov_b32 s1, 0
+        0xbf0d8401u,                            // pc1: s_cmp_lg_u32 s1, 4
+        0xbf840003u,                            // pc2: s_cbranch_scc0 -> pc6
+        0xBE80037Cu,                            // pc3: s_mov_b32 s0, m0   (save in the body)
+        0x80018101u,                            // pc4: s_add_u32 s1, s1, 1
+        0xbf82fffbu,                            // pc5: s_branch -> pc1
+        0x4A020000u,                            // pc6: v_add_nc_u32 v1, s0, v0
+        0xbf810000u,
+    };
+    const uint32_t m0_save_in_loop_control[] = {
+        0xbe810380u, 0xbf0d8401u, 0xbf840003u,
+        0xBE800387u,                            // pc3: s_mov_b32 s0, 7   (ordinary body write)
+        0x80018101u, 0xbf82fffbu, 0x4A020000u,
+        0xbf810000u,
+    };
+    struct { const uint32_t* code; size_t n; const char* what; } m0_merge_arms[] = {
+        {m0_save_in_if,      std::size(m0_save_in_if),      "an if-only arm"},
+        {m0_save_in_if_else, std::size(m0_save_in_if_else), "an if/else arm"},
+        {m0_save_in_loop,    std::size(m0_save_in_loop),    "a loop body"},
+    };
+    struct { const uint32_t* code; size_t n; const char* what; } m0_merge_controls[] = {
+        {m0_save_in_if_control,      std::size(m0_save_in_if_control),      "an if-only arm"},
+        {m0_save_in_if_else_control, std::size(m0_save_in_if_else_control), "an if/else arm"},
+        {m0_save_in_loop_control,    std::size(m0_save_in_loop_control),    "a loop body"},
+    };
+    for (const auto& arm : m0_merge_arms)
+        if (!recompile_compute(arm.code, arm.n, nullptr, m0_config).empty()) {
+            printf("  [FAIL] #3133: an entry-M0 save in %s reached arithmetic past the merge\n",
+                   arm.what);
+            return 1;
+        }
+    printf("  [ok]   #3133: an entry-M0 token cannot cross a CFG merge into the data domain\n");
+    for (const auto& control : m0_merge_controls)
+        if (recompile_compute(control.code, control.n, nullptr, m0_config).empty()) {
+            printf("  [FAIL] #3133: control -- an ordinary scalar write in %s must still compile\n",
+                   control.what);
+            return 1;
+        }
+    printf("  [ok]   #3133: controls -- the same regions with an ordinary scalar write compile\n");
+
+    // The permissive half, and the reason the join carries the token rather than rejecting the
+    // region: a save whose value never leaves the arm still compiles.
+    const uint32_t m0_save_dead_after_if[] = {
+        0xBE800385u,                            // pc0: s_mov_b32 s0, 5
+        0xbf068004u,                            // pc1: s_cmp_eq_u32 s4, 0
+        0xbf840002u,                            // pc2: s_cbranch_scc0 -> pc5
+        0xBE80037Cu,                            // pc3: s_mov_b32 s0, m0  (save)
+        0xBEFC0300u,                            // pc4: s_mov_b32 m0, s0  (restore, same arm)
+        0xbf810000u,
+    };
+    if (recompile_compute(m0_save_dead_after_if, std::size(m0_save_dead_after_if), nullptr,
+                          m0_config).empty()) {
+        printf("  [FAIL] #3133: an arm-local M0 round trip with no post-merge read must compile\n");
+        return 1;
+    }
+    printf("  [ok]   #3133: an arm-local M0 round trip whose copy is dead after the merge compiles\n");
     if (m0_lds_spv.empty() ||
         !binary_uses_literal_operands(
             m0_lds_spv, OpBitwiseAnd, 0x0c600020u, 0xffffu) ||

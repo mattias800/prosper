@@ -991,6 +991,22 @@ int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
     return highest;
 }
 
+// Does [lo, hi) contain a `s_mov_b32 sX, m0` -- the instruction that starts an entry-M0 token
+// lifetime (#3133)? A STATIC property of the decoded stream, so it can be asked before any block is
+// emitted, which is what the loop emitters need: their header phis are built before the body runs,
+// and a loop-carried token has no value to seed one with. Returns the destination register (>= 0)
+// of the first such save, or -1.
+int entry_m0_save_in_range(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi) {
+    for (const auto& in : ins) {
+        if (in.pc < lo || in.pc >= hi) continue;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+            in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
+            in.dst.value <= 105)
+            return in.dst.value;
+    }
+    return -1;
+}
+
 // Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
 // approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
 // write targets, INCLUDING multi-register writes (MIMG dmask -> N consecutive VGPRs, SMEM -> N SGPRs) so
@@ -1706,6 +1722,31 @@ bool emit_cfg_state_machine(
     }
     for (const auto& kv : initial.vreg) vregs.insert(kv.first);
     for (const auto& kv : initial.sreg) sregs.insert(kv.first);
+
+    // #3133: every scalar the stream touches gets a Function variable that is STORED AS ZERO when
+    // the architectural word has no value on this path, and reloaded as ordinary tracked data at
+    // each block entry -- the same fabricated zero a CFG phi would invent, one indirection further
+    // away. An entry-M0 token is precisely a word with no value, so it cannot survive a dispatcher
+    // edge. There is no MUST analysis for it here (the sibling one, `entry_wave64_scalar_words`,
+    // exists only on the Wave64 mask path), so take the MAY set -- every register any save in this
+    // stream can leave holding the token -- and re-establish the TOKEN on those words at every
+    // block entry, dropping the reloaded placeholder. Erasing alone would not do: an untracked
+    // ordinary SGPR reads as `uconst(0)` with `ok` left true, so it would fabricate the same word
+    // silently. With the token, a save and its restore inside one block still work, and anything
+    // that crosses a dispatcher edge rejects loudly at its read.
+    //
+    // This over-rejects a register that the shader reuses for real data in a LATER block, which is
+    // the price of having no MUST analysis here; it is the safe direction, and it can only cost a
+    // shader that contains `s_mov_b32 sX, m0`, every one of which rejected outright before #3133.
+    // The set is empty for every other shader, so nothing that compiles today can change.
+    std::set<int> entry_m0_may_hold;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+            in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
+            in.dst.value <= 105)
+            entry_m0_may_hold.insert(in.dst.value);
+    }
 
     // Most vector destinations are one static consecutive range. V_MOVRELD is different: M0 can
     // select any observable VGPR at or above VDST, exactly the range emit_alu updates. Analyses that
@@ -3508,6 +3549,10 @@ bool emit_cfg_state_machine(
             state.vreg[kv.first] = b.load_function(b.t_u32, kv.second);
         }
         for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
+        for (int reg : entry_m0_may_hold) {                        // #3133 (see the MAY set above)
+            state.sreg.erase(reg);
+            state.sreg_entry_m0.insert(reg);
+        }
         const std::set<int>* entry_b32 = nullptr;
         const std::set<int>* entry_b64 = nullptr;
         const std::set<int>* entry_wave64_b64 = nullptr;
@@ -6212,6 +6257,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::unordered_map<int, uint32_t> then_v, then_s;
             for (int reg : written_v) then_v[reg] = vget(reg);
             for (int reg : written_s) then_s[reg] = sget(reg);
+            // #3133: which of those scalars is the THEN edge holding as an entry-M0 token? `sget`
+            // rendered each of them as uconst(0) above; the meet below decides whether that value
+            // may be phi'd at all.
+            std::set<int> then_entry_m0;
+            for (int reg : written_s)
+                if (entry_m0_live(rs, reg)) then_entry_m0.insert(reg);
             const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
             const bool then_narrowed = rs.exec_narrowed;
             const auto then_bool = rs.sreg_bool;
@@ -6234,6 +6285,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
             for (int reg : written_s) {
                 const uint32_t else_value = sget(reg);
+                // `rs` is the else edge here; skip the phi entirely when the token decides (#3133).
+                if (!join_entry_m0(rs, reg, then_entry_m0.count(reg) != 0)) continue;
                 if (then_s[reg] != else_value)
                     rs.sreg[reg] = b.emit_phi_2way(
                         b.t_u32, then_s[reg], then_block, else_value, else_block);
@@ -6292,6 +6345,23 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.emit_branch(hdr); b.emit_label(hdr);
         struct PhiRec { int reg; int dom; uint32_t phi; size_t patch; };   // dom: 0=vreg,1=sreg,2=scc,3=vcc,4=exec
         std::vector<PhiRec> phis;
+        // #3133: a loop-carried entry-M0 token has no value to seed a header phi with, and `sget`
+        // would supply the `uconst(0)` the token exists to withhold. Unlike an if merge, "untracked
+        // after the join" is not expressible here -- the phi is built before the body is emitted,
+        // and its back-edge operand is patched from whatever the body left, so both operands would
+        // have to be fabricated. Reject the region instead, which is exactly what happened to every
+        // shader containing this instruction before #3133.
+        if (const int m0_dst = entry_m0_save_in_range(ins, L.header_pc, L.backedge_pc); m0_dst >= 0) {
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "entry-M0 save inside a loop body (s%d)", m0_dst);
+            return false;
+        }
+        for (int r : cs)
+            if (entry_m0_live(rs, r)) {
+                log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                         "entry-M0 token is loop-carried (s%d)", r);
+                return false;
+            }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
@@ -6824,6 +6894,23 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             b.emit_branch(hdr); b.emit_label(hdr);
             struct PhiRec { int reg; int dom; uint32_t phi; size_t patch; };  // dom: 0=vreg,1=sreg,2=scc,3=vcc,4=exec,5=mask
             std::vector<PhiRec> phis;
+            // #3133: a loop-carried entry-M0 token has no value to seed a header phi with, and `sget`
+            // would supply the `uconst(0)` the token exists to withhold. Unlike an if merge, "untracked
+            // after the join" is not expressible here -- the phi is built before the body is emitted,
+            // and its back-edge operand is patched from whatever the body left, so both operands would
+            // have to be fabricated. Reject the region instead, which is exactly what happened to every
+            // shader containing this instruction before #3133.
+            if (const int m0_dst = entry_m0_save_in_range(ins, L.header_pc, L.backedge_pc); m0_dst >= 0) {
+                log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                         "entry-M0 save inside a loop body (s%d)", m0_dst);
+                return false;
+            }
+            for (int r : cs)
+                if (entry_m0_live(rs, r)) {
+                    log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                             "entry-M0 token is loop-carried (s%d)", r);
+                    return false;
+                }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
@@ -7027,6 +7114,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::unordered_map<int,uint32_t> pre_v, pre_s;
                     for (int r : ifv) pre_v[r] = vget(r);
                     for (int r : ifs) pre_s[r] = sget(r);
+                    // #3133: the SKIPPED edge's entry-M0 tokens. `sget` rendered each as uconst(0)
+                    // just now, which is exactly the fabrication the meet below refuses to phi.
+                    std::set<int> pre_entry_m0;
+                    for (int r : ifs)
+                        if (entry_m0_live(rs, r)) pre_entry_m0.insert(r);
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
@@ -7067,7 +7159,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     }
                     b.emit_branch(mergeL); b.emit_label(mergeL);
                     for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
-                    for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
+                    for (int r : ifs) {   // `rs` is the taken arm; the skipped edge is `pre_*`
+                        if (!join_entry_m0(rs, r, pre_entry_m0.count(r) != 0)) continue;   // #3133
+                        rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
+                    }
                     if (then_scc != pre_scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
                                                  then_scc ? then_scc : b.bfalse(), thenEnd);
@@ -7129,6 +7224,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::unordered_map<int,uint32_t> then_v, then_s;
                     for (int r : wv) then_v[r] = vget(r);
                     for (int r : ws) then_s[r] = sget(r);
+                    std::set<int> then_entry_m0;                 // #3133, the then edge's tokens
+                    for (int r : ws)
+                        if (entry_m0_live(rs, r)) then_entry_m0.insert(r);
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
@@ -7144,6 +7242,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     for (int r : wv) { uint32_t ev = vget(r);
                         if (then_v[r] != ev) rs.vreg[r] = b.emit_phi_2way(b.t_u32, then_v[r], thenEnd, ev, elseEnd); }
                     for (int r : ws) { uint32_t es = sget(r);
+                        // `rs` is the else edge here (the then arm's state was rolled back).
+                        if (!join_entry_m0(rs, r, then_entry_m0.count(r) != 0)) continue;   // #3133
                         if (then_s[r] != es) rs.sreg[r] = b.emit_phi_2way(b.t_u32, then_s[r], thenEnd, es, elseEnd); }
                     if (then_scc != rs.scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,

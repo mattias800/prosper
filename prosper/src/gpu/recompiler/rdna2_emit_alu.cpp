@@ -1318,7 +1318,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // ds_append guards require and check for. No value is invented at any point, so there
             // is no "is zero the right constant" question and no way for a fabricated word to leak
             // into the data domain through a copy.
-            if (in.opcode == 0x03 && in.src[0].kind == OperandKind::Special &&
+            //
+            // The DESTINATION is gated as tightly as the source. `in.dst.value` is the raw SOP1 DST
+            // field (`sgpr(w >> 16)`, 0..127), so it also names VCC_LO/HI (106/107), ttmp0..15
+            // (108..123), M0 itself (124) and SGPR_NULL (125). Only an ordinary SGPR may hold the
+            // token: those Special words are read back through the `OperandKind::Special` arm of
+            // `operand_bits`, which never consults `sreg_entry_m0`, so tokenising one of them would
+            // be worse than doing nothing. `s_mov_b32 vcc_lo, m0` is the case that bites -- the arm
+            // erases `rs.sreg[106]` but not `rs.vcc`, and a later data read of VCC_LO then
+            // materialises the STALE BALLOT as if it were entry-M0. Anything above s105 falls
+            // through to the ordinary path below, where an untracked M0 source rejects loudly, i.e.
+            // exactly the behaviour that predates this arm. (EXEC, 126/127, already rejected above.)
+            if (in.opcode == 0x03 && in.dst.value <= 105 &&
+                in.src[0].kind == OperandKind::Special &&
                 in.src[0].value == 124 && !rs.sreg.contains(124)) {
                 rs.sreg.erase(in.dst.value);
                 rs.sreg_entry_m0.insert(in.dst.value);
