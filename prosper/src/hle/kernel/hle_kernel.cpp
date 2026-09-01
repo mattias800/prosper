@@ -3073,7 +3073,42 @@ SCE_PTHREAD_ALIAS(k_sce_rwlock_timedwrlock, k_rwlock_timedwrlock)
 // SemGetvalue left *value uninitialized -> a producer/consumer or gate built on these got NO
 // synchronization (the silent-unsync / UAF class). Back them with host sem_t.
 namespace { bool semlog() { static const bool on = getenv("PROSPER_SEMLOG") != nullptr; return on; } }
-HLE(k_sem_init)      { if (!a0) return 0x16; auto* s = (sem_t*)calloc(1, sizeof(sem_t)); sem_init(s, 0, (unsigned)a2); *(void**)(uintptr_t)a0 = s; if (semlog()) fprintf(stderr, "[sem] init slot=%p value=%u\n", (void*)(uintptr_t)a0, (unsigned)a2); return 0; }
+// #3068: sem_init() CAN fail -- most notably, Darwin does not implement unnamed POSIX semaphores at
+// all, so sem_init() there sets errno=ENOSYS and returns -1 unconditionally. This used to discard
+// that return value outright and report success no matter what, publishing a pointer to a `sem_t`
+// that was never actually initialised. Every other member of the family --  `k_sem_wait`,
+// `k_sem_trywait`, `k_sem_timedwait`, `k_sem_post`, `k_sem_getvalue` -- resolves its host `sem_t`
+// straight out of the slot via `ensure_sem`, so a published-but-uninitialised object turned one
+// honest, traceable failure here into undefined behaviour on every later call instead, with the
+// guest told throughout that its synchronisation was working.
+//
+// Fixed by PROPAGATING the real error rather than manufacturing success, and by refusing to publish
+// the slot when init failed -- the fail-visible choice the charter prefers over a shim that fakes
+// output. A `sem_open`-backed or condvar-backed fallback for platforms lacking unnamed semaphores is
+// deliberately NOT attempted here: nobody has verified what such an emulation needs to preserve on a
+// live macOS boot, and an unverified fallback risks trading one silently-wrong behaviour for
+// another. If a title is later found to depend on this family on such a platform, that is its own
+// issue once the real behaviour is confirmed (see #3068's discussion).
+HLE(k_sem_init) {
+    if (!a0) return 0x16;
+    auto* s = (sem_t*)calloc(1, sizeof(sem_t));
+    if (!s) return 12;   // ENOMEM (bare FreeBSD errno -- encoded/converted by the aliases below)
+    if (sem_init(s, 0, (unsigned)a2) != 0) {
+        const uint64_t rc = fbsd_errno(errno);
+        // Loud but bounded: on a platform where this fails unconditionally (Darwin), every single
+        // semaphore init would otherwise flood stderr once per call. Capped the same way the
+        // __stack_chk_fail diagnostic above is (n++ < 4): visible immediately, not a firehose.
+        static int logged = 0;
+        if (logged++ < 4)
+            fprintf(stderr, "[sem] init FAILED slot=%p value=%u host_errno=%d(%s)\n",
+                    (void*)(uintptr_t)a0, (unsigned)a2, errno, strerror(errno));
+        free(s);
+        return rc;
+    }
+    *(void**)(uintptr_t)a0 = s;
+    if (semlog()) fprintf(stderr, "[sem] init slot=%p value=%u\n", (void*)(uintptr_t)a0, (unsigned)a2);
+    return 0;
+}
 HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog()) fprintf(stderr, "[sem] wait slot=%p enter\n", (void*)(uintptr_t)a0); int rc = sem_wait(s); if (semlog()) fprintf(stderr, "[sem] wait slot=%p exit rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : fbsd_errno(errno); }   // EAGAIN (would block) is 11 here, 35 on the PS5
 // scePthreadSemTimedwait is the one member of the family with no POSIX spelling registered on its
