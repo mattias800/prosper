@@ -7255,12 +7255,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.guest_bytes = guest_bytes;
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
-                if (alias_census_enabled()) {
+                if (alias_census_enabled() && r->gpu_addr) {
                     // A binding that reads nothing from guest memory cannot alias: `src` is null
-                    // exactly when the seed is skipped or the source is renderer-owned.
+                    // exactly when the seed is skipped or the source is renderer-owned. The
+                    // `r->gpu_addr` guard is the same rule the buffer loop applies -- address 0 is
+                    // a synthesized null binding, not a guest range.
                     if (src) alias_seeds.push_back({r->gpu_addr, guest_bytes});
-                    // The writeback writes up to guest_bytes at r->gpu_addr (see below).
-                    if (bi.storage) alias_writes.push_back({r->gpu_addr, guest_bytes});
+                    // The writeback writes up to guest_bytes at r->gpu_addr (see below). This arm
+                    // is unconditional inside the `bi.storage` branch that encloses it; the old
+                    // `if (bi.storage)` here was dead and read as if it discriminated something.
+                    alias_writes.push_back({r->gpu_addr, guest_bytes});
                 }
                 // The writeback still writes up to guest_bytes at r->gpu_addr, so a guest-backed
                 // target must be a valid mapped range even when the SEED read is skipped (#1122
@@ -7751,6 +7755,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 } else {
                     const size_t need = sampled_guest_need;
                     const uint8_t* src = sampled_guest_source;
+                    // KNOWN GAP, recorded rather than papered over: the DCC fast-clear path is
+                    // NOT covered, and it is excluded by accident rather than by argument.
+                    // `sampled_guest_source` is assigned only inside `if (!sampled_dcc_fast_clear)`,
+                    // so a fast-clear sample never reaches here -- yet it does read guest memory,
+                    // through `r->metadata_addr`, and materializes the whole surface from it, while
+                    // the writeback writes that same plane. That is a real producer->consumer
+                    // channel missing from BOTH sides of the census, so the rate is a lower bound.
+                    // Covering it needs the metadata range, not `gpu_addr`, which is a larger
+                    // change than this instrument warrants; #3157 carries it.
                     if (alias_census_enabled() && src && need) {
                         // A SAMPLED binding reads guest memory and never writes back, so it
                         // contributes a seed range and no write range. Omitting these was the
@@ -9037,7 +9050,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // saw only the image path would be a correctness hole rather than a tradeoff. An
             // `alias_of` entry shares an earlier entry's guest range and would double-count.
             for (const auto& b : buffers) {
-                if (!b.resource || b.guest_bytes == 0 || b.alias_of != SIZE_MAX) continue;
+                // Address 0 is not a guest address. An explicit null V# entry is bound as a
+                // 4-byte zero source backed by a STACK-LOCAL array (see `null_buffer_seed`), and
+                // that synthesis deliberately keeps `gpu_addr == 0` -- its own comment says the
+                // point is to bind a null buffer "without inventing a guest address". Letting it
+                // through here would invent one anyway: two consecutive dispatches that each hold
+                // a writable null array entry both produce {0, 4}, which overlaps itself, and the
+                // census would report a FABRICATED alias at a non-address. Not a bias -- a false
+                // positive, and a systematic one on descriptor-array titles.
+                if (!b.resource || !b.resource->gpu_addr) continue;
+                if (b.guest_bytes == 0 || b.alias_of != SIZE_MAX) continue;
                 // NOT `!b.upload_skipped`. That flag means "the cached GPU copy still matches
                 // guest memory" (see its assignment: `submit_unchanged || (watches_complete &&
                 // dirty_chunks.empty())`), not "this binding does not read guest bytes". A bound

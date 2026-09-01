@@ -189,6 +189,22 @@ inline bool claim_compute_transfer_gate_selector_summary(
 //
 // The overlap RATE bounds the achievable win: if consecutive dispatches usually alias, a
 // correctness-preserving pipeline drains constantly and buys nothing. Measure before building.
+//
+// KNOWN BIASES, stated so a reader can weigh the number instead of trusting it. All four were
+// found by review rather than by the instrument, which is itself the reason to write them down:
+//   * UNDER-counts: the sampled DCC fast-clear path reads guest memory through `metadata_addr`
+//     and its writeback writes the same plane, and neither side is recorded (covering it needs
+//     the metadata range, not `gpu_addr`).
+//   * OVER-counts: `compute_transfer_seed_borrowed` bindings are scored as guest seeds, but they
+//     read a retained GPU image rather than guest memory.
+//   * ASYMMETRIC: `SpirvDescriptorBinding::readable` marks a write-only output that need not be
+//     seeded. The image path consults it; `BoundBuffer` copies `writable` but never `readable`,
+//     so write-only IMAGES are excluded from seeds while write-only BUFFERS are included. That
+//     matches what prosper's buffer upload actually does today -- it does not consult `readable`
+//     either, so those bytes really are read -- but the two paths do not agree, and if the upload
+//     ever starts honouring `readable` this census must change with it.
+//   * DEPTH-1 ONLY: overlap is measured against the immediately preceding dispatch, so the rate
+//     is a lower bound for any ring depth greater than one.
 struct ComputeGuestRange {
     uint64_t addr = 0;
     uint64_t bytes = 0;

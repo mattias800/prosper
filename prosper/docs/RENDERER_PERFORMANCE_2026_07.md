@@ -1164,6 +1164,9 @@ resource-ownership scheduling rather than reordering by operation type.
   lives, and it is untried -- it needs a guest-visibility contract the ring does not have. Do not
   read this row as "pipelining the compute path is dead"; read it as "a within-batch ring is dead,
   and the dispatches-per-batch ratio is the number to measure before building the next one."
+  That ratio comes from `PROSPER_RENDER_TIMING`, which counts dispatches and batches; the alias
+  census (`PROSPER_COMPUTE_ALIAS_CENSUS`) answers a different question -- whether consecutive
+  dispatches alias through guest memory -- and has no call or batch counter at all.
 
 
 ## Windows cross-submit texture write watch
