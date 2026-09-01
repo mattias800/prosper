@@ -2650,6 +2650,28 @@ inline const char* render_buffer_upload_failure_name(RenderBufferUploadFailureSt
     }
 }
 
+// Deterministic one-shot injection for the #3045 regression check: simulate the NEXT sampled-
+// texture vkCreateImage call failing, without depending on any real device's limits. A real
+// over-large arrayLayers request cannot be relied on to fail here -- this box's RADV reports
+// maxImageArrayLayers=8192, well above the backend's own kBackendMaxArrayLayers ceiling of 2048,
+// so the array-layer path never actually reaches the driver's own rejection. The production path
+// never arms this state.
+inline bool& render_texture_create_failure_once_storage() {
+    static thread_local bool armed = false;
+    return armed;
+}
+
+inline void inject_render_texture_create_failure_once() {
+    render_texture_create_failure_once_storage() = true;
+}
+
+inline bool consume_render_texture_create_failure_once() {
+    bool& armed = render_texture_create_failure_once_storage();
+    if (!armed) return false;
+    armed = false;
+    return true;
+}
+
 // Create, populate, and unmap one transient storage buffer. Every partial failure tears down in
 // Vulkan lifetime order (buffer before any bound memory) and leaves both outputs null. Returning the
 // exact failed step lets the caller report the binding before substituting a safe zero-word buffer.
@@ -5205,7 +5227,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                     VK_IMAGE_USAGE_SAMPLED_BIT;   // sampled depth bridge (#1275)
-        vkCreateImage(dev, &dci, nullptr, &dimg);
+        // #3045: same class of defect as the sampled-texture upload path, and found while
+        // auditing this function's other vkCreateImage sites for the same review. Unlike the
+        // color-target sites above (which discard the VkResult but do check `!img`/`!img1`/
+        // `!extra_images[slot]` before touching the handle further), this one had NO guard at
+        // all -- a real failure fed a definitely-null `dimg` straight into
+        // vkGetImageMemoryRequirements, the exact undefined behaviour #3045 reports. Match the
+        // sibling return-out-on-failure convention instead.
+        const VkResult ds_image_result = vkCreateImage(dev, &dci, nullptr, &dimg);
+        if (ds_image_result != VK_SUCCESS || !dimg) {
+            dimg = VK_NULL_HANDLE;
+            static std::atomic<uint32_t> ds_create_failure_logs{0};
+            if (ds_create_failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                std::fprintf(stderr,
+                    "[ds-create-failed] vkCreateImage result=%d extent=%ux%u fmt=%d\n",
+                    (int)ds_image_result, W, H, (int)DFMT);
+            if (cached_ds) persistent_ds_cache().erase(ds_key);
+            return out;
+        }
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         dai.allocationSize = dr.size; dai.memoryTypeIndex = pick(dr.memoryTypeBits, 0);
@@ -6953,7 +6992,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                  ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u) |
                                             (upload.key.mip_levels > 1
                                                  ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
-                                vkCreateImage(dev, &tci, nullptr, &upload.image);
+                                // #3045: the result used to be discarded here, so a device
+                                // rejecting the request (VK_ERROR_OUT_OF_DEVICE_MEMORY, or an
+                                // extent/array-layer count past a real device's limits -- Vulkan
+                                // Core only guarantees maxImageArrayLayers >= 256, well under the
+                                // 2048 backend ceiling in #3043) left upload.image as
+                                // VK_NULL_HANDLE and fed straight into vkGetImageMemoryRequirements,
+                                // which is undefined behaviour on a null image. Check the result and
+                                // skip this draw the same way a fatal buffer-upload failure does
+                                // above (buffer_resources_ready = false; break;) instead of
+                                // propagating the null handle.
+                                const VkResult image_create_result =
+                                    consume_render_texture_create_failure_once()
+                                        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                                        : vkCreateImage(dev, &tci, nullptr, &upload.image);
+                                if (image_create_result != VK_SUCCESS || !upload.image) {
+                                    upload.image = VK_NULL_HANDLE;
+                                    static std::atomic<uint32_t> texture_create_failure_logs{0};
+                                    if (texture_create_failure_logs.fetch_add(
+                                            1, std::memory_order_relaxed) < 32)
+                                        std::fprintf(
+                                            stderr,
+                                            "[texture-upload-failed] set=%u binding=%u "
+                                            "vkCreateImage result=%d extent=%ux%ux%u mips=%u "
+                                            "layers=%u fmt=%d -- skipping draw\n",
+                                            r.set, r.binding, (int)image_create_result,
+                                            tci.extent.width, tci.extent.height, tci.extent.depth,
+                                            tci.mipLevels, tci.arrayLayers, (int)tci.format);
+                                    buffer_resources_ready = false;
+                                    break;
+                                }
                                 VkMemoryRequirements tr;
                                 vkGetImageMemoryRequirements(dev, upload.image, &tr);
                                 upload.image_bytes = tr.size;
