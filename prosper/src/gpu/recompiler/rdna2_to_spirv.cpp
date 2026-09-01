@@ -159,9 +159,16 @@ FragmentInterpolationLayout fragment_interpolation_layout(
         else if (instruction.opcode == 2 && instruction.src[0].value < 3)
             selectors[attr] |= static_cast<uint8_t>(1u << instruction.src[0].value);
     }
-    if (pixel_inputs)
+    if (pixel_inputs) {
         layout.passthrough_mask =
             pixel_inputs->effective_passthrough_mask() & layout.attribute_mask;
+        // #3051: the guest's own FLAT_SHADE control bit, independent of which VINTRP opcode the
+        // shader used to read the attribute (see PixelInputMapping::effective_flat_mask()). Computed
+        // here, before the requires_geometry early-out below, because it must apply to every
+        // fragment program -- not only ones that also need the portable interpolation-geometry
+        // fallback.
+        layout.flat_mask = pixel_inputs->effective_flat_mask() & layout.attribute_mask;
+    }
 
     // P10/P20 have no ordinary Vulkan varying equivalent. P0 can retain the cheap Flat-input path
     // when it is the attribute's only interpolation mode; mixed P0+smooth needs the geometry copy too.

@@ -931,6 +931,14 @@ struct InterpolationCacheKey {
     PixelSystemInputMapping system_inputs{};
     bool has_system_inputs = false;
     uint32_t passthrough_mask = 0;
+    // #3051: FragmentInterpolationLayout now also carries flat_mask, derived from pixel_inputs's raw
+    // control words exactly as passthrough_mask is (PixelInputMapping::effective_flat_mask()). It
+    // must be part of this key for the same reason passthrough_mask is: SPI_PS_INPUT_CNTL is a
+    // context register that can carry a different FLAT_SHADE bit across two draws sharing identical
+    // shader bytes, and this cache is keyed on shader identity alone otherwise -- omitting it would
+    // let a flat-shaded draw's layout silently answer a later non-flat draw of the same shader, or
+    // vice versa.
+    uint32_t flat_mask = 0;
 
     bool operator==(const InterpolationCacheKey&) const = default;
 };
@@ -945,6 +953,7 @@ struct InterpolationCacheKeyHash {
             hash = hash_mix(hash, key.system_inputs.addr);
         }
         hash = hash_mix(hash, key.passthrough_mask);
+        hash = hash_mix(hash, key.flat_mask);
         return static_cast<size_t>(hash);
     }
 };
@@ -1892,6 +1901,7 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     key.has_system_inputs = system_inputs != nullptr;
     if (system_inputs) key.system_inputs = *system_inputs;
     key.passthrough_mask = pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
+    key.flat_mask = pixel_inputs ? pixel_inputs->effective_flat_mask() : 0u;   // #3051
     auto& cache = interpolation_cache();
     std::lock_guard lock(cache.mutex);
     auto found = cache.entries.find(key);
