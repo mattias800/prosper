@@ -90,4 +90,22 @@ constexpr size_t block_compressed_cube_source_size(bool block_compressed_cube,
         block_compressed_cube, gpu_address, descriptor_footprint);
 }
 
+// PROSPER_TEXCOMMIT (#3053): the guest-memory byte extent to scan from a sampled texture's SOURCE
+// address. Must be a source-side quantity -- `source_footprint_bytes` is the caller's
+// `gpu_capture_resource_footprint()` for this exact resource, which already folds in BC block
+// bytes, tiling, and the array/cube layer span the same way `layered_array_source_size()` and
+// `layered_cube_source_size()` above do -- and must NEVER be the DECODED byte count
+// (`tw * th * decoded_bpp * layers`, the size a surface expands to once converted to the backend's
+// RGBA8/RGBA16F decode format). For a block-compressed texture the decoded count is 4x+ the source
+// (BC7 decodes 1 source byte/texel to 4 RGBA8 bytes), and a layered array multiplies that again by
+// the layer count: Tomb Raider I-III Remastered's 512x512 BC7 256-layer world atlas measured a
+// decoded count of 268,435,456 against a real source extent of 67,108,864 -- a 4x overshoot that
+// both mis-measured "committed" guest memory (it counted whatever happened to follow the real
+// texture) and read guest memory past the real allocation. This function's signature deliberately
+// has no slot for a decoded byte count, so that value cannot be passed here by mistake.
+constexpr size_t texcommit_scan_extent(uint64_t source_footprint_bytes) {
+    return source_footprint_bytes > SIZE_MAX
+        ? SIZE_MAX : static_cast<size_t>(source_footprint_bytes);
+}
+
 } // namespace prosper::frontend
