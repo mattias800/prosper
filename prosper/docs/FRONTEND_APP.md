@@ -229,6 +229,14 @@ pipelines and image/buffer objects per batch. At that point, unify on a single f
 or share the render target via `VK_KHR_external_memory` (zero-copy), while retaining `present_readback`
 for headless tests and screenshot tooling.
 
+**Update (#1270, landed 2026-07-24):** the "unify on a single device" half of this landed for real game
+boots, ahead of the pipeline/resource-caching precondition this note originally set — `prosper-app`
+adopts the *renderer's* device (rather than a frontend-provided one) and GPU-blits its front-buffer image
+straight to the swapchain by default, with `PROSPER_APP_GPU_PRESENT=0` as the explicit opt-out. The
+two-context design above is still real and still runs: it is what `--test-pattern`, any failed device
+adoption, and `tools/screenshot` all use today. `present_readback` was retained exactly as this note
+anticipated, for headless tests and screenshot tooling.
+
 ## Present loop (sketch)
 
 ```
@@ -647,16 +655,30 @@ large logical arenas sparse and physical aliases coherent without letting Window
 overwrite guest SysV red-zone locals. If sparse backing cannot be created, direct-memory mapping fails
 closed instead of silently returning to the unsafe `SEC_RESERVE` exception path.
 
-The current renderer remains a deterministic readback-based implementation. It retains CPU-visible pixels
-for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702
-tracks persistent Vulkan resource/pipeline caching and direct image presentation beyond the initial
-readback-memory, detile, compute-context, transient-memory-pool, scratch-reuse, and shader-cache fixes.
+**Present-path correction (2026-09-01, #3087):** this paragraph used to open with "the current renderer
+remains a deterministic readback-based implementation," stated with no date, as though it described the
+renderer generally. **#1270 (landed 2026-07-24) falsified that for the shipped app.** `prosper-app`
+defaults to GPU present for any real game boot: the renderer publishes its front-buffer image directly
+and the app GPU-blits it straight to the swapchain, skipping the CPU round-trip
+(`PROSPER_APP_GPU_PRESENT=0` is the explicit opt-out; the app also falls back to the private-device CPU
+path at runtime if shared-device adoption fails). The CPU readback described in "The Vulkan-context
+decision" above is still real code — it is what `--test-pattern`, any adoption failure, and every caller
+that never invokes `set_gpu_present_active` still take, which includes `tools/screenshot` (the sole call
+site is `frontends/prosper-app/main.cpp:668`) and every headless/ctest/CI path. Before quoting an FPS
+figure or calling "the renderer" readback-based, check which of the two paths produced it — see
+CLAUDE.md's "before quoting an FPS number" bullet, which carries this exact distinction; it is not
+restated here. Issue #702, which this paragraph used to cite as tracking "direct image presentation,"
+closed 2026-07-19 — five days before #1270 delivered exactly that for the interactive path.
+
 On the native Windows Messenger first level, the exact-byte texture cache improved the same-binary
-workload from about 20 FPS to 24 FPS (resource construction 10.1-10.5 ms to about 3.9 ms). The remaining
-roughly 36-38 ms submit time is primarily ordered graphics/compute backend work: four graphics spans,
-four compute dispatches, synchronous fence waits/readbacks, and transient Vulkan pipelines/resources.
-Further work should be validated against a 3D title and converge graphics/compute resource ownership;
-title-specific 2D cache additions are not the current priority.
+workload from about 20 FPS to 24 FPS (resource construction 10.1-10.5 ms to about 3.9 ms). **That figure
+is itself a readback-path measurement from 2026-07-14, ten days before #1270**, and is not a current
+renderer rate — see CLAUDE.md and `RENDERER_PERFORMANCE_2026_07.md` for the 2026-08-27 windowed
+re-measurement (median ~156 presented fps under GPU present) before treating it as current. The
+remaining roughly 36-38 ms submit time was primarily ordered graphics/compute backend work: four
+graphics spans, four compute dispatches, synchronous fence waits/readbacks, and transient Vulkan
+pipelines/resources. Further work should be validated against a 3D title and converge graphics/compute
+resource ownership; title-specific 2D cache additions are not the current priority.
 The complete A/B table, heavy-frame budget, corrected capture graph, rejected experiments, and handoff
 decision are preserved in `RENDERER_PERFORMANCE_2026_07.md`.
 
@@ -728,5 +750,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 - **Present latency/vsync** defaults to FIFO. `--present-mode mailbox` opts into low-latency vsync,
   and `--present-mode immediate` explicitly permits tearing; unsupported optional modes fall back to
   FIFO with a diagnostic.
-- **Later zero-copy** (`external_memory`) is deliberately deferred; the readback seam is the v1 answer.
+- **Later zero-copy** (`external_memory`) is deliberately deferred; the readback seam was the v1 answer.
+  **Superseded 2026-07-24 for the shipped app:** #1270 made GPU present (renderer device adoption + a
+  direct front-buffer blit, not `external_memory`) the default for a real game boot; the readback seam
+  remains the fallback (`PROSPER_APP_GPU_PRESENT=0`, adoption failure, `--test-pattern`, `tools/screenshot`).
 - **area:** shared/host infrastructure — needs an `area:` decision and coordination before build.

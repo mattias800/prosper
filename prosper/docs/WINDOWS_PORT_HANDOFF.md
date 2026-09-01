@@ -23,7 +23,11 @@ The guest, on Windows (MinGW, native), reproducibly:
   (`WriteData`/`ReleaseMem`/`WaitRegMem`) and delivers flip/vblank/EOP events.
 - Delivers IL2CPP's exception-type `0x1e` asynchronously on the requested target thread, allowing
   repeated GC stop-the-world suspend/resume cycles to complete.
-- Runs the shared live Vulkan renderer and normal 1920x1080 present/readback path on an NVIDIA host.
+- Runs the shared live Vulkan renderer and presents 1920x1080 frames on an NVIDIA host. This predates
+  #1270 (2026-07-24), which is platform-independent: `prosper-app` now defaults to GPU present (the
+  renderer's device is adopted and its front-buffer image is blitted straight to the swapchain, no CPU
+  round-trip) on Windows exactly as on Linux, with the CPU present/readback path as the
+  `PROSPER_APP_GPU_PRESENT=0` fallback.
 - Builds SDL3 with native Win32 video, WASAPI audio, XInput/HIDAPI controllers, and Vulkan support.
 
 ### Current GC delivery model (#690)
