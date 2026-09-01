@@ -2098,6 +2098,17 @@ if(TARGET prosper_core)
   target_link_libraries(test_videoout PRIVATE prosper_core)
   add_test(NAME videoout_queries COMMAND test_videoout)
 
+  # #3017: the display prosper advertises must be DERIVED from the host's real mode rather than
+  # hardcoded 1080p59.94. Its own executable, not an arm of test_videoout, because the advertised
+  # mode resolves ONCE per process on first use -- so the derived case needs a process whose
+  # environment is set before any VideoOut call, and test_videoout above is exactly the
+  # complementary process where those variables are unset and the untouched `legacy` default is
+  # asserted. CROSS-PLATFORM for the same reason test_videoout is: it drives the HLE registry and
+  # a pure header, with no OS display access.
+  add_executable(test_display_mode tests/hle/graphics/test_display_mode.cpp)
+  target_link_libraries(test_display_mode PRIVATE prosper_core)
+  add_test(NAME display_mode_derivation COMMAND test_display_mode)
+
   # precise_sleep's deadline post-condition (#3074): every sleep_until_steady_ns() backend must
   # never return before now_ns() >= deadline_ns. Win32SleepFallback did not re-check after its one
   # OS sleep call, unlike the sibling high-resolution-timer path. CROSS-PLATFORM like test_videoout

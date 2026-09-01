@@ -229,6 +229,15 @@ sceVideoOutGetOutputStatus, `w0hLuNarQxY` sceVideoOutConfigureOutput. Plus fixed
 (was all-zero → now 1920×1080@59.94Hz) and added GetVblankStatus (advancing counter) +
 GetDeviceCapabilityInfo (SDR). All output-struct writes are size-exact.
 
+> **The 1080p@59.94 in this entry is no longer the whole answer (#3017).** It remains the *default*,
+> so this record still describes what a default run advertises — but that pair was hardcoded, and a
+> title that reads the advertised mode and paces to it was therefore told 59.94 Hz on any host and
+> 1080p on a 4K one. Since #3017 the mode is **derived** from the host's real display under
+> `PROSPER_DISPLAY_MODE` (`legacy` | `host` | `host-high-refresh`), and the vblank period that paces
+> the guest comes from the *same* resolved mode rather than from a third constant kept in step by
+> hand. `src/hle/graphics/display_mode.hpp` holds the policy and the evidence grading behind each
+> refresh enumerant; deriving is opt-in because titles act on this value.
+
 **Verified the game requests exactly what we advertise:** `SetBufferAttribute2` arrives with
 `width=0x780 (1920)`, `height=0x438 (1080)`, `pixel_format=0x8000000000000000` (PS5 A8R8G8B8 sRGB);
 `RegisterBuffers2` registers **3** framebuffers (triple-buffered). Recorded them in a display-buffer

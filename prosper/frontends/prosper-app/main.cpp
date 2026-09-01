@@ -32,6 +32,7 @@
 #include "keyboard_pad_map.hpp"         // which key is which pad control (#2234)
 #include "hle/input/ime_input.hpp"           // #1093: forward host keyboard keys to the guest IME path
 #include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
+#include "hle/graphics/display_mode.hpp" // #3017: validate --display-mode against the one policy parser
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
@@ -1429,6 +1430,25 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--display-mode" && i + 1 < argc) {
+            // Which display prosper tells the guest it is attached to (#3017). `legacy` (the
+            // default, so this flag is never needed to keep today's behaviour) always advertises
+            // 1920x1080 @ 59.94. `host` derives resolution and refresh from the real display.
+            // `host-high-refresh` additionally allows the 119.88 Hz enumerant, whose VALUE prosper
+            // cannot yet defend from primary evidence and which no title here has been checked
+            // against for flip-rate-dependent logic -- see display_mode.hpp.
+            const std::string requested = argv[++i];
+            prosper::hle::graphics::DisplayModePolicy parsed{};
+            if (!prosper::hle::graphics::parse_display_mode_policy(requested, parsed)) {
+                fprintf(stderr, "prosper-app: --display-mode must be legacy, host, or "
+                                "host-high-refresh (got \"%s\")\n", requested.c_str());
+                return 2;
+            }
+            if (!set_environment("PROSPER_DISPLAY_MODE", requested.c_str())) {
+                fprintf(stderr, "prosper-app: failed to set PROSPER_DISPLAY_MODE\n");
+                return 2;
+            }
+        }
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
     pick.has_dump = !dump.empty();
@@ -1482,6 +1502,34 @@ int main(int argc, char** argv) {
             printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
         fprintf(stderr, "prosper-app: %zu title(s) in %s\n", games.size(), gamesDir.c_str());
         return games.empty() ? 1 : 0;
+    }
+
+    // #3017: publish the host's REAL display mode before anything boots, so the VideoOut layer can
+    // derive what it advertises to the guest instead of hardcoding 1920x1080 @ 59.94 Hz. Publishing
+    // is unconditional and inert on its own -- PROSPER_DISPLAY_MODE (default `legacy`) decides
+    // whether the derivation actually uses it, so a title that works today is untouched until
+    // somebody opts in.
+    //
+    // Position is load-bearing: start_guest() below spawns the guest thread, and the VideoOut layer
+    // resolves its mode ONCE on first use. Publishing after the boot would make which mode the guest
+    // sees depend on whether it asked before we wrote the variable -- a race, and one that would
+    // usually resolve the wrong way. SDL_InitSubSystem rather than the authoritative SDL_Init
+    // further down: video is not up yet here, and a failure must cost only the derivation (the
+    // documented fallback is exactly the hardcoded mode prosper always used), never the boot.
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        const SDL_DisplayMode* host_mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+        if (host_mode && host_mode->w > 0 && host_mode->h > 0 && host_mode->refresh_rate > 0.0f) {
+            char published[64];
+            snprintf(published, sizeof published, "%dx%d@%.4f",
+                     host_mode->w, host_mode->h, (double)host_mode->refresh_rate);
+            if (set_environment("PROSPER_HOST_DISPLAY_MODE", published))
+                fprintf(stderr, "[app] host display: %s\n", published);
+            else
+                fprintf(stderr, "[app] failed to publish PROSPER_HOST_DISPLAY_MODE\n");
+        } else {
+            fprintf(stderr, "[app] host display mode unavailable (%s); VideoOut keeps its "
+                            "1920x1080 @ 59.94 default.\n", SDL_GetError());
+        }
     }
 
     // Boot the game (unless test-pattern): the shared start_guest() path registers the live renderer

@@ -19,6 +19,7 @@
 #include "gpu/texture/tile.hpp"             // de-swizzle a TILE-mode scanout into a linear image
 #include "host/memory/guest_memory_map.hpp" // guest_readable_mapping_containing (real over-read proof)
 #include "host/platform/precise_sleep.hpp"   // #1765: a vblank wait whose resolution is not the Win32 tick
+#include "hle/graphics/display_mode.hpp"      // #3017: the one derived answer for "which display is this?"
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -139,9 +140,59 @@ namespace {
         g_last_submit_tsc = completion_tsc;
     }
 
-    // The one display we advertise. 1920x1080 @ 59.94Hz (refresh-rate enum 3), 16:9, ~50".
-    constexpr uint32_t kDispW = 1920, kDispH = 1080;
-    constexpr uint64_t kRefresh5994 = 3;   // SCE_VIDEO_OUT_REFRESH_RATE_59_94HZ
+    // The one display we advertise, and the ONE place it is decided (#3017).
+    //
+    // This used to be two hardcoded constants here plus a third (the 16683350 ns vblank period)
+    // 600 lines further down, kept in step by hand. A title that reads the advertised mode and
+    // paces to it was therefore told 59.94 Hz on every host, and a 4K host was told 1080p. Now the
+    // answer is DERIVED from the host's real mode -- published by the frontend as
+    // PROSPER_HOST_DISPLAY_MODE="<w>x<h>@<hz>" -- under the PROSPER_DISPLAY_MODE policy, and both
+    // the status struct and the pacing grid read their fields off this single object. See
+    // display_mode.hpp for the policy, the resolution set, and the evidence grading behind each
+    // refresh enumerant.
+    //
+    // Default is `legacy`: 1920x1080 @ 59.94 (enum 3), byte-identical to the pre-#3017 behaviour.
+    // Deriving is opt-in because titles ACT on the advertised mode -- both their render resolution
+    // and their frame pacing hang off it -- so it wants per-title verification, not a global flip.
+    //
+    // Resolved ONCE, on first use, and never re-read. The vblank grid's epoch is itself first-use
+    // anchored, so a period that changed mid-run would step the guest's vblank count sideways; and
+    // a status struct that disagreed with the grid it is paced by is exactly the defect this
+    // replaces. One immutable answer removes both possibilities by construction.
+    const prosper::hle::graphics::AdvertisedDisplayMode& advertised_display_mode() {
+        using namespace prosper::hle::graphics;
+        static const AdvertisedDisplayMode mode = [] {
+            DisplayModePolicy policy = DisplayModePolicy::legacy;
+            if (const char* requested = getenv("PROSPER_DISPLAY_MODE")) {
+                // A malformed policy keeps the conservative default rather than picking one
+                // nobody asked for, and says so: silently ignoring it would leave a user who
+                // typo'd the opt-in believing they had measured it.
+                if (!parse_display_mode_policy(requested, policy))
+                    fprintf(stderr, "[vo] PROSPER_DISPLAY_MODE=\"%s\" is not one of "
+                                    "legacy|host|host-high-refresh -- keeping legacy.\n", requested);
+            }
+            HostDisplayMode host;
+            if (const char* published = getenv("PROSPER_HOST_DISPLAY_MODE")) {
+                if (!parse_host_display_mode(published, host))
+                    fprintf(stderr, "[vo] PROSPER_HOST_DISPLAY_MODE=\"%s\" is not "
+                                    "\"<w>x<h>@<hz>\" -- falling back to 1920x1080 @ 59.94.\n",
+                            published);
+            }
+            const AdvertisedDisplayMode resolved = select_display_mode(policy, host);
+            // Always logged, not gated behind PROSPER_GFXLOG: which display the guest believes it
+            // is attached to changes what several titles render and how fast they run, so it
+            // belongs in the record of every run rather than in an opt-in diagnostic.
+            fprintf(stderr, "[vo] display: %ux%u @ refresh-enum %llu (%llu ns vblank) "
+                            "policy=%s source=%s\n",
+                    resolved.width, resolved.height,
+                    (unsigned long long)resolved.refresh_enum,
+                    (unsigned long long)resolved.vblank_period_ns,
+                    display_mode_policy_name(policy),
+                    resolved.derived ? "host" : "fallback");
+            return resolved;
+        }();
+        return mode;
+    }
 
     void vo_argtrace(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
         if (getenv("PROSPER_GFXLOG"))
@@ -768,22 +819,27 @@ HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our s
     *(int32_t*) (s + 0x38) = buf;          // currentBuffer
     return 0;
 }
-// SceVideoOutResolutionStatus (0x30 bytes): report a real 1080p60 panel instead of the previous
-// all-zero display, and initialize flags/reserved0/reserved1 rather than leaking caller garbage.
+// SceVideoOutResolutionStatus (0x30 bytes): report a real panel instead of the previous all-zero
+// display, and initialize flags/reserved0/reserved1 rather than leaking caller garbage.
+//
+// This is half of what #3017 is about -- what the title READS. The other half is what actually
+// paces it (the vblank grid below). Both now come from advertised_display_mode(), so a title that
+// reads this struct and paces to it is paced at the rate this struct reports.
 HLE(g_vo_resstatus)   {
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
+    const auto& display = advertised_display_mode();
     uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x30);
-    *(uint32_t*)(s + 0x00) = kDispW;   *(uint32_t*)(s + 0x04) = kDispH;   // full w/h
-    *(uint32_t*)(s + 0x08) = kDispW;   *(uint32_t*)(s + 0x0c) = kDispH;   // pane w/h
-    *(uint64_t*)(s + 0x10) = kRefresh5994;
+    *(uint32_t*)(s + 0x00) = display.width;   *(uint32_t*)(s + 0x04) = display.height;  // full w/h
+    *(uint32_t*)(s + 0x08) = display.width;   *(uint32_t*)(s + 0x0c) = display.height;  // pane w/h
+    *(uint64_t*)(s + 0x10) = display.refresh_enum;
     *(float*)   (s + 0x18) = 50.0f;                                      // screen size (inch)
     return 0;
 }
 
-// The monotonic ~59.94 Hz timebase shared by sceVideoOutGetVblankStatus's `count` and
+// The monotonic vblank timebase shared by sceVideoOutGetVblankStatus's `count` and
 // sceVideoOutWaitVblank's wake-up boundary. They MUST share it in PHASE, not merely in period: a
 // game that waits for a vblank and then reads the count has to observe the tick it just waited for,
 // which is a statement about where the boundaries fall, not about how far apart they are. Anchored
@@ -813,7 +869,12 @@ HLE(g_vo_resstatus)   {
 // tracks when the title started caring about vblanks rather than when it first asked -- but
 // it is a change, and a comment claiming callers cannot move the grid would have hidden it.
 namespace {
-constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
+// The vblank period, derived from the SAME resolved mode the status struct reports (#3017). It was
+// a hardcoded 16683350 ns beside a separately hardcoded refresh enumerant, so changing one without
+// the other would pace a title at a rate it does not believe it is in -- the exact failure this
+// issue names. Reading both off one object makes that unrepresentable rather than merely avoided.
+// Still constant for the process: advertised_display_mode() resolves once.
+uint64_t vblank_period_ns() { return advertised_display_mode().vblank_period_ns; }
 // Deterministic clock used only by test_videoout's phase-integration check. Zero leaves the
 // production steady clock and sleep path untouched. Keeping the seam here, underneath both public
 // HLE calls, lets the test prove their shared grid without making host scheduler latency part of
@@ -845,7 +906,7 @@ void vblank_sleep_until_ns(uint64_t deadline_ns) {
 // comment ("aligning them is a real follow-up; asserting they are aligned is wrong"). Sharing
 // the origin and the period here is what closes it (#3024).
 extern "C" uint64_t prosper_vo_vblank_grid_origin_ns() { return vblank_epoch_ns(); }
-extern "C" uint64_t prosper_vo_vblank_period_ns() { return kVblankNs; }
+extern "C" uint64_t prosper_vo_vblank_period_ns() { return vblank_period_ns(); }
 
 extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns) {
     g_vblank_test_now_ns.store(now_ns, std::memory_order_relaxed);
@@ -870,7 +931,7 @@ HLE(g_vo_vblankstatus) {
     // the first query made Astro Bot compute a frame-rate sample as
     // `(frames * refresh) / (count - previous_count)` with both counts zero and trap on
     // IDIV. Keep the time-based behavior, but number the first process-relative vblank 1.
-    *(uint64_t*)(s + 0x00) = 1 + (ns - t0) / kVblankNs;  // count: one tick per vblank period
+    *(uint64_t*)(s + 0x00) = 1 + (ns - t0) / vblank_period_ns();  // count: one tick per vblank period
     *(uint64_t*)(s + 0x08) = (ns - t0) / 1000;           // processTime (µs)
     *(uint64_t*)(s + 0x10) = ns;                         // tsc (monotonic ns; matches ReadTsc's unit)
     return 0;
@@ -885,7 +946,7 @@ HLE(g_vo_vblankstatus) {
 // decode, present, frame timing) runs unbounded. Found on PPSA26414 (R-Type Delta: HD Boosted,
 // #1746), whose display thread is exactly that loop.
 //
-// The wait boundary comes from vblank_epoch_ns()/kVblankNs — the SAME timebase
+// The wait boundary comes from vblank_epoch_ns()/vblank_period_ns() — the SAME timebase
 // sceVideoOutGetVblankStatus reports — so a thread that waits for a vblank and then reads the
 // status observes the tick it waited for, not a disagreeing second clock. The handle is validated
 // under g_vo_handle_mx and the guard is released BEFORE sleeping: holding it across a ~16 ms sleep
@@ -912,7 +973,8 @@ HLE(g_vo_wait_vblank) {
     const uint64_t now = vblank_now_ns();
     // Next strictly-future boundary: a caller that is already exactly on one still waits a full
     // period, which is what "wait for the NEXT vblank" means.
-    const uint64_t next = t0 + ((now - t0) / kVblankNs + 1) * kVblankNs;
+    const uint64_t period = vblank_period_ns();
+    const uint64_t next = t0 + ((now - t0) / period + 1) * period;
     // F5: the deadline crosses into host::sleep_until_steady_ns as a plain nanosecond count, and the
     // duration_cast back to a steady_clock::time_point happens there — see precise_sleep.cpp, which
     // also records why this is not a bare std::this_thread::sleep_until on Windows (#1765).
