@@ -192,6 +192,39 @@ def main():
     expect(out, "Fix the wait primitive's resolution",
            "case 8: the imperative IS earned when the census supports it")
 
+    # 9. Drift bias hand-check (#3061). The `[audio-dbg]` emitter logs gap=0.00ms for a port's
+    #    FIRST arrival -- no previous arrival to measure from -- so `span_s = sum(gaps)` covers
+    #    only the REAL inter-arrival intervals while `frames_total` sums frames from every
+    #    arrival, including that first, unmeasured one. `frames_total / span_s` overcounts by one
+    #    arrival's worth of frames.
+    #
+    #    Chosen so the TRUE rate is exact and the bias is exact too: 11 records of 100 frames at
+    #    a 1000 Hz device, delivered at EXACTLY real-time cadence (100.00 ms per 100-frame grain
+    #    == 100 frames/s * 1000 == 1000 Hz). By construction the true delivered rate is exactly
+    #    the device rate:
+    #
+    #      true_drift = (delivered_hz - device_hz) / device_hz
+    #                 = (frames_after_first / real_span_s - device_hz) / device_hz
+    #                 = ((10 * 100) / 1.0 - 1000) / 1000 = 0 / 1000 = 0.00%
+    #
+    #    The pre-fix formula divides ALL 11 records' frames by the same 1.0 s real span:
+    #
+    #      biased_hz   = frames_total / span_s = (11 * 100) / 1.0 = 1100
+    #      biased_drift = (1100 - 1000) / 1000 = +10.00%    (== calls / (calls - 1) - 1 = 1/10)
+    #
+    #    +10.00% is comfortably past the +-0.3% threshold, so the bug does not just misreport a
+    #    number -- it flips the verdict to the false "runs above the device rate" the issue names.
+    log = dbg(gap=0.00, frames=100, queued=100000, bpf=1, channels=1)
+    log += "".join(
+        dbg(gap=100.00, frames=100, queued=100000, bpf=1, channels=1) for _ in range(10))
+    out, _ = run(log, ["--device-hz", "1000"])
+    expect(out, "-> drift +0.00%",
+           "case 9: an exact real-time 11-record log must report the true 0.00% drift, not +10.00%")
+    expect(out, "delivery matches the device rate",
+           "case 9: the true rate must read as matching, not as a clock excess")
+    reject(out, "runs above the device rate",
+           "case 9: the pre-fix +1/(N-1) bias (+10.00% at N=11) must not survive")
+
     if failures:
         print("FAILURES:")
         for failure in failures:
