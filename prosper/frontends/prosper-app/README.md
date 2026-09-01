@@ -216,6 +216,30 @@ tuning one; leave it unset for normal use.
 - `--record-axis flip|pad-read` — timestamp recorded intervals by display flips (the backward-compatible
   default) or by successful guest input-state reads. Pad-read routes remain stable when presentation
   pauses while the title continues polling input.
+- `--display-mode legacy|host|host-high-refresh` — which display prosper tells the **guest** it is
+  attached to. See below. Default `legacy`.
+
+## `--display-mode`: what the guest is told it is plugged into
+
+This is not a window or swapchain setting — it is the display prosper *advertises* through
+`libSceVideoOut`, which some titles read to pick their render resolution and to pace themselves. It
+also sets the vblank period the guest is woken on, because those two must agree: a title paced at a
+rate it does not believe it is in behaves as badly as one told a rate it cannot act on.
+
+- `legacy` (**default**) — always 1920×1080 @ 59.94 Hz, exactly what prosper advertised before #3017.
+  Deriving is opt-in because titles *act* on this: anything that advances state per flip rather than
+  per elapsed second runs fast at a higher rate.
+- `host` — derive resolution and refresh from the real display. The resolution becomes the largest
+  **PS5 output mode** the host can show (720p / 1080p / 4K — never the host's own desktop resolution,
+  which may be one no PS5 ever reports). Refresh is capped at 59.94: the 119.88 enumerant's integer
+  value rests on no primary evidence, so deriving alone never reaches it.
+- `host-high-refresh` — additionally allow the 119.88 Hz enumerant on a host that can present it.
+  **Experimental**, for exactly the reason above; verify the title before trusting a run made with it.
+
+The app publishes the host's mode as `PROSPER_HOST_DISPLAY_MODE=<w>x<h>@<hz>` before the guest boots;
+`PROSPER_DISPLAY_MODE` is the same policy switch for harnesses that do not go through this frontend.
+An unknown or unparseable host mode falls back to 1920×1080 @ 59.94, and the chosen mode is printed
+once at startup (`[vo] display: …`).
 
 ## `--fps`: two numbers, and the first one is the honest one
 
