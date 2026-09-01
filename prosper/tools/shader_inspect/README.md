@@ -17,11 +17,18 @@ run the title or replay with `PROSPER_SHADER_DUMP_SUCCESS=DIR`. Each unique succ
 produces a pair such as:
 
 ```text
-success_ps_35956264829da0c6_62ad8faab4566b7a.bin
-success_ps_35956264829da0c6_62ad8faab4566b7a.spv
-success_cs_6f6a5fdd6e9f8d73_2339aa565126d182.bin
-success_cs_6f6a5fdd6e9f8d73_2339aa565126d182.spv
+success_ps_at_00000005008f1400_35956264829da0c6_62ad8faab4566b7a.bin
+success_ps_at_00000005008f1400_35956264829da0c6_62ad8faab4566b7a.spv
+success_cs_at_0000000413dc6700_6f6a5fdd6e9f8d73_2339aa565126d182.bin
+success_cs_at_0000000413dc6700_6f6a5fdd6e9f8d73_2339aa565126d182.spv
 ```
+
+The field after the stage tag is the **guest code address** (#3196), so a program you identified by
+address is one glob away — `ls DIR/success_*_at_00000005008efd00_*` — and
+`PROSPER_SHADER_DUMP_PROGRAM=0x5008efd00` narrows the run to it so a 4K boot does not write thousands
+of modules. A chained vertex program also writes a `_main_<main-addr>_<main-hash>.bin` holding its NGG
+continuation, and either half's address selects the pair. See `tools/AGENTS.md` for the filter's full
+contract, including why a malformed spec dumps everything rather than nothing.
 
 For a large live compute program that reaches the backend but fails during Vulkan pipeline creation,
 filter the backend trace by guest code address and dump only that exact translated module:
@@ -50,8 +57,9 @@ PROSPER_COMPUTELOG_SPIRV=~/work/target.spv \
 
 Reach for it whenever the question is about **control flow** — where the loops are, what a loop's
 exits are, whether a branch is backward. `PROSPER_SHADER_DUMP_SUCCESS` also writes raw `.bin` files,
-but its filenames carry only hashes, so recovering the program at a known *address* from that
-directory means hash-matching by hand. The program length is re-derived by decoding to the program's
+and since #3196 those filenames carry the code address too, so either route recovers a program by
+address; this one is still the right choice when you want *one* live traced program and its emitted
+SPIR-V written to exact paths you name. The program length is re-derived by decoding to the program's
 own terminator rather than trusted, and a run prints what it wrote:
 
 ```text

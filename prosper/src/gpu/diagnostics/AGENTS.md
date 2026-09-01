@@ -18,6 +18,9 @@ guarantee.
   frequency**; several phantom findings came from reading a capped count as a real one.
 - `watch_list`, `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute
   parentage.
+- `shader_dump_filter` — `PROSPER_SHADER_DUMP_PROGRAM`, which narrows `PROSPER_SHADER_DUMP_SUCCESS`
+  to named guest programs. It fails **open** where the skip selectors fail closed, and the header
+  explains why: an empty dump directory reads as "that program never compiled".
 
 Two standing cautions, both learned expensively:
 
