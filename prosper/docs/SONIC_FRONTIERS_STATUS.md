@@ -573,7 +573,8 @@ changes nothing.
   **`gpu_replay` still declines this op**, and v57 does not change that: a replayed resource is
   `host_data`-backed and its blob covers only the selected level, so the derivation fails closed
   there. Materializing the chain on replay needs the capture to own the whole allocation's bytes —
-  a separate change. Do not take a capsule expecting to study the fetch offline yet.
+  a separate change, tracked as **#3202**. Do not take a capsule expecting to study the fetch
+  offline yet.
 * **Reject-by-default.** Linear chains, a selected level packed in the tail, layered or volume
   views, DCC, block-compressed and converting formats, a shifted `BASE_LEVEL`, and `host_data`
   backing all keep the historical single-level image. A binding whose shape cannot carry the chain
