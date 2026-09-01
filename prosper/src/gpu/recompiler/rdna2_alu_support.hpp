@@ -182,6 +182,27 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
             }
             auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: {
+            // Holding the ENTRY value of M0 as an opaque token (#3133). It is not data, and the
+            // register's stale `sreg_input` word is not it either -- reading either here would be
+            // exactly the fabricated value the token exists to avoid. Only `s_mov_b32 m0, sSRC`
+            // consumes it, and it does so without going through this function.
+            // The token is live only while the register still has NO value: any later write that
+            // leaves a VALUE -- SMEM, SOP2, anything -- supersedes it, so the check is
+            // `token AND untracked` rather than a set that every write site would have to remember
+            // to clear. Stray's `0x300c010000` is exactly why: it saves M0 into s0, restores from
+            // s0, and then `s_load_dword s0, ...` reuses the register for real data twelve dwords
+            // later. A token that outlived that write rejected a legitimate read.
+            // A write that deliberately erases its `sreg` value instead -- a VOPC mask destination,
+            // `s_getpc_b64`, any unrepresentable write -- leaves a STALE token behind, and a later
+            // legitimate read of that register then rejects. That over-rejects rather than
+            // fabricates, and it can only cost a shader that already contains a save, every one of
+            // which rejected outright before #3133, so it is left as the safe direction.
+            // Membership is per-path and gets a meet at every CFG join (`join_entry_m0`): a merge
+            // reads absent scalars as `uconst(0)`, so without one the token would come out of a
+            // branch as a tracked, fabricated zero.
+            if (rs.sreg_entry_m0.contains(o.value) && !rs.sreg.contains(o.value)) {
+                if (ok) *ok = false; return b.uconst(0);
+            }
             auto it = rs.sreg.find(o.value);
             if (it != rs.sreg.end()) return it->second;
             auto input = rs.sreg_input.find(o.value);

@@ -1301,6 +1301,57 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // reject rather than model it. VCC_LO/HI (106/107) and M0 stay accepted as the
             // documented data-scratch round-trip (NGG preamble s_bfe_u32 vcc_lo, DOLL M0 moves).
             if (in.dst.value == 126 || in.dst.value == 127) { ok = false; return true; }
+            // #3133, the M0 entry-value round trip. Compiled code borrows M0 as scratch: it saves
+            // the driver's entry value, overwrites M0 with the LDS base it wants, uses it, and puts
+            // the original back.
+            //
+            //     s_mov_b32 s0, m0 | s_movk_i32 m0, 0 | ds_... | s_mov_b32 m0, s0
+            //
+            // Stray's `0x300c010000` -- a full-screen fragment pass -- does exactly that twice, and
+            // the SAVE was an unresolved operand, so the whole stage failed and every draw bound to
+            // it was discarded.
+            //
+            // Both halves are modelled as an OPAQUE TOKEN, never as a number. The save marks the
+            // destination as holding entry-M0 and leaves it with no `sreg` value, so arithmetic on
+            // it, a V_WRITELANE scalar source, an LDS index -- every consumer that is not the
+            // restore -- still rejects exactly as an untracked read does. The restore consumes the
+            // token and returns M0 to UNTRACKED, which is the state the movrel / ADDTID /
+            // ds_append guards require and check for. No value is invented at any point, so there
+            // is no "is zero the right constant" question and no way for a fabricated word to leak
+            // into the data domain through a copy.
+            //
+            // The DESTINATION is gated as tightly as the source. `in.dst.value` is the raw SOP1 DST
+            // field (`sgpr(w >> 16)`, 0..127), so it also names VCC_LO/HI (106/107), ttmp0..15
+            // (108..123), M0 itself (124) and SGPR_NULL (125). Only an ordinary SGPR may hold the
+            // token: those Special words are read back through the `OperandKind::Special` arm of
+            // `operand_bits`, which never consults `sreg_entry_m0`, so tokenising one of them would
+            // be worse than doing nothing. `s_mov_b32 vcc_lo, m0` is the case that bites -- the arm
+            // erases `rs.sreg[106]` but not `rs.vcc`, and a later data read of VCC_LO then
+            // materialises the STALE BALLOT as if it were entry-M0. Anything above s105 falls
+            // through to the ordinary path below, where an untracked M0 source rejects loudly, i.e.
+            // exactly the behaviour that predates this arm. (EXEC, 126/127, already rejected above.)
+            if (in.opcode == 0x03 && in.dst.value <= 105 &&
+                in.src[0].kind == OperandKind::Special &&
+                in.src[0].value == 124 && !rs.sreg.contains(124)) {
+                rs.sreg.erase(in.dst.value);
+                rs.sreg_entry_m0.insert(in.dst.value);
+                rs.sreg_srt.erase(in.dst.value);
+                rs.sreg_bool.erase(in.dst.value);
+                rs.sreg_bool_narrowed.erase(in.dst.value);
+                rs.sreg_bool_b32.erase(in.dst.value);
+                rs.sreg_written.insert(in.dst.value);
+                return true;
+            }
+            if (in.opcode == 0x03 && in.dst.value == 124 &&
+                in.src[0].kind == OperandKind::SGPR &&
+                rs.sreg_entry_m0.contains(in.src[0].value) &&
+                !rs.sreg.contains(in.src[0].value)) {
+                rs.sreg.erase(124);                 // M0 is untracked again, as it was at entry
+                rs.sreg_entry_m0.erase(124);
+                return true;
+            }
+            // A write of anything else ends this register's entry-M0 lifetime.
+            rs.sreg_entry_m0.erase(in.dst.value);
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
             // An ordinary scalar-data write starts a new lifetime for this physical word.  Do not
             // let an earlier Wave32 mask save alias that new value in later mask-domain moves.
