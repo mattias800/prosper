@@ -285,6 +285,40 @@ inline DecodedImageView unmapped_format_image_view(const DecodedImageDescriptor&
 // separate sites build a Texture/StorageImage ShaderResource from a (descriptor, view) pair; they
 // have drifted before (#2265), so the provenance travels through one function rather than three
 // copies of five assignments.
+// Do two descriptors agree about the MIP CHAIN they would materialize? (#3205)
+//
+// The five `mip_chain_*` fields describe an allocation-wide chain, and they are only part of an
+// image's IDENTITY when a chain is actually materialized. A single-level image is fully described
+// by its extent, format, tiling and address; its chain provenance describes nothing.
+//
+// That distinction is load-bearing rather than tidy, because the provenance is NOT populated
+// uniformly: `image_base_level_view` fills it in, while `unmapped_format_image_view` deliberately
+// leaves it at zero ("no allocation-wide mip placement -- zero element extent = not modelled").
+// Comparing it unconditionally therefore made two IDENTICAL single-level descriptors for the same
+// guest address compare unequal purely by which construction path built them.
+//
+// The cost of getting this wrong is not a cache miss. Descriptors that fail to compare equal stop
+// aliasing one Vulkan image, and callers depend on that aliasing: GTA V's 4K output shader writes
+// the four 8x8 quadrants of each 16x16 block through four bindings at a single address, so losing
+// the alias drops three of four stores and renders a checkerboard over the frame. Measured on
+// PPSA04263 before this guard: 33,615 aliasing rejections across 46 distinct addresses in under a
+// minute, and EVERY ONE of them had `declared_mip_levels == 1` on both sides -- not one involved a
+// chain at all.
+//
+// `declared_mip_levels` itself is compared by the caller and is genuinely part of identity; this
+// predicate covers only the derived provenance.
+inline bool shader_resource_mip_chain_provenance_matches(const ShaderResource& a,
+                                                         const ShaderResource& b) {
+    // No chain on either side: the provenance describes nothing, so it cannot distinguish them.
+    if (a.declared_mip_levels < 2u && b.declared_mip_levels < 2u) return true;
+    return a.mip_chain_element_width == b.mip_chain_element_width &&
+           a.mip_chain_element_height == b.mip_chain_element_height &&
+           a.mip_chain_bytes_per_block == b.mip_chain_bytes_per_block &&
+           a.mip_chain_max_level == b.mip_chain_max_level &&
+           a.mip_chain_base_level == b.mip_chain_base_level;
+}
+
+
 inline void shader_resource_apply_mip_chain_provenance(ShaderResource& r,
                                                        const DecodedImageView& view) {
     r.mip_chain_element_width = view.chain_element_width;

@@ -6608,11 +6608,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // The chain length is derived from these six fields (#3048); two descriptors
                     // that disagree on any of them materialize different images.
                     p->declared_mip_levels == r->declared_mip_levels &&
-                    p->mip_chain_element_width == r->mip_chain_element_width &&
-                    p->mip_chain_element_height == r->mip_chain_element_height &&
-                    p->mip_chain_bytes_per_block == r->mip_chain_bytes_per_block &&
-                    p->mip_chain_max_level == r->mip_chain_max_level &&
-                    p->mip_chain_base_level == r->mip_chain_base_level &&
+                    // #3205: the derived chain provenance is part of image identity only when a
+                    // chain exists. It is populated on one construction path and left unset on
+                    // another, so comparing it unconditionally split identical single-level
+                    // descriptors into separate images -- which breaks the aliasing the comment
+                    // above requires and renders GTA V's checkerboard.
+                    prosper::gpu::shader_resource_mip_chain_provenance_matches(*p, *r) &&
                     p->srgb == r->srgb && same_host_backing &&
                     p->host_data_size == r->host_data_size && same_dcc_identity;
                 bool same_sampler = true;
