@@ -2240,6 +2240,24 @@ struct SpirvCompute {
     // Exact sampled IMAGE_LOAD representation for guest 2D_MSAA: the host image is single-sample
     // 2D-array, with each guest sample plane in one layer. The guest's explicit sample coordinate is
     // therefore the third integer coordinate; LOD remains zero because the host view has one level.
+    // IMAGE_LOAD_MIP lowering: the guest's own mip selector reaches OpImageFetch's Lod operand.
+    // Identical to image_fetch_2d except that the level is a value rather than the constant zero,
+    // so it is valid only against a binding whose image really carries that many levels (#3048).
+    void image_fetch_2d_lod(uint32_t binding, uint32_t x_bits, uint32_t y_bits,
+                            uint32_t lod_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
+        uint32_t coord = id();
+        if (tex_is_arrayed(binding))
+            put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, uconst(0)});
+        else
+            put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
+        uint32_t res   = id();
+        put(code, Op_ImageFetch,
+            {texture_vec4(binding), res, img, coord, ImgOp_Lod, lod_bits});
+        unpack_texture_result(binding, res, out);
+    }
+
     void image_fetch_2d_array(uint32_t binding, uint32_t x_bits, uint32_t y_bits,
                               uint32_t layer_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
