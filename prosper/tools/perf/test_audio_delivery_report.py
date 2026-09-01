@@ -152,6 +152,46 @@ def main():
     if "no [audio-dbg] records" not in out:
         failures.append(f"case 5: expected the no-records refusal, got: {out!r}")
 
+    # 6/7/8 (#3080). The bottom "mixer's wake is quantized" verdict fires on clustered arrivals
+    # regardless of WHY they cluster, and case 3 above never reaches it (its 9.66 ms gap sits
+    # under the 10.67 ms two-grain threshold). This is a reconstruction of the actual Blasphemous 2
+    # numbers from #3080: a steady ~11.85 ms gap against a 5.33 ms grain -- 100% of arrivals beyond
+    # two grains -- driven by a guest producing audio at ~45% of real time (drift ~-55%, matching
+    # the issue's -55.29%). Before the fix this printed "the mixer's wake is quantized ... Fix the
+    # wait primitive's resolution" unconditionally, which is the exact wrong verdict #3080 reports:
+    # the title's ONLY timed wait (usleep) measured x1.02 via PROSPER_TIMEDWAIT_CENSUS, i.e. not
+    # quantized, and the clock deficit already explains the clustering.
+    deficit_log = "".join(dbg(gap=11.85, queued=64) for _ in range(488))
+
+    # 6. No census in the log: the verdict must hedge rather than assert a mechanism it has no
+    #    evidence for, and must name the census as the way to settle it.
+    out, _ = run(deficit_log)
+    expect(out, "cannot tell them apart", "case 6: no census -> hedged, not asserted")
+    expect(out, "PROSPER_TIMEDWAIT_CENSUS=1", "case 6: names the discriminator")
+    reject(out, "Fix the wait primitive's resolution",
+           "case 6: must not issue the imperative with no evidence for it")
+
+    # 7. A census IS present and shows the guest's only wait primitive resolving close to exact
+    #    (x1.02, the #3080 figure) -- the verdict must say quantization is RULED OUT, not assert it.
+    census_low = ("[timedwait 5s] usleep           calls=488       requested= 20.143 ms"
+                  "  actual= 20.503 ms  x1.02\n")
+    out, _ = run(deficit_log + census_low)
+    expect(out, "RULES OUT a quantized wake", "case 7: census rules out quantization")
+    expect(out, "x1.02", "case 7: reports the measured ratio")
+    reject(out, "Fix the wait primitive's resolution",
+           "case 7: must not issue the imperative when the census contradicts it")
+
+    # 8. A census IS present and shows a genuinely coarse wait (x2.90, #3013's figure for the
+    #    primitive that really was the cause elsewhere) -- here the verdict is earned, and this is
+    #    the one case where "fix the wait primitive" should still appear.
+    census_high = ("[timedwait 5s] sem_timedwait    calls=488       requested=  5.330 ms"
+                   "  actual= 15.457 ms  x2.90\n")
+    out, _ = run(deficit_log + census_high)
+    expect(out, "CONFIRMS a coarse wait", "case 8: census confirms quantization")
+    expect(out, "x2.90", "case 8: reports the measured ratio")
+    expect(out, "Fix the wait primitive's resolution",
+           "case 8: the imperative IS earned when the census supports it")
+
     if failures:
         print("FAILURES:")
         for failure in failures:
