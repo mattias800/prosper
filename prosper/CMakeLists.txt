@@ -2038,6 +2038,20 @@ if(TARGET prosper_core)
   target_link_libraries(test_mip_provenance_identity PRIVATE prosper_core)
   add_test(NAME mip_provenance_identity COMMAND test_mip_provenance_identity)
 
+  # #3204: the image-identity predicates extracted from execute_item. They decide whether two
+  # bindings alias ONE Vulkan image -- the aliasing GTA V's four quadrant writes depend on, and
+  # the thing #3205 broke while it was an unnamed local expression. Pure comparisons.
+  add_executable(test_image_identity tests/gpu/agc/test_image_identity.cpp)
+  target_link_libraries(test_image_identity PRIVATE prosper_core)
+  add_test(NAME image_identity COMMAND test_image_identity)
+
+  # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
+  # direction binds the guest image with the wrong element type, so every arm has a rejection
+  # partner -- including atomics, which are never a native storage image however well formats match.
+  add_executable(test_spirv_storage_match tests/gpu/agc/test_spirv_storage_match.cpp)
+  target_link_libraries(test_spirv_storage_match PRIVATE prosper_core)
+  add_test(NAME spirv_storage_match COMMAND test_spirv_storage_match)
+
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
   add_executable(test_convention_bindings tests/gpu/test_convention_bindings.cpp)
@@ -2169,6 +2183,16 @@ if(TARGET prosper_core)
       if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(prosper_live_renderer PRIVATE -Werror=switch)
       endif()
+
+      # #3204: the renderer-target format table, extracted from execute_item where it was an
+      # `||` chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D
+      # menu. Now an exhaustive switch: the compiler pins exhaustiveness, this test pins the
+      # table. Registered HERE, inside if(Vulkan_FOUND), because live_target_format.hpp includes
+      # <vulkan/vulkan.h> -- registering it outside built on Linux and broke MinGW and macOS.
+      add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
+      target_link_libraries(test_live_target_format_match PRIVATE prosper_core Vulkan::Vulkan)
+      target_include_directories(test_live_target_format_match PRIVATE frontends src)
+      add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
       # Keep the production compute backend covered on native Windows too. This catches host- and
@@ -2496,6 +2520,17 @@ if(TARGET prosper_core)
       target_include_directories(test_draw_program_skip_render PRIVATE src tests tools/boot_trace)
       target_link_libraries(test_draw_program_skip_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME draw_program_skip_render COMMAND test_draw_program_skip_render)
+
+      # #3204: the renderer-target format table, extracted from execute_item where it was an
+      # `||` chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D menu.
+      # Now an exhaustive switch: the compiler pins exhaustiveness, this test pins the table.
+      # Registered in BOTH the UNIX and WIN32 branches, like the compute-backend tests above:
+      # live_target_format.hpp includes <vulkan/vulkan.h>, so it needs an if(Vulkan_FOUND) scope,
+      # and this file has one per platform.
+      add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
+      target_link_libraries(test_live_target_format_match PRIVATE prosper_core Vulkan::Vulkan)
+      target_include_directories(test_live_target_format_match PRIVATE frontends src)
+      add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
       # Armed from the ENVIRONMENT rather than by a setenv inside the test. The persistent-target
       # opt-out is read through PROSPER_ENV_VALUE, which caches, so arming it from inside the process
       # is exactly the vacuous-arm defect cached_env_arming_logic exists to catch; and the selector
