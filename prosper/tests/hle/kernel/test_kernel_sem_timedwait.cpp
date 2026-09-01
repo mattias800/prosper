@@ -108,11 +108,13 @@ int main() {
     // Asserts that init REPORTS success, not that the count is observably 0 -- the count is then
     // established by arm 1 timing out rather than being acquired.
     //
-    // Weaker still than that, and named rather than left implied: k_sem_init DISCARDS
-    // sem_init's return and returns 0 unconditionally, so this CHECK cannot fail as the code
-    // stands. It is kept as a tripwire for the day that is fixed, and the fix is #3068 --
-    // which matters on macOS, where unnamed POSIX semaphores are ENOSYS and this family may
-    // therefore be operating on an uninitialised object while reporting success.
+    // Until #3068, k_sem_init DISCARDED sem_init's return and reported success unconditionally, so
+    // this CHECK could not fail as the code stood -- it was kept only as a tripwire. #3068 made init
+    // forward the real host result, so this now genuinely exercises the success path (value 0 is
+    // always a legal initial count) rather than an unconditional 0. The FAILURE path -- a value
+    // sem_init genuinely rejects, and the guest slot staying unpublished when it does -- is covered
+    // by test_kernel_sem_init_error.cpp, which is what actually reddens without #3068's fix; this
+    // CHECK alone still cannot (init with 0 succeeds on every platform this suite runs on).
     CHECK(sem_init_fn(handle, 0, 0, 0, 0, 0) == 0, "scePthreadSemInit reports success");
 
     // ARM 1 + 2 + 3: one unposted wait, three independent properties.

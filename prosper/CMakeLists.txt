@@ -680,6 +680,16 @@ if(TARGET prosper_core)
   # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
   # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.
   set_tests_properties(kernel_sem_timedwait PROPERTIES TIMEOUT 60)
+
+  # scePthreadSemInit must forward a real sem_init() failure instead of discarding it and
+  # manufacturing success (#3068). Platform-neutral: it probes the host sem_init() with an
+  # out-of-range value first and only asserts the guest-visible contract when the host call
+  # actually failed, so it is meaningful on every CI platform (EINVAL on Linux, ENOSYS on Darwin)
+  # without needing per-platform code, and skips itself explicitly rather than passing vacuously
+  # if some future libc happens to accept the probe value.
+  add_executable(test_kernel_sem_init_error tests/hle/kernel/test_kernel_sem_init_error.cpp)
+  target_link_libraries(test_kernel_sem_init_error PRIVATE prosper_core)
+  add_test(NAME kernel_sem_init_error COMMAND test_kernel_sem_init_error)
   # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
   # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
   # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
