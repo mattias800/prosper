@@ -19,6 +19,26 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-01
+
+### The three getenv calls the profiler pointed at were the three we could not fix
+
+No picture — this one is pure CPU time. `getenv` costs 1.24% of Blue Prince's gameplay frame
+because a per-draw guard like `if (getenv("PROSPER_GFXLOG"))` rescans the whole environment block
+for every draw, to answer a question whose answer never changes.
+
+The interesting part is what the sweep found. Every one of the four call sites [#3094][i3094]
+nominated as the obvious fix turns out to be unsafe to cache: three are armed at runtime by tests
+that toggle them between phases, and caching those does not make a test fail — it makes it go
+*vacuous*, still printing `[ok]` against a stale value. A fourth class is worse, because no gate
+can currently see it: `gpu_replay` re-applies a whole allowlist of renderer switches once per
+bundle submit, through a variable rather than a literal. So the sweep became a screening problem
+rather than a mechanical one. Forty-two sites across the renderer backend, the draw executor and
+the live frontend now read once instead of per draw, measured at 30% fewer `getenv` calls across
+the render test suite, and the sites are pinned so they cannot quietly grow back.
+
+[i3094]: https://github.com/mattias800/prosper/issues/3094
+
 ## 2026-08-31
 
 ### Stray's splash runs 66% faster, and the title screen now holds 65 fps

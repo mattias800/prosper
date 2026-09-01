@@ -1,7 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "shared/live/live_renderer.hpp"
-#include "hle/dispatch/dispatch.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
+#include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "shared/rtt/rtt_authority.hpp"
@@ -2368,7 +2368,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // colour with no content -- which is exactly Little Nightmares III's
                         // uniform-yellow presents (#2014). Deduped per (address, decoded colour) so a
                         // run costs a handful of lines.
-                        if (const char* dcclog = std::getenv("PROSPER_DCCLOG")) {
+                        if (const char* dcclog = PROSPER_ENV_VALUE("PROSPER_DCCLOG")) {
                             if (dcclog[0] == '1' && dcclog[1] == '\0') {
                                 static std::mutex dcc_mutex;
                                 static std::set<std::pair<uint64_t, uint32_t>> dcc_seen;
@@ -5431,7 +5431,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // measures, and a diagnostic that prints a field a different switch
                             // decided is one whose output cannot be trusted on its own -- which
                             // check_diag_gates.py enforces (TWO-GATE).
-                            if (!is_cube && getenv("PROSPER_SLICESTRIDE")) {
+                            if (!is_cube && PROSPER_ENV_ON("PROSPER_SLICESTRIDE")) {
                                 static std::unordered_set<uint64_t> reported;
                                 if (reported.insert(r.gpu_addr).second)
                                     fprintf(stderr,
@@ -9532,7 +9532,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // substitution happened, not what was substituted or where it came from.
                             // Sampled, not exhaustive: a full uniformity scan of a 33 MB frame on the
                             // present path would cost more than the render.
-                            if (const char* uni = std::getenv("PROSPER_UNIFORMLOG")) {
+                            if (const char* uni = PROSPER_ENV_VALUE("PROSPER_UNIFORMLOG")) {
                                 if (uni[0] == '1' && uni[1] == '\0' && selected_pixels &&
                                     selected_pixels->size() >= 4) {
                                     const uint8_t* px = selected_pixels->data();

@@ -44,3 +44,22 @@ published conclusion on #3142. `diag_now_us()` gives them a common monotonic rea
 is process-wide, so independently taken values in unrelated translation units compare directly with
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
+
+`env_cache.hpp` is the third always-reachable file, and it is here for the same reason as
+`diag_clock.hpp`: it is shared, and it belongs to no one subsystem. It holds `PROSPER_ENV_ON` /
+`PROSPER_ENV_VALUE`, the one-shot reads of a `PROSPER_*` switch. They lived in
+`hle/dispatch/dispatch.hpp` until #3094, which is where they were first needed and not where they
+belong — the renderer backend, the draw executor and the live frontend all evaluate diagnostic
+gates on per-draw and per-resource paths, and none of them should pull in the HLE dispatch
+registry to ask whether a switch is on. `dispatch.hpp` includes this header, so its existing users
+did not change.
+
+The thing to know before using them: **caching a diagnostic switch changes its semantics**, and it
+fails in the quiet direction. The variable is sampled at first use, so a process that arms it later
+never observes the write — and a test that arms a diagnostic and then asserts on the behaviour does
+not go red when the read is cached, it goes **vacuous** and keeps printing `[ok]` (#2214).
+`tools/env/check_cached_env.py` is the gate: it refuses any name something in the tree arms at
+runtime, and separately pins the hot sites #3094 converted so they cannot regrow a live `getenv`.
+Run it before caching a new name. Note it can only see arming through a *literal* name —
+`tools/gpu_replay` re-applies `render_env[]` (`gpu/capture/gpu_capture.cpp`) per bundle submit
+through a variable, which is invisible to it; that comment lives in `env_cache.hpp` itself.

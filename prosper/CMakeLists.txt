@@ -1362,6 +1362,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_boot_phase_log PRIVATE prosper_core)
   add_test(NAME diagnostics_boot_phase_log COMMAND test_boot_phase_log)
 
+  # PROSPER_ENV_ON / PROSPER_ENV_VALUE sample getenv exactly once (#3094). Header-only, so this
+  # needs no library: it mutates the environment between two evaluations of the same macro and
+  # asserts the second still reports the first value -- the one behaviour a live getenv cannot
+  # produce, so the arms go red if the caching is ever removed.
+  add_executable(test_env_cache tests/diagnostics/test_env_cache.cpp)
+  target_include_directories(test_env_cache PRIVATE src)
+  add_test(NAME diagnostics_env_cache COMMAND test_env_cache)
+
   # Diagnostics: enabled-path and JSON tests (only when feature is built).
   if(PROSPER_DIAGNOSTICS)
     add_executable(test_diagnostics_enabled tests/diagnostics/test_diagnostics_enabled.cpp)
