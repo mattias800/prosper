@@ -139,6 +139,26 @@ int main() {
     printf("  (0.75,0.25) center=(%u,%u,%u)\n", ok1?rgb[0]:0, ok1?rgb[1]:0, ok1?rgb[2]:0);
     CHECK(ok1 && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "sampling texel (1,0) yields GREEN (proves u routing)");
 
+    // #3045: vkCreateImage's result used to be discarded in the texture-upload path and fed
+    // straight into vkGetImageMemoryRequirements, so any real allocation failure handed the
+    // Vulkan loader a VK_NULL_HANDLE. inject_render_texture_create_failure_once() simulates that
+    // exact failure deterministically for the next texture upload -- a real over-large request
+    // can't be relied on to fail here, since this box's RADV reports maxImageArrayLayers=8192,
+    // well above the backend's own 2048 ceiling (#3043), so it never actually reaches the driver.
+    // A fixed backend must skip the draw carrying the unmaterializable texture rather than use
+    // the null handle: the pass still renders (blue clear, per this file's header), but the texel
+    // that WOULD have been GREEN never gets drawn.
+    {
+        prosper::test::inject_render_texture_create_failure_once();
+        uint8_t frgb[3];
+        bool okFail = sample_center(C075, C025, frgb);
+        printf("  vkCreateImage-failure (0.75,0.25) center=(%u,%u,%u)\n",
+               okFail?frgb[0]:0, okFail?frgb[1]:0, okFail?frgb[2]:0);
+        CHECK(okFail && frgb[2] > 0x80 && frgb[0] < 0x40 && frgb[1] < 0x40,
+              "vkCreateImage failure skips the draw (blue clear survives) instead of using the "
+              "null image handle (#3045)");
+    }
+
     // Dynamic single-channel textures (notably Astro Bot's FMV planes) stay R8 through upload. The
     // component mapping reproduces the live frontend's historical coverage broadcast without a 4x
     // CPU expansion to RGBA8.
