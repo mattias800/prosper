@@ -1341,6 +1341,159 @@ int main() {
 #endif
     }
 
+    // #3032: the compare-flag readback stride had no regression arm because nothing in this suite
+    // ever reached two GPU-compared targets in one dispatch with a genuinely-changed target at
+    // j >= 1 -- the only shape that can observe indexing the flags buffer by sizeof(uint32_t)
+    // instead of by the descriptor-offset stride (#3031). Two persistent >=1 MiB writable buffers
+    // bound to ONE dispatch, each already carrying a retained GPU-side result baseline from a prior
+    // dispatch of the same item. The first (j=0) is re-dispatched with an unchanged fill value; the
+    // second (j=1) is re-dispatched with a genuinely different one. A correct readback must publish
+    // the new guest bytes for j=1; reading the padding between flags on a device whose storage-buffer
+    // offset alignment exceeds four (lavapipe: 16) would silently report it unchanged instead,
+    // exactly like j=0, and leave the stale baseline bytes in guest memory.
+    {
+        constexpr uint32_t compare_stride_target_bytes = 1u << 20;
+        std::vector<uint8_t> compare_stride_hostA(compare_stride_target_bytes, 0);
+        std::vector<uint8_t> compare_stride_hostB(compare_stride_target_bytes, 0);
+
+        // Hand-written RDNA2: v4 = 0 (single invocation, no thread-index dependency needed); store
+        // s4-s7 through the V# at s0-s3 (binding 0, j=0), then s12-s15 through the V# at s8-s11
+        // (binding 1, j=1). Both stores are buffer_store_dwordx4, idxen, offset 0 -- word-for-word
+        // the Dead Cells fill kernel's decoded MUBUF encoding above (opcode 7, VDATA/VADDR/SRSRC/
+        // SOFFSET per rdna2_decode.cpp's own field layout), just re-targeted to a second V#/value
+        // pair for the second store. VOP1 v_mov_b32 = 0x7E000000 | vdst<<17 | 1<<9 | src0, verified
+        // against both `v0 = s4` (this file) and `v5 = y = 0` (image_copy_2d below).
+        static const uint32_t two_target_fill[] = {
+            0x7e080280u,               // v4 = 0
+            0x7e000204u,               // v0 = s4
+            0x7e020205u,               // v1 = s5
+            0x7e040206u,               // v2 = s6
+            0x7e060207u,               // v3 = s7
+            0xe01c2000u, 0x80000004u,  // buffer_store_dwordx4 v[0:3], v4, s[0:3], offset0 idxen (j=0)
+            0x7e0a020cu,               // v5 = s12
+            0x7e0c020du,               // v6 = s13
+            0x7e0e020eu,               // v7 = s14
+            0x7e10020fu,               // v8 = s15
+            0xe01c2000u, 0x80020504u,  // buffer_store_dwordx4 v[5:8], v4, s[8:11], offset0 idxen (j=1)
+            0xbf810000u,               // s_endpgm
+        };
+
+        ShaderResourceTable compare_stride_rt;
+        ShaderResource compare_stride_a;
+        compare_stride_a.cls = ResourceClass::ConstantBuffer;
+        compare_stride_a.format = DataFormat::Uint32;
+        compare_stride_a.num_components = 4;
+        compare_stride_a.binding = 0;
+        compare_stride_a.sgpr_base = 0;
+        compare_stride_a.stride = 4 * sizeof(uint32_t);
+        compare_stride_a.gpu_addr = reinterpret_cast<uint64_t>(compare_stride_hostA.data());
+        compare_stride_a.size = compare_stride_target_bytes;
+        compare_stride_rt.resources.push_back(compare_stride_a);
+        ShaderResource compare_stride_b;
+        compare_stride_b.cls = ResourceClass::ConstantBuffer;
+        compare_stride_b.format = DataFormat::Uint32;
+        compare_stride_b.num_components = 4;
+        compare_stride_b.binding = 1;
+        compare_stride_b.sgpr_base = 8;
+        compare_stride_b.stride = 4 * sizeof(uint32_t);
+        compare_stride_b.gpu_addr = reinterpret_cast<uint64_t>(compare_stride_hostB.data());
+        compare_stride_b.size = compare_stride_target_bytes;
+        compare_stride_rt.resources.push_back(compare_stride_b);
+
+        ComputeShaderConfig compare_stride_config;
+        compare_stride_config.local_x = 1;
+        compare_stride_config.user_sgprs = {
+            0, 0, 0, 0,                                          // s0-3: A's V# (injected)
+            0xa1a1a1a1u, 0xa2a2a2a2u, 0xa3a3a3a3u, 0xa4a4a4a4u,   // s4-7: A's baseline fill
+            0, 0, 0, 0,                                          // s8-11: B's V# (injected)
+            0xb1b1b1b1u, 0xb2b2b2b2u, 0xb3b3b3b3u, 0xb4b4b4b4u,   // s12-15: B's baseline fill
+        };
+        std::vector<uint32_t> compare_stride_spirv = recompile_compute(
+            two_target_fill, std::size(two_target_fill), &compare_stride_rt, compare_stride_config);
+        CHECK(!compare_stride_spirv.empty(), "#3032 two-target compare-flag kernel recompiles");
+        if (!compare_stride_spirv.empty()) {
+            auto compare_stride_report = validate_spirv_descriptor_interface(
+                compare_stride_spirv, &compare_stride_rt, 0, SpirvShaderStage::Compute);
+            CHECK(compare_stride_report.ok(),
+                  "#3032 two-target compare-flag kernel's descriptor interface validates");
+
+            ComputeItem compare_stride_item;
+            compare_stride_item.spirv = compare_stride_spirv;
+            compare_stride_item.resources =
+                std::make_shared<ShaderResourceTable>(compare_stride_rt);
+            compare_stride_item.launch.threads_x = compare_stride_item.launch.threads_y =
+                compare_stride_item.launch.threads_z = 1;
+            compare_stride_item.launch.local_x = compare_stride_item.launch.local_y =
+                compare_stride_item.launch.local_z = 1;
+            compare_stride_item.launch.groups_x = compare_stride_item.launch.groups_y =
+                compare_stride_item.launch.groups_z = 1;
+            compare_stride_item.user_sgprs = compare_stride_config.user_sgprs;
+            compare_stride_item.code_addr = 0x3032000000ull;
+
+            CHECK(prosper::frontend::execute_live_compute_items({compare_stride_item}),
+                  "#3032 two-target dispatch establishes both retained GPU baselines");
+
+            auto load_u32 = [](const std::vector<uint8_t>& bytes, size_t offset) {
+                uint32_t value = 0;
+                std::memcpy(&value, bytes.data() + offset, sizeof(value));
+                return value;
+            };
+            const bool baseline_a_ok = load_u32(compare_stride_hostA, 0) == 0xa1a1a1a1u &&
+                load_u32(compare_stride_hostA, 4) == 0xa2a2a2a2u &&
+                load_u32(compare_stride_hostA, 8) == 0xa3a3a3a3u &&
+                load_u32(compare_stride_hostA, 12) == 0xa4a4a4a4u;
+            const bool baseline_b_ok = load_u32(compare_stride_hostB, 0) == 0xb1b1b1b1u &&
+                load_u32(compare_stride_hostB, 4) == 0xb2b2b2b2u &&
+                load_u32(compare_stride_hostB, 8) == 0xb3b3b3b3u &&
+                load_u32(compare_stride_hostB, 12) == 0xb4b4b4b4u;
+            CHECK(baseline_a_ok && baseline_b_ok,
+                  "#3032 two-target dispatch publishes both targets' initial guest bytes");
+
+            // Re-dispatch unchanged: nothing wrote either host buffer since the first dispatch, so
+            // both A and B are eligible for the retained-baseline GPU comparator this time (j=0 and
+            // j=1 respectively). Give the SECOND target (j=1) a genuinely different fill value; the
+            // first (j=0) stays identical to prove the fast path still engages at all -- otherwise a
+            // suite change that stopped exercising the comparator entirely would pass this arm too.
+            ComputeItem compare_stride_item2 = compare_stride_item;
+            compare_stride_item2.user_sgprs[12] = 0xc1c1c1c1u;
+            compare_stride_item2.user_sgprs[13] = 0xc2c2c2c2u;
+            compare_stride_item2.user_sgprs[14] = 0xc3c3c3c3u;
+            compare_stride_item2.user_sgprs[15] = 0xc4c4c4c4u;
+
+            const uint64_t compare_stride_skips_before =
+                prosper::frontend::live_compute_buffer_gpu_result_skips();
+            CHECK(prosper::frontend::execute_live_compute_items({compare_stride_item2}),
+                  "#3032 two-target dispatch re-runs with only the SECOND target changed");
+            CHECK(prosper::frontend::live_compute_buffer_gpu_result_skips() >
+                      compare_stride_skips_before,
+                  "#3032 unchanged first target still takes the retained GPU-comparator fast path");
+
+            const bool target_a_unchanged =
+                load_u32(compare_stride_hostA, 0) == 0xa1a1a1a1u &&
+                load_u32(compare_stride_hostA, 4) == 0xa2a2a2a2u &&
+                load_u32(compare_stride_hostA, 8) == 0xa3a3a3a3u &&
+                load_u32(compare_stride_hostA, 12) == 0xa4a4a4a4u;
+            CHECK(target_a_unchanged,
+                  "#3032 GPU-identical first target (j=0) preserves its guest bytes");
+
+            // The discriminating assertion. A wrong readback that indexes the flags buffer by
+            // sizeof(uint32_t) reads j=1's flag from the padding between j=0's and j=1's dwords on
+            // any device with an offset alignment above four (lavapipe: 16). That padding is zero,
+            // so it reports j=1 as unchanged and the writeback loop takes the byte-preserving skip
+            // path instead of copying the genuinely new GPU result into guest memory -- the same
+            // silent-stale-read #3031 fixed for the descriptor offset, previously unguarded for the
+            // readback.
+            const bool target_b_updated =
+                load_u32(compare_stride_hostB, 0) == 0xc1c1c1c1u &&
+                load_u32(compare_stride_hostB, 4) == 0xc2c2c2c2u &&
+                load_u32(compare_stride_hostB, 8) == 0xc3c3c3c3u &&
+                load_u32(compare_stride_hostB, 12) == 0xc4c4c4c4u;
+            CHECK(target_b_updated,
+                  "#3032 genuinely-changed second target (j=1) publishes its new guest bytes, not "
+                  "stale padding-read baseline bytes");
+        }
+    }
+
     std::fill(result.begin(), result.end(), 0xeeeeeeee);
     item.user_sgprs = alternate_config.user_sgprs;
     CHECK(prosper::frontend::execute_live_compute_items({item}),
