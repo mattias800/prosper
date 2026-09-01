@@ -70,6 +70,20 @@ void sleep_until_with_std(uint64_t deadline_ns) {
             std::chrono::nanoseconds(deadline_ns))));
 }
 
+}  // namespace
+
+// Defined OUTSIDE the anonymous namespace and outside every #ifdef _WIN32 block: this is the
+// pure-function half of the #3074 fix; see its declaration in precise_sleep.hpp for why it takes
+// function pointers rather than calling steady_now_ns()/sleep_until_with_std() directly, and
+// test_precise_sleep.cpp for the platform-neutral test that exercises it.
+void sleep_until_deadline_retry(uint64_t deadline_ns,
+                                 uint64_t (*now_ns)(),
+                                 void (*sleep_once)(uint64_t deadline_ns)) {
+    while (now_ns() < deadline_ns) sleep_once(deadline_ns);
+}
+
+namespace {
+
 #ifdef _WIN32
 // One auto-reset timer per waiting thread. Auto-reset so the wait itself consumes the signal and no
 // stale signalled state can make the NEXT wait return instantly.
@@ -124,7 +138,11 @@ void sleep_until_steady_ns(uint64_t deadline_ns) {
     // Anything above that did not work out lands here — no worse than master's behaviour, and
     // reported distinctly so a test can tell the two apart rather than silently pacing at ~32 Hz.
     if (steady_now_ns() >= deadline_ns) return;
-    sleep_until_with_std(deadline_ns);
+    // #3074: sleep_until_with_std() is ONE OS sleep call with no post-condition re-check of its
+    // own -- unlike the high-resolution loop above, which re-reads the clock after every timer
+    // signal -- so calling it once and returning let this path come back before deadline_ns.
+    // sleep_until_deadline_retry() re-checks and, if the sleep returned early, sleeps again.
+    sleep_until_deadline_retry(deadline_ns, steady_now_ns, sleep_until_with_std);
     g_backend = SleepBackend::Win32SleepFallback;
 #else
     // glibc: sleep_until -> sleep_for -> a nanosleep loop that also restarts on EINTR, which matters
