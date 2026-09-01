@@ -173,6 +173,28 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn("real", summary["readback_note"])
         self.assertNotIn("harness, not the title", summary["readback_note"])
 
+    def test_every_readback_note_is_well_formed_prose(self):
+        # A structural guard, added because the previous commit shipped a visible break that every
+        # existing arm was blind to: the tails became full sentences while one branch stayed a
+        # trailing clause, rendering "...through a real window. before acting on this verdict."
+        # `assertIn` on a substring cannot see a break OUTSIDE that substring, so no amount of
+        # content assertions would have caught it -- this checks the joins instead of the content.
+        cases = {
+            "readback": capture(SAMPLES, renderer=[self.READBACK_RENDERER[0]]),
+            "compute": capture(SAMPLES, renderer=[{"total_ms": 1500, "readback_ms": 1400}],
+                               compute=[{"total_ms": 3500.0}]),
+            "inconclusive": capture(SAMPLES, renderer=[{"total_ms": 2000, "readback_ms": 977.7}],
+                                    compute=[{"total_ms": 1134.0}]),
+            "cannot-say": capture([], renderer=self.READBACK_RENDERER),
+        }
+        for name, records in cases.items():
+            note = summarize(records)["readback_note"]
+            self.assertIsNotNone(note, name)
+            self.assertNotRegex(note, r"\.\s+[a-z]", f"{name}: lowercase clause after a period")
+            self.assertNotRegex(note, r"\s\.", f"{name}: space before a period")
+            self.assertNotRegex(note, r"\.\.", f"{name}: doubled period")
+            self.assertTrue(note.endswith("."), f"{name}: note does not end in a period")
+
     def test_no_post_samples_cannot_determine_gpu_present(self):
         # The one uncovered line in the helper. With no post population there is nothing to read the
         # field from, so the honest answer is the third state rather than either branch.
@@ -238,8 +260,19 @@ class PerformanceCaptureReportTests(unittest.TestCase):
 
     def test_classification_evidence_bar_is_pinned(self):
         # Nothing pinned this at all: moving the tool's primary classification threshold from 0.40
-        # to 0.50 passed the entire suite. Both arms below fail if it moves, so the bar is now held
-        # by behaviour and not only by a literal.
+        # to 0.50 passed the entire suite.
+        #
+        # The two halves below are COMPLEMENTARY, not redundant, and the measured split is not what
+        # "both arms fail if it moves" would suggest -- swept with the literal assert neutralised,
+        # the behavioural pair alone tolerates (0.375, 0.4444]:
+        #
+        #   bar        0.375   0.376   0.42   0.4444   0.445   0.50
+        #   behavioural  FAIL    pass   pass     pass    FAIL   FAIL
+        #
+        # So inside that window only the literal catches a value change -- while reverting the USE
+        # SITE to an inline literal (decoupling the constant from the code it governs) is caught
+        # only by the behavioural pair, which is the failure the whole finding was about. Each
+        # covers what the other cannot.
         self.assertAlmostEqual(CLASSIFICATION_EVIDENCE_SHARE, 0.40)
         # Totals are scaled so measured work clears 40% of the 1000 ms wall window in SAMPLES --
         # otherwise both arms land in `cpu-outside-renderer` and neither exercises the bar at all,
@@ -266,10 +299,12 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertNotIn("before acting on this verdict", decisive["readback_note"])
         self.assertIn("does not depend on it", decisive["readback_note"])
 
-        # ...while a readback VERDICT still says exactly that, because there it is correct.
+        # ...while a readback VERDICT says the strongest thing of the five, because there the
+        # readback is not a caveat on the verdict -- it IS the verdict.
         owned = summarize(capture(SAMPLES, renderer=[self.READBACK_RENDERER[0]]))
         self.assertEqual(owned["classification"], "readback")
-        self.assertIn("before acting on this verdict", owned["readback_note"])
+        self.assertIn("nothing else here to act on", owned["readback_note"])
+        self.assertNotIn("does not depend on it", owned["readback_note"])
 
     def test_readback_note_does_not_vouch_for_a_verdict_the_readback_can_flip(self):
         # The case the previous version got WRONG, and it is this change's own motivating capture:

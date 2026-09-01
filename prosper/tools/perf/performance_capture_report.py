@@ -262,6 +262,10 @@ CLASSIFICATION_EVIDENCE_SHARE = 0.40
 # the only variable is share, and the 31% one reproduces the capture that motivated the change --
 # but neither is what fixes the band, and a comment claiming otherwise sends the next reader to the
 # wrong test when they want to tighten it.
+# Deriving this FROM the bar means a bar mutation is a COMPOUND mutation: the threshold moves with
+# it, so at a bar of 0.80 or more the threshold leaves the (0.020, 0.200] band its own arms pin and
+# readback tests start failing for reasons that have nothing to do with the bar. Harmless for any
+# plausible bar value, and worth knowing before reading a wide sweep's failures.
 READBACK_NOTE_MIN_SHARE = CLASSIFICATION_EVIDENCE_SHARE / 4
 
 
@@ -283,7 +287,11 @@ _VERDICTS_READBACK_CANNOT_FLIP = frozenset({
 
 def _readback_note_tail(classification):
     if classification == "readback":
-        return " before acting on this verdict."
+        # A full sentence, like the other four. It was a trailing subordinate clause until the
+        # callers grew their own terminating period, at which point it rendered as
+        # "...through a real window. before acting on this verdict." -- and no assertion could see
+        # it, because every arm used `assertIn` on a substring the break left intact.
+        return " Readback IS this capture's verdict, so there is nothing else here to act on."
     if classification in _VERDICTS_READBACK_CANNOT_FLIP:
         # Safe to reassure: this verdict survives the readback being removed.
         return (f" The {classification} verdict above does not depend on it: removing the readback "
