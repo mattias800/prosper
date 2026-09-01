@@ -6948,41 +6948,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Ungated, and deduped per (pc, srsrc). It fires only when an image op has already
                 // failed to resolve, so its volume is bounded by the defect it reports. Behind
                 // PROSPER_DBG it was unreachable in practice on any routed boot.
-            // PROSPER_MIMG_SOFT=1 -- diagnostic only, and deliberately WRONG output.
-            //
-            // Placed BEFORE the reporting dedupe below on purpose. That dedupe fires once per
-            // (program, pc, srsrc); downstream of it, only the FIRST compile of each site would be
-            // softened and every later one -- reachable through ordinary shader-cache eviction --
-            // would take the reject path unchanged. The recorded result would then be
-            // indistinguishable from "nothing was softened", which is exactly the reading this
-            // diagnostic exists to produce. When an image
-            // op cannot resolve its descriptor, write a constant instead of failing the stage, so a
-            // frame can be seen that would otherwise be discarded entirely. It answers one question
-            // nothing else here can: how much of the picture is riding on THIS resolution failure.
-            // On Stray it showed the answer was "none" -- the composite compiled and the frame did
-            // not change -- which is what redirected #3126 away from the recompiler.
-            //
-            // Never acceptable in a run that produces progression evidence: every unresolved sample
-            // reads a flat value.
-            if (!res && getenv("PROSPER_MIMG_SOFT")) {
-                const uint32_t soft = b.uconst(fbits(0.5f));
-                uint32_t comps = 0;
-                for (uint32_t m = 0; m < 4; ++m) if (in.mimg_dmask & (1u << m)) ++comps;
-                if (!comps) comps = 1;
-                for (uint32_t k = 0; k < comps; ++k) {
-                    const int dst = in.dst.value + static_cast<int>(k);
-                    if (dst < 0) break;
-                    const uint32_t old = vreg_old(b, rs, dst);
-                    rs.vreg[dst] = soft;
-                    predicate_write(b, rs, dst, old);
-                }
-                static std::mutex smx; static std::set<uint64_t> sseen;
-                std::lock_guard<std::mutex> lk(smx);
-                if (sseen.insert(((uint64_t)b.diagnostic.program_address << 16) | in.pc).second)
-                    fprintf(stderr, "[mimg-soft] program=0x%llx pc=%u -> constant %u comps\n",
-                            (unsigned long long)b.diagnostic.program_address, in.pc, comps);
-                return true;
-            }
+                //
+                // #3143: this report used to sit downstream of the PROSPER_MIMG_SOFT early return
+                // below, so arming that switch to see whether softening changes a frame ALSO deleted
+                // the one line that names which descriptor failed -- the switch was least informative
+                // exactly when it was armed for its intended purpose ("softening changed nothing"
+                // became indistinguishable from "there was nothing here to soften"). It now runs
+                // before either the soft or the reject path decides what to DO about the failure, so
+                // both keep the same descriptor identification; the soft path still gets its own
+                // confirmation line below ([mimg-soft]) once the constant is written.
                 static std::mutex mimg_mutex;
                 // Keyed by PROGRAM as well as (pc, srsrc): every shader has a pc 16, so a
                 // pc-only key lets the first program to reach one silence all later programs and
@@ -6994,35 +6968,35 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     first_report = mimg_reported.emplace(b.diagnostic.program_address, in.pc,
                                                          in.src[1].value).second;
                 }
-                if (!first_report) { ok = false; return true; }
-                uint32_t srt_tag = 0;
-                const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
-                const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
-                const ShaderResource* pp = rt->by_fetch_pc(in.pc);
-                // Report the copy-alias step too. Without it a staged descriptor (#1773) and a
-                // genuinely absent one print the identical line, which is the output-vs-input
-                // confusion that cost #1590 several sessions -- name which provenance route failed.
-                int ud_origin = 0;
-                const bool has_ud_alias = sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin);
-                const ShaderResource* pa = has_ud_alias ? rt->by_sgpr_base(ud_origin) : nullptr;
-                fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u op=0x%02x storage=%d srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s written=%d (%zu res)\n",
-                        (unsigned long long)b.diagnostic.program_address,
-                        in.pc, in.opcode, (int)storage_only_op,
-                        in.src[1].value, has_srt_tag ? "" : "NONE ",
-                        has_srt_tag ? srt_tag : 0u,
-                        pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
-                        pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
-                        has_ud_alias ? "s" : "NONE ", has_ud_alias ? ud_origin : 0,
-                        pa ? (pa->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
-                        sreg_range_written(rs, in.src[1].value, 8) ? 1 : 0,
-                        rt->resources.size());
-                // #3126: say what WAS available, not only what failed. "key_res=null pc_res=null"
-                // tells you the lookups missed; it does not tell you whether the table holds the
-                // descriptor under a different key, holds it classified as something else, or does
-                // not hold it at all -- and those are three different bugs. Print every resource's
-                // class and provenance so the miss can be diagnosed from one line instead of a
-                // rebuild. Bounded, and only on a reject.
-                {
+                if (first_report) {
+                    uint32_t srt_tag = 0;
+                    const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
+                    const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
+                    const ShaderResource* pp = rt->by_fetch_pc(in.pc);
+                    // Report the copy-alias step too. Without it a staged descriptor (#1773) and a
+                    // genuinely absent one print the identical line, which is the output-vs-input
+                    // confusion that cost #1590 several sessions -- name which provenance route failed.
+                    int ud_origin = 0;
+                    const bool has_ud_alias = sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin);
+                    const ShaderResource* pa = has_ud_alias ? rt->by_sgpr_base(ud_origin) : nullptr;
+                    fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u op=0x%02x storage=%d srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s written=%d (%zu res)\n",
+                            (unsigned long long)b.diagnostic.program_address,
+                            in.pc, in.opcode, (int)storage_only_op,
+                            in.src[1].value, has_srt_tag ? "" : "NONE ",
+                            has_srt_tag ? srt_tag : 0u,
+                            pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                            pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                            has_ud_alias ? "s" : "NONE ", has_ud_alias ? ud_origin : 0,
+                            pa ? (pa->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                            sreg_range_written(rs, in.src[1].value, 8) ? 1 : 0,
+                            rt->resources.size());
+                    // #3126: say what WAS available, not only what failed. "key_res=null pc_res=null"
+                    // tells you the lookups missed; it does not tell you whether the table holds the
+                    // descriptor under a different key, holds it classified as something else, or does
+                    // not hold it at all -- and those are three different bugs. Print every resource's
+                    // class and provenance so the miss can be diagnosed from one line instead of a
+                    // rebuild. Bounded, and printed once per site regardless of whether the site is
+                    // then softened or rejected (#3143).
                     std::string avail;
                     size_t shown = 0;
                     for (const ShaderResource& r : rt->resources) {
@@ -7043,6 +7017,43 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     fprintf(stderr, "[mimg-unresolved]   available:%s\n",
                             avail.empty() ? " (none)" : avail.c_str());
                 }
+
+                // PROSPER_MIMG_SOFT=1 -- diagnostic only, and deliberately WRONG output.
+                //
+                // Placed BEFORE the reject gate below on purpose. That gate fires once per
+                // (program, pc, srsrc); downstream of it, only the FIRST compile of each site would be
+                // softened and every later one -- reachable through ordinary shader-cache eviction --
+                // would take the reject path unchanged. The recorded result would then be
+                // indistinguishable from "nothing was softened", which is exactly the reading this
+                // diagnostic exists to produce. When an image
+                // op cannot resolve its descriptor, write a constant instead of failing the stage, so a
+                // frame can be seen that would otherwise be discarded entirely. It answers one question
+                // nothing else here can: how much of the picture is riding on THIS resolution failure.
+                // On Stray it showed the answer was "none" -- the composite compiled and the frame did
+                // not change -- which is what redirected #3126 away from the recompiler.
+                //
+                // Never acceptable in a run that produces progression evidence: every unresolved sample
+                // reads a flat value.
+                if (!res && getenv("PROSPER_MIMG_SOFT")) {
+                    const uint32_t soft = b.uconst(fbits(0.5f));
+                    uint32_t comps = 0;
+                    for (uint32_t m = 0; m < 4; ++m) if (in.mimg_dmask & (1u << m)) ++comps;
+                    if (!comps) comps = 1;
+                    for (uint32_t k = 0; k < comps; ++k) {
+                        const int dst = in.dst.value + static_cast<int>(k);
+                        if (dst < 0) break;
+                        const uint32_t old = vreg_old(b, rs, dst);
+                        rs.vreg[dst] = soft;
+                        predicate_write(b, rs, dst, old);
+                    }
+                    static std::mutex smx; static std::set<uint64_t> sseen;
+                    std::lock_guard<std::mutex> lk(smx);
+                    if (sseen.insert(((uint64_t)b.diagnostic.program_address << 16) | in.pc).second)
+                        fprintf(stderr, "[mimg-soft] program=0x%llx pc=%u -> constant %u comps\n",
+                                (unsigned long long)b.diagnostic.program_address, in.pc, comps);
+                    return true;
+                }
+                if (!first_report) { ok = false; return true; }
             }
             if (!res) { ok = false; return true; }
             const bool uint_texture = res->format == DataFormat::Uint8 ||
