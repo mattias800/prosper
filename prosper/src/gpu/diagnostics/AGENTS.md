@@ -28,6 +28,9 @@ read them before quoting a result. Its companion `PROSPER_DRAW_PROGRAM_CENSUS` i
   parentage.
 - `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw
   that uses it.
+- `shader_dump_filter` — `PROSPER_SHADER_DUMP_PROGRAM`, which narrows `PROSPER_SHADER_DUMP_SUCCESS`
+  to named guest programs. It fails **open** where the skip selectors fail closed, and the header
+  explains why: an empty dump directory reads as "that program never compiled".
 
 Two standing cautions, both learned expensively:
 

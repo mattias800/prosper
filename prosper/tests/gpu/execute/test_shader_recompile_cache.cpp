@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/diagnostics/shader_dump_filter.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include <array>
 #include <atomic>
@@ -32,6 +33,21 @@ static void set_test_env(const char* name, const char* value) {
 #else
     if (value) setenv(name, value, 1); else unsetenv(name);
 #endif
+}
+
+// Names, not just extensions: #3196 is about what the FILENAME says, so the assertion has to read
+// it. A substring match is deliberate -- pinning the whole name would pin the hashes too, and those
+// legitimately change whenever the recompiler's output does.
+static size_t count_names_containing(const std::filesystem::path& directory, const char* needle) {
+    std::error_code ec;
+    size_t count = 0;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->is_regular_file(ec) &&
+            it->path().filename().string().find(needle) != std::string::npos)
+            ++count;
+    }
+    return ec ? 0 : count;
 }
 
 static size_t count_extension(const std::filesystem::path& directory, const char* extension) {
@@ -1970,6 +1986,97 @@ int main() {
               array_s8_again == array_s8 && stats.misses == 4 && stats.hits == 1 &&
               stats.entries == 4,
           "buffer-array cache separates arity, selector source, and same-entry admission mutations");
+
+    // ---- #3196: the dump names its program by guest ADDRESS, and can be narrowed to one ----
+    //
+    // Four arms, and each one fails against a different half of the change. The copies are heap
+    // vectors rather than second static arrays on purpose: identical `.rodata` objects can be
+    // folded to one symbol by the linker, and that would silently give two "different" programs the
+    // same address -- an instrument that cannot fail for the reason it is testing.
+    {
+        const std::filesystem::path address_dir =
+            prosper_test::test_scratch_dir() / "prosper-shader-dump-address";
+        std::error_code address_ec;
+        std::filesystem::remove_all(address_dir, address_ec);
+        set_test_env("PROSPER_SHADER_DUMP_SUCCESS", address_dir.string().c_str());
+        set_test_env("PROSPER_SHADER_DUMP_PROGRAM", nullptr);
+
+        ShaderResource address_resource;
+        address_resource.cls = ResourceClass::VertexBuffer;
+        address_resource.format = DataFormat::Float32;
+        address_resource.num_components = 3;
+        address_resource.binding = 7;
+        address_resource.stride = 12;
+        address_resource.srt_offset = 0x20;
+        address_resource.sgpr_base = 8;
+        address_resource.fetch_pc = 4;
+        address_resource.gpu_addr = 0x100000;
+        address_resource.size = 4096;
+        ShaderResourceTable address_table;
+        address_table.resources.push_back(address_resource);
+
+        const std::vector<uint32_t> vs_copy(std::begin(kVs), std::end(kVs));
+        const std::vector<uint32_t> vs_other(std::begin(kVs), std::end(kVs));
+        const std::vector<uint32_t> vs_malformed_arm(std::begin(kVs), std::end(kVs));
+        auto address_needle = [](const std::vector<uint32_t>& words) {
+            char text[64];
+            std::snprintf(text, sizeof text, "_at_%016llx_",
+                          static_cast<unsigned long long>(
+                              reinterpret_cast<uintptr_t>(words.data())));
+            return std::string(text);
+        };
+        auto address_spec = [](const std::vector<uint32_t>& words) {
+            char text[64];
+            std::snprintf(text, sizeof text, "0x%llx",
+                          static_cast<unsigned long long>(
+                              reinterpret_cast<uintptr_t>(words.data())));
+            return std::string(text);
+        };
+
+        // 1. Unfiltered. These are byte-identical to kVs, which an earlier arm already dumped, so
+        //    with the pre-#3196 hash-only dedup key this writes NOTHING; and with the pre-#3196
+        //    filename it could not be told apart from kVs's own pair.
+        recompile_graphics_shader_cached(ShaderProgramStage::Vertex, vs_copy.data(),
+                                         vs_copy.size(), &address_table);
+        CHECK(count_names_containing(address_dir, address_needle(vs_copy).c_str()) == 2,
+              "a dumped shader is named by its guest code address (#3196)");
+
+        // 2. Armed on an address this program does not have: withheld, and the directory does not
+        //    grow. A selector that cannot withhold is not a selector.
+        set_test_env("PROSPER_SHADER_DUMP_PROGRAM", "0xdeadbeef");
+        const size_t before_withheld = count_extension(address_dir, ".bin") +
+                                       count_extension(address_dir, ".spv");
+        recompile_graphics_shader_cached(ShaderProgramStage::Vertex, vs_other.data(),
+                                         vs_other.size(), &address_table);
+        CHECK(prosper::gpu::shader_dump_program_filter().armed() &&
+                  count_names_containing(address_dir, address_needle(vs_other).c_str()) == 0 &&
+                  count_extension(address_dir, ".bin") + count_extension(address_dir, ".spv") ==
+                      before_withheld,
+              "PROSPER_SHADER_DUMP_PROGRAM withholds a program it does not name (#3196)");
+
+        // 3. Armed on this program's own address: written. Note it is the SAME program the previous
+        //    arm withheld -- which only works because the filter is consulted BEFORE the dedup set,
+        //    so a withheld program is never recorded as already dumped.
+        set_test_env("PROSPER_SHADER_DUMP_PROGRAM", address_spec(vs_other).c_str());
+        recompile_graphics_shader_cached(ShaderProgramStage::Vertex, vs_other.data(),
+                                         vs_other.size(), &address_table);
+        CHECK(count_names_containing(address_dir, address_needle(vs_other).c_str()) == 2,
+              "PROSPER_SHADER_DUMP_PROGRAM dumps exactly the program it names (#3196)");
+
+        // 4. Malformed. It fails OPEN and says so: an empty dump directory would read as "that
+        //    program never compiled", which is the false negative this change exists to remove.
+        set_test_env("PROSPER_SHADER_DUMP_PROGRAM", "deadbeef");
+        recompile_graphics_shader_cached(ShaderProgramStage::Vertex, vs_malformed_arm.data(),
+                                         vs_malformed_arm.size(), &address_table);
+        CHECK(!prosper::gpu::shader_dump_program_filter().armed() &&
+                  count_names_containing(
+                      address_dir, address_needle(vs_malformed_arm).c_str()) == 2,
+              "a malformed PROSPER_SHADER_DUMP_PROGRAM arms nothing and dumps everything (#3196)");
+
+        set_test_env("PROSPER_SHADER_DUMP_PROGRAM", nullptr);
+        set_test_env("PROSPER_SHADER_DUMP_SUCCESS", nullptr);
+        std::filesystem::remove_all(address_dir, address_ec);
+    }
 
     // #3130, and deliberately LAST. The arm above cannot show that the program address actually
     // ARRIVES -- a signature that accepts the diagnostic context and drops it on the floor passes it.

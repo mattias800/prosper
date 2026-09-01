@@ -1684,6 +1684,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_draw_program_skip PRIVATE prosper_core)
   add_test(NAME draw_program_skip COMMAND test_draw_program_skip)
 
+  add_executable(test_shader_dump_filter tests/gpu/diagnostics/test_shader_dump_filter.cpp)
+  target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
+  add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
+
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
