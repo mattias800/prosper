@@ -17,16 +17,20 @@ that log into the numbers that name the failure mode, offline, without listening
   * effective delivery rate vs the device rate -- a persistent deficit is a CLOCK DRIFT
     between the guest's budgeted audio clock and the device crystal; no cushion survives it,
     and the fix is drift compensation, not deeper buffering;
-  * burst clustering -- the fraction of arrivals that carry more than one grain of audio
-    after a gap of more than two grain periods. This shape is CONSISTENT WITH a quantized
-    mixer wake, but the cadence alone cannot prove it: a producer simply delivering audio
-    below real time also arrives in clusters, spaced by production rather than by a wait
-    (#3080 -- the verdict named the wrong cause on a title where a `PROSPER_TIMEDWAIT_CENSUS=1`
-    measurement, in the same log, showed the guest's only timed wait resolving at x1.02, i.e.
-    not quantized at all; the -55% delivery-rate deficit already explained the clustering). So
-    if `[timedwait Ns]` census lines are present in the same input, their ratio for the
-    dominant wait primitive SETTLES which cause applies; if they are absent, the report says so
-    and names the census as the discriminator instead of asserting a mechanism it cannot see.
+  * burst clustering -- the fraction of arrivals whose inter-arrival GAP exceeds two grain
+    periods (#3061: earlier wording here promised a stronger conjunct -- "carries more than
+    one grain of audio" -- that the code has never tested; frames-per-arrival is available in
+    the log but is not examined, so this is gap-only, same as the code). This shape is
+    CONSISTENT WITH a quantized mixer wake, but the cadence alone cannot prove it -- and, being
+    gap-only, it does not distinguish a real multi-grain flush from a producer simply
+    delivering audio below real time, which also arrives in clusters, spaced by production
+    rather than by a wait (#3080 -- the verdict named the wrong cause on a title where a
+    `PROSPER_TIMEDWAIT_CENSUS=1` measurement, in the same log, showed the guest's only timed
+    wait resolving at x1.02, i.e. not quantized at all; the -55% delivery-rate deficit already
+    explained the clustering). So if `[timedwait Ns]` census lines are present in the same
+    input, their ratio for the dominant wait primitive SETTLES which cause applies; if they are
+    absent, the report says so and names the census as the discriminator instead of asserting a
+    mechanism it cannot see.
 
 WHAT THIS TOOL DOES NOT SEE
 ---------------------------
@@ -225,7 +229,31 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame, census=None):
               f" ({100 * empty / len(queued):.1f}%) -- STARVED: nothing left to play")
 
     if span_s > 0 and device_hz:
-        delivered_hz = frames_total / span_s
+        # The emitter logs gap=0.00ms for a port's FIRST arrival -- there is no previous arrival
+        # on that port to measure from -- so `gaps` holds only (calls - 1) REAL inter-arrival
+        # intervals, and span_s = sum(gaps) covers exactly those: the time from the first arrival
+        # to the last. frames_total, though, sums frames from all `calls` arrivals, including the
+        # first one, whose own accumulation time was never captured by any logged gap (it may
+        # have been building up for a full grain period before this log even starts). Dividing
+        # the full frame total by that (calls - 1)-interval span overcounts by one arrival's
+        # worth of frames, inflating delivered_hz by a factor of calls / (calls - 1) -- roughly
+        # +1/(calls - 1) at the calls this tool typically sees -- issue #3061. Measured example:
+        # 11 records of 100 frames at an exact 1000 Hz real-time cadence have a TRUE drift of
+        # 0.00%, but frames_total/span_s reports 1100 frames / 1.0 s = 1100 vs device 1000, i.e.
+        # +10.00% -- comfortably past the +-0.3% threshold below, so a real-time log at small N
+        # was reported as running the audio clock fast.
+        #
+        # Fix: drop the first arrival's frames from the numerator to match what span_s already
+        # spans, rather than stretching span_s by an imputed extra grain period -- the two give
+        # the same answer only when every arrival is the same size, and dropping the frame needs
+        # no such assumption. Gate on the emitter's own zero-gap sentinel (not just "index 0")
+        # so a log excerpt that starts mid-stream -- where the first logged gap is a real,
+        # already-elapsed interval, not the emitter's "no previous arrival" zero -- is left
+        # unadjusted rather than having a genuine arrival's frames silently discarded.
+        frames_in_span = frames_total
+        if slot["gaps"][0] == 0.0:
+            frames_in_span = frames_total - slot["frames"][0]
+        delivered_hz = frames_in_span / span_s
         device_hz_total = device_hz
         drift_pct = 100.0 * (delivered_hz - device_hz_total) / device_hz_total
         print(f"  effective delivery: {delivered_hz:.0f} frames/s vs device {device_hz_total}"
@@ -244,6 +272,15 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame, census=None):
                   " burst rows above.")
 
     if grain_ms > 0:
+        # GAP-ONLY, deliberately (#3061): this counts arrivals separated from the previous one by
+        # more than two grain periods, not arrivals that themselves carry more than one grain of
+        # frames -- the emitter logs frames= per record, so that conjunct could be tested, but
+        # doing so would make this gate blind to exactly the case #3080 needed it for: a producer
+        # delivering ordinary single-grain arrivals, delayed by a clock deficit rather than a
+        # quantized wake, which never carries more than a grain per arrival. The three-way verdict
+        # below (present since #3168) already exists to tell that case apart from a real multi-grain
+        # burst using the timedwait census; narrowing the gate here to frames > grain would silence
+        # that verdict for the scenario it was built to diagnose instead.
         bursts = sum(1 for g in gaps if g > 2 * grain_ms)
         if bursts > len(gaps) * 0.2 and mean_gap > 1.5 * grain_ms:
             # This cadence shape (clustering beyond two grain periods) is what a quantized mixer
