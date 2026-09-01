@@ -2049,7 +2049,11 @@ if(TARGET prosper_core)
   # chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D menu. Now an
   # exhaustive switch: the compiler pins exhaustiveness, this test pins the table.
   add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
-  target_link_libraries(test_live_target_format_match PRIVATE prosper_core prosper_live_renderer)
+  # The header is inline-only and needs nothing but prosper_core's types, so DON'T link
+  # prosper_live_renderer: that target is defined later and only inside `if(Vulkan_FOUND)`,
+  # so on MinGW/macOS this test found neither the library nor its PUBLIC include path.
+  target_link_libraries(test_live_target_format_match PRIVATE prosper_core)
+  target_include_directories(test_live_target_format_match PRIVATE frontends)
   add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
 
   # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
