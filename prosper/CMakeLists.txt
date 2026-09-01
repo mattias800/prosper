@@ -2038,6 +2038,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_mip_provenance_identity PRIVATE prosper_core)
   add_test(NAME mip_provenance_identity COMMAND test_mip_provenance_identity)
 
+  # #3204: the image-identity predicates extracted from execute_item. They decide whether two
+  # bindings alias ONE Vulkan image -- the aliasing GTA V's four quadrant writes depend on, and
+  # the thing #3205 broke while it was an unnamed local expression. Pure comparisons.
+  add_executable(test_image_identity tests/gpu/agc/test_image_identity.cpp)
+  target_link_libraries(test_image_identity PRIVATE prosper_core)
+  add_test(NAME image_identity COMMAND test_image_identity)
+
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
   add_executable(test_convention_bindings tests/gpu/test_convention_bindings.cpp)
