@@ -1314,7 +1314,31 @@ void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t hei
     tile_census_note("tile_surface", width, height, bytes_per_texel, tile_mode);
     if (!tile_mode_is_tiled(tile_mode)) { std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     const size_t dst_bytes = tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel);
-    std::memset(dst, 0, dst_bytes);   // padding texels (rows beyond height) stay zero
+    // Zero only what the copy will NOT write. The zero-fill exists for padding texels -- the ones
+    // in blocks that extend past `width`/`height` -- but the copy overwrites every in-bounds texel,
+    // so zeroing the whole surface repeats that work. On a 3840x2160 target this memset alone is
+    // 33 MiB per writeback, and this file's block copier already measures ~22% of CPU (#3149).
+    //
+    // 64 KiB modes lay blocks out row-major (block = (y/bh)*blocks_x + (x/bw), 64 KiB each), so
+    // when `width` is block-aligned there is no column padding and every block row below
+    // height/bh is fully covered. Those rows need no zeroing; the tail from the first partially
+    // covered row onward still does. Any other mode, an unaligned width, or a non-zero pitch keeps
+    // the whole-surface fill, which is always correct.
+    size_t zero_from = 0;
+    if (is_64kb_mode(tile_mode) && pitch == 0) {
+        const uint32_t el = sw64kb_elem_log2(bytes_per_texel);
+        if (el != UINT32_MAX) {
+            uint32_t bw = 0, bh = 0;
+            sw64kb_dims(el, bw, bh);
+            if (bw && bh && width % bw == 0) {
+                const size_t blocks_x = width / bw;
+                const size_t covered_rows = height / bh;   // block rows entirely within `height`
+                const size_t covered = covered_rows * blocks_x * 65536u;
+                if (covered <= dst_bytes) zero_from = covered;
+            }
+        }
+    }
+    std::memset(dst + zero_from, 0, dst_bytes - zero_from);
     if (tile_mode == (uint32_t)TileMode::Sw256BS) {
         sw256_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes);
         return;
