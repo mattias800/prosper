@@ -1700,6 +1700,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
 
+  # #3137: the FORMAT-path MUBUF reject diagnostic must name which provenance step failed.
+  add_executable(test_vertex_fetch_reject_diagnostic
+                 tests/gpu/recompiler/test_vertex_fetch_reject_diagnostic.cpp)
+  target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
+  add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
+
   add_executable(test_gta5_selected_sbuffer tests/gpu/recompiler/test_gta5_selected_sbuffer.cpp)
   target_link_libraries(test_gta5_selected_sbuffer PRIVATE prosper_core)
   add_test(NAME gta5_selected_sbuffer COMMAND test_gta5_selected_sbuffer)

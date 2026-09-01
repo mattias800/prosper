@@ -5845,11 +5845,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // A format load (vertex fetch) reads a VERTEX buffer — resolve the SRSRC SGPR to a vertex
                 // buffer specifically (that SGPR may hold a constant-buffer V# at other points; the const-
                 // fold-resolved vertex buffer is keyed by this SRSRC SGPR). Fall back to an s_load SRT tag.
+                // Any write to the four-dword SRSRC range invalidates its entry-time direct V#.
+                // Exact per-fetch and s_load provenance below may still identify the live descriptor,
+                // but a missing/rejected dynamic result must never fall back to stale user data.
+                //
+                // Hoisted out of the `if (rt)` block below because the REJECT diagnostic needs it:
+                // whether the shader built its own SRSRC is the single fact that separates "the
+                // resource table has no entry for this fetch" from "it has one but direct-SGPR
+                // provenance was deliberately suppressed", and those two point at different files
+                // (#3137).
+                const bool srsrc_rewritten = sreg_range_written(rs, in.src[1].value, 4);
                 if (rt) {
-                    // Any write to the four-dword SRSRC range invalidates its entry-time direct V#.
-                    // Exact per-fetch and s_load provenance below may still identify the live descriptor,
-                    // but a missing/rejected dynamic result must never fall back to stale user data.
-                    const bool srsrc_rewritten = sreg_range_written(rs, in.src[1].value, 4);
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
                     // exact fetch instruction's pc; fall back to untouched SGPR user data or an s_load
                     // SRT tag. A rewritten direct descriptor without either provenance stays unresolved.
@@ -5919,10 +5925,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         const ShaderResource* tagged_res = has_srt_tag && rt
                                                                ? rt->by_srt_offset(srt_tag)
                                                                : nullptr;
-                        fprintf(stderr, "[mubuf-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s (%zu res)\n",
+                        // `pc_res` and `rewritten` are the two fields the RAW path
+                        // (`[mubuf-raw-unresolved]`) has always printed and this one did not, and
+                        // their absence is what made #3137 diagnosable only by re-running the title
+                        // under PROSPER_DYNTRACE_FAIL: with `pc_res=null rewritten=1` the line says
+                        // outright that the const-fold published no descriptor for this exact fetch
+                        // AND that the shader assembles its own SRSRC, so the direct-SGPR fallbacks
+                        // were correctly suppressed rather than tried and missed. That is a
+                        // front-half/user-data verdict, not a recompiler one. `rewritten=0` with
+                        // `pc_res=null` is the opposite verdict: the table simply has no entry at
+                        // this SGPR.
+                        const ShaderResource* pc_res = rt ? rt->by_fetch_pc(in.pc) : nullptr;
+                        fprintf(stderr, "[mubuf-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s "
+                                        "pc_res=%s rewritten=%d (%zu res)\n",
                                 in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
                                 has_srt_tag ? srt_tag : 0u,
                                 !rt ? "no-table" : (tagged_res ? "yes" : "null"),
+                                !rt ? "no-table" : (pc_res ? "yes" : "null"),
+                                (int)srsrc_rewritten,
                                 rt ? rt->resources.size() : 0u);
                     }
                     buf_op.how = "reject-unresolved";
