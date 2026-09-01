@@ -227,11 +227,21 @@ def _compute_program_groups(records, limit=10, address_limit=8):
     }
 
 
+# The share a component must reach to WIN the classification. Named because two things depend on
+# it and it was previously a bare literal in one of them, so neither the dependency nor the value
+# was pinned by anything -- moving it passed the whole suite.
+CLASSIFICATION_EVIDENCE_SHARE = 0.40
+
 # Readback must reach this share of measured work before the harness-readback note is emitted.
 #
-# ANCHOR: one quarter of the 0.40 classification evidence bar. The note exists to cover the gap
-# UNDER that bar -- a readback large enough to mislead but too small to win the verdict -- so the
-# threshold belongs well below it, and a quarter is the round fraction that is.
+# It sits BELOW the evidence bar by construction: the note exists to cover the gap under that bar,
+# a readback large enough to mislead but too small to win the verdict. That inequality is the real
+# invariant and is what the tests assert.
+#
+# One quarter of the bar is a CHOSEN fraction, not a derived one -- it came out of review as a
+# rationalisation for 0.10 rather than from anything about the data, and pinning it as an equality
+# would give a reviewer's off-hand ratio the authority of an invariant. Recorded as the reason the
+# value is what it is; the tests deliberately do not enforce the ratio.
 #
 # WHAT THE TESTS ACTUALLY PIN, measured per-arm rather than by exit code, because the two are not
 # the same question and reading only the exit code gets this wrong:
@@ -252,18 +262,36 @@ def _compute_program_groups(records, limit=10, address_limit=8):
 # the only variable is share, and the 31% one reproduces the capture that motivated the change --
 # but neither is what fixes the band, and a comment claiming otherwise sends the next reader to the
 # wrong test when they want to tighten it.
-READBACK_NOTE_MIN_SHARE = 0.10
+READBACK_NOTE_MIN_SHARE = CLASSIFICATION_EVIDENCE_SHARE / 4
 
 
 # The note's closing advice depends on whether readback DECIDED the verdict. "before acting on this
 # verdict" is right when the verdict IS readback; on a capture whose verdict is a decisive compute or
 # renderer-resource share it is wrong advice attached to a correct conclusion, which is worse than no
 # advice -- the reader is told to discard a finding the readback had no part in.
+# Verdicts that CANNOT flip when the readback is removed. Removing readback scales every other
+# component's share up by the same factor, so a component that already won still wins. A verdict
+# that exists precisely BECAUSE nothing won ("inconclusive"), or because measured work was small
+# against the wall window ("cpu-outside-renderer"), can and does flip -- measured on this change's
+# own motivating capture, where dropping the harness readback turns "inconclusive" into "compute
+# (1134.0 ms, 53%)". This module already records the same effect from hardware: #3152 saw a verdict
+# become renderer-resource with the graphics total halved once the capture ran through a real window.
+_VERDICTS_READBACK_CANNOT_FLIP = frozenset({
+    "compute", "renderer-resource", "gpu-device", "gpu-wait", "gpu-wait-overhead",
+})
+
+
 def _readback_note_tail(classification):
     if classification == "readback":
-        return " before acting on this verdict"
-    return (" before reading the readback line below; it does not affect the "
-            + str(classification) + " verdict above")
+        return " before acting on this verdict."
+    if classification in _VERDICTS_READBACK_CANNOT_FLIP:
+        # Safe to reassure: this verdict survives the readback being removed.
+        return (f" The {classification} verdict above does not depend on it: removing the readback "
+                "raises every other share, so a component that already won still wins.")
+    # Not safe. Saying "the verdict is unaffected" here would invite trust in a verdict the harness
+    # may have produced, which is the opposite of what this note exists to prevent.
+    return (f" The {classification} verdict above may itself be an artefact of that readback -- it "
+            "is not a verdict some component won, so removing the readback can change it.")
 
 
 def summarize(records):
@@ -333,7 +361,7 @@ def summarize(records):
     if measured_total > 0:
         largest, cost = max(classification_components.items(), key=lambda item: item[1])
         share = cost / measured_total
-        if share >= 0.40:
+        if share >= CLASSIFICATION_EVIDENCE_SHARE:
             classification = largest
             reason = f"{largest} is the largest measured component ({cost:.1f} ms, {share:.0%})"
         elif cpu_cores is not None and cpu_cores >= 0.80 and wall_ms and measured_total < wall_ms * 0.40:
@@ -341,7 +369,8 @@ def summarize(records):
             reason = (f"the process used {cpu_cores:.2f} CPU cores while measured renderer/compute "
                       f"work covered only {measured_total / wall_ms:.0%} of the sampled wall window")
         else:
-            reason = "measured work is split across components; no component reaches the 40% evidence threshold"
+            reason = ("measured work is split across components; no component reaches the "
+                      f"{CLASSIFICATION_EVIDENCE_SHARE:.0%} evidence threshold")
     elif cpu_cores is not None and cpu_cores >= 0.80:
         classification = "cpu-outside-renderer"
         reason = (f"the process used {cpu_cores:.2f} CPU cores with no retained renderer/compute "
@@ -390,13 +419,13 @@ def summarize(records):
             readback_note = (
                 "this capture cannot say whether GPU present was adopted, so it cannot say whether "
                 "the readback is real or the harness copying every scanout frame to the CPU. Check "
-                "the run log for a GPU-present surface failure" + _readback_note_tail(classification))
+                "the run log for a GPU-present surface failure." + _readback_note_tail(classification))
         elif adopted is False:
             readback_note = (
                 "GPU present was NOT adopted for this capture, so the frontend copied every scanout "
                 "frame to the CPU -- most often prosper-app under SDL_VIDEODRIVER=offscreen, which "
                 "needs VK_EXT_headless_surface. This readback is the harness, not the title. "
-                "Re-measure through a real window" + _readback_note_tail(classification))
+                "Re-measure through a real window." + _readback_note_tail(classification))
         else:
             readback_note = (
                 "GPU present WAS adopted, so scanout readback is skipped and this readback is real "
