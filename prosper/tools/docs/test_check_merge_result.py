@@ -14,6 +14,9 @@ Run directly, or via ctest as doc_merge_result_checker.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +25,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TOOL = HERE / "check_merge_result.py"
 DOC = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
+
+sys.path.insert(0, str(HERE))
+
+import check_merge_result as cmr  # noqa: E402 -- needs the sys.path insert above it; used only by
+                                   # checker_output_undecodable, to monkeypatch subprocess.run for
+                                   # the one call it targets (#3079)
 
 FAILURES: list[str] = []
 
@@ -157,6 +166,117 @@ def cli_missing_checker(name: str) -> None:
 
 
 cli_missing_checker("a missing checker is reported as a tooling failure, not a table defect")
+
+
+# #3079: the checker invocation decodes with the locale codec, and the fix must be BOTH SIDES --
+# `encoding="utf-8"` on how THIS tool decodes the checker's captured output, and
+# `PYTHONIOENCODING=utf-8` in the checker's own environment so it actually EMITS utf-8. Forcing
+# only the parent side turns an accidental agreement (both sides silently sharing whatever the
+# ambient locale is) into a real mismatch, which is worse than doing nothing.
+#
+# The checker here is a STAND-IN, not the real check_numbered_table.py: it deterministically
+# writes UTF-8 or cp1252 bytes depending on whether PYTHONIOENCODING=utf-8 is present in its own
+# environment, so this arm does not depend on which locales happen to be installed on the machine
+# running the test -- the real defect needs a genuinely non-UTF-8 ambient locale (cp1252 on an
+# unconfigured Windows host), which nothing here can assume exists. Same substitution technique as
+# cli_missing_checker above (swap the sibling file check_merge_result.py resolves at import time).
+#
+# Verified this arm actually discriminates rather than being a same-source control that cannot
+# fail (CLAUDE.md's positive-control rule): run against a copy of this file from BEFORE #3079's fix
+# (neither encoding="utf-8" nor env=...PYTHONIOENCODING present), it crashes with a raw
+# UnicodeDecodeError; run against a ONE-SIDED fix (encoding="utf-8" added but env= left out --
+# exactly the "obvious" partial fix the issue warns against) it crashes with the SAME
+# UnicodeDecodeError. Only with both present does it pass. All three were run by hand against the
+# real subprocess plumbing (not mocked) before this test was written.
+FAKE_LOCALE_CHECKER = '''\
+import os
+import sys
+
+MESSAGE = "caf\\u00e9 row \\u2192 problem"
+
+forced_utf8 = os.environ.get("PYTHONIOENCODING", "").split(":", 1)[0].lower() == "utf-8"
+codec = "utf-8" if forced_utf8 else "cp1252"
+
+sys.stdout.buffer.write(b"\\n1 problem(s) found.\\n")
+sys.stderr.buffer.write(("error: fake:1: " + MESSAGE + "\\n").encode(codec, errors="replace"))
+sys.exit(1)
+'''
+
+
+def checker_locale_mismatch(name: str) -> None:
+    with tempfile.TemporaryDirectory() as d:
+        repo = scenario(BASE, table("1:a", "2:b", "3:c", "4:master's row"),
+                         table("1:a", "5:the lane's row", "2:b", "3:c"), d)
+        lone = Path(d) / "lone"
+        lone.mkdir()
+        (lone / TOOL.name).write_text(TOOL.read_text(encoding="utf-8"), encoding="utf-8")
+        (lone / "check_numbered_table.py").write_text(FAKE_LOCALE_CHECKER, encoding="utf-8")
+        env = dict(os.environ)
+        env.pop("PYTHONIOENCODING", None)  # deterministic regardless of the invoking shell
+        proc = subprocess.run(
+            [sys.executable, str(lone / TOOL.name), "--no-fetch", "--base", "master",
+             "--head", "lane"],
+            cwd=repo, capture_output=True, text=True, env=env,
+        )
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.stdout is None or proc.stderr is None or "UnicodeDecodeError" in out:
+        FAILURES.append(f"{name}: the checker's own output could not be decoded: {out[:400]!r}")
+    elif "café row → problem" not in out:
+        FAILURES.append(f"{name}: expected the checker's message intact, got {out[:400]!r}")
+    else:
+        print(f"  ok  {name}")
+
+
+checker_locale_mismatch("a checker message with non-ASCII content survives a hostile child locale")
+
+
+# The `stdout is None` / `stderr is None` guard (#3079) is a defence for a specific PLATFORM
+# behaviour this suite cannot produce through a REAL subprocess on every OS: on a platform whose
+# pipe reader runs in a background thread (Windows -- see check_merge_result.py's own git()
+# comment, which measured this directly), a decode failure inside that thread does not raise here
+# at all -- the affected stream comes back None with returncode 0, and the guard this arm tests is
+# what stops that being reported as "no table problem found". Measured on the machine that wrote
+# this test (Linux/CPython 3.14), the equivalent mismatch instead raises UnicodeDecodeError
+# synchronously -- checker_locale_mismatch above already covers that shape for real. So this arm
+# injects the documented Windows outcome directly at the unit level (monkeypatching subprocess.run
+# for the ONE call it targets, leaving every git() call to run for real) rather than trying to
+# coerce a POSIX subprocess into a platform-specific behaviour it does not have.
+def checker_output_undecodable(name: str) -> None:
+    real_run = cmr.subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        if len(cmd) >= 2 and cmd[1] == str(cmr.CHECKER):
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=None, stderr=None)
+        return real_run(cmd, *a, **kw)
+
+    with tempfile.TemporaryDirectory() as d:
+        repo = scenario(BASE, BASE, table("1:a", "2:b", "3:c", "4:lane"), d)
+        old_cwd = Path.cwd()
+        old_argv = sys.argv
+        cmr.subprocess.run = fake_run
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        try:
+            os.chdir(repo)
+            sys.argv = ["check_merge_result.py", "--no-fetch", "--base", "master", "--head", "lane"]
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = cmr.main()
+        finally:
+            cmr.subprocess.run = real_run
+            sys.argv = old_argv
+            os.chdir(old_cwd)
+
+    out = out_buf.getvalue() + err_buf.getvalue()
+    if rc != 2:
+        FAILURES.append(f"{name}: expected rc=2, got {rc}: {out[:300]!r}")
+    elif "problem(s) found" in out or "clean merge" in out:
+        FAILURES.append(f"{name}: a None stream was reported as a real verdict: {out[:300]!r}")
+    elif "could not be decoded" not in out:
+        FAILURES.append(f"{name}: expected the fail-closed message, got {out[:300]!r}")
+    else:
+        print(f"  ok  {name}")
+
+
+checker_output_undecodable("a checker output that cannot be decoded refuses to report a verdict")
 
 
 # Nothing to check is not a pass-by-accident: it is stated, so a caller cannot mistake "already

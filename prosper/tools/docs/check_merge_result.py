@@ -37,6 +37,7 @@ the same one `check_numbered_table.py`'s own WHAT THIS CANNOT SEE section draws)
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -139,11 +140,37 @@ def main() -> int:
         merged_copy.write_text(show.stdout, encoding="utf-8")
         base_copy.write_text(git("show", f"{base}:{args.file}").stdout, encoding="utf-8")
 
+        # encoding="utf-8" AND env=...PYTHONIOENCODING on the SAME call, deliberately: this is a
+        # BOTH-SIDES fix, not two independent ones. `encoding="utf-8"` fixes how THIS process
+        # decodes the checker's captured stdout/stderr; it says nothing about what bytes the
+        # checker actually wrote. Absent an override, the checker's own `print()` encodes with
+        # WHATEVER the ambient locale is (cp1252 on an unconfigured Windows host) -- and today,
+        # with neither side forced, parent and child read that same ambient locale and agree BY
+        # ACCIDENT. Adding encoding="utf-8" here alone would break that accidental agreement
+        # into a real one: the checker would still emit cp1252 bytes, and this call would then
+        # insist on decoding them as UTF-8. `PYTHONIOENCODING=utf-8` in the child's environment
+        # is what makes the checker itself emit UTF-8 regardless of locale, so the two sides
+        # agree on purpose instead of by luck. Neither half alone is a fix -- see #3079.
         proc = subprocess.run(
             [sys.executable, str(CHECKER), "--ordered", "--table-header", args.table_header,
              "--baseline", str(base_copy), str(merged_copy)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
+    if proc.stdout is None or proc.stderr is None:
+        # Fail closed rather than let a discarded stream read as "nothing to report". A decode
+        # failure inside subprocess's capture does not always raise here -- on a platform whose
+        # pipe reader runs in a background thread (this file's own git() helper measured that on
+        # Windows: the decode fails in the READER THREAD, and the affected stream comes back None
+        # with returncode 0 rather than propagating), the exception never reaches this frame at
+        # all. The `if stream:` guard below treats `None` exactly like "the checker printed
+        # nothing", so without this check a lost read would report a CLEAN merge from a read that
+        # never happened -- strictly worse than a crash, because nothing about it looks wrong.
+        # encoding="utf-8" plus the child-side PYTHONIOENCODING above should make this
+        # unreachable in ordinary operation; this is the backstop for when it somehow is not.
+        print("error: the checker's output could not be decoded as UTF-8; refusing to report a "
+              "verdict from a partial read.", file=sys.stderr)
+        return 2
     # Rewrite the temporary path back to the real one: an error naming a file in /tmp that no longer
     # exists reads as a tooling failure rather than as a finding about your change.
     for stream, out in ((proc.stdout, sys.stdout), (proc.stderr, sys.stderr)):
