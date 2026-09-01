@@ -1205,6 +1205,39 @@ int main() {
         CHECK(tail_levels > 0, "the small Frontiers levels are packed into the shared mip tail");
     }
 
+    // #3149 targeted zero-fill: tile_surface now zeroes only what the copy will not write.
+    // The case that separates it from the old whole-surface memset is a width that IS block
+    // aligned with a height that is NOT -- 3840x2160 at 4 bytes/texel in Sw64KbRX, where blocks
+    // are 128x128, so 3840%128 == 0 while 2160%128 == 112. Built by hand rather than drawn from
+    // the generators above: a padding byte left stale is invisible to a round-trip check, so the
+    // sentinel sweep is the half that can actually fail.
+    {
+        // All three 64 KiB modes, not just Sw64KbRX: the targeted zero-fill's guard keys on
+        // is_64kb_mode(), so a mode-specific block geometry regression would otherwise be
+        // invisible here. Flagged in review of #3149.
+        const uint32_t modes[] = {(uint32_t)TileMode::Sw64KbS, (uint32_t)TileMode::Sw64KbZX,
+                                  (uint32_t)TileMode::Sw64KbRX};
+        for (const uint32_t M : modes) {
+        const uint32_t W = 3840, H = 2160, BPE = 4;
+        std::vector<uint8_t> lin((size_t)W * H * BPE);
+        for (size_t i = 0; i < lin.size(); i++) {
+            uint8_t v = (uint8_t)(i * 7 + 1);
+            if (v == 0xAB) v = 0x11;          // 0xAB must stay exclusive to the sentinel
+            lin[i] = v;
+        }
+        const size_t tb = tiled_surface_bytes(W, H, M, 0, BPE);
+        std::vector<uint8_t> tiled(tb, 0xAB), back((size_t)W * H * BPE, 0);
+        tile_surface(tiled.data(), lin.data(), W, H, M, 0, BPE);
+        detile_surface(back.data(), tiled.data(), W, H, M, 0, BPE);
+        size_t residual = 0;
+        for (size_t i = 0; i < tb; i++) if (tiled[i] == 0xAB) residual++;
+        CHECK(std::memcmp(lin.data(), back.data(), lin.size()) == 0,
+              "4K block-aligned-width / unaligned-height tile+detile round-trips exactly");
+        CHECK(residual == 0,
+              "every tiled byte is written by the copy or zeroed -- no stale padding survives");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
