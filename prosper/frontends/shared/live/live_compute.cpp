@@ -6506,29 +6506,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 }
                 if (renderer_owned && bi.storage) {
-                    const uint32_t nc = r->num_components ? r->num_components : 1;
-                    const bool compatible =
-                        (live_target.format == LiveTargetPixelFormat::Rgba8Unorm &&
-                         r->format == DataFormat::Unorm8 && nc == 4) ||
-                        (live_target.format == LiveTargetPixelFormat::Rgba16Float &&
-                         r->format == DataFormat::Float16 && nc == 4) ||
-                        (live_target.format == LiveTargetPixelFormat::Rg16Float &&
-                         r->format == DataFormat::Float16 && nc == 2) ||
-                        (live_target.format == LiveTargetPixelFormat::R16Float &&
-                         r->format == DataFormat::Float16 && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::R11G11B10Float &&
-                         r->format == DataFormat::Float10_11_11 && nc == 3) ||
-                        (live_target.format == LiveTargetPixelFormat::R8Unorm &&
-                         r->format == DataFormat::Unorm8 && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::Rg8Unorm &&
-                         r->format == DataFormat::Unorm8 && nc == 2) ||
-                        (live_target.format == LiveTargetPixelFormat::R32Uint &&
-                         (r->format == DataFormat::Uint32 ||
-                          r->format == DataFormat::Float32) && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::R32Float &&
-                         r->format == DataFormat::Float32 && nc == 1) ||
-                        (live_target.format == LiveTargetPixelFormat::Rgba32Float &&
-                         r->format == DataFormat::Float32 && nc == 4);
+                    const uint32_t nc = r->num_components ? r->num_components : 1;  // used by the trace below
+                    // #3204: the format-compatibility table now lives in live_target_format.hpp as an
+                    // exhaustive switch, so adding a LiveTargetPixelFormat is a build error there instead
+                    // of silently reporting every binding of that format incompatible.
+                    const bool compatible = prosper::frontend::live_target_format_matches_declaration(
+                        live_target.format, r->format, r->num_components);
                     if (!compatible) {
                         // The same allocation can carry another target view before this compute
                         // operation (Astro Bot uses R8G8 and RGBA16F views at one base). A snapshot

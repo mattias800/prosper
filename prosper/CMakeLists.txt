@@ -2045,6 +2045,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_image_identity PRIVATE prosper_core)
   add_test(NAME image_identity COMMAND test_image_identity)
 
+  # #3204: the renderer-target format table, extracted from execute_item where it was an `||`
+  # chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D menu. Now an
+  # exhaustive switch: the compiler pins exhaustiveness, this test pins the table.
+  add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
+  target_link_libraries(test_live_target_format_match PRIVATE prosper_core prosper_live_renderer)
+  add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
+
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
   add_executable(test_convention_bindings tests/gpu/test_convention_bindings.cpp)
