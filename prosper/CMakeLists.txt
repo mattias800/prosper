@@ -2045,17 +2045,6 @@ if(TARGET prosper_core)
   target_link_libraries(test_image_identity PRIVATE prosper_core)
   add_test(NAME image_identity COMMAND test_image_identity)
 
-  # #3204: the renderer-target format table, extracted from execute_item where it was an `||`
-  # chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D menu. Now an
-  # exhaustive switch: the compiler pins exhaustiveness, this test pins the table.
-  add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
-  # The header is inline-only and needs nothing but prosper_core's types, so DON'T link
-  # prosper_live_renderer: that target is defined later and only inside `if(Vulkan_FOUND)`,
-  # so on MinGW/macOS this test found neither the library nor its PUBLIC include path.
-  target_link_libraries(test_live_target_format_match PRIVATE prosper_core)
-  target_include_directories(test_live_target_format_match PRIVATE frontends)
-  add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
-
   # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
   # direction binds the guest image with the wrong element type, so every arm has a rejection
   # partner -- including atomics, which are never a native storage image however well formats match.
@@ -2194,6 +2183,16 @@ if(TARGET prosper_core)
       if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(prosper_live_renderer PRIVATE -Werror=switch)
       endif()
+
+      # #3204: the renderer-target format table, extracted from execute_item where it was an
+      # `||` chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D
+      # menu. Now an exhaustive switch: the compiler pins exhaustiveness, this test pins the
+      # table. Registered HERE, inside if(Vulkan_FOUND), because live_target_format.hpp includes
+      # <vulkan/vulkan.h> -- registering it outside built on Linux and broke MinGW and macOS.
+      add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
+      target_link_libraries(test_live_target_format_match PRIVATE prosper_core Vulkan::Vulkan)
+      target_include_directories(test_live_target_format_match PRIVATE frontends src)
+      add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
       # Keep the production compute backend covered on native Windows too. This catches host- and
@@ -2521,6 +2520,17 @@ if(TARGET prosper_core)
       target_include_directories(test_draw_program_skip_render PRIVATE src tests tools/boot_trace)
       target_link_libraries(test_draw_program_skip_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME draw_program_skip_render COMMAND test_draw_program_skip_render)
+
+      # #3204: the renderer-target format table, extracted from execute_item where it was an
+      # `||` chain -- the shape that cost Dead Cells an HDR target (#773) and Syberia its 3D menu.
+      # Now an exhaustive switch: the compiler pins exhaustiveness, this test pins the table.
+      # Registered in BOTH the UNIX and WIN32 branches, like the compute-backend tests above:
+      # live_target_format.hpp includes <vulkan/vulkan.h>, so it needs an if(Vulkan_FOUND) scope,
+      # and this file has one per platform.
+      add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
+      target_link_libraries(test_live_target_format_match PRIVATE prosper_core Vulkan::Vulkan)
+      target_include_directories(test_live_target_format_match PRIVATE frontends src)
+      add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
       # Armed from the ENVIRONMENT rather than by a setenv inside the test. The persistent-target
       # opt-out is read through PROSPER_ENV_VALUE, which caches, so arming it from inside the process
       # is exactly the vacuous-arm defect cached_env_arming_logic exists to catch; and the selector
