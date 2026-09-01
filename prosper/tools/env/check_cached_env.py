@@ -89,6 +89,86 @@ def scan(root: Path):
     return cached, armed
 
 
+# --- tier 3: the hot sites must not REGROW a live getenv ----------------------------------------
+#
+# #3094 took getenv off the per-draw and per-resource paths of the three files below. Nothing about
+# a bare getenv looks wrong at the call site, so the only thing that noticed the cost in the first
+# place was a perf profile -- which means the next edit to any of these guards can silently put it
+# back and no build, test or review would go red. This table is the standing statement that these
+# particular reads are hot, so that reintroducing getenv for one of them fails here instead.
+#
+# Adding a name is cheap; removing one needs a reason. A name here must ALSO survive the tier-1 and
+# tier-2 checks above -- being hot is never a licence to cache something that is armed at runtime.
+HOT_SITES = {
+    "tests/fixtures/render_runner.h": [
+        "PROSPER_BACKEND_LOAD_LOG", "PROSPER_GEOM_PROBE", "PROSPER_DSLOG",
+        "PROSPER_RENDER_DROP_UNPROVEN_DRAW", "PROSPER_DRAW_STATS", "PROSPER_DEPTH_CLEAR",
+        "PROSPER_DEPTH_CLEAR_WHY", "PROSPER_PIPELOG", "PROSPER_BACKEND_TRACE",
+        "PROSPER_NO_BACKEND_BUFFER_ARENA", "PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS",
+        "PROSPER_DS_SLICE_CENSUS", "PROSPER_STENCIL_MIRROR", "PROSPER_STENCILLOG",
+        "PROSPER_SHADER_TAP", "PROSPER_GEOM_PROBE_DUMP", "PROSPER_NO_DEPTH_BIAS",
+    ],
+    "src/gpu/execute/gpu_execute.hpp": [
+        "PROSPER_FORCE_COLORWRITE", "PROSPER_NO_EARLY_NO_EFFECT", "PROSPER_DRAWDIAG",
+        "PROSPER_DRAWLOG", "PROSPER_EXECLOG", "PROSPER_RECTLOG", "PROSPER_RTLOG",
+        "PROSPER_INTERPLOG", "PROSPER_GEOM_PROBE", "PROSPER_ONLY_ATLAS", "PROSPER_ONLY_IC",
+        "PROSPER_CAPTION_DIAG", "PROSPER_PROLOGLOG", "PROSPER_VS_DUMP", "PROSPER_SHADER_DUMP",
+        "PROSPER_DRAWMAP",
+    ],
+    "frontends/shared/live/live_renderer.cpp": [
+        "PROSPER_DCCLOG", "PROSPER_SLICESTRIDE", "PROSPER_UNIFORMLOG",
+    ],
+}
+
+
+def live_getenv_names(line: str):
+    """PROSPER_* names this line reads with a LIVE getenv.
+
+    A line carrying `static` is excluded: `static const bool x = getenv("N") != nullptr;` is a
+    one-shot read already -- the older hand-rolled spelling of the same fix, still present in the
+    tree and not something this gate should push people off.
+    """
+    if "static" in line:
+        return []
+    return LIVE_GETENV_RE.findall(line)
+
+
+LIVE_GETENV_RE = re.compile(r'(?:std::)?getenv\s*\(\s*"(PROSPER_[A-Z_0-9]+)"\s*\)')
+CACHED_USE_RE = re.compile(r'PROSPER_ENV_(?:ON|VALUE)\(\s*"(PROSPER_[A-Z_0-9]+)"\s*\)')
+
+
+def check_hot_sites(root) -> int:
+    """Every HOT_SITES name must be read through PROSPER_ENV_* and never through a live getenv."""
+    bad = 0
+    for relpath, names in sorted(HOT_SITES.items()):
+        path = root / relpath
+        if not path.is_file():
+            print(f"  [FAIL] hot-site file missing: {relpath}")
+            print( "         the guard cannot see the sites it is meant to protect -- if the file")
+            print( "         moved, move this entry with it rather than deleting it")
+            bad += 1
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        cached_here = set(CACHED_USE_RE.findall(text))
+        live_here = {}
+        for lineno, line in enumerate(text.split("\n"), 1):
+            for nm in live_getenv_names(line):
+                live_here.setdefault(nm, []).append(lineno)
+        for name in sorted(names):
+            if name in live_here:
+                print(f"  [FAIL] {relpath}: {name} is read with a live getenv at "
+                      f"line(s) {', '.join(str(n) for n in live_here[name][:4])}")
+                bad += 1
+            elif name not in cached_here:
+                print(f"  [FAIL] {relpath}: {name} is in HOT_SITES but the file reads it neither")
+                print( "         cached nor live -- the guard is stale, so fix or drop the entry")
+                bad += 1
+    if not bad:
+        total = sum(len(v) for v in HOT_SITES.values())
+        print(f"  [ok]   {total} hot site(s) across {len(HOT_SITES)} file(s) still read cached")
+    return bad
+
+
 def scan_line(line: str):
     """The per-line half of scan(), exposed so the self-test exercises the real code path."""
     return ([m.group(1) for m in CACHED_RE.finditer(line)],
@@ -126,8 +206,29 @@ SELF_TESTS = [
 ]
 
 
+# Shapes the hot-site scanner must and must not treat as a LIVE read. Without these, a regex that
+# stops matching turns tier 3 into a permanent [ok] -- the same silent-clean failure the tier-1
+# self-tests above exist to prevent.
+HOT_SELF_TESTS = [
+    ('if (getenv("PROSPER_HOT")) {', ["PROSPER_HOT"]),
+    ('const char* v = std::getenv("PROSPER_HOT");', ["PROSPER_HOT"]),
+    ('x = getenv("PROSPER_HOT") != nullptr;', ["PROSPER_HOT"]),
+    # MUST NOT match: already a one-shot read, in the older hand-rolled spelling.
+    ('static const bool on = getenv("PROSPER_HOT") != nullptr;', []),
+    # MUST NOT match: the cached macro is the fix.
+    ('if (PROSPER_ENV_ON("PROSPER_HOT")) {', []),
+    # MUST NOT match: prose naming the variable reads nothing.
+    ('// PROSPER_HOT is evaluated per draw', []),
+]
+
+
 def self_test() -> int:
     bad = 0
+    for snippet, want in HOT_SELF_TESTS:
+        got = live_getenv_names(snippet)
+        if got != want:
+            print(f"  [FAIL] hot-site self-test: {snippet!r} want={want} got={got}")
+            bad += 1
     for snippet, want_cached, want_armed in SELF_TESTS:
         got_cached, got_armed = scan_line(snippet)
         if got_cached != want_cached or got_armed != want_armed:
@@ -138,7 +239,7 @@ def self_test() -> int:
     if bad:
         print(f"  the scanner's own patterns are broken -- a tree scan would report a false CLEAN")
     else:
-        print(f"  [ok]   scanner self-test: {len(SELF_TESTS)} cases")
+        print(f"  [ok]   scanner self-test: {len(SELF_TESTS) + len(HOT_SELF_TESTS)} cases")
     return bad
 
 
@@ -182,6 +283,12 @@ def main() -> int:
 
     if not fails:
         print(f"  [ok]   no cached variable is armed by a test ({len(notes)} ordering note(s) above)")
+        if check_hot_sites(root):
+            print("  A hot site regrew a live getenv. #3094 measured these on per-draw and")
+            print("  per-resource paths; restore the PROSPER_ENV_ON/VALUE read, or if the site is")
+            print("  genuinely no longer hot, remove its entry from HOT_SITES in this file.")
+            print("== 1 failure(s) ==")
+            return 1
         print("== all checks passed ==")
         return 0
 

@@ -5,6 +5,7 @@
 #pragma once
 #include "self/module.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / PROSPER_ENV_VALUE
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -29,35 +30,10 @@ namespace prosper {
 // marker of the boundary in case a future toolchain makes the attribute viable.
 #define PROSPER_SYSV_ABI
 
-// Cached diagnostic-flag read, for HOT paths.
-//
-// getenv() is not free: the UCRT walks a locked environment block, strlen-ing and comparing each
-// entry, on EVERY call. A diagnostic that is switched OFF therefore still costs that scan every
-// time its guard is evaluated -- and some of these guards sit on per-draw and per-RESOURCE paths,
-// so the cost scales with scene complexity rather than with logging.
-//
-// Measured on Blue Prince (native Windows), sampling the guest primary thread with every
-// diagnostic disabled: 97 of 331 samples -- ~30% of that thread's wall time -- were inside
-// getenv's strlen loop.
-//
-// Each use site gets its own function-local static, so the read happens exactly once.
-//
-// THIS CHANGES SEMANTICS, and that is why it is not applied everywhere: the variable is sampled at
-// first use, so a caller that sets it LATER never sees it. Several tests arm diagnostics at runtime
-// with _putenv_s and then assert on the behaviour -- applying this to hle_kernel.cpp, gpu_executor
-// or the command processor broke win_exception_delivery, eop_write and dynfetch_fold for exactly
-// that reason. Use it only where the flag is a pure boot-time diagnostic switch AND the path is
-// hot, and run the suite after.
-#define PROSPER_ENV_ON(name) ([]() -> bool { static const bool prosper_env_on_v = std::getenv(name) != nullptr; return prosper_env_on_v; }())
-
-// The same, for a diagnostic that reads a VALUE rather than just presence. Same one-shot read and
-// the same consequence: sampled at first use, so a caller that sets it later never sees it.
-//
-// Worth its own macro because the value form is the one that hides: `const char* m = getenv(...)`
-// does not look like a flag check, so a boolean-guard sweep skips it -- and in live_renderer.cpp
-// the single hottest getenv site was exactly that shape, on a per-RESOURCE path, calling getenv up
-// to three times per resource.
-#define PROSPER_ENV_VALUE(name) ([]() -> const char* { static const char* prosper_env_value_v = std::getenv(name); return prosper_env_value_v; }())
+// Cached diagnostic-flag reads for HOT paths (PROSPER_ENV_ON / PROSPER_ENV_VALUE) moved to
+// diagnostics/env_cache.hpp: the renderer backend and the draw executor need them too, and
+// should not have to include the HLE dispatch registry to ask whether a switch is on. Included
+// here so every existing user of dispatch.hpp keeps compiling unchanged.
 
 // Generic HLE handler signature (up to 6 integer/pointer args, SysV).
 using HleFn = PROSPER_SYSV_ABI uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
