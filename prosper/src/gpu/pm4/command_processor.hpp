@@ -139,7 +139,18 @@ struct GpuState {
     static uint64_t pack_prov_src(uint8_t origin, uint32_t jump_depth, uint32_t fold) {
         return (uint64_t)origin | ((uint64_t)(jump_depth & 0xFFu) << 8) | ((uint64_t)fold << 16);
     }
-    uint32_t index_type = 0;                             // last SetIndexType
+    uint32_t index_type = 0;                             // last SetIndexType (0 = 16-bit, 1 = 32-bit)
+    // Whether an IT_INDEX_TYPE packet was ever folded, i.e. whether the guest ANNOUNCED an index
+    // element size (#3009). `index_type` alone cannot say: 0 is simultaneously the announced 16-bit
+    // encoding and the reset default of a title that never announces anything, and the two demand
+    // opposite handling downstream. The #304 detectors exist only to recover a size the guest never
+    // announced -- run against a title that DID announce, they are free to overrule a fact prosper
+    // was told, on a byte pattern with a measured residual (gpu_execute.hpp,
+    // index_buffer_is_unannounced_32bit_high). Sticky for the process, like the register files:
+    // agc_graphics_state() is a process-lifetime fold, so "ever announced" is the question a draw
+    // in a later submit needs answered. Announcing 32-bit and then 16-bit leaves this true and
+    // index_type 0, which is exactly the state the sentinel could not express.
+    bool index_type_announced = false;
     uint32_t num_instances = 1;                          // default before SetNumInstances; zero discards
     // Gen5 indexed-draw binding state (issue #232, DOLL/UE4 geometry). SetIndexBuffer/SetIndexCount
     // set these; DrawIndexOffset consumes them to emit an indexed Draw. Persist across draws within a

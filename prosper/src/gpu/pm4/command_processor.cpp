@@ -4180,6 +4180,7 @@ const std::shared_ptr<const GpuState>& GpuState::refresh_state_snapshot() {
     if (state_dirty_ || !last_snapshot_) {
         auto snap = std::make_shared<GpuState>();
         snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+        snap->index_type_announced = index_type_announced;
         snap->num_instances = num_instances;
         snap->command_order = command_order;   // #305 instrument: order at snapshot
         if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
@@ -4457,6 +4458,11 @@ void GpuState::apply(const Pm4Command& c) {
         }
         case K::SetIndexType:
             index_type = c.index_size;
+            // #3009: record the ANNOUNCEMENT, not just the value. A type-3 packet is at least two
+            // dwords (pm4_decode.cpp hdr_len adds 2), so a decoded SetIndexType always carried its
+            // payload dword and this is unconditional -- the `npl >= 1` guard on c.index_size is
+            // defensive, not a reachable "announced nothing" case.
+            index_type_announced = true;
             state_dirty_ = true;
             break;
         case K::SetNumInstances:
