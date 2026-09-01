@@ -10,6 +10,7 @@
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "gpu/capture/capture_compute_policy.hpp"
 #include "gpu/diagnostics/compute_parent_walk.hpp"
+#include "gpu/diagnostics/shader_dump_filter.hpp"  // PROSPER_SHADER_DUMP_PROGRAM address filter
 #include "gpu/diagnostics/compute_tree_watch.hpp"
 #include "gpu/present/videoout_present.hpp"   // present_write_frame
 #include "gpu/agc/agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
@@ -1713,10 +1714,57 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     return {};
 }
 
+// `program_address` and `chain_address` are the guest addresses the dumped words came from, and
+// carrying them into the FILENAME is the point of #3196. A content hash names WHAT was compiled and
+// never WHERE the guest put it, so an investigation holding an address -- which is how
+// `PROSPER_SKIP_DRAW_PROGRAM`, `PROSPER_COMPUTE_SKIP_PROGRAM`, `PROSPER_DRAW_PROGRAM_CENSUS` and the
+// `[buf-op]` / `[mubuf-unresolved]` lines all name programs -- could not ask this dump for its
+// program, and had to hash-match the directory by hand. `chain_address` is the NGG main
+// continuation of a vertex chain, 0 when there is none. Either may be 0 when the caller genuinely
+// has no address; that is written as `0000000000000000` rather than omitted, so a reader can tell
+// "no address was available" from "the address is unusual".
 void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
-                                  const std::vector<uint32_t>& spirv) {
+                                  const std::vector<uint32_t>& spirv, uint64_t program_address,
+                                  uint64_t chain_address) {
+    // Detect-its-own-invalidity, against #2149's TWO-GATE shape. `PROSPER_SHADER_DUMP_PROGRAM` is a
+    // modifier of `PROSPER_SHADER_DUMP_SUCCESS`, not a switch of its own, so arming only the one
+    // whose NAME matches the question -- "dump the program at 0x..." -- produces an empty directory
+    // and not one line, which reads as "that program never compiled". Said once, from the first
+    // shader that reaches here; the function-local static keeps the steady-state cost at one guard
+    // load, because this runs per draw realization on a cache hit.
+    static const bool announced_filter_without_directory = [] {
+        if (!getenv("PROSPER_SHADER_DUMP_PROGRAM") || getenv("PROSPER_SHADER_DUMP_SUCCESS"))
+            return false;
+        fprintf(stderr,
+                "[shader-dump] PROSPER_SHADER_DUMP_PROGRAM is set but PROSPER_SHADER_DUMP_SUCCESS=DIR "
+                "is NOT -- nothing will be dumped. The filter narrows a dump; it does not start one\n");
+        return true;
+    }();
+    (void)announced_filter_without_directory;
+
     const char* directory = getenv("PROSPER_SHADER_DUMP_SUCCESS");
     if (!directory || !*directory || !key.code || key.code->empty() || spirv.empty()) return;
+
+    // PROSPER_SHADER_DUMP_PROGRAM: the other half of #3196. Default OFF, in which case `allows` is
+    // true for everything and this costs one env read per dumped shader -- and that read only
+    // happens once the dump directory is set, so a default run never reaches here at all.
+    // Ordered BEFORE the dedup set on purpose: a withheld program must not be recorded as dumped,
+    // or re-arming the filter (which a test does, and a long-running process could) would then
+    // silently write nothing. The consequence is that the ordinal below counts dump OPPORTUNITIES,
+    // not distinct programs -- a cache hit on a withheld program counts again. Read it as a lower
+    // bound on volume avoided, never as a program count.
+    auto& dump_filter = shader_dump_program_filter();
+    if (!dump_filter.allows(program_address, chain_address)) {
+        const auto withheld = dump_filter.note_withheld();
+        if (withheld.print)
+            fprintf(stderr,
+                    "[shader-dump] withheld addr=0x%llx chain=0x%llx (not named by "
+                    "PROSPER_SHADER_DUMP_PROGRAM) opportunities=%llu\n",
+                    static_cast<unsigned long long>(program_address),
+                    static_cast<unsigned long long>(chain_address),
+                    static_cast<unsigned long long>(withheld.ordinal));
+        return;
+    }
 
     const uint64_t spirv_hash = gpu_capture_hash(
         reinterpret_cast<const uint8_t*>(spirv.data()), spirv.size() * sizeof(uint32_t));
@@ -1727,9 +1775,14 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
                            key.chain_code->size() * sizeof(uint32_t))
         : 0;
     static std::mutex dump_mutex;
-    static std::set<std::tuple<uint32_t, uint64_t, uint64_t, uint64_t>> dumped;
+    // The address joins the dedup key now that it is part of the filename. Without it the FIRST
+    // address to compile a given body would claim the pair and every later address sharing those
+    // bytes would silently write nothing -- which is exactly the false negative this whole change
+    // exists to remove, just moved one step downstream.
+    static std::set<std::tuple<uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>> dumped;
     std::lock_guard lock(dump_mutex);
-    if (!dumped.emplace(static_cast<uint32_t>(stage), spirv_hash, raw_hash, chain_hash).second)
+    if (!dumped.emplace(static_cast<uint32_t>(stage), program_address, chain_address, spirv_hash,
+                        raw_hash, chain_hash).second)
         return;
 
     std::error_code ec;
@@ -1741,14 +1794,23 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
     const char* tag = stage == ShaderProgramStage::Vertex ? "vs" :
                       stage == ShaderProgramStage::Fragment ? "ps" : "cs";
     char raw_path[1024], chain_path[1024], spirv_path[1024];
-    snprintf(raw_path, sizeof(raw_path), "%s/success_%s_%016llx_%016llx.bin", directory, tag,
+    // `success_<stage>_at_<addr>_<spirv-hash>_<raw-hash>` -- the address leads the hash fields so
+    // that recovering a known program is one glob (`success_vs_at_00000005008efd00_*`) instead of a
+    // hash match. The hashes stay: they are what deduplicates, and one program compiled against
+    // different resource tables legitimately yields several variants under the same address.
+    snprintf(raw_path, sizeof(raw_path), "%s/success_%s_at_%016llx_%016llx_%016llx.bin", directory,
+             tag, static_cast<unsigned long long>(program_address),
              static_cast<unsigned long long>(spirv_hash),
              static_cast<unsigned long long>(raw_hash));
-    snprintf(chain_path, sizeof(chain_path), "%s/success_%s_%016llx_%016llx_main_%016llx.bin",
-             directory, tag, static_cast<unsigned long long>(spirv_hash),
+    snprintf(chain_path, sizeof(chain_path),
+             "%s/success_%s_at_%016llx_%016llx_%016llx_main_%016llx_%016llx.bin",
+             directory, tag, static_cast<unsigned long long>(program_address),
+             static_cast<unsigned long long>(spirv_hash),
              static_cast<unsigned long long>(raw_hash),
+             static_cast<unsigned long long>(chain_address),
              static_cast<unsigned long long>(chain_hash));
-    snprintf(spirv_path, sizeof(spirv_path), "%s/success_%s_%016llx_%016llx.spv", directory, tag,
+    snprintf(spirv_path, sizeof(spirv_path), "%s/success_%s_at_%016llx_%016llx_%016llx.spv",
+             directory, tag, static_cast<unsigned long long>(program_address),
              static_cast<unsigned long long>(spirv_hash),
              static_cast<unsigned long long>(raw_hash));
     FILE* raw = fopen(raw_path, "wb");
@@ -1766,8 +1828,10 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
     if (chain) fclose(chain);
     if (translated) fclose(translated);
     fprintf(stderr,
-            "[shader-dump] %s spv=%016llx raw=%016llx main=%016llx words=%zu+%zu/%zu "
-            "result=%s\n", tag,
+            "[shader-dump] %s addr=0x%llx chain=0x%llx spv=%016llx raw=%016llx main=%016llx "
+            "words=%zu+%zu/%zu result=%s\n", tag,
+            static_cast<unsigned long long>(program_address),
+            static_cast<unsigned long long>(chain_address),
             static_cast<unsigned long long>(spirv_hash),
             static_cast<unsigned long long>(raw_hash),
             static_cast<unsigned long long>(chain_hash), key.code->size(),
@@ -1778,7 +1842,8 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
 SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, ShaderCompileKey key,
                                                   const ShaderResourceTable* resources,
                                                   uint64_t* cache_identity,
-                                                  uint64_t program_address) {
+                                                  uint64_t program_address,
+                                                  uint64_t chain_address) {
     if (cache_identity) *cache_identity = 0;
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
@@ -1788,7 +1853,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         }
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
             compile_graphics_shader(stage, key, resources, program_address));
-        maybe_dump_successful_shader(stage, key, *spirv);
+        maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
         return spirv;
     }
 
@@ -1799,14 +1864,15 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         ++cache.stats.hits;
         found->second.last_use = ++cache.use_counter;
         if (cache_identity) *cache_identity = found->second.identity;
-        maybe_dump_successful_shader(stage, key, *found->second.spirv);
+        maybe_dump_successful_shader(stage, key, *found->second.spirv, program_address,
+                                    chain_address);
         return found->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
     auto spirv = std::make_shared<const std::vector<uint32_t>>(
         compile_graphics_shader(stage, key, resources, program_address));
-    maybe_dump_successful_shader(stage, key, *spirv);
+    maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
@@ -1983,7 +2049,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     if (key.trip_bound.bound) key.trip_bound_program_address = program_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
     return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity,
-                                          program_address);
+                                          program_address, /*chain_address=*/0);
 }
 
 SharedShaderWords recompile_vertex_chain_cached_shared(
@@ -1999,12 +2065,18 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         if (cache_identity) *cache_identity = 0;
         return {};
     }
-    const uint64_t chain_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prolog));
+    // The prolog address is the program's identity everywhere else -- `DrawItem::vs_guest_addr` is
+    // `rs.es_addr` for a chained vertex program, and that is the address a census or a skip selector
+    // reports. The main continuation gets its own address so the dumped `_main_` file can be found
+    // by either half, matching what gpu_capture already does when it resolves a wanted code address.
+    const uint64_t prolog_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prolog));
+    const uint64_t main_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(main));
     key.trip_bound = compute_trip_bound_settings();
-    if (key.trip_bound.bound) key.trip_bound_program_address = chain_address;
+    if (key.trip_bound.bound) key.trip_bound_program_address = prolog_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
     return cache_compiled_graphics_shader(
-        ShaderProgramStage::Vertex, std::move(key), resources, cache_identity, chain_address);
+        ShaderProgramStage::Vertex, std::move(key), resources, cache_identity, prolog_address,
+        main_address);
 }
 
 std::vector<uint32_t> recompile_graphics_shader_cached(
@@ -2087,7 +2159,8 @@ std::vector<uint32_t> recompile_compute_shader_cached(
             ++cache.stats.bypasses;
         }
         std::vector<uint32_t> spirv = compile();
-        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, spirv);
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, spirv,
+                                     diagnostic.program_address, 0);
         return spirv;
     }
 
@@ -2098,13 +2171,15 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         ++cache.stats.hits;
         found->second.last_use = ++cache.use_counter;
         if (cache_identity) *cache_identity = found->second.identity;
-        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv);
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv,
+                                    diagnostic.program_address, 0);
         return *found->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
     auto spirv = std::make_shared<const std::vector<uint32_t>>(compile());
-    maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *spirv);
+    maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *spirv,
+                                 diagnostic.program_address, 0);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();

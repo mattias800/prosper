@@ -1226,6 +1226,45 @@ That ordinal is not stable across frames, so it cannot name "every draw that run
 use it to test a specific suspected draw within one captured submit, and the program selector above
 for anything that has to hold across frames.
 
+**`PROSPER_SHADER_DUMP_SUCCESS=DIR` — dump every successfully recompiled shader, and
+`PROSPER_SHADER_DUMP_PROGRAM=0xADDR[,0xADDR...]` — narrow that to named guest programs (#3196).**
+Each dumped shader writes its raw guest RDNA2 (`.bin`, the input `shader_inspect` decodes) and the
+SPIR-V prosper emitted for it (`.spv`), and a chained vertex program additionally writes its NGG main
+continuation as a `_main_` `.bin`. **Filenames carry the guest code address**:
+
+```text
+success_vs_at_00000005008efd00_35956264829da0c6_62ad8faab4566b7a.bin
+success_vs_at_00000005008efd00_35956264829da0c6_62ad8faab4566b7a.spv
+```
+
+so recovering a program you identified by address — which is how `PROSPER_SKIP_DRAW_PROGRAM`,
+`PROSPER_COMPUTE_SKIP_PROGRAM`, `PROSPER_DRAW_PROGRAM_CENSUS` and the `[buf-op]` /
+`[mubuf-unresolved]` lines all name programs — is one glob:
+`ls DIR/success_*_at_00000005008efd00_*`. The two hashes are the SPIR-V and the raw RDNA2; they
+remain because they are what deduplicates, and one program compiled against different resource
+tables legitimately yields several variants under the same address. An address of
+`0000000000000000` means no address was available at that emit site, not an unusual address.
+
+The filter is default-OFF, parsed by the strict `0x`-only parser in `gpu/diagnostics/watch_list.hpp`
+(so a bare decimal arms nothing rather than arming 5,008), and announces itself once:
+
+```text
+[shader-dump] PROSPER_SHADER_DUMP_PROGRAM=0x5008efd00 -> armed on 1 program address(es); ONLY shaders at those addresses are dumped
+[shader-dump] vs addr=0x5008efd00 chain=0x0 spv=... raw=... main=... words=…+…/… result=written
+```
+
+Four things to know before reading a result:
+
+- **A malformed spec fails OPEN, not closed** — it arms nothing, says so loudly, and dumps
+  everything. This is deliberately the opposite of the skip selectors: withholding every module
+  would leave an empty directory, and an empty directory reads as *"that program never compiled"*.
+- **Naming either half of a vertex chain selects the pair**, because a census line gives you the ES
+  address and a `[buf-op]` line may give you the main.
+- **Only programs that recompile SUCCESSFULLY reach here.** A rejected program is written by
+  `PROSPER_SHADER_DUMP` instead, so naming its address produces nothing — check the arming line
+  before concluding the address was wrong.
+- **`withheld … opportunities=N` counts dump opportunities, not distinct programs.** A cache hit on
+  a withheld program counts again; read it as volume avoided, never as a program count.
 `PROSPER_PROVENANCE_DIM=WxH` retains every decoded `CB_COLOR0_BASE` write across submits, then reports
 the last matching writer whenever a draw samples an image of that size. Descriptor resolution can be
 limited to likely target submits with `PROSPER_PROVENANCE_MIN_DRAWS=N`; color-target history is still

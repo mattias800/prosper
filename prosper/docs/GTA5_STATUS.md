@@ -4290,7 +4290,7 @@ armed, a dispatcher loop must not be.
 | switch | default | what it does | the trap it avoids |
 | --- | --- | --- | --- |
 | `PROSPER_CFG_TRIP_BOUND` + `_PROGRAM` + **required** `_PHASE` | off | caps the CFG dispatcher's back edge for one program and phase, and records a device-side hit witness | covers **only** the CFG dispatcher, so a null on a structurizer-accepted program means *not measured*; without `_PHASE` nothing is emitted, because one record cannot describe two phases |
-| `PROSPER_COMPUTELOG_RAW` | off | writes a traced program's guest RDNA2 bytes for `tools/shader_inspect` | `PROSPER_SHADER_DUMP_SUCCESS` names files by hash, so recovering one program by address means hash-matching by hand |
+| `PROSPER_COMPUTELOG_RAW` | off | writes a traced program's guest RDNA2 bytes for `tools/shader_inspect` | writes ONE named program to an exact path. Since #3196 `PROSPER_SHADER_DUMP_SUCCESS` also carries the code address in its filenames and `PROSPER_SHADER_DUMP_PROGRAM=0xADDR` narrows it, so hash-matching by hand is no longer the alternative |
 | `PROSPER_INDIRECT_APERTURE_RECOVERY` | **off** | rebuilds a base-less queue-2 indirect argument address from the last-seen SetBase aperture | changes execution: the aperture is learned from any SetBase on any queue, and *mapped* is not *this is the argument buffer* |
 | `PROSPER_INDIRECTLOG` | off | per-packet base/offset/queue, the three argument dwords, and an end-of-run outcome census | readability was probed and values were not, so a misread surfaced only as a `workgroup-count-limit` decline thousands of operations later |
 

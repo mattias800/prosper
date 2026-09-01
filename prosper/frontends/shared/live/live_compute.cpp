@@ -4563,9 +4563,14 @@ void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool
 
 // The raw-guest half of PROSPER_COMPUTELOG_SPIRV. That switch answers "what did we emit"; this one
 // answers "what did the guest actually write", which is the only ground truth for a control-flow
-// question and the exact input `tools/shader_inspect` decodes. Without it the guest ISA for a live
-// program can only be recovered by hash-matching a PROSPER_SHADER_DUMP_SUCCESS directory, because
-// those filenames carry no code address -- so the two halves of a divergence could not be compared.
+// question and the exact input `tools/shader_inspect` decodes. It writes ONE traced program to an
+// exact path you name, which is what makes it the right tool for comparing the two halves of a
+// divergence.
+//
+// This comment used to add that the alternative was hash-matching a PROSPER_SHADER_DUMP_SUCCESS
+// directory by hand, "because those filenames carry no code address". That is no longer true: #3196
+// put the guest address in those filenames and added PROSPER_SHADER_DUMP_PROGRAM to narrow the dump
+// to named programs, so either route now recovers a program by address.
 //
 // The length is re-derived here rather than trusted: read what guest memory will actually give us,
 // then let the decoder walk to the program's own terminator. A truncated tail is written as what it
