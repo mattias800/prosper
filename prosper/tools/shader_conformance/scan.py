@@ -30,59 +30,152 @@ DIM_NAMES = {0: "1D", 1: "2D", 2: "3D", 3: "CUBE",
 DIM_ARRAYED = {4, 5, 7}
 DIM_3D = {2}
 MIMG_ENCODING = 0b111100          # dword0[31:26]
+S_ENDPGM = 0xBF810000             # SOPP encoding of s_endpgm -- terminates the walk, as it terminates
+                                   # the real program (rdna2_decode.cpp's S_ENDPGM).
+
+
+class Step:
+    """One decoded instruction's length and (if it is one) MIMG identity. See `rdna2_instr_len`."""
+    __slots__ = ("length", "is_mimg", "opcode", "dim", "is_end", "is_unknown")
+
+    def __init__(self, length, is_mimg=False, opcode=None, dim=None, is_end=False, is_unknown=False):
+        self.length, self.is_mimg, self.opcode, self.dim = length, is_mimg, opcode, dim
+        self.is_end, self.is_unknown = is_end, is_unknown
+
+
+def _sop_has_literal(w, nsrc):
+    """A scalar source operand field == 255 selects a trailing 32-bit literal constant dword."""
+    if (w & 0xFF) == 0xFF:
+        return True
+    if nsrc >= 2 and ((w >> 8) & 0xFF) == 0xFF:
+        return True
+    return False
+
+
+def rdna2_instr_len(words, i):
+    """Decode the LENGTH (in dwords) of the instruction at `words[i]`, plus its MIMG identity if any.
+
+    #3040: `decode_mimg_sites` used to test every dword for the MIMG top-6-bit encoding regardless of
+    what instruction it actually belonged to, so an operand or trailing-literal dword whose top bits
+    happened to alias the encoding (0b111100) read as an instruction start -- a phantom finding for a
+    MIMG that was never in the program. The fix is to walk real instruction boundaries: decode each
+    instruction's length from its format, exactly as the guest's own wavefront would, and only ever
+    test a dword for MIMG-ness when it is actually the first dword of an instruction.
+
+    This mirrors the length computation in `rdna2_decode_one` / `rdna2_walk`
+    (`src/gpu/recompiler/rdna2_decode.cpp`) -- every format bucket that instruction actually
+    dispatches on, so this walk lands on the same instruction boundaries the real recompiler does. It
+    intentionally ports only the LENGTH rule, not full operand decode (register fields, DPP/SDWA
+    sub-modes, condition codes): that is all a boundary-accurate walk needs, and it is a small,
+    self-contained piece of the ~1,200-line decoder, not a port of the whole thing.
+
+    Being a second, independent implementation of that dispatch is itself a drift risk -- if
+    `rdna2_decode_one`'s length rules change, this walk needs a matching update or it can silently
+    fall out of sync. #3040's own suggested fix (teaching `shader_histo` to emit real per-instruction
+    MIMG sites and having `scan.py` consume that) removes the duplication entirely and remains the
+    more robust long-term direction; this is the length-aware fix within the existing Python-only
+    tool, not a replacement for that suggestion.
+
+    RDNA2 ISA reference: AMD document 70648 ("RDNA 2" Instruction Set Architecture: Reference Guide).
+    """
+    n = len(words)
+    w = words[i]
+    max_dwords = n - i
+
+    if (w & 0x80000000) == 0:
+        # Vector ALU group (bit31 == 0): VOP1 (0x7E prefix), VOPC (0x7C prefix), else VOP2.
+        is_vop2 = (w & 0xFE000000) != 0x7E000000 and (w & 0xFE000000) != 0x7C000000
+        src0 = w & 0x1FF
+        # A VOP src0 field selects an extra dword four ways: 0xFF = trailing literal; 0xF9 = SDWA,
+        # 0xFA = DPP16, 0xE9/0xEA = DPP8 = a control word. All make the instruction 2 dwords.
+        if src0 in (0xF9, 0xFA, 0xE9, 0xEA):
+            length = 2 if max_dwords >= 2 else 1
+        else:
+            lit = (src0 == 0xFF)
+            if is_vop2:
+                # The six K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K:
+                # v_madmk_f32(0x20) v_madak_f32(0x21) v_fmamk_f32(0x2C) v_fmaak_f32(0x2D)
+                # v_fmamk_f16(0x37) v_fmaak_f16(0x38).
+                if ((w >> 25) & 0x3F) in (0x20, 0x21, 0x2C, 0x2D, 0x37, 0x38):
+                    lit = True
+            length = (2 if max_dwords >= 2 else 1) if lit else 1
+        return Step(min(length, max_dwords))
+
+    if (w & 0xC0000000) == 0x80000000:
+        # Scalar group (bits[31:30] == 10): SOPP/SOPC/SOP1/SOPK carved out before the SOP2 default.
+        if (w & 0xFF800000) == 0xBF800000:
+            return Step(min(1, max_dwords), is_end=(w == S_ENDPGM))
+        if (w & 0xFF800000) == 0xBF000000:      # SOPC
+            lit = _sop_has_literal(w, 2)
+        elif (w & 0xFF800000) == 0xBE800000:    # SOP1
+            lit = _sop_has_literal(w, 1)
+        elif (w & 0xF0000000) == 0xB0000000:    # SOPK, except S_SETREG_IMM32_B32 (opcode 21) whose
+            lit = ((w >> 23) & 0x1F) == 21       # 32-bit register data trails as a mandatory literal.
+        else:                                    # SOP2
+            lit = _sop_has_literal(w, 2)
+        length = (2 if max_dwords >= 2 else 1) if lit else 1
+        return Step(min(length, max_dwords))
+
+    # Remaining top-bit patterns (bits[31:30] == 11) dispatch on dword0[31:26].
+    bucket = w >> 26
+    if bucket == 0x32:                                          # VINTRP
+        return Step(min(1, max_dwords))
+    if bucket in (0x33, 0x34, 0x35):                             # VOP3P, VOP3 (old-gen/RDNA2)
+        # 2 dwords, plus a trailing literal when any of dword1's three 9-bit src fields is 0xFF.
+        if max_dwords < 2:
+            return Step(min(1, max_dwords))
+        d1 = words[i + 1]
+        lit = ((d1 & 0x1FF) == 0xFF or ((d1 >> 9) & 0x1FF) == 0xFF or ((d1 >> 18) & 0x1FF) == 0xFF)
+        length = 3 if (lit and max_dwords >= 3) else 2
+        return Step(min(length, max_dwords))
+    if bucket in (0x36, 0x37, 0x38, 0x3A, 0x3D, 0x3E):           # DS, FLAT, MUBUF, MTBUF, SMEM, EXP
+        return Step(min(2, max_dwords) if max_dwords >= 2 else 1)
+    if bucket == MIMG_ENCODING:                                  # 0x3C -- MIMG
+        # 2 dwords, plus NSA (Non-Sequential Address) extra dwords holding the split address VGPRs.
+        # dword0[2:1] gives the extra-dword count (0..3), so total length is 2..5 dwords. Opcode and
+        # DIM are both dword0-only fields, so they are exact even when the buffer ends mid-instruction.
+        extra = (w >> 1) & 0x3
+        opcode = ((w & 1) << 7) | ((w >> 18) & 0x7F)
+        dim = (w >> 3) & 0x7
+        return Step(min(2 + extra, max_dwords), is_mimg=True, opcode=opcode, dim=dim)
+    return Step(min(1, max_dwords), is_unknown=True)
 
 
 def decode_mimg_sites(raw: bytes):
-    """(dword_index, opcode, dim) for every dword matching the MIMG encoding."""
+    """(dword_index, opcode, dim) for every MIMG instruction found by a LENGTH-AWARE walk of `raw`.
+
+    Each dword is visited only once, as either the first dword of an instruction (tested for MIMG-
+    ness) or an operand/literal dword of the instruction that precedes it (never tested) -- see
+    `rdna2_instr_len`. The walk stops at `s_endpgm` or an undecodable encoding, exactly as
+    `rdna2_walk` does, since nothing after either is reachable guest code.
+    """
     n = len(raw) // 4
     if not n:
         return []
     words = struct.unpack(f"<{n}I", raw[:n * 4])
     out = []
-    for i, w in enumerate(words):
-        if (w >> 26) != MIMG_ENCODING:
-            continue
-        # opcode spans a split field, exactly as rdna2_decode.cpp reconstructs it.
-        out.append((i, ((w & 1) << 7) | ((w >> 18) & 0x7F), (w >> 3) & 0x7))
+    pc = 0
+    while pc < n:
+        step = rdna2_instr_len(words, pc)
+        if step.is_mimg:
+            out.append((pc, step.opcode, step.dim))
+        if step.length <= 0:
+            break                                # safety: never loop on a zero-length step
+        pc += step.length
+        if step.is_end or step.is_unknown:
+            break
     return out
 
 
 def decode_mimg(raw: bytes):
     """Every MIMG instruction in a raw RDNA2 shader, as (opcode, dim).
 
-    This is an OVER-APPROXIMATION and the direction of the error is the whole basis for trusting a
-    clean result. A correct walk needs per-instruction lengths (prosper's own `rdna2_decode.cpp`
-    has them, and records what mis-sizing costs: "the extra dword is mis-decoded as a phantom
-    instruction, derailing the stream walk"). Without them, a literal constant whose top six bits
-    read as the MIMG encoding looks like an instruction start.
-
-    So: this finder can invent an MIMG that is not there, and CANNOT hide one that is. A finding is
-    a candidate to confirm; a clean result IS sound for the classes checked.
-
-    **Every dword is tested, including the one after a match.** An earlier revision skipped it, on
-    the reasoning that MIMG is at minimum two dwords so its dword1 cannot start an instruction.
-    That is true of a REAL MIMG and false of a phantom -- and it broke the property above, which is
-    the only reason a clean result means anything. Review of #3039 demonstrated it end to end: a
-    `v_mov_b32 v0, 0xF0000000` whose literal aliases the encoding, immediately followed by a genuine
-    `image_sample dim:2D_ARRAY` against a non-arrayed image -- the literal #325 defect -- scanned
-    CLEAN, because the phantom consumed the real instruction. The skip also bought almost nothing:
-    the false positives it removed need a real MIMG dword1 with the reserved bits 28/29 set, which
-    prosper's own decoder rejects (`rdna2_decode.cpp:901`), and `classify()` already collapses
-    repeated hits of one class into a single finding.
+    A length-aware walk (see `decode_mimg_sites`) can only ever test a dword for the MIMG encoding
+    when it is genuinely the first dword of an instruction, so it can neither invent an MIMG from an
+    operand/literal dword (#3040) nor let a phantom match swallow a real one that follows it (#3039;
+    both directions are exercised in `self_test`).
     """
     return [(op, dim) for _, op, dim in decode_mimg_sites(raw)]
-
-
-def phantom_risk(raw: bytes):
-    """Candidates sitting immediately after another candidate.
-
-    Real MIMG instructions are at minimum two dwords, so back-to-back matches mean at least one of
-    them is an operand or literal misreading as an instruction. This does not identify WHICH, and a
-    zero here does not certify the rest -- it is a "this shader's findings deserve extra suspicion"
-    signal, reported per shader in --json and never used to suppress a finding.
-    """
-    idx = [i for i, _, _ in decode_mimg_sites(raw)]
-    return sum(1 for a, b in zip(idx, idx[1:]) if b - a == 1)
 
 
 def parse_spirv_images(dis: str):
@@ -280,10 +373,8 @@ def scan_capture(replay, capture, tmp):
             continue
         types, arities = parse_spirv_images(dis.stdout)
         examined += 1
-        risk = phantom_risk(raw)
         for f in classify(mimg, types, arities):
-            f.update(capture=os.path.basename(capture), draw=draw, stage=stage, shader=sh,
-                     phantom_risk=risk)
+            f.update(capture=os.path.basename(capture), draw=draw, stage=stage, shader=sh)
             findings.append(f)
     return dict(examined=examined, skipped=skipped, findings=findings,
                 skip_reasons=skip_reasons), None
@@ -379,18 +470,46 @@ def self_test():
     check(decode_mimg(struct.pack("<II", 0xF4800028, 0)) == [],
           "encoding 0b111101 is NOT MIMG (pins MIMG_ENCODING against an off-by-one)")
     check(decode_mimg(struct.pack("<I", 0x12345678)) == [], "a non-MIMG word decodes to nothing")
-    check(decode_mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5), (0x20, 5)],
-          "EVERY dword is tested, including the one after a match -- skipping it lets a phantom "
-          "swallow a real MIMG, which is what makes a clean result unsound")
-    check(phantom_risk(struct.pack("<II", 0xF0800028, 0xF0800028)) == 1
-          and phantom_risk(struct.pack("<II", 0xF0800028, 0)) == 0,
-          "phantom_risk counts back-to-back candidates and is 0 for an isolated one")
+    # A real 2-dword MIMG's SECOND dword (VADDR/SRSRC/SSAMP operand fields) is consumed as part of
+    # that SAME instruction by the length-aware walk, not re-tested as a new instruction start --
+    # #3040. This is the load-bearing behavior change from the pre-#3040 walk, which tested every
+    # dword unconditionally and would have reported TWO hits here.
+    check(decode_mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5)],
+          "a real MIMG's own dword1 is consumed by that instruction, not read as a second one (#3040)")
     # The exact sequence review of #3039 used: a literal aliasing the encoding, then a REAL
-    # 2D_ARRAY sample. The real one must survive the phantom.
+    # 2D_ARRAY sample. The real one must survive the phantom, AND (#3040) the phantom itself must be
+    # gone: `0x7E0002FF` is `v_mov_b32 v0, <literal>` (VOP1, src0=0xFF forces a trailing literal), so
+    # the length-aware walk consumes dwords 0-1 as ONE instruction and never tests dword1 in
+    # isolation -- unlike the pre-#3040 walk, which read dword1 as its own MIMG candidate (DIM 0).
     swallow = struct.pack("<III", 0x7E0002FF, 0xF0000000, 0xF0800028)
-    check((0x20, 5) in decode_mimg(swallow),
-          "a real MIMG immediately after an aliasing literal is still found")
+    check(decode_mimg(swallow) == [(0x20, 5)],
+          "a real MIMG immediately after an aliasing literal is found, and ONLY it is (#3039 + #3040)")
     check(decode_mimg(b"") == [] and decode_mimg(b"\x01\x02") == [], "short/empty input is safe")
+
+    # --- #3040's own positive control, built BY HAND rather than from `MIMG_ENCODING`/`DIM_ARRAYED`
+    # (a same-source control tests the discriminator, not the domain -- see CLAUDE.md). This is a
+    # single real instruction -- `v_mov_b32 v0, 0xF0000028` (VOP1, forced literal) -- and NO MIMG
+    # instruction anywhere in it. The literal's value is hand-picked so ITS OWN top 6 bits alias the
+    # MIMG encoding (0b111100) with DIM=5 (2D_ARRAY, an arrayed shape) sitting in bits [5:3]: exactly
+    # the pattern a dword-by-dword scan mistakes for `image_sample dim:2D_ARRAY`. Before #3040, this
+    # decoded as one MIMG finding and classify() reported a phantom `array-layer-dropped` defect
+    # against a "shader" that samples no image at all.
+    phantom_literal = struct.pack("<II", 0x7E0002FF, 0xF0000028)
+    check(decode_mimg(phantom_literal) == [],
+          "a literal operand aliasing an ARRAYED MIMG encoding is not read as an instruction (#3040)")
+    check(classify(decode_mimg(phantom_literal), [("2D", 0)], []) == [],
+          "...and so the full pipeline reports no phantom array-layer-dropped finding either")
+
+    # --- NSA (Non-Sequential Address) length: a real MIMG can be 2-5 dwords (dword0[2:1] gives the
+    # extra-dword count), and each extra dword must be skipped too, not just dword1. Here the NSA
+    # instruction's own extra dwords are themselves crafted to alias the MIMG encoding -- if the walk
+    # advanced by a fixed 2 dwords instead of reading the NSA field, it would misread them as two
+    # more (phantom) MIMG instructions, and would then desync and miss the real one that follows.
+    nsa_dim1 = 0xF0000000 | (1 << 1) | (1 << 3)          # MIMG, NSA=1 extra dword, DIM=1 (plain 2D)
+    nsa = struct.pack("<IIII", nsa_dim1, 0xF0800028, 0xF0800028, 0xF0800028)
+    check(decode_mimg_sites(nsa) == [(0, 0x00, 1), (3, 0x20, 5)],
+          "NSA's extra dwords (dword0[2:1]) are skipped, not read as instructions, and the real MIMG "
+          "that follows is found at the correct offset (#3040)")
 
     # --- SPIR-V parse, both directions.
     arrayed = "%1 = OpTypeImage %float 2D 0 1 0 1 Unknown"
@@ -542,10 +661,11 @@ def main():
               f"captures unscannable: {len(failed)}")
         print(f"shaders with a mismatch: {len(all_f)}")
         if all_f:
-            print("\nFindings are an OVER-APPROXIMATION -- the ISA walk is not length-aware, so a\n"
-                  "literal dword can read as an instruction. Confirm each before acting on it.\n"
-                  "A CLEAN result is sound for these classes: a superset that found nothing means\n"
-                  "there was nothing to find.")
+            print("\nConfirm each finding before acting on it -- classify() is a module-wide match (any\n"
+                  "declared image of the wrong shape clears every guest sample of that shape in the\n"
+                  "module, not just the one it actually resolved to), so a finding can still be a false\n"
+                  "positive for THAT sample even though the ISA walk itself is length-aware (#3040) and\n"
+                  "cannot invent an instruction from an operand or literal dword.")
         if barren:
             print(f"\nNOT A CLEAN RESULT -- {len(barren)} capture(s) yielded zero examined shaders:",
                   file=sys.stderr)
