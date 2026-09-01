@@ -8,13 +8,58 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <string>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+#ifdef _WIN32
+static int test_fileno(FILE* stream) { return _fileno(stream); }
+static int test_dup(int descriptor) { return _dup(descriptor); }
+static int test_dup2(int source, int destination) { return _dup2(source, destination); }
+static void test_close(int descriptor) { _close(descriptor); }
+#else
+static int test_fileno(FILE* stream) { return fileno(stream); }
+static int test_dup(int descriptor) { return dup(descriptor); }
+static int test_dup2(int source, int destination) { return dup2(source, destination); }
+static void test_close(int descriptor) { close(descriptor); }
+#endif
+
+// Redirects stderr to a temp file for the duration of `action`, then returns everything written to
+// it. Used by the #3143 regression below to see whether [mimg-unresolved] survives PROSPER_MIMG_SOFT.
+template <typename Fn>
+static std::string capture_stderr(Fn&& action) {
+    FILE* capture = std::tmpfile();
+    if (!capture) return {};
+    std::fflush(stderr);
+    const int stderr_fd = test_fileno(stderr);
+    const int saved_fd = test_dup(stderr_fd);
+    if (saved_fd < 0 || test_dup2(test_fileno(capture), stderr_fd) < 0) {
+        if (saved_fd >= 0) test_close(saved_fd);
+        std::fclose(capture);
+        return {};
+    }
+    action();
+    std::fflush(stderr);
+    test_dup2(saved_fd, stderr_fd);
+    test_close(saved_fd);
+    std::rewind(capture);
+    std::string output;
+    char chunk[2048];
+    while (const size_t bytes = std::fread(chunk, 1, sizeof(chunk), capture))
+        output.append(chunk, bytes);
+    std::fclose(capture);
+    return output;
+}
 
 int main() {
     printf("== test_recompile_coverage ==\n");
@@ -2982,6 +3027,67 @@ int main() {
     CHECK(typed_pcrel_folds(pcrel_table_vs_typed_branch_entry,
                             std::size(pcrel_table_vs_typed_branch_entry)) == 0,
           "detector: a branch entering after the s_getpc is refused (#2862)");
+
+    // #3143: PROSPER_MIMG_SOFT must not blind the operator to WHICH descriptor failed to resolve.
+    // [mimg-unresolved] is the only diagnostic that names the failing srsrc/provenance; it used to be
+    // printed only downstream of the soft path's own early return, so arming the switch to see
+    // whether softening changes a frame ALSO deleted the one line that would say what got softened.
+    // Build a program whose single MIMG op cannot resolve against an empty resource table (no
+    // fetch-pc key, no SRT tag, and the SRSRC range was never written so the sgpr_base fallback also
+    // misses), and prove [mimg-unresolved] survives PROSPER_MIMG_SOFT while [mimg-soft] -- the
+    // existing confirmation that a constant was substituted -- keeps firing too.
+    {
+        const uint32_t mimg_unresolved_probe[] = {
+            0x7E080300u,               // v_mov_b32 v4, v0 (1D image coordinate)
+            0xF0000F00u, 0x00000004u,  // image_load v[0:3], v4, s[0:7], dmask:0xf dim:1D
+            0xBF810000u,               // s_endpgm
+        };
+        ShaderResourceTable empty_rt; // deliberately no resources: s[0:7] resolves to nothing.
+        ComputeShaderConfig probe_config;
+        probe_config.user_sgprs.resize(16);
+
+        // Reject path (PROSPER_MIMG_SOFT unset): a sanity check that the reordering in emit_alu.cpp
+        // did not also break the reject path's own (pre-existing) reporting.
+#ifdef _WIN32
+        _putenv_s("PROSPER_MIMG_SOFT", "");
+#else
+        unsetenv("PROSPER_MIMG_SOFT");
+#endif
+        const std::string reject_log = capture_stderr([&] {
+            std::vector<uint32_t> spv = recompile_compute(
+                mimg_unresolved_probe, std::size(mimg_unresolved_probe), &empty_rt, probe_config,
+                RecompileDiagnosticContext{RecompileDiagnosticStage::Compute, 0x3143a1ull});
+            CHECK(spv.empty(), "an unresolved MIMG descriptor rejects the compile");
+        });
+        CHECK(reject_log.find("[mimg-unresolved]") != std::string::npos,
+              "reject path reports which descriptor failed to resolve (sanity)");
+
+        // Soft path (PROSPER_MIMG_SOFT=1): the switch must still soften (compile succeeds AND
+        // [mimg-soft] confirms the substitution, both unchanged), but [mimg-unresolved] must now
+        // ALSO appear -- this is the exact assertion that fails without the #3143 fix, since the old
+        // code returned from the soft branch before ever reaching that report.
+#ifdef _WIN32
+        _putenv_s("PROSPER_MIMG_SOFT", "1");
+#else
+        setenv("PROSPER_MIMG_SOFT", "1", 1);
+#endif
+        const std::string soft_log = capture_stderr([&] {
+            std::vector<uint32_t> spv = recompile_compute(
+                mimg_unresolved_probe, std::size(mimg_unresolved_probe), &empty_rt, probe_config,
+                RecompileDiagnosticContext{RecompileDiagnosticStage::Compute, 0x3143a2ull});
+            CHECK(!spv.empty(), "PROSPER_MIMG_SOFT still substitutes a constant and compiles");
+        });
+#ifdef _WIN32
+        _putenv_s("PROSPER_MIMG_SOFT", "");
+#else
+        unsetenv("PROSPER_MIMG_SOFT");
+#endif
+        CHECK(soft_log.find("[mimg-soft]") != std::string::npos,
+              "PROSPER_MIMG_SOFT still confirms it substituted a constant (unchanged behaviour)");
+        CHECK(soft_log.find("[mimg-unresolved]") != std::string::npos,
+              "#3143: PROSPER_MIMG_SOFT must not suppress [mimg-unresolved] -- the failing "
+              "descriptor must stay identifiable even when the failure is softened");
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
