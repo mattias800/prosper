@@ -75,9 +75,13 @@ jobs:
       # one — the same shape as #1711, where a `spirv-val` gate reported PASS with no validator
       # present.
       #
-      # Both binaries come from the `spirv-tools` package this workflow installs, so the realistic
-      # way to lose it is that install being dropped or renamed — a change that would otherwise
-      # leave the suite green.
+      # What actually stays green is NARROWER than "the spirv-tools install is dropped", and the
+      # distinction matters because the broad version makes this guard look redundant. Dropping the
+      # whole package turns the job red anyway: `spv_validate` is registered unconditionally and
+      # hard-fails when `spirv-val` is missing (tools/spv_validate/spv_validate.cpp:306-315 -- a
+      # deliberate fix, since it once printed PASS with no validator). The cases this guard is the
+      # only cover for are the ones that leave `spirv-val` present: `spirv-as` alone disappearing
+      # or being renamed, `python3` absent, or the CMake gate itself being edited.
       - name: Verify the spirv-tools-gated control check is actually registered
         run: |
           if ! ctest --test-dir prosper/build-ci -N -R '^vkprobe_hand_written_controls$' | grep -q "Test *#"; then
