@@ -2915,13 +2915,24 @@ HLE(k_ef_delete)  {
 }
 HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); interruptible_mutex_lock(&e->m); e->bits |= a1; interruptible_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; interruptible_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
-// Absolute CLOCK_REALTIME deadline `usec` microseconds from now (for pthread_cond_timedwait
-// on default-attr condvars, which time against CLOCK_REALTIME).
+// A guest RELATIVE microsecond timeout as an absolute CLOCK_REALTIME deadline, for the host
+// primitives that take one (pthread_mutex_timedlock, pthread_rwlock_timed*, sem_timedwait).
+//
+// The arithmetic itself is prosper::host::abs_deadline_from_rel_us in precise_sleep.hpp, beside the
+// rest of this family's pure timing decisions (#3069, #3074): expressed on int64 fields it is
+// testable with a fake clock on any host, and it saturates rather than wrapping on a guest-supplied
+// microsecond count. This wrapper is the host-`struct timespec` adapter its callers still need.
+//
+// CLOCK_REALTIME and not a steady clock, because that is the clock the host timed-wait primitives
+// below measure their absolute deadline against; a wall-clock jump therefore shifts these waits.
+// The CONDITION waits no longer come through here -- they resolve the guest condvar's own clock
+// instead (#3056) -- so what remains exposed is the mutex/rwlock family, unchanged.
 static timespec abs_deadline_us(uint64_t usec) {
     timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += (time_t)(usec / 1000000u);
-    ts.tv_nsec += (long)(usec % 1000000u) * 1000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    const prosper::host::WaitDeadline dl = prosper::host::abs_deadline_from_rel_us(
+        prosper::host::WaitDeadline{(int64_t)ts.tv_sec, (int64_t)ts.tv_nsec}, usec);
+    ts.tv_sec = (time_t)dl.sec;
+    ts.tv_nsec = (long)dl.nsec;   // normalized to [0, 1e9), so the host's 32-bit long cannot truncate
     return ts;
 }
 // scePthreadMutexTimedlock(mutex, SceKernelUseconds usec): acquire with a RELATIVE microsecond timeout,
@@ -2936,7 +2947,10 @@ static timespec abs_deadline_us(uint64_t usec) {
 HLE(k_mutex_timedlock) {
     auto* m = ensure_mutex(a0); if (!m) return prosper::hle::kSceKernelErrorEINVAL;
     if (guest_mutex_self_deadlock(m)) return prosper::hle::kSceKernelErrorEDEADLK;
-    hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock, a1 * 1000ull);
+    // Saturating for the same reason k_sem_timedwait's is (#3022's rule for the whole family):
+    // `a1 * 1000` wraps for a guest-supplied microsecond count above ~1.8e16.
+    hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock,
+                                prosper::host::timeout_ns_from_us(a1));
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_mutex_timedlock(m, &dl);
     if (rc == 0) guest_mutex_acquired(m);
@@ -2962,15 +2976,47 @@ HLE(k_cond_timedwait_sce) {
     // host already implements the FreeBSD contract itself.
     if (guest_mutex_not_owned_by_self(m)) return prosper::hle::kSceKernelErrorEPERM;
     GuestCondWaiterScope waiting(c);   // #2168: this body parks too, and was not counted either
+    // #3056: the relative interval is measured on the CONDVAR'S OWN CLOCK, which is what its POSIX
+    // sibling k_cond_timedwait already does (guest_cond_snapshot -> interruptible_cond_clock_timedwait).
+    // This spelling used to hardcode CLOCK_REALTIME through abs_deadline_us(), so the SAME condition
+    // variable answered the same question two different ways depending on which name the guest
+    // called -- the divergence class #1873 records, here between two spellings rather than two
+    // libraries. It matters most for SCE_KERNEL_CLOCK_VIRTUAL/PROF, where the guest asked for an
+    // interval of process CPU time and got one of wall-clock time: a mostly-blocked thread then
+    // times out far too early. For SCE_KERNEL_CLOCK_MONOTONIC it removes a wall-clock-jump exposure
+    // the interval never had on hardware.
+    //
+    // For the DEFAULT realtime clock this is the identical path it always took:
+    // interruptible_cond_clock_timedwait forwards a realtime deadline straight to
+    // interruptible_cond_timedwait. So nothing changes for a title that never sets a condattr clock
+    // -- including the Blasphemous 2 census #3056 was filed from.
+    const int32_t clock_id = guest_cond_snapshot(c).clock_id;
+    timespec now{};
+    if (const int clock_rc = guest_cond_clock_now(clock_id, now))
+        return sce_pthread_rc(fbsd_errno(clock_rc));
+    const prosper::host::WaitDeadline abs = prosper::host::abs_deadline_from_rel_us(
+        prosper::host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec}, a2);
+    const timespec dl{(time_t)abs.sec, (long)abs.nsec};
     // Censused separately from k_cond_timedwait: this is the Sony spelling and its timeout is
     // RELATIVE microseconds, so unlike the POSIX abstime form it yields an exact requested
     // interval. Leaving it out made the census report a clean zero for cond waits on titles
     // that only ever call this one, which is the shape CLAUDE.md warns about: the null was
     // about the bodies instrumented, not about the guest.
-    hle::WaitCensusScope census(hle::WaitKind::CondTimedwaitSce, a2 * 1000ull);
-    timespec dl = abs_deadline_us(a2);
-    int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
-                                          nullptr, kGuestMutexCondWaitBookkeeping);
+    //
+    // The scope opens HERE, after the clock read that can fail, not before it: an early return
+    // would otherwise record a call with the guest's full requested interval and an actual duration
+    // of nothing, pulling the reported ratio toward zero on a path where no wait happened at all.
+    // An instrument that counts its own failures as fast waits is the shape CLAUDE.md's trap list
+    // exists for (raised in review of #3235). The clock read it now excludes is a few hundred
+    // nanoseconds against a millisecond-scale request.
+    //
+    // The requested value is SATURATING, matching guest_ns_from in hle_kernel_time.cpp and
+    // k_sem_timedwait above: a2 is guest-controlled and `a2 * 1000` wraps above ~1.8e16 us, which
+    // would report a 5,800-year request as a short one.
+    hle::WaitCensusScope census(hle::WaitKind::CondTimedwaitSce,
+                                prosper::host::timeout_ns_from_us(a2));
+    int rc = interruptible_cond_clock_timedwait(c, m, dl, clock_id, nullptr,
+                                                kGuestMutexCondWaitBookkeeping);
     // sce_pthread_rc passes the already-encoded ETIMEDOUT through untouched, and encodes the rest.
     return sce_pthread_rc(rc == ETIMEDOUT ? prosper::hle::kSceKernelErrorETIMEDOUT : fbsd_errno(rc));
 }

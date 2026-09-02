@@ -186,4 +186,104 @@ constexpr SemPollStep sem_poll_step(uint64_t start_ns, uint64_t deadline_ns, uin
     return {false, now_ns + poll_slice_ns(elapsed_ns, deadline_ns - now_ns)};
 }
 
+// ---------------------------------------------------------------------------
+// The RELATIVE-microsecond timed waits' deadline arithmetic (#3056).
+//
+// scePthreadCondTimedwait, scePthreadMutexTimedlock and scePthreadRwlockTimedrd/wrlock all take a
+// RELATIVE microsecond scalar and have to turn it into an absolute deadline; the Windows condition
+// wait then has to turn that absolute deadline BACK into the whole-millisecond count WaitOnAddress
+// accepts. Both halves used to be inline -- the first in hle_kernel.cpp's abs_deadline_us(), the
+// second inside sync_futex.cpp's `#ifdef _WIN32` branch, which a POSIX host cannot even compile.
+// Extracted here for the same reason, and tested the same way, as sem_poll_step() above (#3069) and
+// sleep_until_deadline_retry() (#3074): a fake clock reaches every case, where timing the real HLE
+// reaches almost none of them.
+//
+// Fields are int64_t rather than a host `struct timespec`, deliberately. The guest is FreeBSD
+// x86-64, where tv_nsec is 64-bit, while MinGW-w64 declares `long tv_nsec` -- 32 bits on Windows
+// x64. #3038 records the truncation that costs the select()/pselect() callers; arithmetic written
+// on explicit 64-bit fields cannot acquire it, and the same expression is then exercised on both
+// platforms rather than only on the one that happens to be wide enough.
+struct WaitDeadline {
+    int64_t sec = 0;
+    int64_t nsec = 0;   // [0, 1e9) on every value these functions RETURN; see normalize_wait_deadline
+};
+
+// Carry an out-of-range nanosecond field into the seconds, saturating rather than wrapping at
+// either end. Every production caller hands in a clock_gettime() result, which is already
+// normalized -- this exists so the functions below are TOTAL, i.e. so a test may drive them with a
+// fake clock that is not, and so a garbage guest value cannot reach the arithmetic below unnormalized.
+constexpr WaitDeadline normalize_wait_deadline(WaitDeadline t) {
+    constexpr int64_t kNsPerSec = 1000000000ll;
+    if (t.nsec >= 0 && t.nsec < kNsPerSec) return t;
+    int64_t carry = t.nsec / kNsPerSec;
+    int64_t nsec = t.nsec - carry * kNsPerSec;
+    if (nsec < 0) { nsec += kNsPerSec; carry -= 1; }
+    if (carry > 0 && t.sec > INT64_MAX - carry) return WaitDeadline{INT64_MAX, kNsPerSec - 1};
+    if (carry < 0 && t.sec < INT64_MIN - carry) return WaitDeadline{INT64_MIN, 0};
+    return WaitDeadline{t.sec + carry, nsec};
+}
+
+// `now` + `usec`, saturating at INT64_MAX seconds.
+//
+// The saturation is the rule guest_ns_from() (#3022) and timeout_ns_from_us() (#3069) already state
+// for this family: the microsecond count arrives straight from a guest register, and a wrap turns a
+// very long wait into an instant one. On this platform the addition happens to be unreachable --
+// UINT64_MAX microseconds is 5.8e5 years of seconds against int64's 2.9e11 -- so this arm is a
+// consistency guard, not a live defect, and saying which it is matters more than having it.
+constexpr WaitDeadline abs_deadline_from_rel_us(WaitDeadline now, uint64_t usec) {
+    constexpr int64_t kNsPerSec = 1000000000ll;
+    constexpr WaitDeadline kSaturated{INT64_MAX, kNsPerSec - 1};
+    const WaitDeadline base = normalize_wait_deadline(now);
+    // < 1e9 + 1e9, so this cannot overflow whatever the guest passed.
+    int64_t nsec = base.nsec + (int64_t)(usec % 1000000ull) * 1000ll;
+    int64_t sec = base.sec;
+    if (nsec >= kNsPerSec) {
+        nsec -= kNsPerSec;
+        if (sec == INT64_MAX) return kSaturated;
+        sec += 1;
+    }
+    const uint64_t whole_seconds = usec / 1000000ull;
+    if (sec >= 0 && whole_seconds > (uint64_t)(INT64_MAX - sec)) return kSaturated;
+    return WaitDeadline{sec + (int64_t)whole_seconds, nsec};
+}
+
+// Whole milliseconds from `now` to `deadline`, ROUNDED UP, saturating at `max_ms`, and exactly zero
+// when the deadline is already at or in the past. Feeds WaitOnAddress's DWORD timeout.
+//
+// ROUNDING UP IS THE LOAD-BEARING HALF, and it is a contract rather than a preference:
+// pthread_cond_timedwait must not report ETIMEDOUT before its deadline has passed, so the conversion
+// may never round a positive remainder down to zero. It is also the whole of the sub-millisecond
+// overshoot this call has on Windows -- a 0.818 ms request becomes a 1 ms wait (#3056) -- which is
+// worth knowing is INTENTIONAL before anyone reads the census ratio as an arithmetic bug.
+//
+// `max_ms` is a parameter rather than INFINITE-1 baked in, so the saturation is reachable from a
+// test without INFINITE (a Windows macro) appearing in this header.
+constexpr uint64_t wait_timeout_ms_ceil(WaitDeadline now, WaitDeadline deadline, uint64_t max_ms) {
+    constexpr int64_t kNsPerSec = 1000000000ll;
+    const WaitDeadline a = normalize_wait_deadline(now);
+    const WaitDeadline b = normalize_wait_deadline(deadline);
+    if (b.sec < a.sec) return 0;
+    // Unsigned subtraction of the two's-complement patterns is the EXACT difference here, and is
+    // well-defined for every pair: b.sec >= a.sec, so the mathematical difference is in [0, 2^64),
+    // where the signed subtraction would overflow for a span wider than INT64_MAX.
+    uint64_t seconds = (uint64_t)b.sec - (uint64_t)a.sec;
+    int64_t nanos = b.nsec - a.nsec;            // both normalized, so in (-1e9, 1e9)
+    if (nanos < 0) {
+        if (seconds == 0) return 0;             // deadline strictly in the past
+        nanos += kNsPerSec;
+        seconds -= 1;
+    }
+    // Bound BEFORE multiplying, so `seconds * 1000` cannot overflow for any span...
+    if (seconds > max_ms / 1000ull) return max_ms;
+    const uint64_t whole_ms = seconds * 1000ull;                       // <= max_ms, by the bound
+    const uint64_t frac_ms = ((uint64_t)nanos + 999999ull) / 1000000ull;   // 0..1000
+    // ...and bound the SUM the same way rather than adding and clamping afterwards. A trailing
+    // `ms > max_ms ? max_ms : ms` looks equivalent and is not: for a max_ms near UINT64_MAX the
+    // addition itself wraps, and the clamp then reads a tiny number as being under the limit.
+    // Unreachable from the one production caller, which passes INFINITE-1 -- but a function whose
+    // whole purpose is to saturate should not have a reachable-only-by-luck wrap in it (raised in
+    // review of #3235).
+    return frac_ms > max_ms - whole_ms ? max_ms : whole_ms + frac_ms;
+}
+
 }  // namespace prosper::host

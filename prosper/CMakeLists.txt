@@ -711,6 +711,20 @@ if(TARGET prosper_core)
   add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
   target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
   add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
+
+  # scePthreadCondTimedwait resolves the CONDVAR'S clock for its relative microsecond timeout
+  # (#3056), which its POSIX sibling already did and this spelling did not. CROSS-PLATFORM, and
+  # deliberately so: the defect is in the shared HLE body, not in either platform's wait primitive,
+  # and the discriminator (SCE_KERNEL_CLOCK_VIRTUAL is process CPU time, so an idle wait cannot
+  # reach its deadline) reads a RETURN VALUE rather than a duration. See the test's own header for
+  # why realtime and monotonic clocks cannot discriminate anything here.
+  add_executable(test_kernel_cond_timedwait_clock tests/hle/kernel/test_kernel_cond_timedwait_clock.cpp)
+  target_link_libraries(test_kernel_cond_timedwait_clock PRIVATE prosper_core)
+  add_test(NAME kernel_cond_timedwait_clock COMMAND test_kernel_cond_timedwait_clock)
+  # Bounded: the arm parks a worker on a condvar whose deadline an idle process cannot reach, and
+  # relies on the main thread's signal to release it. A regression that loses the signal would
+  # otherwise hang the suite rather than fail it.
+  set_tests_properties(kernel_cond_timedwait_clock PROPERTIES TIMEOUT 60)
   # Bounded for the same reason as the nanosleep case: the fixed path returns in ~5 ms, so a
   # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
   # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.

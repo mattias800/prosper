@@ -4,7 +4,9 @@
 #endif
 #include "hle/sync/sync_futex.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "host/platform/precise_sleep.hpp"   // #3056: the ms conversion, and a relock that is not on the tick
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,12 @@ namespace prosper {
 namespace {
 std::atomic<int> g_waiters{0};
 #ifdef _WIN32
+// Nanoseconds on std::chrono::steady_clock's epoch -- the same reading
+// prosper::host::sleep_until_steady_ns takes as its deadline (#3056).
+inline uint64_t steady_now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 struct WaitSlot {
     std::atomic<uint64_t> publication{0};
     uint64_t next_publication = 0; // written only while publication holds the exclusive sentinel
@@ -371,18 +379,75 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
 
+    // Give the wait a POST-CONDITION it can be held to: never report ETIMEDOUT before the interval
+    // the guest asked for has actually elapsed. The single-shot form had none and could not state
+    // one -- it made one OS wait and reported ETIMEDOUT for whatever came back, including a FALSE
+    // that is not a timeout at all. A guest reads ETIMEDOUT as "it did not happen", so an early one
+    // is a false negative rather than imprecision. This is the shape sleep_until_steady_ns()
+    // composes for exactly the same reason (#3074): a single OS wait is not trusted to satisfy the
+    // contract on its own, so the caller re-checks and re-arms.
+    //
+    // THE BUDGET IS COMPUTED ONCE FROM CLOCK_REALTIME AND THEN SPENT AGAINST steady_clock, and that
+    // split is the load-bearing part rather than an implementation detail. Re-reading
+    // CLOCK_REALTIME inside the loop would make the EXIT CONDITION depend on that clock's
+    // resolution: where it advances coarsely, a sub-millisecond wait would re-arm until it ticked,
+    // which is the tick quantization #3013 -> #3022 -> #3044 exists to remove, reintroduced by the
+    // loop meant to improve accuracy. Nothing in this tree measures mingw-w64's CLOCK_REALTIME
+    // resolution, so the loop must not depend on it. steady_clock is QueryPerformanceCounter and
+    // cannot fail to advance, so the loop is bounded by construction. Computing the budget once is
+    // also what the single-shot form did, so a wall-clock step DURING the wait changes nothing it
+    // did not already change.
+    //
+    // That substitution is only worth anything if steady_clock's OWN resolution is fine, and this
+    // tree does have evidence for that where it has none for CLOCK_REALTIME -- which is the point,
+    // not a detail. `kernel_sem_timedwait` drives a 5 ms guest wait through #3044's 500 us
+    // sleep_until_steady_ns slices, i.e. about ten steady_clock reads and ten short high-resolution
+    // sleeps, and the Windows MinGW CI job reports the whole case at **0.03 s**, measured by ctest
+    // from outside the process. A 15.6 ms-granular steady_clock cannot express a 500 us slice at
+    // all and would put that case above ~0.15 s. So the loop's exit condition rests on a clock this
+    // project measures rather than on one it assumes (raised in review of #3235).
+    //
+    // What this does NOT fix, stated because the mechanism is the same one: the INITIAL budget is
+    // still a difference of two CLOCK_REALTIME readings, so a coarse realtime clock can put it out
+    // by up to one of its ticks in either direction, exactly as before. Removing that needs the
+    // relative Sony form to stop round-tripping through an absolute realtime deadline, which is a
+    // change to this function's signature and its POSIX callers, not to its body.
+    //
+    // THE FIRST WaitOnAddress ALWAYS HAPPENS, even for a zero budget: that call is a value check as
+    // well as a wait, returning TRUE at once when the sequence already differs. Skipping it for an
+    // already-expired deadline would report ETIMEDOUT for a condvar that HAD been signalled --
+    // reachable, because dispatch_pending_guest_exception() above can run an entire guest handler
+    // between latching `expected` and reading the clock. A wake is otherwise reported as a wake
+    // immediately, spurious or not, so the guest-exception interruption path is untouched
+    // (interrupt_guest_wait wakes this address without changing its value).
+    //
+    // The conversion is prosper::host::wait_timeout_ms_ceil, in precise_sleep.hpp beside the rest of
+    // this family's pure arithmetic, so a fake-clock test reaches it on every host rather than only
+    // where this branch compiles (#3056). Its rounding UP is what keeps a sub-millisecond remainder
+    // from becoming a zero-millisecond wait.
     timespec now{};
     clock_gettime(CLOCK_REALTIME, &now);
-    int64_t sec = (int64_t)deadline->tv_sec - (int64_t)now.tv_sec;
-    int64_t nsec = (int64_t)deadline->tv_nsec - (int64_t)now.tv_nsec;
-    if (nsec < 0) { nsec += 1000000000; sec--; }
-    DWORD timeout = 0;
-    if (sec >= 0) {
-        uint64_t ms = (uint64_t)sec * 1000 + ((uint64_t)nsec + 999999) / 1000000;
-        timeout = ms >= (uint64_t)INFINITE ? INFINITE - 1 : (DWORD)ms;
+    uint64_t remaining_ms = host::wait_timeout_ms_ceil(
+        host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec},
+        host::WaitDeadline{(int64_t)deadline->tv_sec, (int64_t)deadline->tv_nsec},
+        (uint64_t)(INFINITE - 1));
+    // <= (INFINITE-1) * 1e6 ns, so neither the multiply nor the sum can wrap.
+    const uint64_t budget_end_ns = steady_now_ns() + remaining_ms * 1000000ull;
+    bool signaled = false;
+    for (;;) {
+        if (WaitOnAddress((volatile void*)&slot->sequence, &expected,
+                          sizeof(expected), (DWORD)remaining_ms) != FALSE) {
+            signaled = true;
+            break;
+        }
+        // Not a timeout: the wait did not happen and waiting again will not make it happen. Still
+        // reported as ETIMEDOUT, which is what the single-shot form did -- changing it to EINVAL
+        // would be a guest-visible contract change with no way to verify it from here.
+        if (GetLastError() != ERROR_TIMEOUT) break;
+        const uint64_t now_ns = steady_now_ns();
+        if (now_ns >= budget_end_ns) break;   // the budget really is spent -> ETIMEDOUT below
+        remaining_ms = (budget_end_ns - now_ns + 999999ull) / 1000000ull;
     }
-    const bool signaled = WaitOnAddress((volatile void*)&slot->sequence, &expected,
-                                        sizeof(expected), timeout) != FALSE;
     dispatch_pending_guest_exception();
     if (const int injected = consume_cond_wait_failure(
             CondWaitFailurePointForTest::BeforeRelock)) {
@@ -535,11 +600,38 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex) {
     // Winpthreads' timed mutex wait has remained inside WaitForSingleObject after its absolute
     // deadline was already seconds in the past. Polling trylock keeps the wait cooperative: a GC
     // stop request is acknowledged even when the mutex owner is itself waiting for that thread.
+    // NOT ::Sleep(1) between polls, which Windows quantizes to the process timer period -- measured
+    // on this toolchain at 15.554 ms by default against 1.930 ms with the period raised (#3013,
+    // restated in precise_sleep.cpp's header). This loop runs inside EVERY guest condition wait's
+    // relock as well as every contended guest mutex acquisition, so that tick was charged to the
+    // interval the timed-wait census attributes to the wait itself (#3056). Same remedy #3022
+    // applied to the guest sleep family: an absolute deadline served by the high-resolution timer.
+    //
+    // The CADENCE is the semaphore poll loop's, reusing its function rather than picking a second
+    // set of numbers: 500 us while the wait is young, 2 ms after 8 ms have passed (#3044's measured
+    // floor table, beside poll_slice_ns in precise_sleep.hpp). A flat 500 us would poll 31x more
+    // often than the ::Sleep(1) it replaces for a lock held for seconds, which is the cost #3062
+    // quantifies and the reason the coarse regime exists; a flat 2 ms would blunt exactly the short
+    // contention this is trying to serve. There is no deadline here -- an untimed lock waits as long
+    // as it must -- so the "remaining" clamp is passed the maximum and never binds.
+    //
+    // THE POLL INTERVAL IS ALSO THE GUEST-EXCEPTION DELIVERY LATENCY HERE, which is a better reason
+    // for this change than timed-wait accuracy is. This loop takes no wait registration -- there is
+    // no register_wait call in it -- so a thread parked here is invisible to interrupt_guest_wait
+    // and can notice a pending stop only at the dispatch call below, once per poll. That is exactly
+    // what the paragraph at the top of this function means by keeping the wait cooperative:
+    // IL2CPP's stop-the-world could not reach a thread contending a guest mutex any sooner than the
+    // next ::Sleep(1) tick. 15.6 ms -> 0.5-2 ms is therefore an improvement in GC delivery latency,
+    // not only in what the timed-wait census attributes to a condition wait (raised in review of
+    // #3235).
+    const uint64_t start_ns = steady_now_ns();
     for (;;) {
         const int result = pthread_mutex_trylock(mutex);
         if (result != EBUSY) return result;
         dispatch_pending_guest_exception();
-        Sleep(1);
+        const uint64_t now_ns = steady_now_ns();
+        const uint64_t slice = host::poll_slice_ns(now_ns - start_ns, ~0ull);
+        host::sleep_until_steady_ns(now_ns + slice);
     }
 #else
     return pthread_mutex_lock(mutex);
