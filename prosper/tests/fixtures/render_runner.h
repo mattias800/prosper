@@ -564,8 +564,14 @@ struct BackendTextureUploadStats {
     uint64_t persistent_cached_bytes = 0;
 };
 
+// thread_local like every other per-call stats storage in this file (#2953). It was the one
+// exception: a plain static written inside `render_draw_pass_rgba` and read by the caller after the
+// call returns, so a second rendering thread could clobber it between the write and the read -- a
+// data race on a non-atomic object, and silently wrong numbers even where it did not tear. Every
+// reader in the tree reads it on the thread that just rendered, so per-thread storage is what the
+// contract already was.
 inline BackendTextureUploadStats& backend_texture_upload_stats_storage() {
-    static BackendTextureUploadStats stats;
+    static thread_local BackendTextureUploadStats stats;
     return stats;
 }
 
@@ -698,6 +704,115 @@ struct PersistentPipelineKeyHash {
 struct PersistentPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint64_t last_use = 0;
+};
+
+// --- The backend's persistent-resource domain lock (#2953) --------------------------------------
+//
+// The process-lifetime caches this backend owns -- the persistent pipeline, pipeline-layout,
+// colour-target, depth/stencil and texture caches, their byte totals and their generation counters
+// -- are ONE domain with ONE owner at a time, and `render_draw_pass_rgba` is the critical section.
+// There is no finer granularity that would be honest: that function looks an entry up, keeps the
+// iterator or the reference across dozens of Vulkan calls, mutates through it, evicts through it,
+// and updates a byte total by read-modify-write. A per-container lock taken and released around
+// each individual access would describe none of that while reading as if it did.
+//
+// WHY IT EXISTS. #2953 recorded a host SIGSEGV on a guest job thread inside
+// `persistent_texture_images.find()` -- libstdc++'s `_M_equals`, reached through
+// `_M_find_before_node`, dereferencing a null node. A `find()` racing another thread's rehash reads
+// torn bucket pointers, which is that crash shape; #278 already fixed the same shape once, one
+// layer up, on the folded GpuState.
+//
+// WHY IT IS NOT SOMEBODY ELSE'S JOB. On the live route this backend is reached only from
+// `agc_driver_submit_dcb` / `submit_dcb_stream`, which hold `g_agc_state_mu` (#278), so that route
+// is already serialised -- by an invariant that lives in `src/hle/graphics/hle_agc.cpp`, a
+// different layer, in a library this header is not compiled against. `gpu_replay`, `boot_trace` and
+// every Vulkan test include `render_runner.h` and link no HLE at all. Nothing here stated the
+// invariant, nothing enforced it, and nothing could detect its violation. State that owns
+// process-lifetime Vulkan objects carries its own contract.
+//
+// COST. One uncontended mutex acquire/release plus four relaxed atomics per `render_draw_pass_rgba`
+// call. That is a per-SUBMIT cost, not a per-draw one, against a call that records a command
+// buffer, submits it and waits on a fence -- tens of nanoseconds against tens of microseconds at
+// the very least. On the live route it is uncontended by construction, for the reason above.
+//
+// SCOPE. The guard makes `render_draw_pass_rgba` mutually exclusive with itself, which covers every
+// static that function owns. It does NOT cover the colour-target and depth/stencil caches' OTHER
+// entry points -- `invalidate_persistent_color_target*`, `readback_persistent_color_target`,
+// `snapshot_persistent_ds_images` and the frontend's direct iteration of both caches -- which are
+// reachable without this lock and are tracked in #3240. Nor is the multi-segment loop in
+// `render_draws_rgba` atomic: the guard is released between segments, which is the same granularity
+// two consecutive submits already have.
+//
+// IT MEASURES ITS OWN PREMISE. `in_flight` is incremented BEFORE the mutex acquire, so a blocked
+// thread is counted: `backend_persistent_resource_peak_in_flight()` reports how many threads have
+// ever wanted this domain at once, which is precisely the question #2953 left open and could not
+// settle by reading code. A run ending at 1 has shown the single-thread assumption held for that
+// run; above 1 has shown it false, and says so once on stderr.
+// `backend_persistent_resource_overlaps()` counts threads observed inside the critical section
+// simultaneously -- always 0 while this guard is taken, and non-zero the moment it is not, which is
+// what the regression test asserts on.
+inline std::mutex& backend_persistent_resource_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::atomic<int>& backend_persistent_resource_in_flight() {
+    static std::atomic<int> in_flight{0};
+    return in_flight;
+}
+
+inline std::atomic<int>& backend_persistent_resource_peak_in_flight() {
+    static std::atomic<int> peak{0};
+    return peak;
+}
+
+inline std::atomic<int>& backend_persistent_resource_depth() {
+    static std::atomic<int> depth{0};
+    return depth;
+}
+
+inline std::atomic<uint64_t>& backend_persistent_resource_overlaps() {
+    static std::atomic<uint64_t> overlaps{0};
+    return overlaps;
+}
+
+// One line, once per process, the first time two threads want this domain at once. Deliberately not
+// behind an environment variable: it is the discovery that a design assumption is false, and the run
+// that most needs to report it is the one nobody thought to arm a diagnostic for.
+inline void backend_report_persistent_resource_contention(int in_flight) {
+    static std::atomic<bool> reported{false};
+    bool expected = false;
+    if (!reported.compare_exchange_strong(expected, true)) return;
+    std::fprintf(stderr,
+                 "[render] %d threads are inside the backend's persistent-resource domain at once; "
+                 "they are being serialised by its own lock (#2953)\n",
+                 in_flight);
+}
+
+class BackendPersistentResourceGuard {
+public:
+    BackendPersistentResourceGuard() {
+        const int in_flight =
+            backend_persistent_resource_in_flight().fetch_add(1, std::memory_order_acq_rel) + 1;
+        int peak = backend_persistent_resource_peak_in_flight().load(std::memory_order_relaxed);
+        while (peak < in_flight &&
+               !backend_persistent_resource_peak_in_flight().compare_exchange_weak(
+                   peak, in_flight, std::memory_order_relaxed)) {
+        }
+        if (in_flight > 1) backend_report_persistent_resource_contention(in_flight);
+        backend_persistent_resource_mutex().lock();
+        if (backend_persistent_resource_depth().fetch_add(1, std::memory_order_acq_rel) != 0)
+            backend_persistent_resource_overlaps().fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ~BackendPersistentResourceGuard() {
+        backend_persistent_resource_depth().fetch_sub(1, std::memory_order_acq_rel);
+        backend_persistent_resource_mutex().unlock();
+        backend_persistent_resource_in_flight().fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    BackendPersistentResourceGuard(const BackendPersistentResourceGuard&) = delete;
+    BackendPersistentResourceGuard& operator=(const BackendPersistentResourceGuard&) = delete;
 };
 
 inline std::unordered_map<PersistentPipelineKey, PersistentPipeline, PersistentPipelineKeyHash>&
@@ -4749,6 +4864,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         draws = std::span<const BackendDraw>(proven_storage);
     }
     if (backend_has_unproven_submission()) return out;
+    // #2953. Everything from here on reads and writes the backend's persistent-resource domain --
+    // the pipeline, pipeline-layout, colour-target, depth/stencil and texture caches, their byte
+    // totals and their generation counters. Taken BEFORE `direct_submission` is constructed, so the
+    // batch destructor (which submits, and whose failure cleanups touch the texture cache) still
+    // runs inside the critical section; a guard declared after it would be destroyed first and
+    // leave exactly those accesses outside. See the block comment on the guard for why the lock
+    // lives here rather than being inherited from `g_agc_state_mu`.
+    const BackendPersistentResourceGuard persistent_resource_guard;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
     BackendSubmissionBatch direct_submission;

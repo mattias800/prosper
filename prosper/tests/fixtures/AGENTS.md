@@ -29,6 +29,16 @@ Two consequences for anything you change in it:
   false trigger would cost.
 - **It cannot depend on the app** — no capture singleton, no frontend state — because it is also
   compiled into Vulkan tests that link none of that.
+- **It cannot depend on the HLE's locks either, and that one is easy to miss** (#2953). The live
+  route reaches this backend only under `g_agc_state_mu` (`src/hle/graphics/hle_agc.cpp`, #278), so
+  reading the live path alone makes the persistent caches look safely single-threaded. `gpu_replay`,
+  `boot_trace` and every Vulkan test compile this header and link no HLE, so on them that invariant
+  simply does not exist. Process-lifetime state declared here carries its own synchronisation:
+  `render_draw_pass_rgba` holds `BackendPersistentResourceGuard` for its whole body, which covers
+  every `static` that function owns. It does **not** cover the colour-target and depth/stencil
+  caches' other entry points (`invalidate_persistent_color_target*`,
+  `readback_persistent_color_target`, `snapshot_persistent_ds_images`, and the frontend's direct
+  iteration of both), so do not add a new one without reading #3240.
 
 ## Adding to it
 
