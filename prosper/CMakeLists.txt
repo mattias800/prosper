@@ -257,6 +257,20 @@ if(Python3_Interpreter_FOUND)
   # version of this file reported a green boundary test it could not actually fail (#2526).
   add_test(NAME il2cpp_resolve_lookup
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/il2cpp/test_il2cpp_tools.py")
+  # replay_determinism_report decides whether a renderer-determinism campaign may be read as a
+  # NEGATIVE. #2945's failure rate drifts machine-wide over minutes, so a campaign that sits in a
+  # quiet window and a campaign on a repaired renderer produce identical numbers -- which is why
+  # the tool has three verdicts and the third (UNDECIDED: one hash, but the bare-Vulkan control
+  # never failed either) is the one being pinned. Every arm here except one still passes with the
+  # control check deleted, so that arm is a MUTATION: it defeats the check and requires the quiet
+  # campaign to flip to DETERMINISTIC.
+  #
+  # Platform-independent, and that is a statement about the tool: this half touches no Vulkan, no
+  # GPU and no capture. It asserts on the READING of a campaign, which is where both of this
+  # issue's published misreadings happened.
+  add_test(NAME replay_determinism_report
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/determinism/test_replay_determinism_report.py")
   # hle_calls decides, per run, whether a reader should TRUST an entire measurement -- a nine-state
   # verdict machine whose most consequential branch is VOID vs VIOLATED ("this run cannot say" vs
   # "distrust every value in it"). It had no test at all, because hle_calls_gdb.py does `import gdb`

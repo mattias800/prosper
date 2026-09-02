@@ -451,6 +451,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   exit codes (0 busy / 1 free / 2 tool error), counting the five consumer names including
   `screenshot_snap`. Replaces the inline `pgrep -x a b c` spelling that was a usage error
   masquerading as a clean box (trap 222, #2948).
+- **`determinism/`** — "does replaying this frozen capture twice give the same picture?", and the
+  rule for reading the answer. `replay_determinism.sh` replays a capture N times in N separate
+  processes with `tools/vkprobe` beside it as a control, alternating order and loaded/unloaded
+  blocks; `replay_determinism_report.py` turns that CSV into one of **three** verdicts. The third is
+  the point: #2945's failure rate drifts machine-wide over minutes, so "every replay agreed" is
+  produced equally by a repaired renderer and by a quiet half-hour, and the report answers
+  `UNDECIDED` rather than `DETERMINISTIC` when the control never failed either. ctest case
+  `replay_determinism_report` (platform-independent; it reads a CSV and touches no GPU).
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,
   are gitignored, and must never be committed. The tool exits non-zero on output-hash mismatch.
