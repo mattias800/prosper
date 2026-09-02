@@ -3,6 +3,7 @@
 // host C library. Registered by NID so the loader binds imports directly to them.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "host/abi/guest_varargs.hpp"   // #3246: the guest's variadic list, re-expressed for the host
 #include "gpu/timeline/gpu_timeline.hpp"
 #include <cstring>
 #include <cstdlib>
@@ -457,7 +458,86 @@ HLE(h_strspn)   { return (uint64_t)strspn(CS(a0), CS(a1)); }
 HLE(h_strcspn)  { return (uint64_t)strcspn(CS(a0), CS(a1)); }
 HLE(h_strpbrk)  { return (uint64_t)(uintptr_t)strpbrk(CS(a0), CS(a1)); }
 HLE(h_wcslen)   { return (uint64_t)wcslen((const wchar_t*)P(a0)); }   // host wchar_t is 32-bit == PS5/FreeBSD ABI
-HLE(h_vsscanf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsscanf(CS(a0), CS(a1), ap); }
+// --- variadic calls across the guest/host ABI boundary (#3246) ---------------------------------
+//
+// On Linux and macOS the host convention IS the guest's: the import stub tail-jumps with the guest's
+// System V frame intact, the compiler's own variadic prologue captures it, and a guest `va_list`
+// pointer can be copied straight into a host one. Nothing in this block runs there.
+//
+// On Windows neither half holds, and both failures are silent:
+//   * `va_list` is a bare `char*` walking a flat array of 8-byte slots, so copying `sizeof(va_list)`
+//     bytes out of a guest list copies EIGHT bytes of a TWENTY-FOUR byte System V structure and then
+//     reads its {gp_offset, fp_offset} pair as a pointer. That is what the v* handlers below did.
+//   * a Microsoft variadic call additionally wants every floating-point argument duplicated into the
+//     corresponding INTEGER register, which the fixed import shuffle never did — so `%f` arrived as
+//     whatever happened to be in that register, and, because System V counts integer and SSE
+//     arguments separately, every argument BEHIND the float was displaced as well.
+//
+// One answer serves both: read the guest's System V list by the System V rules, learn each
+// argument's class from the format string, and write the flat slot array that IS a Microsoft
+// `va_list`. host/abi/guest_varargs.cpp owns that; this is the wiring.
+namespace {
+int capture_aware_vprintf(const char* format, va_list args);   // defined below, with the log capture
+
+#if defined(_WIN32)
+using prosper::abi::FormatGrammar;
+using prosper::abi::MsVarargCall;
+using prosper::abi::SysvVaList;
+
+// A format the model cannot fully express formats only the prefix it can (MsVarargCall). Say so, a
+// bounded number of times: it is silence that made the defect this replaces invisible for so long.
+void warn_unmodelled_format(const char* fmt, const char* why) {
+    static std::atomic<unsigned> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    fprintf(stderr, "[libc] variadic format not fully modelled (%s); formatted its leading part "
+                    "only: \"%s\"\n", why ? why : "?", fmt ? fmt : "(null)");
+}
+
+enum class WinVariadicSink { Printf, Sprintf, Snprintf, Sscanf };
+
+// Everything the PROSPER_GUEST_ABI shims must not do in their own frames. `noinline` and `noexcept`
+// are load-bearing rather than decorative: a guest-ABI frame cannot carry SEH unwind data, so an
+// inlined callee owning a destructor — or a call that may throw — makes the function fail to
+// assemble (`.seh_handlerdata used outside of .seh_proc block`). See PROSPER_GUEST_ABI in
+// dispatch.hpp. Keeping every C++ object on this side of the call is the whole discipline.
+__attribute__((noinline))
+uint64_t win_variadic_call(WinVariadicSink sink, void* buf, size_t n, const char* src,
+                           const char* fmt, const SysvVaList& ap, bool run_checkpoint) noexcept {
+    const bool scanf_like = sink == WinVariadicSink::Sscanf;
+    MsVarargCall call(fmt, ap, scanf_like ? FormatGrammar::Scanf : FormatGrammar::Printf);
+    if (!call.complete()) warn_unmodelled_format(fmt, call.reject());
+    va_list host_ap = (va_list)(char*)call.va_list_image();
+    int r = 0;
+    switch (sink) {
+    case WinVariadicSink::Printf:   r = capture_aware_vprintf(call.format(), host_ap); break;
+    case WinVariadicSink::Sprintf:  r = vsprintf((char*)buf, call.format(), host_ap); break;
+    case WinVariadicSink::Snprintf: r = vsnprintf((char*)buf, n, call.format(), host_ap); break;
+    case WinVariadicSink::Sscanf:   r = vsscanf(src, call.format(), host_ap); break;
+    }
+    // A guest-ABI handler is reached by a bare tail-jump, so the import stub's pending-guest-exception
+    // checkpoint never runs for it. Make the poll here instead, keeping the contract every other
+    // import return has. The v* handlers keep the converting stub and its checkpoint, and pass false.
+    if (run_checkpoint) dispatch_pending_guest_exception();
+    return (uint64_t)(int64_t)r;
+}
+
+// A guest `va_list*`, read as the System V structure it actually is.
+SysvVaList guest_va_list_at(uint64_t guest_ptr) {
+    SysvVaList ap{};
+    if (guest_ptr) memcpy(&ap, (const void*)(uintptr_t)guest_ptr, sizeof ap);
+    return ap;
+}
+#endif  // _WIN32
+} // namespace
+
+HLE(h_vsscanf)  {
+#if defined(_WIN32)
+    return win_variadic_call(WinVariadicSink::Sscanf, nullptr, 0, CS(a0), CS(a1),
+                             guest_va_list_at(a2), /*run_checkpoint=*/false);
+#else
+    va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsscanf(CS(a0), CS(a1), ap);
+#endif
+}
 // _init_env / malloc_stats_fast: legitimately no-ops here (no PS5 process env vars; no malloc stats
 // sink). Registered so they resolve as real, intentional no-ops rather than logged "unimplemented".
 HLE(h_init_env)         { return 0; }
@@ -514,28 +594,22 @@ static double m_expm1(double x){return expm1(x);} static float m_expm1f(float x)
 static double m_strtod(const char* s, char** e){ return strtod(s, e); }
 static float  m_strtof(const char* s, char** e){ return strtof(s, e); }
 
-HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
-HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
-// Variadic forms: REAL C variadic functions, not the old 3-int-register forward (which dropped
-// %f/XMM args, all stack args, and %s past the 4th argument -> garbage output or a SIGSEGV on a
-// bogus %s pointer). The import stub TAIL-JUMPS into these with the guest's SysV call frame intact
-// (GP regs + XMM + AL + overflow stack), so the compiler-generated variadic prologue captures the
-// full argument set and va_start/v*printf format it correctly. Guest pointers are identity-mapped
-// (guest VA == host VA), so the buffer, format string, and any %s arguments are usable host
-// pointers directly — no P() translation needed (the tail-jump passes the raw guest values).
-// CONFIDENCE: HIGH for register + XMM args (the overwhelmingly common case, correct on both the
-// tail-jmp and GUEST_FS swap-stub paths). MED only for args that spill to the STACK (>6 GP or
-// >8 FP) under the GUEST_FS swap stub, whose reframing shifts the overflow area — rare for a
-// format call, and still strictly better than the old register-only truncation.
-static uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
-    va_list ap; va_start(ap, fmt); int r = vsnprintf((char*)buf, n, fmt, ap); va_end(ap);
-    return (uint64_t)(int64_t)r;
+HLE(h_vsnprintf) {
+#if defined(_WIN32)
+    return win_variadic_call(WinVariadicSink::Snprintf, P(a0), (size_t)a1, nullptr,
+                             (const char*)P(a2), guest_va_list_at(a3), /*run_checkpoint=*/false);
+#else
+    va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap);
+#endif
 }
-static uint64_t h_sprintf(void* buf, const char* fmt, ...) {
-    va_list ap; va_start(ap, fmt); int r = vsprintf((char*)buf, fmt, ap); va_end(ap);
-    return (uint64_t)(int64_t)r;
+HLE(h_vsprintf)  {
+#if defined(_WIN32)
+    return win_variadic_call(WinVariadicSink::Sprintf, P(a0), 0, nullptr,
+                             (const char*)P(a1), guest_va_list_at(a2), /*run_checkpoint=*/false);
+#else
+    va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap);
+#endif
 }
-
 namespace {
 // A %n conversion writes through a guest pointer while formatting. The capture adapter must never
 // evaluate it speculatively, so conservatively leave such calls on the original one-pass vprintf path.
@@ -603,14 +677,75 @@ void observe_guest_c_string(const char* text, bool known_newline,
 }
 } // namespace
 
-static uint64_t h_printf(const char* fmt, ...) {
+// The printf family: REAL C variadic functions, and PROSPER_GUEST_ABI so the import stub is the same
+// bare tail-jump on EVERY platform. That is what puts the guest's own System V frame — integer
+// registers, xmm registers, AL and the overflow area alike — in front of the compiler's variadic
+// prologue, which is the only thing that can capture an argument list the format string decides at
+// run time. On Linux and macOS this is exactly what already happened and the tag expands to nothing;
+// on Windows it replaces a fixed integer shuffle that could not deliver a floating-point argument at
+// all and displaced every argument behind one (#3246).
+//
+// Guest pointers are identity-mapped (guest VA == host VA), so the buffer, the format string and any
+// %s argument are usable host pointers directly — no P() translation, because nothing re-places the
+// guest's values on the way in.
+//
+// Each body is deliberately trivial, and that is a REQUIREMENT rather than a style: a guest-ABI frame
+// cannot carry SEH unwind data on Windows, so it may own no object with a destructor and must call
+// nothing that could be inlined into it carrying one (PROSPER_GUEST_ABI in dispatch.hpp). Capture,
+// delegate, return.
+//
+// CONFIDENCE: HIGH on Linux/macOS, where this is the long-standing behaviour and the tag is empty.
+// HIGH on the Windows mechanism as well — the shape below was assembled by MinGW GCC 16.1.1 at every
+// optimization level and executed under wine, delivering a twelve-argument mixed call including
+// System V overflow-area integers and five xmm doubles (#3246). What is NOT verified is a live guest
+// calling it on a Windows host; nobody here has one.
+static PROSPER_GUEST_ABI uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
+#if defined(_WIN32)
+    __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
+    prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
+    __builtin_sysv_va_end(ap);
+    return win_variadic_call(WinVariadicSink::Snprintf, buf, n, nullptr, fmt, captured,
+                             /*run_checkpoint=*/true);
+#else
+    va_list ap; va_start(ap, fmt); int r = vsnprintf((char*)buf, n, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+#endif
+}
+static PROSPER_GUEST_ABI uint64_t h_sprintf(void* buf, const char* fmt, ...) {
+#if defined(_WIN32)
+    __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
+    prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
+    __builtin_sysv_va_end(ap);
+    return win_variadic_call(WinVariadicSink::Sprintf, buf, 0, nullptr, fmt, captured,
+                             /*run_checkpoint=*/true);
+#else
+    va_list ap; va_start(ap, fmt); int r = vsprintf((char*)buf, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+#endif
+}
+static PROSPER_GUEST_ABI uint64_t h_printf(const char* fmt, ...) {
+#if defined(_WIN32)
+    __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
+    prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
+    __builtin_sysv_va_end(ap);
+    return win_variadic_call(WinVariadicSink::Printf, nullptr, 0, nullptr, fmt, captured,
+                             /*run_checkpoint=*/true);
+#else
     va_list ap; va_start(ap, fmt); int r = capture_aware_vprintf(fmt, ap); va_end(ap);
     return (uint64_t)(int64_t)r;
+#endif
 }
-// sscanf: a REAL variadic host thunk (like the *printf family) — the import stub tail-jumps with the
-// guest's full SysV frame so va_start captures every arg. Output pointer args are guest pointers
-// (identity-mapped), so vsscanf writes through them directly. MISSING before -> returned 0 leaving ALL
-// output args uninitialized (the guest consumed uninit memory as parsed values).
+// sscanf: a REAL variadic host thunk, and deliberately NOT guest-ABI — the one member of the family
+// #3246's affected table lists that turns out not to be affected. Every variadic argument a
+// scanf-family call passes is a POINTER, so the list is all-integer, no floating-point duplication is
+// required, and System V's integer registers map one-for-one onto Microsoft's first ten argument
+// positions — which is precisely what the historical shuffle already delivers. Leaving it there keeps
+// a correct path unchanged rather than routing it through a new one for symmetry.
+//
+// The cap that remains is the shuffle's: it forwards ten arguments, so an eleventh assignment would
+// be dropped on Windows. Recorded rather than fixed, because fixing it would change a working path.
+// MISSING before -> returned 0 leaving ALL output args uninitialized (the guest consumed uninit
+// memory as parsed values).
 static uint64_t h_sscanf(const char* s, const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); int r = vsscanf(s, fmt, ap); va_end(ap);
     return (uint64_t)(int64_t)r;
@@ -826,6 +961,10 @@ void register_builtin_hle() {
     // whose signature mentions float or double; R is correct for everything else, and for an
     // integer-only signature the two are equivalent by construction.
     #define RT(str, fn) Hle::register_typed(nid_hash(str), fn, str)
+    // RV registers a REAL C VARIADIC. Its parameter type carries PROSPER_GUEST_ABI, so on Windows a
+    // handler that forgot the tag is a compile error rather than a stub reading the wrong registers;
+    // the emitted stub then converts nothing and the guest's own variadic frame arrives intact (#3246).
+    #define RV(str, fn) Hle::register_guest_abi(nid_hash(str), fn, str)
     // libSceLibcInternalExt heap-trace hookup (raw NID — guaranteed match; see handler comment).
     Hle::register_fn("NWtTN10cJzE", (HleFn)h_heap_get_trace_info, "sceLibcHeapGetTraceInfo");
     R("memcpy", h_memcpy);   R("memmove", h_memmove); R("memset", h_memset);
@@ -858,9 +997,9 @@ void register_builtin_hle() {
     R("_ZdlPvRKSt9nothrow_t", h_delete); R("_ZdaPvRKSt9nothrow_t", h_delete);
     // stdio
     R("vsnprintf", h_vsnprintf); R("vsprintf", h_vsprintf);
-    R("snprintf", h_snprintf);   R("sprintf", h_sprintf);   R("snprintf_s", h_snprintf);
-    R("sprintf_s", h_snprintf);   // Annex-K sprintf_s(s, n, fmt, ...) has a size arg -> bounded snprintf, NOT sprintf
-    R("printf", h_printf);       R("puts", h_puts);
+    RV("snprintf", h_snprintf);  RV("sprintf", h_sprintf);  RV("snprintf_s", h_snprintf);
+    RV("sprintf_s", h_snprintf);  // Annex-K sprintf_s(s, n, fmt, ...) has a size arg -> bounded snprintf, NOT sprintf
+    RV("printf", h_printf);      R("puts", h_puts);
     R("putchar", h_putchar);     R("fputs", h_fputs);
     // locale / ctype
     R("_Getpctype", h_getpctype); R("_Getptolower", h_getptolow); R("_Getptoupper", h_getptoup);
@@ -908,6 +1047,7 @@ void register_builtin_hle() {
     RT("sinh", m_sinh); RT("sinhf", m_sinhf); RT("cosh", m_cosh); RT("coshf", m_coshf);
     RT("tanh", m_tanh); RT("tanhf", m_tanhf); RT("log1p", m_log1p); RT("log1pf", m_log1pf);
     RT("expm1", m_expm1); RT("expm1f", m_expm1f);
+    #undef RV
     #undef RT
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)

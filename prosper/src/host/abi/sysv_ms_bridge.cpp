@@ -129,9 +129,22 @@ size_t emit_legacy_integer_prologue(uint8_t* out) {
     return sizeof seq;
 }
 
+size_t emit_guest_abi_tailjump(uint8_t* out, uint64_t handler) {
+    Buf b{ out };
+    movabs_rax(b, handler);
+    b.b(0xFF); b.b(0xE0);          // jmp rax
+    return b.n;
+}
+
 size_t emit_sysv_to_ms_bridge(uint8_t* out, const BridgeParams& params) {
     Buf b{ out };
     const CallSignature& sig = params.signature;
+
+    // A handler compiled in the guest's own convention needs no conversion at all — the guest's frame
+    // is already the one it reads, including a variadic frame no CallSignature could have described
+    // (#3246). Checked before the signature, because the two are mutually exclusive: a guest-ABI
+    // handler's arguments are not the bridge's business, and a declared signature would only mislead.
+    if (params.guest_abi) return emit_guest_abi_tailjump(out, params.handler);
 
     if (!sig.needs_conversion()) {
         // Historical path, byte for byte. The pad + four copied guest stack words + the 0x30 outgoing

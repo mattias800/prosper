@@ -20,6 +20,7 @@ namespace {
         bool placeholder = false;
         HleReturnHook return_hook = nullptr;
         abi::CallSignature signature{};   // #2955: only ever set for a float/double-bearing handler
+        bool guest_abi = false;           // #3246: handler compiled in the guest's own convention
     };
     std::unordered_map<std::string, Reg>& registry() {
         static std::unordered_map<std::string, Reg> r; return r;
@@ -105,7 +106,7 @@ void Hle::register_fn(const std::string& nid, HleFn fn, const char* name,
     // A re-registration with the SAME fn (harmless dedup) is not recorded.
     if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
         shadow_list().push_back({ nid, it->second.name, name ? name : "" });
-    reg[nid] = { fn, name ? name : "", false, return_hook, {} };
+    reg[nid] = { fn, name ? name : "", false, return_hook, {}, false };
 }
 void Hle::register_fn_with_signature(const std::string& nid, HleFn fn, const char* name,
                                      const abi::CallSignature& signature,
@@ -121,6 +122,18 @@ void Hle::register_fn_with_signature(const std::string& nid, HleFn fn, const cha
     // an overwrite is already the #330 shadow class and is recorded above.
     if (signature.needs_conversion()) registry()[nid].signature = signature;
 }
+void Hle::register_guest_abi_fn(const std::string& nid, HleFn fn, const char* name) {
+    register_fn(nid, fn, name);
+    // Set AFTER register_fn, which rewrites the whole entry. As with a declared signature, a later
+    // plain register_fn on the same NID drops the flag along with the handler it described — the safe
+    // direction, since an unknown handler is then reached through the converting bridge rather than
+    // through a tail-jump that would hand it the guest's frame raw.
+    registry()[nid].guest_abi = true;
+}
+bool Hle::guest_abi_nid(const std::string& nid) {
+    auto it = registry().find(nid);
+    return it != registry().end() && it->second.guest_abi;
+}
 abi::CallSignature Hle::signature_of_nid(const std::string& nid) {
     auto it = registry().find(nid);
     return it == registry().end() ? abi::CallSignature{} : it->second.signature;
@@ -133,7 +146,7 @@ void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* nam
     auto it = reg.find(nid);
     if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
         shadow_list().push_back({ nid, it->second.name, name ? name : "" });
-    reg[nid] = { fn, name ? name : "", true, nullptr, {} };
+    reg[nid] = { fn, name ? name : "", true, nullptr, {}, false };
 }
 const std::vector<ShadowedReg>& Hle::shadowed_registrations() { return shadow_list(); }
 std::vector<RegisteredFn> Hle::registrations() {
@@ -141,7 +154,7 @@ std::vector<RegisteredFn> Hle::registrations() {
     out.reserve(registry().size());
     for (const auto& kv : registry())
         out.push_back({ kv.first, kv.second.name, (const void*)kv.second.fn, kv.second.placeholder,
-                        kv.second.signature });
+                        kv.second.signature, kv.second.guest_abi });
     return out;
 }
 HleFn Hle::lookup(const std::string& nid) {
