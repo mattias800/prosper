@@ -14,168 +14,95 @@ whole world from one 256-slice array and rendered flat for exactly that reason -
 several hours, and mechanically detectable in seconds.
 
 Usage:
-    scan.py <capture.prgcap|.prgbundle> [more...] [--gpu-replay PATH] [--json] [--self-test]
+    scan.py <capture.prgcap|.prgbundle> [more...] [--gpu-replay PATH] [--mimg-decoder PATH]
+            [--json] [--self-test]
 
 Exit codes: 0 = scanned, no mismatch. 1 = mismatches found. 2 = could not scan (see below).
 
+The ISA walk is prosper's OWN RDNA2 decoder, reached through `shader_inspect --mimg-sites` (#3184).
+Nothing in this file decodes an instruction: a second implementation of a decoding rule is the one
+that drifts, and it drifts silently, which is the failure this tool exists to make impossible.
+
 It refuses to report "clean" without having parsed something. A run that dumps no shader, or whose
-disassembler is missing, exits 2 and says so rather than printing zero findings -- a silent scanner
-is indistinguishable from a clean codebase, and that failure has cost this project real time.
+disassembler or decoder is missing, exits 2 and says so rather than printing zero findings -- a
+silent scanner is indistinguishable from a clean codebase, and that failure has cost this project
+real time.
 """
 import argparse, json, os, re, shutil, struct, subprocess, sys, tempfile
 
-# MIMG DIM field (SQ_RSRC): the encoding prosper's own decoder uses, rdna2_decode.cpp `(w >> 3) & 0x7`.
+# MIMG DIM values (SQ_RSRC), as reported by prosper's decoder in `Rdna2Inst::mimg_dim`. This is a
+# naming and classification table, not a decode: nothing here reads an instruction word. Which bits
+# hold DIM, where the opcode's split MSB lives and how long an instruction is are all stated once,
+# in `src/gpu/recompiler/rdna2_decode.cpp`, and reach this tool through `--mimg-sites` (#3184).
 DIM_NAMES = {0: "1D", 1: "2D", 2: "3D", 3: "CUBE",
              4: "1D_ARRAY", 5: "2D_ARRAY", 6: "2D_MSAA", 7: "2D_MSAA_ARRAY"}
 DIM_ARRAYED = {4, 5, 7}
 DIM_3D = {2}
-MIMG_ENCODING = 0b111100          # dword0[31:26]
-S_ENDPGM = 0xBF810000             # SOPP encoding of s_endpgm -- terminates the walk, as it terminates
-                                   # the real program (rdna2_decode.cpp's S_ENDPGM).
 
 
-class Step:
-    """One decoded instruction's length and (if it is one) MIMG identity. See `rdna2_instr_len`."""
-    __slots__ = ("length", "is_mimg", "opcode", "dim", "is_end", "is_unknown")
-
-    def __init__(self, length, is_mimg=False, opcode=None, dim=None, is_end=False, is_unknown=False):
-        self.length, self.is_mimg, self.opcode, self.dim = length, is_mimg, opcode, dim
-        self.is_end, self.is_unknown = is_end, is_unknown
+class DecoderUnavailable(Exception):
+    """The MIMG census could not be obtained. Never confusable with an empty census (see below)."""
 
 
-def _sop_has_literal(w, nsrc):
-    """A scalar source operand field == 255 selects a trailing 32-bit literal constant dword."""
-    if (w & 0xFF) == 0xFF:
-        return True
-    if nsrc >= 2 and ((w >> 8) & 0xFF) == 0xFF:
-        return True
-    return False
+def decoder_cmd(decoder):
+    """The MIMG-site decoder, as an argv prefix. A `.py` value is run with this interpreter.
 
-
-def rdna2_instr_len(words, i):
-    """Decode the LENGTH (in dwords) of the instruction at `words[i]`, plus its MIMG identity if any.
-
-    #3040: `decode_mimg_sites` used to test every dword for the MIMG top-6-bit encoding regardless of
-    what instruction it actually belonged to, so an operand or trailing-literal dword whose top bits
-    happened to alias the encoding (0b111100) read as an instruction start -- a phantom finding for a
-    MIMG that was never in the program. The fix is to walk real instruction boundaries: decode each
-    instruction's length from its format, exactly as the guest's own wavefront would, and only ever
-    test a dword for MIMG-ness when it is actually the first dword of an instruction.
-
-    This mirrors the length computation in `rdna2_decode_one` / `rdna2_walk`
-    (`src/gpu/recompiler/rdna2_decode.cpp`) -- every format bucket that instruction actually
-    dispatches on, so this walk lands on the same instruction boundaries the real recompiler does. It
-    intentionally ports only the LENGTH rule, not full operand decode (register fields, DPP/SDWA
-    sub-modes, condition codes): that is all a boundary-accurate walk needs, and it is a small,
-    self-contained piece of the ~1,200-line decoder, not a port of the whole thing.
-
-    Being a second, independent implementation of that dispatch is itself a drift risk -- if
-    `rdna2_decode_one`'s length rules change, this walk needs a matching update or it can silently
-    fall out of sync. #3040's own suggested fix (teaching `shader_histo` to emit real per-instruction
-    MIMG sites and having `scan.py` consume that) removes the duplication entirely and remains the
-    more robust long-term direction; this is the length-aware fix within the existing Python-only
-    tool, not a replacement for that suggestion.
-
-    RDNA2 ISA reference: AMD document 70648 ("RDNA 2" Instruction Set Architecture: Reference Guide).
+    Same shape as `replay_cmd`, and for the same Windows reason: `CreateProcess` cannot execute a
+    `.py` by path the way a POSIX shebang can.
     """
-    n = len(words)
-    w = words[i]
-    max_dwords = n - i
-
-    if (w & 0x80000000) == 0:
-        # Vector ALU group (bit31 == 0): VOP1 (0x7E prefix), VOPC (0x7C prefix), else VOP2.
-        is_vop2 = (w & 0xFE000000) != 0x7E000000 and (w & 0xFE000000) != 0x7C000000
-        src0 = w & 0x1FF
-        # A VOP src0 field selects an extra dword four ways: 0xFF = trailing literal; 0xF9 = SDWA,
-        # 0xFA = DPP16, 0xE9/0xEA = DPP8 = a control word. All make the instruction 2 dwords.
-        if src0 in (0xF9, 0xFA, 0xE9, 0xEA):
-            length = 2 if max_dwords >= 2 else 1
-        else:
-            lit = (src0 == 0xFF)
-            if is_vop2:
-                # The six K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K:
-                # v_madmk_f32(0x20) v_madak_f32(0x21) v_fmamk_f32(0x2C) v_fmaak_f32(0x2D)
-                # v_fmamk_f16(0x37) v_fmaak_f16(0x38).
-                if ((w >> 25) & 0x3F) in (0x20, 0x21, 0x2C, 0x2D, 0x37, 0x38):
-                    lit = True
-            length = (2 if max_dwords >= 2 else 1) if lit else 1
-        return Step(min(length, max_dwords))
-
-    if (w & 0xC0000000) == 0x80000000:
-        # Scalar group (bits[31:30] == 10): SOPP/SOPC/SOP1/SOPK carved out before the SOP2 default.
-        if (w & 0xFF800000) == 0xBF800000:
-            return Step(min(1, max_dwords), is_end=(w == S_ENDPGM))
-        if (w & 0xFF800000) == 0xBF000000:      # SOPC
-            lit = _sop_has_literal(w, 2)
-        elif (w & 0xFF800000) == 0xBE800000:    # SOP1
-            lit = _sop_has_literal(w, 1)
-        elif (w & 0xF0000000) == 0xB0000000:    # SOPK, except S_SETREG_IMM32_B32 (opcode 21) whose
-            lit = ((w >> 23) & 0x1F) == 21       # 32-bit register data trails as a mandatory literal.
-        else:                                    # SOP2
-            lit = _sop_has_literal(w, 2)
-        length = (2 if max_dwords >= 2 else 1) if lit else 1
-        return Step(min(length, max_dwords))
-
-    # Remaining top-bit patterns (bits[31:30] == 11) dispatch on dword0[31:26].
-    bucket = w >> 26
-    if bucket == 0x32:                                          # VINTRP
-        return Step(min(1, max_dwords))
-    if bucket in (0x33, 0x34, 0x35):                             # VOP3P, VOP3 (old-gen/RDNA2)
-        # 2 dwords, plus a trailing literal when any of dword1's three 9-bit src fields is 0xFF.
-        if max_dwords < 2:
-            return Step(min(1, max_dwords))
-        d1 = words[i + 1]
-        lit = ((d1 & 0x1FF) == 0xFF or ((d1 >> 9) & 0x1FF) == 0xFF or ((d1 >> 18) & 0x1FF) == 0xFF)
-        length = 3 if (lit and max_dwords >= 3) else 2
-        return Step(min(length, max_dwords))
-    if bucket in (0x36, 0x37, 0x38, 0x3A, 0x3D, 0x3E):           # DS, FLAT, MUBUF, MTBUF, SMEM, EXP
-        return Step(min(2, max_dwords) if max_dwords >= 2 else 1)
-    if bucket == MIMG_ENCODING:                                  # 0x3C -- MIMG
-        # 2 dwords, plus NSA (Non-Sequential Address) extra dwords holding the split address VGPRs.
-        # dword0[2:1] gives the extra-dword count (0..3), so total length is 2..5 dwords. Opcode and
-        # DIM are both dword0-only fields, so they are exact even when the buffer ends mid-instruction.
-        extra = (w >> 1) & 0x3
-        opcode = ((w & 1) << 7) | ((w >> 18) & 0x7F)
-        dim = (w >> 3) & 0x7
-        return Step(min(2 + extra, max_dwords), is_mimg=True, opcode=opcode, dim=dim)
-    return Step(min(1, max_dwords), is_unknown=True)
+    return [sys.executable, decoder] if str(decoder).endswith(".py") else [decoder]
 
 
-def decode_mimg_sites(raw: bytes):
-    """(dword_index, opcode, dim) for every MIMG instruction found by a LENGTH-AWARE walk of `raw`.
+def decode_mimg_sites(decoder, path):
+    """(dword_index, opcode, dim) for every MIMG instruction in the raw RDNA2 stream at `path`.
 
-    Each dword is visited only once, as either the first dword of an instruction (tested for MIMG-
-    ness) or an operand/literal dword of the instruction that precedes it (never tested) -- see
-    `rdna2_instr_len`. The walk stops at `s_endpgm` or an undecodable encoding, exactly as
-    `rdna2_walk` does, since nothing after either is reachable guest code.
+    The walk is prosper's OWN decoder -- `shader_inspect --mimg-sites`, which is `rdna2_walk` over
+    `rdna2_decode_one` (`src/gpu/recompiler/rdna2_decode.cpp`) and nothing else. There is no second
+    implementation of the RDNA2 length rules in this file, and that is the point (#3184).
+
+    What used to be here was a Python port of `rdna2_decode_one`'s format/length dispatch: enough of
+    it to tell a real instruction boundary from an operand or trailing-literal dword whose top six
+    bits happen to alias the MIMG encoding. It was correct -- 11,266 real shaders out of the local
+    dump library, carrying 199,521 MIMG sites, decode identically through both -- but correct is not
+    the property that matters for a copy. The copy is the one nobody updates when the decoder learns
+    a new literal-forcing opcode or a wider NSA field, and it fails by *silently* returning a
+    plausible instruction stream, which is the failure this whole tool exists to make impossible.
+    The same folder had already drifted this way once, in the other direction: shader_histo's
+    hand-maintained format-name table lost track of `Rdna2Format` when VOP3P was added (#3229).
+
+    Raises `DecoderUnavailable` rather than returning [] when the census could not be taken. A
+    scanner whose entire product is a CLEAN result must never let "this shader has no image
+    instruction" and "the decoder did not run" reduce to the same value -- so the decoder prints a
+    `mimg-sites-end` sentinel and this refuses any output without one, whatever the exit code said.
+
+    The sentinel also carries the decoder's OWN site count, and this cross-checks it against the
+    number of lines actually parsed. Without that, the remaining silent failure is on this side of
+    the pipe rather than the far side: a site line the regex stops matching -- a widened field, a
+    renamed key -- would be dropped while the sentinel still arrived, and an under-count reads as a
+    cleaner shader. Two independent statements of the same number make that loud instead.
     """
-    n = len(raw) // 4
-    if not n:
-        return []
-    words = struct.unpack(f"<{n}I", raw[:n * 4])
-    out = []
-    pc = 0
-    while pc < n:
-        step = rdna2_instr_len(words, pc)
-        if step.is_mimg:
-            out.append((pc, step.opcode, step.dim))
-        if step.length <= 0:
-            break                                # safety: never loop on a zero-length step
-        pc += step.length
-        if step.is_end or step.is_unknown:
-            break
-    return out
+    r = run(decoder_cmd(decoder) + [path, "--mimg-sites"])
+    sites, claimed = [], None
+    for ln in r.stdout.splitlines():
+        m = re.match(r"^mimg-site pc=(\d+) op=0x([0-9a-fA-F]+) dim=(\d+)$", ln)
+        if m:
+            sites.append((int(m.group(1)), int(m.group(2), 16), int(m.group(3))))
+            continue
+        m = re.match(r"^mimg-sites-end .*\bsites=(\d+)\b", ln)
+        if m:
+            claimed = int(m.group(1))
+    if r.returncode != 0 or claimed is None:
+        why = "no mimg-sites-end sentinel" if claimed is None else "exit " + str(r.returncode)
+        raise DecoderUnavailable(f"mimg decoder {why}: {(r.stderr or r.stdout).strip()[:160]}")
+    if claimed != len(sites):
+        raise DecoderUnavailable(f"mimg decoder reported sites={claimed} but {len(sites)} site "
+                                 f"line(s) parsed -- the census and its own count disagree")
+    return sites
 
 
-def decode_mimg(raw: bytes):
-    """Every MIMG instruction in a raw RDNA2 shader, as (opcode, dim).
-
-    A length-aware walk (see `decode_mimg_sites`) can only ever test a dword for the MIMG encoding
-    when it is genuinely the first dword of an instruction, so it can neither invent an MIMG from an
-    operand/literal dword (#3040) nor let a phantom match swallow a real one that follows it (#3039;
-    both directions are exercised in `self_test`).
-    """
-    return [(op, dim) for _, op, dim in decode_mimg_sites(raw)]
+def decode_mimg(decoder, path):
+    """Every MIMG instruction in a raw RDNA2 shader file, as (opcode, dim)."""
+    return [(op, dim) for _, op, dim in decode_mimg_sites(decoder, path)]
 
 
 def parse_spirv_images(dis: str):
@@ -328,7 +255,7 @@ def materialize(replay, path, tmp):
     return out, None
 
 
-def scan_capture(replay, capture, tmp):
+def scan_capture(replay, decoder, capture, tmp):
     findings, examined, skipped = [], 0, 0
     skip_reasons = []
     capture, err = materialize(replay, capture, tmp)
@@ -360,14 +287,22 @@ def scan_capture(replay, capture, tmp):
             skipped += 1
             skip_reasons.append(f"draw[{draw}] {stage}: spirv-dis exit {dis.returncode}")
             continue
-        raw = open(raw_p, "rb").read()
-        if not raw:
+        if os.path.getsize(raw_p) == 0:
             # An empty ISA dump is a shader we did NOT read. Counting it as examined is how a
             # capture that yielded nothing still reports a clean scan.
             skipped += 1
             skip_reasons.append(f"draw[{draw}] {stage}: empty ISA dump")
             continue
-        mimg = decode_mimg(raw)
+        try:
+            mimg = decode_mimg(decoder, raw_p)
+        except DecoderUnavailable as e:
+            # An unreadable census is a shader we did NOT examine, exactly like an unreadable dump.
+            # The decoder also refuses a dump that is not a whole number of dwords, which the old
+            # in-process walk silently truncated instead -- a partial dword is a truncated dump, and
+            # a scanner that reports on one is reporting on bytes it does not have.
+            skipped += 1
+            skip_reasons.append(f"draw[{draw}] {stage}: {e}")
+            continue
         if not mimg:
             examined += 1
             continue
@@ -418,7 +353,7 @@ sys.exit(0)
 """
 
 
-def _run_self_test_case(tmp, script, captures):
+def _run_self_test_case(tmp, script, decoder, captures):
     """Drive scan.py end-to-end against the stub. Returns (returncode, stdout, stderr)."""
     stub = os.path.join(tmp, "stub_replay.py")
     with open(stub, "w") as f:
@@ -438,21 +373,35 @@ def _run_self_test_case(tmp, script, captures):
         q = os.path.join(tmp, f"{name}.prgcap")
         open(q, "wb").write(b"\0")
         paths.append(q)
-    r = subprocess.run([sys.executable, script, "--gpu-replay", stub] + paths,
+    r = subprocess.run([sys.executable, script, "--gpu-replay", stub,
+                        "--mimg-decoder", decoder] + paths,
                        capture_output=True, text=True, env=env)
     return r.returncode, r.stdout, r.stderr
 
 
-def self_test():
+def self_test(decoder):
     """Every check below is written to FAIL under a mutation of the thing it claims to cover.
 
-    The previous suite did not. It built its MIMG fixture out of `MIMG_ENCODING`, so mutating that
-    constant mutated the fixture too and the check passed either way -- a same-source positive
-    control, which tests the discriminator and never the domain. It also never touched the
-    classifier, the exit contract, or either parser's caller, so nine separate mutations (including
-    `DIM_ARRAYED = {4, 7}`, which drops the entire #325 class this tool exists to find) all still
-    printed PASSED.
+    The previous suite did not. It built its MIMG fixture out of the encoding constant it was
+    checking, so mutating that constant mutated the fixture too and the check passed either way -- a
+    same-source positive control, which tests the discriminator and never the domain. It also never
+    touched the classifier, the exit contract, or either parser's caller, so nine separate mutations
+    (including `DIM_ARRAYED = {4, 7}`, which drops the entire #325 class this tool exists to find)
+    all still printed PASSED.
+
+    Since #3184 the decode arms are no longer hermetic, and that is the improvement rather than a
+    regression: the walk they exercise is prosper's REAL decoder, reached through
+    `shader_inspect --mimg-sites`, so a change to `rdna2_decode.cpp`'s length dispatch now reddens
+    this suite. It could not before -- the Python port was a separate implementation, and a suite
+    that only tested the copy is exactly how the copy drifts unnoticed. A missing decoder is
+    reported as exit 2 (could not test), never as a pass.
     """
+    if not decoder or not os.path.exists(decoder):
+        print(f"self-test: no shader_inspect at {decoder!r}. That binary IS the ISA walk under\n"
+              f"           test, so this suite cannot run without it and must not report a pass.\n"
+              f"           Build it (cmake --build <dir> --target shader_inspect) and pass\n"
+              f"           --mimg-decoder <path>.", file=sys.stderr)
+        return 2
     ok = True
 
     def check(cond, label):
@@ -460,56 +409,110 @@ def self_test():
         print(f"  [{'ok' if cond else 'FAIL'}]   {label}")
         ok = ok and cond
 
-    # --- MIMG decode. Literal words, computed by hand, NOT built from the constants under test.
-    # 0xF0800028: encoding 0b111100, opcode 0x20, DIM 5. 0xF0800029 sets the opcode MSB -> 0xa0.
-    # 0xF4800028 is encoding 0b111101 and must decode to nothing.
-    mimg2 = struct.pack("<II", 0xF0800028, 0)
-    check(decode_mimg(mimg2) == [(0x20, 5)], "literal 0xF0800028 decodes as opcode 0x20 / DIM 5")
-    check(decode_mimg(struct.pack("<II", 0xF0800029, 0)) == [(0xa0, 5)],
-          "opcode MSB (bit 0) is reconstructed -- 0xF0800029 is opcode 0xa0, not 0x20")
-    check(decode_mimg(struct.pack("<II", 0xF4800028, 0)) == [],
-          "encoding 0b111101 is NOT MIMG (pins MIMG_ENCODING against an off-by-one)")
-    check(decode_mimg(struct.pack("<I", 0x12345678)) == [], "a non-MIMG word decodes to nothing")
-    # A real 2-dword MIMG's SECOND dword (VADDR/SRSRC/SSAMP operand fields) is consumed as part of
-    # that SAME instruction by the length-aware walk, not re-tested as a new instruction start --
-    # #3040. This is the load-bearing behavior change from the pre-#3040 walk, which tested every
-    # dword unconditionally and would have reported TWO hits here.
-    check(decode_mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5)],
-          "a real MIMG's own dword1 is consumed by that instruction, not read as a second one (#3040)")
-    # The exact sequence review of #3039 used: a literal aliasing the encoding, then a REAL
-    # 2D_ARRAY sample. The real one must survive the phantom, AND (#3040) the phantom itself must be
-    # gone: `0x7E0002FF` is `v_mov_b32 v0, <literal>` (VOP1, src0=0xFF forces a trailing literal), so
-    # the length-aware walk consumes dwords 0-1 as ONE instruction and never tests dword1 in
-    # isolation -- unlike the pre-#3040 walk, which read dword1 as its own MIMG candidate (DIM 0).
-    swallow = struct.pack("<III", 0x7E0002FF, 0xF0000000, 0xF0800028)
-    check(decode_mimg(swallow) == [(0x20, 5)],
-          "a real MIMG immediately after an aliasing literal is found, and ONLY it is (#3039 + #3040)")
-    check(decode_mimg(b"") == [] and decode_mimg(b"\x01\x02") == [], "short/empty input is safe")
+    with tempfile.TemporaryDirectory() as fixtures:
+        # Hand-built ISA streams, decoded THE WAY scan_capture decodes a real dump: written to a
+        # file and handed to prosper's own decoder. The words below are computed by hand, never
+        # assembled from a constant this file also uses to judge the answer.
+        def sites(words):
+            path = os.path.join(fixtures, "fixture.bin")
+            with open(path, "wb") as f:
+                f.write(words)
+            return decode_mimg_sites(decoder, path)
 
-    # --- #3040's own positive control, built BY HAND rather than from `MIMG_ENCODING`/`DIM_ARRAYED`
-    # (a same-source control tests the discriminator, not the domain -- see CLAUDE.md). This is a
-    # single real instruction -- `v_mov_b32 v0, 0xF0000028` (VOP1, forced literal) -- and NO MIMG
-    # instruction anywhere in it. The literal's value is hand-picked so ITS OWN top 6 bits alias the
-    # MIMG encoding (0b111100) with DIM=5 (2D_ARRAY, an arrayed shape) sitting in bits [5:3]: exactly
-    # the pattern a dword-by-dword scan mistakes for `image_sample dim:2D_ARRAY`. Before #3040, this
-    # decoded as one MIMG finding and classify() reported a phantom `array-layer-dropped` defect
-    # against a "shader" that samples no image at all.
-    phantom_literal = struct.pack("<II", 0x7E0002FF, 0xF0000028)
-    check(decode_mimg(phantom_literal) == [],
-          "a literal operand aliasing an ARRAYED MIMG encoding is not read as an instruction (#3040)")
-    check(classify(decode_mimg(phantom_literal), [("2D", 0)], []) == [],
-          "...and so the full pipeline reports no phantom array-layer-dropped finding either")
+        def mimg(words):
+            return [(op, dim) for _, op, dim in sites(words)]
 
-    # --- NSA (Non-Sequential Address) length: a real MIMG can be 2-5 dwords (dword0[2:1] gives the
-    # extra-dword count), and each extra dword must be skipped too, not just dword1. Here the NSA
-    # instruction's own extra dwords are themselves crafted to alias the MIMG encoding -- if the walk
-    # advanced by a fixed 2 dwords instead of reading the NSA field, it would misread them as two
-    # more (phantom) MIMG instructions, and would then desync and miss the real one that follows.
-    nsa_dim1 = 0xF0000000 | (1 << 1) | (1 << 3)          # MIMG, NSA=1 extra dword, DIM=1 (plain 2D)
-    nsa = struct.pack("<IIII", nsa_dim1, 0xF0800028, 0xF0800028, 0xF0800028)
-    check(decode_mimg_sites(nsa) == [(0, 0x00, 1), (3, 0x20, 5)],
-          "NSA's extra dwords (dword0[2:1]) are skipped, not read as instructions, and the real MIMG "
-          "that follows is found at the correct offset (#3040)")
+        def refused(words):
+            try:
+                mimg(words)
+            except DecoderUnavailable:
+                return True
+            return False
+
+        # --- MIMG identity. 0xF0800028: encoding 0b111100, opcode 0x20, DIM 5. 0xF0800029 sets the
+        # opcode MSB -> 0xa0. 0xF4800028 is encoding 0b111101 and must decode to nothing.
+        check(mimg(struct.pack("<II", 0xF0800028, 0)) == [(0x20, 5)],
+              "literal 0xF0800028 decodes as opcode 0x20 / DIM 5")
+        check(mimg(struct.pack("<II", 0xF0800029, 0)) == [(0xa0, 5)],
+              "opcode MSB (bit 0) is reconstructed -- 0xF0800029 is opcode 0xa0, not 0x20")
+        check(mimg(struct.pack("<II", 0xF4800028, 0)) == [],
+              "encoding 0b111101 is NOT MIMG (pins the encoding against an off-by-one)")
+        check(mimg(struct.pack("<I", 0x12345678)) == [], "a non-MIMG word decodes to nothing")
+        # A real 2-dword MIMG's SECOND dword (VADDR/SRSRC/SSAMP operand fields) is consumed as part
+        # of that SAME instruction by the length-aware walk, not re-tested as a new instruction
+        # start -- #3040. This is the load-bearing behavior of a real walk: a scan that tested every
+        # dword unconditionally would report TWO hits here.
+        check(mimg(struct.pack("<II", 0xF0800028, 0xF0800028)) == [(0x20, 5)],
+              "a real MIMG's own dword1 is consumed by that instruction, not read as a second one")
+        # The exact sequence review of #3039 used: a literal aliasing the encoding, then a REAL
+        # 2D_ARRAY sample. The real one must survive the phantom, AND the phantom itself must be
+        # gone: `0x7E0002FF` is `v_mov_b32 v0, <literal>` (VOP1, src0=0xFF forces a trailing
+        # literal), so the walk consumes dwords 0-1 as ONE instruction and never tests dword1 in
+        # isolation -- unlike a dword-by-dword scan, which reads dword1 as its own MIMG candidate.
+        check(mimg(struct.pack("<III", 0x7E0002FF, 0xF0000000, 0xF0800028)) == [(0x20, 5)],
+              "a real MIMG immediately after an aliasing literal is found, and ONLY it is (#3039)")
+
+        # --- #3040's positive control, built BY HAND rather than from `DIM_ARRAYED` (a same-source
+        # control tests the discriminator, not the domain -- see CLAUDE.md). This is a single real
+        # instruction -- `v_mov_b32 v0, 0xF0000028` (VOP1, forced literal) -- and NO MIMG
+        # instruction anywhere in it. The literal's value is hand-picked so ITS OWN top 6 bits alias
+        # the MIMG encoding (0b111100) with DIM=5 (2D_ARRAY, an arrayed shape) in bits [5:3]:
+        # exactly the pattern a dword-by-dword scan mistakes for `image_sample dim:2D_ARRAY`. Such a
+        # scan decodes one MIMG here and classify() reports a phantom `array-layer-dropped` defect
+        # against a "shader" that samples no image at all.
+        phantom_literal = struct.pack("<II", 0x7E0002FF, 0xF0000028)
+        check(mimg(phantom_literal) == [],
+              "a literal operand aliasing an ARRAYED MIMG encoding is not read as an instruction")
+        check(classify(mimg(phantom_literal), [("2D", 0)], []) == [],
+              "...and so the full pipeline reports no phantom array-layer-dropped finding either")
+
+        # --- NSA (Non-Sequential Address) length: a real MIMG can be 2-5 dwords (dword0[2:1] gives
+        # the extra-dword count), and each extra dword must be skipped too, not just dword1. Here
+        # the NSA instruction's own extra dwords are themselves crafted to alias the MIMG encoding
+        # -- if the walk advanced by a fixed 2 dwords instead of reading the NSA field, it would
+        # misread them as two more (phantom) MIMG instructions, then desync and miss the real one
+        # that follows. Reverting `rdna2_decode.cpp`'s `2 + extra` to a flat `2` reddens this.
+        nsa_dim1 = 0xF0000000 | (1 << 1) | (1 << 3)     # MIMG, NSA=1 extra dword, DIM=1 (plain 2D)
+        check(sites(struct.pack("<IIII", nsa_dim1, 0xF0800028, 0xF0800028, 0xF0800028))
+              == [(0, 0x00, 1), (3, 0x20, 5)],
+              "NSA's extra dwords (dword0[2:1]) are skipped, not read as instructions, and the real "
+              "MIMG that follows is found at the correct dword offset")
+
+        # --- A stream the decoder cannot read is REFUSED, not answered with an empty census. This
+        # is the half that keeps a clean result honest, and it is a real behavior change from the
+        # in-process walk, which truncated a partial dword and returned []. A partial dword is a
+        # truncated dump; a scanner that reports on one is reporting on bytes it does not have.
+        check(refused(b""), "a zero-byte ISA dump is refused, not decoded as 'no MIMG'")
+        check(refused(b"\x01\x02"), "half a dword is refused, not silently truncated")
+
+        # --- The sentinel contract, with a stub decoder. `mimg-sites-end` is what separates "this
+        # shader has no image instruction" -- the answer that certifies a clean scan -- from "the
+        # decoder died before printing anything". Without this arm, a decoder that crashed on
+        # startup would certify every shader in a run as clean.
+        fixture = os.path.join(fixtures, "fixture.bin")
+        with open(fixture, "wb") as f:
+            f.write(struct.pack("<II", 0xF0800028, 0))
+        silent = os.path.join(fixtures, "silent_decoder.py")
+        with open(silent, "w") as f:
+            f.write("import sys\nsys.exit(0)\n")          # exits 0 having printed nothing
+        truncated = os.path.join(fixtures, "truncated_decoder.py")
+        with open(truncated, "w") as f:                     # prints a site, then dies before the end
+            f.write("import sys\nprint('mimg-site pc=0 op=0x20 dim=5')\nsys.exit(0)\n")
+        undercount = os.path.join(fixtures, "undercount_decoder.py")
+        with open(undercount, "w") as f:                    # sentinel claims 5, one line parseable
+            f.write("import sys\n"
+                    "print('mimg-site pc=0 op=0x20 dim=5')\n"
+                    "print('mimg-site pc=2 op=0xZZ dim=5')\n"
+                    "print('mimg-sites-end dwords=8 consumed=8 instructions=2 sites=5 endpgm=1')\n")
+        for stub, label in ((silent, "a decoder that exits 0 having printed nothing"),
+                            (truncated, "a decoder that prints sites but no mimg-sites-end"),
+                            (undercount, "a census whose sentinel count disagrees with its lines")):
+            raised = False
+            try:
+                decode_mimg_sites(stub, fixture)
+            except DecoderUnavailable:
+                raised = True
+            check(raised, f"{label} is refused, not read as a census")
 
     # --- SPIR-V parse, both directions.
     arrayed = "%1 = OpTypeImage %float 2D 0 1 0 1 Unknown"
@@ -540,7 +543,7 @@ def self_test():
     # --- The exit contract, end to end. These are what make a clean result mean anything.
     script = os.path.abspath(__file__)
     with tempfile.TemporaryDirectory() as tmp:
-        rc, out, err = _run_self_test_case(tmp, script, ["good"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["good"])
         # The positive count matters as much as the exit code. Every `rc == 2` arm below would pass
         # if the stub could not START -- a stub that never runs is indistinguishable from a capture
         # that could not be scanned -- so at least one arm has to assert that the stub really
@@ -549,36 +552,36 @@ def self_test():
         check(rc == 0 and "examined=2" in out,
               "a capture whose module IS arrayed exits 0 AND reports its 2 examined shaders")
 
-        rc, out, err = _run_self_test_case(tmp, script, ["bad"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["bad"])
         check(rc == 1 and "array-layer-dropped" in out, "a real mismatch exits 1 and is printed")
 
-        rc, out, err = _run_self_test_case(tmp, script, ["empty"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["empty"])
         check(rc == 2, "a capture with no shaders exits 2, not 0")
 
-        rc, out, err = _run_self_test_case(tmp, script, ["broken"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["broken"])
         check(rc == 2, "a capture gpu_replay could not inspect exits 2")
 
-        rc, out, err = _run_self_test_case(tmp, script, ["nodump"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["nodump"])
         check(rc == 2 and "zero examined" in err,
               "dumps that exit non-zero are NOT counted as examined")
 
-        rc, out, err = _run_self_test_case(tmp, script, ["emptyisa"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["emptyisa"])
         check(rc == 2, "a zero-byte ISA dump is NOT an examined shader (it exits 0, so only its "
                        "emptiness distinguishes it)")
 
         # The finding that made the old exit contract unsound: one good capture certifying a run.
-        rc, out, err = _run_self_test_case(tmp, script, ["good", "empty"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["good", "empty"])
         check(rc == 2, "one readable capture does NOT certify a barren one alongside it")
 
-        rc, out, err = _run_self_test_case(tmp, script, ["bad", "nodump"])
+        rc, out, err = _run_self_test_case(tmp, script, decoder, ["bad", "nodump"])
         check(rc == 2, "a barren capture outranks findings elsewhere (2 beats 1)")
 
         # Cross-capture contamination: `nodump` writes nothing, so it must contribute no findings
         # even when a previous capture in the SAME run wrote files under the same shader hashes.
-        _, alone, _ = _run_self_test_case(tmp, script, ["bad"])
+        _, alone, _ = _run_self_test_case(tmp, script, decoder, ["bad"])
         finding_lines = lambda out: [ln for ln in out.splitlines() if "guest " in ln]
         for bad_tag in ("nodump", "partial", "silentzero"):
-            _, pair, _ = _run_self_test_case(tmp, script, ["bad", bad_tag])
+            _, pair, _ = _run_self_test_case(tmp, script, decoder, ["bad", bad_tag])
             attributed = [ln for ln in finding_lines(pair) if ln.startswith(bad_tag)]
             check(len(finding_lines(pair)) == len(finding_lines(alone)) and not attributed,
                   f"'{bad_tag}' contributes no findings of its own")
@@ -586,9 +589,9 @@ def self_test():
         # version did not: `partial` writes a file and exits non-zero, so ONLY the return-code check
         # rejects it; `silentzero` exits 0 having written nothing, so ONLY the per-capture temp
         # directory stops it inheriting the previous capture's file under the same shader hash.
-        rc, _, err = _run_self_test_case(tmp, script, ["partial"])
+        rc, _, err = _run_self_test_case(tmp, script, decoder, ["partial"])
         check(rc == 2, "a dump that writes a file but exits non-zero is not an examined shader")
-        rc, _, err = _run_self_test_case(tmp, script, ["silentzero"])
+        rc, _, err = _run_self_test_case(tmp, script, decoder, ["silentzero"])
         check(rc == 2, "a dump that exits 0 having written nothing is not an examined shader")
 
     print("== self-test PASSED ==" if ok else "== self-test FAILED ==")
@@ -600,12 +603,17 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("captures", nargs="*")
     ap.add_argument("--gpu-replay", default="./build-linux/gpu_replay")
+    # The MIMG walk is prosper's own decoder, invoked out of process (#3184). There is deliberately
+    # no in-process fallback: a fallback would be the duplicate implementation this replaced, and an
+    # untested one, so a missing decoder must stop the scan rather than quietly downgrade it.
+    ap.add_argument("--mimg-decoder", default="./build-linux/shader_inspect",
+                    help="shader_inspect binary, which supplies the real RDNA2 MIMG walk")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
 
     if a.self_test:
-        return self_test()
+        return self_test(a.mimg_decoder)
     if not a.captures:
         ap.error("give at least one capture, or --self-test")
     if not os.environ.get("PROSPER_SPIRV_DIS") and not shutil.which("spirv-dis"):
@@ -615,6 +623,12 @@ def main():
     if not os.path.exists(a.gpu_replay):
         print(f"scan: no gpu_replay at {a.gpu_replay} (--gpu-replay to point elsewhere)", file=sys.stderr)
         return 2
+    if not os.path.exists(a.mimg_decoder):
+        print(f"scan: no shader_inspect at {a.mimg_decoder} -- that binary IS the ISA walk, so\n"
+              f"      without it this tool cannot find a single image instruction and a clean\n"
+              f"      result would be meaningless. Build it (--target shader_inspect), or point\n"
+              f"      --mimg-decoder at it.", file=sys.stderr)
+        return 2
 
     all_f, total_examined, total_skipped, failed, per_capture = [], 0, 0, [], []
     for cap in a.captures:
@@ -623,7 +637,7 @@ def main():
         # against bytes the tool never read.
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                res, err = scan_capture(a.gpu_replay, cap, tmp)
+                res, err = scan_capture(a.gpu_replay, a.mimg_decoder, cap, tmp)
             except Exception as e:                       # noqa: BLE001 -- must not exit 1
                 res, err = None, f"{type(e).__name__}: {e}"
         if res is None:

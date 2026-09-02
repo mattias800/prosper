@@ -77,6 +77,40 @@ control-flow shape may remain listed there even when the vertex/fragment structu
 `--stage vertex|fragment|compute` additionally runs the complete stage translator, which exposes contextual
 resource and structured-control-flow failures that per-instruction coverage cannot decide.
 
+## `--mimg-sites`: the MIMG census, for tools that must not carry their own decoder
+
+```bash
+./build-linux/shader_inspect exec_ps_7f123400.bin --mimg-sites
+mimg-site pc=0042 op=0x20 dim=5
+mimg-site pc=0061 op=0x00 dim=1
+mimg-sites-end dwords=903 consumed=903 instructions=781 sites=2 endpgm=1
+```
+
+One line per image instruction — its dword PC, its 8-bit opcode with the split MSB already
+reassembled, and its `DIM` — and nothing else: no coverage, no stage recompile, no resource-table
+reasoning. The default listing is untouched; this replaces it, and combining it with `--stage` is a
+usage error so the exit code stays unambiguous.
+
+**Why it exists.** `tools/shader_conformance/scan.py` needs to know where the image instructions are
+in a raw dump, and to do that it needs real instruction lengths — otherwise an operand or a trailing
+literal dword whose top six bits alias the MIMG encoding reads as an instruction. It used to carry
+its own Python port of `rdna2_decode_one`'s format and length dispatch for exactly that (#3040). The
+port was correct, and that was never the problem: a copy of a decoding rule is the one nobody
+updates when the decoder learns a new literal-forcing opcode or a wider NSA field, and it fails by
+silently returning a plausible instruction stream. This flag deletes the copy (#3184).
+
+`mimg-sites-end` is a **completion sentinel, not decoration**. A consumer must be able to tell "this
+shader contains no image instruction" — the answer that certifies a clean conformance scan — from
+"this process printed nothing because it died", and those two must never look alike. `scan.py`
+refuses any census that arrives without it, and cross-checks its `sites=` count against the number
+of `mimg-site` lines it parsed — so a line the consumer's parser stops matching is loud rather than
+a quietly smaller census.
+
+Exit is `0` whenever the file was read and walked; `2` for usage or I/O errors, including an empty
+input or one that is not a whole number of dwords. A stream that stops short of `s_endpgm` is
+reported as `endpgm=0` rather than as a failure — a census over a truncated dump is still an exact
+census of what could be decoded.
+
 ## `--stage` cannot prove a shader is unsupported (#1571)
 
 **`shader_inspect` has no resource table, and a table-less stage rejection is NOT evidence of a shader

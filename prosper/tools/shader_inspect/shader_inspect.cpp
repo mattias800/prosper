@@ -77,14 +77,39 @@ bool needs_resource_table(Rdna2Format fmt, const std::string& stage) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Flags are parsed rather than positionally matched, so a mode can be added without the arity
+    // of the previous one becoming load-bearing. `--mimg-sites` is exclusive: it replaces the
+    // listing with a machine-readable census (see below), and combining it with a stage recompile
+    // would make its exit code ambiguous between "the census ran" and "the stage recompiled".
     std::string stage;
-    if (argc == 4 && std::strcmp(argv[2], "--stage") == 0) stage = argv[3];
-    if ((argc != 2 && argc != 4) ||
+    std::string input_path;
+    bool mimg_sites = false;
+    bool bad_usage = false;
+    for (int i = 1; i < argc && !bad_usage; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--stage") {
+            if (i + 1 >= argc) bad_usage = true;
+            else stage = argv[++i];
+        } else if (arg == "--mimg-sites") {
+            mimg_sites = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            bad_usage = true;
+        } else if (input_path.empty()) {
+            input_path = arg;
+        } else {
+            bad_usage = true;
+        }
+    }
+    if (input_path.empty() || bad_usage || (mimg_sites && !stage.empty()) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
+        std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
         std::fprintf(stderr,
             "\n"
             "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
+            "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the same\n"
+            "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
+            "census from a run that died before printing one.\n"
             "\n"
             "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
             "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
@@ -97,9 +122,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::ifstream input(argv[1], std::ios::binary);
+    std::ifstream input(input_path.c_str(), std::ios::binary);
     if (!input) {
-        std::fprintf(stderr, "shader_inspect: cannot open %s\n", argv[1]);
+        std::fprintf(stderr, "shader_inspect: cannot open %s\n", input_path.c_str());
         return 2;
     }
     constexpr size_t kMaxBytes = 16u << 20;
@@ -116,7 +141,7 @@ int main(int argc, char** argv) {
     input.seekg(0, std::ios::beg);
     std::vector<uint8_t> bytes(static_cast<size_t>(input_size));
     if (!input.read(reinterpret_cast<char*>(bytes.data()), input_size)) {
-        std::fprintf(stderr, "shader_inspect: failed to read %s\n", argv[1]);
+        std::fprintf(stderr, "shader_inspect: failed to read %s\n", input_path.c_str());
         return 2;
     }
 
@@ -124,6 +149,38 @@ int main(int argc, char** argv) {
     std::memcpy(words.data(), bytes.data(), bytes.size());
     std::vector<Rdna2Inst> instructions;
     const size_t consumed = rdna2_walk(words.data(), words.size(), instructions);
+
+    // --mimg-sites: the MIMG census, and nothing else. This exists so a consumer never has to carry
+    // its own port of the RDNA2 length rules to find where the image instructions are. Before it,
+    // `tools/shader_conformance/scan.py` reimplemented `rdna2_decode_one`'s whole format/length
+    // dispatch in Python so it could tell an instruction boundary from an operand or literal dword
+    // that happens to alias the MIMG encoding -- a second implementation of a decoding rule, which
+    // is the thing that drifts (#3184; the same folder's `fn[]` name table drifted exactly this way,
+    // #3229). The fields come straight off the decoded instruction, so opcode's split MSB and the
+    // DIM position are stated in exactly one place in this repository.
+    //
+    // It deliberately walks and prints, nothing more: no coverage, no recompile, no resource-table
+    // reasoning. Everything a census consumer can be wrong about is then a property of rdna2_walk.
+    //
+    // `mimg-sites-end` is a completion sentinel, not decoration. Without it a consumer cannot
+    // distinguish "this shader contains no image instruction" -- the answer that certifies a clean
+    // conformance scan -- from "this process printed nothing because it died", and those two must
+    // never look alike. Exit is 0 whenever the stream was read and walked: a stream that stops
+    // short of s_endpgm is reported as `endpgm=0` rather than as a failure, because a census over
+    // a truncated dump is still an exact census of what could be decoded.
+    if (mimg_sites) {
+        const bool walk_ended = !instructions.empty() && instructions.back().is_end;
+        size_t sites = 0;
+        for (const Rdna2Inst& in : instructions) {
+            if (in.fmt != Rdna2Format::MIMG) continue;
+            ++sites;
+            std::printf("mimg-site pc=%u op=0x%x dim=%u\n", in.pc, in.opcode, in.mimg_dim);
+        }
+        std::printf("mimg-sites-end dwords=%zu consumed=%zu instructions=%zu sites=%zu endpgm=%d\n",
+                    words.size(), consumed, instructions.size(), sites, walk_ended ? 1 : 0);
+        return 0;
+    }
+
     std::vector<RecompileUnsupportedSite> unsupported_sites;
     const RecompileCoverage coverage =
         recompile_coverage(words.data(), words.size(), &unsupported_sites);
