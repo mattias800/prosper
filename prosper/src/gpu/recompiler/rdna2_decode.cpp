@@ -1270,10 +1270,35 @@ bool rdna2_mimg_dynamic_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
     if (in.mimg_r128 || in.mimg_tfe || in.mimg_lwe || in.mimg_a16 || in.mimg_d16 ||
         in.mimg_reserved)
         return false;
-    if (in.mimg_nsa != 0u || in.len_dwords != 2u) return false;
     if (in.mimg_dim != 1u && in.mimg_dim != 5u) return false;
     if (in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0) return false;
-    const uint32_t reg = static_cast<uint32_t>(in.src[0].value) + (in.mimg_dim == 5u ? 3u : 2u);
+    // IMAGE_LOAD_MIP's address vector is the dimension's coordinates followed by the mip selector,
+    // so the mip is always the LAST address: 2D = [x, y, mip], 2D_ARRAY = [x, y, slice, mip].
+    const uint32_t address_count = in.mimg_dim == 5u ? 4u : 3u;
+    uint32_t reg = 0;
+    if (in.mimg_nsa == 0u) {
+        // Consecutive encoding: every address is VADDR + its index.
+        if (in.len_dwords != 2u) return false;
+        reg = static_cast<uint32_t>(in.src[0].value) + (address_count - 1u);
+    } else {
+        // NSA (#3134). The extra dwords are an ADDRESS ENCODING, not a different operation: addr0
+        // still comes from VADDR and every later address names an arbitrary VGPR, one per byte of
+        // words[2..], low byte first. Treating "three dwords" as an unknown packet is what rejected
+        // Stray's fragment (`f004070a,00080500,0000052a` = `image_load_mip v[5:7], [v0, v42, v5],
+        // s[32:39] dmask:0x7 dim:SQ_RSRC_IMG_2D`, byte-verified against llvm-mc gfx1030) even though
+        // its address vector is the same [x, y, mip] the consecutive form carries.
+        //
+        // One extra dword holds four address bytes, so every shape this function models (3 or 4
+        // addresses = 2 or 3 bytes after VADDR) encodes with NSA=1 and exactly one extra dword.
+        // A larger NSA on this operand count is not something a compiler emits and would place the
+        // mip elsewhere, so it stays fail-closed rather than being guessed at.
+        if (in.mimg_nsa != 1u || in.len_dwords != 3u) return false;
+        const uint32_t nsa_addresses = address_count - 1u;   // bytes of words[2] that carry an addr
+        // Unused high bytes of the extra dword must be zero. A nonzero one means the packet carries
+        // more addresses than this dimension accounts for, i.e. it is not the shape modelled here.
+        if ((in.words[2] >> (8u * nsa_addresses)) != 0u) return false;
+        reg = (in.words[2] >> (8u * (nsa_addresses - 1u))) & 0xffu;
+    }
     if (reg >= 256u) return false;
     if (mip_vgpr) *mip_vgpr = reg;
     return true;

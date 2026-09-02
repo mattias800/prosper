@@ -2430,6 +2430,245 @@ int main() {
         }
     }
 
+    // #3134: the SAME dynamic-mip lowering reached through the NSA address encoding. Stray's
+    // (PPSA02101) title-screen fragment issues `image_load_mip v[5:7], [v0, v42, v5], s[32:39]
+    // dmask:0x7 dim:SQ_RSRC_IMG_2D` -- three dwords, because NSA spells each address after the
+    // first as one byte of an extra dword instead of taking consecutive VGPRs from VADDR. That is
+    // an ADDRESS ENCODING, not a different operation, and the shape predicate could not read it,
+    // so the whole stage was rejected `mode=unresolved-operand`.
+    //
+    // The discriminator is deliberately built so a consecutive-VGPR reading CANNOT pass it: the
+    // mip lives in v7 (value 1) while v2 -- the register the old arithmetic would have named --
+    // holds 0. A regression that read v2 would fetch level ZERO and redden the level-one equality.
+    {
+        constexpr uint32_t NSA_W = 256, NSA_H = 256, NSA_BPE = 4, NSA_MAX_MIP = 8;
+        const uint32_t nsa_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        const TiledMipLevelLayout nsa_level0 = tiled_mip_level_layout(
+            NSA_W, NSA_H, NSA_BPE, nsa_tile, NSA_MAX_MIP, 0);
+        const TiledMipLevelLayout nsa_level1 = tiled_mip_level_layout(
+            NSA_W, NSA_H, NSA_BPE, nsa_tile, NSA_MAX_MIP, 1);
+        const size_t nsa_bytes = tiled_mip_chain_bytes(
+            NSA_W, NSA_H, NSA_BPE, nsa_tile, NSA_MAX_MIP);
+        CHECK(nsa_level0.supported && !nsa_level0.in_tail && nsa_level1.supported &&
+                  !nsa_level1.in_tail && nsa_bytes != 0,
+              "the NSA fixture places levels zero and one outside the shared mip tail");
+
+        std::vector<uint8_t> nsa_allocation(nsa_bytes, 0x6b);
+        std::vector<uint32_t> nsa_level0_linear(static_cast<size_t>(NSA_W) * NSA_H);
+        std::vector<uint32_t> nsa_level1_linear(
+            static_cast<size_t>(NSA_W / 2u) * (NSA_H / 2u));
+        for (size_t i = 0; i < nsa_level0_linear.size(); ++i)
+            nsa_level0_linear[i] = static_cast<uint32_t>(i * 1103515245u + 0x33333333u);
+        for (size_t i = 0; i < nsa_level1_linear.size(); ++i)
+            nsa_level1_linear[i] = static_cast<uint32_t>(i * 22695477u + 0x6b6b0000u);
+        tile_surface(nsa_allocation.data() + nsa_level0.byte_offset,
+                     reinterpret_cast<const uint8_t*>(nsa_level0_linear.data()),
+                     NSA_W, NSA_H, nsa_tile, 0, NSA_BPE);
+        tile_surface(nsa_allocation.data() + nsa_level1.byte_offset,
+                     reinterpret_cast<const uint8_t*>(nsa_level1_linear.data()),
+                     NSA_W / 2u, NSA_H / 2u, nsa_tile, 0, NSA_BPE);
+
+        // Every word below is llvm-mc gfx1030 output for the instruction in its comment.
+        const uint32_t nsa_mip_program[] = {
+            0x7e080300u,                                  // v4 = x (shell input, saved)
+            0x7e020280u,                                  // v1 = y = 0
+            0x7e040280u,                                  // v2 = 0  <- a consecutive read lands here
+            0x7e0e0281u,                                  // v7 = mip = 1 <- the NSA byte's register
+            0x7e0a0280u,                                  // v5 = destination y = 0
+            0xf004010au, 0x00050000u, 0x00000701u,        // IMAGE_LOAD_MIP v0, [v0,v1,v7], s[20:27]
+            0xbf8c3f70u,                                  // s_waitcnt
+            0xf0200108u, 0x00020004u,                     // IMAGE_STORE v0, [v4,v5], s[8:15]
+            0xbf810000u,                                  // s_endpgm
+        };
+        {
+            // The encoding claim this arm rests on, checked against the decoder rather than
+            // assumed from the comment: three dwords, NSA=1, and the mip named by the SECOND
+            // address byte.
+            uint32_t decoded_mip = UINT32_MAX;
+            const Rdna2Inst decoded = rdna2_decode_one(&nsa_mip_program[5], 3);
+            CHECK(decoded.fmt == Rdna2Format::MIMG && decoded.opcode == 0x01u &&
+                      decoded.mimg_nsa == 1u && decoded.len_dwords == 3u &&
+                      rdna2_mimg_dynamic_mip_shape(decoded, &decoded_mip) && decoded_mip == 7u,
+                  "#3134: the fixture's NSA packet names v7 -- not v2 -- as its mip operand");
+        }
+        std::vector<uint32_t> nsa_dst(W, 0x44444444u);
+        ShaderResourceTable nsa_rt = irt;
+        for (ShaderResource& resource : nsa_rt.resources) {
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.sgpr_base = 20;
+                resource.fetch_pc = 5;
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                resource.width = NSA_W;
+                resource.height = NSA_H;
+                resource.depth = 1;
+                resource.tile_mode = nsa_tile;
+                resource.declared_mip_levels = NSA_MAX_MIP + 1u;
+                resource.mip_chain_element_width = NSA_W;
+                resource.mip_chain_element_height = NSA_H;
+                resource.mip_chain_bytes_per_block = NSA_BPE;
+                resource.mip_chain_max_level = NSA_MAX_MIP;
+                resource.mip_chain_base_level = 0;
+                resource.proven_zero_mip = false;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(
+                    nsa_allocation.data() + nsa_level0.byte_offset);
+                resource.size = static_cast<uint32_t>(
+                    tiled_surface_bytes(NSA_W, NSA_H, nsa_tile, 0, NSA_BPE));
+            } else if (resource.binding == 5) {
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(nsa_dst.data());
+                resource.size = static_cast<uint32_t>(nsa_dst.size() * sizeof(uint32_t));
+            }
+        }
+        const std::vector<uint32_t> nsa_spirv = recompile_valu(
+            nsa_mip_program, std::size(nsa_mip_program), 1, 0, &nsa_rt);
+        CHECK(!nsa_spirv.empty(),
+              "#3134: an NSA-encoded IMAGE_LOAD_MIP recompiles instead of rejecting the stage");
+        if (!nsa_spirv.empty()) {
+            ComputeItem item;
+            item.spirv = nsa_spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(nsa_rt);
+            item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x30be800000ull;   // Stray's own fragment address, as a label
+            CHECK(prosper::frontend::execute_live_compute_items({item}),
+                  "#3134: the live backend executes an NSA-addressed dynamic-mip dispatch");
+            CHECK(std::equal(nsa_dst.begin(), nsa_dst.end(), nsa_level1_linear.begin()),
+                  "#3134: the NSA packet's mip byte selects LEVEL ONE's own guest texels");
+            // Fixture-validity guards, not discriminators -- the same distinction #3048's block
+            // draws. Level one must be distinguishable from level zero, and the dispatch must
+            // actually have written every texel, or the equality above could pass vacuously.
+            CHECK(!std::equal(nsa_dst.begin(), nsa_dst.end(), nsa_level0_linear.begin()),
+                  "#3134: level one is distinguishable from level zero in the NSA fixture");
+            CHECK(std::none_of(nsa_dst.begin(), nsa_dst.end(),
+                               [](uint32_t value) { return value == 0x44444444u; }),
+                  "#3134: every NSA destination texel was actually written by the dispatch");
+        }
+    }
+
+    // #3134: a chain whose SELECTED level is itself packed in the shared mip tail. Stray's
+    // resource is a 32x32 six-level pyramid, which at 4 bytes per texel is smaller than one 64 KiB
+    // macroblock -- so AddrLib packs every level, level zero included, into the allocation's tail
+    // and leaves `gpu_addr` at the allocation base. `shader_resource_mip_chain_plan` used to refuse
+    // that placement outright, which refused the whole small-texture class rather than an exotic
+    // corner. 64x64 is used here (not 32x32) only so level one is 32 texels wide, which the
+    // dispatch below covers exactly; the tail geometry is identical.
+    {
+        constexpr uint32_t TAIL_W = 64, TAIL_H = 64, TAIL_BPE = 4, TAIL_MAX_MIP = 6;
+        constexpr uint32_t TAIL_THREADS = 32;   // = level one's width
+        const uint32_t tail_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        const TiledMipLevelLayout tail_level0 = tiled_mip_level_layout(
+            TAIL_W, TAIL_H, TAIL_BPE, tail_tile, TAIL_MAX_MIP, 0);
+        const TiledMipLevelLayout tail_level1 = tiled_mip_level_layout(
+            TAIL_W, TAIL_H, TAIL_BPE, tail_tile, TAIL_MAX_MIP, 1);
+        const size_t tail_bytes = tiled_mip_chain_bytes(
+            TAIL_W, TAIL_H, TAIL_BPE, tail_tile, TAIL_MAX_MIP);
+        CHECK(tail_level0.supported && tail_level0.in_tail && tail_level1.supported &&
+                  tail_level1.in_tail && tail_bytes != 0 &&
+                  tail_level0.tail_block_bytes == tail_bytes,
+              "#3134: the tail fixture really packs level zero AND level one into one block");
+
+        std::vector<uint8_t> tail_allocation(tail_bytes, 0x91);
+        std::vector<uint32_t> tail_level0_linear(static_cast<size_t>(TAIL_W) * TAIL_H);
+        std::vector<uint32_t> tail_level1_linear(
+            static_cast<size_t>(TAIL_W / 2u) * (TAIL_H / 2u));
+        for (size_t i = 0; i < tail_level0_linear.size(); ++i)
+            tail_level0_linear[i] = static_cast<uint32_t>(i * 2891336453u + 0x19191919u);
+        for (size_t i = 0; i < tail_level1_linear.size(); ++i)
+            tail_level1_linear[i] = static_cast<uint32_t>(i * 374761393u + 0x91910000u);
+        // Tail levels share one block and are addressed by element coordinate inside it, so they
+        // are written with the sibling-preserving level writer rather than by offset.
+        tile_surface_level(tail_allocation.data(), tail_allocation.size(),
+                           reinterpret_cast<const uint8_t*>(tail_level0_linear.data()),
+                           TAIL_W, TAIL_H, tail_tile, TAIL_BPE,
+                           tail_level0.tail_x, tail_level0.tail_y);
+        tile_surface_level(tail_allocation.data(), tail_allocation.size(),
+                           reinterpret_cast<const uint8_t*>(tail_level1_linear.data()),
+                           TAIL_W / 2u, TAIL_H / 2u, tail_tile, TAIL_BPE,
+                           tail_level1.tail_x, tail_level1.tail_y);
+
+        const uint32_t tail_mip_program[] = {
+            0x7e080300u,                                  // v4 = x
+            0x7e020280u,                                  // v1 = y = 0
+            0x7e040281u,                                  // v2 = mip = 1
+            0x7e0a0280u,                                  // v5 = destination y = 0
+            0xf0040108u, 0x00050000u,                     // IMAGE_LOAD_MIP v0, [v0,v1,v2], s[20:27]
+            0xbf8c3f70u,                                  // s_waitcnt
+            0xf0200108u, 0x00020004u,                     // IMAGE_STORE v0, [v4,v5], s[8:15]
+            0xbf810000u,                                  // s_endpgm
+        };
+        std::vector<uint32_t> tail_dst(TAIL_THREADS, 0x27272727u);
+        ShaderResourceTable tail_rt = irt;
+        for (ShaderResource& resource : tail_rt.resources) {
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.sgpr_base = 20;
+                resource.fetch_pc = 4;
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                resource.width = TAIL_W;
+                resource.height = TAIL_H;
+                resource.depth = 1;
+                resource.tile_mode = tail_tile;
+                resource.declared_mip_levels = TAIL_MAX_MIP + 1u;
+                resource.mip_chain_element_width = TAIL_W;
+                resource.mip_chain_element_height = TAIL_H;
+                resource.mip_chain_bytes_per_block = TAIL_BPE;
+                resource.mip_chain_max_level = TAIL_MAX_MIP;
+                resource.mip_chain_base_level = 0;
+                resource.proven_zero_mip = false;
+                // The descriptor's own published tail placement -- gpu_addr is NOT shifted onto
+                // the selected level, because a tail level owns no disjoint byte range.
+                resource.in_mip_tail = true;
+                resource.mip_tail_offset = static_cast<uint32_t>(tail_level0.byte_offset);
+                resource.mip_tail_bytes = tail_level0.tail_block_bytes;
+                resource.mip_tail_x = tail_level0.tail_x;
+                resource.mip_tail_y = tail_level0.tail_y;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(tail_allocation.data());
+                resource.size = static_cast<uint32_t>(tail_bytes);
+            } else if (resource.binding == 5) {
+                resource.img_dim = 1;
+                resource.format = DataFormat::Uint32;
+                resource.num_components = 1;
+                // The destination is only as wide as the dispatch, because level one is 32 texels
+                // across: a wider one would leave the tail of the row unwritten and out of bounds.
+                resource.width = TAIL_THREADS;
+                resource.height = 1;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(tail_dst.data());
+                resource.size = static_cast<uint32_t>(tail_dst.size() * sizeof(uint32_t));
+            }
+        }
+        const std::vector<uint32_t> tail_spirv = recompile_valu(
+            tail_mip_program, std::size(tail_mip_program), 1, 0, &tail_rt);
+        CHECK(!tail_spirv.empty(),
+              "#3134: IMAGE_LOAD_MIP recompiles against a tail-packed declared chain");
+        if (!tail_spirv.empty()) {
+            ComputeItem item;
+            item.spirv = tail_spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(tail_rt);
+            item.launch.threads_x = TAIL_THREADS; item.launch.local_x = TAIL_THREADS;
+            item.launch.groups_x = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x308e090000ull;   // Stray's own resource address, as a label
+            CHECK(prosper::frontend::execute_live_compute_items({item}),
+                  "#3134: the live backend executes a dispatch over a tail-packed chain");
+            CHECK(std::equal(tail_dst.begin(), tail_dst.end(), tail_level1_linear.begin()),
+                  "#3134: a tail-packed level one returns its OWN guest texels");
+            CHECK(!std::equal(tail_dst.begin(), tail_dst.end(), tail_level0_linear.begin()),
+                  "#3134: level one is distinguishable from level zero in the tail fixture");
+            CHECK(std::none_of(tail_dst.begin(), tail_dst.end(),
+                               [](uint32_t value) { return value == 0x27272727u; }),
+                  "#3134: every tail destination texel was actually written by the dispatch");
+        }
+    }
+
     // #3048: the SAME dynamic-mip lowering at DMASK 0x3. `rdna2_mimg_dynamic_mip_shape` widened
     // DMASK from the zero-mip shape's {0x1, 0xf} to anything, and Sonic Frontiers' kernels issue
     // exactly 0x3 against a two-channel surface -- so the two-component result mask, and the

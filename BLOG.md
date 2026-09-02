@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### The "exotic" image instruction blocking a Stray draw was an ordinary one, spelled differently
+
+A three-dword `image_load_mip` had been rejecting a whole Stray fragment shader, and the extra dword
+looked like an unknown packet. It is RDNA2's NSA address encoding: the same `[x, y, mip]` the
+two-dword form carries, with each address naming any register instead of the next one along — so the
+bug was our rule about how many address dwords an instruction may have, not the instruction. The
+same fix also stopped refusing textures small enough that their entire mip pyramid fits in one tile.
+[#3237](https://github.com/mattias800/prosper/pull/3237)
+
 ### The shader-conformance scanner stopped carrying its own copy of the RDNA2 decoder
 
 No picture in this one — the finding is that `shader_histo` has been reading past the end of an

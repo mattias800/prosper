@@ -305,9 +305,41 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   cmake -S prosper -B prosper/build-linux -DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0
   ```
   Never `cd` back to the main repo root to run git or builds. If you MUST touch the main checkout,
-  assume another agent is actively working there — check `git status` first and don't reset/stash/
-  switch branches under them (the stash stack is shared too — see the worktree note in the environment
-  preamble).
+  assume another agent is actively working there — check `git status` first and don't reset or
+  switch branches under them. Don't stash there either — and that one is not a rule about the main
+  checkout, it is a rule everywhere in this repository, for the reason in the next bullet.
+  - **`git stash` is NOT worktree-local — it is the one piece of state the rule above does not
+    isolate.** A worktree gets its own `HEAD`, its own index and its own working tree. `refs/stash`
+    is a **single ref in the shared `.git` directory**, so every worktree pushes onto and pops from
+    **one LIFO stack**. Two agents each obeying the rule above therefore still collide: on
+    2026-09-01 lane A stashed one file so it could rebuild without it, lane B stashed in its own
+    tree moments later, and A's `git stash pop` took the top of the stack — B's entry — applying an
+    unrelated `hle_kernel.cpp` change into A's tree and **dropping B's entry** on the way through
+    (#3174, instrument trap 247). Both agents happened to notice the foreign diff. The silent
+    version of that mixes two issues' changes into one branch, or discards a lane's WIP as an
+    unreachable, GC-eligible commit — and the rebuild you were about to measure now contains
+    somebody else's edit under a banner saying only your own change was removed.
+    **So do not `git stash` in this repository.** Park changes somewhere that really is yours:
+    ```bash
+    python3 prosper/tools/wt_stash.py push -m 'A/B: rebuild without this' src/foo.cpp
+    #   ... rebuild, confirm the regression arm fails without it ...
+    python3 prosper/tools/wt_stash.py pop
+    ```
+    It snapshots with `git stash create` (which writes no ref and touches no working tree) and
+    stores the result under `refs/worktree/prosper-stash/<slot>` — `git-worktree(1)` § REFS:
+    *"refs inside refs/bisect, refs/worktree and refs/rewritten are not shared"*. Slots are
+    addressed by **name**, never by top-of-stack, and `push` **refuses** an occupied slot instead of
+    stacking, so nothing can be displaced by a neighbour or by yourself. `wt_stash.py check` reads
+    the shared `refs/stash` and tells you whether what is on it is yours **before** you touch it;
+    `wt_stash.py list --all` finds an entry parked in another tree. Two tool-free alternatives are
+    equally safe: a temporary commit on your own branch (`git commit -m wip-tmp`, later
+    `git reset --soft HEAD~1`), which touches nothing outside `refs/heads/<your-branch>`, and a
+    second `git worktree add` when you want both states at once.
+    **Nothing enforces this for you.** A `git` alias cannot shadow a builtin, so a `git stash`
+    wrapper is impossible; the optional `wt_stash.py install-hook` works but is off by default and
+    lives in untracked `.git/hooks`, so it is absent in every fresh clone. Treat this as a rule you
+    follow, in the same family as trap 41's `git checkout <branch> -- <file>`: a git command that is
+    perfectly safe alone and destructive when several people share one repository.
   - **Nothing cleans your worktree up. This line used to claim "your worktree is auto-cleaned when
     its branch merges", and that mechanism never existed** — no git hook, no `core.hooksPath`, no
     `hooks` key in any settings.json, no `.claude/hooks/`, no workflow, no timer, and — until the
@@ -358,8 +390,13 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     figure read 89 GiB a few hours later on the same day, because this churns constantly. The
     conclusion is what is stable — well over 100 GB, and the sweeper can reclaim almost none of it. Automation cannot
     fix that and never will, because refusing a dirty tree is the guard that stops it destroying
-    someone's work. **So commit, stash or discard before you leave a tree**, or you are the only one
-    who will ever be able to clean it up.
+    someone's work. **So commit or discard before you leave a tree**, or you are the only one
+    who will ever be able to clean it up. This line used to say "commit, stash or discard", and
+    stashing is the one option that makes things worse rather than better: `worktree_reclaim.py`
+    never looks at `refs/stash` (grep it), so a tree whose only work is stashed reads as clean and
+    loses the DIRTY protection that was keeping it alive — while the work itself survives only as
+    an entry on the repo-wide stack described above, attributable to nobody and poppable by every
+    other lane.
 - **On a Windows host, run git through PowerShell (Windows git), not WSL.** The repo lives on the
   Windows filesystem (`C:\...` = `/mnt/c/...`), and worktrees created from Windows store a
   Windows-path gitdir link (`gitdir: C:/Users/.../.git/worktrees/<name>`). WSL's git can't resolve
