@@ -25,7 +25,7 @@ Route: `scripts/gris/reach-title-screen.pad`. The title appears without input; t
 route keeps a neutral scripted controller connected and prevents an evidence run from selecting
 **NEW GAME**.
 
-![GRIS — opening gameplay](../../assets/screenshots/gris.png)
+![GRIS — opening gameplay](../../assets/screenshots/gris.webp)
 
 Route: `scripts/gris/reach-first-gameplay.pad`. Poll-safe Cross edges select the default New Game
 entry and cover the opening sequence's timing variation. Right is held from 78 through 150 seconds.
@@ -36,12 +36,12 @@ contained 85 source-distinct and 85 pixel-distinct unmodified 1920×1080 fronten
 
 ### Sonic Origins
 
-![Sonic Origins — the title screen](../../assets/screenshots/sonic-origins-title-screen.png)
+![Sonic Origins — the title screen](../../assets/screenshots/sonic-origins-title-screen.webp)
 
 Route: `scripts/sonic/dismiss-boot-notice.pad`, sample 77 of 84 at t=385 s. Direct, unmodified
 `tools/screenshot` capture at native 3840x2160.
 
-![Sonic Origins — the boot auto-save notice](../../assets/screenshots/sonic-origins-autosave-notice.png)
+![Sonic Origins — the boot auto-save notice](../../assets/screenshots/sonic-origins-autosave-notice.webp)
 
 The wall in front of it, from a **default launch with no input**: sample 21 of 42 at t=210 s. The
 `[X] Close` button is the whole blocker.
@@ -50,7 +50,7 @@ The wall in front of it, from a **default launch with no input**: sample 21 of 4
 
 ![Space Adventure Cobra — The Awakening title](screenshots/issue-1356-space-adventure-cobra-title.png)
 
-![Space Adventure Cobra — tutorial combat](../../assets/screenshots/space-adventure-cobra.png)
+![Space Adventure Cobra — tutorial combat](../../assets/screenshots/space-adventure-cobra.webp)
 
 Route: `scripts/cobra/reach-title-or-gameplay.pad`.
 
@@ -1273,7 +1273,7 @@ an id that was never created). On the same route and the same dump:
 | `sonicteam_logo_4k.usm` | never opened | opened |
 | pixel-distinct frames in a 120 s native 3840x2160 `screenshot` run | 1 (black) | **8** |
 
-![Sonic Origins — SEGA logo](../../assets/screenshots/sonic-origins-sega-logo.png)
+![Sonic Origins — SEGA logo](../../assets/screenshots/sonic-origins-sega-logo.webp)
 
 Direct, unmodified `screenshot` frontend capture at 3840x2160 with `PROSPER_RENDER_SCALE=1
 PROSPER_RENDER_EVERY=1`, route `scripts/sonic/reach-title-or-gameplay.pad`, sample 8 of 24 at t=40 s.

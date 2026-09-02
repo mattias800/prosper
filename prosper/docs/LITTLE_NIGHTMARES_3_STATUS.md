@@ -1,7 +1,7 @@
 # Little Nightmares III (`PPSA05143`) — status and evidence
 
 Unreal Engine 4. **Rung 2 — title screen** (2026-08-05, master `4d7a2ded`;
-`assets/screenshots/little-nightmares-3-title-screen.png`). Tracked on
+`assets/screenshots/little-nightmares-3-title-screen.webp`). Tracked on
 [#1893](https://github.com/mattias800/prosper/issues/1893).
 
 ## Where it stands (2026-08-05)
@@ -93,7 +93,7 @@ Open as [#2014](https://github.com/mattias800/prosper/issues/2014).
 advances to its **End-User License Agreement** screen — Bandai Namco's EULA text, a `Decline` /
 `Accept` selector with `Accept` highlighted, and the `Navigate / Skip / Select / Back` prompt row.
 It renders completely and, in the clean frames, correctly —
-`assets/screenshots/little-nightmares-3-eula.png`.
+`assets/screenshots/little-nightmares-3-eula.webp`.
 
 This is still **rung 2**, not rung 3: a EULA is a menu, not gameplay with real GPU draws. It is
 recorded because it establishes two things the next lane would otherwise have to re-derive — that

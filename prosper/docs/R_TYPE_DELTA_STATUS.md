@@ -132,7 +132,7 @@ without calling it a defect. The coordinate fix does not bypass the default-laun
 (#1746), and retained replay evidence does not change the compatibility rung.
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-movie-coordinate-progress.png" alt="Intermediate R-Type Delta retained-frame replay after texel-coordinate recovery; recognizable detail is visible, while replay's missing row-pitch provenance causes a green-purple cast"><br>
+  <img src="../../assets/screenshots/rtype-delta-movie-coordinate-progress.webp" alt="Intermediate R-Type Delta retained-frame replay after texel-coordinate recovery; recognizable detail is visible, while replay's missing row-pitch provenance causes a green-purple cast"><br>
   <sub>Intermediate retained-frame replay: detail recovery is real; the green/purple cast is a replay-provenance artifact, and live chroma/placement correctness remains unverified.</sub>
 </p>
 
@@ -455,7 +455,7 @@ It also has two immediate practical consequences:
 | The flat composite is a wrong sampler LOD, a wrong image view, or a degenerate/uncovered quad | **Falsified.** `PROSPER_GEOM_PROBE=1780` returns a correct full-screen quad (6/6 vertices on-screen, clip bbox exactly ±1), and `PROSPER_FS_TAP=1780:12/:13` shows the interpolated coordinate is constant at the source rect's own origin — the sample location never varies, so nothing downstream of it can be the cause. | `gpu_replay` probes on `c9e2588e`, #2006 |
 | The post-movie collapse shares #2005's cause (the AvPlayer chroma plane declared as a one-layer 2D array) | **Falsified before the fix, by a lane that landed #2037 and re-measured.** With the chroma fix on the branch the movie reaches 315,101 distinct colours while the post-movie phase stayed at exactly 1 colour for 39 consecutive samples. Two independent defects. | #2037 branch route on `e58d387c`, #2006 |
 | Prosper's guest reads are unrealistically fast because they come from the host page cache, so a storage-latency model is the missing fidelity | **Half true, and it still is not the fix.** Page-cache state really does decide this race: with only the dump's pages evicted, INPUT→`DLLInit` is 779–1158 ms across five arms and the title **boots** every time, against 289–362 ms and five SIGSEGVs warm — and the least-contended pair points the same way (warm at load 13.4 faults, cold at load 14.7 boots), so it is not peer CPU load. But the cold arm is this box's **external USB SSD** at ~0.25 GB/s, not a PS5: a PS5 internal SSD delivers the same 101.4 MB in tens of ms, i.e. it behaves like the *warm* arm. A PS5-faithful storage model would therefore add almost nothing and cannot be justified by this race. The measurable consequence is an instrument rule, not a fix: **no startup-timing number for this title is valid unless the page-cache state is recorded.** | cold/warm A/B on `4d7a2ded`, § Host page-cache state, #1746 |
-| Cross answers the title screen's `PRESS` prompt, as it does on most titles | **Falsified.** The prompt's glyph is the PS5 **OPTIONS** icon (a filled vertical pill with three horizontal lines above it, `assets/screenshots/rtype-delta-title.png` at 1060,740-1180,870 under 4x). A Cross-only arm never leaves the title screen; OPTIONS leaves it on the first press. Inside the menu OPTIONS is *back*, not confirm. | routed arms on `82baa409`, `scripts/rtype-delta-PPSA26414/README.md` |
+| Cross answers the title screen's `PRESS` prompt, as it does on most titles | **Falsified.** The prompt's glyph is the PS5 **OPTIONS** icon (a filled vertical pill with three horizontal lines above it, `assets/screenshots/rtype-delta-title.webp` at 1060,740-1180,870 under 4x). A Cross-only arm never leaves the title screen; OPTIONS leaves it on the first press. Inside the menu OPTIONS is *back*, not confirm. | routed arms on `82baa409`, `scripts/rtype-delta-PPSA26414/README.md` |
 | A stage PRX load, a high draw count, or a frame full of ships and explosions separates player-driven play from attract mode on this title | **Falsified.** With **no input at all** (`neutral.pad`, same command and build) the attract loop loaded `title`, `select`, `st1r9`, `st2` and `st5` -- it plays demos of stages 1, 2 and 5 and shows the Force-device screen. The discriminator that survives is `loadsel_Release.prx` + `loads1_Release.prx` (the title's own loading-screen modules, reached only through the menu path) plus `<PROSPER_SAVE0>/PPSA26414/SaveData.dat`; the neutral arm produced none of the three. | neutral control arm on `82baa409` |
 | The post-title frame freeze on master is caused by configuring an input route -- a connected controller changes the title's flow | **Falsified twice.** It reproduces with `neutral.pad`, which delivers no input; and prosper's default pad backend already reports **one connected controller with neutral input** when no route is configured (`src/hle/input/hle_pad.cpp`, `poll_controller`), so `PROSPER_PAD_SCRIPT` changes the buttons, not the connection. The cause is a renderer regression against `83e3383a`. | #2783 |
 
@@ -508,7 +508,7 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 ```
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png" alt="R-Type Delta HD Boosted rung 1: the Clear River Games publisher logo and the opening movie's R-9 hangar shot, both rendered live"><br>
+  <img src="../../assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp" alt="R-Type Delta HD Boosted rung 1: the Clear River Games publisher logo and the opening movie's R-9 hangar shot, both rendered live"><br>
   <sub>Rung 1, <code>tools/screenshot</code>, default route on <code>bffa5e25</code>, unmodified binary and guest, host CPU contended so the title wins its own #1746 startup race. Left: Clear River Games logo (sample 03, guest frame ~250). Right: opening movie (sample 17, guest frame 1660). Both carry the live chroma cast — greys render green, the image is magenta-tinted.</sub>
 </p>
 
@@ -519,7 +519,7 @@ Two things are visible in those frames and both are real, live defects rather th
   reproduced on the live path, so that attribution was incomplete. Tracked in #2005 — **fixed; see
   `## The chroma cast, solved` below.** The screenshot above is retained as the historical rung-1
   evidence and still shows the cast; the corrected capture is
-  `assets/screenshots/rtype-delta-opening-movie-colour.png`.
+  `assets/screenshots/rtype-delta-opening-movie-colour.webp`.
 - Software H.264 fallback: `No support for codec h264 profile 77` / `Failed setup for format vaapi`.
   The movie decodes and plays anyway; worth checking whether VAAPI should have taken profile 77.
 
@@ -620,7 +620,7 @@ CPU-contention arm, not from this route; the numbers above are the route this do
 describes.)
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta HD Boosted: the opening movie's R-9 hangar shot rendered live in full, correct colour"><br>
+  <img src="../../assets/screenshots/rtype-delta-opening-movie-colour.webp" alt="R-Type Delta HD Boosted: the opening movie's R-9 hangar shot rendered live in full, correct colour"><br>
   <sub>The opening movie after the fix, on the deterministic <code>tools/dropcache.py</code> route.
   <code>tools/screenshot</code> frontend, <strong>default route with no CPU-contention hack</strong>,
   unmodified binary and guest, no diagnostic environment. Sample 05 of a 180 s / 45-sample run, guest
@@ -662,13 +662,13 @@ dropped publish, or a blank composite source: the phase renders its whole scene 
 offscreen 1600×960 target and only the final upscale/composite draw collapses.
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-title.png" alt="R-Type Delta: HD Boosted title screen with the PRESS prompt, rendered live at 1920x1080"><br>
+  <img src="../../assets/screenshots/rtype-delta-title.webp" alt="R-Type Delta: HD Boosted title screen with the PRESS prompt, rendered live at 1920x1080"><br>
   <sub>Rung 2 — <code>tools/screenshot</code>, default route, unmodified binary and guest, page cache
   evicted with <code>tools/dropcache.py</code>. Sample 07 of 22 on <code>71b38ca4</code> + this fix.</sub>
 </p>
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-force-select.png" alt="R-Type Delta attract mode: the R-9 and its Force device on the DEMONSTRATION screen"><br>
+  <img src="../../assets/screenshots/rtype-delta-force-select.webp" alt="R-Type Delta attract mode: the R-9 and its Force device on the DEMONSTRATION screen"><br>
   <sub>The attract sequence that follows, same route and run, sample 13 of 22.</sub>
 </p>
 
@@ -797,7 +797,7 @@ belong here because they are about the title rather than about the route file.
 
 **The title screen's prompt is OPTIONS.** The `PRESS <glyph>` prompt renders the PS5 **OPTIONS**
 glyph — a filled vertical pill with three horizontal lines above it — visible at 1060,740–1180,870 in
-`assets/screenshots/rtype-delta-title.png` under 4× magnification. That is what the prompt **names**;
+`assets/screenshots/rtype-delta-title.webp` under 4× magnification. That is what the prompt **names**;
 no Cross-only arm was run, so it is not a claim about what the title would accept. What is measured
 about behaviour is a two-arm A/B on the menus: an arm that alternated OPTIONS and Cross 5 s apart
 never advanced past the first two states — it oscillated between `Start Game` and
@@ -817,7 +817,7 @@ discriminator: the attract loop *is* gameplay, played by the title. A neutral-in
 untouched. Those are module loads, not frames: #2783 had frozen that arm's composite before any of
 them, so what the attract loop *looked* like there was not observed. That the Force-device scene
 belongs to the attract loop is corroborated separately by
-`assets/screenshots/rtype-delta-force-select.png`, captured on a default, unrouted run. So **a stage module load, a high
+`assets/screenshots/rtype-delta-force-select.webp`, captured on a default, unrouted run. So **a stage module load, a high
 draw count, or a frame full of ships is not evidence of player-driven play here.**
 
 What the neutral arm never did, and every routed run does: load **`loadsel_Release.prx`** and
@@ -926,7 +926,7 @@ pixels, one line of menu description text on black. **Both arms reach the identi
 differs, which is the control the defect needed.
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-stage1-restored.png" alt="R-Type Delta stage 1: the R-9 and its Force device over the city, with enemy formations and the BEAM/score HUD, rendered live at 1920x1080"><br>
+  <img src="../../assets/screenshots/rtype-delta-stage1-restored.webp" alt="R-Type Delta stage 1: the R-9 and its Force device over the city, with enemy formations and the BEAM/score HUD, rendered live at 1920x1080"><br>
   <sub>Stage 1 with the fix — <code>tools/screenshot</code>, <code>reach-gameplay.pad</code>, page cache
   evicted, unmodified binary and guest. Sample 60 of 60, t = 120.2 s, 132,613 distinct colours.</sub>
 </p>

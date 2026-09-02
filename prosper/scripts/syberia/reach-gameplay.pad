@@ -1,7 +1,7 @@
 # Syberia: Remastered (PPSA30140) - VALIDATED on Linux with hardware Vulkan (RADV), 1920x1080,
 # PROSPER_RENDER=1. The run that validated it reached the title screen at t~280-292 s and gameplay
 # from t~312 s onward; those two states are the captures attached to COMPATIBILITY.md
-# (assets/screenshots/syberia-title.png, syberia-gameplay.png). Re-run before changing any line.
+# (assets/screenshots/syberia-title.webp, syberia-gameplay.png). Re-run before changing any line.
 # The profile-select menu settles at ~183 s. Profile No.1 is preselected and shows the Cross
 # prompt, so repeated one-second Cross holds confirm it and advance any following prompt.
 186-187:cross

@@ -27,13 +27,13 @@ The world map now renders and keeps animating for the whole run, where before it
 screen a minute in — that freeze was a RADV device reset, and it is gone (0 submission failures
 against 65, 62 and 57 on three control runs).
 
-![Astro Bot at 3840x2160, the world map 90 s into a default launch: a deep-space field of stars and drifting pale-blue shards, light shafts crossing the frame, coloured confetti and green fragments down the left edge, all of it animating](assets/screenshots/astro-bot-worldmap-lit.png)
+![Astro Bot at 3840x2160, the world map 90 s into a default launch: a deep-space field of stars and drifting pale-blue shards, light shafts crossing the frame, coloured confetti and green fragments down the left edge, all of it animating](assets/screenshots/astro-bot-worldmap-lit.webp)
 
-![The same run at 150 s: the camera has moved, a large white-and-red framed panel now fills the lower half and the starfield continues behind it -- the frame is still changing, not frozen](assets/screenshots/astro-bot-worldmap-lit-later.png)
+![The same run at 150 s: the camera has moved, a large white-and-red framed panel now fills the lower half and the starfield continues behind it -- the frame is still changing, not frozen](assets/screenshots/astro-bot-worldmap-lit-later.webp)
 
 This is what the same route showed before, at the same moment — the frozen frame after the reset:
 
-![The control run at 150 s: a completely white frame. The GPU was reset at around 75 s and every frame after it is this same picture](assets/screenshots/astro-bot-worldmap-device-reset-frozen.png)
+![The control run at 150 s: a completely white frame. The GPU was reset at around 75 s and every frame after it is this same picture](assets/screenshots/astro-bot-worldmap-device-reset-frozen.webp)
 
 The cause was one line of binding policy. When a guest compute program uses GDS, the recompiler
 hard-codes descriptor binding 127 for it — but prosper's binding assignment renumbered every
@@ -216,7 +216,7 @@ instrument traps, because the failure that survives a green test is the expensiv
 
 ### Tactics Ogre: Reborn comes back from 25 days of black
 
-<p align="center"><img src="assets/screenshots/tactics-ogre-title-restored.png" alt="Tactics Ogre: Reborn — the illustrated prologue map of the Valerian Isles with a subtitle line"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-title-restored.webp" alt="Tactics Ogre: Reborn — the illustrated prologue map of the Valerian Isles with a subtitle line"></p>
 
 One save-data call did it. `sceSaveDataDirNameSearchPs4` was registered in #2302 and answered
 `NOT_FOUND` instead of the old success — a well-argued change whose own commit message noted it was
@@ -232,7 +232,7 @@ sibling already does: zero hits, written explicitly, and success.
 A regression took GTA V's lighting for a day — the bank heist still drew, but unlit and under a grid
 artifact. Restored.
 
-<p align="center"><img src="assets/screenshots/gta5-prologue-bank-restored.png" alt="Grand Theft Auto V — the prologue bank interior in full colour, the masked gunman in a red plaid shirt, water cooler, holiday cards and radar"></p>
+<p align="center"><img src="assets/screenshots/gta5-prologue-bank-restored.webp" alt="Grand Theft Auto V — the prologue bank interior in full colour, the masked gunman in a red plaid shirt, water cooler, holiday cards and radar"></p>
 
 The cause was one line, and the reason it got through is worth more than the fix. #3093 made every
 HTILE write discard retained depth, to cure Blue Prince's black frame. It checked GTA and cleared
@@ -256,9 +256,9 @@ Its whole intro cinematic plays in full colour once the run gets a save director
 black screens we had been reading as a broken composite came from a leftover save on the shared box
 that made the title resume into a state it draws nothing for.
 
-![Unbound: Worlds Apart at 3840x2160 — a sunlit village clearing in the intro cinematic: thatched huts strung with orange bunting, tall trees and drifting fireflies, pink mushrooms in the foreground grass, the small red-cloaked character at the right, and a prompt reading Press Square to skip](assets/screenshots/unbound-worlds-apart-intro-cinematic-village.png)
+![Unbound: Worlds Apart at 3840x2160 — a sunlit village clearing in the intro cinematic: thatched huts strung with orange bunting, tall trees and drifting fireflies, pink mushrooms in the foreground grass, the small red-cloaked character at the right, and a prompt reading Press Square to skip](assets/screenshots/unbound-worlds-apart-intro-cinematic-village.webp)
 
-![Unbound: Worlds Apart at 3840x2160 — the title screen held for the full 200 s of a default launch with no input: the UNBOUND / Worlds Apart wordmark over a dark forest lit by fire, a cloaked figure at the left, the Cross prompt below and the Unreal Engine logo in the corner](assets/screenshots/unbound-worlds-apart-title-screen.png)
+![Unbound: Worlds Apart at 3840x2160 — the title screen held for the full 200 s of a default launch with no input: the UNBOUND / Worlds Apart wordmark over a dark forest lit by fire, a cloaked figure at the left, the Cross prompt below and the Unreal Engine logo in the corner](assets/screenshots/unbound-worlds-apart-title-screen.webp)
 
 The title screen also renders continuously now — 40 of 40 samples across 200 s, where the survey a
 week ago caught it on about 9%.
@@ -270,11 +270,11 @@ week ago caught it on about 9%.
 The field HUD is live — minimap, party status, the Pilchard Bay banner — and the player is standing
 in the harbour rather than watching it.
 
-![Dragon Quest VII Reimagined at 3840x2160: the player character stands outside a harbour house with an orange quest marker over its door and a rowing boat beached to the right, foliage and a cliff on the left. The circular minimap sits at bottom-left and the party block at bottom-right reads Lv.1, HP 22, MP 7. Colour is badly degraded — the buildings are blown to white and the ground crushed to navy — but the scene is structurally complete](assets/screenshots/dragon-quest-vii-pilchard-bay-gameplay.png)
+![Dragon Quest VII Reimagined at 3840x2160: the player character stands outside a harbour house with an orange quest marker over its door and a rowing boat beached to the right, foliage and a cliff on the left. The circular minimap sits at bottom-left and the party block at bottom-right reads Lv.1, HP 22, MP 7. Colour is badly degraded — the buildings are blown to white and the ground crushed to navy — but the scene is structurally complete](assets/screenshots/dragon-quest-vii-pilchard-bay-gameplay.webp)
 
-![Dragon Quest VII Reimagined: the Pilchard Bay location banner appearing as the player enters the area, with the field HUD live. The world behind it is largely lost to the composite collapse](assets/screenshots/dragon-quest-vii-field-hud.png)
+![Dragon Quest VII Reimagined: the Pilchard Bay location banner appearing as the player enters the area, with the field HUD live. The world behind it is largely lost to the composite collapse](assets/screenshots/dragon-quest-vii-field-hud.webp)
 
-![Dragon Quest VII Reimagined: the same harbour after a left-stick window — the quest-marker house that stood centre-left is now upper-right, a cliff face has entered from the left, and the minimap has scrolled to match. The player has walked](assets/screenshots/dragon-quest-vii-walked-to-cliff.png)
+![Dragon Quest VII Reimagined: the same harbour after a left-stick window — the quest-marker house that stood centre-left is now upper-right, a cliff face has entered from the left, and the minimap has scrolled to match. The player has walked](assets/screenshots/dragon-quest-vii-walked-to-cliff.webp)
 
 The colour is plainly wrong, and depending on the run a quarter to a half of the frames still lose
 the world to the composite — geometry and the HUD are fine; it is the lit-material shading that is
@@ -287,7 +287,7 @@ had gave it about forty confirms before deciding it was a wall.
 Master had been rendering a pure black frame; the title screen and its desk of curiosities are
 whole again, and the fix costs GTA V nothing.
 
-![Blue Prince title screen: the BLUE PRINCE logo over NEW GAME and SETTINGS on the left, and a dark study on the right with a globe, a red paper crown on a stack of books, an hourglass, a violin, a pocket watch and blueprints spread across a desk](assets/screenshots/blue-prince-title-restored.png)
+![Blue Prince title screen: the BLUE PRINCE logo over NEW GAME and SETTINGS on the left, and a dark study on the right with a globe, a red paper crown on a stack of books, an hourglass, a violin, a pocket watch and blueprints spread across a desk](assets/screenshots/blue-prince-title-restored.webp)
 
 One line in the GTA V rendering foundation stopped prosper from discarding a depth buffer when the
 guest rewrote its HTILE metadata with identical bytes — sound-looking, because identical bytes ought
@@ -303,7 +303,7 @@ and the screen went black. ([#3089](https://github.com/mattias800/prosper/issues
 Croft Manor's assault course — brickwork, sandstone, mossy wooden platforms, gravel, ivy, Lara, and
 Winston bringing the tea.
 
-![Croft Manor assault course: Lara on wooden platforms with moss, red brick and sandstone walls, gravel ground, ivy and trees under a bright sky, Winston carrying a tea tray at the left](assets/screenshots/tomb-raider-croft-manor-assault-course.png)
+![Croft Manor assault course: Lara on wooden platforms with moss, red brick and sandstone walls, gravel ground, ivy and trees under a bright sky, Winston carrying a tea tray at the left](assets/screenshots/tomb-raider-croft-manor-assault-course.webp)
 
 The decode cache was validating 262144 of 90177536 bytes — 0.29% — of the 256-layer world atlas, so
 a decode taken while the atlas was nearly empty was reused all run and the walls wore whatever had
@@ -337,9 +337,9 @@ It is left here rather than deleted because the blog's own rule is that it recor
 and when. Recorded as instrument trap 230 — it looked *better* than the emulator could plausibly
 render, and that is the tell.
 
-![The genuine render of the same level: geometry correct but every surface a flat cream colour](assets/screenshots/tomb-raider-croft-manor-untextured.png)
+![The genuine render of the same level: geometry correct but every surface a flat cream colour](assets/screenshots/tomb-raider-croft-manor-untextured.webp)
 
-![Tomb Raider II title screen: Lara's model, the logo, game-select thumbnails and the Lara's Home menu entry](assets/screenshots/tomb-raider-title-screen-tr2.png)
+![Tomb Raider II title screen: Lara's model, the logo, game-select thumbnails and the Lara's Home menu entry](assets/screenshots/tomb-raider-title-screen-tr2.webp)
 
 [#325](https://github.com/mattias800/prosper/issues/325) · [#2998](https://github.com/mattias800/prosper/issues/2998)
 
@@ -349,7 +349,7 @@ render, and that is the tell.
 Lara's Home, and every wall and floor is wearing something real from elsewhere in the game — her
 passport, the Game Boy collectibles, an inventory document page.
 
-![Croft Manor interior: walls tiled with Game Boy console artwork and a UK passport page, the floor covered in a document reading THIS PAGE IS RESERVED FOR OFFICIAL OBSERVATIONS, Lara silhouetted in the centre](assets/screenshots/tomb-raider-croft-manor-interior-wrong-textures.png)
+![Croft Manor interior: walls tiled with Game Boy console artwork and a UK passport page, the floor covered in a document reading THIS PAGE IS RESERVED FOR OFFICIAL OBSERVATIONS, Lara silhouetted in the centre](assets/screenshots/tomb-raider-croft-manor-interior-wrong-textures.webp)
 
 The textures decode correctly and the geometry is right; the wrong content is being selected.
 [#2998](https://github.com/mattias800/prosper/issues/2998)
@@ -360,7 +360,7 @@ The textures decode correctly and the geometry is right; the wrong content is be
 Windowed and uncapped on current master — the charter's long-standing "roughly 24 FPS" predates a
 change to how frames reach the screen and has not described this title since July.
 
-![The Messenger's opening: an 8-bit sunset over the ocean, the great tree, the Messenger on a plank platform, and a dialogue box reading "Demon army this and magic scroll that, nothing's happened in centuries, so why are we still hiding?"](assets/screenshots/messenger-first-level-windowed-2026-08-27.png)
+![The Messenger's opening: an 8-bit sunset over the ocean, the great tree, the Messenger on a plank platform, and a dialogue box reading "Demon army this and magic scroll that, nothing's happened in centuries, so why are we still hiding?"](assets/screenshots/messenger-first-level-windowed-2026-08-27.webp)
 
 That is a presented rate rather than a count of new frames, so treat it as an upper bound.
 [#3083](https://github.com/mattias800/prosper/issues/3083)
@@ -390,9 +390,9 @@ art, and that title art uses 36 colours against the splash's 2,159.
 The prologue bank heist on a default launch, with the game's own Performance graphics mode selected —
 until now the HUD and radar drew over nothing.
 
-![Bank lobby: a hostage face-down with her hands raised, wrapped presents stacked behind her, floor markings and overhead light reflections](assets/screenshots/gta5-prologue-bank-lobby.png)
+![Bank lobby: a hostage face-down with her hands raised, wrapped presents stacked behind her, floor markings and overhead light reflections](assets/screenshots/gta5-prologue-bank-lobby.webp)
 
-![Bank interior: the masked gunman in a red plaid shirt, a water cooler, holiday cards pinned to the wall, radar bottom-left](assets/screenshots/gta5-prologue-bank-interior.png)
+![Bank interior: the masked gunman in a red plaid shirt, a water cooler, holiday cards pinned to the wall, radar bottom-left](assets/screenshots/gta5-prologue-bank-interior.webp)
 
 Gameplay runs at a few frames a second, and the texture path is most of the frame.
 [#1873](https://github.com/mattias800/prosper/issues/1873)
@@ -402,9 +402,9 @@ Gameplay runs at a few frames a second, and the texture path is most of the fram
 
 Croft Manor now renders with correct geometry — same route, same scene, same build, before and after.
 
-![Croft Manor before the fix: the world shattered into stretched triangles](assets/screenshots/tomb-raider-world-before-index-fix.png)
+![Croft Manor before the fix: the world shattered into stretched triangles](assets/screenshots/tomb-raider-world-before-index-fix.webp)
 
-![Croft Manor after the fix: steps, walls, hedges and trees all correctly shaped, with Lara and Winston](assets/screenshots/tomb-raider-gameplay.png)
+![Croft Manor after the fix: steps, walls, hedges and trees all correctly shaped, with Lara and Winston](assets/screenshots/tomb-raider-gameplay.webp)
 
 Surfaces are still untextured — that is the next thing. [#2990](https://github.com/mattias800/prosper/issues/2990)
 
@@ -423,7 +423,7 @@ We now reach the rendered Tomb Raider I title screen. This title had never been 
 before today, and it needed no code change at all — only a pad route to clear the game's own 40-page
 EULA, which Cross refuses to accept until you have scrolled to the last page.
 
-![Tomb Raider I-III Remastered — the Tomb Raider I title screen](assets/screenshots/tomb-raider-title-screen.png)
+![Tomb Raider I-III Remastered — the Tomb Raider I title screen](assets/screenshots/tomb-raider-title-screen.webp)
 
 ## 2026-08-25
 
@@ -440,9 +440,9 @@ No picture for this one — it's audio. Start GRIS and listen.
 
 ### Metaphor: ReFantazio can read its own font now, and the first thing it wanted to say was hello in twelve languages
 
-<p align="center"><img src="assets/screenshots/metaphor-language-select.png" alt="Metaphor: ReFantazio — the language-selection screen: twelve languages listed in white serif type over black, English highlighted with a blue brush-stroke, the list reading English, Deutsch, Español (España), Español (Latinoamérica), Français, Italiano, Português, Русский, 日本語, 中文(繁體), 中文(简体), 한국어"></p>
+<p align="center"><img src="assets/screenshots/metaphor-language-select.webp" alt="Metaphor: ReFantazio — the language-selection screen: twelve languages listed in white serif type over black, English highlighted with a blue brush-stroke, the list reading English, Deutsch, Español (España), Español (Latinoamérica), Français, Italiano, Português, Русский, 日本語, 中文(繁體), 中文(简体), 한국어"></p>
 
-<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.png" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book, drawn in blue and red over black in the lower right corner"></p>
+<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.webp" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book, drawn in blue and red over black in the lower right corner"></p>
 
 Sony's font library has a call that draws one letter and then tells you how big the letter it drew
 was; prosper had never implemented it, so it politely reported success and left the answer blank.
@@ -492,9 +492,9 @@ what stops us overwriting it. Details in
 
 ### The same captured frame, replayed twice, two different pictures
 
-<p align="center"><img src="assets/screenshots/balan-replay-same-file-menu.png" alt="BALAN WONDERWORLD - the language-select menu over the red-and-gold theatre backdrop, with the option pills and their text rendered"></p>
+<p align="center"><img src="assets/screenshots/balan-replay-same-file-menu.webp" alt="BALAN WONDERWORLD - the language-select menu over the red-and-gold theatre backdrop, with the option pills and their text rendered"></p>
 
-<p align="center"><img src="assets/screenshots/balan-replay-same-file-slivers.png" alt="BALAN WONDERWORLD - the same menu from the same captured frame, but the theatre is gone and most of the option pills and glyphs have collapsed into thin diagonal slivers on white"></p>
+<p align="center"><img src="assets/screenshots/balan-replay-same-file-slivers.webp" alt="BALAN WONDERWORLD - the same menu from the same captured frame, but the theatre is gone and most of the option pills and glyphs have collapsed into thin diagonal slivers on white"></p>
 
 Both of those came out of **one captured file**, replayed offline by `gpu_replay` on the same
 binary minutes apart, with no game running. That is the defect: some of BALAN's menu draws
@@ -508,9 +508,9 @@ it is not: [#2945](https://github.com/mattias800/prosper/issues/2945).
 
 ### New Joe & Mac: Caveman Ninja plays start to finish
 
-<p align="center"><img src="assets/screenshots/joe-mac.png" alt="New Joe & Mac: Caveman Ninja — gameplay: Joe crouched in a jungle level with palms, pink blossom, a volcano behind and coiled snakes either side, with the name plate, score, health bar and a lives counter reading x3"></p>
+<p align="center"><img src="assets/screenshots/joe-mac.webp" alt="New Joe & Mac: Caveman Ninja — gameplay: Joe crouched in a jungle level with palms, pink blossom, a volcano behind and coiled snakes either side, with the name plate, score, health bar and a lives counter reading x3"></p>
 
-<p align="center"><img src="assets/screenshots/joe-mac-menu.png" alt="New Joe & Mac: Caveman Ninja — the game's menu at 1920x1080"></p>
+<p align="center"><img src="assets/screenshots/joe-mac-menu.webp" alt="New Joe & Mac: Caveman Ninja — the game's menu at 1920x1080"></p>
 
 We play this one through, and have done for a while — it is rung 6 with a reviewed `joe-mac-gameplay`
 snapshot guard, and it had somehow never appeared here. Tracker
@@ -520,7 +520,7 @@ snapshot guard, and it had somehow never appeared here. Tracker
 
 ### BALAN's language menu was never waiting for Cross
 
-<p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.png" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
+<p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.webp" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
 
 Three titles sat on a screen whose own prompt named a button. Only one really was waiting for it.
 BALAN's language menu answers Cross with a modal — *change the language to English?* — that 109
@@ -531,13 +531,13 @@ cinematic actually asks for. Trackers [#2882](https://github.com/mattias800/pros
 
 ### The eight titles nobody had ever run
 
-<p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.webp" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
 
-<p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.png" alt="BALAN WONDERWORLD — the language-select menu at 3840x2160, over the game's theatre artwork, with button glyphs along the bottom"></p>
+<p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.webp" alt="BALAN WONDERWORLD — the language-select menu at 3840x2160, over the game's theatre artwork, with button glyphs along the bottom"></p>
 
-<p align="center"><img src="assets/screenshots/stray-brightness-calibration.png" alt="Stray — the 4K brightness-calibration screen, a dim reference image with a slider and the game's own Cross Accept prompt"></p>
+<p align="center"><img src="assets/screenshots/stray-brightness-calibration.webp" alt="Stray — the 4K brightness-calibration screen, a dim reference image with a slider and the game's own Cross Accept prompt"></p>
 
-<p align="center"><img src="assets/screenshots/little-nightmares-2-tarsier-logo.png" alt="Little Nightmares II — the Tarsier Studios logo at 3840x2160, part of the boot logo sequence"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-2-tarsier-logo.webp" alt="Little Nightmares II — the Tarsier Studios logo at 3840x2160, part of the boot logo sequence"></p>
 
 Eight tracked titles had never been booted. All eight now have: three reach a menu or title screen,
 one a logo sequence, four render nothing. *Unbound* is the best of them — that is its real title
@@ -547,9 +547,9 @@ symptoms, and every rung-0 wall is its own.
 
 ### Sonic Origins reaches its title screen, and the wall was a dialog box
 
-<p align="center"><img src="assets/screenshots/sonic-origins-title-screen.png" alt="Sonic Origins — the title screen at 3840x2160: the classic winged gold ring emblem with blue stars, Sonic peering over a red-and-white striped banner, in front of the painted South Island seascape with cliffs, clouds and sunlit water"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-title-screen.webp" alt="Sonic Origins — the title screen at 3840x2160: the classic winged gold ring emblem with blue stars, Sonic peering over a red-and-white striped banner, in front of the painted South Island seascape with cliffs, clouds and sunlit water"></p>
 
-<p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.png" alt="Sonic Origins — the game's own boot notice at 3840x2160: a white panel over the cyan and green striped menu background, a glowing gold ring icon, the text 'This title supports auto save. When this icon is shown, do not turn off the power. Save data may be corrupted.' and a Close button marked with the Cross glyph"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.webp" alt="Sonic Origins — the game's own boot notice at 3840x2160: a white panel over the cyan and green striped menu background, a glowing gold ring icon, the text 'This title supports auto save. When this icon is shown, do not turn off the power. Save data may be corrupted.' and a Close button marked with the Cross glyph"></p>
 
 The most-investigated title in this repository, and the last wall was a modal waiting for CROSS.
 Nine lanes went at its black startup frame. What finally moved it was tonight's save-data fix — the
@@ -558,7 +558,7 @@ The banner is empty because the wordmark never draws
 ([#2920](https://github.com/mattias800/prosper/issues/2920)).
 ### Sonic Origins' SONIC TEAM logo is blue
 
-<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.png" alt="Sonic Origins — the SONIC TEAM logo at 3840x2160: the blue Sonic head silhouette and blue SONIC TEAM wordmark on a near-white background"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.webp" alt="Sonic Origins — the SONIC TEAM logo at 3840x2160: the blue Sonic head silhouette and blue SONIC TEAM wordmark on a near-white background"></p>
 
 The 2026-08-20 entry further down this page has the same frame in **purple**, and that was an
 honest record of what prosper drew that day: every movie in the title composited with its two chroma
@@ -571,9 +571,9 @@ Refs [#2904](https://github.com/mattias800/prosper/issues/2904).
 
 ### Beast of Reincarnation: the whole game was under a coat of white paint
 
-<p align="center"><img src="assets/screenshots/beast-of-reincarnation-deluxe-bonus-dialog.png" alt="Beast of Reincarnation — the game's own Digital Deluxe bonus dialog: an item list with Big Dipper, Black Shiba Skin, Special Hat, Amber and crop seedlings, a scrollbar, an orange note and an OK button, rendered at 3840x2160"></p>
+<p align="center"><img src="assets/screenshots/beast-of-reincarnation-deluxe-bonus-dialog.webp" alt="Beast of Reincarnation — the game's own Digital Deluxe bonus dialog: an item list with Big Dipper, Black Shiba Skin, Special Hat, Amber and crop seedlings, a scrollbar, an orange note and an OK button, rendered at 3840x2160"></p>
 
-<p align="center"><img src="assets/screenshots/beast-of-reincarnation-game-freak-logo.png" alt="Beast of Reincarnation — the GAME FREAK developer logo in white on black, rendered at 3840x2160"></p>
+<p align="center"><img src="assets/screenshots/beast-of-reincarnation-game-freak-logo.webp" alt="Beast of Reincarnation — the GAME FREAK developer logo in white on black, rendered at 3840x2160"></p>
 
 Game Freak's first PS5 title, and the corpus's second confirmed UE5. A default launch shows a flat
 white 4K frame for four minutes, while the guest runs happily and prosper renders hundreds of draw
@@ -590,9 +590,9 @@ real ABI, recovered from the title's own call sites. Still rung 0; next blocker
 [#2898](https://github.com/mattias800/prosper/issues/2898).
 ### Hi-Fi RUSH reaches its title screen on the first try
 
-<p align="center"><img src="assets/screenshots/hifi-rush-title.png" alt="Hi-Fi RUSH title screen — the yellow branding, shattered logo and Press Any Button prompt, rendered at 3840x2160"></p>
+<p align="center"><img src="assets/screenshots/hifi-rush-title.webp" alt="Hi-Fi RUSH title screen — the yellow branding, shattered logo and Press Any Button prompt, rendered at 3840x2160"></p>
 
-<p align="center"><img src="assets/screenshots/hifi-rush-rooftop-black-materials.png" alt="Hi-Fi RUSH Vandelay rooftop — correct geometry, depth and sky gradient, with every opaque surface shaded flat black"></p>
+<p align="center"><img src="assets/screenshots/hifi-rush-rooftop-black-materials.webp" alt="Hi-Fi RUSH Vandelay rooftop — correct geometry, depth and sky gradient, with every opaque surface shaded flat black"></p>
 
 Added to the library in the evening, at its title screen a few hours later — 281 ms to
 `BOOT_COMPLETE`, default launch, no throttle, no pad. The second picture is the Vandelay rooftop,
@@ -763,7 +763,7 @@ single-level descriptors. It just has never been able to look at them together.
 
 ### The Messenger's title screen runs at 206 fps and 0 fps at the same time
 
-<p align="center"><img src="assets/screenshots/messenger-title-fps-overlay.png" alt="The Messenger's title screen with a burned-in overlay reading 2.9 FPS (206.3 PRESENTED) 1920X1080"></p>
+<p align="center"><img src="assets/screenshots/messenger-title-fps-overlay.webp" alt="The Messenger's title screen with a burned-in overlay reading 2.9 FPS (206.3 PRESENTED) 1920X1080"></p>
 
 That counter is burned in by the new `screenshot --fps-overlay`, and both numbers are true. prosper
 handed this picture to the display **206 times a second**. Across one 120-second stretch of that run
@@ -782,7 +782,7 @@ column for it, sourced from a new `FPS record:` line in the game trackers.
 
 ### And the first real number: Blue Prince at 4.7 fps
 
-<p align="center"><img src="assets/screenshots/blue-prince-cinematic-fps-overlay.png" alt="Blue Prince's opening cinematic — a blueprint of Mount Holly — with an overlay reading 4.7 FPS 94% ACTIVE 1920X1080"></p>
+<p align="center"><img src="assets/screenshots/blue-prince-cinematic-fps-overlay.webp" alt="Blue Prince's opening cinematic — a blueprint of Mount Holly — with an overlay reading 4.7 FPS 94% ACTIVE 1920X1080"></p>
 
 The Day One opening cinematic, at native 1080p with no snapshot acceleration, over fifteen minutes.
 **4.7 frames per second, and 95% of the run was spent producing them** — that second number is what
@@ -822,7 +822,7 @@ realization — the GPU sits at 5-16% throughout.
 marker counts down as you move, and the characters talk over it. A cutscene would not have a live
 distance readout, which is how we know it is the real thing.
 
-<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="Beneath — the opening dive, waypoint HUD reading 21m, dialogue subtitles over a dark seabed"></p>
+<p align="center"><img src="assets/screenshots/beneath-gameplay.webp" alt="Beneath — the opening dive, waypoint HUD reading 21m, dialogue subtitles over a dark seabed"></p>
 
 It is very dark, and that is the game rather than us — but it is worth an eye-check when this one
 comes up for manual verification. Getting here needed no renderer work at all; the title was one
@@ -834,7 +834,7 @@ guest back a low page that reads as zero, which is what the console gave it.
 
 ### R-Type Delta, blank for nine days, draws stage 1 again
 
-<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.png" alt="R-Type Delta stage 1: the R-9 and its Force device over a sunset cityscape with enemy formations and the BEAM and score HUD"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.webp" alt="R-Type Delta stage 1: the R-9 and its Force device over a sunset cityscape with enemy formations and the BEAM and score HUD"></p>
 
 The R-9, its Force pod, enemy formations, and a city at sunset. This one is a good story. For nine
 days the title rendered its logo and its whole opening movie and then went blank forever — the guest
@@ -852,7 +852,7 @@ Reaching it also needed a route, and the title screen taught us something: its p
 
 ### Sonic Frontiers reaches Cyber Space — and the world is black
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-cyberspace-hud.png" alt="Sonic Frontiers Cyber Space — stage clock at 00:55.89, ring counter, star medals and speedometer over an entirely black screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-cyberspace-hud.webp" alt="Sonic Frontiers Cyber Space — stage clock at 00:55.89, ring counter, star medals and speedometer over an entirely black screen"></p>
 
 Not a pretty picture, and it is here because it is honest. That is a real running stage — the clock
 reads 55 seconds, the speedometer needle moves, the music plays — with a hundred streamed terrain
@@ -869,51 +869,51 @@ we just stopped counting a black screen as a win.
 
 ### dragon-quest-vii-opening-chapter.png
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.png" alt="dragon quest vii opening chapter"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.webp" alt="dragon quest vii opening chapter"></p>
 
 feat(dq7): the route reaches the opening chapter in Estard, and Unreal titles get an IoStore package oracle (#2779)
 
-`0ea7868c` · [`assets/screenshots/dragon-quest-vii-opening-chapter.png`](assets/screenshots/dragon-quest-vii-opening-chapter.png)
+`0ea7868c` · [`assets/screenshots/dragon-quest-vii-opening-chapter.webp`](assets/screenshots/dragon-quest-vii-opening-chapter.webp)
 
 ### bendy-dark-revival-gameplay.png
 
-<p align="center"><img src="assets/screenshots/bendy-dark-revival-gameplay.png" alt="bendy dark revival gameplay"></p>
+<p align="center"><img src="assets/screenshots/bendy-dark-revival-gameplay.webp" alt="bendy dark revival gameplay"></p>
 
 feat(bendy-dark-revival): rung 2 -> rung 3 — a route reaches the PPSA27624 Chapter 1 sections (#2769)
 
-`5501dd45` · [`assets/screenshots/bendy-dark-revival-gameplay.png`](assets/screenshots/bendy-dark-revival-gameplay.png)
+`5501dd45` · [`assets/screenshots/bendy-dark-revival-gameplay.webp`](assets/screenshots/bendy-dark-revival-gameplay.webp)
 
 ### tales-graces-f-gameplay-dialogue.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay-dialogue.png" alt="tales graces f gameplay dialogue"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay-dialogue.webp" alt="tales graces f gameplay dialogue"></p>
 
 feat(route): Tales of Graces f Remastered reaches gameplay -- the wall was two OPTIONS-button gates, not the renderer (#2763)
 
-`f249929d` · [`assets/screenshots/tales-graces-f-gameplay-dialogue.png`](assets/screenshots/tales-graces-f-gameplay-dialogue.png)
+`f249929d` · [`assets/screenshots/tales-graces-f-gameplay-dialogue.webp`](assets/screenshots/tales-graces-f-gameplay-dialogue.webp)
 
 ### tales-graces-f-gameplay.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay.png" alt="tales graces f gameplay"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay.webp" alt="tales graces f gameplay"></p>
 
 feat(route): Tales of Graces f Remastered reaches gameplay -- the wall was two OPTIONS-button gates, not the renderer (#2763)
 
-`f249929d` · [`assets/screenshots/tales-graces-f-gameplay.png`](assets/screenshots/tales-graces-f-gameplay.png)
+`f249929d` · [`assets/screenshots/tales-graces-f-gameplay.webp`](assets/screenshots/tales-graces-f-gameplay.webp)
 
 ### sonic-origins-sonic-team-logo.png
 
-<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo.png" alt="sonic origins sonic team logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo.webp" alt="sonic origins sonic team logo"></p>
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`assets/screenshots/sonic-origins-sonic-team-logo.png`](assets/screenshots/sonic-origins-sonic-team-logo.png)
+`29f4db65` · [`assets/screenshots/sonic-origins-sonic-team-logo.webp`](assets/screenshots/sonic-origins-sonic-team-logo.webp)
 
 ### tales-graces-f-title-no-input.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-title-no-input.png" alt="tales graces f title no input"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-title-no-input.webp" alt="tales graces f title no input"></p>
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`assets/screenshots/tales-graces-f-title-no-input.png`](assets/screenshots/tales-graces-f-title-no-input.png)
+`29f4db65` · [`assets/screenshots/tales-graces-f-title-no-input.webp`](assets/screenshots/tales-graces-f-title-no-input.webp)
 
 ### issue-2731-tales-graces-f-movie-chroma.png
 
@@ -933,171 +933,171 @@ docs(compat): refresh the checked-in visual evidence, and repair two trackers th
 
 ### asterix-babylon-gameplay.png
 
-<p align="center"><img src="assets/screenshots/asterix-babylon-gameplay.png" alt="asterix babylon gameplay"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-gameplay.webp" alt="asterix babylon gameplay"></p>
 
 bringup(asterix-babylon): a Triangle-aware input route reaches GAMEPLAY (rung 2 -> 3) (#2736)
 
-`5404e173` · [`assets/screenshots/asterix-babylon-gameplay.png`](assets/screenshots/asterix-babylon-gameplay.png)
+`5404e173` · [`assets/screenshots/asterix-babylon-gameplay.webp`](assets/screenshots/asterix-babylon-gameplay.webp)
 
 ## 2026-08-19
 
 ### plucky-squire-chapter1-intro.png
 
-<p align="center"><img src="assets/screenshots/plucky-squire-chapter1-intro.png" alt="plucky squire chapter1 intro"></p>
+<p align="center"><img src="assets/screenshots/plucky-squire-chapter1-intro.webp" alt="plucky squire chapter1 intro"></p>
 
 docs(plucky): status doc — the chapter-one world renders, plus five falsified hypotheses (#2742)
 
-`675ff2f6` · [`assets/screenshots/plucky-squire-chapter1-intro.png`](assets/screenshots/plucky-squire-chapter1-intro.png)
+`675ff2f6` · [`assets/screenshots/plucky-squire-chapter1-intro.webp`](assets/screenshots/plucky-squire-chapter1-intro.webp)
 
 ## 2026-08-08
 
 ### sonic-crossworlds-title.png
 
-<p align="center"><img src="assets/screenshots/sonic-crossworlds-title.png" alt="sonic crossworlds title"></p>
+<p align="center"><img src="assets/screenshots/sonic-crossworlds-title.webp" alt="sonic crossworlds title"></p>
 
 docs(crossworlds): rung 2 — the title screen renders completely, reproduced across two runs (#2360)
 
-`a3a88356` · [`assets/screenshots/sonic-crossworlds-title.png`](assets/screenshots/sonic-crossworlds-title.png)
+`a3a88356` · [`assets/screenshots/sonic-crossworlds-title.webp`](assets/screenshots/sonic-crossworlds-title.webp)
 
 ## 2026-08-07
 
 ### arcrunner-title-screen-default-route.png
 
-<p align="center"><img src="assets/screenshots/arcrunner-title-screen-default-route.png" alt="arcrunner title screen default route"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-title-screen-default-route.webp" alt="arcrunner title screen default route"></p>
 
 ArcRunner: the per-fold account — the guest's builder is released mid-fold, and the contract that forbids it is version-gated off (#2219)
 
-`a22cf8de` · [`assets/screenshots/arcrunner-title-screen-default-route.png`](assets/screenshots/arcrunner-title-screen-default-route.png)
+`a22cf8de` · [`assets/screenshots/arcrunner-title-screen-default-route.webp`](assets/screenshots/arcrunner-title-screen-default-route.webp)
 
 ## 2026-08-06
 
 ### sonic-frontiers-autosave-notice.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-autosave-notice.png" alt="sonic frontiers autosave notice"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-autosave-notice.webp" alt="sonic frontiers autosave notice"></p>
 
 fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK — Sonic Frontiers reaches its title screen (#2208)
 
-`7801a5bc` · [`assets/screenshots/sonic-frontiers-autosave-notice.png`](assets/screenshots/sonic-frontiers-autosave-notice.png)
+`7801a5bc` · [`assets/screenshots/sonic-frontiers-autosave-notice.webp`](assets/screenshots/sonic-frontiers-autosave-notice.webp)
 
 ### sonic-frontiers-main-menu.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-main-menu.png" alt="sonic frontiers main menu"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-main-menu.webp" alt="sonic frontiers main menu"></p>
 
 fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK — Sonic Frontiers reaches its title screen (#2208)
 
-`7801a5bc` · [`assets/screenshots/sonic-frontiers-main-menu.png`](assets/screenshots/sonic-frontiers-main-menu.png)
+`7801a5bc` · [`assets/screenshots/sonic-frontiers-main-menu.webp`](assets/screenshots/sonic-frontiers-main-menu.webp)
 
 ### sonic-frontiers-title-screen.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-title-screen.png" alt="sonic frontiers title screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-title-screen.webp" alt="sonic frontiers title screen"></p>
 
 fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK — Sonic Frontiers reaches its title screen (#2208)
 
-`7801a5bc` · [`assets/screenshots/sonic-frontiers-title-screen.png`](assets/screenshots/sonic-frontiers-title-screen.png)
+`7801a5bc` · [`assets/screenshots/sonic-frontiers-title-screen.webp`](assets/screenshots/sonic-frontiers-title-screen.webp)
 
 ### arcrunner-title-screen.png
 
-<p align="center"><img src="assets/screenshots/arcrunner-title-screen.png" alt="arcrunner title screen"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-title-screen.webp" alt="arcrunner title screen"></p>
 
 docs(arcrunner): the title screen is behind the movie, and the throttle rescues by DELAY not by lock hold (#2205)
 
-`40129122` · [`assets/screenshots/arcrunner-title-screen.png`](assets/screenshots/arcrunner-title-screen.png)
+`40129122` · [`assets/screenshots/arcrunner-title-screen.webp`](assets/screenshots/arcrunner-title-screen.webp)
 
 ### sonic-origins-sega-logo.png
 
-<p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.png" alt="sonic origins sega logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.webp" alt="sonic origins sega logo"></p>
 
 fix(savedata): sceSaveDataCreateTransactionResource must return a positive resource id (#2121)
 
-`e404841c` · [`assets/screenshots/sonic-origins-sega-logo.png`](assets/screenshots/sonic-origins-sega-logo.png)
+`e404841c` · [`assets/screenshots/sonic-origins-sega-logo.webp`](assets/screenshots/sonic-origins-sega-logo.webp)
 
 ### arcrunner-default-route-logos.png
 
-<p align="center"><img src="assets/screenshots/arcrunner-default-route-logos.png" alt="arcrunner default route logos"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-default-route-logos.webp" alt="arcrunner default route logos"></p>
 
 ArcRunner: the init-side generation census — the #1756 question answered, four falsifications, and real graphics off the throttle (#1226) (#2122)
 
-`8c8e74f5` · [`assets/screenshots/arcrunner-default-route-logos.png`](assets/screenshots/arcrunner-default-route-logos.png)
+`8c8e74f5` · [`assets/screenshots/arcrunner-default-route-logos.webp`](assets/screenshots/arcrunner-default-route-logos.webp)
 
 ### arcrunner-intro-city.png
 
-<p align="center"><img src="assets/screenshots/arcrunner-intro-city.png" alt="arcrunner intro city"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-intro-city.webp" alt="arcrunner intro city"></p>
 
 ArcRunner renders its intro cinematic — the #1226 fault is a submit-timing race (follow-up to #2077) (#2086)
 
-`0a6f82a8` · [`assets/screenshots/arcrunner-intro-city.png`](assets/screenshots/arcrunner-intro-city.png)
+`0a6f82a8` · [`assets/screenshots/arcrunner-intro-city.webp`](assets/screenshots/arcrunner-intro-city.webp)
 
 ### arcrunner-intro-space-station.png
 
-<p align="center"><img src="assets/screenshots/arcrunner-intro-space-station.png" alt="arcrunner intro space station"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-intro-space-station.webp" alt="arcrunner intro space station"></p>
 
 ArcRunner renders its intro cinematic — the #1226 fault is a submit-timing race (follow-up to #2077) (#2086)
 
-`0a6f82a8` · [`assets/screenshots/arcrunner-intro-space-station.png`](assets/screenshots/arcrunner-intro-space-station.png)
+`0a6f82a8` · [`assets/screenshots/arcrunner-intro-space-station.webp`](assets/screenshots/arcrunner-intro-space-station.webp)
 
 ### rtype-delta-force-select.png
 
-<p align="center"><img src="assets/screenshots/rtype-delta-force-select.png" alt="rtype delta force select"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-force-select.webp" alt="rtype delta force select"></p>
 
 fix(gpu): a saved-EXEC wave mask must survive the NGG fetch-index fold — R-Type Delta reaches its title screen (#2061)
 
-`83e3383a` · [`assets/screenshots/rtype-delta-force-select.png`](assets/screenshots/rtype-delta-force-select.png)
+`83e3383a` · [`assets/screenshots/rtype-delta-force-select.webp`](assets/screenshots/rtype-delta-force-select.webp)
 
 ### rtype-delta-title.png
 
-<p align="center"><img src="assets/screenshots/rtype-delta-title.png" alt="rtype delta title"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-title.webp" alt="rtype delta title"></p>
 
 fix(gpu): a saved-EXEC wave mask must survive the NGG fetch-index fold — R-Type Delta reaches its title screen (#2061)
 
-`83e3383a` · [`assets/screenshots/rtype-delta-title.png`](assets/screenshots/rtype-delta-title.png)
+`83e3383a` · [`assets/screenshots/rtype-delta-title.webp`](assets/screenshots/rtype-delta-title.webp)
 
 ### crisis-core-main-menu.png
 
-<p align="center"><img src="assets/screenshots/crisis-core-main-menu.png" alt="crisis core main menu"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-main-menu.webp" alt="crisis core main menu"></p>
 
 Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the guest wins, not a late write (#2060)
 
-`e311e6cd` · [`assets/screenshots/crisis-core-main-menu.png`](assets/screenshots/crisis-core-main-menu.png)
+`e311e6cd` · [`assets/screenshots/crisis-core-main-menu.webp`](assets/screenshots/crisis-core-main-menu.webp)
 
 ### crisis-core-title.png
 
-<p align="center"><img src="assets/screenshots/crisis-core-title.png" alt="crisis core title"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-title.webp" alt="crisis core title"></p>
 
 Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the guest wins, not a late write (#2060)
 
-`e311e6cd` · [`assets/screenshots/crisis-core-title.png`](assets/screenshots/crisis-core-title.png)
+`e311e6cd` · [`assets/screenshots/crisis-core-title.webp`](assets/screenshots/crisis-core-title.webp)
 
 ### crisis-core-voice-language.png
 
-<p align="center"><img src="assets/screenshots/crisis-core-voice-language.png" alt="crisis core voice language"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-voice-language.webp" alt="crisis core voice language"></p>
 
 Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the guest wins, not a late write (#2060)
 
-`e311e6cd` · [`assets/screenshots/crisis-core-voice-language.png`](assets/screenshots/crisis-core-voice-language.png)
+`e311e6cd` · [`assets/screenshots/crisis-core-voice-language.webp`](assets/screenshots/crisis-core-voice-language.webp)
 
 ### sonic-frontiers-middleware-credits.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.png" alt="sonic frontiers middleware credits"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.webp" alt="sonic frontiers middleware credits"></p>
 
 fix(present): publish the flipped VideoOut buffer when no pass ever targets it — with a real guest-authorship test and the composited-frame gate intact (#2068)
 
-`33dac763` · [`assets/screenshots/sonic-frontiers-middleware-credits.png`](assets/screenshots/sonic-frontiers-middleware-credits.png)
+`33dac763` · [`assets/screenshots/sonic-frontiers-middleware-credits.webp`](assets/screenshots/sonic-frontiers-middleware-credits.webp)
 
 ### sonic-frontiers-sega-logo.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.png" alt="sonic frontiers sega logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.webp" alt="sonic frontiers sega logo"></p>
 
 fix(present): publish the flipped VideoOut buffer when no pass ever targets it — with a real guest-authorship test and the composited-frame gate intact (#2068)
 
-`33dac763` · [`assets/screenshots/sonic-frontiers-sega-logo.png`](assets/screenshots/sonic-frontiers-sega-logo.png)
+`33dac763` · [`assets/screenshots/sonic-frontiers-sega-logo.webp`](assets/screenshots/sonic-frontiers-sega-logo.webp)
 
 ### rtype-delta-opening-movie-colour.png
 
-<p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.png" alt="rtype delta opening movie colour"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.webp" alt="rtype delta opening movie colour"></p>
 
 fix(gpu): recognise an AvPlayer chroma plane declared as a one-layer 2D array (#2037)
 
-`08d75128` · [`assets/screenshots/rtype-delta-opening-movie-colour.png`](assets/screenshots/rtype-delta-opening-movie-colour.png)
+`08d75128` · [`assets/screenshots/rtype-delta-opening-movie-colour.webp`](assets/screenshots/rtype-delta-opening-movie-colour.webp)
 
 ### issue-1946-health-warning-before-after.png
 
@@ -1117,301 +1117,301 @@ fix(agc): offer the render-target-0 blend key on every SDK version — The Orego
 
 ### sonic-crossworlds-sega-logo.png
 
-<p align="center"><img src="assets/screenshots/sonic-crossworlds-sega-logo.png" alt="sonic crossworlds sega logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-crossworlds-sega-logo.webp" alt="sonic crossworlds sega logo"></p>
 
 docs(crossworlds): Sonic Racing: CrossWorlds reaches rung 1 — the SEGA logo renders (#2039)
 
-`f8b0f040` · [`assets/screenshots/sonic-crossworlds-sega-logo.png`](assets/screenshots/sonic-crossworlds-sega-logo.png)
+`f8b0f040` · [`assets/screenshots/sonic-crossworlds-sega-logo.webp`](assets/screenshots/sonic-crossworlds-sega-logo.webp)
 
 ### little-nightmares-3-eula.png
 
-<p align="center"><img src="assets/screenshots/little-nightmares-3-eula.png" alt="little nightmares 3 eula"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-3-eula.webp" alt="little nightmares 3 eula"></p>
 
 docs(little-nightmares-3): #2014 is a wrong background clear, not a channel map — plus the first input route (#2041)
 
-`f811615a` · [`assets/screenshots/little-nightmares-3-eula.png`](assets/screenshots/little-nightmares-3-eula.png)
+`f811615a` · [`assets/screenshots/little-nightmares-3-eula.webp`](assets/screenshots/little-nightmares-3-eula.webp)
 
 ## 2026-08-05
 
 ### little-nightmares-3-title-screen.png
 
-<p align="center"><img src="assets/screenshots/little-nightmares-3-title-screen.png" alt="little nightmares 3 title screen"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-3-title-screen.webp" alt="little nightmares 3 title screen"></p>
 
 docs(little-nightmares-3): rung 2 — the title screen renders; land the ruled-out record (#2017)
 
-`080263cf` · [`assets/screenshots/little-nightmares-3-title-screen.png`](assets/screenshots/little-nightmares-3-title-screen.png)
+`080263cf` · [`assets/screenshots/little-nightmares-3-title-screen.webp`](assets/screenshots/little-nightmares-3-title-screen.webp)
 
 ### rtype-delta-rung1-logo-and-opening-movie.png
 
-<p align="center"><img src="assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png" alt="rtype delta rung1 logo and opening movie"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp" alt="rtype delta rung1 logo and opening movie"></p>
 
 docs(rtype): R-Type Delta reaches rung 1 — the #1746 startup race is host CPU speed, not a prosper defect (#2009)
 
-`c3614f51` · [`assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png`](assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png)
+`c3614f51` · [`assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp`](assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp)
 
 ### oregon-trail-title-screen.png
 
-<p align="center"><img src="assets/screenshots/oregon-trail-title-screen.png" alt="oregon trail title screen"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-title-screen.webp" alt="oregon trail title screen"></p>
 
 diag(fault): probe every guest-pointer register at a worker fault, not just rdx/rax (#1992)
 
-`034f959a` · [`assets/screenshots/oregon-trail-title-screen.png`](assets/screenshots/oregon-trail-title-screen.png)
+`034f959a` · [`assets/screenshots/oregon-trail-title-screen.webp`](assets/screenshots/oregon-trail-title-screen.webp)
 
 ### oregon-trail-gameloft-splash.png
 
-<p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.png" alt="oregon trail gameloft splash"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.webp" alt="oregon trail gameloft splash"></p>
 
 fix(hle): scePthread* must return libkernel-encoded errors — Oregon Trail advances three checkpoints (#1984)
 
-`38619f29` · [`assets/screenshots/oregon-trail-gameloft-splash.png`](assets/screenshots/oregon-trail-gameloft-splash.png)
+`38619f29` · [`assets/screenshots/oregon-trail-gameloft-splash.webp`](assets/screenshots/oregon-trail-gameloft-splash.webp)
 
 ### oregon-trail-health-warning.png
 
-<p align="center"><img src="assets/screenshots/oregon-trail-health-warning.png" alt="oregon trail health warning"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-health-warning.webp" alt="oregon trail health warning"></p>
 
 fix(hle): scePthread* must return libkernel-encoded errors — Oregon Trail advances three checkpoints (#1984)
 
-`38619f29` · [`assets/screenshots/oregon-trail-health-warning.png`](assets/screenshots/oregon-trail-health-warning.png)
+`38619f29` · [`assets/screenshots/oregon-trail-health-warning.webp`](assets/screenshots/oregon-trail-health-warning.webp)
 
 ### bendy-dark-revival-title.png
 
-<p align="center"><img src="assets/screenshots/bendy-dark-revival-title.png" alt="bendy dark revival title"></p>
+<p align="center"><img src="assets/screenshots/bendy-dark-revival-title.webp" alt="bendy dark revival title"></p>
 
 fix(avplayer): end a source nobody consumes on its own media clock (#1981)
 
-`afe4a2b0` · [`assets/screenshots/bendy-dark-revival-title.png`](assets/screenshots/bendy-dark-revival-title.png)
+`afe4a2b0` · [`assets/screenshots/bendy-dark-revival-title.webp`](assets/screenshots/bendy-dark-revival-title.webp)
 
 ### asterix-babylon-intro-cutscene.png
 
-<p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.png" alt="asterix babylon intro cutscene"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.webp" alt="asterix babylon intro cutscene"></p>
 
 feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest file-replacement reader (#1974)
 
-`ff72e77c` · [`assets/screenshots/asterix-babylon-intro-cutscene.png`](assets/screenshots/asterix-babylon-intro-cutscene.png)
+`ff72e77c` · [`assets/screenshots/asterix-babylon-intro-cutscene.webp`](assets/screenshots/asterix-babylon-intro-cutscene.webp)
 
 ### asterix-babylon-title.png
 
-<p align="center"><img src="assets/screenshots/asterix-babylon-title.png" alt="asterix babylon title"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-title.webp" alt="asterix babylon title"></p>
 
 feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest file-replacement reader (#1974)
 
-`ff72e77c` · [`assets/screenshots/asterix-babylon-title.png`](assets/screenshots/asterix-babylon-title.png)
+`ff72e77c` · [`assets/screenshots/asterix-babylon-title.webp`](assets/screenshots/asterix-babylon-title.webp)
 
 ### little-nightmares-3-boot-splash.png
 
-<p align="center"><img src="assets/screenshots/little-nightmares-3-boot-splash.png" alt="little nightmares 3 boot splash"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-3-boot-splash.webp" alt="little nightmares 3 boot splash"></p>
 
 fix(ajm): accept the config revision — Little Nightmares III reaches rung 1 (#1966)
 
-`1fc8ece9` · [`assets/screenshots/little-nightmares-3-boot-splash.png`](assets/screenshots/little-nightmares-3-boot-splash.png)
+`1fc8ece9` · [`assets/screenshots/little-nightmares-3-boot-splash.webp`](assets/screenshots/little-nightmares-3-boot-splash.webp)
 
 ### sonic-frontiers-opening-sequence.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.png" alt="sonic frontiers opening sequence"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.webp" alt="sonic frontiers opening sequence"></p>
 
 docs(sonic-frontiers): rung 1 — it renders; the rung-0 reading was a failure-only diagnostic (#1969)
 
-`440d84d2` · [`assets/screenshots/sonic-frontiers-opening-sequence.png`](assets/screenshots/sonic-frontiers-opening-sequence.png)
+`440d84d2` · [`assets/screenshots/sonic-frontiers-opening-sequence.webp`](assets/screenshots/sonic-frontiers-opening-sequence.webp)
 
 ### sonic-frontiers-sonic-team-logo.png
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.png" alt="sonic frontiers sonic team logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.webp" alt="sonic frontiers sonic team logo"></p>
 
 docs(sonic-frontiers): rung 1 — it renders; the rung-0 reading was a failure-only diagnostic (#1969)
 
-`440d84d2` · [`assets/screenshots/sonic-frontiers-sonic-team-logo.png`](assets/screenshots/sonic-frontiers-sonic-team-logo.png)
+`440d84d2` · [`assets/screenshots/sonic-frontiers-sonic-team-logo.webp`](assets/screenshots/sonic-frontiers-sonic-team-logo.webp)
 
 ## 2026-08-04
 
 ### oregon-trail-legal-popup.png
 
-<p align="center"><img src="assets/screenshots/oregon-trail-legal-popup.png" alt="oregon trail legal popup"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-legal-popup.webp" alt="oregon trail legal popup"></p>
 
 feat(oregon): reach rung 1 — the startup legal popup renders on a default launch (#1950)
 
-`e92d2f7f` · [`assets/screenshots/oregon-trail-legal-popup.png`](assets/screenshots/oregon-trail-legal-popup.png)
+`e92d2f7f` · [`assets/screenshots/oregon-trail-legal-popup.webp`](assets/screenshots/oregon-trail-legal-popup.webp)
 
 ### beneath-title.png
 
-<p align="center"><img src="assets/screenshots/beneath-title.png" alt="beneath title"></p>
+<p align="center"><img src="assets/screenshots/beneath-title.webp" alt="beneath title"></p>
 
 docs: record Beneath title screen
 
-`0dafd22d` · [`assets/screenshots/beneath-title.png`](assets/screenshots/beneath-title.png)
+`0dafd22d` · [`assets/screenshots/beneath-title.webp`](assets/screenshots/beneath-title.webp)
 
 ### forgotten-city-title.png
 
-<p align="center"><img src="assets/screenshots/forgotten-city-title.png" alt="forgotten city title"></p>
+<p align="center"><img src="assets/screenshots/forgotten-city-title.webp" alt="forgotten city title"></p>
 
 docs: record first-run compatibility baselines
 
-`1640bb30` · [`assets/screenshots/forgotten-city-title.png`](assets/screenshots/forgotten-city-title.png)
+`1640bb30` · [`assets/screenshots/forgotten-city-title.webp`](assets/screenshots/forgotten-city-title.webp)
 
 ### tactics-ogre-hevc-movie.png
 
-<p align="center"><img src="assets/screenshots/tactics-ogre-hevc-movie.png" alt="tactics ogre hevc movie"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-hevc-movie.webp" alt="tactics ogre hevc movie"></p>
 
 docs(tactics-ogre): record restored HEVC presentation
 
-`0d2f9a9f` · [`assets/screenshots/tactics-ogre-hevc-movie.png`](assets/screenshots/tactics-ogre-hevc-movie.png)
+`0d2f9a9f` · [`assets/screenshots/tactics-ogre-hevc-movie.webp`](assets/screenshots/tactics-ogre-hevc-movie.webp)
 
 ### tactics-ogre-reborn-gameplay.png
 
-<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-gameplay.png" alt="tactics ogre reborn gameplay"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-gameplay.webp" alt="tactics ogre reborn gameplay"></p>
 
 Document Tactics Ogre tutorial battle
 
-`038c166d` · [`assets/screenshots/tactics-ogre-reborn-gameplay.png`](assets/screenshots/tactics-ogre-reborn-gameplay.png)
+`038c166d` · [`assets/screenshots/tactics-ogre-reborn-gameplay.webp`](assets/screenshots/tactics-ogre-reborn-gameplay.webp)
 
 ## 2026-08-03
 
 ### tactics-ogre-reborn-opening-scene.png
 
-<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-opening-scene.png" alt="tactics ogre reborn opening scene"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-opening-scene.webp" alt="tactics ogre reborn opening scene"></p>
 
 Document Tactics Ogre opening scene
 
-`4c8e3997` · [`assets/screenshots/tactics-ogre-reborn-opening-scene.png`](assets/screenshots/tactics-ogre-reborn-opening-scene.png)
+`4c8e3997` · [`assets/screenshots/tactics-ogre-reborn-opening-scene.webp`](assets/screenshots/tactics-ogre-reborn-opening-scene.webp)
 
 ### house-of-the-dead-2-remake-gameplay.png
 
-<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-gameplay.png" alt="house of the dead 2 remake gameplay"></p>
+<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-gameplay.webp" alt="house of the dead 2 remake gameplay"></p>
 
 Document House of the Dead 2 gameplay
 
-`b01e057c` · [`assets/screenshots/house-of-the-dead-2-remake-gameplay.png`](assets/screenshots/house-of-the-dead-2-remake-gameplay.png)
+`b01e057c` · [`assets/screenshots/house-of-the-dead-2-remake-gameplay.webp`](assets/screenshots/house-of-the-dead-2-remake-gameplay.webp)
 
 ### tactics-ogre-title.png
 
-<p align="center"><img src="assets/screenshots/tactics-ogre-title.png" alt="tactics ogre title"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-title.webp" alt="tactics ogre title"></p>
 
 Add Tactics Ogre title milestone
 
-`4d192dc1` · [`assets/screenshots/tactics-ogre-title.png`](assets/screenshots/tactics-ogre-title.png)
+`4d192dc1` · [`assets/screenshots/tactics-ogre-title.webp`](assets/screenshots/tactics-ogre-title.webp)
 
 ### house-of-the-dead-2-remake-title.png
 
-<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-title.png" alt="house of the dead 2 remake title"></p>
+<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-title.webp" alt="house of the dead 2 remake title"></p>
 
 Document newly tested game compatibility
 
-`fbde2b4c` · [`assets/screenshots/house-of-the-dead-2-remake-title.png`](assets/screenshots/house-of-the-dead-2-remake-title.png)
+`fbde2b4c` · [`assets/screenshots/house-of-the-dead-2-remake-title.webp`](assets/screenshots/house-of-the-dead-2-remake-title.webp)
 
 ### rtype-delta-movie-coordinate-progress.png
 
-<p align="center"><img src="assets/screenshots/rtype-delta-movie-coordinate-progress.png" alt="rtype delta movie coordinate progress"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-movie-coordinate-progress.webp" alt="rtype delta movie coordinate progress"></p>
 
 fix(gpu): honor unnormalized sample coordinates
 
-`d4fa07a8` · [`assets/screenshots/rtype-delta-movie-coordinate-progress.png`](assets/screenshots/rtype-delta-movie-coordinate-progress.png)
+`d4fa07a8` · [`assets/screenshots/rtype-delta-movie-coordinate-progress.webp`](assets/screenshots/rtype-delta-movie-coordinate-progress.webp)
 
 ### blue-prince-hall.png
 
-<p align="center"><img src="assets/screenshots/blue-prince-hall.png" alt="blue prince hall"></p>
+<p align="center"><img src="assets/screenshots/blue-prince-hall.webp" alt="blue prince hall"></p>
 
 Fix Blue Prince hall snapshot guard (#1813)
 
-`730d434e` · [`assets/screenshots/blue-prince-hall.png`](assets/screenshots/blue-prince-hall.png)
+`730d434e` · [`assets/screenshots/blue-prince-hall.webp`](assets/screenshots/blue-prince-hall.webp)
 
 ## 2026-08-02
 
 ### earthion-title-menu.png
 
-<p align="center"><img src="assets/screenshots/earthion-title-menu.png" alt="earthion title menu"></p>
+<p align="center"><img src="assets/screenshots/earthion-title-menu.webp" alt="earthion title menu"></p>
 
 feat(earthion): route past the intro — the "missing picture" was a black text page (#1590) (#1775)
 
-`3d1a7480` · [`assets/screenshots/earthion-title-menu.png`](assets/screenshots/earthion-title-menu.png)
+`3d1a7480` · [`assets/screenshots/earthion-title-menu.webp`](assets/screenshots/earthion-title-menu.webp)
 
 ### tales-graces-f-options.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-options.png" alt="tales graces f options"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-options.webp" alt="tales graces f options"></p>
 
 feat(talesgraces): routes to the title screen and the new-game Options screen (PPSA19991 rung 2) (#1759)
 
-`30477a2d` · [`assets/screenshots/tales-graces-f-options.png`](assets/screenshots/tales-graces-f-options.png)
+`30477a2d` · [`assets/screenshots/tales-graces-f-options.webp`](assets/screenshots/tales-graces-f-options.webp)
 
 ### tales-graces-f-title.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-title.png" alt="tales graces f title"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-title.webp" alt="tales graces f title"></p>
 
 feat(talesgraces): routes to the title screen and the new-game Options screen (PPSA19991 rung 2) (#1759)
 
-`30477a2d` · [`assets/screenshots/tales-graces-f-title.png`](assets/screenshots/tales-graces-f-title.png)
+`30477a2d` · [`assets/screenshots/tales-graces-f-title.webp`](assets/screenshots/tales-graces-f-title.webp)
 
 ### bendy-gameplay.png
 
-<p align="center"><img src="assets/screenshots/bendy-gameplay.png" alt="bendy gameplay"></p>
+<p align="center"><img src="assets/screenshots/bendy-gameplay.webp" alt="bendy gameplay"></p>
 
 docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/bendy-gameplay.png`](assets/screenshots/bendy-gameplay.png)
+`8fc79ca0` · [`assets/screenshots/bendy-gameplay.webp`](assets/screenshots/bendy-gameplay.webp)
 
 ### bendy-title.png
 
-<p align="center"><img src="assets/screenshots/bendy-title.png" alt="bendy title"></p>
+<p align="center"><img src="assets/screenshots/bendy-title.webp" alt="bendy title"></p>
 
 docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/bendy-title.png`](assets/screenshots/bendy-title.png)
+`8fc79ca0` · [`assets/screenshots/bendy-title.webp`](assets/screenshots/bendy-title.webp)
 
 ### pathless-title.png
 
-<p align="center"><img src="assets/screenshots/pathless-title.png" alt="pathless title"></p>
+<p align="center"><img src="assets/screenshots/pathless-title.webp" alt="pathless title"></p>
 
 docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/pathless-title.png`](assets/screenshots/pathless-title.png)
+`8fc79ca0` · [`assets/screenshots/pathless-title.webp`](assets/screenshots/pathless-title.webp)
 
 ### plucky-squire-title.png
 
-<p align="center"><img src="assets/screenshots/plucky-squire-title.png" alt="plucky squire title"></p>
+<p align="center"><img src="assets/screenshots/plucky-squire-title.webp" alt="plucky squire title"></p>
 
 docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/plucky-squire-title.png`](assets/screenshots/plucky-squire-title.png)
+`8fc79ca0` · [`assets/screenshots/plucky-squire-title.webp`](assets/screenshots/plucky-squire-title.webp)
 
 ### astro-bot-opening-cinematic.png
 
-<p align="center"><img src="assets/screenshots/astro-bot-opening-cinematic.png" alt="astro bot opening cinematic"></p>
+<p align="center"><img src="assets/screenshots/astro-bot-opening-cinematic.webp" alt="astro bot opening cinematic"></p>
 
 docs(astro): Astro Bot enters COMPATIBILITY.md at rung 2 — the title screen renders (#1736)
 
-`6d7b69e9` · [`assets/screenshots/astro-bot-opening-cinematic.png`](assets/screenshots/astro-bot-opening-cinematic.png)
+`6d7b69e9` · [`assets/screenshots/astro-bot-opening-cinematic.webp`](assets/screenshots/astro-bot-opening-cinematic.webp)
 
 ### astro-bot-title.png
 
-<p align="center"><img src="assets/screenshots/astro-bot-title.png" alt="astro bot title"></p>
+<p align="center"><img src="assets/screenshots/astro-bot-title.webp" alt="astro bot title"></p>
 
 docs(astro): Astro Bot enters COMPATIBILITY.md at rung 2 — the title screen renders (#1736)
 
-`6d7b69e9` · [`assets/screenshots/astro-bot-title.png`](assets/screenshots/astro-bot-title.png)
+`6d7b69e9` · [`assets/screenshots/astro-bot-title.webp`](assets/screenshots/astro-bot-title.webp)
 
 ### astro-bot-worldmap-background.png
 
-<p align="center"><img src="assets/screenshots/astro-bot-worldmap-background.png" alt="astro bot worldmap background"></p>
+<p align="center"><img src="assets/screenshots/astro-bot-worldmap-background.webp" alt="astro bot worldmap background"></p>
 
 fix(gpu): CB_COLOR_CONTROL.MODE must not override the guest's colour write mask (#1728)
 
-`c8fe4afd` · [`assets/screenshots/astro-bot-worldmap-background.png`](assets/screenshots/astro-bot-worldmap-background.png)
+`c8fe4afd` · [`assets/screenshots/astro-bot-worldmap-background.webp`](assets/screenshots/astro-bot-worldmap-background.webp)
 
 ## 2026-08-01
 
 ### tales-graces-f-criware.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-criware.png" alt="tales graces f criware"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-criware.webp" alt="tales graces f criware"></p>
 
 fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667)
 
-`fa1f07b3` · [`assets/screenshots/tales-graces-f-criware.png`](assets/screenshots/tales-graces-f-criware.png)
+`fa1f07b3` · [`assets/screenshots/tales-graces-f-criware.webp`](assets/screenshots/tales-graces-f-criware.webp)
 
 ### tales-graces-f-publisher.png
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-publisher.png" alt="tales graces f publisher"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-publisher.webp" alt="tales graces f publisher"></p>
 
 fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667)
 
-`fa1f07b3` · [`assets/screenshots/tales-graces-f-publisher.png`](assets/screenshots/tales-graces-f-publisher.png)
+`fa1f07b3` · [`assets/screenshots/tales-graces-f-publisher.webp`](assets/screenshots/tales-graces-f-publisher.webp)
 
 ### issue-1630-grid-after.png
 
@@ -1455,165 +1455,165 @@ feat(app): per-title background art and focus music in the library (#1647)
 
 ### syberia-gameplay.png
 
-<p align="center"><img src="assets/screenshots/syberia-gameplay.png" alt="syberia gameplay"></p>
+<p align="center"><img src="assets/screenshots/syberia-gameplay.webp" alt="syberia gameplay"></p>
 
 docs(syberia): validated route to gameplay, and localize the black scene to one format gap (#1622)
 
-`5ee5e785` · [`assets/screenshots/syberia-gameplay.png`](assets/screenshots/syberia-gameplay.png)
+`5ee5e785` · [`assets/screenshots/syberia-gameplay.webp`](assets/screenshots/syberia-gameplay.webp)
 
 ### syberia-title.png
 
-<p align="center"><img src="assets/screenshots/syberia-title.png" alt="syberia title"></p>
+<p align="center"><img src="assets/screenshots/syberia-title.webp" alt="syberia title"></p>
 
 docs(syberia): validated route to gameplay, and localize the black scene to one format gap (#1622)
 
-`5ee5e785` · [`assets/screenshots/syberia-title.png`](assets/screenshots/syberia-title.png)
+`5ee5e785` · [`assets/screenshots/syberia-title.webp`](assets/screenshots/syberia-title.webp)
 
 ### worms-armageddon-gameplay.png
 
-<p align="center"><img src="assets/screenshots/worms-armageddon-gameplay.png" alt="worms armageddon gameplay"></p>
+<p align="center"><img src="assets/screenshots/worms-armageddon-gameplay.webp" alt="worms armageddon gameplay"></p>
 
 fix(pad): scePadGetHandle looks up an open handle instead of fabricating one (#1623)
 
-`823c9670` · [`assets/screenshots/worms-armageddon-gameplay.png`](assets/screenshots/worms-armageddon-gameplay.png)
+`823c9670` · [`assets/screenshots/worms-armageddon-gameplay.webp`](assets/screenshots/worms-armageddon-gameplay.webp)
 
 ## 2026-07-31
 
 ### syberia-profile.png
 
-<p align="center"><img src="assets/screenshots/syberia-profile.png" alt="syberia profile"></p>
+<p align="center"><img src="assets/screenshots/syberia-profile.webp" alt="syberia profile"></p>
 
 fix(agc): register sceAgcAcbWriteData — Syberia goes from hard hang to its profile menu (#1610)
 
-`961a6cdd` · [`assets/screenshots/syberia-profile.png`](assets/screenshots/syberia-profile.png)
+`961a6cdd` · [`assets/screenshots/syberia-profile.webp`](assets/screenshots/syberia-profile.webp)
 
 ### nikoderiko-title.png
 
-<p align="center"><img src="assets/screenshots/nikoderiko-title.png" alt="nikoderiko title"></p>
+<p align="center"><img src="assets/screenshots/nikoderiko-title.webp" alt="nikoderiko title"></p>
 
 docs(compat): add Nikoderiko at title screen and The Oregon Trail at research tier (#1608)
 
-`a933091d` · [`assets/screenshots/nikoderiko-title.png`](assets/screenshots/nikoderiko-title.png)
+`a933091d` · [`assets/screenshots/nikoderiko-title.webp`](assets/screenshots/nikoderiko-title.webp)
 
 ### greak-title.png
 
-<p align="center"><img src="assets/screenshots/greak-title.png" alt="greak title"></p>
+<p align="center"><img src="assets/screenshots/greak-title.webp" alt="greak title"></p>
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/greak-title.png`](assets/screenshots/greak-title.png)
+`5a0eb7b6` · [`assets/screenshots/greak-title.webp`](assets/screenshots/greak-title.webp)
 
 ### greak.png
 
-<p align="center"><img src="assets/screenshots/greak.png" alt="greak"></p>
+<p align="center"><img src="assets/screenshots/greak.webp" alt="greak"></p>
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/greak.png`](assets/screenshots/greak.png)
+`5a0eb7b6` · [`assets/screenshots/greak.webp`](assets/screenshots/greak.webp)
 
 ### rugrats-title.png
 
-<p align="center"><img src="assets/screenshots/rugrats-title.png" alt="rugrats title"></p>
+<p align="center"><img src="assets/screenshots/rugrats-title.webp" alt="rugrats title"></p>
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/rugrats-title.png`](assets/screenshots/rugrats-title.png)
+`5a0eb7b6` · [`assets/screenshots/rugrats-title.webp`](assets/screenshots/rugrats-title.webp)
 
 ### rugrats.png
 
-<p align="center"><img src="assets/screenshots/rugrats.png" alt="rugrats"></p>
+<p align="center"><img src="assets/screenshots/rugrats.webp" alt="rugrats"></p>
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/rugrats.png`](assets/screenshots/rugrats.png)
+`5a0eb7b6` · [`assets/screenshots/rugrats.webp`](assets/screenshots/rugrats.webp)
 
 ### asterix-slap-them-all.png
 
-<p align="center"><img src="assets/screenshots/asterix-slap-them-all.png" alt="asterix slap them all"></p>
+<p align="center"><img src="assets/screenshots/asterix-slap-them-all.webp" alt="asterix slap them all"></p>
 
 docs(compat): add Asterix Slap Them All and Summer Sports Games at gameplay (#1604)
 
-`2421d503` · [`assets/screenshots/asterix-slap-them-all.png`](assets/screenshots/asterix-slap-them-all.png)
+`2421d503` · [`assets/screenshots/asterix-slap-them-all.webp`](assets/screenshots/asterix-slap-them-all.webp)
 
 ### summer-sports-games.png
 
-<p align="center"><img src="assets/screenshots/summer-sports-games.png" alt="summer sports games"></p>
+<p align="center"><img src="assets/screenshots/summer-sports-games.webp" alt="summer sports games"></p>
 
 docs(compat): add Asterix Slap Them All and Summer Sports Games at gameplay (#1604)
 
-`2421d503` · [`assets/screenshots/summer-sports-games.png`](assets/screenshots/summer-sports-games.png)
+`2421d503` · [`assets/screenshots/summer-sports-games.webp`](assets/screenshots/summer-sports-games.webp)
 
 ### joe-mac-menu.png
 
-<p align="center"><img src="assets/screenshots/joe-mac-menu.png" alt="joe mac menu"></p>
+<p align="center"><img src="assets/screenshots/joe-mac-menu.webp" alt="joe mac menu"></p>
 
 docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
-`bb5a11a2` · [`assets/screenshots/joe-mac-menu.png`](assets/screenshots/joe-mac-menu.png)
+`bb5a11a2` · [`assets/screenshots/joe-mac-menu.webp`](assets/screenshots/joe-mac-menu.webp)
 
 ### joe-mac.png
 
-<p align="center"><img src="assets/screenshots/joe-mac.png" alt="joe mac"></p>
+<p align="center"><img src="assets/screenshots/joe-mac.webp" alt="joe mac"></p>
 
 docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
-`bb5a11a2` · [`assets/screenshots/joe-mac.png`](assets/screenshots/joe-mac.png)
+`bb5a11a2` · [`assets/screenshots/joe-mac.webp`](assets/screenshots/joe-mac.webp)
 
 ### worms-armageddon-title.png
 
-<p align="center"><img src="assets/screenshots/worms-armageddon-title.png" alt="worms armageddon title"></p>
+<p align="center"><img src="assets/screenshots/worms-armageddon-title.webp" alt="worms armageddon title"></p>
 
 docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
-`bb5a11a2` · [`assets/screenshots/worms-armageddon-title.png`](assets/screenshots/worms-armageddon-title.png)
+`bb5a11a2` · [`assets/screenshots/worms-armageddon-title.webp`](assets/screenshots/worms-armageddon-title.webp)
 
 ### alex-kidd.png
 
-<p align="center"><img src="assets/screenshots/alex-kidd.png" alt="alex kidd"></p>
+<p align="center"><img src="assets/screenshots/alex-kidd.webp" alt="alex kidd"></p>
 
 test(snapshot): reviewed alexkidd-gameplay content guard — PPSA02664 reaches ladder rung 6 (#1582)
 
-`a6d995fa` · [`assets/screenshots/alex-kidd.png`](assets/screenshots/alex-kidd.png)
+`a6d995fa` · [`assets/screenshots/alex-kidd.webp`](assets/screenshots/alex-kidd.webp)
 
 ### dragon-quest-vii-onboarding.png
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-onboarding.png" alt="dragon quest vii onboarding"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-onboarding.webp" alt="dragon quest vii onboarding"></p>
 
 docs: record Dragon Quest VII onboarding
 
-`aeee4d48` · [`assets/screenshots/dragon-quest-vii-onboarding.png`](assets/screenshots/dragon-quest-vii-onboarding.png)
+`aeee4d48` · [`assets/screenshots/dragon-quest-vii-onboarding.webp`](assets/screenshots/dragon-quest-vii-onboarding.webp)
 
 ### dragon-quest-vii-name-confirmation.png
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-confirmation.png" alt="dragon quest vii name confirmation"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-confirmation.webp" alt="dragon quest vii name confirmation"></p>
 
 Document DQ7 name confirmation milestone
 
-`d2fe1c66` · [`assets/screenshots/dragon-quest-vii-name-confirmation.png`](assets/screenshots/dragon-quest-vii-name-confirmation.png)
+`d2fe1c66` · [`assets/screenshots/dragon-quest-vii-name-confirmation.webp`](assets/screenshots/dragon-quest-vii-name-confirmation.webp)
 
 ### dragon-quest-vii-name-entry.png
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-entry.png" alt="dragon quest vii name entry"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-entry.webp" alt="dragon quest vii name entry"></p>
 
 Document Dragon Quest name entry
 
-`297ec493` · [`assets/screenshots/dragon-quest-vii-name-entry.png`](assets/screenshots/dragon-quest-vii-name-entry.png)
+`297ec493` · [`assets/screenshots/dragon-quest-vii-name-entry.webp`](assets/screenshots/dragon-quest-vii-name-entry.webp)
 
 ### space-adventure-cobra.png
 
-<p align="center"><img src="assets/screenshots/space-adventure-cobra.png" alt="space adventure cobra"></p>
+<p align="center"><img src="assets/screenshots/space-adventure-cobra.webp" alt="space adventure cobra"></p>
 
 fix(runtime): preserve guest TLS across write-watch faults
 
-`82eadf58` · [`assets/screenshots/space-adventure-cobra.png`](assets/screenshots/space-adventure-cobra.png)
+`82eadf58` · [`assets/screenshots/space-adventure-cobra.webp`](assets/screenshots/space-adventure-cobra.webp)
 
 ### gris.png
 
-<p align="center"><img src="assets/screenshots/gris.png" alt="gris"></p>
+<p align="center"><img src="assets/screenshots/gris.webp" alt="gris"></p>
 
 docs: record GRIS opening gameplay
 
-`b08f0a94` · [`assets/screenshots/gris.png`](assets/screenshots/gris.png)
+`b08f0a94` · [`assets/screenshots/gris.webp`](assets/screenshots/gris.webp)
 
 ### issue-1459-astrobot-blue-fmv-gpu-present.png
 
@@ -1825,11 +1825,11 @@ feat: bring GRIS and Cobra to title with audio (#1368)
 
 ### dragon-quest-vii-title.png
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-title.png" alt="dragon quest vii title"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-title.webp" alt="dragon quest vii title"></p>
 
 docs: publish Dragon Quest VII title capture
 
-`18abdf28` · [`assets/screenshots/dragon-quest-vii-title.png`](assets/screenshots/dragon-quest-vii-title.png)
+`18abdf28` · [`assets/screenshots/dragon-quest-vii-title.webp`](assets/screenshots/dragon-quest-vii-title.webp)
 
 ### issue-1352-wall-shading-after.png
 
@@ -1851,107 +1851,107 @@ fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#13
 
 ### blue-prince-title.png
 
-<p align="center"><img src="assets/screenshots/blue-prince-title.png" alt="blue prince title"></p>
+<p align="center"><img src="assets/screenshots/blue-prince-title.webp" alt="blue prince title"></p>
 
 Add Blue Prince and Terminator docs screenshots (#1342)
 
-`5e11d900` · [`assets/screenshots/blue-prince-title.png`](assets/screenshots/blue-prince-title.png)
+`5e11d900` · [`assets/screenshots/blue-prince-title.webp`](assets/screenshots/blue-prince-title.webp)
 
 ### terminator-title.png
 
-<p align="center"><img src="assets/screenshots/terminator-title.png" alt="terminator title"></p>
+<p align="center"><img src="assets/screenshots/terminator-title.webp" alt="terminator title"></p>
 
 Add Blue Prince and Terminator docs screenshots (#1342)
 
-`5e11d900` · [`assets/screenshots/terminator-title.png`](assets/screenshots/terminator-title.png)
+`5e11d900` · [`assets/screenshots/terminator-title.webp`](assets/screenshots/terminator-title.webp)
 
 ### terminator.png
 
-<p align="center"><img src="assets/screenshots/terminator.png" alt="terminator"></p>
+<p align="center"><img src="assets/screenshots/terminator.webp" alt="terminator"></p>
 
 Add Blue Prince and Terminator docs screenshots (#1342)
 
-`5e11d900` · [`assets/screenshots/terminator.png`](assets/screenshots/terminator.png)
+`5e11d900` · [`assets/screenshots/terminator.webp`](assets/screenshots/terminator.webp)
 
 ### gta5-main-menu.png
 
-<p align="center"><img src="assets/screenshots/gta5-main-menu.png" alt="gta5 main menu"></p>
+<p align="center"><img src="assets/screenshots/gta5-main-menu.webp" alt="gta5 main menu"></p>
 
 docs: show GTA V current renderer state (#1339)
 
-`e6b8fb06` · [`assets/screenshots/gta5-main-menu.png`](assets/screenshots/gta5-main-menu.png)
+`e6b8fb06` · [`assets/screenshots/gta5-main-menu.webp`](assets/screenshots/gta5-main-menu.webp)
 
 ### gta5-title.png
 
-<p align="center"><img src="assets/screenshots/gta5-title.png" alt="gta5 title"></p>
+<p align="center"><img src="assets/screenshots/gta5-title.webp" alt="gta5 title"></p>
 
 docs: show GTA V current renderer state (#1339)
 
-`e6b8fb06` · [`assets/screenshots/gta5-title.png`](assets/screenshots/gta5-title.png)
+`e6b8fb06` · [`assets/screenshots/gta5-title.webp`](assets/screenshots/gta5-title.webp)
 
 ### blasphemous2-title.png
 
-<p align="center"><img src="assets/screenshots/blasphemous2-title.png" alt="blasphemous2 title"></p>
+<p align="center"><img src="assets/screenshots/blasphemous2-title.webp" alt="blasphemous2 title"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/blasphemous2-title.png`](assets/screenshots/blasphemous2-title.png)
+`958979f6` · [`assets/screenshots/blasphemous2-title.webp`](assets/screenshots/blasphemous2-title.webp)
 
 ### blasphemous2.png
 
-<p align="center"><img src="assets/screenshots/blasphemous2.png" alt="blasphemous2"></p>
+<p align="center"><img src="assets/screenshots/blasphemous2.webp" alt="blasphemous2"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/blasphemous2.png`](assets/screenshots/blasphemous2.png)
+`958979f6` · [`assets/screenshots/blasphemous2.webp`](assets/screenshots/blasphemous2.webp)
 
 ### dead-cells-title.png
 
-<p align="center"><img src="assets/screenshots/dead-cells-title.png" alt="dead cells title"></p>
+<p align="center"><img src="assets/screenshots/dead-cells-title.webp" alt="dead cells title"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/dead-cells-title.png`](assets/screenshots/dead-cells-title.png)
+`958979f6` · [`assets/screenshots/dead-cells-title.webp`](assets/screenshots/dead-cells-title.webp)
 
 ### dead-cells.png
 
-<p align="center"><img src="assets/screenshots/dead-cells.png" alt="dead cells"></p>
+<p align="center"><img src="assets/screenshots/dead-cells.webp" alt="dead cells"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/dead-cells.png`](assets/screenshots/dead-cells.png)
+`958979f6` · [`assets/screenshots/dead-cells.webp`](assets/screenshots/dead-cells.webp)
 
 ### evergate-title.png
 
-<p align="center"><img src="assets/screenshots/evergate-title.png" alt="evergate title"></p>
+<p align="center"><img src="assets/screenshots/evergate-title.webp" alt="evergate title"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/evergate-title.png`](assets/screenshots/evergate-title.png)
+`958979f6` · [`assets/screenshots/evergate-title.webp`](assets/screenshots/evergate-title.webp)
 
 ### evergate.png
 
-<p align="center"><img src="assets/screenshots/evergate.png" alt="evergate"></p>
+<p align="center"><img src="assets/screenshots/evergate.webp" alt="evergate"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/evergate.png`](assets/screenshots/evergate.png)
+`958979f6` · [`assets/screenshots/evergate.webp`](assets/screenshots/evergate.webp)
 
 ### messenger-title.png
 
-<p align="center"><img src="assets/screenshots/messenger-title.png" alt="messenger title"></p>
+<p align="center"><img src="assets/screenshots/messenger-title.webp" alt="messenger title"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/messenger-title.png`](assets/screenshots/messenger-title.png)
+`958979f6` · [`assets/screenshots/messenger-title.webp`](assets/screenshots/messenger-title.webp)
 
 ### messenger.png
 
-<p align="center"><img src="assets/screenshots/messenger.png" alt="messenger"></p>
+<p align="center"><img src="assets/screenshots/messenger.webp" alt="messenger"></p>
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/messenger.png`](assets/screenshots/messenger.png)
+`958979f6` · [`assets/screenshots/messenger.webp`](assets/screenshots/messenger.webp)
 
 ## 2026-07-19
 

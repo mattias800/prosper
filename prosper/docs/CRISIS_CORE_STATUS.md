@@ -5,8 +5,8 @@ Unreal Engine 4.27 + IoStore. Tracker: [#1894](https://github.com/mattias800/pro
 **Rung 2 — the title screen is reached and rendered.** Verified 2026-08-06 on a native
 Linux/Vulkan run (RADV, AMD Radeon 8060S), unmodified `tools/screenshot`, images inspected by eye.
 
-<p align="center"><img src="../../assets/screenshots/crisis-core-title.png" alt="Crisis Core Reunion — title screen"></p>
-<p align="center"><img src="../../assets/screenshots/crisis-core-main-menu.png" alt="Crisis Core Reunion — main menu"></p>
+<p align="center"><img src="../../assets/screenshots/crisis-core-title.webp" alt="Crisis Core Reunion — title screen"></p>
+<p align="center"><img src="../../assets/screenshots/crisis-core-main-menu.webp" alt="Crisis Core Reunion — main menu"></p>
 
 The boot sequence that now runs end to end: white splash → the autosave-notice dialog → (one
 Cross) → **"Press Any Button" title screen** with `Ver. 1.0.4` and the Square Enix copyright, held

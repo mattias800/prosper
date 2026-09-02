@@ -11,7 +11,7 @@ Rung 2 on the ladder, with the **real 3D world now rendering**: the checked-in r
 save-slot and play-style menus, streams `MainLevel` + `Desk_C01` + `Desk_C01_Lighting`, and then plays
 the authored chapter-one intro cutscene (`cam_cutscene_c01_intro`) with real GPU draws at 3840x2160.
 
-[![The Plucky Squire — chapter-one intro](https://raw.githubusercontent.com/mattias800/prosper/master/assets/screenshots/plucky-squire-chapter1-intro.png)](https://github.com/mattias800/prosper/blob/master/assets/screenshots/plucky-squire-chapter1-intro.png)
+[![The Plucky Squire — chapter-one intro](https://raw.githubusercontent.com/mattias800/prosper/master/assets/screenshots/plucky-squire-chapter1-intro.webp)](https://github.com/mattias800/prosper/blob/master/assets/screenshots/plucky-squire-chapter1-intro.webp)
 
 *`tools/screenshot` (headless frontend), unmodified 3840x2160 capture downscaled for the repository,
 checked-in `scripts/plucky-squire/reach-first-gameplay.pad` route, t = 1080 s.*

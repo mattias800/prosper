@@ -13,7 +13,7 @@ and then waits for input; the old uniform post-logo observation was a static gue
 of a renderer failure. A held Cross does not advance it — the route must alternate neutral and pressed
 states (#2358).
 
-![Sonic Racing: CrossWorlds — title screen](../../assets/screenshots/sonic-crossworlds-title.png)
+![Sonic Racing: CrossWorlds — title screen](../../assets/screenshots/sonic-crossworlds-title.webp)
 
 Two independent direct, unmodified `tools/screenshot` runs on Linux/RADV reached the native 3840x2160
 title screen: the full 3D scene, every character, the track, logo and UI. The animated frames differ in

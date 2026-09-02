@@ -1,7 +1,7 @@
 # The Oregon Trail (`PPSA19244`) — status and evidence
 
 Unreal Engine 4. **Rung 2 — title screen**, and since #1946 the whole UI layer composites correctly
-(`assets/screenshots/oregon-trail-title-screen.png`). Since #1933 landed the ErrorDialog foreground
+(`assets/screenshots/oregon-trail-title-screen.webp`). Since #1933 landed the ErrorDialog foreground
 lifecycle, the title renders its startup legal/EULA popup (`WBP_System_Disclaimer_Popup`) at native
 3840x2160 from the live renderer. Tracked on
 [#1606](https://github.com/mattias800/prosper/issues/1606) and
@@ -13,7 +13,7 @@ lifecycle, the title renders its startup legal/EULA popup (`WBP_System_Disclaime
 idle host produced **zero** #1945 faults and zero exit-90 (bounds 12–60 s; see `## Ruled out`); the 60 s
 arm ran 3,689 guest frames, every sample pixel-distinct, ending on the rendered *The Oregon Trail*
 title screen with its "Press any button" prompt
-(`assets/screenshots/oregon-trail-title-screen.png`). Neither the ordered-DMA stall below (closed by
+(`assets/screenshots/oregon-trail-title-screen.webp`). Neither the ordered-DMA stall below (closed by
 #1987) nor #1945 bounds a default launch any more. The #1945 non-reproduction is a **timing**
 result, not a code one — the same binary previously produced 10/10 exit-90 — see `## Ruled out`.
 The next frontier here is a route past the title screen.
@@ -52,7 +52,7 @@ on the night-sky gradient with no black box, the sky/ground gradient and clouds 
 logos, and Slate text draws its real glyph coverage. A default-launch title-screen sample goes from
 a handful of flat colours to **66,460 distinct colours**.
 
-`assets/screenshots/oregon-trail-title-screen.png`, `…-gameloft-splash.png` and
+`assets/screenshots/oregon-trail-title-screen.webp`, `…-gameloft-splash.png` and
 `…-health-warning.png` are all re-captured from a default-environment run on the fixed build.
 `…-legal-popup.png` is **not** — it is a pre-fix capture and still shows the blocky text; four dense
 arms (0.5 s sampling) all reached the Gameloft splash by 2.0 s without catching the popup, so it was
@@ -62,9 +62,9 @@ file is kept because the earlier sections above cite it.
 ## Where it stood earlier on 2026-08-05
 
 The startup sequence now runs **past** the EULA stage. On a default launch the title presents, in
-order: the legal popup, the **Gameloft splash** (`assets/screenshots/oregon-trail-gameloft-splash.png`),
+order: the legal popup, the **Gameloft splash** (`assets/screenshots/oregon-trail-gameloft-splash.webp`),
 one corrupted blue/magenta frame, and the **health/epilepsy warning screen**
-(`assets/screenshots/oregon-trail-health-warning.png`) — then **stalls with the frame counter frozen**
+(`assets/screenshots/oregon-trail-health-warning.webp`) — then **stalls with the frame counter frozen**
 (frame 252 and frame 396 in two arms), immediately after:
 
 ```text
@@ -100,7 +100,7 @@ The black-frame era is over. On master `9dcb6c4b` the default environment
 (`PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, no diagnostics, no
 route) produces real content within two seconds: a green legal panel titled *"Welcome to The Oregon
 Trail"*, three legal links, and a focused confirm button, at 3840x2160 with **4,009,938 non-black
-pixels** (48 % of the frame). `assets/screenshots/oregon-trail-legal-popup.png` is that frame.
+pixels** (48 % of the frame). `assets/screenshots/oregon-trail-legal-popup.webp` is that frame.
 
 Two defects now bound the title, in this order:
 
@@ -222,7 +222,7 @@ re-derive these without contradictory new evidence.
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
 | A skipped or rejected compute dispatch is dropping content on this title, as it does on the other stuck Unreal titles | **Falsified — this is the cleanest compute result in the whole Unreal survey.** A 122 s default-launch `tools/screenshot` arm on `2703a6c3` (30/30 samples at 3840x2160, `stop=request-satisfied guest=running status=ok`, no worker fault) with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` printed its census header — **32,768 dispatch decisions over 8 programs** — and **no program rows at all**, i.e. not one program skipped even once. No `[compute] skip unsupported program`, no `[compute] skip invalid descriptor contract`, no `[compute-table]` block (the last two print only on a reject). Nothing in the #2741 `VCC`/`M0`-as-scalar-data family, and no froxel-shaped resource. Scope: 8 programs is what a 4K 2D title screen exercises; this says the compute recompiler is not a blocker in the phase reached, not that gameplay would be clean. | #2747 |
-| #1945 bounds **every** run on this title, so it is the reproducible member of that issue's four-title family | **Falsified at master `c77c66b4` on an idle host — and the title now reaches the TITLE SCREEN.** **Nine** arms on 2026-08-05 — three clean 12 s, one 15 s (`PROSPER_MB3_FREELIST_GUARD`+`PROSPER_GENERATION_GUARD`), one 12 s (`PROSPER_WRITE_TRAP=0x1`+`PROSPER_FORGE_TRIP`), two clean 18 s under `taskset -c 0,1`, one clean 32 s in the exact env the census quoted (`PROSPER_NULL_PAGE=1`, no `-force-gfx-direct`), one clean 60 s — produced **zero** `WORKER-THREAD FAULT` lines, zero exit-90, every sample pixel-distinct. The longest arm ran **60 s / 3,689 guest frames** and its last sample is the rendered *The Oregon Trail* title screen with the "Press any button" prompt (`assets/screenshots/oregon-trail-title-screen.png`) — a **rung 2** this doc previously recorded as never reached. The earlier 10/10 exit-90 census was measured on the same binary (`278c9b1f`; `c77c66b4` is its docs-only child, sole diff `GAME_COMPAT_ORCHESTRATION.md`), so the difference is **timing, not code** — that much is established. *Why* the timing differs is a **hypothesis, not a result**: contention would explain both this and the 2/7, 3/4 and 1/4 rates on the other three titles, but the two `taskset -c 0,1` arms here were a deliberate attempt to widen the window by CPU starvation and did **not** reproduce it, which cuts mildly against the simplest form of that reading. Do not plan work here on the assumption that a default launch reproduces #1945. | #1945 |
+| #1945 bounds **every** run on this title, so it is the reproducible member of that issue's four-title family | **Falsified at master `c77c66b4` on an idle host — and the title now reaches the TITLE SCREEN.** **Nine** arms on 2026-08-05 — three clean 12 s, one 15 s (`PROSPER_MB3_FREELIST_GUARD`+`PROSPER_GENERATION_GUARD`), one 12 s (`PROSPER_WRITE_TRAP=0x1`+`PROSPER_FORGE_TRIP`), two clean 18 s under `taskset -c 0,1`, one clean 32 s in the exact env the census quoted (`PROSPER_NULL_PAGE=1`, no `-force-gfx-direct`), one clean 60 s — produced **zero** `WORKER-THREAD FAULT` lines, zero exit-90, every sample pixel-distinct. The longest arm ran **60 s / 3,689 guest frames** and its last sample is the rendered *The Oregon Trail* title screen with the "Press any button" prompt (`assets/screenshots/oregon-trail-title-screen.webp`) — a **rung 2** this doc previously recorded as never reached. The earlier 10/10 exit-90 census was measured on the same binary (`278c9b1f`; `c77c66b4` is its docs-only child, sole diff `GAME_COMPAT_ORCHESTRATION.md`), so the difference is **timing, not code** — that much is established. *Why* the timing differs is a **hypothesis, not a result**: contention would explain both this and the 2/7, 3/4 and 1/4 rates on the other three titles, but the two `taskset -c 0,1` arms here were a deliberate attempt to widen the window by CPU starvation and did **not** reproduce it, which cuts mildly against the simplest form of that reading. Do not plan work here on the assumption that a default launch reproduces #1945. | #1945 |
 | The `R11G11B10F` compute write-back notifier gap (Syberia #1619) explains the black scene here | **Falsified.** The precondition holds — the scene-colour target really is `R11G11B10_FLOAT` — but the notifier is only reached from `live_compute.cpp` under `bi.mirror_result_to_imported`, i.e. when a dispatch writes a *renderer-owned* storage image. A validated live trace with `PROSPER_COMPUTELOG=1` (which does **not** clear `live_gpu_targets`) produced **11,440 `[compute]` lines and zero** `mirrored storage result into renderer RTT` lines; every storage image in the run logs `renderer_owned=0`. **The notifier is never invoked by this title.** CONFIDENCE: HIGH. | #1606 |
 | Prosper's `CB_COLOR_CONTROL` tracking is stale, unwritten, or folds wrongly, and the `MODE` decode is wrong | **Falsified — the tracking is exact.** `PROSPER_REGWATCH` over ~14 s records **12,390** `CB_COLOR_CONTROL` writes and 11,358 `CB_TARGET_MASK` writes, all on the indirect (`Set*RegsIndirect`) path. `MODE=1` (`CB_NORMAL`) is the **dominant** value at 9,346 writes versus 1,335 `MODE=0`, a 7:1 ratio. Joined correctly against each draw's own `command_order`, all **1,050 of 1,050** suppressed draws resolve exactly the `CB_COLOR_CONTROL` and `CB_TARGET_MASK` the guest wrote at or before that draw — **zero mismatches**. The guest deliberately programs `CB_DISABLE` on these draws, immediately before each one. The decode is sound in the other direction too: the same title's post-process draws decode `MODE=1` and render. **Do not force `MODE=1`** — it is not a fix, and `PROSPER_FORCE_COLORWRITE=1` leaves the frame byte-identically black. **Amended by #1724:** this row's finding stands (the decode is exact and the guest deliberately programs `CB_DISABLE`), but prosper no longer *acts* on `MODE` when deriving the colour write mask — the mask comes from `CB_TARGET_MASK & CB_SHADER_MASK` alone. If this title's suppressed draws carry a non-zero mask they now write; re-measure before reasoning from the old suppression counts. | #1606 |
 | This is Astro Bot's colour-state signature (#1585), or #305's stale/unwritten-register family | **Falsified.** #1585 records `MODE=1` occurring *zero* times in an entire Astro frame; here it is dominant 7:1. Do not correlate these investigations on that basis. | #1606 |

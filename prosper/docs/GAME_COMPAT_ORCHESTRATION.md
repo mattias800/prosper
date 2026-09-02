@@ -1783,7 +1783,7 @@ alpha" factor as the live hypothesis. Re-verify any tiling-related claim with a 
 > no-input boot renders the **title screen** (`NEW GAME` / `OPTIONS`) at 2560x1440 and holds it for a full
 > 200 s run with `max_stale_seconds=0.0`, so neither "every presented frame is a flat colour" nor "progression
 > freezes at ~18 s" reproduces. Evidence and manifest numbers are in #1570; the screenshot is
-> `assets/screenshots/pathless-title.png`. **Do not start this lane from the packed-FP16 MRT0 export lead
+> `assets/screenshots/pathless-title.webp`. **Do not start this lane from the packed-FP16 MRT0 export lead
 > below** — it was derived from a capture taken in the flat-colour state that no longer occurs, so re-take a
 > capture before trusting any address, submit ordinal or hash in the rest of this section. The remaining real
 > gap is that no input route has been tried and gameplay has not been reached. The section is retained

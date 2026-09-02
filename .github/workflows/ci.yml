@@ -286,6 +286,22 @@ jobs:
         run: |
           git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py --github
 
+      # Committed imagery, not prose, but this is the cheap job that already has Python and needs no
+      # build. Measured 2026-09-02: `assets/screenshots` was 398 MiB of a 621 MiB pack while ALL
+      # source, docs and tests in the entire history came to 18 MiB -- images were ~96% of the
+      # repository, and the cause was resolution rather than count (121 files averaging 2.5 MiB, all
+      # 3840x2160 PNG). Re-encoding took them to 14.2 MiB. Without a gate this drifts straight back:
+      # the capture tools emit 4K PNG, so committing one is the path of least resistance and nothing
+      # would notice until the repository was large again.
+      #
+      # The check is `--check`, which re-encodes to memory and exits 1 if any file WOULD change. It
+      # skips a file that is already WebP and within the width cap, so a conforming tree goes green
+      # -- a gate that always reports work to do is one nobody can satisfy, and would be turned off.
+      - name: Verify committed screenshots are within the size convention
+        run: |
+          python3 -m pip install --quiet Pillow
+          python3 prosper/tools/screenshots/shrink.py --check assets/screenshots
+
       # The other half of the numbering contract, and until now nobody checked it. The table's value
       # is that other files point AT it by number, and roughly half of those references are
       # .cpp/.hpp/.py COMMENTS rather than prose -- the step prints the live counts, so no figure is

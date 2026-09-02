@@ -19,7 +19,7 @@ the boost gauge, and **a stage timer that advances monotonically with the guest'
 (00:52.39 -> 00:56.76 across one 55-sample capture; 01:02.36 -> 01:05.83 across a second run).
 A running stage clock is the discriminator this title offers and a menu cannot fake it: no
 aggregate frame metric was used to make the call. Checked-in capture:
-`assets/screenshots/sonic-frontiers-cyberspace-hud.png` (direct unmodified `tools/screenshot` frame,
+`assets/screenshots/sonic-frontiers-cyberspace-hud.webp` (direct unmodified `tools/screenshot` frame,
 3840x2160, route arm, stage clock at 00:55.89).
 
 **What is not there is the world.** The 3840x2160 frame is black behind the HUD, because
@@ -229,13 +229,13 @@ a no-input arm at 3840×2160:
 
 | Screen | Asset |
 | --- | --- |
-| SEGA logo | `assets/screenshots/sonic-frontiers-sega-logo.png` |
-| Cyber Space opening | `assets/screenshots/sonic-frontiers-opening-sequence.png` |
-| Sonic Team logo | `assets/screenshots/sonic-frontiers-sonic-team-logo.png` |
-| Middleware credits | `assets/screenshots/sonic-frontiers-middleware-credits.png` |
-| Auto-save notice | `assets/screenshots/sonic-frontiers-autosave-notice.png` |
-| **Title screen** | `assets/screenshots/sonic-frontiers-title-screen.png` |
-| **Main menu** | `assets/screenshots/sonic-frontiers-main-menu.png` |
+| SEGA logo | `assets/screenshots/sonic-frontiers-sega-logo.webp` |
+| Cyber Space opening | `assets/screenshots/sonic-frontiers-opening-sequence.webp` |
+| Sonic Team logo | `assets/screenshots/sonic-frontiers-sonic-team-logo.webp` |
+| Middleware credits | `assets/screenshots/sonic-frontiers-middleware-credits.webp` |
+| Auto-save notice | `assets/screenshots/sonic-frontiers-autosave-notice.webp` |
+| **Title screen** | `assets/screenshots/sonic-frontiers-title-screen.webp` |
+| **Main menu** | `assets/screenshots/sonic-frontiers-main-menu.webp` |
 
 ## What reaching rung 2 took: one unregistered NID
 
