@@ -14,7 +14,11 @@
 // The scan is split in two so the interesting half is testable without a live guest:
 //   * memory_search_ranges() is pure -- it takes the ranges, a fetch callback and the needle, and
 //     owns the chunking, the overlap that keeps a needle straddling a chunk boundary from being
-//     missed, the hit de-duplication that overlap otherwise creates, and the budget accounting.
+//     missed, the range-end handling that prefix mode needs, and the budget accounting. It does NOT
+//     need to de-duplicate: consecutive chunks' searched START windows are contiguous and disjoint,
+//     so the overlap cannot produce a repeat. (There is a high-water guard in the loop, kept as an
+//     invariant against a future change to those bounds; it is not reachable as written, and no test
+//     pins it. This line used to claim the opposite.)
 //   * guest_memory_search() is the thin POSIX half: enumerate this process's readable mappings from
 //     /proc/self/maps and read them with process_vm_readv (never a raw dereference -- a mapping can
 //     disappear under a diagnostic, and a diagnostic must not fault the run).

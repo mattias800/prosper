@@ -2762,6 +2762,9 @@ struct ZeroWatchEntry {
     int reprofiles_done = 0;
     bool find_control_done = false;      // the "the data IS findable" arm has run
     bool find_control_found = false;
+    // The control did not run at all (every needle it had was degenerate), which is a different
+    // reason to skip the second scan than "the control looked and found nothing".
+    bool find_control_refused = false;
 };
 std::mutex g_zw_mx;
 std::vector<ZeroWatchEntry> g_zw;
@@ -2858,7 +2861,7 @@ size_t zerowatch_find_prefix() {
 }
 
 void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, uint64_t needle_off,
-             const char* window, bool* found_out) {
+             const char* window, bool* found_out, bool* refused_out) {
     // A needle whose leading prefix_len bytes are all zero matches essentially everywhere, so both
     // its hits and its misses are meaningless. The arming code below picks a non-zero start where
     // one exists inside the window; this is the backstop for when none does, and it refuses rather
@@ -2868,6 +2871,9 @@ void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, u
         if (needle[k]) degenerate = false;
     if (degenerate) {
         if (found_out) *found_out = false;
+        // REFUSED is not the same as "found nothing", and the difference decides whether a later
+        // scan is worth running. Reported separately so the skip line downstream can say which.
+        if (refused_out) *refused_out = true;
         fprintf(stderr, "[zerowatch-find] t=%llu %s dst=0x%llx window=%s seed-off=0x%llx "
                         "DEGENERATE NEEDLE (first %zu bytes all zero) -- NOT scanned\n",
                 (unsigned long long)prosper::diagnostics::diag_now_us(), when,
@@ -3062,23 +3068,37 @@ void zerowatch_poll_forever() {
                     if (e.find_control_done && e.find_control_found)
                         pending_find.push_back({e, "AFTER-ZERO"});
                     else if (e.find_control_done)
-                        fprintf(stderr, "[zerowatch-find] dst=0x%llx AFTER-ZERO scan SKIPPED -- its "
-                                        "control scan found nothing, so a null here would be void\n",
-                                (unsigned long long)e.dst);
+                        fprintf(stderr, "[zerowatch-find] dst=0x%llx AFTER-ZERO scan SKIPPED -- %s, "
+                                        "so a null here would be void\n",
+                                (unsigned long long)e.dst,
+                                e.find_control_refused
+                                    ? "its control was REFUSED (every needle degenerate) and never ran"
+                                    : "its control scan ran and found nothing");
                 }
             }
         }
         // Outside the lock: see the note at the top of this function.
         for (auto& p : pending_find) {
-            bool found = false, found_deep = false;
-            zw_find(p.first, p.second, p.first.seed, p.first.find_off, "first", &found);
+            bool found = false, found_deep = false, refused = false, refused_deep = false;
+            zw_find(p.first, p.second, p.first.seed, p.first.find_off, "first", &found, &refused);
             if (p.first.has_seed_deep)
                 zw_find(p.first, p.second, p.first.seed_deep, p.first.find_deep_off, "deep",
-                        &found_deep);
+                        &found_deep, &refused_deep);
+            else if (strcmp(p.second, "CONTROL") == 0)
+                // A missing deep needle is as much a limit on the scan as a refused one, and it was
+                // silent: the payload had no second non-zero window past the first, so only the
+                // chunk header is being followed. Say so, or a reader counts two scans and gets one.
+                fprintf(stderr, "[zerowatch-find] dst=0x%llx has NO deep window -- the payload's only "
+                                "non-zero 256B window is the first, so this range is followed by its "
+                                "head alone\n",
+                        (unsigned long long)p.first.dst);
             if (strcmp(p.second, "CONTROL") == 0) {
                 std::lock_guard<std::mutex> lk(g_zw_mx);
                 for (auto& e : g_zw)
-                    if (e.dst == p.first.dst) e.find_control_found = found || found_deep;
+                    if (e.dst == p.first.dst) {
+                        e.find_control_found = found || found_deep;
+                        e.find_control_refused = refused && (!p.first.has_seed_deep || refused_deep);
+                    }
             }
         }
         pending_find.clear();
