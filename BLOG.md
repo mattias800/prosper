@@ -21,6 +21,24 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### A guest asking to sleep for 584 years was served in zero milliseconds
+
+No picture — the finding is that prosper's guest sleeps saturate a hostile interval to the largest
+unsigned nanosecond count, and the clock underneath then reads that as a *signed* one and hands back
+a deadline in the past. So the clamp written to stop a long sleep becoming a short one produced the
+shortest sleep there is. Fixed alongside `select()`-as-sleep, which was the last guest sleep still
+resolving on Windows' ~15.6 ms scheduler tick.
+[#3038](https://github.com/mattias800/prosper/issues/3038)
+
+### On Windows, every `sinf` the guest ever called returned whatever was left lying in xmm0
+
+No picture — this one is Windows-only and invisible on the box we develop on. The import trampoline
+that converts a guest call to the host ABI moved integer registers and nothing else, so a float
+argument, everything behind it, and every float *return* were wrong: 78 functions, most of them the
+maths library. It now builds the conversion from each handler's own declaration, and a new test
+executes the real trampoline bytes across the ABI boundary on any machine.
+[#2955](https://github.com/mattias800/prosper/issues/2955)
+
 ### The "exotic" image instruction blocking a Stray draw was an ordinary one, spelled differently
 
 A three-dword `image_load_mip` had been rejecting a whole Stray fragment shader, and the extra dword

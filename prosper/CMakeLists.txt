@@ -888,6 +888,13 @@ if(TARGET prosper_core)
   add_executable(test_select_sleep tests/hle/kernel/test_select_sleep.cpp)
   target_link_libraries(test_select_sleep PRIVATE prosper_core)
   add_test(NAME select_sleep COMMAND test_select_sleep)
+  # This test drives real sleeps through the HLE, and its #3038 arms feed it timeouts a regression
+  # would take LITERALLY: carrying an out-of-range tv_nsec into the total makes 0x7fff... a
+  # 292-year wait, so the failure mode is a wedge rather than a red. Measured while mutation-testing
+  # this PR -- with the range rule removed, test_select_sleep does not return. A bound turns that
+  # into a legible timeout instead of ctest's 25-minute default. The whole run is ~0.5 s, so 60 s is
+  # a hundredfold headroom and cannot flake under load.
+  set_tests_properties(select_sleep PROPERTIES TIMEOUT 60)
 
   # Opt-in flip-paced monotonic clock (#240): exact frame steps, thread-safe first-flip anchor,
   # and no coupling into CLOCK_REALTIME while virtual time is paused between flips.
@@ -1853,6 +1860,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
   add_test(NAME guest_memory_map COMMAND test_guest_memory_map)
 
+  # #3142: the chunked guest-memory content scan. The straddling case is the one that earns the
+  # test -- a scanner that drops its overlap still returns a plausible hit list, so the blindness
+  # is invisible in a live run and turns a "not found" into a wrong answer.
+  add_executable(test_guest_memory_search tests/host/memory/test_guest_memory_search.cpp)
+  target_link_libraries(test_guest_memory_search PRIVATE prosper_core)
+  add_test(NAME guest_memory_search COMMAND test_guest_memory_search)
+
   add_executable(test_guest_read_cache_disabled tests/host/memory/test_guest_read_cache_disabled.cpp)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
   add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
@@ -2168,6 +2182,16 @@ if(TARGET prosper_core)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME hle_stack_args_guest_fs COMMAND test_hle_stack_args --guest-fs)
   endif()
+
+  # #2955: the guest(SysV) -> host(Microsoft x64) import bridge. CROSS-PLATFORM on purpose, and that
+  # is the point rather than an accident: the bridge's placement rules are a pure function of a
+  # handler's signature, so they can be asserted anywhere, and on any x86-64 host the emitted bytes
+  # can additionally be EXECUTED across the SysV/Microsoft boundary via __attribute__((ms_abi)).
+  # Gating this on WIN32 would leave the one defect it exists to catch visible only on the platform
+  # nobody develops on. Its non-x86-64 arm still checks the tables.
+  add_executable(test_sysv_ms_bridge tests/host/abi/test_sysv_ms_bridge.cpp)
+  target_link_libraries(test_sysv_ms_bridge PRIVATE prosper_core)
+  add_test(NAME sysv_ms_bridge COMMAND test_sysv_ms_bridge)
 
   # sceImeUpdate must invoke the guest key handler on the CALLER's guest %fs, not the host %fs the
   # import stub swapped in (#1286: Evergate SIGSEGV at eboot+0xaf8431 on a key press). Drives the real

@@ -6,6 +6,7 @@
 #include "self/module.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / PROSPER_ENV_VALUE
+#include "host/abi/call_signature.hpp" // #2955: the declared shape of a handler's arguments
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -25,7 +26,11 @@ namespace prosper {
 // Windows — that conflicts with SEH-based C++ exception unwinding in MinGW ("`.seh_handlerdata`
 // used outside of `.seh_proc` block"), and 537 STL-using handlers can't all drop exceptions.
 // Instead the guest↔host ABI conversion is done in the emitted import-stub trampoline
-// (exec_image_win.cpp emit_impl/emit_unimpl), so every handler stays a plain host function.
+// (exec_image_win.cpp emit_impl/emit_unimpl over host/abi/sysv_ms_bridge.cpp), so every handler
+// stays a plain host function. That trampoline places INTEGER arguments from a fixed shuffle and
+// FLOATING-POINT ones from the handler's declared signature — so a handler taking or returning a
+// float or a double must register through Hle::register_typed below, never through a `(HleFn)` cast,
+// which erases the very types the placement depends on (#2955).
 // PROSPER_SYSV_ABI is therefore empty on all platforms today; it is kept as the single documented
 // marker of the boundary in case a future toolchain makes the attribute viable.
 #define PROSPER_SYSV_ABI
@@ -60,6 +65,7 @@ struct RegisteredFn {
     std::string name;         // prosper's display name for it
     const void* fn = nullptr; // handler address; equal addresses = Sony entry points that collapse
     bool placeholder = false; // registered as a deliberately-overridable tracing thunk
+    abi::CallSignature signature{};  // #2955: declared only where a float/double is involved
 };
 
 // Registry of implemented functions, keyed by NID.
@@ -67,6 +73,24 @@ class Hle {
 public:
     static void  register_fn(const std::string& nid, HleFn fn, const char* name,
                              HleReturnHook return_hook = nullptr);
+    // Register a handler whose C++ declaration is preserved, so the Windows import bridge can place
+    // its arguments (#2955). Prefer this over the `(HleFn)` cast form for anything taking or
+    // returning a float or a double: the cast erases exactly the type information the bridge needs,
+    // and the guest's SysV frame then cannot be converted to Microsoft x64 correctly. For a purely
+    // integer/pointer handler the two forms are equivalent — the placements coincide, and the
+    // registry deliberately records no signature so the historical bridge bytes are emitted.
+    template <class R, class... A>
+    static void register_typed(const std::string& nid, R (*fn)(A...), const char* name,
+                               HleReturnHook return_hook = nullptr) {
+        register_fn_with_signature(nid, reinterpret_cast<HleFn>(fn), name,
+                                   abi::signature_of(fn), return_hook);
+    }
+    static void  register_fn_with_signature(const std::string& nid, HleFn fn, const char* name,
+                                            const abi::CallSignature& signature,
+                                            HleReturnHook return_hook = nullptr);
+    // The declared signature for a NID, or a default-constructed (undeclared) one. The Windows
+    // import stub consults this; every other platform's host ABI already matches the guest's.
+    static abi::CallSignature signature_of_nid(const std::string& nid);
     // Like register_fn, but marks the entry as a deliberately-overridable placeholder (a diagnostic/
     // tracing thunk that a real handler is expected to replace later). A subsequent register_fn that
     // overwrites a placeholder is NOT flagged as a shadow — that override is the intent.

@@ -19,6 +19,7 @@ namespace {
         std::string name;
         bool placeholder = false;
         HleReturnHook return_hook = nullptr;
+        abi::CallSignature signature{};   // #2955: only ever set for a float/double-bearing handler
     };
     std::unordered_map<std::string, Reg>& registry() {
         static std::unordered_map<std::string, Reg> r; return r;
@@ -104,7 +105,25 @@ void Hle::register_fn(const std::string& nid, HleFn fn, const char* name,
     // A re-registration with the SAME fn (harmless dedup) is not recorded.
     if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
         shadow_list().push_back({ nid, it->second.name, name ? name : "" });
-    reg[nid] = { fn, name ? name : "", false, return_hook };
+    reg[nid] = { fn, name ? name : "", false, return_hook, {} };
+}
+void Hle::register_fn_with_signature(const std::string& nid, HleFn fn, const char* name,
+                                     const abi::CallSignature& signature,
+                                     HleReturnHook return_hook) {
+    register_fn(nid, fn, name, return_hook);
+    // Record the signature only when the two conventions actually place it differently. An
+    // integer/pointer handler is placed identically by both, so leaving it undeclared keeps the
+    // Windows bridge on its historical bytes and makes typed registration a no-op for the ~700
+    // handlers that do not involve a float — the property that bounds this change (#2955).
+    // A later plain register_fn on the same NID replaces the whole entry and so drops the signature
+    // with the handler it described, which is the safe direction: an unknown handler falls back to
+    // the fixed integer bridge rather than being placed as though it were the one it displaced. Such
+    // an overwrite is already the #330 shadow class and is recorded above.
+    if (signature.needs_conversion()) registry()[nid].signature = signature;
+}
+abi::CallSignature Hle::signature_of_nid(const std::string& nid) {
+    auto it = registry().find(nid);
+    return it == registry().end() ? abi::CallSignature{} : it->second.signature;
 }
 void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* name) {
     // Same as register_fn but marks the entry overridable, so a later real handler replacing it is
@@ -114,14 +133,15 @@ void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* nam
     auto it = reg.find(nid);
     if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
         shadow_list().push_back({ nid, it->second.name, name ? name : "" });
-    reg[nid] = { fn, name ? name : "", true, nullptr };
+    reg[nid] = { fn, name ? name : "", true, nullptr, {} };
 }
 const std::vector<ShadowedReg>& Hle::shadowed_registrations() { return shadow_list(); }
 std::vector<RegisteredFn> Hle::registrations() {
     std::vector<RegisteredFn> out;
     out.reserve(registry().size());
     for (const auto& kv : registry())
-        out.push_back({ kv.first, kv.second.name, (const void*)kv.second.fn, kv.second.placeholder });
+        out.push_back({ kv.first, kv.second.name, (const void*)kv.second.fn, kv.second.placeholder,
+                        kv.second.signature });
     return out;
 }
 HleFn Hle::lookup(const std::string& nid) {

@@ -99,12 +99,10 @@ struct FontFace {
 //
 // Not a style preference -- a bound. Every quantity that reaches the rasterizer comes from the
 // guest: the pixel scale through `sceFontSetScalePixel`, the code point through the render call.
-// On Windows those float arguments are additionally NOT reliably delivered at all -- the import
-// trampoline remaps integer registers only, which is stated at
-// src/host/image/exec_image_win.cpp's emit_sysv_to_ms_prologue (dispatch.hpp says the conversion
-// happens in the trampoline, but not that it is integer-only; #2955) -- so
-// a face there can legitimately be carrying an unreviewed scale. A clamp turns every one of those
-// cases into a missing glyph instead of a multi-gigabyte allocation.
+// Nothing about the scale is checked before it reaches here, so a clamp turns a hostile or garbled
+// value into a missing glyph instead of a multi-gigabyte allocation. (Until #2955 the Windows import
+// trampoline could not deliver a float argument at all, which made an unreviewed scale routine
+// rather than exceptional there; that is fixed, and the bound stands on its own regardless.)
 constexpr float kMaxPixelScale = 4096.0f;
 constexpr int   kMaxGlyphDim   = 4096;
 
@@ -494,8 +492,7 @@ int32_t font_unbind_renderer(void* handle) {
 int32_t font_set_scale(void* handle, float width, float height) {
     // Clamped at both ends. The floor was always here; the ceiling and the NaN rejection are new,
     // because these two floats now size a real rasterization. See kMaxPixelScale for why a guest
-    // value reaching here cannot simply be trusted -- especially on Windows, where the import
-    // trampoline does not deliver float arguments at all.
+    // value reaching here cannot simply be trusted.
     auto sane = [](float v, float fallback) {
         if (!std::isfinite(v) || v < 1.0f) return fallback;
         return std::min(v, kMaxPixelScale);
@@ -696,27 +693,14 @@ int32_t render_glyph(void* handle, uint32_t code, RenderSurface* surface,
     return 0;
 }
 
-#if defined(_WIN32)
-// Windows: the import-stub trampoline converts the guest's SysV call to the MS ABI by remapping
-// INTEGER registers only (exec_image_win.cpp emit_sysv_to_ms_prologue) -- it never touches xmm.
-// That is #2955, a general defect of the trampoline rather than of this library; delete this #if
-// when it is fixed.
-// A declaration carrying `float x, float y` in their guest positions would therefore read the two
-// pointer arguments after them out of the wrong slots and write through whatever happened to be
-// in guest r9 and the guest stack. That is an arbitrary memory write, not a wrong glyph, so the
-// Windows arm takes the five integer arguments only -- which the trampoline DOES place correctly
-// -- and renders at the line-box origin.
-int32_t font_render_char_glyph_image(void* handle, uint32_t code, RenderSurface* surface,
-                                     GlyphMetrics* metrics, RenderResult* result) {
-    return render_glyph(handle, code, surface, 0.0f, 0.0f, /*have_pen=*/false, metrics, result);
-}
-#else
+// The pen position arrives in xmm0/xmm1 and the two out-pointers in rcx/r8, which on Windows means
+// the import stub has to know this declaration to place any of them -- see the register_typed calls
+// at the bottom of this file, and #2955 for what a signature-blind trampoline did to it.
 int32_t font_render_char_glyph_image(void* handle, uint32_t code, RenderSurface* surface,
                                      float x, float y, GlyphMetrics* metrics,
                                      RenderResult* result) {
     return render_glyph(handle, code, surface, x, y, /*have_pen=*/true, metrics, result);
 }
-#endif
 
 // sceFontRenderCharGlyphImageHorizontal (kAenWy1Zw5o). Astro Bot is the corpus's only importer,
 // and its call sites (eboot+0xed9b46, +0xed9ba5, +0xedcb3a, +0xedcb70 of the flattened eboot,
@@ -729,19 +713,11 @@ int32_t font_render_char_glyph_image(void* handle, uint32_t code, RenderSurface*
 // implementation is the same honest renderer. CONFIDENCE: HIGH on the signature (four call sites
 // in two independent functions); MED that Astro never exercises more than it (one glyph per
 // surface, like Metaphor; vertical-writing layouts are unobserved here).
-#if defined(_WIN32)
-int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code,
-                                                RenderSurface* surface, GlyphMetrics* metrics,
-                                                RenderResult* result) {
-    return render_glyph(handle, code, surface, 0.0f, 0.0f, /*have_pen=*/false, metrics, result);
-}
-#else
 int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code,
                                                 RenderSurface* surface, float x, float y,
                                                 GlyphMetrics* metrics, RenderResult* result) {
     return render_glyph(handle, code, surface, x, y, /*have_pen=*/true, metrics, result);
 }
-#endif
 
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
                               void* parser, void* object) {
@@ -824,6 +800,13 @@ uint64_t font_ok(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { r
 
 void register_font_hle() {
     auto R = [](const char* nid, HleFn fn, const char* name) { Hle::register_fn(nid, fn, name); };
+    // Every handler below that takes a float registers through Hle::register_typed instead of R,
+    // which preserves the C++ declaration so the Windows import stub can place the arguments
+    // (#2955). The `(HleFn)` cast R performs erases exactly that, and a float in the middle of a
+    // signature displaces every argument after it as well -- so a cast-registered float handler does
+    // not merely get a wrong scale, it reads its out-pointers from the wrong registers. Spelled out
+    // at each site rather than hidden behind a local wrapper: tools/re/hle_handler_map.py has to be
+    // able to see which NID each handler serves, and a templated lambda is a shape it cannot read.
     R("whrS4oksXc4", (HleFn)font_memory_init, "sceFontMemoryInit");
     R("oM+XCzVG3oM", (HleFn)font_select_library_ft, "sceFontSelectLibraryFt");
     R("Xx974EW-QFY", (HleFn)font_select_renderer_ft, "sceFontSelectRendererFt");
@@ -840,12 +823,12 @@ void register_font_hle() {
     R("vzHs3C8lWJk", (HleFn)font_close, "sceFontCloseFont");
     R("3OdRkSjOcog", (HleFn)font_bind_renderer, "sceFontBindRenderer");
     R("1QjhKxrsOB8", (HleFn)font_unbind_renderer, "sceFontUnbindRenderer");
-    R("N1EBMeGhf7E", (HleFn)font_set_scale, "sceFontSetScalePixel");
-    R("6vGCkkQJOcI", (HleFn)font_set_scale, "sceFontSetupRenderScalePixel");
-    R("TMtqoFQjjbA", (HleFn)font_set_slant, "sceFontSetEffectSlant");
-    R("lz9y9UFO2UU", (HleFn)font_set_slant, "sceFontSetupRenderEffectSlant");
-    R("v0phZwa4R5o", (HleFn)font_set_weight, "sceFontSetEffectWeight");
-    R("XIGorvLusDQ", (HleFn)font_set_weight, "sceFontSetupRenderEffectWeight");
+    Hle::register_typed("N1EBMeGhf7E", font_set_scale, "sceFontSetScalePixel");
+    Hle::register_typed("6vGCkkQJOcI", font_set_scale, "sceFontSetupRenderScalePixel");
+    Hle::register_typed("TMtqoFQjjbA", font_set_slant, "sceFontSetEffectSlant");
+    Hle::register_typed("lz9y9UFO2UU", font_set_slant, "sceFontSetupRenderEffectSlant");
+    Hle::register_typed("v0phZwa4R5o", font_set_weight, "sceFontSetEffectWeight");
+    Hle::register_typed("XIGorvLusDQ", font_set_weight, "sceFontSetupRenderEffectWeight");
     R("IQtleGLL5pQ", (HleFn)font_get_metrics, "sceFontGetRenderCharGlyphMetrics");
     R("imxVx8lm+KM", (HleFn)font_get_horizontal, "sceFontGetHorizontalLayout");
     R("3BrWWFU+4ts", (HleFn)font_get_vertical, "sceFontGetVerticalLayout");
@@ -854,9 +837,9 @@ void register_font_hle() {
     R("gdUCnU0gHdI", (HleFn)font_surface_init, "sceFontRenderSurfaceInit");
     R("vRxf4d0ulPs", (HleFn)font_surface_set_scissor, "sceFontRenderSurfaceSetScissor");
     R("L97d+3OgMlE", (HleFn)font_get_metrics, "sceFontGetCharGlyphMetrics");
-    R("3G4zhgKuxE8", (HleFn)font_render_char_glyph_image, "sceFontRenderCharGlyphImage");
-    R("kAenWy1Zw5o", (HleFn)font_render_char_glyph_image_horizontal,
-      "sceFontRenderCharGlyphImageHorizontal");
+    Hle::register_typed("3G4zhgKuxE8", font_render_char_glyph_image, "sceFontRenderCharGlyphImage");
+    Hle::register_typed("kAenWy1Zw5o", font_render_char_glyph_image_horizontal,
+                        "sceFontRenderCharGlyphImageHorizontal");
     // Intentional no-op lifecycle/capability surface used during Astro's initialization.
     R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
     R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");

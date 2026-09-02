@@ -509,6 +509,8 @@ static double m_expm1(double x){return expm1(x);} static float m_expm1f(float x)
 // strtod/strtof return a double/float in XMM0 (which the return-0 stub never set -> garbage float for
 // every text-parsed number). Native-signature thunks land the result in the right register; endptr is a
 // guest pointer, passed through. (Also fixes float.Parse / Atof / JSON numeric fields across all titles.)
+// Both ABIs return in xmm0, but the Windows bridge runs a host call after the handler returns, so it
+// has to know the return is floating-point in order to preserve it -- hence RT below (#2955).
 static double m_strtod(const char* s, char** e){ return strtod(s, e); }
 static float  m_strtof(const char* s, char** e){ return strtof(s, e); }
 
@@ -819,6 +821,11 @@ HLE(h_heap_get_trace_info) {
 
 void register_builtin_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // RT preserves the handler's C++ declaration instead of casting it away, which is what lets the
+    // Windows import stub place a floating-point argument or return (#2955). Use it for anything
+    // whose signature mentions float or double; R is correct for everything else, and for an
+    // integer-only signature the two are equivalent by construction.
+    #define RT(str, fn) Hle::register_typed(nid_hash(str), fn, str)
     // libSceLibcInternalExt heap-trace hookup (raw NID — guaranteed match; see handler comment).
     Hle::register_fn("NWtTN10cJzE", (HleFn)h_heap_get_trace_info, "sceLibcHeapGetTraceInfo");
     R("memcpy", h_memcpy);   R("memmove", h_memmove); R("memset", h_memset);
@@ -873,7 +880,7 @@ void register_builtin_hle() {
     // conversion / tokenize / wide / scan (were MISSING -> 0/garbage on parsing paths; confirmed imports)
     R("strtol", h_strtol);   R("strtoll", h_strtoll);
     R("strtoul", h_strtoul); R("strtoull", h_strtoull);
-    R("strtod", m_strtod);   R("strtof", m_strtof);
+    RT("strtod", m_strtod);   RT("strtof", m_strtof);
     R("atoi", h_atoi);       R("atol", h_atol);
     R("rand", h_rand);       R("srand", h_srand);       R("rand_r", h_rand_r);   // were MISSING -> rand()==0
     R("strdup", h_strdup);   R("strtok", h_strtok);
@@ -882,24 +889,26 @@ void register_builtin_hle() {
     R("sscanf", h_sscanf);   R("vsscanf", h_vsscanf);
     R("_init_env", h_init_env);   R("malloc_stats_fast", h_malloc_stats_fast);
     R("__error", h_errno_location);  R("__errno_location", h_errno_location);  R("___errno", h_errno_location);
-    // math (real host thunks; float args in XMM survive the tail-jump stub)
-    R("sinf", m_sinf); R("cosf", m_cosf); R("tanf", m_tanf); R("asinf", m_asinf); R("acosf", m_acosf);
-    R("atanf", m_atanf); R("atan2f", m_atan2f); R("expf", m_expf); R("exp2f", m_exp2f); R("logf", m_logf);
-    R("log10f", m_log10f); R("log2f", m_log2f); R("sqrtf", m_sqrtf); R("cbrtf", m_cbrtf); R("powf", m_powf);
-    R("floorf", m_floorf); R("ceilf", m_ceilf); R("roundf", m_roundf); R("truncf", m_truncf);
-    R("fmodf", m_fmodf); R("fabsf", m_fabsf); R("hypotf", m_hypotf);
-    R("sin", m_sin); R("cos", m_cos); R("tan", m_tan); R("asin", m_asin); R("acos", m_acos);
-    R("atan", m_atan); R("atan2", m_atan2); R("exp", m_exp); R("exp2", m_exp2); R("log", m_log);
-    R("log10", m_log10); R("log2", m_log2); R("sqrt", m_sqrt); R("cbrt", m_cbrt); R("pow", m_pow);
-    R("floor", m_floor); R("ceil", m_ceil); R("round", m_round); R("trunc", m_trunc);
-    R("fmod", m_fmod); R("fabs", m_fabs); R("hypot", m_hypot);
-    R("sincosf", m_sincosf); R("sincos", m_sincos);
-    R("ldexp", m_ldexp); R("ldexpf", m_ldexpf); R("frexp", m_frexp); R("frexpf", m_frexpf);
-    R("modf", m_modf); R("modff", m_modff); R("copysign", m_copysign); R("copysignf", m_copysignf);
-    R("fmin", m_fmin); R("fminf", m_fminf); R("fmax", m_fmax); R("fmaxf", m_fmaxf);
-    R("sinh", m_sinh); R("sinhf", m_sinhf); R("cosh", m_cosh); R("coshf", m_coshf);
-    R("tanh", m_tanh); R("tanhf", m_tanhf); R("log1p", m_log1p); R("log1pf", m_log1pf);
-    R("expm1", m_expm1); R("expm1f", m_expm1f);
+    // math (real host thunks). On Linux the tail-jump stub leaves the guest's XMM arguments in
+    // place; on Windows the import bridge re-places them from the declaration RT preserves (#2955).
+    RT("sinf", m_sinf); RT("cosf", m_cosf); RT("tanf", m_tanf); RT("asinf", m_asinf); RT("acosf", m_acosf);
+    RT("atanf", m_atanf); RT("atan2f", m_atan2f); RT("expf", m_expf); RT("exp2f", m_exp2f); RT("logf", m_logf);
+    RT("log10f", m_log10f); RT("log2f", m_log2f); RT("sqrtf", m_sqrtf); RT("cbrtf", m_cbrtf); RT("powf", m_powf);
+    RT("floorf", m_floorf); RT("ceilf", m_ceilf); RT("roundf", m_roundf); RT("truncf", m_truncf);
+    RT("fmodf", m_fmodf); RT("fabsf", m_fabsf); RT("hypotf", m_hypotf);
+    RT("sin", m_sin); RT("cos", m_cos); RT("tan", m_tan); RT("asin", m_asin); RT("acos", m_acos);
+    RT("atan", m_atan); RT("atan2", m_atan2); RT("exp", m_exp); RT("exp2", m_exp2); RT("log", m_log);
+    RT("log10", m_log10); RT("log2", m_log2); RT("sqrt", m_sqrt); RT("cbrt", m_cbrt); RT("pow", m_pow);
+    RT("floor", m_floor); RT("ceil", m_ceil); RT("round", m_round); RT("trunc", m_trunc);
+    RT("fmod", m_fmod); RT("fabs", m_fabs); RT("hypot", m_hypot);
+    RT("sincosf", m_sincosf); RT("sincos", m_sincos);
+    RT("ldexp", m_ldexp); RT("ldexpf", m_ldexpf); RT("frexp", m_frexp); RT("frexpf", m_frexpf);
+    RT("modf", m_modf); RT("modff", m_modff); RT("copysign", m_copysign); RT("copysignf", m_copysignf);
+    RT("fmin", m_fmin); RT("fminf", m_fminf); RT("fmax", m_fmax); RT("fmaxf", m_fmaxf);
+    RT("sinh", m_sinh); RT("sinhf", m_sinhf); RT("cosh", m_cosh); RT("coshf", m_coshf);
+    RT("tanh", m_tanh); RT("tanhf", m_tanhf); RT("log1p", m_log1p); RT("log1pf", m_log1pf);
+    RT("expm1", m_expm1); RT("expm1f", m_expm1f);
+    #undef RT
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
