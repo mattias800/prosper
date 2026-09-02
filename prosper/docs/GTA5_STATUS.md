@@ -1,7 +1,7 @@
 # Grand Theft Auto V (`PPSA04263`, RAGE) — status
 
 **Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws, **and since the
-rendering series (`97ecc58a`, #2996) the 3D world renders** — the prologue bank heist in full
+rendering series (`e63f4038`, #2996) the 3D world renders** — the prologue bank heist in full
 colour, on a default launch with the game's own **Performance** graphics mode selected. Route:
 `scripts/gta5/reach-performance-story.pad`; screenshots in `BLOG.md` (2026-08-26).
 
@@ -251,7 +251,7 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 | dead hypothesis | evidence that killed it | ref |
 | --- | --- | --- |
-| Removing the byte-preserving HTILE suppression is safe for GTA V, because peak colour coverage is 99.78% in both arms (#3093's own clearing check) | **False, and the check is the reason it passed.** `aced0703` cost GTA its deferred lighting for a day: the world still covered the frame, drawn with no illumination and a grid artifact from depth-dependent sampling. Peak coverage cannot see a wrongly-lit but fully-covered frame. Bisected from a user report over 52 commits, 4 builds, with 30-frame contact sheets reviewed by eye at each step. | #3121 |
+| Removing the byte-preserving HTILE suppression is safe for GTA V, because peak colour coverage is 99.78% in both arms (#3093's own clearing check) | **False, and the check is the reason it passed.** `3f5460d0` cost GTA its deferred lighting for a day: the world still covered the frame, drawn with no illumination and a grid artifact from depth-dependent sampling. Peak coverage cannot see a wrongly-lit but fully-covered frame. Bisected from a user report over 52 commits, 4 builds, with 30-frame contact sheets reviewed by eye at each step. | #3121 |
 | A *uniform* HTILE plane means a fast clear, so uniformity can discriminate a clear from a HiZ refresh where byte equality cannot | **Measured false BEFORE it was implemented.** `PROSPER_HTILE_UNIFORMLOG` over both titles: GTA **6,500/6,500 writes uniform, zero transitions, first word 0x00000000**; Blue Prince **62,000/62,000 uniform, zero transitions, first word 0x00000000**. The two titles are indistinguishable at this site on every available signal, differing only in plane size (73,728 vs 49,152 words = resolution). A discriminator built on uniformity would have been built on a difference that does not exist. | #3121 |
 | Restoring the suppression re-breaks Blue Prince, so the two titles are in tension | **False.** One binary, one environment variable, measured the same day: Blue Prince reaches `max_nonblack` **0.2085 in BOTH arms** — the same "~21%" #3093 called its restored healthy value — while GTA is broken in one and correct in the other. There is no trade. | #3121 |
 
@@ -4777,7 +4777,7 @@ binding 256 MB constant buffers whose spans happen to *contain* the watched addr
 documented "match the whole span, not the base" behaviour doing its job, but it means this instrument
 needs its output filtered by `class=` and by an exact `addr=` match before the signal is visible.
 
-**This row existed only because of the fix in `acaea037`.** Before it, `report_compute_binding_watch`
+**This row existed only because of the fix in `668a65af`.** Before it, `report_compute_binding_watch`
 returned from the `item.spirv.empty()` branch without reporting, so a recompile-failed dispatch
 produced no row at all — and this census would have shown the executed *consumer* and nothing else,
 i.e. exactly the false "no compute producer writes this surface" conclusion. The reviewer's finding
@@ -4941,9 +4941,9 @@ falsification.
   this same document** -- "should a write that provably preserves guest bytes invalidate a detached
   Vulkan depth image? ... **yes, it must** ... and *Dead Cells* #611 is the counterexample where
   sparing it makes gameplay geometry disappear. That is why no preservation policy is proposed
-  here." `97ecc58a` shipped that preservation policy anyway, and it cost *Blue Prince* its entire
-  picture. `97ecc58a` ("gpu: GTA V world rendering series", the squash of #2996; branch commit
-  `1b5b9471`, not on master) stopped invalidating retained depth when a guest HTILE write
+  here." `e63f4038` shipped that preservation policy anyway, and it cost *Blue Prince* its entire
+  picture. `e63f4038` ("gpu: GTA V world rendering series", the squash of #2996; branch commit
+  `ee0d57c4`, not on master) stopped invalidating retained depth when a guest HTILE write
   compared byte-identical, to keep the depth this title's deferred lighting samples. That rule is
   **unsound in principle**: prosper never writes rendered HiZ back into the guest HTILE plane, so
   the guest copy is a constant the guest's own writes keep reproducing, and the comparator reports

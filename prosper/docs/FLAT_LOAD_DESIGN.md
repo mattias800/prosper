@@ -179,9 +179,9 @@ an unreviewed contract.
 
 ## Stage 5 groundwork — the five backend sites an indexed descriptor array touches (#2412)
 
-Surveyed 2026-08-10 against `08d42aea`, independently of stage 4b: this half needs only stage 2's
-representation (`table_index_count`, merged as 48d978ab) and stage 1's enabled features (merged as
-056edd10), not the SPIR-V emitter. Every line number below was read, not recalled.
+Surveyed 2026-08-10 against `4d39313b`, independently of stage 4b: this half needs only stage 2's
+representation (`table_index_count`, merged as b9367b10) and stage 1's enabled features (merged as
+13c81f15), not the SPIR-V emitter. Every line number below was read, not recalled.
 
 **1. The descriptor POOL is sized one entry per resource, and this is the site that fails furthest from
 its cause.** `tests/fixtures/render_runner.h` counts demand with `++storage_buffers` / `++storage_images` /

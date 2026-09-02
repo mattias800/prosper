@@ -322,14 +322,14 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
             subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True)
 
         # `--no-fetch --base master` unless an arm asks for a real remote, in which case it runs the
-        # DEFAULT path: fetch, then read origin/master. Every other arm skips the fetch, which is
+        # DEFAULT path: fetch, then read origin/main. Every other arm skips the fetch, which is
         # how the fetch went unexercised (#2624).
         base_args = ["--no-fetch", "--base", "master"]
         if origin_missing:
-            base_args = ["--base", "origin/master"]
+            base_args = ["--base", "origin/main"]
             git(repo, "remote", "add", "origin", str(root / "no-such-upstream"))
         elif origin_rows is not None:
-            base_args = ["--base", "origin/master"]
+            base_args = ["--base", "origin/main"]
             upstream = root / "upstream"
             init = subprocess.run(["git", "init", "--bare", "-q", str(upstream)],
                                   capture_output=True, text=True)
@@ -345,7 +345,7 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
             # this is exactly the state of a checkout that has not fetched since that push, and it is
             # what makes the arm discriminate. Without a fetch the tool reads `seeded` and answers
             # from rows that are two commits stale.
-            git(repo, "update-ref", "refs/remotes/origin/master", seeded)
+            git(repo, "update-ref", "refs/remotes/origin/main", seeded)
 
         if no_gh:
             # PATH with NO gh at all -- not even the stub. `git` still has to resolve, so keep the
@@ -508,7 +508,7 @@ run_main("the default path fetches, so the base is the pushed one and not a stal
 # ...and the failure direction of the same promise: a fetch that CANNOT run must stop the tool. If
 # it were swallowed, the answer would come from whatever the last fetch left behind and would look
 # exactly like a successful run. Asserting the message names `git fetch` is what discriminates: the
-# subsequent `git show origin/master:...` would fail too, so rc=1 alone proves nothing.
+# subsequent `git show origin/main:...` would fail too, so rc=1 alone proves nothing.
 run_main("a fetch that fails is a hard error naming that call, not a fall back to the stale ref",
          want_rc=1, expect="git fetch", absent="next free number", origin_missing=True)
 

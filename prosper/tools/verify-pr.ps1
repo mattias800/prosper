@@ -4,7 +4,7 @@ param(
     [ValidateSet('docs', 'core', 'renderer')]
     [string] $Profile,
 
-    [string] $Base = 'origin/master',
+    [string] $Base = 'origin/main',
     [string] $LinuxBuild = 'prosper/build-linux',
     [string] $WindowsBuild = 'prosper/build-windows',
     [string[]] $Snapshot = @(),

@@ -76,7 +76,7 @@ def admin_of(repo: Path, name: str) -> Path:
 
 
 def build_repo(root: Path) -> Path:
-    """A repo whose `origin/master` ref exists without needing a real remote."""
+    """A repo whose `origin/main` ref exists without needing a real remote."""
     repo = root / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "master")
@@ -86,7 +86,7 @@ def build_repo(root: Path) -> Path:
     git(repo, "add", "file.txt")
     git(repo, "commit", "-qm", "base")
     head = git(repo, "rev-parse", "HEAD").strip()
-    git(repo, "update-ref", "refs/remotes/origin/master", head)
+    git(repo, "update-ref", "refs/remotes/origin/main", head)
     return repo
 
 
@@ -95,12 +95,12 @@ def add_wt(repo: Path, name: str, branch: str | None = None) -> Path:
     args = ["worktree", "add", "-q"]
     if branch:
         args += ["-b", branch]
-    git(repo, *args, str(path), "origin/master")
+    git(repo, *args, str(path), "origin/main")
     return path
 
 
 def survey(repo: Path, **kw):
-    opts = dict(base="origin/master", min_idle_hours=12.0, jobs=2, use_github=False,
+    opts = dict(base="origin/main", min_idle_hours=12.0, jobs=2, use_github=False,
                 gh_limit=0, scan_fds=False, scan_maps=False, with_size=False)
     opts.update(kw)
     trees, meta = W.survey(repo=str(repo), **opts)
@@ -367,7 +367,7 @@ def test_nested_worktree_is_refused() -> None:
         repo = build_repo(root)
         outer = add_wt(repo, "outer", "feat/outer")
         inner = outer / "inner"
-        git(repo, "worktree", "add", "-q", "-b", "feat/inner", str(inner), "origin/master")
+        git(repo, "worktree", "add", "-q", "-b", "feat/inner", str(inner), "origin/main")
         age(outer, admin_of(repo, "outer"))
         age(inner, admin_of(repo, "inner"))
 
@@ -386,7 +386,7 @@ def test_holder_attributed_to_most_specific_tree() -> None:
         repo = build_repo(root)
         outer = add_wt(repo, "outer", "feat/outer")
         inner = outer / "inner"
-        git(repo, "worktree", "add", "-q", "-b", "feat/inner", str(inner), "origin/master")
+        git(repo, "worktree", "add", "-q", "-b", "feat/inner", str(inner), "origin/main")
 
         holder = spawn_holder(inner)
         try:
@@ -529,7 +529,7 @@ def test_removal_rechecks_state_rather_than_trusting_the_census() -> None:
         holder = spawn_holder(wt)  # an agent cd's in after the scan
         try:
             time.sleep(0.4)
-            removed = W.recheck_and_remove(str(repo), trees["racy"], "origin/master", 12.0,
+            removed = W.recheck_and_remove(str(repo), trees["racy"], "origin/main", 12.0,
                                            False, False, False, 0, False)
             check("recheck refuses", removed, False)
             check("tree still on disk", wt.is_dir(), True)

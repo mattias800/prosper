@@ -23,7 +23,7 @@ Guards -- ALL must pass before a tree is even a candidate:
   main        the primary worktree is never touched
   exists      a vanished directory is a `git worktree prune` job, not a `remove` job
   locked      `git worktree lock` is an explicit human "leave this alone"
-  unmerged    the tree's work must be provably in origin/master (see "Merge evidence")
+  unmerged    the tree's work must be provably in origin/main (see "Merge evidence")
   dirty       `git status --porcelain --untracked-files=all` must be empty, untracked included
   in-use      no process may have cwd / exe / an open fd / a mapping inside the tree
   recent      the tree must have been idle for --min-idle-hours (default 12)
@@ -31,7 +31,7 @@ Guards -- ALL must pass before a tree is even a candidate:
 
 Merge evidence -- two independent primary sources, never a heuristic:
 
-  ancestor    `git merge-base --is-ancestor <head> origin/master`. Exact, but blind to squash
+  ancestor    `git merge-base --is-ancestor <head> origin/main`. Exact, but blind to squash
               merges, which is how this repository merges every PR (checked: the last 20 commits
               on master each have one parent). After a squash the branch tip is NOT an ancestor,
               so this test alone under-reports badly -- it mostly catches branches that never
@@ -870,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--repo", default=None, help="repository root (default: containing this file)")
-    ap.add_argument("--base", default="origin/master", help="branch work must have landed in")
+    ap.add_argument("--base", default="origin/main", help="branch work must have landed in")
     ap.add_argument("--min-idle-hours", type=float, default=DEFAULT_MIN_IDLE_HOURS)
     ap.add_argument("--jobs", type=int, default=4, help="parallel git probes (default 4)")
     ap.add_argument("--no-github", action="store_true", help="skip the merged-PR cross-check")

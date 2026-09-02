@@ -21,7 +21,7 @@ names the conflicted paths, so a textual conflict is distinguished from a clean 
 nevertheless invalid -- which is the case the gate exists for, since two rows claiming one number on
 lines a few apart merge CLEANLY (#1701, #2211).
 
-`--base` DEFAULTS TO `origin/master`, WHICH IS WRONG FOR A STACKED PR. The honest pre-merge check is
+`--base` DEFAULTS TO `origin/main`, WHICH IS WRONG FOR A STACKED PR. The honest pre-merge check is
 against the branch this one will actually merge into, so pass `--base <that branch>` when your PR is
 stacked. A green run against the wrong base is not a weaker signal -- it is a confident statement
 about a merge that will never happen.
@@ -108,7 +108,7 @@ def _make_own_output_utf8() -> None:
 def main() -> int:
     _make_own_output_utf8()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--base", default="origin/master", help="branch to merge into (default origin/master)")
+    ap.add_argument("--base", default="origin/main", help="branch to merge into (default origin/main)")
     ap.add_argument("--head", default="HEAD", help="what to merge (default HEAD)")
     ap.add_argument("--file", default=DEFAULT_FILE, help=f"file to check (default {DEFAULT_FILE})")
     ap.add_argument("--table-header", default=DEFAULT_HEADER,

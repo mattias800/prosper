@@ -873,7 +873,7 @@ we just stopped counting a black screen as a win.
 
 feat(dq7): the route reaches the opening chapter in Estard, and Unreal titles get an IoStore package oracle (#2779)
 
-`0ea7868c` · [`assets/screenshots/dragon-quest-vii-opening-chapter.webp`](assets/screenshots/dragon-quest-vii-opening-chapter.webp)
+`b166e6de` · [`assets/screenshots/dragon-quest-vii-opening-chapter.webp`](assets/screenshots/dragon-quest-vii-opening-chapter.webp)
 
 ### bendy-dark-revival-gameplay.png
 
@@ -881,7 +881,7 @@ feat(dq7): the route reaches the opening chapter in Estard, and Unreal titles ge
 
 feat(bendy-dark-revival): rung 2 -> rung 3 — a route reaches the PPSA27624 Chapter 1 sections (#2769)
 
-`5501dd45` · [`assets/screenshots/bendy-dark-revival-gameplay.webp`](assets/screenshots/bendy-dark-revival-gameplay.webp)
+`642fe84b` · [`assets/screenshots/bendy-dark-revival-gameplay.webp`](assets/screenshots/bendy-dark-revival-gameplay.webp)
 
 ### tales-graces-f-gameplay-dialogue.png
 
@@ -889,7 +889,7 @@ feat(bendy-dark-revival): rung 2 -> rung 3 — a route reaches the PPSA27624 Cha
 
 feat(route): Tales of Graces f Remastered reaches gameplay -- the wall was two OPTIONS-button gates, not the renderer (#2763)
 
-`f249929d` · [`assets/screenshots/tales-graces-f-gameplay-dialogue.webp`](assets/screenshots/tales-graces-f-gameplay-dialogue.webp)
+`dd010553` · [`assets/screenshots/tales-graces-f-gameplay-dialogue.webp`](assets/screenshots/tales-graces-f-gameplay-dialogue.webp)
 
 ### tales-graces-f-gameplay.png
 
@@ -897,7 +897,7 @@ feat(route): Tales of Graces f Remastered reaches gameplay -- the wall was two O
 
 feat(route): Tales of Graces f Remastered reaches gameplay -- the wall was two OPTIONS-button gates, not the renderer (#2763)
 
-`f249929d` · [`assets/screenshots/tales-graces-f-gameplay.webp`](assets/screenshots/tales-graces-f-gameplay.webp)
+`dd010553` · [`assets/screenshots/tales-graces-f-gameplay.webp`](assets/screenshots/tales-graces-f-gameplay.webp)
 
 ### sonic-origins-sonic-team-logo.png
 
@@ -905,7 +905,7 @@ feat(route): Tales of Graces f Remastered reaches gameplay -- the wall was two O
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`assets/screenshots/sonic-origins-sonic-team-logo.webp`](assets/screenshots/sonic-origins-sonic-team-logo.webp)
+`8c233eb6` · [`assets/screenshots/sonic-origins-sonic-team-logo.webp`](assets/screenshots/sonic-origins-sonic-team-logo.webp)
 
 ### tales-graces-f-title-no-input.png
 
@@ -913,7 +913,7 @@ docs(compat): refresh the checked-in visual evidence, and repair two trackers th
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`assets/screenshots/tales-graces-f-title-no-input.webp`](assets/screenshots/tales-graces-f-title-no-input.webp)
+`8c233eb6` · [`assets/screenshots/tales-graces-f-title-no-input.webp`](assets/screenshots/tales-graces-f-title-no-input.webp)
 
 ### issue-2731-tales-graces-f-movie-chroma.png
 
@@ -921,7 +921,7 @@ docs(compat): refresh the checked-in visual evidence, and repair two trackers th
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp`](prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp)
+`8c233eb6` · [`prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp`](prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp)
 
 ### issue-2734-little-nightmares-3-corrupt-save-modal.png
 
@@ -929,7 +929,7 @@ docs(compat): refresh the checked-in visual evidence, and repair two trackers th
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp`](prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp)
+`8c233eb6` · [`prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp`](prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp)
 
 ### asterix-babylon-gameplay.png
 
@@ -937,7 +937,7 @@ docs(compat): refresh the checked-in visual evidence, and repair two trackers th
 
 bringup(asterix-babylon): a Triangle-aware input route reaches GAMEPLAY (rung 2 -> 3) (#2736)
 
-`5404e173` · [`assets/screenshots/asterix-babylon-gameplay.webp`](assets/screenshots/asterix-babylon-gameplay.webp)
+`65ebd16c` · [`assets/screenshots/asterix-babylon-gameplay.webp`](assets/screenshots/asterix-babylon-gameplay.webp)
 
 ## 2026-08-19
 
@@ -947,7 +947,7 @@ bringup(asterix-babylon): a Triangle-aware input route reaches GAMEPLAY (rung 2 
 
 docs(plucky): status doc — the chapter-one world renders, plus five falsified hypotheses (#2742)
 
-`675ff2f6` · [`assets/screenshots/plucky-squire-chapter1-intro.webp`](assets/screenshots/plucky-squire-chapter1-intro.webp)
+`b21bf552` · [`assets/screenshots/plucky-squire-chapter1-intro.webp`](assets/screenshots/plucky-squire-chapter1-intro.webp)
 
 ## 2026-08-08
 
@@ -957,7 +957,7 @@ docs(plucky): status doc — the chapter-one world renders, plus five falsified 
 
 docs(crossworlds): rung 2 — the title screen renders completely, reproduced across two runs (#2360)
 
-`a3a88356` · [`assets/screenshots/sonic-crossworlds-title.webp`](assets/screenshots/sonic-crossworlds-title.webp)
+`5166cdb4` · [`assets/screenshots/sonic-crossworlds-title.webp`](assets/screenshots/sonic-crossworlds-title.webp)
 
 ## 2026-08-07
 
@@ -967,7 +967,7 @@ docs(crossworlds): rung 2 — the title screen renders completely, reproduced ac
 
 ArcRunner: the per-fold account — the guest's builder is released mid-fold, and the contract that forbids it is version-gated off (#2219)
 
-`a22cf8de` · [`assets/screenshots/arcrunner-title-screen-default-route.webp`](assets/screenshots/arcrunner-title-screen-default-route.webp)
+`c42b89c3` · [`assets/screenshots/arcrunner-title-screen-default-route.webp`](assets/screenshots/arcrunner-title-screen-default-route.webp)
 
 ## 2026-08-06
 
@@ -977,7 +977,7 @@ ArcRunner: the per-fold account — the guest's builder is released mid-fold, an
 
 fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK — Sonic Frontiers reaches its title screen (#2208)
 
-`7801a5bc` · [`assets/screenshots/sonic-frontiers-autosave-notice.webp`](assets/screenshots/sonic-frontiers-autosave-notice.webp)
+`0be16d5f` · [`assets/screenshots/sonic-frontiers-autosave-notice.webp`](assets/screenshots/sonic-frontiers-autosave-notice.webp)
 
 ### sonic-frontiers-main-menu.png
 
@@ -985,7 +985,7 @@ fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK 
 
 fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK — Sonic Frontiers reaches its title screen (#2208)
 
-`7801a5bc` · [`assets/screenshots/sonic-frontiers-main-menu.webp`](assets/screenshots/sonic-frontiers-main-menu.webp)
+`0be16d5f` · [`assets/screenshots/sonic-frontiers-main-menu.webp`](assets/screenshots/sonic-frontiers-main-menu.webp)
 
 ### sonic-frontiers-title-screen.png
 
@@ -993,7 +993,7 @@ fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK 
 
 fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK — Sonic Frontiers reaches its title screen (#2208)
 
-`7801a5bc` · [`assets/screenshots/sonic-frontiers-title-screen.webp`](assets/screenshots/sonic-frontiers-title-screen.webp)
+`0be16d5f` · [`assets/screenshots/sonic-frontiers-title-screen.webp`](assets/screenshots/sonic-frontiers-title-screen.webp)
 
 ### arcrunner-title-screen.png
 
@@ -1001,7 +1001,7 @@ fix(hle): sceSaveDataTransferringMountPs4 must report "no PS4 save", not SCE_OK 
 
 docs(arcrunner): the title screen is behind the movie, and the throttle rescues by DELAY not by lock hold (#2205)
 
-`40129122` · [`assets/screenshots/arcrunner-title-screen.webp`](assets/screenshots/arcrunner-title-screen.webp)
+`15e22519` · [`assets/screenshots/arcrunner-title-screen.webp`](assets/screenshots/arcrunner-title-screen.webp)
 
 ### sonic-origins-sega-logo.png
 
@@ -1009,7 +1009,7 @@ docs(arcrunner): the title screen is behind the movie, and the throttle rescues 
 
 fix(savedata): sceSaveDataCreateTransactionResource must return a positive resource id (#2121)
 
-`e404841c` · [`assets/screenshots/sonic-origins-sega-logo.webp`](assets/screenshots/sonic-origins-sega-logo.webp)
+`726aa8da` · [`assets/screenshots/sonic-origins-sega-logo.webp`](assets/screenshots/sonic-origins-sega-logo.webp)
 
 ### arcrunner-default-route-logos.png
 
@@ -1017,7 +1017,7 @@ fix(savedata): sceSaveDataCreateTransactionResource must return a positive resou
 
 ArcRunner: the init-side generation census — the #1756 question answered, four falsifications, and real graphics off the throttle (#1226) (#2122)
 
-`8c8e74f5` · [`assets/screenshots/arcrunner-default-route-logos.webp`](assets/screenshots/arcrunner-default-route-logos.webp)
+`bc063d75` · [`assets/screenshots/arcrunner-default-route-logos.webp`](assets/screenshots/arcrunner-default-route-logos.webp)
 
 ### arcrunner-intro-city.png
 
@@ -1025,7 +1025,7 @@ ArcRunner: the init-side generation census — the #1756 question answered, four
 
 ArcRunner renders its intro cinematic — the #1226 fault is a submit-timing race (follow-up to #2077) (#2086)
 
-`0a6f82a8` · [`assets/screenshots/arcrunner-intro-city.webp`](assets/screenshots/arcrunner-intro-city.webp)
+`3b47dedf` · [`assets/screenshots/arcrunner-intro-city.webp`](assets/screenshots/arcrunner-intro-city.webp)
 
 ### arcrunner-intro-space-station.png
 
@@ -1033,7 +1033,7 @@ ArcRunner renders its intro cinematic — the #1226 fault is a submit-timing rac
 
 ArcRunner renders its intro cinematic — the #1226 fault is a submit-timing race (follow-up to #2077) (#2086)
 
-`0a6f82a8` · [`assets/screenshots/arcrunner-intro-space-station.webp`](assets/screenshots/arcrunner-intro-space-station.webp)
+`3b47dedf` · [`assets/screenshots/arcrunner-intro-space-station.webp`](assets/screenshots/arcrunner-intro-space-station.webp)
 
 ### rtype-delta-force-select.png
 
@@ -1041,7 +1041,7 @@ ArcRunner renders its intro cinematic — the #1226 fault is a submit-timing rac
 
 fix(gpu): a saved-EXEC wave mask must survive the NGG fetch-index fold — R-Type Delta reaches its title screen (#2061)
 
-`83e3383a` · [`assets/screenshots/rtype-delta-force-select.webp`](assets/screenshots/rtype-delta-force-select.webp)
+`7cc74ef5` · [`assets/screenshots/rtype-delta-force-select.webp`](assets/screenshots/rtype-delta-force-select.webp)
 
 ### rtype-delta-title.png
 
@@ -1049,7 +1049,7 @@ fix(gpu): a saved-EXEC wave mask must survive the NGG fetch-index fold — R-Typ
 
 fix(gpu): a saved-EXEC wave mask must survive the NGG fetch-index fold — R-Type Delta reaches its title screen (#2061)
 
-`83e3383a` · [`assets/screenshots/rtype-delta-title.webp`](assets/screenshots/rtype-delta-title.webp)
+`7cc74ef5` · [`assets/screenshots/rtype-delta-title.webp`](assets/screenshots/rtype-delta-title.webp)
 
 ### crisis-core-main-menu.png
 
@@ -1057,7 +1057,7 @@ fix(gpu): a saved-EXEC wave mask must survive the NGG fetch-index fold — R-Typ
 
 Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the guest wins, not a late write (#2060)
 
-`e311e6cd` · [`assets/screenshots/crisis-core-main-menu.webp`](assets/screenshots/crisis-core-main-menu.webp)
+`6ff91efa` · [`assets/screenshots/crisis-core-main-menu.webp`](assets/screenshots/crisis-core-main-menu.webp)
 
 ### crisis-core-title.png
 
@@ -1065,7 +1065,7 @@ Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the gue
 
 Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the guest wins, not a late write (#2060)
 
-`e311e6cd` · [`assets/screenshots/crisis-core-title.webp`](assets/screenshots/crisis-core-title.webp)
+`6ff91efa` · [`assets/screenshots/crisis-core-title.webp`](assets/screenshots/crisis-core-title.webp)
 
 ### crisis-core-voice-language.png
 
@@ -1073,7 +1073,7 @@ Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the gue
 
 Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the guest wins, not a late write (#2060)
 
-`e311e6cd` · [`assets/screenshots/crisis-core-voice-language.webp`](assets/screenshots/crisis-core-voice-language.webp)
+`6ff91efa` · [`assets/screenshots/crisis-core-voice-language.webp`](assets/screenshots/crisis-core-voice-language.webp)
 
 ### sonic-frontiers-middleware-credits.png
 
@@ -1081,7 +1081,7 @@ Crisis Core (PPSA07809) reaches rung 2 — and its #1945 fault is a race the gue
 
 fix(present): publish the flipped VideoOut buffer when no pass ever targets it — with a real guest-authorship test and the composited-frame gate intact (#2068)
 
-`33dac763` · [`assets/screenshots/sonic-frontiers-middleware-credits.webp`](assets/screenshots/sonic-frontiers-middleware-credits.webp)
+`fe554cc8` · [`assets/screenshots/sonic-frontiers-middleware-credits.webp`](assets/screenshots/sonic-frontiers-middleware-credits.webp)
 
 ### sonic-frontiers-sega-logo.png
 
@@ -1089,7 +1089,7 @@ fix(present): publish the flipped VideoOut buffer when no pass ever targets it �
 
 fix(present): publish the flipped VideoOut buffer when no pass ever targets it — with a real guest-authorship test and the composited-frame gate intact (#2068)
 
-`33dac763` · [`assets/screenshots/sonic-frontiers-sega-logo.webp`](assets/screenshots/sonic-frontiers-sega-logo.webp)
+`fe554cc8` · [`assets/screenshots/sonic-frontiers-sega-logo.webp`](assets/screenshots/sonic-frontiers-sega-logo.webp)
 
 ### rtype-delta-opening-movie-colour.png
 
@@ -1097,7 +1097,7 @@ fix(present): publish the flipped VideoOut buffer when no pass ever targets it �
 
 fix(gpu): recognise an AvPlayer chroma plane declared as a one-layer 2D array (#2037)
 
-`08d75128` · [`assets/screenshots/rtype-delta-opening-movie-colour.webp`](assets/screenshots/rtype-delta-opening-movie-colour.webp)
+`7569a81c` · [`assets/screenshots/rtype-delta-opening-movie-colour.webp`](assets/screenshots/rtype-delta-opening-movie-colour.webp)
 
 ### issue-1946-health-warning-before-after.png
 
@@ -1105,7 +1105,7 @@ fix(gpu): recognise an AvPlayer chroma plane declared as a one-layer 2D array (#
 
 fix(agc): offer the render-target-0 blend key on every SDK version — The Oregon Trail's whole UI layer was unblended (#1946) (#2031)
 
-`beeff2ab` · [`prosper/docs/screenshots/issue-1946-health-warning-before-after.webp`](prosper/docs/screenshots/issue-1946-health-warning-before-after.webp)
+`c76504b4` · [`prosper/docs/screenshots/issue-1946-health-warning-before-after.webp`](prosper/docs/screenshots/issue-1946-health-warning-before-after.webp)
 
 ### issue-1946-slate-blend-before-after.png
 
@@ -1113,7 +1113,7 @@ fix(agc): offer the render-target-0 blend key on every SDK version — The Orego
 
 fix(agc): offer the render-target-0 blend key on every SDK version — The Oregon Trail's whole UI layer was unblended (#1946) (#2031)
 
-`beeff2ab` · [`prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp`](prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp)
+`c76504b4` · [`prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp`](prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp)
 
 ### sonic-crossworlds-sega-logo.png
 
@@ -1121,7 +1121,7 @@ fix(agc): offer the render-target-0 blend key on every SDK version — The Orego
 
 docs(crossworlds): Sonic Racing: CrossWorlds reaches rung 1 — the SEGA logo renders (#2039)
 
-`f8b0f040` · [`assets/screenshots/sonic-crossworlds-sega-logo.webp`](assets/screenshots/sonic-crossworlds-sega-logo.webp)
+`99a98232` · [`assets/screenshots/sonic-crossworlds-sega-logo.webp`](assets/screenshots/sonic-crossworlds-sega-logo.webp)
 
 ### little-nightmares-3-eula.png
 
@@ -1129,7 +1129,7 @@ docs(crossworlds): Sonic Racing: CrossWorlds reaches rung 1 — the SEGA logo re
 
 docs(little-nightmares-3): #2014 is a wrong background clear, not a channel map — plus the first input route (#2041)
 
-`f811615a` · [`assets/screenshots/little-nightmares-3-eula.webp`](assets/screenshots/little-nightmares-3-eula.webp)
+`8e7061f0` · [`assets/screenshots/little-nightmares-3-eula.webp`](assets/screenshots/little-nightmares-3-eula.webp)
 
 ## 2026-08-05
 
@@ -1139,7 +1139,7 @@ docs(little-nightmares-3): #2014 is a wrong background clear, not a channel map 
 
 docs(little-nightmares-3): rung 2 — the title screen renders; land the ruled-out record (#2017)
 
-`080263cf` · [`assets/screenshots/little-nightmares-3-title-screen.webp`](assets/screenshots/little-nightmares-3-title-screen.webp)
+`dafc7d0f` · [`assets/screenshots/little-nightmares-3-title-screen.webp`](assets/screenshots/little-nightmares-3-title-screen.webp)
 
 ### rtype-delta-rung1-logo-and-opening-movie.png
 
@@ -1147,7 +1147,7 @@ docs(little-nightmares-3): rung 2 — the title screen renders; land the ruled-o
 
 docs(rtype): R-Type Delta reaches rung 1 — the #1746 startup race is host CPU speed, not a prosper defect (#2009)
 
-`c3614f51` · [`assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp`](assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp)
+`91bd49ce` · [`assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp`](assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.webp)
 
 ### oregon-trail-title-screen.png
 
@@ -1155,7 +1155,7 @@ docs(rtype): R-Type Delta reaches rung 1 — the #1746 startup race is host CPU 
 
 diag(fault): probe every guest-pointer register at a worker fault, not just rdx/rax (#1992)
 
-`034f959a` · [`assets/screenshots/oregon-trail-title-screen.webp`](assets/screenshots/oregon-trail-title-screen.webp)
+`c292b920` · [`assets/screenshots/oregon-trail-title-screen.webp`](assets/screenshots/oregon-trail-title-screen.webp)
 
 ### oregon-trail-gameloft-splash.png
 
@@ -1163,7 +1163,7 @@ diag(fault): probe every guest-pointer register at a worker fault, not just rdx/
 
 fix(hle): scePthread* must return libkernel-encoded errors — Oregon Trail advances three checkpoints (#1984)
 
-`38619f29` · [`assets/screenshots/oregon-trail-gameloft-splash.webp`](assets/screenshots/oregon-trail-gameloft-splash.webp)
+`9710c4e5` · [`assets/screenshots/oregon-trail-gameloft-splash.webp`](assets/screenshots/oregon-trail-gameloft-splash.webp)
 
 ### oregon-trail-health-warning.png
 
@@ -1171,7 +1171,7 @@ fix(hle): scePthread* must return libkernel-encoded errors — Oregon Trail adva
 
 fix(hle): scePthread* must return libkernel-encoded errors — Oregon Trail advances three checkpoints (#1984)
 
-`38619f29` · [`assets/screenshots/oregon-trail-health-warning.webp`](assets/screenshots/oregon-trail-health-warning.webp)
+`9710c4e5` · [`assets/screenshots/oregon-trail-health-warning.webp`](assets/screenshots/oregon-trail-health-warning.webp)
 
 ### bendy-dark-revival-title.png
 
@@ -1179,7 +1179,7 @@ fix(hle): scePthread* must return libkernel-encoded errors — Oregon Trail adva
 
 fix(avplayer): end a source nobody consumes on its own media clock (#1981)
 
-`afe4a2b0` · [`assets/screenshots/bendy-dark-revival-title.webp`](assets/screenshots/bendy-dark-revival-title.webp)
+`b7cb661c` · [`assets/screenshots/bendy-dark-revival-title.webp`](assets/screenshots/bendy-dark-revival-title.webp)
 
 ### asterix-babylon-intro-cutscene.png
 
@@ -1187,7 +1187,7 @@ fix(avplayer): end a source nobody consumes on its own media clock (#1981)
 
 feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest file-replacement reader (#1974)
 
-`ff72e77c` · [`assets/screenshots/asterix-babylon-intro-cutscene.webp`](assets/screenshots/asterix-babylon-intro-cutscene.webp)
+`ea299e97` · [`assets/screenshots/asterix-babylon-intro-cutscene.webp`](assets/screenshots/asterix-babylon-intro-cutscene.webp)
 
 ### asterix-babylon-title.png
 
@@ -1195,7 +1195,7 @@ feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest file-replac
 
 feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest file-replacement reader (#1974)
 
-`ff72e77c` · [`assets/screenshots/asterix-babylon-title.webp`](assets/screenshots/asterix-babylon-title.webp)
+`ea299e97` · [`assets/screenshots/asterix-babylon-title.webp`](assets/screenshots/asterix-babylon-title.webp)
 
 ### little-nightmares-3-boot-splash.png
 
@@ -1203,7 +1203,7 @@ feat(avplayer): implement sceAvPlayerJumpToTime and honour the guest file-replac
 
 fix(ajm): accept the config revision — Little Nightmares III reaches rung 1 (#1966)
 
-`1fc8ece9` · [`assets/screenshots/little-nightmares-3-boot-splash.webp`](assets/screenshots/little-nightmares-3-boot-splash.webp)
+`8a21470f` · [`assets/screenshots/little-nightmares-3-boot-splash.webp`](assets/screenshots/little-nightmares-3-boot-splash.webp)
 
 ### sonic-frontiers-opening-sequence.png
 
@@ -1211,7 +1211,7 @@ fix(ajm): accept the config revision — Little Nightmares III reaches rung 1 (#
 
 docs(sonic-frontiers): rung 1 — it renders; the rung-0 reading was a failure-only diagnostic (#1969)
 
-`440d84d2` · [`assets/screenshots/sonic-frontiers-opening-sequence.webp`](assets/screenshots/sonic-frontiers-opening-sequence.webp)
+`56c6a3d7` · [`assets/screenshots/sonic-frontiers-opening-sequence.webp`](assets/screenshots/sonic-frontiers-opening-sequence.webp)
 
 ### sonic-frontiers-sonic-team-logo.png
 
@@ -1219,7 +1219,7 @@ docs(sonic-frontiers): rung 1 — it renders; the rung-0 reading was a failure-o
 
 docs(sonic-frontiers): rung 1 — it renders; the rung-0 reading was a failure-only diagnostic (#1969)
 
-`440d84d2` · [`assets/screenshots/sonic-frontiers-sonic-team-logo.webp`](assets/screenshots/sonic-frontiers-sonic-team-logo.webp)
+`56c6a3d7` · [`assets/screenshots/sonic-frontiers-sonic-team-logo.webp`](assets/screenshots/sonic-frontiers-sonic-team-logo.webp)
 
 ## 2026-08-04
 
@@ -1229,7 +1229,7 @@ docs(sonic-frontiers): rung 1 — it renders; the rung-0 reading was a failure-o
 
 feat(oregon): reach rung 1 — the startup legal popup renders on a default launch (#1950)
 
-`e92d2f7f` · [`assets/screenshots/oregon-trail-legal-popup.webp`](assets/screenshots/oregon-trail-legal-popup.webp)
+`1f510121` · [`assets/screenshots/oregon-trail-legal-popup.webp`](assets/screenshots/oregon-trail-legal-popup.webp)
 
 ### beneath-title.png
 
@@ -1237,7 +1237,7 @@ feat(oregon): reach rung 1 — the startup legal popup renders on a default laun
 
 docs: record Beneath title screen
 
-`0dafd22d` · [`assets/screenshots/beneath-title.webp`](assets/screenshots/beneath-title.webp)
+`a2034338` · [`assets/screenshots/beneath-title.webp`](assets/screenshots/beneath-title.webp)
 
 ### forgotten-city-title.png
 
@@ -1245,7 +1245,7 @@ docs: record Beneath title screen
 
 docs: record first-run compatibility baselines
 
-`1640bb30` · [`assets/screenshots/forgotten-city-title.webp`](assets/screenshots/forgotten-city-title.webp)
+`95ee2215` · [`assets/screenshots/forgotten-city-title.webp`](assets/screenshots/forgotten-city-title.webp)
 
 ### tactics-ogre-hevc-movie.png
 
@@ -1253,7 +1253,7 @@ docs: record first-run compatibility baselines
 
 docs(tactics-ogre): record restored HEVC presentation
 
-`0d2f9a9f` · [`assets/screenshots/tactics-ogre-hevc-movie.webp`](assets/screenshots/tactics-ogre-hevc-movie.webp)
+`fa6c95dc` · [`assets/screenshots/tactics-ogre-hevc-movie.webp`](assets/screenshots/tactics-ogre-hevc-movie.webp)
 
 ### tactics-ogre-reborn-gameplay.png
 
@@ -1261,7 +1261,7 @@ docs(tactics-ogre): record restored HEVC presentation
 
 Document Tactics Ogre tutorial battle
 
-`038c166d` · [`assets/screenshots/tactics-ogre-reborn-gameplay.webp`](assets/screenshots/tactics-ogre-reborn-gameplay.webp)
+`2d1913ad` · [`assets/screenshots/tactics-ogre-reborn-gameplay.webp`](assets/screenshots/tactics-ogre-reborn-gameplay.webp)
 
 ## 2026-08-03
 
@@ -1271,7 +1271,7 @@ Document Tactics Ogre tutorial battle
 
 Document Tactics Ogre opening scene
 
-`4c8e3997` · [`assets/screenshots/tactics-ogre-reborn-opening-scene.webp`](assets/screenshots/tactics-ogre-reborn-opening-scene.webp)
+`b3cca048` · [`assets/screenshots/tactics-ogre-reborn-opening-scene.webp`](assets/screenshots/tactics-ogre-reborn-opening-scene.webp)
 
 ### house-of-the-dead-2-remake-gameplay.png
 
@@ -1279,7 +1279,7 @@ Document Tactics Ogre opening scene
 
 Document House of the Dead 2 gameplay
 
-`b01e057c` · [`assets/screenshots/house-of-the-dead-2-remake-gameplay.webp`](assets/screenshots/house-of-the-dead-2-remake-gameplay.webp)
+`f977e012` · [`assets/screenshots/house-of-the-dead-2-remake-gameplay.webp`](assets/screenshots/house-of-the-dead-2-remake-gameplay.webp)
 
 ### tactics-ogre-title.png
 
@@ -1287,7 +1287,7 @@ Document House of the Dead 2 gameplay
 
 Add Tactics Ogre title milestone
 
-`4d192dc1` · [`assets/screenshots/tactics-ogre-title.webp`](assets/screenshots/tactics-ogre-title.webp)
+`da52181f` · [`assets/screenshots/tactics-ogre-title.webp`](assets/screenshots/tactics-ogre-title.webp)
 
 ### house-of-the-dead-2-remake-title.png
 
@@ -1295,7 +1295,7 @@ Add Tactics Ogre title milestone
 
 Document newly tested game compatibility
 
-`fbde2b4c` · [`assets/screenshots/house-of-the-dead-2-remake-title.webp`](assets/screenshots/house-of-the-dead-2-remake-title.webp)
+`a1aff2e9` · [`assets/screenshots/house-of-the-dead-2-remake-title.webp`](assets/screenshots/house-of-the-dead-2-remake-title.webp)
 
 ### rtype-delta-movie-coordinate-progress.png
 
@@ -1303,7 +1303,7 @@ Document newly tested game compatibility
 
 fix(gpu): honor unnormalized sample coordinates
 
-`d4fa07a8` · [`assets/screenshots/rtype-delta-movie-coordinate-progress.webp`](assets/screenshots/rtype-delta-movie-coordinate-progress.webp)
+`941da33c` · [`assets/screenshots/rtype-delta-movie-coordinate-progress.webp`](assets/screenshots/rtype-delta-movie-coordinate-progress.webp)
 
 ### blue-prince-hall.png
 
@@ -1311,7 +1311,7 @@ fix(gpu): honor unnormalized sample coordinates
 
 Fix Blue Prince hall snapshot guard (#1813)
 
-`730d434e` · [`assets/screenshots/blue-prince-hall.webp`](assets/screenshots/blue-prince-hall.webp)
+`bf861656` · [`assets/screenshots/blue-prince-hall.webp`](assets/screenshots/blue-prince-hall.webp)
 
 ## 2026-08-02
 
@@ -1321,7 +1321,7 @@ Fix Blue Prince hall snapshot guard (#1813)
 
 feat(earthion): route past the intro — the "missing picture" was a black text page (#1590) (#1775)
 
-`3d1a7480` · [`assets/screenshots/earthion-title-menu.webp`](assets/screenshots/earthion-title-menu.webp)
+`8b1f6254` · [`assets/screenshots/earthion-title-menu.webp`](assets/screenshots/earthion-title-menu.webp)
 
 ### tales-graces-f-options.png
 
@@ -1329,7 +1329,7 @@ feat(earthion): route past the intro — the "missing picture" was a black text 
 
 feat(talesgraces): routes to the title screen and the new-game Options screen (PPSA19991 rung 2) (#1759)
 
-`30477a2d` · [`assets/screenshots/tales-graces-f-options.webp`](assets/screenshots/tales-graces-f-options.webp)
+`e50594cc` · [`assets/screenshots/tales-graces-f-options.webp`](assets/screenshots/tales-graces-f-options.webp)
 
 ### tales-graces-f-title.png
 
@@ -1337,39 +1337,39 @@ feat(talesgraces): routes to the title screen and the new-game Options screen (P
 
 feat(talesgraces): routes to the title screen and the new-game Options screen (PPSA19991 rung 2) (#1759)
 
-`30477a2d` · [`assets/screenshots/tales-graces-f-title.webp`](assets/screenshots/tales-graces-f-title.webp)
+`e50594cc` · [`assets/screenshots/tales-graces-f-title.webp`](assets/screenshots/tales-graces-f-title.webp)
 
 ### bendy-gameplay.png
 
 <p align="center"><img src="assets/screenshots/bendy-gameplay.webp" alt="bendy gameplay"></p>
 
-docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
+docs(compat): boot sweep of fourteen titles on c79f742e — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/bendy-gameplay.webp`](assets/screenshots/bendy-gameplay.webp)
+`673aacb1` · [`assets/screenshots/bendy-gameplay.webp`](assets/screenshots/bendy-gameplay.webp)
 
 ### bendy-title.png
 
 <p align="center"><img src="assets/screenshots/bendy-title.webp" alt="bendy title"></p>
 
-docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
+docs(compat): boot sweep of fourteen titles on c79f742e — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/bendy-title.webp`](assets/screenshots/bendy-title.webp)
+`673aacb1` · [`assets/screenshots/bendy-title.webp`](assets/screenshots/bendy-title.webp)
 
 ### pathless-title.png
 
 <p align="center"><img src="assets/screenshots/pathless-title.webp" alt="pathless title"></p>
 
-docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
+docs(compat): boot sweep of fourteen titles on c79f742e — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/pathless-title.webp`](assets/screenshots/pathless-title.webp)
+`673aacb1` · [`assets/screenshots/pathless-title.webp`](assets/screenshots/pathless-title.webp)
 
 ### plucky-squire-title.png
 
 <p align="center"><img src="assets/screenshots/plucky-squire-title.webp" alt="plucky squire title"></p>
 
-docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, four new rows, and a frame-rate census (#1740)
+docs(compat): boot sweep of fourteen titles on c79f742e — corrected rungs, four new rows, and a frame-rate census (#1740)
 
-`8fc79ca0` · [`assets/screenshots/plucky-squire-title.webp`](assets/screenshots/plucky-squire-title.webp)
+`673aacb1` · [`assets/screenshots/plucky-squire-title.webp`](assets/screenshots/plucky-squire-title.webp)
 
 ### astro-bot-opening-cinematic.png
 
@@ -1377,7 +1377,7 @@ docs(compat): boot sweep of fourteen titles on 3a473bca — corrected rungs, fou
 
 docs(astro): Astro Bot enters COMPATIBILITY.md at rung 2 — the title screen renders (#1736)
 
-`6d7b69e9` · [`assets/screenshots/astro-bot-opening-cinematic.webp`](assets/screenshots/astro-bot-opening-cinematic.webp)
+`a1f3b05c` · [`assets/screenshots/astro-bot-opening-cinematic.webp`](assets/screenshots/astro-bot-opening-cinematic.webp)
 
 ### astro-bot-title.png
 
@@ -1385,7 +1385,7 @@ docs(astro): Astro Bot enters COMPATIBILITY.md at rung 2 — the title screen re
 
 docs(astro): Astro Bot enters COMPATIBILITY.md at rung 2 — the title screen renders (#1736)
 
-`6d7b69e9` · [`assets/screenshots/astro-bot-title.webp`](assets/screenshots/astro-bot-title.webp)
+`a1f3b05c` · [`assets/screenshots/astro-bot-title.webp`](assets/screenshots/astro-bot-title.webp)
 
 ### astro-bot-worldmap-background.png
 
@@ -1393,7 +1393,7 @@ docs(astro): Astro Bot enters COMPATIBILITY.md at rung 2 — the title screen re
 
 fix(gpu): CB_COLOR_CONTROL.MODE must not override the guest's colour write mask (#1728)
 
-`c8fe4afd` · [`assets/screenshots/astro-bot-worldmap-background.webp`](assets/screenshots/astro-bot-worldmap-background.webp)
+`58abbc7d` · [`assets/screenshots/astro-bot-worldmap-background.webp`](assets/screenshots/astro-bot-worldmap-background.webp)
 
 ## 2026-08-01
 
@@ -1403,7 +1403,7 @@ fix(gpu): CB_COLOR_CONTROL.MODE must not override the guest's colour write mask 
 
 fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667)
 
-`fa1f07b3` · [`assets/screenshots/tales-graces-f-criware.webp`](assets/screenshots/tales-graces-f-criware.webp)
+`f1c716e8` · [`assets/screenshots/tales-graces-f-criware.webp`](assets/screenshots/tales-graces-f-criware.webp)
 
 ### tales-graces-f-publisher.png
 
@@ -1411,7 +1411,7 @@ fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667
 
 fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667)
 
-`fa1f07b3` · [`assets/screenshots/tales-graces-f-publisher.webp`](assets/screenshots/tales-graces-f-publisher.webp)
+`f1c716e8` · [`assets/screenshots/tales-graces-f-publisher.webp`](assets/screenshots/tales-graces-f-publisher.webp)
 
 ### issue-1630-grid-after.png
 
@@ -1419,7 +1419,7 @@ fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-grid-after.webp`](prosper/docs/screenshots/issue-1630-grid-after.webp)
+`0553c329` · [`prosper/docs/screenshots/issue-1630-grid-after.webp`](prosper/docs/screenshots/issue-1630-grid-after.webp)
 
 ### issue-1630-grid-before.png
 
@@ -1427,7 +1427,7 @@ feat(app): per-title background art and focus music in the library (#1647)
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-grid-before.webp`](prosper/docs/screenshots/issue-1630-grid-before.webp)
+`0553c329` · [`prosper/docs/screenshots/issue-1630-grid-before.webp`](prosper/docs/screenshots/issue-1630-grid-before.webp)
 
 ### issue-1630-library-background-1.png
 
@@ -1435,7 +1435,7 @@ feat(app): per-title background art and focus music in the library (#1647)
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-1.webp`](prosper/docs/screenshots/issue-1630-library-background-1.webp)
+`0553c329` · [`prosper/docs/screenshots/issue-1630-library-background-1.webp`](prosper/docs/screenshots/issue-1630-library-background-1.webp)
 
 ### issue-1630-library-background-2.png
 
@@ -1443,7 +1443,7 @@ feat(app): per-title background art and focus music in the library (#1647)
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-2.webp`](prosper/docs/screenshots/issue-1630-library-background-2.webp)
+`0553c329` · [`prosper/docs/screenshots/issue-1630-library-background-2.webp`](prosper/docs/screenshots/issue-1630-library-background-2.webp)
 
 ### issue-1630-library-background-3.png
 
@@ -1451,7 +1451,7 @@ feat(app): per-title background art and focus music in the library (#1647)
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-3.webp`](prosper/docs/screenshots/issue-1630-library-background-3.webp)
+`0553c329` · [`prosper/docs/screenshots/issue-1630-library-background-3.webp`](prosper/docs/screenshots/issue-1630-library-background-3.webp)
 
 ### syberia-gameplay.png
 
@@ -1459,7 +1459,7 @@ feat(app): per-title background art and focus music in the library (#1647)
 
 docs(syberia): validated route to gameplay, and localize the black scene to one format gap (#1622)
 
-`5ee5e785` · [`assets/screenshots/syberia-gameplay.webp`](assets/screenshots/syberia-gameplay.webp)
+`757d29a3` · [`assets/screenshots/syberia-gameplay.webp`](assets/screenshots/syberia-gameplay.webp)
 
 ### syberia-title.png
 
@@ -1467,7 +1467,7 @@ docs(syberia): validated route to gameplay, and localize the black scene to one 
 
 docs(syberia): validated route to gameplay, and localize the black scene to one format gap (#1622)
 
-`5ee5e785` · [`assets/screenshots/syberia-title.webp`](assets/screenshots/syberia-title.webp)
+`757d29a3` · [`assets/screenshots/syberia-title.webp`](assets/screenshots/syberia-title.webp)
 
 ### worms-armageddon-gameplay.png
 
@@ -1475,7 +1475,7 @@ docs(syberia): validated route to gameplay, and localize the black scene to one 
 
 fix(pad): scePadGetHandle looks up an open handle instead of fabricating one (#1623)
 
-`823c9670` · [`assets/screenshots/worms-armageddon-gameplay.webp`](assets/screenshots/worms-armageddon-gameplay.webp)
+`45024ab2` · [`assets/screenshots/worms-armageddon-gameplay.webp`](assets/screenshots/worms-armageddon-gameplay.webp)
 
 ## 2026-07-31
 
@@ -1485,7 +1485,7 @@ fix(pad): scePadGetHandle looks up an open handle instead of fabricating one (#1
 
 fix(agc): register sceAgcAcbWriteData — Syberia goes from hard hang to its profile menu (#1610)
 
-`961a6cdd` · [`assets/screenshots/syberia-profile.webp`](assets/screenshots/syberia-profile.webp)
+`0502aaf1` · [`assets/screenshots/syberia-profile.webp`](assets/screenshots/syberia-profile.webp)
 
 ### nikoderiko-title.png
 
@@ -1493,7 +1493,7 @@ fix(agc): register sceAgcAcbWriteData — Syberia goes from hard hang to its pro
 
 docs(compat): add Nikoderiko at title screen and The Oregon Trail at research tier (#1608)
 
-`a933091d` · [`assets/screenshots/nikoderiko-title.webp`](assets/screenshots/nikoderiko-title.webp)
+`408201a4` · [`assets/screenshots/nikoderiko-title.webp`](assets/screenshots/nikoderiko-title.webp)
 
 ### greak-title.png
 
@@ -1501,7 +1501,7 @@ docs(compat): add Nikoderiko at title screen and The Oregon Trail at research ti
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/greak-title.webp`](assets/screenshots/greak-title.webp)
+`68259cee` · [`assets/screenshots/greak-title.webp`](assets/screenshots/greak-title.webp)
 
 ### greak.png
 
@@ -1509,7 +1509,7 @@ feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/greak.webp`](assets/screenshots/greak.webp)
+`68259cee` · [`assets/screenshots/greak.webp`](assets/screenshots/greak.webp)
 
 ### rugrats-title.png
 
@@ -1517,7 +1517,7 @@ feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/rugrats-title.webp`](assets/screenshots/rugrats-title.webp)
+`68259cee` · [`assets/screenshots/rugrats-title.webp`](assets/screenshots/rugrats-title.webp)
 
 ### rugrats.png
 
@@ -1525,7 +1525,7 @@ feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600
 
 feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600)
 
-`5a0eb7b6` · [`assets/screenshots/rugrats.webp`](assets/screenshots/rugrats.webp)
+`68259cee` · [`assets/screenshots/rugrats.webp`](assets/screenshots/rugrats.webp)
 
 ### asterix-slap-them-all.png
 
@@ -1533,7 +1533,7 @@ feat(recompiler): lower s_ttracedata — Greak and Rugrats reach gameplay (#1600
 
 docs(compat): add Asterix Slap Them All and Summer Sports Games at gameplay (#1604)
 
-`2421d503` · [`assets/screenshots/asterix-slap-them-all.webp`](assets/screenshots/asterix-slap-them-all.webp)
+`8f6095a8` · [`assets/screenshots/asterix-slap-them-all.webp`](assets/screenshots/asterix-slap-them-all.webp)
 
 ### summer-sports-games.png
 
@@ -1541,7 +1541,7 @@ docs(compat): add Asterix Slap Them All and Summer Sports Games at gameplay (#16
 
 docs(compat): add Asterix Slap Them All and Summer Sports Games at gameplay (#1604)
 
-`2421d503` · [`assets/screenshots/summer-sports-games.webp`](assets/screenshots/summer-sports-games.webp)
+`8f6095a8` · [`assets/screenshots/summer-sports-games.webp`](assets/screenshots/summer-sports-games.webp)
 
 ### joe-mac-menu.png
 
@@ -1549,7 +1549,7 @@ docs(compat): add Asterix Slap Them All and Summer Sports Games at gameplay (#16
 
 docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
-`bb5a11a2` · [`assets/screenshots/joe-mac-menu.webp`](assets/screenshots/joe-mac-menu.webp)
+`46bf1a27` · [`assets/screenshots/joe-mac-menu.webp`](assets/screenshots/joe-mac-menu.webp)
 
 ### joe-mac.png
 
@@ -1557,7 +1557,7 @@ docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
 docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
-`bb5a11a2` · [`assets/screenshots/joe-mac.webp`](assets/screenshots/joe-mac.webp)
+`46bf1a27` · [`assets/screenshots/joe-mac.webp`](assets/screenshots/joe-mac.webp)
 
 ### worms-armageddon-title.png
 
@@ -1565,7 +1565,7 @@ docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
 docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
-`bb5a11a2` · [`assets/screenshots/worms-armageddon-title.webp`](assets/screenshots/worms-armageddon-title.webp)
+`46bf1a27` · [`assets/screenshots/worms-armageddon-title.webp`](assets/screenshots/worms-armageddon-title.webp)
 
 ### alex-kidd.png
 
@@ -1573,7 +1573,7 @@ docs(compat): record five newly triaged titles, two of them rendering (#1596)
 
 test(snapshot): reviewed alexkidd-gameplay content guard — PPSA02664 reaches ladder rung 6 (#1582)
 
-`a6d995fa` · [`assets/screenshots/alex-kidd.webp`](assets/screenshots/alex-kidd.webp)
+`44a08fa5` · [`assets/screenshots/alex-kidd.webp`](assets/screenshots/alex-kidd.webp)
 
 ### dragon-quest-vii-onboarding.png
 
@@ -1581,7 +1581,7 @@ test(snapshot): reviewed alexkidd-gameplay content guard — PPSA02664 reaches l
 
 docs: record Dragon Quest VII onboarding
 
-`aeee4d48` · [`assets/screenshots/dragon-quest-vii-onboarding.webp`](assets/screenshots/dragon-quest-vii-onboarding.webp)
+`ae95a013` · [`assets/screenshots/dragon-quest-vii-onboarding.webp`](assets/screenshots/dragon-quest-vii-onboarding.webp)
 
 ### dragon-quest-vii-name-confirmation.png
 
@@ -1589,7 +1589,7 @@ docs: record Dragon Quest VII onboarding
 
 Document DQ7 name confirmation milestone
 
-`d2fe1c66` · [`assets/screenshots/dragon-quest-vii-name-confirmation.webp`](assets/screenshots/dragon-quest-vii-name-confirmation.webp)
+`e02961e2` · [`assets/screenshots/dragon-quest-vii-name-confirmation.webp`](assets/screenshots/dragon-quest-vii-name-confirmation.webp)
 
 ### dragon-quest-vii-name-entry.png
 
@@ -1597,7 +1597,7 @@ Document DQ7 name confirmation milestone
 
 Document Dragon Quest name entry
 
-`297ec493` · [`assets/screenshots/dragon-quest-vii-name-entry.webp`](assets/screenshots/dragon-quest-vii-name-entry.webp)
+`1a6ef445` · [`assets/screenshots/dragon-quest-vii-name-entry.webp`](assets/screenshots/dragon-quest-vii-name-entry.webp)
 
 ### space-adventure-cobra.png
 
@@ -1605,7 +1605,7 @@ Document Dragon Quest name entry
 
 fix(runtime): preserve guest TLS across write-watch faults
 
-`82eadf58` · [`assets/screenshots/space-adventure-cobra.webp`](assets/screenshots/space-adventure-cobra.webp)
+`ce09bf50` · [`assets/screenshots/space-adventure-cobra.webp`](assets/screenshots/space-adventure-cobra.webp)
 
 ### gris.png
 
@@ -1613,7 +1613,7 @@ fix(runtime): preserve guest TLS across write-watch faults
 
 docs: record GRIS opening gameplay
 
-`b08f0a94` · [`assets/screenshots/gris.webp`](assets/screenshots/gris.webp)
+`4424ba00` · [`assets/screenshots/gris.webp`](assets/screenshots/gris.webp)
 
 ### issue-1459-astrobot-blue-fmv-gpu-present.png
 
@@ -1621,7 +1621,7 @@ docs: record GRIS opening gameplay
 
 docs: capture Astro Bot blue intro
 
-`3f72a8ce` · [`prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp`](prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp)
+`264c70c2` · [`prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp`](prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp)
 
 ## 2026-07-30
 
@@ -1631,7 +1631,7 @@ docs: capture Astro Bot blue intro
 
 fix(app): address review findings on the library view
 
-`44d1689d` · [`prosper/docs/screenshots/issue-1471-library-empty.webp`](prosper/docs/screenshots/issue-1471-library-empty.webp)
+`f5ffe44d` · [`prosper/docs/screenshots/issue-1471-library-empty.webp`](prosper/docs/screenshots/issue-1471-library-empty.webp)
 
 ### issue-1471-library-scrolled.png
 
@@ -1639,7 +1639,7 @@ fix(app): address review findings on the library view
 
 fix(app): address review findings on the library view
 
-`44d1689d` · [`prosper/docs/screenshots/issue-1471-library-scrolled.webp`](prosper/docs/screenshots/issue-1471-library-scrolled.webp)
+`f5ffe44d` · [`prosper/docs/screenshots/issue-1471-library-scrolled.webp`](prosper/docs/screenshots/issue-1471-library-scrolled.webp)
 
 ### issue-1471-library-grid.png
 
@@ -1647,7 +1647,7 @@ fix(app): address review findings on the library view
 
 feat(app): draw the game library with Dear ImGui
 
-`7cf767fe` · [`prosper/docs/screenshots/issue-1471-library-grid.webp`](prosper/docs/screenshots/issue-1471-library-grid.webp)
+`352a2a0b` · [`prosper/docs/screenshots/issue-1471-library-grid.webp`](prosper/docs/screenshots/issue-1471-library-grid.webp)
 
 ### issue-1459-astrobot-linux-indirect-title.png
 
@@ -1655,7 +1655,7 @@ feat(app): draw the game library with Dear ImGui
 
 gpu: execute AGC indirect work after producers
 
-`e85c527c` · [`prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp`](prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp)
+`53598b4c` · [`prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp`](prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp)
 
 ## 2026-07-29
 
@@ -1665,7 +1665,7 @@ gpu: execute AGC indirect work after producers
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-drop-messenger.webp`](prosper/docs/screenshots/issue-1469-drop-messenger.webp)
+`2b329eb7` · [`prosper/docs/screenshots/issue-1469-drop-messenger.webp`](prosper/docs/screenshots/issue-1469-drop-messenger.webp)
 
 ### issue-1469-picker-messenger.png
 
@@ -1673,7 +1673,7 @@ docs(app): interactive-open evidence screenshots (#1469)
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-picker-messenger.webp`](prosper/docs/screenshots/issue-1469-picker-messenger.webp)
+`2b329eb7` · [`prosper/docs/screenshots/issue-1469-picker-messenger.webp`](prosper/docs/screenshots/issue-1469-picker-messenger.webp)
 
 ### issue-1469-reject-not-a-title.png
 
@@ -1681,7 +1681,7 @@ docs(app): interactive-open evidence screenshots (#1469)
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-reject-not-a-title.webp`](prosper/docs/screenshots/issue-1469-reject-not-a-title.webp)
+`2b329eb7` · [`prosper/docs/screenshots/issue-1469-reject-not-a-title.webp`](prosper/docs/screenshots/issue-1469-reject-not-a-title.webp)
 
 ### issue-1469-relaunch-blasphemous2.png
 
@@ -1689,7 +1689,7 @@ docs(app): interactive-open evidence screenshots (#1469)
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp`](prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp)
+`2b329eb7` · [`prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp`](prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp)
 
 ### issue-1459-astrobot-worldmap-current.png
 
@@ -1697,7 +1697,7 @@ docs(app): interactive-open evidence screenshots (#1469)
 
 docs: capture current Astro Bot world map
 
-`2e83d1ea` · [`prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp`](prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp)
+`14953eeb` · [`prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp`](prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp)
 
 ### issue-1466-astrobot-direct-tile.png
 
@@ -1705,7 +1705,7 @@ docs: capture current Astro Bot world map
 
 perf(gpu): tile mapped storage images directly
 
-`1b8eeed6` · [`prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp`](prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp)
+`1d60f71e` · [`prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp`](prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp)
 
 ## 2026-07-26
 
@@ -1715,7 +1715,7 @@ perf(gpu): tile mapped storage images directly
 
 docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
-`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-hall-live-fixed.webp`](prosper/docs/screenshots/issue-1287-hall-live-fixed.webp)
+`67760515` · [`prosper/docs/screenshots/issue-1287-hall-live-fixed.webp`](prosper/docs/screenshots/issue-1287-hall-live-fixed.webp)
 
 ### issue-1287-hall-live-vs-oracle.png
 
@@ -1723,7 +1723,7 @@ docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
 docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
-`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp`](prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp)
+`67760515` · [`prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp`](prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp)
 
 ### issue-1287-manor-approach-live.png
 
@@ -1731,7 +1731,7 @@ docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
 docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
-`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-manor-approach-live.webp`](prosper/docs/screenshots/issue-1287-manor-approach-live.webp)
+`67760515` · [`prosper/docs/screenshots/issue-1287-manor-approach-live.webp`](prosper/docs/screenshots/issue-1287-manor-approach-live.webp)
 
 ### issue-1427-hall-geometry-restored.png
 
@@ -1739,7 +1739,7 @@ docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
 fix(render): upload a buffer binding's whole declared range, not the first 1 MiB (#1429)
 
-`ad5a840a` · [`prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp`](prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp)
+`323c5244` · [`prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp`](prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp)
 
 ### issue-1427-oracle-before-after.png
 
@@ -1747,7 +1747,7 @@ fix(render): upload a buffer binding's whole declared range, not the first 1 MiB
 
 fix(render): upload a buffer binding's whole declared range, not the first 1 MiB (#1429)
 
-`ad5a840a` · [`prosper/docs/screenshots/issue-1427-oracle-before-after.webp`](prosper/docs/screenshots/issue-1427-oracle-before-after.webp)
+`323c5244` · [`prosper/docs/screenshots/issue-1427-oracle-before-after.webp`](prosper/docs/screenshots/issue-1427-oracle-before-after.webp)
 
 ### issue-1287-hall-materials-fixed.png
 
@@ -1755,7 +1755,7 @@ fix(render): upload a buffer binding's whole declared range, not the first 1 MiB
 
 docs: Blue Prince hall with correct materials (#1287 milestone frame) (#1418)
 
-`0f7d9310` · [`prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp`](prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp)
+`83e98a6f` · [`prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp`](prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp)
 
 ## 2026-07-25
 
@@ -1765,7 +1765,7 @@ docs: Blue Prince hall with correct materials (#1287 milestone frame) (#1418)
 
 fix(gpu): GPU-copy the MSAA resolve into the destination persistent image (#1382)
 
-`6479cd5f` · [`prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp`](prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp)
+`af21d480` · [`prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp`](prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp)
 
 ### issue-1287-hall-bundle-tonemapped.png
 
@@ -1773,7 +1773,7 @@ fix(gpu): GPU-copy the MSAA resolve into the destination persistent image (#1382
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp`](prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp)
+`9e22c190` · [`prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp`](prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp)
 
 ### issue-1287-hall-magenta-prosper.png
 
@@ -1781,7 +1781,7 @@ docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp`](prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp)
+`9e22c190` · [`prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp`](prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp)
 
 ### issue-1287-hall-night-prosper.png
 
@@ -1789,7 +1789,7 @@ docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-night-prosper.webp`](prosper/docs/screenshots/issue-1287-hall-night-prosper.webp)
+`9e22c190` · [`prosper/docs/screenshots/issue-1287-hall-night-prosper.webp`](prosper/docs/screenshots/issue-1287-hall-night-prosper.webp)
 
 ### issue-1287-hall-nobatch-live.png
 
@@ -1797,7 +1797,7 @@ docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp`](prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp)
+`9e22c190` · [`prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp`](prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp)
 
 ### issue-1287-vestibule-prosper.png
 
@@ -1805,7 +1805,7 @@ docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-vestibule-prosper.webp`](prosper/docs/screenshots/issue-1287-vestibule-prosper.webp)
+`9e22c190` · [`prosper/docs/screenshots/issue-1287-vestibule-prosper.webp`](prosper/docs/screenshots/issue-1287-vestibule-prosper.webp)
 
 ### issue-1356-gris-title.png
 
@@ -1813,7 +1813,7 @@ docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
 feat: bring GRIS and Cobra to title with audio (#1368)
 
-`8b37be95` · [`prosper/docs/screenshots/issue-1356-gris-title.webp`](prosper/docs/screenshots/issue-1356-gris-title.webp)
+`6fd8be05` · [`prosper/docs/screenshots/issue-1356-gris-title.webp`](prosper/docs/screenshots/issue-1356-gris-title.webp)
 
 ### issue-1356-space-adventure-cobra-title.png
 
@@ -1821,7 +1821,7 @@ feat: bring GRIS and Cobra to title with audio (#1368)
 
 feat: bring GRIS and Cobra to title with audio (#1368)
 
-`8b37be95` · [`prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp`](prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp)
+`6fd8be05` · [`prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp`](prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp)
 
 ### dragon-quest-vii-title.png
 
@@ -1829,7 +1829,7 @@ feat: bring GRIS and Cobra to title with audio (#1368)
 
 docs: publish Dragon Quest VII title capture
 
-`18abdf28` · [`assets/screenshots/dragon-quest-vii-title.webp`](assets/screenshots/dragon-quest-vii-title.webp)
+`43ff887f` · [`assets/screenshots/dragon-quest-vii-title.webp`](assets/screenshots/dragon-quest-vii-title.webp)
 
 ### issue-1352-wall-shading-after.png
 
@@ -1837,7 +1837,7 @@ docs: publish Dragon Quest VII title capture
 
 fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#1354)
 
-`feb5822d` · [`prosper/docs/screenshots/issue-1352-wall-shading-after.webp`](prosper/docs/screenshots/issue-1352-wall-shading-after.webp)
+`7eb15f24` · [`prosper/docs/screenshots/issue-1352-wall-shading-after.webp`](prosper/docs/screenshots/issue-1352-wall-shading-after.webp)
 
 ### issue-1352-wall-shading-before.png
 
@@ -1845,7 +1845,7 @@ fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#13
 
 fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#1354)
 
-`feb5822d` · [`prosper/docs/screenshots/issue-1352-wall-shading-before.webp`](prosper/docs/screenshots/issue-1352-wall-shading-before.webp)
+`7eb15f24` · [`prosper/docs/screenshots/issue-1352-wall-shading-before.webp`](prosper/docs/screenshots/issue-1352-wall-shading-before.webp)
 
 ## 2026-07-24
 
@@ -1855,7 +1855,7 @@ fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#13
 
 Add Blue Prince and Terminator docs screenshots (#1342)
 
-`5e11d900` · [`assets/screenshots/blue-prince-title.webp`](assets/screenshots/blue-prince-title.webp)
+`28cc99ba` · [`assets/screenshots/blue-prince-title.webp`](assets/screenshots/blue-prince-title.webp)
 
 ### terminator-title.png
 
@@ -1863,7 +1863,7 @@ Add Blue Prince and Terminator docs screenshots (#1342)
 
 Add Blue Prince and Terminator docs screenshots (#1342)
 
-`5e11d900` · [`assets/screenshots/terminator-title.webp`](assets/screenshots/terminator-title.webp)
+`28cc99ba` · [`assets/screenshots/terminator-title.webp`](assets/screenshots/terminator-title.webp)
 
 ### terminator.png
 
@@ -1871,7 +1871,7 @@ Add Blue Prince and Terminator docs screenshots (#1342)
 
 Add Blue Prince and Terminator docs screenshots (#1342)
 
-`5e11d900` · [`assets/screenshots/terminator.webp`](assets/screenshots/terminator.webp)
+`28cc99ba` · [`assets/screenshots/terminator.webp`](assets/screenshots/terminator.webp)
 
 ### gta5-main-menu.png
 
@@ -1879,7 +1879,7 @@ Add Blue Prince and Terminator docs screenshots (#1342)
 
 docs: show GTA V current renderer state (#1339)
 
-`e6b8fb06` · [`assets/screenshots/gta5-main-menu.webp`](assets/screenshots/gta5-main-menu.webp)
+`70bab8f9` · [`assets/screenshots/gta5-main-menu.webp`](assets/screenshots/gta5-main-menu.webp)
 
 ### gta5-title.png
 
@@ -1887,7 +1887,7 @@ docs: show GTA V current renderer state (#1339)
 
 docs: show GTA V current renderer state (#1339)
 
-`e6b8fb06` · [`assets/screenshots/gta5-title.webp`](assets/screenshots/gta5-title.webp)
+`70bab8f9` · [`assets/screenshots/gta5-title.webp`](assets/screenshots/gta5-title.webp)
 
 ### blasphemous2-title.png
 
@@ -1895,7 +1895,7 @@ docs: show GTA V current renderer state (#1339)
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/blasphemous2-title.webp`](assets/screenshots/blasphemous2-title.webp)
+`795e609d` · [`assets/screenshots/blasphemous2-title.webp`](assets/screenshots/blasphemous2-title.webp)
 
 ### blasphemous2.png
 
@@ -1903,7 +1903,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/blasphemous2.webp`](assets/screenshots/blasphemous2.webp)
+`795e609d` · [`assets/screenshots/blasphemous2.webp`](assets/screenshots/blasphemous2.webp)
 
 ### dead-cells-title.png
 
@@ -1911,7 +1911,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/dead-cells-title.webp`](assets/screenshots/dead-cells-title.webp)
+`795e609d` · [`assets/screenshots/dead-cells-title.webp`](assets/screenshots/dead-cells-title.webp)
 
 ### dead-cells.png
 
@@ -1919,7 +1919,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/dead-cells.webp`](assets/screenshots/dead-cells.webp)
+`795e609d` · [`assets/screenshots/dead-cells.webp`](assets/screenshots/dead-cells.webp)
 
 ### evergate-title.png
 
@@ -1927,7 +1927,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/evergate-title.webp`](assets/screenshots/evergate-title.webp)
+`795e609d` · [`assets/screenshots/evergate-title.webp`](assets/screenshots/evergate-title.webp)
 
 ### evergate.png
 
@@ -1935,7 +1935,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/evergate.webp`](assets/screenshots/evergate.webp)
+`795e609d` · [`assets/screenshots/evergate.webp`](assets/screenshots/evergate.webp)
 
 ### messenger-title.png
 
@@ -1943,7 +1943,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/messenger-title.webp`](assets/screenshots/messenger-title.webp)
+`795e609d` · [`assets/screenshots/messenger-title.webp`](assets/screenshots/messenger-title.webp)
 
 ### messenger.png
 
@@ -1951,7 +1951,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs: refresh public README + COMPATIBILITY with screenshots and current status
 
-`958979f6` · [`assets/screenshots/messenger.webp`](assets/screenshots/messenger.webp)
+`795e609d` · [`assets/screenshots/messenger.webp`](assets/screenshots/messenger.webp)
 
 ## 2026-07-19
 
@@ -1961,7 +1961,7 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 docs(astrobot): attach natural Linux graphics captures
 
-`2a09b44d` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp)
+`c7ed9204` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp)
 
 ### issue-897-astrobot-linux-natural-opening-visible.png
 
@@ -1969,7 +1969,7 @@ docs(astrobot): attach natural Linux graphics captures
 
 docs(astrobot): attach natural Linux graphics captures
 
-`2a09b44d` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp)
+`c7ed9204` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp)
 
 ## 2026-07-18
 
@@ -1979,7 +1979,7 @@ docs(astrobot): attach natural Linux graphics captures
 
 docs(astrobot): attach Windows progress captures
 
-`815a84b2` · [`prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp`](prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp)
+`a0620f7a` · [`prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp`](prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp)
 
 ### issue-825-astrobot-windows-title.png
 
@@ -1987,7 +1987,7 @@ docs(astrobot): attach Windows progress captures
 
 docs(astrobot): attach Windows progress captures
 
-`815a84b2` · [`prosper/docs/screenshots/issue-825-astrobot-windows-title.webp`](prosper/docs/screenshots/issue-825-astrobot-windows-title.webp)
+`a0620f7a` · [`prosper/docs/screenshots/issue-825-astrobot-windows-title.webp`](prosper/docs/screenshots/issue-825-astrobot-windows-title.webp)
 
 ## 2026-07-17
 
@@ -1997,4 +1997,4 @@ docs(astrobot): attach Windows progress captures
 
 docs(astrobot): attach Linux loading screenshot
 
-`a1395e75` · [`prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp`](prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp)
+`6b45f80f` · [`prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp`](prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp)

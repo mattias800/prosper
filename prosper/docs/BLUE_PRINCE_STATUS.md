@@ -14,7 +14,7 @@ chain are now hardware-faithful offline (families 1-3 resolved 2026-07-26).
 
 Rung 3 was cleared by that route; rungs 4-6 were cleared afterwards and this section lagged behind
 them. Per tracker [#1808](https://github.com/mattias800/prosper/issues/1808) (2026-08-06, master
-`730d434e`): the live renderer is confirmed by eye, the hall has a checked-in PS5 hardware
+`bf861656`): the live renderer is confirmed by eye, the hall has a checked-in PS5 hardware
 comparison ([`screenshots/issue-1287-hall-live-vs-oracle.png`](screenshots/issue-1287-hall-live-vs-oracle.png)),
 and `blue-prince-hall` guards the restored scene using reviewed evidence from two independent
 fresh-save runs. Both `blue-prince-title` and `blue-prince-hall` are registered in
@@ -107,7 +107,7 @@ reviewed live capture is published as `assets/screenshots/blue-prince-hall.webp`
   frontend, which is the part of this paragraph that held.
 
 - **#1284 (open) — the frame-time term is backend storage-buffer upload, not textures or
-  descriptors.** Re-measured on `3a473bca` (post-#1292, post-#1703), 35 peer-free heavy windows:
+  descriptors.** Re-measured on `c79f742e` (post-#1292, post-#1703), 35 peer-free heavy windows:
   the backend submit is **165.18 ms** (was 263.33 in the issue body), and **every term that
   decomposition named has collapsed except `draw_setup`** — `readback` 79.16 -> 14.71,
   `record_upload` 22.58 -> 2.73, `gpu_wait` 29.29 -> 6.71, fence waits 61 -> 16.3, while
@@ -242,14 +242,14 @@ were confirmed as legitimate frustum culls.
 
 | commit | | non-black |
 | --- | --- | --- |
-| `f5624cf6` (23 Aug) | outer-bisect good end | 21.06% |
-| `81ea1abf` | parent of the squash | 21.04% |
-| `97ecc58a` | **the squash** (`gpu: GTA V world rendering series`) | **0.00%** |
-| `c110fcea` | parent of the sub-commit | 21.03-21.06% (4 runs) |
-| **`1b5b9471`** | **`gpu: GTA V deferred-mip rendering`** | **0.00% (3/3 runs)** |
+| `dd38445e` (23 Aug) | outer-bisect good end | 21.06% |
+| `d011eb54` | parent of the squash | 21.04% |
+| `e63f4038` | **the squash** (`gpu: GTA V world rendering series`) | **0.00%** |
+| `d3cec231` | parent of the sub-commit | 21.03-21.06% (4 runs) |
+| **`ee0d57c4`** | **`gpu: GTA V deferred-mip rendering`** | **0.00% (3/3 runs)** |
 
-`97ecc58a` is a squash; `refs/pull/2996/head` still holds its 8 original commits and was bisected
-again to reach `1b5b9471` (+1386/−141, 29 files).
+`e63f4038` is a squash; `refs/pull/2996/head` still holds its 8 original commits and was bisected
+again to reach `ee0d57c4` (+1386/−141, 29 files).
 
 ### RETRACTED: "the culprit skips the colour readback"
 
@@ -261,8 +261,8 @@ different pass counts per target, so two 60-line windows covered different popul
 counts were not comparable. Re-measured with identical probes on both builds, at the same call site:
 
 ```
-parent  c110fcea:  23 x gpx=0,  7 x gpx=8294400
-culprit 1b5b9471:  23 x gpx=0,  7 x gpx=8294400
+parent  d3cec231:  23 x gpx=0,  7 x gpx=8294400
+culprit ee0d57c4:  23 x gpx=0,  7 x gpx=8294400
 ```
 
 Instrumenting the backend's own decision (`readback_color0`) agrees: **7 readbacks of 30 passes in
@@ -338,10 +338,10 @@ into swap. Kill by explicit PID (never `pkill`).
 
 ### Constraint on any fix
 
-`97ecc58a` is what made **GTA V** render its world. A revert is not acceptable — the fix must keep
+`e63f4038` is what made **GTA V** render its world. A revert is not acceptable — the fix must keep
 both titles working.
 
-## Where the gameplay frame actually goes (2026-08-28, Linux/AMD, `aced0703`)
+## Where the gameplay frame actually goes (2026-08-28, Linux/AMD, `3f5460d0`)
 
 Measured on an **interactive human-played session** at the Bedroom (Rank 2), ~20.7 fps — the owner
 pressed F8 and F9 in-game and the live process was sampled with `perf` while it ran. Three
@@ -443,8 +443,8 @@ neutral here.
 
 
 **The pure-black frame on master, 2026-08-28 (#3089, fixed by the PR that adds this row).** The
-cause is one line in `97ecc58a` ("gpu: GTA V world rendering series", the squash of #2996; the
-pre-squash branch commit is `1b5b9471`, which is NOT on master -- cite the squash, or a fresh clone
+cause is one line in `e63f4038` ("gpu: GTA V world rendering series", the squash of #2996; the
+pre-squash branch commit is `ee0d57c4`, which is NOT on master -- cite the squash, or a fresh clone
 cannot resolve it). HTILE-driven depth/stencil invalidation was suppressed whenever the guest write
 carried the `gpu-preserving` origin, so Blue Prince's retained depth was never discarded and stale
 depth rejected the whole scene.
@@ -454,7 +454,7 @@ for.** `GTA5_STATUS.md` asks whether "a write that provably preserves guest byte
 invalidate a detached Vulkan depth image" and answers **"yes, it must -- byte equality with guest
 memory says nothing about equality with a renderer-owned image the renderer has since drawn into,
 and *Dead Cells* #611 is the counterexample where sparing it makes gameplay geometry disappear.
-That is why no preservation policy is proposed here."** `97ecc58a` shipped that preservation policy
+That is why no preservation policy is proposed here."** `e63f4038` shipped that preservation policy
 anyway. Read that passage before proposing any variant of it again.
 
 **Do not re-derive this by reverting hunks of that commit** -- seven candidate mechanisms were
@@ -578,7 +578,7 @@ compared against each other; the project owner watched a live run and said it pl
 
 **It recurred on 2026-08-08, so here is the arithmetic that produces the wrong number, measured.**
 An independent Linux cross-check (`prosper-app`, `SDL_VIDEODRIVER=offscreen`, default switches,
-`PROSPER_IME_AUTOKEY=1`, 252 s, master `53273364`) puts hard figures on the two failure modes:
+`PROSPER_IME_AUTOKEY=1`, 252 s, master `ba31e11b`) puts hard figures on the two failure modes:
 
 | window | flips/s | presents/s | draws/s |
 | --- | ---: | ---: | ---: |

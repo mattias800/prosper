@@ -181,7 +181,7 @@ Burns a small annotation into the top-left of every PNG the run writes:
 
 ```
 3.4 FPS  (59.8 PRESENTED)  3840X2160
-PPSA26414  SAMPLE 7  T+42.0S  BUILD 966391df
+PPSA26414  SAMPLE 7  T+42.0S  BUILD cb80f210
 ROUTE REACH-STAGE1
 ```
 

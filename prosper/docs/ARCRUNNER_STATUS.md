@@ -131,7 +131,7 @@ means construction/later mutation remains open, and any unrelated value means re
 The missing page-side reference is a concrete lifetime seam, not yet proof that external ownership
 fails to cover the page's consumption interval.
 
-One ordinary, unsuppressed rendered run on current master (`ce258440`) tried to recover those two
+One ordinary, unsuppressed rendered run on current master (`7ca135e1`) tried to recover those two
 objects with the existing generic fault-memory peek. It was **void for this question**: after about
 13 seconds the `AudioMixerRende` worker jumped to null first, so the process exited before reaching
 `eboot+0x117811f`. The peek fired correctly but sampled the audio function's unrelated stack layout;
@@ -142,7 +142,7 @@ does not attribute the null audio call to that wait. The run had exact zero pre/
 and terminated naturally with worker-fault exit 90; no suppression or skip was armed.
 
 A second ordinary arm on the exact documentation revision `bdae813d` (runtime code unchanged from
-`ce258440`) was also **void for the sibling-lifetime question**, for a different reason. After 13.4
+`7ca135e1`) was also **void for the sibling-lifetime question**, for a different reason. After 13.4
 seconds the usual allocator chain won the race first: `RenderThread 1` faulted at
 `eboot+0x127e8eb` while dereferencing `0x30016000`, alongside the guest fatal
 `FMallocBinned3 Attempt to realloc an unrecognized block 2000000001`. A subsequent null fault was
@@ -153,7 +153,7 @@ seconds, had exact zero pre/post process censuses, and used no suppression or sk
 that ordinary runs can lose to at least two competing terminal paths before the target sibling; it
 does not make the sibling absent or weaken the static lifetime seam.
 
-The first address-filtered arm on exact revision `c0964271` was likewise **void**, while validating
+The first address-filtered arm on exact revision `18f2c319` was likewise **void**, while validating
 the new apparatus far enough to use again. The hardware execute breakpoint armed at
 `eboot+0x117811f` on the primary guest boundary and on every logged worker boundary, with the exact
 `r14 == 0` gate and a one-record cap. No `[hwbp]` hit or `[hwbp-probe]` record occurred. After about
@@ -184,7 +184,7 @@ blanketing the target, not content and not a guest clear. See the `## Ruled out`
 
 ## Rung-1 pass: what the presented frames actually contain
 
-Three bounded runs on `9dcb6c4b`, ordinary and unsuppressed
+Three bounded runs on `6a40d191`, ordinary and unsuppressed
 (`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), each with exact zero pre/post process
 censuses and no suppression, skip, or shim. Timing is deliberately not quoted: peer lanes shared the GPU.
 
@@ -257,7 +257,7 @@ is wrong rather than missing.
 ## 2026-08-05: the black composite is the movie, and the movie is black there
 
 This section **supersedes the rung-1 framing above**. The three findings below were taken on
-`c3614f51` with `boot_trace`, ordinary and unsuppressed
+`91bd49ce` with `boot_trace`, ordinary and unsuppressed
 (`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), three runs, exact zero pre/post process
 censuses, no suppression, skip, or shim. See [#2011](https://github.com/mattias800/prosper/issues/2011).
 
@@ -290,7 +290,7 @@ the raw guest bytes of every sampled texture. The movie's luma and chroma planes
 byte-correct.
 
 > **Do not re-measure this and read a difference as a regression.** These counts were taken on
-> `c3614f51`, when the pitch padding was `memset` to `0`. #2032 changed the padding fill to
+> `91bd49ce`, when the pitch padding was `memset` to `0`. #2032 changed the padding fill to
 > limited-range black (`Y=0x10`, `U=V=0x80`) — because `Y=0, U=V=0` is not black but mid green
 > (~`(0, 136, 0)`), which with the coded-extent `width` would have shown as a green right-edge
 > stripe. On current master the same dump therefore reads **2,211,840 of 2,211,840** luma bytes
@@ -460,7 +460,7 @@ Durable run records are in the #1226 comments for the
 
 ## What the `addr=(nil)` fault actually dereferences
 
-Measured on current master (`c9e2588e`), ordinary and unsuppressed
+Measured on current master (`99e6c0d9`), ordinary and unsuppressed
 (`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), with the new `PROSPER_LAZY_COMMIT_STRICT`
 discriminator. **Three terminal paths compete for the same run**, so a single run per arm cannot A/B
 anything on this title — see the `## Ruled out` row.
@@ -509,7 +509,7 @@ comparable.
 The tripwire is now split into a *decision* predicate (unchanged; what the default guards use) and a
 *report* predicate over the whole guest-VA window, with `window=narrow|wide-only` on every
 `FORGE-STOMP` line and a running `FORGE-TRIP-TOTALS`. That makes the following a **real negative**
-rather than an unobtainable one — one bounded run on `c9e2588e` + this change,
+rather than an unobtainable one — one bounded run on `99e6c0d9` + this change,
 `PROSPER_FORGE_TRIP=1`:
 
 ```text
@@ -621,7 +621,7 @@ The section above left this title's threshold bracketed only at `(0, 1500]` and 
 `(500, 1500]` figure from *Crisis Core*. **The 500 us arm has now been run here, and ArcRunner's own
 bracket is `(500, 1500]` — the same one.** [#2084](https://github.com/mattias800/prosper/issues/2084).
 
-Twelve arms, four doses, three arms per dose, **one binary** (built from `f080fc23`; the same
+Twelve arms, four doses, three arms per dose, **one binary** (built from `c3b362f6`; the same
 `sha256` recorded in every arm's log header), ArcRunner's own `boot_trace` route, a 120 s bound, and
 one endpoint scored the same way for every arm. Two design points beyond the method in #2084. The
 doses were **interleaved** — 0, 500, 1500, 3000, repeated three times — rather than run in per-dose
@@ -824,7 +824,7 @@ inert (`submit_stall()` returns early on 0), but unset is the default route exac
 
 ## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE pointer
 
-Measured on `66eaf77b` plus the two instruments this section introduces, nine ordinary unsuppressed
+Measured on `a745da82` plus the two instruments this section introduces, nine ordinary unsuppressed
 `boot_trace` runs (`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), exact zero pre/post process censuses, no
 suppression, skip or shim. See [#1226](https://github.com/mattias800/prosper/issues/1226).
 
@@ -1231,7 +1231,7 @@ Nothing in this pass measured that, and the throughput inversion above says the 
 
 ## 2026-08-06 (arc6): the title screen is reached, and the throttle rescues by DELAY, not by lock hold
 
-Three results, on `8ab70b74` plus the discriminator this section adds. All three runs of every arm
+Three results, on `bf69a14e` plus the discriminator this section adds. All three runs of every arm
 used `PROSPER_GUEST_ARGS= PROSPER_RENDER=1` with `PROSPER_RENDER_SCALE=1` and
 `PROSPER_RENDER_EVERY=1` at their defaults, and no suppression, skip, guard or shim.
 
@@ -1522,7 +1522,7 @@ were exact zero before and after all six arms.
 
 Three of the pre-13 titles are **rung-6, snapshot-guarded** (Dead Cells, Blasphemous 2, Alex Kidd),
 so the gate is load-bearing for the guarded matrix and removing it must be scored against it. The
-gate's own provenance carries no recorded evidence — it arrived inside `474af058`, a large DQ7 commit
+gate's own provenance carries no recorded evidence — it arrived inside `cb0ed8ca`, a large DQ7 commit
 with a one-line message, and `#2031` kept it while explicitly moving the *register table* off the
 same gate — but a numeric improvement is not evidence of a correct model. **The next step is a
 cross-title snapshot pass with the gate removed, plus review; that is what stands between this title
@@ -1600,7 +1600,7 @@ Do not re-derive these without contradictory new evidence.
 | Suppressing the label writes prosper can detect is enough to get the title past the fault | It is not. The maximal arm `PROSPER_MB3_FREELIST_GUARD=1 PROSPER_GENERATION_GUARD=1 PROSPER_REL1_WAF_GUARD=1 PROSPER_NONHEAP_PTR_GUARD=1`, with every lever independently witnessed (**26** `MB3-` suppressions, **3–10** `REL-GENERATION-CHANGED-STALE-SUPPRESS`, **1** `NONHEAP-PTR-DECLINE`), still faults on `RHIThread` in the same window and still delivers **31** video frames with 31 successes — the same as an unguarded run. The label writes compose the fault *value*; they are not the whole blocker. A fix has to address the block-lifetime seam. | #1226 |
 | The rung-1 blocker is a rendering, recompiler, AvPlayer or composite defect somewhere in prosper's graphics path | It is none of those. With `PROSPER_SUBMIT_STALL_US=1500` the title renders its **entire intro cinematic** in 4K — a nebula and the ringed station captioned *TITAN-CLASS SPACE STATION "THE ARC"*, a rainy neon street with a character and reflections, and a *POPULATION: 10 MIL* text card — with **0 of 4** stalled runs faulting against **17 of 17** default runs, 1,901 of 1,908 `GetVideoDataEx` calls succeeding against 31, and ~26.4 M of 33.2 M bytes nonzero per presented frame against RGB 0. Frames opened, not just measured: `assets/screenshots/arcrunner-intro-space-station.webp`, `assets/screenshots/arcrunner-intro-city.webp`. Every graphics subsystem needed to produce this cinematic runs — geometry, text, composition and presentation are all correct — and the blocker is a submit-timing race. Not a claim that the graphics path is defect-free: the same frames carry a chroma-plane colour fault (#2085). | #1226, #1945 |
 | The ArcRunner corruption is title-specific, so it needs a title-specific fix | The same lever gives the same answer on **Crisis Core** (`PPSA07809`), whose dose-response is 0/3 at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us. **The shared finding was originally the direction only, because ArcRunner had been run at 1500 and 3000 us alone — that caveat is now retired: this title's own twelve arms give 0/3, 0/3, 3/3, 3/3 at the same four doses, so its bracket is `(500, 1500]`, identical to Crisis Core's** (#2084; see § *2026-08-06: the submit-duration dose-response*). Pend-queue residency on Crisis Core peaks at 3 ms, so "our completion writes land late" is false on both titles. Two titles, one lever, one measured threshold: this is a property of prosper's submit timing, not of either guest. It also agrees with this document's own `PROSPER_EOP_WRITE_SYNC` null. It is still not a general law — a third title owes its own dose-response. | #1945, #1894, #1226, #2084 |
-| ArcRunner's `(500, 1500]` threshold is Crisis Core's, imported rather than reproduced, and must be treated as an untested assumption until someone runs the 500 us arm here | The 500 us arm was run: **0 of 3 survived**, all three faulting in the already-recorded family (two at `0x30016000`, one at `rip=0x0`) at 11.6–17.9 s with 31–37 video frames. With 3/3 surviving at 1500 us, this title's bracket is measured, not inherited. Twelve arms, four doses, one binary from `f080fc23`, doses interleaved so load drift cannot align with dose, no passive observer armed (instrument trap 104), and a peer-process census of zero before and after each arm. | #2084, #1226 |
+| ArcRunner's `(500, 1500]` threshold is Crisis Core's, imported rather than reproduced, and must be treated as an untested assumption until someone runs the 500 us arm here | The 500 us arm was run: **0 of 3 survived**, all three faulting in the already-recorded family (two at `0x30016000`, one at `rip=0x0`) at 11.6–17.9 s with 31–37 video frames. With 3/3 surviving at 1500 us, this title's bracket is measured, not inherited. Twelve arms, four doses, one binary from `c3b362f6`, doses interleaved so load drift cannot align with dose, no passive observer armed (instrument trap 104), and a peer-process census of zero before and after each arm. | #2084, #1226 |
 | ~~The throttle rescues the title by giving prosper time to catch up inside the guest's build-to-submit interval~~ — **NOT ESTABLISHED; this row is withdrawn as filed** | The first revision claimed the opposite (that the interval is *longer* when the arm survives) from a pooled sample of every ring-bearing diagnostic line. That sample is **selected for the condition under test**: rings are only printed inside diagnostics that embed `label_hist_report`, and a dying arm's pairs come almost entirely from its 11–27 `SUSPECT-REL1-OVERLAP` lines, a population a surviving arm has **zero** of. Restricted to the `WaitRegMem` rings both classes have, the medians are 282–413 ms over **29** pairs in the dying arms against 347–584 ms over **363** in the surviving ones — not shorter, but 2–8 pairs per dying arm cannot falsify anything. What stands is only the absence of evidence for the shortening story. `CONFIDENCE: LOW`; needs a per-fold instrument. Caught in review of #2091, not by the author. | #2084, #1226 |
 | prosper's deferred-stream barrier model (#312) is in the default path, so the build-to-exec gap on this title is prosper holding the packet | `PROSPER_WAIT_DEFER` is **opt-in and default OFF** (`src/gpu/pm4/command_processor.cpp`). On the default route prosper barrels through an unsatisfied `WAIT_REG_MEM` with the "dependency violated" log and defers nothing — confirmed directly in all twelve dose arms, where the `dependency violated` count equals the unsatisfied-wait count exactly (3/3, 4/4, 2/2, 1/1, 2/2, 4/4, 40/40, 36/36, 28/28, 40/40, 40/40, 40/40) and the barrier model's own marker `pausing queue (deferred effects)` appears **0 times in all twelve**, against 1 in each of the three `PROSPER_WAIT_DEFER=1` arms. The ~250–580 ms build-to-exec gap is therefore entirely the **guest's own** build-ahead. | #2084, #1226 |
 | Honouring the guest's `WAIT_REG_MEM` barriers instead of barrelling through them fixes the title — the obvious non-throttle candidate, and the one #312's original 5/5 evidence points at | `PROSPER_WAIT_DEFER=1`, three arms on the same binary and route with no throttle: **3 of 3 faulted**, at 11.4/13.6/11.4 s with 61/34/35 video frames, all in the `addr=(nil) rip=0x0` `AudioMixerRende` class, with `SUSPECT-REL1-OVERLAP` still reaching ordinals 25 and 22. The lever is witnessed rather than assumed — every arm logs `WaitRegMem … — pausing queue (deferred effects)` and one logs `DEFER TIMEOUT #1 after 1000ms`, while no dose arm carries the `pausing queue (deferred effects)` marker at all — 0 of 12 against 3 of 3. Do not substitute a bare `defer` grep for that marker: the six surviving dose arms each contain one unrelated `layered image deferred to #657` line. This reproduces on ArcRunner the verdict `command_processor.cpp` already records from ~20 DOLL runs: the model removes the ordering-violation leg and a wait-order-independent leg dominates, and deferral latency makes the title die sooner. | #2084, #312, #1226 |
@@ -1608,9 +1608,9 @@ Do not re-derive these without contradictory new evidence.
 | `PROSPER_AVP_LOG=1` enables the AvPlayer log, so a run with it set and zero `video-ex` lines means the movie never started | `avp_log()` reads **`PROSPER_AVPLOG`** (`src/hle/service/hle_service.cpp:978`), not `PROSPER_AVP_LOG`. A max-guard arm here reported `video-ex calls: 0` purely because the wrong switch was passed; re-run with `PROSPER_AVPLOG=1` it reported **31**. Two arms were void this way before it was caught. Pass `PROSPER_AVPLOG=1`. | #1226 |
 | `PROSPER_PRESENT_NZLOG=1` on its own reports presented-frame content under `boot_trace` | It reports nothing. A run with it set produced **zero** `[render-nz]` lines over ~100 presented frames: the line is gated on `!px.empty()` in `frontends/shared/live/live_renderer.cpp`, `px` comes from `selected_pixels`, and the registrar announced `dump=0` — the readback that fills it is opt-in and this switch does not request it. A silent run is **not** "every frame was black". | #1226 |
 | The `addr=(nil)` faults show that page `0x2100000000` is a **legitimately committed guest region whose contents prosper lost** — [#1944](https://github.com/mattias800/prosper/issues/1944) reading 1, argued from "two *different* guest code sites first-touch the same 64 KiB page; a wild pointer would not repeat like that" | It is reading 2 (a wild read masked), and the repetition is a property of the value, not the mapping. `PROSPER_LAZY_COMMIT_STRICT=1` moves the fault to the loading instruction: `[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221`, then `sig=11 addr=0x2100000041 rip=eboot+0x117e221`. The load is `mov rdi,[r12+rcx*8]` / `mov rcx,[rdi+0x40]` with `rdi=0x2100000001`, and `0x40` is added **without masking the low bit**, so `rdi` is a plain corrupt pointer. **Any** `0x21000000xx` value lands in page `0x2100000000` — which is exactly the shape a heap pointer takes when its low dword is lost — so both recorded sites hitting that page is expected, not anomalous. Exactly one lazy-commit event occurs per affected run. Do not spend another arm treating the page as a commit-protocol gap on this title. | #1944, #1226 |
-| The `0x2100000001` that the terminal `addr=(nil)` fault dereferences is composed by prosper's own `RELEASE_MEM`/`WRITE_DATA` fence, the way `0x2000000001` is — and `ptr_like()`'s stale upper bound (exactly `0x2100000000`) is hiding that population from the tripwire and from both guards | The blind spot is **real but empty on this title**, on both branches. With the tripwire's report predicate widened to prosper's whole guest-VA window, one bounded run on `c9e2588e` ends at `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0`: none of the 256 reported candidates is wide-only, every one has `pre=0x2000000000`, and the absence of a `#512` totals line on the dense every-256 schedule bounds the run's population below 512. The sibling `REL1-LIVE` branch — a fence over a pre whose low dword is a real pointer half, which is what would turn a live `0x2100e05140` into exactly `0x2100000001` — was checked separately with `PROSPER_PTRLIKE_WIDE=1`, which arms both guards over the wide window and prints `PTRLIKE-WIDE ARMED` so the lever is witnessed: two runs, `SUSPECT-REL1-LIVE` count **0**, terminal fault unchanged. So prosper's label writes are excluded as the author of the value that terminates the run. Two limits: `report_suspect_write()` has emitted no line of any kind on this title across nine runs, so the `REL1-LIVE` zero has no in-run positive control (it is consistent with the REL1 population being homogeneous, not independently proven); and this does **not** clear the narrow window for other titles — it is still stale, and the lever exists to A/B flipping it. | #1226 |
+| The `0x2100000001` that the terminal `addr=(nil)` fault dereferences is composed by prosper's own `RELEASE_MEM`/`WRITE_DATA` fence, the way `0x2000000001` is — and `ptr_like()`'s stale upper bound (exactly `0x2100000000`) is hiding that population from the tripwire and from both guards | The blind spot is **real but empty on this title**, on both branches. With the tripwire's report predicate widened to prosper's whole guest-VA window, one bounded run on `99e6c0d9` ends at `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0`: none of the 256 reported candidates is wide-only, every one has `pre=0x2000000000`, and the absence of a `#512` totals line on the dense every-256 schedule bounds the run's population below 512. The sibling `REL1-LIVE` branch — a fence over a pre whose low dword is a real pointer half, which is what would turn a live `0x2100e05140` into exactly `0x2100000001` — was checked separately with `PROSPER_PTRLIKE_WIDE=1`, which arms both guards over the wide window and prints `PTRLIKE-WIDE ARMED` so the lever is witnessed: two runs, `SUSPECT-REL1-LIVE` count **0**, terminal fault unchanged. So prosper's label writes are excluded as the author of the value that terminates the run. Two limits: `report_suspect_write()` has emitted no line of any kind on this title across nine runs, so the `REL1-LIVE` zero has no in-run positive control (it is consistent with the REL1 population being homogeneous, not independently proven); and this does **not** clear the narrow window for other titles — it is still stale, and the lever exists to A/B flipping it. | #1226 |
 | `{small nonzero high dword, low dword ≤ 1}` is by itself a prosper-forge signature, so a value of that shape found in guest memory attributes the write to us | It is also **ordinary guest data**. A fault-time dump of a live guest table (`PROSPER_FAULTMEM=1`, register `r12`) shows 16-byte `{pointer, metadata}` entries whose metadata qword is a constant `0x0000000400000002`, interleaved with live pointers `0x2000e03840` / `0x2000e03830` / `0x2100e05140`. `0x400000001` — the value at the `AudioMixerRende` `rip=0x0` jump, and the one #1945's brief quotes — has that same `{4, n}` shape. Value-shape alone therefore cannot attribute a `<high>_0000000n` qword to a GPU write; only a write-side record (the attribution ring, or the forge tripwire's `pre`) can. | #1226, #1945 |
-| A one-run-per-arm comparison can A/B a candidate fix on this title | **Three terminal paths compete for every run** and which one wins is a race: measured on `c9e2588e`, the allocator chain (`addr=0x30016000 rip=eboot+0x127e751`), the lazy-commit-masked null (`rip=eboot+0x117e225`, one lazy-commit event), and an `AudioMixerRende` jump to `rip=0x0` with `rax=0x400000001` each terminated at least one of six runs, and one run produced two faults. Consequently the `PROSPER_EOP_WRITE_SYNC=1` and `PROSPER_REL1_WAF_GUARD=1` arms run here are **non-discriminating, not negative**: each was a single run, each ended on the same `AudioMixerRende` null jump as its baseline at ~16 presented frames. Any future arm needs ≥3 runs and a quantitative progress metric (presented frames, delivered video frames, time to first fault), not the identity of the terminal fault. | #1226 |
+| A one-run-per-arm comparison can A/B a candidate fix on this title | **Three terminal paths compete for every run** and which one wins is a race: measured on `99e6c0d9`, the allocator chain (`addr=0x30016000 rip=eboot+0x127e751`), the lazy-commit-masked null (`rip=eboot+0x117e225`, one lazy-commit event), and an `AudioMixerRende` jump to `rip=0x0` with `rax=0x400000001` each terminated at least one of six runs, and one run produced two faults. Consequently the `PROSPER_EOP_WRITE_SYNC=1` and `PROSPER_REL1_WAF_GUARD=1` arms run here are **non-discriminating, not negative**: each was a single run, each ended on the same `AudioMixerRende` null jump as its baseline at ~16 presented frames. Any future arm needs ≥3 runs and a quantitative progress metric (presented frames, delivered video frames, time to first fault), not the identity of the terminal fault. | #1226 |
 | The `PROSPER_MB3WATCH` per-thread head watch reports nothing, so the bin head is not being stomped | A DIFFERENT instrument from the `ptr_like()` upper bound two rows above — that one is `command_processor.cpp`'s report predicate, this one is the watchpoint's arm hook, and widening either says nothing about the other. The arm hook (`exec_image_linux.cpp`) filtered on a stale DOLL-era `[0x20_0000_0000, 0x21_0000_0000)` window while every current title's per-thread cache base is `0x30_xxxx_xxxx` — ArcRunner's is `0x3152350000`, Crisis Core's `0x3001af0000`. It therefore **armed nothing at all**, printed nothing, and read exactly like "armed and saw no write" — the same class as the #1998 finding for `PROSPER_WATCH_LABEL`/`PROSPER_WATCH_HOT`. Window widened to `[0x20..0x40)`, and its report trigger widened from the byte-shift value shape to the structural "a head must be 0 or a 0x20-aligned mapped node". Any null quoted from this instrument before 2026-08-06 is **void, not negative**. | #1945, #1998 |
 | Both prosper-authored halves of the forged pointer are jointly necessary for the corruption (the open question left by the *Suppressing the forging fence* row above; that ArcRunner arm was read as settling it) | Run on **Crisis Core** (`PPSA07809`), a cheaper reproducer for the same family, with the same lever and a valid census (`candidates=127 suppressed=127 landed=0`, `INIT-SUPPRESS` past #4096): the guest allocator is **still** corrupted and still faults at its bundle-list pop, with `0x0002400100024001` in the bin head. Separately, the "our completion writes land late in a recycled block" premise underneath this whole line was measured on that title and is **false**: pend-queue residency peaked at **3 ms** over 5,632 writes, none above 20 ms (`PROSPER_PEND_AGE`). What *does* decide the outcome there is the DURATION of the guest's own submit call, measured as a dose-response over a plain `nanosleep` in the submit fold: **0/3 survive at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us** (0/6 vs 6/6, Fisher two-tailed p ≈ 0.002), threshold between 500 and 1500 us. That is the controlled form of the timing-not-code conclusion `OREGON_TRAIL_STATUS.md` reached from nine arms of PPSA19244. | #1945, #1894 |
 | The DMA-init generation question is **blocked** because #1756 removed the packet slot `dma_build_pre_changed()` reads — recorded as the concrete next step and as unreachable in the same paragraph | It was never blocked. The build snapshot the check needs already existed **out of band**: `prosper_fence_journal_record()` stores a per-packet build-time target and content, keyed by the packet's guest address, and the `RELEASE_MEM` / `WRITE_DATA` / `WAIT_REG_MEM` legs all called it — the DMA-init builder was the only one that did not. Adding that one call, plus `PROSPER_DMA_INIT_GEN=1` to read it back at exec time, answers both halves (generation depth and build→exec drift) with no packet-format change and no content predicate. Generalise: before recording a question as blocked on a removed field, check whether a sibling path already records the same fact for its own reasons. | #1226, #2084 |
@@ -1628,7 +1628,7 @@ Ordered for **rung 1** (any real graphics), which the terminal faults do not blo
    by the fault at 43-54. Nothing else stands between this title and real visible graphics, and the
    ownership question in #1945 is the live part of it. Note this **reverses** the standing guidance
    that redirected the lane away from the fault — see the withdrawn `## Ruled out` row.
-2. ~~Re-check the movie surface extent after the `AvPlayerVideoEx` crop fix.~~ **CONFIRMED on `b97d0bb3`
+2. ~~Re-check the movie surface extent after the `AvPlayerVideoEx` crop fix.~~ **CONFIRMED on `c2685e8c`
    — do not re-run this.** The measurement and its numbers are in
    § *The movie surface extent, measured before and after the `AvPlayerVideoEx` fix* above: the
    `1792x1080` movie surfaces go to **zero** and `1920x1080` ones appear, so the guest does use the

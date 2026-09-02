@@ -4,7 +4,7 @@ Unreal Engine 4. **Rung 0** as of 2026-08-22. The title boots, links every modul
 renderer and issues real GPU work, but **no frame with content has ever been observed**: it dies in
 its startup movie roughly five seconds in, before anything but a flat clear reaches the screen.
 
-First brought up 2026-08-22 from `b5aeefbf`. No prior work, no tracker, no `COMPATIBILITY.md` row
+First brought up 2026-08-22 from `fc0076b5`. No prior work, no tracker, no `COMPATIBILITY.md` row
 existed before that date.
 
 ## Where it stands
@@ -56,7 +56,7 @@ from this title's bytes beyond the fields it happens to read.
 
 [#1658](https://github.com/mattias800/prosper/issues/1658) closed asking for exactly this: "a title
 that calls it, traced with the struct it passes and the `size` field it sets." `PPSA06367` is that
-title. Measured on `b5aeefbf`:
+title. Measured on `fc0076b5`:
 
 - The structure is **0x78 (120) bytes**, and its **first field is a `u64` size** set to `0x78`
   (`mov QWORD PTR [rsp+0x110],0x78`). The guest zeroes `+0x08 .. +0x77` before the call, so every

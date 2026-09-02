@@ -2,13 +2,13 @@
 """Allocate the next free row number for a numbered doc table, against master AND every open PR.
 
 WHY THIS EXISTS. The instrument-trap table in `docs/GAME_COMPAT_ORCHESTRATION.md` is appended to by
-several lanes at once, and the obvious allocation -- read the highest row on `origin/master`, add
+several lanes at once, and the obvious allocation -- read the highest row on `origin/main`, add
 one -- is wrong the moment another lane pushes. It is not wrong *rarely*: #1729 records four
 collisions in one day, and on 2026-08-17 #2574 and #2581 both read 181 and both wrote 182. Reading
 the max more carefully cannot fix that, because the competing claim was never on master to be read;
 it was sitting in an open PR.
 
-So this reads the same table out of `origin/master` and out of the head of every open pull request,
+So this reads the same table out of `origin/main` and out of the head of every open pull request,
 and reports the highest number each one holds. The next free number is one above the maximum of all
 of them.
 
@@ -287,7 +287,7 @@ def main() -> int:
     ap.add_argument("--table-header", default=DEFAULT_HEADER,
                     help=f"select the table whose header contains this (default {DEFAULT_HEADER!r})")
     ap.add_argument("--limit", type=int, default=60, help="how many open PRs to scan (default 60)")
-    ap.add_argument("--base", default="origin/master", help="the merged baseline (default origin/master)")
+    ap.add_argument("--base", default="origin/main", help="the merged baseline (default origin/main)")
     ap.add_argument("--no-fetch", action="store_true", help="skip `git fetch` (the base may be stale)")
     ap.add_argument("--quiet", action="store_true", help="print only the next free number")
     args = ap.parse_args()

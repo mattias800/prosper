@@ -11,6 +11,6 @@ correctly coloured but spatially scrambled, which reads as a geometry or UV prob
 looks like the right image cut into blocks, start here.
 
 Layouts are generic where possible, and a title-specific tiling special case is a strong signal the
-general rule is wrong. Worked example: #1578 (`336ea104`) fixed a wrong block-to-element multiplier
+general rule is wrong. Worked example: #1578 (`13908a66`) fixed a wrong block-to-element multiplier
 in the **shared generic** path and resolved a whole title at once — the defect was in the rule
 everyone used, not in a per-title hack.

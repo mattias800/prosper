@@ -183,7 +183,7 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--base", help="git ref to diff against (e.g. origin/master)")
+    ap.add_argument("--base", help="git ref to diff against (e.g. origin/main)")
     ap.add_argument("--name-status-file", help="a file holding `git diff --name-status` output")
     ap.add_argument("--github", action="store_true",
                     help="emit ::error:: annotations so failures surface on the Actions summary")

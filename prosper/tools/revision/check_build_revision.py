@@ -169,8 +169,8 @@ def main() -> int:
                         help="check a screenshot manifest's recorded revision instead")
     parser.add_argument("--binary", type=pathlib.Path, action="append", default=[],
                         help="executable to certify (repeatable); defaults to the known frontends")
-    parser.add_argument("--against", default="origin/master",
-                        help="git ref the build must match (default: origin/master)")
+    parser.add_argument("--against", default="origin/main",
+                        help="git ref the build must match (default: origin/main)")
     parser.add_argument("--allow-stale", action="store_true",
                         help="report loudly but exit 0 (deliberate pre-fix A/B arms)")
     parser.add_argument("--strict-dirty", action="store_true",

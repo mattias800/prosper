@@ -246,7 +246,7 @@ that title happened to call.
 | builder absent as well | 34 | left alone: a size would be a guess, and the builder call fails anyway |
 
 (Count the delta and the total separately: **22 NIDs are added**, bringing the answered total from 6
-to 28. `git diff 928b21f5..HEAD -- prosper/src/hle/graphics/hle_agc.cpp | grep -c '^+ *RN(".*get_size'` is 22,
+to 28. `git diff 2a0c1934..HEAD -- prosper/src/hle/graphics/hle_agc.cpp | grep -c '^+ *RN(".*get_size'` is 22,
 and the counter-arm — reverting only those registrations — fails exactly 22 assertions.)
 
 The fix needs no hardware size and cannot be wrong in the dangerous direction: the guest reserves

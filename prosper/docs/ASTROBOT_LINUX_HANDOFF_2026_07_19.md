@@ -18,7 +18,7 @@ headless/app behavior.
 ## Executive status
 
 - Start from remote `master`. At final handoff publication it is
-  `f13b90cf88834a9ce963a04a74715aab0fada41b`, including PR #1030 plus the subsequently merged
+  `9d3c02e3eef467345e72ce2b391ad572d411ad02`, including PR #1030 plus the subsequently merged
   compute-shader and AudioIn work in PRs #1053 and #1055.
 - The handoff branch is `fix/issue-1054-astro-pcrel`. It is already pushed and claimed on #1054.
 - Astro reaches `title_controller_ship` and the title level starts on the established Linux diagnostic
@@ -45,7 +45,7 @@ headless/app behavior.
 
 At the time this handoff was written:
 
-- `origin/master`: `f13b90c` (`Merge pull request #1055 ... audioin-core`)
+- `origin/master`: `9d3c02e` (`Merge pull request #1055 ... audioin-core`)
 - active branch: `fix/issue-1054-astro-pcrel`
 - active issue: #1054, labeled `bug`, `area:infra`, `in-progress`, and `agent:astro-title`
 - no other open PR carries the `agent:astro-title` label
@@ -155,8 +155,8 @@ volume unnecessarily.
 
 ## PR #1030: the completed predecessor
 
-PR #1030 merged as `9c63435`. Its branch exact head was
-`b5f883ae11ce4f0ed92100f8f8f27909b156d537`.
+PR #1030 merged as `6c43138`. Its branch exact head was
+`23f8cc4589f4a20982a5eaa7ef4e422c20d76226`.
 
 The title PS instruction at dword PC 137 is:
 
@@ -182,7 +182,7 @@ Verification recorded on the exact PR head:
 - Blasphemous II: 98/98 qualifying and structural/nonblack, 97 pixel changes
 
 The final merge combined #1030 with later master shader changes (#1041 and #1044). Those merges were
-textually clean, but the full four-title snapshot matrix was not rerun on merge commit `9c63435`.
+textually clean, but the full four-title snapshot matrix was not rerun on merge commit `6c43138`.
 Run current-master/current-branch guards before publishing the next renderer change.
 
 ## Exact PC-relative scalar-table evidence
@@ -622,7 +622,7 @@ it is meaningful. Continue the wider title-screen/gameplay investigation indepen
 ## DCC producer allocation reuse result (2026-08-04)
 
 PR #1900 made Astro's consumer reuse the producer's retained 4K storage image, but the producer then
-became the dominant compute frontier. A complete post-#1900 F8 window on exact master `61446754`
+became the dominant compute frontier. A complete post-#1900 F8 window on exact master `4e72e423`
 localized the shift by stable SPIR-V identity: consumer `0x05975892ababe69f` fell from 30.35 to
 8.95 ms/dispatch, while producer `0xa5e27ec0def1a807` rose from 27.91 to 57.72 ms/dispatch. An exact
 producer-only phase/image arm then found that the shader and retile were unchanged: post-writeback
@@ -713,7 +713,7 @@ evidence remains outside git under
 
 Issue #1732's post-#1924 PS-logo stall was an eager `WAIT_REG_MEM` reading a label before two
 retained producers could execute: an owned exact-base `WRITE_DATA(0)` followed by
-`RELEASE_MEM32(1)`. Candidate `88c61215`, based on master `5cecfbe8`, overlays only one or two owned
+`RELEASE_MEM32(1)`. Candidate `88c61215`, based on master `ca3b9b16`, overlays only one or two owned
 inline dwords at the exact waited address and then applies the fixed release in command order. It
 keeps partial snapshots, unowned payloads, writes wider than the waited qword, offset writes, and
 physically aliased virtual addresses fail-closed.
@@ -784,7 +784,7 @@ correctness claim, so no screenshot is attached. Retained evidence is outside gi
 
 ## The world-map GPU reset is a non-terminating loop in the PIXEL shader (2026-09-02)
 
-Measured on master `c1987cdf` plus the ordinal-scoped trip bound this section describes, with
+Measured on master `3cc3a8ac` plus the ordinal-scoped trip bound this section describes, with
 `tools/screenshot`, native 3840x2160, no pad script,
 `PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, `--seconds 30 --count 5 --timeout 170`.
 "Losses" counts `[backend] GRAPHICS submission failed` lines. See #3193.
@@ -865,7 +865,7 @@ control flow and the world map still shows only its nebula backdrop (#1459) with
 
 ## The light-list arena prosper hands that pixel shader is ENTIRELY ZERO (2026-09-02)
 
-Measured on master `bbf84773` plus `PROSPER_DRAW_LINKSCAN` (this work), with `tools/screenshot`,
+Measured on master `c663520c` plus `PROSPER_DRAW_LINKSCAN` (this work), with `tools/screenshot`,
 native 3840x2160, no pad script, `PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`,
 `--seconds 30 --count 5 --timeout 170`. See #3214.
 
@@ -947,7 +947,7 @@ executes, and the world-map GPU reset does not happen.
 
 | arm | `[compute] skip invalid descriptor contract` | `0x5006e8500` | GRAPHICS submission failures | pixel-distinct | max pixel stale |
 | --- | --- | --- | --- | --- | --- |
-| control (master `bbf84773`) | 5 programs | executed 0 / skipped 918 | 65 | 3 / 5 | 60.0 s |
+| control (master `c663520c`) | 5 programs | executed 0 / skipped 918 | 65 | 3 / 5 | 60.0 s |
 | control, replication | 5 programs | -- | 62 | 3 / 5 | 60.0 s |
 | control, replication | 5 programs | executed 0 / skipped 918 | 57 | 2 / 5 | 60.0 s |
 | **with the fix** | **0** | **executes** | **0** | **4 / 5** | **30.0 s** |
@@ -1061,7 +1061,7 @@ than re-deriving a dead answer at full cost.
 
 - **"#1900's post-writeback DCC promotion makes the producer/consumer pair cheaper enough by itself
   to improve world-map throughput."** False in the first comparable whole-workload F8 window after
-  merge. On exact master `61446754`, a normal native/default run reached `worldmap` before the
+  merge. On exact master `4e72e423`, a normal native/default run reached `worldmap` before the
   automatic trigger and retained a complete 5.02-second window (`pre=20 post=21 renderer=51
   compute=1359`, zero dropped or unknown-identity records). The exact consumer fell from 30.35 to
   8.95 ms/dispatch versus the retained pre-#1900 window, but the exact producer rose from 27.91 to
@@ -1080,7 +1080,7 @@ than re-deriving a dead answer at full cost.
   #1732.
 
 - **"The 4K consumer keeps rebuilding a stable image because unrelated GPU-write notifications
-  falsely invalidate its cache entry."** False on exact master `04c43b15` in the natural 720-present
+  falsely invalidate its cache entry."** False on exact master `215d7e86` in the natural 720-present
   exact-hash arms for #1732. Consumer `0x5005a8100` / `0x05975892ababe69f` used the 3840x2160 target
   at `0x520440000` 172 times: its first use skipped the upload even though producer
   `0x50057b800` / `0xa5e27ec0def1a807` had just published an ordinary full-range GPU write in the
@@ -1118,7 +1118,7 @@ than re-deriving a dead answer at full cost.
   retained timelines cannot answer reset-versus-dispatch ordering; recapture that question with v10.
 
 - **"The four GDS resets are missing, late, or separated from producer `0x5006eac00`."** False on
-  master `fdc906d0` in the rendered high-half diagnostic run for #1732. Timeline v10 captured 1,022
+  master `baef68d7` in the rendered high-half diagnostic run for #1732. Timeline v10 captured 1,022
   producer submits, and every one had the same exact raw-PM4 sequence: zero GDS offsets
   `0xc70/0xc74/0xc78/0xc7c` at producer-order deltas `-33/-31/-29/-27`, read them to guest memory at
   `-20/-18/-16/-14`, run the producer, then read them again at `+3/+5/+7/+9`. All 7,788 recorded

@@ -12,7 +12,7 @@ than as eight investigations.
 
 ## How everything below was measured
 
-One build of master `bffa40d4`, `-DPROSPER_APP=ON`, built inside the project's distrobox. Every run
+One build of master `03855b1f`, `-DPROSPER_APP=ON`, built inside the project's distrobox. Every run
 used the frontend **`tools/screenshot`** on the **default route** — no pad input, no snapshot
 acceleration, `PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct`, `PROSPER_BOOTPHASE=1`,
 Linux / AMD Radeon 8060S (RADV STRIX_HALO). Name the frontend when quoting any of it (instrument
@@ -106,7 +106,7 @@ never answer 0 — but a ranking that ordered by call count would put them first
 
 ### Row 2, settled — what was behind the three screens
 
-Routed 2026-08-22 on master `bb57d617`, one `.pad` route per title under `prosper/scripts/`, same
+Routed 2026-08-22 on master `6cf7e075`, one `.pad` route per title under `prosper/scripts/`, same
 frontend and conditions as the rest of this document. **All three advance, none reaches a rendered
 world, and the prompt bar was a reliable guide on exactly one of them.**
 
@@ -353,7 +353,7 @@ that still failed that request would move the symptom without fixing it. Recorde
 Running `ctest` on the survey build turned up something the survey was not looking for and which is
 recorded here because it is true of the ground everything above stands on.
 
-**Five Vulkan-execution tests fail on RADV at `bffa40d4`, and every failing assertion is an indexed
+**Five Vulkan-execution tests fail on RADV at `03855b1f`, and every failing assertion is an indexed
 draw** — while CI is **green on the same SHA**, because `.github/workflows/ci.yml` runs the suite
 under Mesa **lavapipe** on a runner with no GPU. 296 of 301 pass. The discriminator is internal to
 one process:

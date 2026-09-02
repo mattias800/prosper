@@ -183,7 +183,7 @@ run("out of ascending order",
 # The message must forbid the repair that breaks the citation contract. An author whose row is out
 # of order because another lane's higher number landed first can fix it by MOVING the line; the one
 # thing they must not do is renumber: 118 references on 110 lines in 46 files cite these rows by
-# number (origin/master 7413647a, 2026-08-17), naming 63 distinct rows -- and 50 of those
+# number (origin/main 7413647a, 2026-08-17), naming 63 distinct rows -- and 50 of those
 # references are .cpp/.hpp/.py COMMENTS, not prose.
 run("the out-of-order message forbids renumbering",
     "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
@@ -764,7 +764,7 @@ cli_stdout("a successful run does not claim it was refused",
 # problem with the DOCUMENT rather than with the invocation -- several briefings propagated the ref
 # form (#2675). The message must name the flag's actual contract.
 cli("--baseline handed a git ref names the contract, not just 'cannot read'",
-    ["--ordered", "--baseline", "origin/master", "<FILE>"],
+    ["--ordered", "--baseline", "origin/main", "<FILE>"],
     want_rc=1, expect_text="takes a FILE PATH, not a git ref")
 
 

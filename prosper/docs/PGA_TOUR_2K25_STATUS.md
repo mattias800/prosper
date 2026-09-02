@@ -151,7 +151,7 @@ HTTP fault, so no hypothesis is recorded here yet.
 ## Ruled out
 
 - **"The `only_if_imported` filter (#2870/#2890) drops `sce_module/libSceNpCppWebApi.prx` for this
-  title, and that is what makes the PSN handshake fail."** Falsified 2026-08-22 on `97b184ef`:
+  title, and that is what makes the PSN handshake fail."** Falsified 2026-08-22 on `af481db2`:
   `PROSPER_INITLOG=1` lists it as **module 8, base `0x4d0000000`** — it is linked, mapped and
   started. Something among the non-candidate modules vouches for it. The PSN failure was the
   `module_start` descriptor above and had nothing to do with module selection.

@@ -32,7 +32,7 @@ write no BMP sequence by default.
 
 ## The opening needs no route at all
 
-Verified 2026-08-02 on master `3a473bca`. With **no** `PROSPER_PAD_SCRIPT`, the guest advances on its own
+Verified 2026-08-02 on master `c79f742e`. With **no** `PROSPER_PAD_SCRIPT`, the guest advances on its own
 through `ps_logo` -> `title_controller_ship` -> `worldmap` and stops there:
 
 ```sh

@@ -1,6 +1,6 @@
 # Little Nightmares III (`PPSA05143`) — status and evidence
 
-Unreal Engine 4. **Rung 2 — title screen** (2026-08-05, master `4d7a2ded`;
+Unreal Engine 4. **Rung 2 — title screen** (2026-08-05, master `e98a8fdb`;
 `assets/screenshots/little-nightmares-3-title-screen.webp`). Tracked on
 [#1893](https://github.com/mattias800/prosper/issues/1893).
 
@@ -13,7 +13,7 @@ left, the copyright line, and the `⊗ Start` prompt bottom right, all legible.
 
 The render-thread stall that used to end every run before the title is **gone**. It was #1962, and
 its cause was #1982's ordered-DMA `Jump` decline, fixed by
-[#1987](https://github.com/mattias800/prosper/pull/1987). A 360 s bounded arm on `4d7a2ded` ran to
+[#1987](https://github.com/mattias800/prosper/pull/1987). A 360 s bounded arm on `e98a8fdb` ran to
 its own end with 36/36 samples source-distinct, 26 pixel-distinct, no `LowLevelFatalError`, no
 watchdog abort, and **zero** `[agc] ordered DMA submit rejected` lines — against a hard wall at
 t≈60 s before.
@@ -63,9 +63,9 @@ What is and is not bounded:
   an earlier draft of this doc did. Two independent observations kill it, and the second needs no
   cross-build argument:
   - The earliest tinted frame on record is the *empty* composite at `frame_seq=4`, t≈4.0 s (#1962,
-    build `ff72e77c`); a frame with nothing drawn over a yellow background is exactly the pure
+    build `ea299e97`); a frame with nothing drawn over a yellow background is exactly the pure
     `RGB(255,255,0)` seen there. Clean logo frames at t=20/40/60/80 s are interleaved with it.
-  - On **`4d7a2ded` itself**, ten consecutive samples (t=120–210 s) are pure `(255,255,0)` across
+  - On **`e98a8fdb` itself**, ten consecutive samples (t=120–210 s) are pure `(255,255,0)` across
     all 8,294,400 pixels — one colour, no content — while that arm did not composite the title
     screen until t≈230 s. Ten of its twenty-four tinted samples therefore carry nothing that any
     post-process chain could have acted on.
@@ -184,7 +184,7 @@ Read this before forming a hypothesis.
 | Hypothesis | Verdict |
 | --- | --- |
 | The `Your options save has corrupted and has been deleted` modal at t=170 s is a defect in the title, or in this dump | **Falsified — it was prosper's, and prosper did the deleting.** Save data was not namespaced by title: `/savedata0`'s per-save host directory was `<shared root>/<guest dirName>`, and UE4 titles pick generic names, so this title read an `OptionSettings` slot **another Unreal title** had written, correctly judged it not its own format, and deleted it. A/B in #2734: identical binary and route against a private empty save root reaches the title screen at t≈300 s. Fixed by namespacing both save roots by title id (#2734, `docs/SAVE_DATA_LAYOUT.md`); verified on a live 200 s `boot_trace` of this dump, which writes its own `PPSA05143/OptionSettings/ue4savegame.dpx.sav` and leaves a foreign payload seeded under another title id byte-identical. |
-| #2022's **17 distinct compute programs** are 17 blocked programs, and the dedup only hides *how often* | **Partly falsified — four of them are not blocked at all, and the true population is larger.** A 501 s arm on `2703a6c3` (50/50 samples, exit 0) with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports **131,072 dispatch decisions over 85 programs, 13 of which never execute**, 16 distinct rejected programs plus 1 on the descriptor-contract path. `0x4186c1f00` executed 2,806 / skipped 1, `0x4187ccc00` 510 / 9, `0x300eb00000` **26,307** / 4 and `0x3016540000` 2,798 / 12 — all self-recovering transients (#1581) that a line count could not tell from a wall. #2747, #2022. |
+| #2022's **17 distinct compute programs** are 17 blocked programs, and the dedup only hides *how often* | **Partly falsified — four of them are not blocked at all, and the true population is larger.** A 501 s arm on `9ea76a52` (50/50 samples, exit 0) with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports **131,072 dispatch decisions over 85 programs, 13 of which never execute**, 16 distinct rejected programs plus 1 on the descriptor-contract path. `0x4186c1f00` executed 2,806 / skipped 1, `0x4187ccc00` 510 / 9, `0x300eb00000` **26,307** / 4 and `0x3016540000` 2,798 / 12 — all self-recovering transients (#1581) that a line count could not tell from a wall. #2747, #2022. |
 | The 17 are one gap | **Falsified.** Every blocking instruction disassembled from its exact words with `llvm-mc -mcpu=gfx1030`: three are the #2741 family (`s_mov_b32 s14, m0`; `s_cselect_b32 vcc_lo, s33, s32`; `s_cselect_b32 vcc_lo, 7, vcc_lo`), one needs **`image_bvh_intersect_ray`** — RDNA2 hardware ray tracing, 0 of 2,802 — two are `s_cbranch_execz` control flow, `0x3012020000` is a plain `v_med3_i32 v17, 7, v0, 0`, and the rest are buffer/global address resolution. #2747. |
 | The skipped compute programs are this title's own bug | **Falsified.** `0x30114c0000` is UE **volumetric fog** and it is the *same program* as *The Plucky Squire*'s: byte-identical blocking dword `be8e037c` (`s_mov_b32 s14, m0`), byte-identical dispatch `groups=30x17x64 local=8x8 threads=240x136`, and three `class=2` sampled inputs plus one `class=4` storage output all of **16,588,800** B = `240x135x64x8` for the 3840x2160 view. `PROSPER_COMPUTE_DISPATCH_LOG=0x30114c0000` logged **512 dispatches, every one `outcome=recompile-empty`**. #2747, #2741. |
 | A 316 s arm is long enough to census this title | **Falsified, and the effect is large.** Same binary, same instrument, same route: **31 programs at 316 s, 85 at 501 s** — 185% more programs for 58% more run time, because the population grows with route depth and because the census only prints at power-of-two totals (#2746). The fog program above is absent from every census row of the 316 s arm while appearing in 73 of its `[compute-table]` lines. #2746, #2747. |
@@ -194,7 +194,7 @@ Read this before forming a hypothesis.
 | The yellow tint comes from the packed-R11G11B10 compute storage path | **NOT falsified — the arm is inconclusive, and is recorded here so nobody counts it as a negative.** `PROSPER_NO_PACKED_R11_STORAGE=1` over a 360 s arm gives **24 / 36** tinted samples against the default arm's 24 / 36. But the switch only reaches the *compute* path (`gpu_executor.cpp:4719`) and the packed emission is further gated on a 3-component `Float10_11_11` storage image (`rdna2_to_spirv.cpp:9516`); nothing logs whether that path was ever taken, so "the switch moved nothing" cannot be told apart from "the switch was never in circuit". Needs a counter of dispatches compiled with `packed_r11=true` before it means anything. #2014. |
 | `[agc] WaitRegMem … dependency violated` is the lead for the stall | **Falsified — instrument noise.** 31 events on *The Pathless* (`PPSA01826`, UE4), which renders its title screen for a full 140 s arm without stalling, against 40 on this title, and on this title they all stop *before* the stall began. #1962. |
 | `crc=666f7b3f` fingerprints this title's wall | **No — it is just "black 3840x2160".** The same crc was the frozen frame of Crisis Core (#1982) and Sonic Frontiers (#1968), which have different causes. Do not group titles by it. |
-| The `0x30016000` UE pooled-allocator fault (#1945 / #1226) bounds this title | **Not seen** in any arm of six on `ff72e77c`, nor in any arm on `4d7a2ded`. |
+| The `0x30016000` UE pooled-allocator fault (#1945 / #1226) bounds this title | **Not seen** in any arm of six on `ea299e97`, nor in any arm on `e98a8fdb`. |
 | #2003 is inert for this title (no `sceNpEntitlementAccessGetSkuFlag` line in the run logs) | **Void, not negative — the instrument was never armed.** `svc_log()` is gated on `PROSPER_SVCLOG`, which those arms did not set. With it armed the title calls `GetSkuFlag` twice, in the same window the title screen composites. Claimed and withdrawn on #1893. |
 | The boot dies in the guest at `addr=0x80` | **Falsified — the faulting instruction was prosper's own.** `k_ef_create` (`hle_kernel.cpp:1792`) storing through a guest out-pointer of `0x80`; the `rip=eboot+0x…` label was instrument-trap 22. The `0x80` itself came from `sceAjmInitialize` rejecting this title's config revision, fixed by #1966. Filed as #1963. |
 

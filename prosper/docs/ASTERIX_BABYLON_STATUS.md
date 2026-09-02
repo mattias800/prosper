@@ -100,7 +100,7 @@ cinematic window (46–149 s) and is **Cross-only from 152 s onward**.
 
 ### Verification of the run itself
 
-Two bounded runs on `2703a6c3`, both `--allow-guest-fault`, both ending `status=ok` with `guest=running`
+Two bounded runs on `9ea76a52`, both `--allow-guest-fault`, both ending `status=ok` with `guest=running`
 and exit 0:
 
 | run | route | samples | pixel-distinct | status | reached |
@@ -374,7 +374,7 @@ unintended runs and add no independent title discriminator. In the same observed
 `--dump-shader` returned before Vulkan initialization. This apparatus finding is recorded as
 instrument trap 63 in `GAME_COMPAT_ORCHESTRATION.md`.
 
-Two independent fresh-save v46 runs on `09be7beccc93c6e2d414657c3570f877271fdcdf`
+Two independent fresh-save v46 runs on `108d79037b7746e40a3c1736149c42d234186416`
 then retained draw 0 PS binding 32's raw descriptor input. Both selected the same natural submit shape,
 reported `raw-identity=full-match`, and retained the same complete zero 128-byte span at realization and
 post-submit. A follow-up allocation-census arm again reproduced that exact v46 subject and found one unique
@@ -384,7 +384,7 @@ two `[dmem-caller]` lines because the diagnostic silently suppresses repeated fi
 ordinary allocation line carries no correlation token. The target allocation therefore cannot safely be
 assigned either retained chain. #1599, #1859.
 
-The corrected caller-chain instrument was then rerun on master `1ccb88da` with the same exact v46
+The corrected caller-chain instrument was then rerun on master `64de306e` with the same exact v46
 submit/draw/stage/binding selector. The run completed 220 presents and captured submit 181 with the same
 8 draws, 6 computes, 14 operations, zero realization failures, raw descriptor full match, and uniformly
 zero 128-byte binding. This time every one of 102 main-direct-memory allocations carried correlation:
@@ -589,7 +589,7 @@ HLE registration. #1599, #1884.
   `ADVENTURE` / `OPTIONS` menu, and it is `SELECTION` on the world map — but the cutscene **Skip**
   prompt is bound to **Triangle**. A Cross-only mash sat through 215 s of `Cinematic_A1_Part_1` →
   `A1_Part_2` → `A2` and never reached the map. #1884.
-- **#1599's three first-boot blockers, as of `2703a6c3`:** "all frames black" (41/45 and 58/60
+- **#1599's three first-boot blockers, as of `9ea76a52`:** "all frames black" (41/45 and 58/60
   pixel-distinct), "renderer stalls at ~138 s" (`max-source-stale=0.0s` over a 600 s run), and the
   MSAA `image_load` fragment-stage rejection (**zero** `[recompile-reject]` in either run) are each
   contradicted by a bounded current run. The issue's *title* still asserts all three. #1599.

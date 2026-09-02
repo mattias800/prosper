@@ -5,7 +5,7 @@ Bring-up record: [#1390](https://github.com/mattias800/prosper/issues/1390).
 
 **Read `## Ruled out` before forming a hypothesis.**
 
-## Current state (2026-08-19, master `2703a6c3`)
+## Current state (2026-08-19, master `9ea76a52`)
 
 Rung 2 on the ladder, with the **real 3D world now rendering**: the checked-in route reaches title,
 save-slot and play-style menus, streams `MainLevel` + `Desk_C01` + `Desk_C01_Lighting`, and then plays
@@ -18,12 +18,12 @@ checked-in `scripts/plucky-squire/reach-first-gameplay.pad` route, t = 1080 s.*
 
 **This is not rung 3.** A cutscene is not gameplay.
 
-**The frontier was re-measured on 2026-08-21 (master `9dcf807f`) and it is not what this section
+**The frontier was re-measured on 2026-08-21 (master `f29f46c0`) and it is not what this section
 originally guessed.** "The route stops driving input at 525 s" is true and irrelevant: the guest reads
 the input it is given and the cutscene is not waiting on a button. The cutscene is not waiting at all —
 it is *advancing about 300x too slowly to finish*, because the guest runs at ~0.19 flips/s once the 3D
 world is up and prosper's guest clock advances in-game time **per flip**. See
-[**## The wall is guest THROUGHPUT**](#the-wall-is-guest-throughput-and-the-reason-is-the-guest-clock-2026-08-21-master-9dcf807f)
+[**## The wall is guest THROUGHPUT**](#the-wall-is-guest-throughput-and-the-reason-is-the-guest-clock-2026-08-21-master-f29f46c0)
 below and [#2839](https://github.com/mattias800/prosper/issues/2839); raising the flip rate alone
 carries the guest past the intro to the `Book_MAIN` storybook camera with no other change.
 
@@ -123,7 +123,7 @@ anchors are invariant to that, and to the sampling cadence — the same file dri
 `PROSPER_RENDER_EVERY` run without retiming. Verified to navigate logos, `SAVE FILES` and `PLAY STYLE`
 through to `FinishDeskLevelLoad`.
 
-## The wall is guest THROUGHPUT, and the reason is the guest clock (2026-08-21, master `9dcf807f`)
+## The wall is guest THROUGHPUT, and the reason is the guest clock (2026-08-21, master `f29f46c0`)
 
 The chapter-one intro cutscene is **not stuck** — it advances, roughly 300x too slowly to finish. What
 makes that fatal rather than merely slow is prosper's own guest-clock contract, so the two have to be
@@ -251,7 +251,7 @@ rather than worked around:
   reached by this lane's evidence either way for the darkness, but **excluded for the progression
   question**: the guest advances to the storybook camera with both programs still absent, purely by
   raising the flip rate. Whatever the two fog rejects cost, they do not gate the cutscene.
-- **"#2741 is this title's bug."** Falsified 2026-08-19 by a cross-title census on `2703a6c3`
+- **"#2741 is this title's bug."** Falsified 2026-08-19 by a cross-title census on `9ea76a52`
   (#2747). *Little Nightmares III* rejects `0x30114c0000` at the **byte-identical** dword `be8e037c`
   (`s_mov_b32 s14, m0`) with the **byte-identical** dispatch `groups=30x17x64 local=8x8
   threads=240x136` and the same 16,588,800-byte volume as `0x3015ab0000` here; *Dragon Quest VII*
@@ -263,7 +263,7 @@ rather than worked around:
   `groups=27x15x64 local=8x8 threads=216x120` for `0x3015ab0000`, i.e. a 3456x1920 view. UE dynamic
   resolution moves the froxel grid's XY between runs; `gz=64` and the 16,588,800 / 131,072 bindings do
   not move. Do not use the XY extent as a run-to-run selector. #2747.
-- **"The three compute programs of #1554 are still skipped."** Falsified 2026-08-19 on `2703a6c3`:
+- **"The three compute programs of #1554 are still skipped."** Falsified 2026-08-19 on `9ea76a52`:
   `PROSPER_COMPUTE_PROGRAM_CENSUS=1` over 131,072 dispatch decisions across 50 programs shows
   `0x3017d90000`, `0x3017450000` and `0x3017460000` with **no skip rows at all** — the census prints a
   row only for a program that skipped at least once. Closed by #1561 / #1564 / #1572.

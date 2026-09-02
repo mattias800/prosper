@@ -207,8 +207,8 @@ during materialization**: all three paths that turn a decoded T# into a `ShaderR
 unresolved descriptor, and the draw was skipped — which reads exactly like a provenance failure from
 the reject line alone.
 
-That guard was added (d43d82a6) as a deliberate fail-closed measure *while the per-slice byte stride
-was unmodelled*. #5237659e then modelled it: `image_base_level_view` advances the view base by
+That guard was added (22f7b647) as a deliberate fail-closed measure *while the per-slice byte stride
+was unmodelled*. #5fa3f25d then modelled it: `image_base_level_view` advances the view base by
 `BASE_ARRAY * tiled_mip_chain_bytes(...)` for cube faces and 2D-array slices, and
 `test_build_shader_resources` has pinned that 720896-byte stride since. **The three call-site guards
 were never lifted, so the descriptor never reached the code that could resolve it.** The fix gates
@@ -216,7 +216,7 @@ the refusal on the image TYPE instead — only where the slice origin is genuine
 2D_MSAA_ARRAY, a 3D UAV view) — and routes every path through one named predicate,
 `image_descriptor_reject_reason`, which reports *why* a T# was refused.
 
-Measured, two 260 s `tools/screenshot` arms on `61cc4877`, identical switches, same session:
+Measured, two 260 s `tools/screenshot` arms on `d914dadc`, identical switches, same session:
 
 | | before | after |
 |---|---|---|
@@ -332,15 +332,15 @@ no cap and is therefore complete by construction over the shaders it is given.
 
 | tier | rejecting ops (sites/arm) | disassembly of the exact logged words |
 |---|---|---|
-| `beeff2ab` | VOP3 `0x307` (30), VOP3 `0x156` (8), VOP1 `0x54` (3) | `v_lshrrev_b16` (one site with `op_sel:[0,0,1]`), `v_max3_u32`, `v_rcp_f16_e32` |
+| `c76504b4` | VOP3 `0x307` (30), VOP3 `0x156` (8), VOP1 `0x54` (3) | `v_lshrrev_b16` (one site with `op_sel:[0,0,1]`), `v_max3_u32`, `v_rcp_f16_e32` |
 | + those (#2067) | VOP3 `0x303` (24), VOP1 `0x52` (10) | `v_add_nc_u16`, `v_cvt_u16_f16_e32` |
 | + those (#2067) | VOP3 `0x358` (14), VOP3 `0x365` (5), VOP3P `0xa` (5) | `v_med3_i16`, `v_mbcnt_lo_u32_b32`, `v_pk_add_u16` |
-| `f080fc23` (this lane's base) | VOP2 `0x1b` (4), VOP1 `0x1` (11), VOP3 `0x365` (5) | `v_and_b32_sdwa` with a WORD **destination**, `v_mov_b32_sdwa` with a WORD **source**, `v_mbcnt_lo_u32_b32` |
+| `c3b362f6` (this lane's base) | VOP2 `0x1b` (4), VOP1 `0x1` (11), VOP3 `0x365` (5) | `v_and_b32_sdwa` with a WORD **destination**, `v_mov_b32_sdwa` with a WORD **source**, `v_mbcnt_lo_u32_b32` |
 | + those | VOP3P `0xa`, VOP3 `0x357` — behind the three above *inside the same programs*, so they surface offline rather than as their own arm | `v_pk_add_u16` (including the `NEG` form below), `v_med3_f16` |
 | + those | VOP1 `0x53` (5), VOP1 `0x51` (5), VOPC `0xab` (4) | the SDWA form of `v_cvt_i16_f16` / `v_cvt_f16_i16`, `v_cmp_le_u16_sdwa` |
 | + those | VOP3 `0x311` (4), VOP1 `0x51` (5, now `src0_sel:WORD_1`) | `v_pack_b32_f16`, the WORD-source form of the same convert |
 | + those | VOP1 `0x1` (5) | `v_mov_b32_sdwa v14, sext(v8) src0_sel:WORD_0` — the **sign-extending** WORD move, one bit away from the zero-extending form above and a different operation |
-| `cdb40942` + those (this lane) | VOP1 `0x1` (9), VOP1 `0x5e` (4), VOP1 `0x5c` (3) | `v_mov_b32_sdwa … sext(…)` in **both** the WORD and BYTE source forms, `v_rndne_f16_sdwa`, `v_ceil_f16_sdwa` |
+| `fb5e92a1` + those (this lane) | VOP1 `0x1` (9), VOP1 `0x5e` (4), VOP1 `0x5c` (3) | `v_mov_b32_sdwa … sext(…)` in **both** the WORD and BYTE source forms, `v_rndne_f16_sdwa`, `v_ceil_f16_sdwa` |
 | + those (**where this lane stopped**) | VOP2 `0x25` (4), VOP1 `0x1` DPP (3) | `v_add_nc_u32_sdwa v4, 8, sext(v5) src1_sel:WORD_0` — SEXT one operand position over, on a VOP2; and `v_mov_b32_dpp v10, v4 row_xmask:4`, which is a cross-lane frontier, not an SDWA one |
 
 Everything in every tier so far is the **16-bit VALU family** in some encoding — scalar, packed,
@@ -405,7 +405,7 @@ grep -E 'compute\] skip|cfg-recompile-reject|compute-struct-reject' ~/census.log
 python3 prosper/tools/re/disasm_words.py <word0>,<word1>
 ```
 
-On `cdb40942` that gives a **1:1** attribution — every live reject pc occurs in exactly one of the
+On `fb5e92a1` that gives a **1:1** attribution — every live reject pc occurs in exactly one of the
 eight dumps, with matching format and opcode. Addresses are run-local; the dword counts are not.
 
 | dwords | blocking instruction (disassembled from the exact logged words) | state |
@@ -426,7 +426,7 @@ than the #590 structurizer.
 
 Measured across three identical arms on one binary lineage, `PROSPER_DBG=1`, 240 s each:
 
-| | `cdb40942` | + the SDWA/f16 tier | + VOP2 source SEXT |
+| | `fb5e92a1` | + the SDWA/f16 tier | + VOP2 source SEXT |
 | --- | --- | --- | --- |
 | `[compute] skip unsupported program` | 8 | 5 | **4** |
 | distinct `[cfg-recompile-reject]` sites | 7 | 4 | 3 |
@@ -438,7 +438,7 @@ Measured across three identical arms on one binary lineage, `PROSPER_DBG=1`, 240
 unsupported program` is the recompiler's message. A program that recompiles *successfully* and then
 fails descriptor validation prints `[compute] skip invalid descriptor contract` instead, and has
 never been in the total above — so the population is **one larger than every census here states**.
-On master at `7a493df2` the split is **3** `skip unsupported program` (#2218 took one more of the
+On master at `b0a43bfa` the split is **3** `skip unsupported program` (#2218 took one more of the
 four) plus **1** descriptor-contract, and the offline capture records exactly that: four declined
 dispatches per frame, `reason=shader-recompile` x3 and `reason=descriptor-contract` x1, in submits
 8022/8039 and 8023/8040 of the repeating frame. Ask a capture for
@@ -470,7 +470,7 @@ listed on the tracker. Nothing in the list is an entitlement or add-content quer
 `libScePlayGo` NIDs (`scePlayGoGetSupportedOptionalChunk`, `scePlayGoGetInstallChunkId`) are the
 same two the 2026-08-05 baseline recorded.
 
-Re-run on `beeff2ab` (2026-08-06) the list is unchanged in kind. `sceRandomGetRandomNumber`
+Re-run on `c76504b4` (2026-08-06) the list is unchanged in kind. `sceRandomGetRandomNumber`
 (`PI7jIZj4pcE`) is worth calling out separately: the dispatcher's default `0` is a **success** return
 that leaves the caller's output buffer untouched, so the guest reads whatever was already there as
 "random" data. Filed as its own issue rather than fixed here.
@@ -490,7 +490,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   `2560x1440x2`. Flagged by size, cleared by shape. #2747.
 - **The skipped compute programs here are a UE5-specific or title-specific problem.** **Falsified on
   the instruction family, not on the pass.** Two of the three programs that never execute on a 323 s
-  default arm at `2703a6c3` (40/40 samples, `status=ok`; **131,072 dispatch decisions over 36
+  default arm at `9ea76a52` (40/40 samples, `status=ok`; **131,072 dispatch decisions over 36
   programs**) reject on wave-mask-as-scalar-data: `0x25c0056e00` on `beea160e`
   = `s_flbit_i32_b64 vcc_lo, s[14:15]` and `0x2880002600` on `bf066a81` = `s_cmp_eq_u32 1, vcc_lo`.
   That is the same family as #2741 (UE4) and #2420 (GTA V, not Unreal at all), so it is a compiler
@@ -604,7 +604,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. The dispatch is
   full-screen: `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **Four** sites
   independently encode which image-atomic image shapes are supported, and **#2272 generalised exactly
-  one of them** to 2D_ARRAY (line numbers as of `7a493df2`):
+  one of them** to 2D_ARRAY (line numbers as of `b0a43bfa`):
 
   | site | where | 2D_ARRAY accepted? |
   | --- | --- | --- |
@@ -667,7 +667,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   decision when the dispatcher is actually selected (`cfg_dispatch_safe` and either
   `exact_compute_wave_cfg` or `cfg_branches > 2`); otherwise `cf_rejected` clears the loop list and
   the branch genuinely does block. So ask **which emitter ran last**, and attribute a reject to a
-  *program* before attributing it to a *cause*. (This lane, 2026-08-06, on `cdb40942`.)
+  *program* before attributing it to a *cause*. (This lane, 2026-08-06, on `fb5e92a1`.)
 - **Restoring HALF the skipped compute programs does not move the composite.** 8 → 5 → **4** skipped
   programs across three identical arms on one binary lineage, with 0 dropped graphics pipelines and 0
   unresolved descriptors throughout, and the composite is byte-identical at every step:
@@ -683,8 +683,8 @@ One line per falsified hypothesis, with the evidence that killed it.
 
 - **APR same-size container collisions are not the startup blocker.** 274/274 reads resolved
   `OK method=id`, 0 size-fallbacks, 0 refusals — the 49 registration warnings are noise here.
-  (Tracker #1895, 2026-08-04 CPU-only baseline; re-confirmed on `c3614f51`.)
-- **The `IoService` AMPR spin is gone and was not the whole story.** #1965 fixed it; on `c3614f51`
+  (Tracker #1895, 2026-08-04 CPU-only baseline; re-confirmed on `91bd49ce`.)
+- **The `IoService` AMPR spin is gone and was not the whole story.** #1965 fixed it; on `91bd49ce`
   `IoService` accumulates 7 jiffies over a whole boot, and the title still produced no frame until
   #2012. (This lane, 2026-08-05.)
 - **The stall was not a spin at all.** All 64 threads sampled over an 8 s window: the busiest is
@@ -701,8 +701,8 @@ One line per falsified hypothesis, with the evidence that killed it.
   ownership query is reached before the wall, and none of the 21 unimplemented NIDs is one.
   (Tracker #1895, 2026-08-05 breakpoint census; unchanged by this lane's arms.)
 - **#2021 and #2003 change nothing here.** `sceSysmoduleIsLoaded` answering from prosper's own load
-  history, and app-param/SKU answering from `param.json`, were both absent from the `c3614f51` base
-  the rung-1 evidence was taken on. On `beeff2ab`, which has both, the boot is identical
+  history, and app-param/SKU answering from `param.json`, were both absent from the `91bd49ce` base
+  the rung-1 evidence was taken on. On `c76504b4`, which has both, the boot is identical
   frame-for-frame: black to t≈20 s, SEGA logo `pixel_crc32=0d70a70a` (1,373 colours, 430,916
   non-black px) at t≈40–60 s, uniform `8bf1b518` from t≈80 s. The only `[sysmodule]` traffic is two
   first-query `IsLoaded` misses (`0xe2`, `0xba`). (This lane, 2026-08-06, two independent arms.)
@@ -732,7 +732,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   **Read that as a property of the ROUTED arm, not of the title** (qualified 2026-08-19, #2737). It
   is easy to compose it with #2571, which later made that decode the default, and conclude that a
   default launch now reaches the garage on its own. **It does not, and cannot.** Re-measured on
-  `4c8b77c8` with `tools/screenshot`, no pad script, 30 samples over 300 s: **3 pixel-distinct
+  `dfee7e4f` with `tools/screenshot`, no pad script, 30 samples over 300 s: **3 pixel-distinct
   frames** — black, a loading indicator at 20 s, then black unchanged for 270 s — with the guest
   alive throughout (flips 1 → 970, `frame_seq` 4 → 2899, no fault). `grep -ciE 'videodec|vdec'` over
   the whole run log is **0**: the title opens no decoder at all before the input edge, so the gate is

@@ -233,7 +233,7 @@ first-party title, and audible, so if it depended on #1700 that would be the fir
 matters beyond the title it was found on. `PROSPER_AUDIO_FLOW=1` over a routed boot says it does
 not. Astro creates one context with 23 ports, exactly one of them MAIN, and that port is
 `data_format=0x800` — **8** channels, not 12. The pre-#1700 gate rejected `channels > 8`, so an
-8-channel bed was always accepted and **Astro Bot was already audible before `75e4417f`**. Its
+8-channel bed was always accepted and **Astro Bot was already audible before `1dcd1081`**. Its
 lifetime counters confirm nothing is being lost on the way: `skip-fmt=0 skip-not-main=0 no-pcm=0
 short=0`, port1 lifetime peak 0.27977 / rms 0.02749 with 63.6 M of 76.1 M samples non-zero, and the
 mixed bed reaching the host sink at peak 0.30449 / rms 0.0545. The 22 non-MAIN ports are `0x100`

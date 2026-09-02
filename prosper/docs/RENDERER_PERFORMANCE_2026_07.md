@@ -78,7 +78,7 @@ memory, clamped to 1-2 GiB. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`;
 
 ## Blue Prince 3D submit decomposition, re-measured (2026-08-02, #1284)
 
-Re-measured on `3a473bca` — i.e. **after** #1292 (demand-driven readbacks) and #1703 (submit-scoped
+Re-measured on `c79f742e` — i.e. **after** #1292 (demand-driven readbacks) and #1703 (submit-scoped
 decode identity) — with `PROSPER_RENDER_TIMING=1` on the scripted Blue Prince fresh-save route into
 the manor, RADV / Radeon 8060S (STRIX_HALO, integrated), native 1920x1080, no snapshot acceleration.
 35 peer-free heavy `[render-window]` samples, median:
@@ -1353,7 +1353,7 @@ pack, retile, notification, and baseline repair.
 On the same machine and route, the updated live run reduced the program to a **0.68 ms median total**
 and **0.00 ms writeback** (81 samples). This is a targeted before/after rather than an alternating
 whole-route benchmark, so it supports the dispatch-local result but not a standalone frame-rate claim.
-The realized capture `/tmp/plucky-393-78922522.prgcap` records the exact four-volume shape and shader,
+The realized capture `/tmp/plucky-393-3281244e.prgcap` records the exact four-volume shape and shader,
 but replay materializes resources as owned `host_data`; by design that does not enter the live
 cross-frame guest-memory cache. Correctness is therefore pinned by the raw 3D production-backend test:
 it proves full coverage, establishes an exact baseline, skips an identical third write, then mutates
@@ -1783,7 +1783,7 @@ until they could be evaluated against a **3D** workload. Astro Bot (`PPSA21564`)
 it is a far sharper instrument than the 2D titles the earlier passes used: here the compute boundary is
 worth roughly 20x rather than a few percent.
 
-Measured on `6d7b69e9`, headless `boot_trace`, route
+Measured on `a1f3b05c`, headless `boot_trace`, route
 `scripts/astrobot/reach-worldmap-boot-trace.pad`, RADV STRIX_HALO, no other GPU consumer at either
 boundary, no render acceleration.
 
@@ -1885,7 +1885,7 @@ and the point in it whenever quoting an absolute cost here.
 
 ### Post-#1819 exact-hash world-map decomposition (2026-08-03)
 
-A clean interactive F8 run on exact revision `908c9eef` reached `worldmap` without device loss at about
+A clean interactive F8 run on exact revision `b7a56cc2` reached `worldmap` without device loss at about
 3.58 guest flips/s and identified stable SPIR-V hash `0x05975892ababe69f` as the largest current compute
 cost. A following selected timing arm proved its own hash selector through one accepted banner, one
 first-match witness and one terminal `seen=53507 matched=69 verdict=matched` summary. All 69 selected

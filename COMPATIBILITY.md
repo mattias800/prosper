@@ -214,7 +214,7 @@ The route reaches the native 1920×1080 desert tutorial combat scene with audio.
 
 **Regressed on current master ([#2899](https://github.com/mattias800/prosper/issues/2899)).** The
 `cobra-gameplay` guard now renders one uniformly black frame for the whole 199.6 s route. Bisected to
-`ff72e77c` (#1974, `sceAvPlayerJumpToTime`): with the seek implemented, Unity's `PS5VideoMedia`
+`ea299e97` (#1974, `sceAvPlayerJumpToTime`): with the seek implemented, Unity's `PS5VideoMedia`
 prepare *succeeds* instead of timing out, and the title then stops driving the player. The two
 screenshots above are the reviewed pre-regression state, not a capture of master.
 
@@ -226,7 +226,7 @@ screenshots above are the reviewed pre-regression state, not a capture of master
 <p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.webp" alt="Sonic Origins — SEGA logo"></p>
 
 *All four are direct, unmodified `tools/screenshot` captures — headless Linux/RADV, native 3840×2160,
-no render-scale or frame-skip acceleration, master `f856e7a8`. The SEGA logo, SONIC TEAM logo and
+no render-scale or frame-skip acceleration, master `94483fc7`. The SEGA logo, SONIC TEAM logo and
 auto-save notice are from a **default launch with no input** (42 samples at 10 s); the title screen is
 from the same launch driven by `prosper/scripts/sonic/dismiss-boot-notice.pad`, sample 77 of 84 at
 t=385 s.*
@@ -512,7 +512,7 @@ The validated route reaches the title screen and first playable scene with real 
 
 *The title-screen frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
 **default launch with no input route**, no render-scale or frame-skip acceleration, master
-`4c8b77c8`, native 1920×1080, t=260 s of a 300 s run. It supersedes the earlier
+`dfee7e4f`, native 1920×1080, t=260 s of a 300 s run. It supersedes the earlier
 `tales-graces-f-title.png`, which is the same screen captured on the pad route and is still on
 master; this one carries the `Press ✕` prompt and, more importantly, was reached with the pad
 unplugged.*
@@ -654,7 +654,7 @@ the [tracker](https://github.com/mattias800/prosper/issues/2886).
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic-village.webp" alt="Unbound: Worlds Apart — a later moment of the intro cinematic at 3840x2160: a sunlit village clearing of thatched huts strung with orange bunting, tall trees and fireflies, pink mushrooms in the foreground grass and the small red-cloaked character at the right, with a prompt reading Press Square to skip"></p>
 
-A second, later frame of the same cinematic, captured with an isolated save on master `4ce6e11e` —
+A second, later frame of the same cinematic, captured with an isolated save on master `52be3751` —
 the evidence that this title's black frames were the save and not the renderer.
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic.webp" alt="Unbound: Worlds Apart — the intro cinematic at 3840x2160: the cloaked blue-hooded character Soli standing beside a golden deer in a teal moonlit forest clearing, thatched huts and bunting behind them, purple mushrooms and grass in the foreground, and a prompt reading Press Square to skip"></p>
@@ -670,7 +670,7 @@ the title advances into a state that renders nothing, and the run goes black abo
 first press — indistinguishable from a composite defect, and it is what the black-frame readings on
 this title had been measuring. A matched A/B on the same commit: 4 of 20 samples carried content with
 the shared save, 17 of 20 with a fresh `PROSPER_SAVE0` + `PROSPER_SAVEDATA_DIR`. Both arms are on
-master `4ce6e11e`; building the 2026-08-22 commit the route was validated against reproduced the black
+master `52be3751`; building the 2026-08-22 commit the route was validated against reproduced the black
 too, so there is no regression here — only a dirty save
 ([#2932](https://github.com/mattias800/prosper/issues/2932)).
 

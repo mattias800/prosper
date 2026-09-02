@@ -1,6 +1,6 @@
 # Tactics Ogre: Reborn status (`PPSA03839`)
 
-> **2026-08-29 — restored after a 25-day regression.** `b3d4b691` (#2302) registered
+> **2026-08-29 — restored after a 25-day regression.** `87e973eb` (#2302) registered
 > `sceSaveDataDirNameSearchPs4` and answered it `NOT_FOUND`. This title calls it once, right after
 > `sceSaveDataInitialize3`; on the error it submitted two DCBs, drew once, then stopped submitting
 > while staying alive — one black frame for the whole run (`max_nonblack=0.0000`,
@@ -13,8 +13,8 @@
 > |---|---|---|
 > | The black screen is the guest reporting its own crash (`sceSystemServiceReportAbnormalTermination`) | Five archived runs contain that call at boot, including one that rendered **40,936 frames over 470 s**. Zero discriminating power. Retracted on #1892. | a wrong tracker comment and a rejected PR |
 > | A new `[pm4] undecoded prosper sub-op` appeared, so the guest changed | The **diagnostic** was added 2026-08-16, twelve days after the working run. Its absence from that log records a missing `printf`, not guest behaviour. | — |
-> | `39e3c69a` (pthread use-after-destroy → EINVAL) | Its own loud diagnostic never fires on this title. | seconds, no build |
-> | `e3b3e4ee` (AGC packet patchers refusing to patch) | The refusal message is ungated with a budget of 8 per call site and never fires. | seconds, no build |
+> | `9b506554` (pthread use-after-destroy → EINVAL) | Its own loud diagnostic never fires on this title. | seconds, no build |
+> | `5911ffa1` (AGC packet patchers refusing to patch) | The refusal message is ungated with a budget of 8 per call site and never fires. | seconds, no build |
 
 
 ## Current state

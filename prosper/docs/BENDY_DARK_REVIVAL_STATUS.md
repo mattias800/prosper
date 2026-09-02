@@ -131,7 +131,7 @@ section.
 *(One line each: the dead hypothesis, the evidence that killed it, and the issue/PR. The pre-#1981
 stalled-boot falsifications are recorded on tracker #1897 and are not repeated here.)*
 
-- **"Reaching gameplay needs a prosper fix."** Falsified 2026-08-20 on `80c0756e` with no code
+- **"Reaching gameplay needs a prosper fix."** Falsified 2026-08-20 on `14fa3131` with no code
   change at all: a pad route reaches `Section_S101`/`S102`/`S103` with `draws_last` up to 1,204 and
   the in-game objective HUD. Three bounded `tools/screenshot` runs, `guest=running status=ok`, exit
   status 0 in each. Tracker #1897.

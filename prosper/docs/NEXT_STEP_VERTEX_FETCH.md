@@ -8,7 +8,7 @@
 >
 > **`PROSPER_GUEST_FS=1` in the reproduction below is historical, and is left exactly as it was run.**
 > It was the Linux opt-in gate for guest `%fs` TLS at the time; guest TLS became **on by default** in
-> #825 (`4fd585ac`, 2026-07-17), with `PROSPER_NO_GUEST_FS=1` as the opt-out. On current master the
+> #825 (`128c610e`, 2026-07-17), with `PROSPER_NO_GUEST_FS=1` as the opt-out. On current master the
 > token is inert on Linux and Windows; `PROSPER_GUEST_FS` is read only on macOS/Rosetta
 > (`src/host/tls/guest_tls.cpp:46`, inside `#ifdef __APPLE__`). Do not copy it into a new recipe (#2095).
 >

@@ -5,7 +5,7 @@
 
 > **Note on `PROSPER_GUEST_FS=1`.** Two dated records below quote it as part of the environment they
 > were run in, and are left as they were run: it was the Linux opt-in gate for guest `%fs` TLS in July
-> 2026. Guest TLS became **on by default** in #825 (`4fd585ac`, 2026-07-17), with
+> 2026. Guest TLS became **on by default** in #825 (`128c610e`, 2026-07-17), with
 > `PROSPER_NO_GUEST_FS=1` as the opt-out, so the reproduction recipe no longer carries it. On current
 > master the token is inert on Linux and Windows; `PROSPER_GUEST_FS` is read only on macOS/Rosetta
 > (`src/host/tls/guest_tls.cpp:46`, inside `#ifdef __APPLE__`). See #2095.
@@ -176,7 +176,7 @@ cutscene's `mask=0`/`color0_base=0` draws. Neither is a small change.
 
 ## 2026-07-07 (third pass) — CORRECTION: the async scene load COMPLETES; the crash is AT activation, not a load stall
 
-Independent re-verification on the current tip (`334dc7f`), `PROSPER_GUEST_FS=1
+Independent re-verification on the current tip (`df3fc64`), `PROSPER_GUEST_FS=1
 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PREADLOG=1`. Earlier passes said the load "plateaus ~block 977
 (≈82%)" and "crashes before the load finishes and the scene can activate". That framing is **wrong** — the
 async load runs to completion:

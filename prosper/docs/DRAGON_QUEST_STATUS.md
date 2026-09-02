@@ -114,7 +114,7 @@ that streams on demand the membership form is enough — that is what made it de
 
 ## 2026-08-20: the route reaches the opening chapter in Estard, and the game writes a save
 
-**Two independent runs on a branch off `82baa409`**, Linux, AMD Radeon 8060S (RADV STRIX_HALO),
+**Two independent runs on a branch off `f7cfaf50`**, Linux, AMD Radeon 8060S (RADV STRIX_HALO),
 native 3840x2160 through `tools/screenshot`, UE4 recipe, native cadence, isolated `PROSPER_SAVE0`
 and `PROSPER_SAVEDATA_DIR`, `PROSPER_FILELOG=1`. Run A 800/800 samples in 802 s
 (`stop=request-satisfied guest=running status=ok`); run B 1400 samples with the route steered live
@@ -361,7 +361,7 @@ title-visibility blocker.
 >
 > **`gpu_replay` cannot demonstrate this fix.** Both `--bundle` and `.prgcap` go through
 > `materialize_gpu_replay`, which binds the **stored** `ResolvedPipelineState` — the `d.ps = x.ps` line in
-> its draw loop (`gpu_capture.cpp`, line 3405 as of `37768edc`; grep the assignment rather than the line
+> its draw loop (`gpu_capture.cpp`, line 3405 as of `e7859b73`; grep the assignment rather than the line
 > number, it drifts) — so replay never re-runs `resolve_pipeline_state` and a change there is invisible to it.
 > That is why #1695's A/B lever had to sit in `gpu_replay`'s `main()`. Verify in a live run or in
 > `tests/gpu/test_pipeline_render.cpp`, not by replaying an artifact.
@@ -552,7 +552,7 @@ current build.
   1.78 M non-zero samples at peak 0.38976. Every port and context line now carries a never-reset
   total for exactly this reason. See instrument-trap 39.
 
-## Windows pre-lift baseline (2026-08-10, master `a6043524`)
+## Windows pre-lift baseline (2026-08-10, master `f014b1f4`)
 
 Recorded **before** the runtime-selected-descriptor lift (#2412) begins landing its layers, so that a
 cross-title regression on this title is detectable afterwards. The lift changes device creation, reflection,
@@ -660,7 +660,7 @@ Bay: the field HUD (circular minimap bottom-left, party block bottom-right readi
 `Lv.1 / HP 22 / MP 7`), the area-entry banner, the player character standing in the world, and quest
 markers over doors. **144 frames spanning t=652-1240 s (588 s).** Linux, RADV STRIX_HALO, native
 3840x2160 through `tools/screenshot`, direct frontend, unmodified captures, UE4 recipe, isolated
-save roots, master `68f89186`.
+save roots, master `509bd1fd`.
 
 Every number in this section comes from one committed script, so it can be re-derived rather than
 taken on trust — two earlier drafts published figures from scratch analysis and both were wrong:
@@ -830,7 +830,7 @@ made three earlier versions of this selftest incapable of failing.
   level-sequence package appearing only in the load window — and the derivation are in
   *Residency is not activation* above. #1874, #2779.
 
-- **"Every compute program this title dispatches executes."** **Falsified 2026-08-19 on `2703a6c3`.**
+- **"Every compute program this title dispatches executes."** **Falsified 2026-08-19 on `9ea76a52`.**
   A `reach-title-screen.pad` arm through `tools/screenshot` (60/60 samples at 3840x2160, 301 s,
   `stop=request-satisfied guest=running status=ok`) with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports
   **65,536 dispatch decisions over 19 programs**, of which **`0x3017400000` executes 0 times against
@@ -958,7 +958,7 @@ blocker.
    identical title and millisecond. The `stat` habit still applies to artifacts captured before that
    landed (`captures/frame_grab_001.*` is exactly that shape) and to anything else named by ordinal.
 7. **`PROSPER_GFXLOG=1` PERTURBS this title's routed capture — the diagnostic changes what it observes.**
-   Measured 2026-08-10 on current master (`08d42aea`), Linux, native 3840x2160, the documented
+   Measured 2026-08-10 on current master (`4d39313b`), Linux, native 3840x2160, the documented
    `reach-title-screen.pad` route with fresh save roots. Identical command except for the variable:
 
    | run | frames 33-44 | verdict a naive reader takes |

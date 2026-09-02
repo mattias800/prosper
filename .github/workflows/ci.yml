@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # Both during the master -> main migration: main is the new default, master is kept as a
+    # rollback until the switch is proven, and neither may go un-gated in the meantime.
+    branches: [main, master]
     tags: ['v*']
   pull_request:
 

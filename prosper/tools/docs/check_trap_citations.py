@@ -25,7 +25,7 @@ WHAT COUNTS AS A REFERENCE. `trap 41`, `traps 55 and 56`, `instrument trap 104`,
 43`, `orchestration trap 68`, and comma lists like `traps 64, 116 and 121`. The word must not be
 preceded by an identifier character, which is what keeps the RDNA2 shader tests' `s_trap 1` and
 `v_trap` out -- those are instruction mnemonics and have nothing to do with this table. That
-exclusion is measured rather than assumed: on `origin/master` `7413647a`, removing the leading
+exclusion is measured rather than assumed: on `origin/main` `7413647a`, removing the leading
 boundary admits exactly **4** extra matches -- `s_trap 0` in `test_dynfetch_fold.cpp`,
 `test_indirect_pointer_static_footprint.cpp` and `test_rdna2_to_spirv.cpp`, and `s_trap 1` in
 `test_recompile_coverage.cpp`. **Three of them cite row 0**, which does not exist, so they would not

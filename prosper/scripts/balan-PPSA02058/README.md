@@ -16,7 +16,7 @@ The screen the title stops on names CROSS on its own prompt bar, and **CROSS alo
 it**. Pressing it raises a modal — *"Are you sure you want to change the game language to
 English?"* — and that modal, not the grid, is the gate. It is answered by **DOWN then CROSS**.
 
-Measured on master `bb57d617`: 109 CROSS presses over 330 s produced no asset load past
+Measured on master `6cf7e075`: 109 CROSS presses over 330 s produced no asset load past
 `game.locres`, identical to a default no-input run. A 10-arm probe (one 30 s window per candidate
 button) put the breakout in the `down` window after `left` and `right` had both failed; re-run with
 CROSS+DOWN alone, `/app0/title` opens at **t = 15.5 s**.

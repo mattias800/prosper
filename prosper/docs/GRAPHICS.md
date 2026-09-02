@@ -790,7 +790,7 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   the mapped slice. #2937.
 - **Do not read #2937's failure list as a set of deterministic failures — three of the five are
   flaky, and one of those passes most of the time.** Measured 30 runs each of the same binary at
-  master (`08c23efd`), Linux/RADV: `descriptor_array_render` **23/30 pass**, `multidraw_render`
+  master (`deb61138`), Linux/RADV: `descriptor_array_render` **23/30 pass**, `multidraw_render`
   **3/30**, `indexed_render` **0/30**, `gpu_execute` **0/30**. An A/B on the first two needs far more
   than a dozen samples per arm to say anything — twelve-run arms of one unchanged binary produced
   10/12 and 5/12 for `descriptor_array_render` on the same afternoon. Only the 0/30 pair is a stable
@@ -811,7 +811,7 @@ PROSPER_CAPTURE_DIR=<work> PROSPER_GRAB_BUNDLE_AFTER_MS=21000 \
 ./gpu_replay --bundle <work>/frame_grab_*.prgbundle <work>/out.bmp
 ```
 
-Measured on one *BALAN WONDERWORLD* (`PPSA02058`) bundle, master `08c23efd`, Linux / AMD Radeon 8060S
+Measured on one *BALAN WONDERWORLD* (`PPSA02058`) bundle, master `deb61138`, Linux / AMD Radeon 8060S
 (RADV STRIX_HALO), **15 replays of the same file with the same binary**:
 
 | submit | operations | distinct output hashes over 15 replays |
@@ -894,7 +894,7 @@ vkprobe --vs no_ssbo_vs.spv --fs minimal_green_fs.spv \
 
 
 The observable is one frozen `.prgbundle` replayed offline by `gpu_replay` producing a different
-picture from run to run. Everything below was measured on master `99d5f738`, Linux / AMD Radeon
+picture from run to run. Everything below was measured on master `406ff0fd`, Linux / AMD Radeon
 8060S (RADV STRIX_HALO), Mesa 26.1.4.
 
 - **READ THIS ROW FIRST: the failure rate drifts machine-wide over minutes, so a NON-INTERLEAVED A/B

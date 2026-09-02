@@ -184,7 +184,7 @@ measurement is what lets the ladder run long enough to cover a slow boot.
 
 *(One line each: the dead hypothesis, the evidence that killed it, and the issue/PR.)*
 
-- **"Reaching gameplay needs a prosper fix."** Falsified 2026-08-21 on `e653f271` with no code
+- **"Reaching gameplay needs a prosper fix."** Falsified 2026-08-21 on `fb64390e` with no code
   change: a pad route reaches `Media/level14` (`SCIENCE_SHIP/Science_Remake2`) with the in-world
   waypoint HUD drawn, in bounded `tools/screenshot` runs ending `guest=running status=ok`.
   Tracker #1898.
@@ -193,7 +193,7 @@ measurement is what lets the ladder run long enough to cover a slow boot.
   `eboot+0xe44346`, both at `addr=0x8`, with `rdx=0x0` and `rax=0x11` — a frame-pointer unwinder at
   depth 17 taking its designed one hop past a NULL frame pointer. A corruption or a wrong return
   value scatters across rips and addresses. See the section above.
-- **"`PROSPER_NULL_PAGE=1` is optional for this title now."** Falsified 2026-08-21 on `e653f271`:
+- **"`PROSPER_NULL_PAGE=1` is optional for this title now."** Falsified 2026-08-21 on `fb64390e`:
   the identical route without it dies at 1.1 s, `0/45` samples, `status=GUEST-FAULT`. The
   2026-08-03 intake on #1898 saw the same fault at the same rip.
 - **"Aggregate frame metrics can confirm the route reached gameplay."** Not tested here and not

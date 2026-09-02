@@ -170,7 +170,7 @@ number by one character, or move the line -- **while a violation of gaplessness 
 all.** The missing number belongs to somebody else's unmerged branch. The only local "repair" is to
 renumber into the gap, which is exactly the forbidden operation ("append, never renumber") and which
 reproduces the duplicate the checker warns about. That prohibition is not ceremonial. Measured on
-`origin/master` (`7413647a`) on 2026-08-17, excluding the table's self-references:
+`origin/main` (`7413647a`) on 2026-08-17, excluding the table's self-references:
 
     118 references on 110 lines in 46 files, naming 63 distinct rows, every one resolving
     -- 66 of them in .md prose, 50 in .cpp/.hpp/.py COMMENTS
@@ -571,7 +571,7 @@ def load_baseline(baseline_path: str, table_header: str | None) -> tuple[tuple[i
     baseline = Path(baseline_path)
     lines, err = read_lines(baseline)
     if err:
-        # A git REF is the wrong-usage this actually receives -- `--baseline origin/master` and
+        # A git REF is the wrong-usage this actually receives -- `--baseline origin/main` and
         # `--baseline HEAD^1` both propagated through briefings (#2675). Bare, the error reads as
         # a problem with the DOCUMENT ("cannot read"), so the reader goes looking at the table. Say
         # what the flag takes and how CI materialises it, on the one path that can be reached only
@@ -580,7 +580,7 @@ def load_baseline(baseline_path: str, table_header: str | None) -> tuple[tuple[i
             err += (
                 "\n  --baseline takes a FILE PATH, not a git ref. Materialise one first -- CI "
                 "uses `git show HEAD^1:<file>`, and by hand:"
-                '\n      B=$(mktemp); git show "origin/master:<file>" > "$B"'
+                '\n      B=$(mktemp); git show "origin/main:<file>" > "$B"'
             )
         return None, f"--baseline {err}"
     tables, _, _ = parse_tables(lines or [])

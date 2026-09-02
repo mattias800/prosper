@@ -19,7 +19,7 @@ faster than the original bring-up and can approach roughly 20 FPS on the measure
 The draw-heavy new-game/opening transition is still only about 6 FPS. The original performance
 objective—representative play at roughly 20-30 FPS—is **not complete**.
 
-The final Windows tranche, PR #1052 (`d5a5cddb08d0e02f17ee369a88c2c09d23ab684d`), stores a shader
+The final Windows tranche, PR #1052 (`22e4787ad629dbf9ad9bab5a7713422034f3c6b0`), stores a shader
 content hash once in the immutable analysis object instead of re-hashing every shader dword during
 every warm compiled-cache lookup. Its measured dense-transition result was:
 

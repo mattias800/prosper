@@ -272,7 +272,7 @@ that lifetime **only for the Wave32 B32 spelling**: a saved **B64** mask stayed 
 register for the rest of the shader, surviving every later scalar write to it.
 
 That was invisible while nothing treated the alias as a liveness fact. #2481's `operand_bits` reject
-(`904e05ad`, 2026-08-11) does treat it as one — a data read of a word whose root is in `sreg_bool` is
+(`e09a0cec`, 2026-08-11) does treat it as one — a data read of a word whose root is in `sreg_bool` is
 refused, on the grounds that "a persisted B64 wave mask has no ordinary scalar dword" — so an
 unbounded lifetime turned an ordinary recycled register into a shader-wide reject.
 

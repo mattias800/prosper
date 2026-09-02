@@ -344,7 +344,7 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   (instrument trap 229). The falsification above had to be measured on a live route.
 
 > The `PROSPER_*` probes cited below are **not on master**. They live on the unmerged WIP branch
-> `wip/issue-325-texture-arrays` (`e1b0fbb2` and later), which exists so these measurements stay
+> `wip/issue-325-texture-arrays` (`4380fcec` and later), which exists so these measurements stay
 > reproducible. Check that branch out before trying to re-run one.
 
 - **"Memory pressure is why 256 decoded layers fail" — false.** A `PROSPER_ARRAY_MAX_LAYERS` bisect
@@ -402,7 +402,7 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 - **The renderer is not rejecting anything, and never was.** A full boot-to-gameplay run produces
   **zero** `[recompile-reject]` lines and **zero** `[compute] skip` lines. Neither the shattered
   geometry (now fixed) nor the missing textures (still open) is an unsupported-op gap — prosper
-  executes the title's draws and gets a wrong answer, rather than declining them. (run08, `606fd6ae`.)
+  executes the title's draws and gets a wrong answer, rather than declining them. (run08, `3599c701`.)
 - **The vertex data and its descriptors were never wrong.** The world's positions decode cleanly as
   `Sint16 x 4` at stride 20 — quantized on the 1024-unit grid the original games used, spanning a
   sane room-sized box — and the four attribute V#s tile the 20-byte record exactly. The shattering

@@ -44,7 +44,7 @@ $Errors = $null
 Assert-True ($Errors.Count -eq 0) 'verifier parses without PowerShell syntax errors'
 
 $HeadSha = (& git -C $Repo rev-parse HEAD).Trim()
-$BaseSha = (& git -C $Repo rev-parse origin/master).Trim()
+$BaseSha = (& git -C $Repo rev-parse origin/main).Trim()
 $ProvenanceBuildRelative = 'prosper/build-linux/verify-pr-provenance'
 $ProvenanceBuild = Join-Path $Repo 'prosper\build-linux\verify-pr-provenance'
 $PreviousBootTrace = $env:PROSPER_BOOT_TRACE

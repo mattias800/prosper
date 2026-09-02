@@ -205,7 +205,7 @@ Not on the draw path (frame DCBs carry no draws). Full disasm + repro in #222.
 - PS5 SELF-variant loading (magic `0xEEF51454`), the real direct-memory model, `sceKernelBatchMap`,
   memfd physical aliasing, the `libSceAmpr` init/begin/setBuffer trio, `sceKernelGetdents`, RTC
   calendar, `pthread_create_name_np`, etc. (PR #47, #49.)
-- **`sceKernelAprResolveFilepathsToIdsAndFileSizes`** (commit 3d51097): the APR entry point.
+- **`sceKernelAprResolveFilepathsToIdsAndFileSizes`** (commit 2f891ae): the APR entry point.
   ABI: `(const char** paths, int count, uint32_t* outIds, uint64_t* outSizes,
   uint32_t* errorIndex)`. Called once per pak container with `/app0`-translated paths
   (`global.utoc/.ucas`, `pakchunkN-ps5.{pak,utoc,ucas}`). Implemented in `hle_file.cpp`
@@ -814,7 +814,7 @@ base?") is answered by static disassembly of the guest (all offsets eboot-relati
   gdb-unwedged engine streamed the whole remaining load through vWU reads with no events).
 
 **Also fixed in the same session — a DOLL boot regression that masked all of the above** (came in
-with the master merge, first bad commit fe8e8d7 / issue #183, found by git bisect): the guest
+with the master merge, first bad commit aba416c / issue #183, found by git bisect): the guest
 wedged single-threaded ~10 s into boot, self-deadlocked in k_mutex_lock (mutex `__owner` == the
 caller). UE4's PS5 lock wrapper (+0x24ca4b6, same shape inside the APR handler at +0x229dcf5)
 builds its own recursion on the FreeBSD self-lock contract:

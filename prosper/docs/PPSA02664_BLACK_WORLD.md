@@ -85,7 +85,7 @@ and must **not** make inactive narration pages overlap. Do **not** treat "this g
 
 ### Reproducibility of the A/B
 - Emulator revision: the diagnostic commit on branch `fix/issue-320-render-oom` (the
-  `PROSPER_FS_SPV_MATCH` commit), based on master `f71a847`. The A/B was run from that committed
+  `PROSPER_FS_SPV_MATCH` commit), based on master `d51edb0`. The A/B was run from that committed
   implementation (not uncommitted local state).
 - Title/build identity: `PPSA02664`. *(Exact game executable/build revision not separately recorded —
   TODO if a future run needs byte-level title identity.)*

@@ -334,7 +334,7 @@ that thread waits on becomes the focus, so matching signals from other threads a
   range than it should be. Reason about both before changing that function; a safety argument covering
   only the first one is the shape of mistake that produced #2144 in the first place.
 - Accepting a tracker-backed `MEM_RESERVE` region is **not** a relaxation. `win_protect`'s own
-  precondition comment (added 2026-07-18 in `9e8b22b5`, well before #2117) already states it: reserved
+  precondition comment (added 2026-07-18 in `536b64bd`, well before #2117) already states it: reserved
   pages take a tracking-only protection change, matching the POSIX `PROT_NONE` reservation path. The
   `MEM_RESERVE` arm pushes nothing into `committed`, so no `VirtualProtect` runs for it at all — the
   entire effect is a success return plus `k_mprotect`'s `retrack_prot` on a range the tracker already

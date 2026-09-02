@@ -32,7 +32,7 @@ chain returns success-with-garbage-out instead of an honest offline failure, so 
 take its offline path to the title. CONFIDENCE MED on the exact subsystem, pending a trace of the
 flow target eboot+0x124beb0.
 
-Diagnosed 2026-07-10 on `diag/doll-loading-progression` (= master e116cd4) with the new
+Diagnosed 2026-07-10 on `diag/doll-loading-progression` (= master df76f2d) with the new
 `PROSPER_PROGRESS` heartbeat + `PROSPER_PROGRESS_UNIMPL` call-count dump (this branch). All runs:
 WSL2 ext4 fast path (`/root/PPSA17942-app0`), `PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1` — recorded as
 run, but `PROSPER_GUEST_FS` was the then-current Linux opt-in gate for guest `%fs` TLS and has been

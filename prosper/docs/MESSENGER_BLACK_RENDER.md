@@ -7,7 +7,7 @@ connected each visible failure to a specific replay, renderer contract, and regr
 
 ## Current conclusion (2026-07-11)
 
-Immutable capture/replay (#514), the color-disabled depth/stencil-pass fix (#520, merged as `376a801`),
+Immutable capture/replay (#514), the color-disabled depth/stencil-pass fix (#520, merged as `024e774`),
 and resource-producer provenance (#524) established this causal chain:
 
 1. The retained current-master capsule contains 46 draws. Replaying draws 0:30 produces the real first-level
@@ -46,13 +46,13 @@ and resource-producer provenance (#524) established this causal chain:
 
 The original black first-level root cause was therefore a missing shader instruction plus loss of per-target dimensions,
 not depth, a stuck palette fade, compute LUT baking, or detiling of the 256x16 palette. The fix merged as #528
-(`e5fce22`) after a clean exact-route run without the identity-LUT substitution: the LUT, grading output, and
+(`cfc14b9`) after a clean exact-route run without the identity-LUT substitution: the LUT, grading output, and
 selected VideoOut front buffer remained nonblack across consecutive flips. #300 and #522 are closed.
 
 The hardware oracle then exposed two independent follow-up defects hidden by the black frame. #534
-(`3941533`) fixes reversed Vulkan front-face enum values; retaining culling with the corrected winding restores
+(`9c6e58d`) fixes reversed Vulkan front-face enum values; retaining culling with the corrected winding restores
 the foreground canopy/tree, rock slopes, player platform, waterline structures, and right-side terrain that
-were absent from the first visible frame. #541 (`ded4a60`) separates persistent D32S8 layout initialization
+were absent from the first visible frame. #541 (`7c1db7b`) separates persistent D32S8 layout initialization
 from logical depth and stencil validity; earlier stencil-only `ALWAYS`/read-only use no longer makes untouched
 depth contents valid, so the later intro `GEQUAL` draw initializes reverse-Z depth correctly instead of loading
 the logo fallback and rendering black.
@@ -86,7 +86,7 @@ restart any of these without contradictory new evidence** — this is the list `
 
 **The actual root cause**, for contrast: a missing recompiler instruction (`V_CVT_OFF_F32_I4`, VOP1
 `0x0e`, #526) in the LUT producer plus loss of per-target dimensions (`CB_COLOR0_ATTRIB2`, #527),
-fixed together by #528 (`e5fce22`); then two follow-ups the black frame had been hiding — reversed
+fixed together by #528 (`cfc14b9`); then two follow-ups the black frame had been hiding — reversed
 `VkFrontFace` translation (#534) and depth/stencil validity tracked independently in persistent D32S8
 surfaces (#541). The formerly invisible save-game list was #299.
 

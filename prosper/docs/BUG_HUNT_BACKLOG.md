@@ -2,7 +2,7 @@
 
 A full review of all 405 mainline commits (oldest → newest, 14 parallel review passes,
 2026-07-08) hunting defects, hacks, hardcoded stand-ins, and silent simplifications.
-Every finding below was **verified to still exist on master @ 96c80b2** before being
+Every finding below was **verified to still exist on master @ f7eae15** before being
 recorded; candidates that later history already fixed were discarded (~60 of them).
 
 Severity legend: how likely it is to bite + how silent the failure is.
@@ -51,24 +51,24 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
    descriptor buffer for the remaining RE. Still open: decode the real (file id, offset)
    from the descriptor buffer / Ampr CB read command and read via
    prosper_apr_path_for_id — required for the compressed .ucas chunk reads.
-   (introduced 41b01f3)
+   (introduced 402f2ae)
 2. **[simplification] Indexed draws silently dropped** — hle_agc.cpp emits R_DRAW_INDEX
    (0x03) but pm4_decode never decodes it: every sceAgcDcbDrawIndex vanishes downstream
    while the guest sees success. Decode it (verify a2/a3 roles from wrapper disassembly and live calls), push a Draw
    with index data, round-trip test. Directly relevant to scene-content rendering.
-   (8d26489)
+   (e20e2ac)
 3. **[hack] Quad-fan topology heuristic** — gpu_execute.hpp:107-112 rewrites any draw
    whose bound VB has 4 records to vertex_count=4 TRIANGLE_FAN. Stands in for real
    index-buffer support; wrong for real 4-vertex meshes. Supersede with #2 then delete.
-   (b1f3420)
+   (f89b808)
 4. **[hardcoded] Sampled textures assumed RGBA8** — agc_shader_layout.cpp:144,151: the
    decoded 9-bit T# format is thrown away; everything uploads as Unorm8 ×4 with
    size = w*h*4 (over-reads BCn allocations up to 8×). Add a Gen5 IMG_FMT→DataFormat
-   mapper from public format definitions and captures, size from block size, loud skip on unmapped. (13d70f7)
+   mapper from public format definitions and captures, size from block size, loud skip on unmapped. (2f87917)
 5. **[defect] release-mem data_sel default write** — command_processor.cpp:58-67 writes
    8 bytes for ANY unrecognized data_sel and cases 1/2 lack the rel_value_valid guard.
    With the stub-frame fix in, data_sel now decodes correctly — make the default
-   log-and-skip and guard cases 1/2. (858c47e)
+   log-and-skip and guard cases 1/2. (3219cd2)
 6. **[defect] Equeue lifetime + semantics cluster** — hle_kernel_time.cpp:
    (a) k_eq_delete deletes EqState while waiters may sit in wait (UAF; registrations in
    g_*_regs never purged — address reuse resurrects them); (b) WaitEqueue returns
@@ -77,11 +77,11 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
    when 4 queued (a flip event can be the one dropped — coalesce by ident/filter
    instead); (d) detached HR-timer threads post to possibly-deleted queues and
    Delete*Event are no-ops. shared_ptr EqState + purge + ETIMEDOUT + coalescing.
-   (61e7ee8, 534bcc1)
+   (c3f5e9e, 60bfa38)
 7. **[defect] TLS DTV keyed by recyclable thread id, never purged** — hle_kernel.cpp
    __tls_get_addr: pthread id reuse hands a new thread the dead thread's dirty TLS
    block; blocks leak. Purge at thread exit (trampoline) or key by a monotonic token.
-   (a76140b/6495dbc; flagged by three passes)
+   (a76140b/8f7fc0a; flagged by three passes)
 8. **[simplification] pthread_once / _Execute_once-style global-lock deadlock** —
    k_pthread_once holds ONE global recursive mutex across the guest init routine;
    cross-thread-dependent inits deadlock. Per-control state (3-state word + condvar),
@@ -91,25 +91,25 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
    CP should at least assert the condition already holds at fold time. (2e4b9de)
 10. **[hardcoded] Ampr mirror view at fixed −0x540000000** — hle_kernel_mem.cpp:431:
     one-title constant, MAP_FIXED over whatever lives there. Track the guest's real
-    second view via the phys-keyed memfd instead. (a51d7ce)
+    second view via the phys-keyed memfd instead. (d31bbef)
 
 ## Medium
 
 - [defect] init-fault dump derefs unchecked g_fault_rip (mprotect result ignored;
-  forces R|X on RW pages) — exec_image_linux.cpp:~1290. Probe first; restore prot. (b51ad10)
+  forces R|X on RW pages) — exec_image_linux.cpp:~1290. Probe first; restore prot. (4805d49)
 - [hardcoded] RTC/time: wall clock = uptime + 1700000000 (frozen Nov 2023), three
   disagreeing time sources; LocalTime ignores tz — hle_kernel_time.cpp:43-96. Base off
-  host CLOCK_REALTIME once at startup. (e1473f8/efaf7cf)
+  host CLOCK_REALTIME once at startup. (e1473f8/49e696d)
 - [simplification] forward-branch clamp swallows real code past s_endpgm —
-  rdna2_to_spirv.cpp:~968: clamp only tgt == end_pc+1, else reject. (4e65a94)
+  rdna2_to_spirv.cpp:~968: clamp only tgt == end_pc+1, else reject. (375bc57)
 - [defect] flip-status triple (g_flip_count/g_current_buffer/g_last_flip_arg) is
-  read/written by 3 threads with no sync — hle_graphics.cpp. Mutex or atomic seq. (dcff92e)
+  read/written by 3 threads with no sync — hle_graphics.cpp. Mutex or atomic seq. (813f07b)
 - [simplification] untyped MUBUF loads/stores hardcode binding 2 (never resolve SRSRC)
-  — rdna2_to_spirv.cpp:~1648. Mirror the format-load provenance resolution. (e9b62dd)
+  — rdna2_to_spirv.cpp:~1648. Mirror the format-load provenance resolution. (ef04fdd)
 - [hardcoded] LDS fixed at 16 KB (RDNA2 allows 64 KB; size is per-shader RSRC2 data) —
-  rdna2_to_spirv.cpp declare_lds. (fbfd8da)
+  rdna2_to_spirv.cpp declare_lds. (d981ea9)
 - [defect] robustImageAccess required by the recompiler's storage-image contract but
-  never enabled at either vkCreateDevice — render_runner.h:113, image_compute_runner.h:57. (e3951c1)
+  never enabled at either vkCreateDevice — render_runner.h:113, image_compute_runner.h:57. (02ce1d3)
 - [simplification] EventWrite drops its address arg (label-carrying events can never
   write) — hle_agc.cpp:136. (2e4b9de)
 - [hardcoded] vk_color_format maps ONLY 8_8_8_8 (else silently Undefined) —
@@ -130,55 +130,55 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
   written) — hle_kernel_mem.cpp. Walk g_dmem gaps. (cf2495c)
 - [simplification] printf-family forwards only integer regs (floats/stack args read
   garbage; %s can fault) — hle_libc.cpp:199. Needs a va-marshaling shim. (3e16200)
-- [simplification] alloc_dmem ignores searchStart/End — constrain the gap walk. (efaf7cf)
+- [simplification] alloc_dmem ignores searchStart/End — constrain the gap walk. (49e696d)
 - [simplification] wait_on_address timeout honor still gated OFF behind
   PROSPER_WAIT_TIMEOUT with an obsolete justification (unwinder long fixed) + 5 s cap —
-  hle_kernel_mem.cpp:334. Flip the default. (0e121a5)
+  hle_kernel_mem.cpp:334. Flip the default. (f69799d)
 - [simplification] folded multi-draw uses draws[0].index_count with the LAST draw's
-  state (chimera draw) — gpu_execute.hpp:136. Use consistent provenance / PERDRAW default. (d99e3c6)
-- [defect] detached timer threads + eq delete UAF (see cluster #6). (534bcc1)
+  state (chimera draw) — gpu_execute.hpp:136. Use consistent provenance / PERDRAW default. (b46426f)
+- [defect] detached timer threads + eq delete UAF (see cluster #6). (60bfa38)
 - [simplification] type-0 AGC data packets get the type-1 payload offset (never RE'd) —
   hle_agc.cpp agc_get_data_packet_payload. Per-type offset or loud diagnostic. (54b7b81)
 - [defect] mb_cur_max returns a POINTER (address of static) where the value is the
   contract — hle_libc.cpp:233. (5b781e4)
 - [simplification] Windows k_wait_on_address fallback drops the timeout + global cv —
-  hle_kernel_mem.cpp #else branch. (8e7a661)
+  hle_kernel_mem.cpp #else branch. (c5596f2)
 - [simplification] guest static-TLS layout hardcodes 16-byte alignment instead of
-  PT_TLS p_align (Variant II tpoff mismatch for p_align>16) — guest_tls.cpp:47. (45016d8)
+  PT_TLS p_align (Variant II tpoff mismatch for p_align>16) — guest_tls.cpp:47. (a72899e)
 
 ## Lower priority / latent
 
-- vblank count advances per POLL, not per 16.67 ms — hle_graphics.cpp:248. (d83b2e6)
+- vblank count advances per POLL, not per 16.67 ms — hle_graphics.cpp:248. (d247054)
 - sceVideoOutGetOutputStatus returns success without writing the out-struct —
-  hle_graphics.cpp:311. (d83b2e6)
+  hle_graphics.cpp:311. (d247054)
 - MsgDialog reports FINISHED before any Open — hle_service.cpp. 3-state lifecycle. (1b14b79)
 - all guest mutexes forced RECURSIVE (settype discarded; static sentinels too) —
-  hle_kernel.cpp:55,73-89. Map sentinel/attr → real type. (cf2495c/8d26489)
+  hle_kernel.cpp:55,73-89. Map sentinel/attr → real type. (cf2495c/e20e2ac)
 - LoadStartModule returns a fake success handle for unknown paths — ENOENT for misses. (e1473f8)
-- dlsym ignores the module handle (global first-wins table) — per-module exports. (b51ad10)
-- pad handle ignored (always backend index 0); getenv per poll — hle_pad.cpp:59. (8564d73)
+- dlsym ignores the module handle (global first-wins table) — per-module exports. (4805d49)
+- pad handle ignored (always backend index 0); getenv per poll — hle_pad.cpp:59. (4626c5c)
 - MUBUF idxen+offen drops the second VADDR (per-lane byte offset) — reject or decode
-  both. (66e82a0)
+  both. (a998f9c)
 - SMEM register SOFFSET never decoded (silently dropped — can't even reject) and the
-  21-bit imm treated unsigned — rdna2_decode.cpp:149. (3bff9d0)
+  21-bit imm treated unsigned — rdna2_decode.cpp:149. (a495c4e)
 - packed vertex attributes assume dword-aligned element addresses — rdna2_to_spirv.cpp
-  packed load/store paths. Fold addr&3 or reject. (08b1f5c)
+  packed load/store paths. Fold addr&3 or reject. (b247793)
 - image_sample → ImplicitLod even in compute/vertex shells (invalid SPIR-V) — gate on
-  fragment, else explicit LOD 0. (f8bcad1)
-- v_interp_mov ignores its P0/P10/P20 selector (flat reads interpolated). (636cf47)
+  fragment, else explicit LOD 0. (c8756b7)
+- v_interp_mov ignores its P0/P10/P20 selector (flat reads interpolated). (86c36fb)
 - v_readfirstlane models "this lane" (marked SPECULATIVE) — use
-  OpGroupNonUniformBroadcastFirst where available. (836394c)
+  OpGroupNonUniformBroadcastFirst where available. (544e0b1)
 - NGG vertex index hardcoded to v5 via an s_sendmsg heuristic — derive from
-  SPI_SHADER_PGM_RSRC/GE state. (6b29017)
-- s_bfe_u64 fold zero-extends negative inline constants (ISA sign-extends). (f8c7371)
-- gpu_clock64 writes steady_clock ns, not GPU-tick units (data_sel=3 deltas wrong). (3685104)
+  SPI_SHADER_PGM_RSRC/GE state. (504983b)
+- s_bfe_u64 fold zero-extends negative inline constants (ISA sign-extends). (4711f3c)
+- gpu_clock64 writes steady_clock ns, not GPU-tick units (data_sel=3 deltas wrong). (2521983)
 - detile treats all tile modes except 5 as linear, silently; 32 bpp only — log
-  unrecognized modes once. (1ecc260)
+  unrecognized modes once. (1f23b55)
 - VS texture-first binding collision with hardwired SB bindings 2/3 —
-  assign_convention_bindings should start at 4. (d99e3c6)
+  assign_convention_bindings should start at 4. (b46426f)
 - dynfetch: fixed 0x4000-dword code walk (bound by AgcShaderHeader size), Unknown
-  format → Float32×4 default, size fallback "stride*4" — gpu_executor.cpp:344-386. (21589ee)
+  format → Float32×4 default, size fallback "stride*4" — gpu_executor.cpp:344-386. (d7ad040)
 - two glibc write() + one getenv() left inside the fault handler's HWBP diag paths
-  (guest-%fs unsafe) — exec_image_linux.cpp:~489/~580. (b51ad10)
+  (guest-%fs unsafe) — exec_image_linux.cpp:~489/~580. (4805d49)
 - shader-capture dump path hardcoded to this machine's WSL layout — hle_graphics.cpp:384. (7089e48)
 - three disagreeing "now" sources (see RTC above) — clock_gettime ignores clockid. (e1473f8)
