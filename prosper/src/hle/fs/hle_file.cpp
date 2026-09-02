@@ -3804,26 +3804,45 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 //   sceAmprCommandBufferConstructor      8aI7R7WaOlc   rewinds -> the commands the chain named are gone
 //   sceAmprAmmCommandBufferConstructor   EDq5bqCqYpA
 //   sceAmprCommandBufferDestructor       GuchCTefuZw   (via ampr_cb_destroy_320)
+//   sceAmprAprCommandBufferDestructor    Qs1xtplKo0U   (same, on BOTH platform arms)
 //   sceAmprAprCommandBufferResetGatherScatterState  YPxkUDhgoNI   the explicit one
 //   sceKernelAprSubmitCommandBuffer{,AndGetResult}  eE4Szl8sil8 / ASoW5WE-UPo
 //
-// The last row is the surprising one. It is not a deliberate ABI claim: the submit handler calls
+// NOT a closer, and deliberately listed so the omission is a decision rather than an oversight:
+// `a8uLzYY--tM sceAmprAprCommandBufferConstructor` (k_ampr_begin on POSIX, a logging stub on
+// Windows) closes nothing, even though it re-initialises the very object the chain is keyed on.
+// It is excluded because it does not reset the buffer's contents or cursor -- it hands back the
+// cursor pair through out-slots -- and because the observed flow is `init(req,…)` (which DOES close,
+// via ampr_cb_construct) followed by `begin(req,…)`, so the chain is already closed when it runs.
+// That is a tension with the "err toward closing" policy below, not a resolution of it: if a title
+// is ever seen opening a chain and then calling begin, this is the line to revisit.
+//
+// The submit row is the surprising one. It is not a deliberate ABI claim: the submit handler calls
 // `ampr_cb_reset` to rewind the command CURSOR (Pathless reuses completed pool buffers without
 // calling the public Reset), and closing the read chain is a side effect of sharing that helper.
 //
-// It is kept anyway, and the reason is a discriminator that does not exist. Yakuza Kiwami's
+// It is kept anyway, and the reason is that NOTHING BEARS ON THE QUESTION. Yakuza Kiwami's
 // dispatcher calls Reset immediately BEFORE the chain-opening ReadFile, so the following ReadFile
 // re-establishes the chain either way — the observation is equally consistent with "Reset closes the
-// chain" and with "Reset does not". Nothing observed so far separates them, and the firmware's
-// separate …ResetGatherScatterState export is weak evidence AGAINST Reset being a closer, since a
-// Reset that already cleared the state would make that export redundant.
+// chain" and with "Reset does not". The firmware's separate …ResetGatherScatterState export is
+// NEUTRAL here and this comment used to over-read it as evidence against: a coarse reset does not
+// make a fine-grained one redundant, and vkResetCommandPool / vkResetCommandBuffer is the same
+// pairing — a fine clear is useful precisely when you do NOT want to discard the buffer.
+//
+// The observation that WOULD discriminate, so the next agent knows what to collect: a Reset (or a
+// submit) arriving BETWEEN a chain-opening ReadFile and a …GatherScatter on the same cb. Serving
+// that segment would prove the chain survives; refusing it correctly would prove it does not.
 //
 // So the closer set is chosen by which way the unknown fails, not by evidence:
 //   * closing too eagerly  -> a legitimate segment is REFUSED, loudly, with the reason printed;
 //   * closing too late     -> a stale chain names the WRONG FILE and the segment is served from it,
 //                             caught by the range guard below only when the wrong file is smaller.
 // The second is the silent-wrong-data outcome this whole handler exists to avoid, so prosper errs
-// toward closing. `tests/hle/test_apr_gather_scatter.cpp` pins the set so it cannot drift silently.
+// toward closing — and the eager side has been MEASURED to cost nothing on the one title that could
+// have paid it. Submit already closed before #2924 (the diff that added this model changed no
+// behaviour in the submit path), so #2924's Kiwami run was measured with the wide set already live
+// and reported ZERO refusals across four archives whose segments tile each file exactly.
+// `tests/hle/test_apr_gather_scatter.cpp` pins the set so it cannot drift silently.
 //
 // CONFIDENCE: HIGH on the argument layout (the guest's two arms are argument-for-argument identical
 // apart from the id) and on the chain being command-buffer state (the firmware's own
@@ -3835,14 +3854,20 @@ HLE(f_apr_read_gather_scatter) {
     // Bounded: a title that issues gather/scatter with no chain would otherwise emit one line per
     // segment for the life of the process, and a diagnostic that drowns the log is one nobody reads.
     // The count is reported so a truncated tail is visible rather than plausible.
-    static std::atomic<uint64_t> refusals{0};
+    //
+    // PER-CLASS budgets, not one shared budget. With a single counter a title producing early
+    // chain-not-open refusals silences the first UNDELIVERED one -- and the undelivered class is
+    // both the newest and the one most worth seeing, since it means bytes were read and then lost
+    // rather than never fetched. A shared budget makes the rarest event the one you cannot observe.
+    static std::atomic<uint64_t> refusals_chain{0}, refusals_undelivered{0};
     constexpr uint64_t kRefusalLogLimit = 32;
-    const auto log_refusal = [&](const char* what) {
-        const uint64_t n = refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto log_refusal_in = [](std::atomic<uint64_t>& budget, const char* what) {
+        const uint64_t n = budget.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n > kRefusalLogLimit) return;
         fprintf(stderr, "[apr] gather-scatter REFUSED (#%llu%s): %s\n", (unsigned long long)n,
-                n == kRefusalLogLimit ? ", further refusals silent" : "", what);
+                n == kRefusalLogLimit ? ", further refusals of this kind silent" : "", what);
     };
+    const auto log_refusal = [&](const char* what) { log_refusal_in(refusals_chain, what); };
     AprChain chain{};
     if (!apr_chain_current(cb, &chain)) {
         char msg[256];
@@ -3893,7 +3918,7 @@ HLE(f_apr_read_gather_scatter) {
                  "is reported as failed rather than served empty",
                  (unsigned long long)r.size, chain.host.c_str(),
                  (unsigned long long)dst, (unsigned long long)offset);
-        log_refusal(msg);
+        log_refusal_in(refusals_undelivered, msg);
     }
     return delivered ? 0 : 0x80020016ull;
 }
@@ -3907,11 +3932,23 @@ HLE(f_apr_read_gather_scatter) {
 // which on this contract is SCE_OK — "the read is queued and will deliver" — while nothing writes
 // the destination. The guest then reads its own buffer and cannot tell an undelivered segment from a
 // successful read of zeros. That is the failure class this whole block exists to prevent, and it is
-// what prosper answers TODAY. These builders return an int32 SCE error code, so 0x80020016 is a
-// value the contract already defines (it is what the other builders return for an unresolvable
-// file) rather than a sentinel read back as data. The refusal is therefore weakly better than the
-// default on every path: a guest that checks gets a truthful failure, and a guest that does not is
-// no worse off than it is now.
+// what prosper answers TODAY. 0x80020016 is a value the contract already defines (it is what the
+// other builders return for an unresolvable file) rather than a sentinel read back as data, so the
+// refusal is weakly better than the default on every path: a guest that checks gets a truthful
+// failure, and a guest that does not is no worse off than it is now.
+//
+// That these builders return a STATUS and not a size is derived, not assumed -- which matters,
+// because a return type is part of a layout and the rest of this block declines to claim one. The
+// firmware exports a SEPARATE sizing function per read builder, all four of them:
+//
+//   vWU-odnS+fU sceAmprMeasureCommandSizeReadFile         qesF88X4DRg …ReadFileGather
+//   DXmgc5op8Yw …ReadFileGatherScatter                    7nXGDGMXSqo …ReadFileScatter
+//
+// A builder therefore never needs to return its own encoded size: sizing already has its own
+// entry point, one-to-one with the builders. The sibling …GatherScatter corroborates it
+// behaviourally -- prosper returns 0/0x80020016 there, and #2924's Kiwami run loaded all four
+// archives with its two segments tiling each file exactly, which a guest reading that return as a
+// byte count could not have done. CONFIDENCE: HIGH on the return being a status.
 //
 // What must NOT happen is registering a guessed layout. Standard DMA vocabulary (gather = many
 // sources -> one destination, scatter = one source -> many destinations) suggests each of these
@@ -3923,8 +3960,24 @@ HLE(f_apr_read_gather_scatter) {
 //
 // The evidence that would settle it is the same shape #2924 used for …GatherScatter: a title that
 // imports one of these NIDs, its SDK inline wrapper disassembled (Kiwami's sit adjacently at
-// eboot+0xcc4a40 and 0xcc4a70), and a live PROSPER_FILELOG run confirming the order. Neither
-// PPSA31334 nor PPSA02739 imports them, so nothing observed calls these yet.
+// eboot+0xcc4a40 and 0xcc4a70), and a live PROSPER_FILELOG run confirming the order.
+//
+// REACHABILITY -- state it precisely, because the obvious version of this sentence is wrong by an
+// order of magnitude. This block used to say "neither PPSA31334 nor PPSA02739 imports them, so
+// nothing observed calls these yet". The premise is true and the conclusion does not follow from
+// it. Swept over the local corpus (2026-09-03): **22 of 55 eboots import BOTH NIDs** in genuine
+// `NID#lib#mod` dynamic-import form -- including PPSA17942 and PPSA02101, the two titles the
+// measure-read work is about, plus PPSA04263, PPSA03831, PPSA21406 and PPSA07809. PPSA31334 really
+// does carry only mQ16-QdKv7k and BVmR1H8l+XI.
+//
+// The stronger claim is the one that holds: NONE of them CALLS either NID on any observed route,
+// and that absence is observable rather than assumed. prosper_on_unimpl (dispatch.cpp) prints its
+// first-seen line unconditionally -- no env gate -- so one call anywhere is impossible to miss in a
+// boot log. Across DOLL's 91 MB and Stray's 33 MB PROSPER_FILELOG boots neither NID string appears
+// at all (0 occurrences; 10 and 6 distinct unimplemented imports respectively).
+//
+// So the blast radius of this refusal is 22 linked titles rather than none, and the honest record
+// says so. If a route ever reaches one, the loud failure below is what makes it findable.
 // CONFIDENCE: HIGH that refusing is better than the current answer; the layout is deliberately not
 // claimed at all.
 static uint64_t apr_read_builder_unimplemented(const char* nid, const char* name,

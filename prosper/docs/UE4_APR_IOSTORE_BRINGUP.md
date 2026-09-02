@@ -179,12 +179,23 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   immediately before every chain-opening `ReadFile`. That ordering is equally consistent with "Reset
   closes the chain" and with "Reset does nothing to it", because the `ReadFile` that follows re-opens
   the chain either way — so the evidence never bore on the question. Two further facts point the
-  other way: the firmware exports a *separate* `sceAmprAprCommandBufferResetGatherScatterState`
-  (`YPxkUDhgoNI`), which a Reset that already cleared the state would make redundant; and prosper's
-  real closer set was already much wider than the comment claimed — every `ampr_cb_reset` and
-  `ampr_cb_construct` caller closes, **submit included**. The set is kept wide *because* the lifetime
-  is undecided: closing too eagerly refuses a legitimate segment loudly, closing too late serves one
-  from the wrong file silently. Confidence is now recorded as LOW and the set is pinned by
+  other way — and an earlier version of this row over-read it. The firmware's *separate*
+  `sceAmprAprCommandBufferResetGatherScatterState` (`YPxkUDhgoNI`) is **neutral**, not evidence
+  against: a coarse reset does not make a fine-grained one redundant, and `vkResetCommandPool` /
+  `vkResetCommandBuffer` is the same pairing — a fine clear is useful precisely when you do *not*
+  want to discard the buffer. (The observation that prosper's own closer set was already wider than
+  its comment is a fact about prosper, downstream of the question, and is not evidence about Sony's
+  contract either; it belongs in the narrative, not the inference.) So the honest position is
+  stronger than "the evidence points the other way": **nothing bears on the question at all**, which
+  is exactly why LOW is right.
+
+  The set is kept wide *because* the lifetime is undecided — closing too eagerly refuses a legitimate
+  segment loudly, closing too late serves one from the wrong file silently — and **the eager side has
+  been measured to cost nothing on the only title that could have paid it**: submit already closed
+  before #2924, so that PR's Kiwami run ran with the wide set live and reported **0 refusals** across
+  four archives whose segments tile each file exactly. **The observation that would discriminate**,
+  for whoever collects it next: a Reset or a submit arriving *between* a chain-opening `ReadFile` and
+  a `…GatherScatter` on the same `cb`. Confidence is LOW and the set is pinned by
   `tests/hle/test_apr_gather_scatter.cpp`. [#2928](https://github.com/mattias800/prosper/issues/2928).
 
 - **"An unregistered libSceAmpr read builder is the safe default" — false for this contract.**
@@ -193,10 +204,32 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   *here*: these return an int32 SCE status where 0 is `SCE_OK` — "the read is queued and will
   deliver" — so an unregistered builder promises bytes and writes none, and the guest cannot tell the
   result from a successful read of zeros. They now refuse with `0x80020016`, a value the contract
-  already defines. This does **not** license registering a guessed argument layout: gather/scatter
-  DMA vocabulary suggests each names one side and takes the other from the chain, but the two
-  readings differ in which argument disappears and prosper's chain state holds no cursor for the
-  implied side, so even the argument count is unknown.
+  already defines.
+
+  **That the builders return a status and not a size is derived, not assumed** — the distinction
+  matters because a return type is part of a layout, and the rest of this entry declines to claim
+  one. The firmware exports a **separate sizing function per read builder, one-to-one, all four**:
+  `vWU-odnS+fU` / `qesF88X4DRg` / `DXmgc5op8Yw` / `7nXGDGMXSqo` for `ReadFile` / `…Gather` /
+  `…GatherScatter` / `…Scatter`. A builder never needs to return its own encoded size because sizing
+  already has its own entry point. The sibling corroborates it behaviourally: prosper returns
+  `0`/`0x80020016` from `…GatherScatter`, and #2924's Kiwami run loaded all four archives with its
+  two segments tiling each file exactly, which a guest reading that return as a byte count could not
+  have done.
+
+  This does **not** license registering a guessed argument layout: gather/scatter DMA vocabulary
+  suggests each names one side and takes the other from the chain, but the two readings differ in
+  which argument disappears and prosper's chain state holds no cursor for the implied side, so even
+  the argument count is unknown.
+
+  **Reachability, stated precisely, because the obvious version is wrong by an order of magnitude:**
+  "neither `PPSA31334` nor `PPSA02739` imports them, so nothing observed calls these" was true in its
+  premise and did not license its conclusion. Swept 2026-09-03 over the local corpus: **22 of 55
+  eboots import BOTH NIDs** in genuine `NID#lib#mod` form, including `PPSA17942` and `PPSA02101`
+  (the two titles #3245 is about), `PPSA04263`, `PPSA03831`, `PPSA21406` and `PPSA07809`. The claim
+  that holds is the stronger one: **none of them CALLS either NID on any observed route**, and that
+  absence is *observable* — `prosper_on_unimpl` prints its first-seen line unconditionally, and
+  neither NID string occurs anywhere in DOLL's 91 MB or Stray's 33 MB `PROSPER_FILELOG` boot logs.
+  So the refusal's blast radius is 22 linked titles rather than none.
   [#2926](https://github.com/mattias800/prosper/issues/2926).
 
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)

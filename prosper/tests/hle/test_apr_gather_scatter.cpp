@@ -147,6 +147,7 @@ int main() {
         { "ULvXMDz56po", "sceAmprCommandBufferClearBuffer",              true  },
         { "8aI7R7WaOlc", "sceAmprCommandBufferConstructor",              true  },
         { "GuchCTefuZw", "sceAmprCommandBufferDestructor",               true  },
+        { "Qs1xtplKo0U", "sceAmprAprCommandBufferDestructor",            true  },
         { "YPxkUDhgoNI", "sceAmprAprCommandBufferResetGatherScatterState", true },
         // Submit is the closer the handler's comment used to deny. It closes because the submit
         // path rewinds the command cursor through the same helper; the choice to keep it is
