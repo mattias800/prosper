@@ -361,19 +361,65 @@ def cmd_check(args):
 
 
 def _hook_path():
+    """Where git looks for this repository's reference-transaction hook, as PYTHON spells it.
+
+    Asking git for an absolute path is the obvious way and it is wrong wherever git and the
+    interpreter disagree about path spelling -- an MSYS git under native Windows python answers
+    `/tmp/...`, which python then resolves against the current drive. The install lands somewhere
+    real, git never looks there, and the guard is silently absent. Measured on this project's
+    Windows MinGW CI, where install-hook returned 0 and `git stash` went on working. A RELATIVE
+    answer has no root spelling to disagree about and survives the crossing; the absolute form
+    stays as a fallback, and a candidate that is not a directory here is a refusal rather than a
+    guess -- a hook installer that cannot prove where it wrote is worse than none.
+    """
     configured = git('config', '--default', '', '--get', 'core.hooksPath').strip()
     if configured:
         raise Fail('core.hooksPath is set to {!r}; this installer only manages the default '
                    'hooks directory. Install the hook there by hand, or unset the config.'
                    .format(configured))
-    common = git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()
-    return os.path.join(common, 'hooks', 'reference-transaction')
+    tried = []
+    for fmt in ('relative', 'absolute'):
+        rc, out, _ = git_rc('rev-parse', '--path-format=' + fmt, '--git-common-dir')
+        if rc != 0 or not out.strip():
+            continue
+        cand = os.path.abspath(os.path.join(os.getcwd(), out.strip()))
+        tried.append(cand)
+        if os.path.isdir(cand):
+            return os.path.join(cand, 'hooks', 'reference-transaction')
+    raise Fail('could not locate this repository\'s common git directory as this interpreter '
+               'spells it; git offered {} and none of it exists here. Install the hook by hand.'
+               .format(', '.join(repr(t) for t in tried) or '(nothing)'))
+
+
+def _hook_is_live():
+    """Did git actually run the hook we just wrote? True / False / None when it cannot be asked.
+
+    An installer that reports success on the strength of its own `write()` is the shape this
+    project keeps a list about: it reads as coverage and cannot fail. So prove it instead, by
+    asking git to do the one thing the hook exists to refuse -- a sentinel write to `refs/stash`.
+
+    Skipped, rather than forced, when `refs/stash` already holds something: that entry is somebody's
+    work, and racing it to test a guard against losing work would be its own answer. The cleanup
+    passes the sentinel as the expected old value, so it can only ever delete the ref this function
+    created.
+    """
+    if resolve('refs/stash') is not None:
+        return None
+    rc, head, _ = git_rc('rev-parse', '--verify', '--quiet', 'HEAD')
+    sentinel = head.strip()
+    if rc != 0 or not sentinel:
+        return None
+    rc, _, _ = git_rc('update-ref', 'refs/stash', sentinel)
+    if rc != 0:
+        return True
+    git_rc('update-ref', '-d', 'refs/stash', sentinel)
+    return False
 
 
 def cmd_install_hook(args):
     path = _hook_path()
     if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+        with open(path, 'r', encoding='utf-8', errors='replace', newline='') as fh:
             existing = fh.read()
         if HOOK_MARKER in existing:
             print('already installed: {}'.format(path))
@@ -382,10 +428,26 @@ def cmd_install_hook(args):
             raise Fail('a different reference-transaction hook already exists at {}\n'
                        '  refusing to overwrite it; merge by hand or pass --force'.format(path))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as fh:
+    # newline='' -- text mode otherwise translates every '\n' to os.linesep, so on Windows the
+    # hook lands with CRLF endings and the shell running it sees a stray CR inside every token
+    # ('then\r' is not 'then'). The guard would then be present, unrunnable, and silent.
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
         fh.write(HOOK_BODY)
     os.chmod(path, 0o755)
+
+    live = _hook_is_live()
+    if live is False:
+        os.remove(path)
+        raise Fail('wrote {} but git did not honour it -- a sentinel refs/stash write went '
+                   'through anyway. The hook has been removed again rather than left there '
+                   'reading as protection. Park changes with `wt_stash.py push` instead.'
+                   .format(path))
     print('installed {}'.format(path))
+    if live is None:
+        print('  NOT verified: refs/stash is already occupied (or HEAD is unborn), so the')
+        print('  sentinel check was skipped rather than raced against somebody else\'s entry.')
+    else:
+        print('  verified: git refused a sentinel refs/stash write through this hook.')
     print('  `git stash` now fails repo-wide, for every worktree AND for interactive use.')
     print('  Bypass once: git -c core.hooksPath=/dev/null stash ...')
     return 0
@@ -396,7 +458,7 @@ def cmd_uninstall_hook(args):
     if not os.path.exists(path):
         print('not installed: {}'.format(path))
         return 0
-    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+    with open(path, 'r', encoding='utf-8', errors='replace', newline='') as fh:
         existing = fh.read()
     if HOOK_MARKER not in existing:
         raise Fail('{} was not written by wt_stash; refusing to remove it'.format(path))
