@@ -70,6 +70,12 @@ done
     echo "replay_determinism.sh: --replay, --capture and --out are required" >&2; exit 2; }
 [ -x "$replay" ] || { echo "replay_determinism.sh: not executable: $replay" >&2; exit 2; }
 [ -s "$capture" ] || { echo "replay_determinism.sh: missing or empty capture: $capture" >&2; exit 2; }
+# A capsule is a positional argument to gpu_replay; a bundle needs --bundle, and passing one
+# positionally is rejected in a way that reads like a bad file rather than a bad invocation.
+case "$capture" in
+    *.prgbundle) capture_flag=--bundle ;;
+    *)           capture_flag= ;;
+esac
 [ ${#arms[@]} -gt 0 ] || arms=("full=")
 work=${work:-$(mktemp -d)}
 mkdir -p "$work" || exit 2
@@ -122,7 +128,8 @@ start_load() {
     : > "$STOP"; : > "$PIDS"
     for i in $(seq 1 "$load"); do
         ( while [ -e "$STOP" ]; do
-              timeout 600 "$replay" "$capture" "$work/load_$i.bmp" >/dev/null 2>&1
+              # shellcheck disable=SC2086 -- $capture_flag is empty for a capsule by design
+              timeout 600 "$replay" $capture_flag "$capture" "$work/load_$i.bmp" >/dev/null 2>&1
           done ) &
         echo $! >> "$PIDS"
     done
@@ -147,8 +154,8 @@ run_subject() {   # <round> <cond> <peers> <arm-spec>
     local log=$work/replay_${round}_$name.log img=$work/out_${round}_$name.bmp
     local t0 t1 rc h
     t0=$(date +%s%N)
-    # shellcheck disable=SC2086 -- $extra is a deliberate argument list from --arm
-    timeout 900 "$replay" "$capture" $extra "$img" > "$log" 2>&1; rc=$?
+    # shellcheck disable=SC2086 -- $extra and $capture_flag are deliberate argument lists
+    timeout 900 "$replay" $capture_flag "$capture" $extra "$img" > "$log" 2>&1; rc=$?
     t1=$(date +%s%N)
     h=$(grep -oE '^\[gpureplay\] output=[0-9x]+ target=[0-9a-f]+ draw=[0-9]+ bytes=[0-9]+ hash=[0-9a-f]+' \
         "$log" | grep -oE 'hash=[0-9a-f]+' | tail -1)
