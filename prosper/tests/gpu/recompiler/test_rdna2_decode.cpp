@@ -782,10 +782,44 @@ int main() {
                   !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(plain_load_words, 2)) &&
                   !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(dim3d_words, 2)),
               "#3048: the dynamic-mip shape rejects D16/A16/TFE/LWE, a plain IMAGE_LOAD, and dim:3D");
-        // An NSA packet spells its addresses in the extra dwords, so the consecutive-VGPR
-        // arithmetic this function does would name the wrong register.
-        CHECK(!rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(stray_load_mip_2d_nsa_words, 3)),
-              "#3048: the dynamic-mip shape rejects the NSA address form");
+        // #3134: NSA is an address ENCODING, not a different operation. This arm used to assert
+        // the opposite -- that the dynamic-mip shape REJECTS the NSA form -- because the function
+        // could only do consecutive-VGPR arithmetic from VADDR, and naming the wrong register is
+        // worse than declining. Now it reads the encoding: addr0 stays in VADDR and every later
+        // address occupies one byte of words[2], low byte first, so Stray's captured packet names
+        // v0=x, v42=y, v5=mip exactly as `image_load_mip v[5:7], [v0, v42, v5], s[32:39]
+        // dmask:0x7 dim:SQ_RSRC_IMG_2D` assembles under llvm-mc gfx1030.
+        CHECK(rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(stray_load_mip_2d_nsa_words, 3),
+                                           &dynamic_vgpr) && dynamic_vgpr == 5u,
+              "#3134: the dynamic-mip shape reads Stray's NSA extra address dword and names v5");
+        // Every byte pattern below is llvm-mc gfx1030 output for the instruction in its comment,
+        // so the register each arm expects is the assembler's own, not this decoder's.
+        //   image_load_mip v[5:7], [v3, v200, v77], s[8:15] dmask:0x7 dim:SQ_RSRC_IMG_2D
+        const uint32_t nsa_high_vgpr_words[] = {0xf004070au, 0x00020503u, 0x00004dc8u};
+        //   image_load_mip v[5:8], [v10, v11, v12, v13], s[32:39] dmask:0xf dim:2D_ARRAY
+        const uint32_t nsa_2d_array_words[] = {0xf0040f2au, 0x0008050au, 0x000d0c0bu};
+        CHECK(rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(nsa_high_vgpr_words, 3),
+                                           &dynamic_vgpr) && dynamic_vgpr == 77u,
+              "#3134: an NSA address byte names any VGPR, not one adjacent to VADDR");
+        const Rdna2Inst nsa_2d_array = rdna2_decode_one(nsa_2d_array_words, 3);
+        CHECK(nsa_2d_array.mimg_dim == 5u && nsa_2d_array.mimg_nsa == 1u &&
+                  rdna2_mimg_dynamic_mip_shape(nsa_2d_array, &dynamic_vgpr) &&
+                  dynamic_vgpr == 13u,
+              "#3134: the NSA 2D_ARRAY form names the mip in the THIRD address byte, after slice");
+        // Fail-closed arms. The first two say the packet carries addresses this dimension does not
+        // account for -- an unused NSA byte is zero in every assembled form above, so a nonzero one
+        // means the shape is not the one modelled here. The third is a larger NSA than any
+        // 3-or-4-address form needs, which would place the mip in a dword this function does not
+        // read. Each mutates ONE field of an accepted packet.
+        const uint32_t nsa_2d_dirty_byte2_words[] = {0xf004070au, 0x00080500u, 0x0001052au};
+        const uint32_t nsa_2d_array_dirty_byte3_words[] = {0xf0040f2au, 0x0008050au, 0x010d0c0bu};
+        const uint32_t nsa_two_extra_words[] = {0xf004070cu, 0x00080500u, 0x0000052au, 0u};
+        CHECK(!rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(nsa_2d_dirty_byte2_words, 3)) &&
+                  !rdna2_mimg_dynamic_mip_shape(
+                      rdna2_decode_one(nsa_2d_array_dirty_byte3_words, 3)) &&
+                  rdna2_decode_one(nsa_two_extra_words, 4).mimg_nsa == 2u &&
+                  !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(nsa_two_extra_words, 4)),
+              "#3134: the NSA dynamic-mip shape rejects unaccounted address bytes and NSA>1");
     }
     const uint32_t gta_pc10_vop2_word[] = {0x4a000804u};
     const uint32_t wide_vop3_words[] = {0xd5761e01u, 0x040a0100u};

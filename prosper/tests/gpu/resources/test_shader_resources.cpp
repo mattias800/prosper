@@ -1128,8 +1128,11 @@ int main() {
         };
         CHECK(levels_after([](ShaderResource& r) { r.tile_mode = 0; }) == 1,
               "a LINEAR chain is declined: its per-level 256-byte pitch is not reproduced yet");
+        // #3134: the tail is no longer refused outright -- but the two derivations of WHERE the
+        // selected level sits must agree. This fixture's level zero is a placed, non-tail level, so
+        // a descriptor claiming the tail contradicts the plan and still declines.
         CHECK(levels_after([](ShaderResource& r) { r.in_mip_tail = true; }) == 1,
-              "a selected level packed in the tail is declined");
+              "a descriptor claiming the tail for a level the plan places outside it is declined");
         CHECK(levels_after([](ShaderResource& r) { r.depth = 3; }) == 1,
               "a multi-layer view is declined: each slice owns its own chain");
         CHECK(levels_after([](ShaderResource& r) { r.layer_stride_bytes = 4096; }) == 1,
@@ -1208,6 +1211,89 @@ int main() {
                   full_mip_chain_levels(kWidth, kHeight) &&
               full_mip_chain_levels(kWidth, kHeight) == 9u,
               "a T# declaring more levels than the extent can hold is CLAMPED to the full chain");
+    }
+
+    // ---- #3134: a chain whose levels ALL live inside the shared mip tail ------------------
+    // Stray's (PPSA02101) title-screen fragment reads a 32x32 R16G16_UINT six-level pyramid at a
+    // runtime LOD. At 4 bytes per texel that whole pyramid is smaller than one 64 KiB macroblock,
+    // so AddrLib packs every level -- level zero included -- into the allocation's shared tail,
+    // and `gpu_addr` is left at the allocation base rather than shifted onto a disjoint level.
+    // Refusing the tail therefore refused the entire small-texture class, not an exotic corner.
+    {
+        constexpr uint32_t kWidth = 32, kHeight = 32, kBytesPerBlock = 4;
+        constexpr uint32_t kTile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        constexpr uint32_t kMaxMip = 5;   // 32 -> 1 is six levels
+        const TiledMipLevelLayout tail_level0 = tiled_mip_level_layout(
+            kWidth, kHeight, kBytesPerBlock, kTile, kMaxMip, 0);
+        const TiledMipLevelLayout tail_level1 = tiled_mip_level_layout(
+            kWidth, kHeight, kBytesPerBlock, kTile, kMaxMip, 1);
+        // The premise this whole block rests on, asserted rather than assumed: if AddrLib ever
+        // placed this extent outside the tail the arms below would be testing a different shape.
+        CHECK(tail_level0.supported && tail_level0.in_tail && tail_level1.in_tail &&
+                  tail_level0.tail_block_bytes == tail_level1.tail_block_bytes,
+              "#3134: a 32x32 4-byte pyramid really is packed entirely inside one tail block");
+
+        ShaderResource tail{};
+        tail.cls = ResourceClass::Texture;
+        tail.format = DataFormat::Uint16;     // Stray's own R16G16_UINT
+        tail.num_components = 2;
+        tail.img_dim = 1;
+        tail.width = kWidth;
+        tail.height = kHeight;
+        tail.depth = 1;
+        tail.tile_mode = kTile;
+        tail.declared_mip_levels = kMaxMip + 1;
+        tail.mip_chain_element_width = kWidth;
+        tail.mip_chain_element_height = kHeight;
+        tail.mip_chain_bytes_per_block = kBytesPerBlock;
+        tail.mip_chain_max_level = kMaxMip;
+        tail.mip_chain_base_level = 0;
+        // What `agc_shader_layout` publishes for a tail-packed selected level: the descriptor
+        // pointer stays at the allocation base and the in-block placement travels beside it.
+        tail.in_mip_tail = true;
+        tail.mip_tail_offset = static_cast<uint32_t>(tail_level0.byte_offset);
+        tail.mip_tail_bytes = tail_level0.tail_block_bytes;
+        tail.mip_tail_x = tail_level0.tail_x;
+        tail.mip_tail_y = tail_level0.tail_y;
+        tail.gpu_addr = 0x308e090000ull;      // the allocation base, unshifted
+
+        const MipChainPlan tail_plan = shader_resource_mip_chain_plan(tail);
+        CHECK(tail_plan.valid && tail_plan.level_count == kMaxMip + 1,
+              "#3134: a tail-packed chain places every level the T# declares");
+        CHECK(shader_resource_compute_mip_chain_levels(tail) == kMaxMip + 1,
+              "#3134: the compute backend materializes a tail-packed chain");
+        bool tail_levels_addressable = tail_plan.valid;
+        for (size_t level = 0; tail_plan.valid && level < tail_plan.levels.size(); ++level) {
+            const MipChainLevel& entry = tail_plan.levels[level];
+            const uint32_t expect_w = kWidth >> level ? kWidth >> level : 1u;
+            const uint32_t expect_h = kHeight >> level ? kHeight >> level : 1u;
+            // Tail levels are addressed by element coordinate inside the allocation's first block,
+            // so a zero byte_offset here is the contract, not a missing offset.
+            tail_levels_addressable &= entry.in_tail && entry.byte_offset == 0u &&
+                                       entry.tail_block_bytes == tail_level0.tail_block_bytes &&
+                                       entry.width == expect_w && entry.height == expect_h;
+        }
+        CHECK(tail_levels_addressable,
+              "#3134: every tail level carries its halved extent and its in-block coordinates");
+        // The plan's level zero must name the same bytes the descriptor does. These three arms are
+        // the cross-check, each mutating ONE published field of an accepted resource.
+        const auto tail_levels_after = [&](void (*mutate)(ShaderResource&)) {
+            ShaderResource copy = tail;
+            mutate(copy);
+            return shader_resource_compute_mip_chain_levels(copy);
+        };
+        CHECK(tail_levels_after([](ShaderResource& r) { r.in_mip_tail = false; }) == 1,
+              "#3134: a descriptor denying the tail for a level the plan packs there is declined");
+        CHECK(tail_levels_after([](ShaderResource& r) { r.mip_tail_x += 8u; }) == 1,
+              "#3134: a tail X that disagrees with the plan's own placement is declined");
+        CHECK(tail_levels_after([](ShaderResource& r) { r.mip_tail_bytes /= 2u; }) == 1,
+              "#3134: a tail block size that disagrees with the plan is declined");
+        // The allocation the capture writer must own starts AT gpu_addr for a tail chain, because
+        // nothing of the allocation lies below the unshifted descriptor pointer.
+        uint64_t tail_prefix = 1, tail_total = 0;
+        CHECK(shader_resource_compute_mip_chain_allocation(tail, tail_prefix, tail_total) &&
+                  tail_prefix == 0u && tail_total == tail_level0.tail_block_bytes,
+              "#3134: a tail chain's owned allocation is the block itself, with no prefix");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

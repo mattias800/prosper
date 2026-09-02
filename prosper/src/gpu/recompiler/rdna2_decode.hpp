@@ -480,12 +480,14 @@ bool rdna2_program_is_terminator_only(const uint32_t* code, size_t dwords);
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
 // The GENERAL IMAGE_LOAD_MIP address shape, whose mip operand is a real runtime value rather than
-// something a proof may discard: consecutive (non-NSA) 2D [x,y,mip] or 2D_ARRAY [x,y,slice,mip],
-// any DMASK, and no operand-shape modifier (A16/D16/R128/TFE/LWE). Unlike
-// `rdna2_mimg_zero_mip_shape` this deliberately does NOT require UNRM/GLC: those are addressing and
-// cache hints, and Sonic Frontiers' stage kernels issue the op with both clear (#3048). Returns the
-// dimension-specific mip VGPR when requested. The caller must still establish that the resource's
-// image is materialized with the levels that operand can select.
+// something a proof may discard: 2D [x,y,mip] or 2D_ARRAY [x,y,slice,mip] in EITHER address
+// encoding -- consecutive VGPRs from VADDR, or NSA, where each address after the first names an
+// arbitrary VGPR one per byte of the extra dwords (#3134) -- any DMASK, and no operand-shape
+// modifier (A16/D16/R128/TFE/LWE). Unlike `rdna2_mimg_zero_mip_shape` this deliberately does NOT
+// require UNRM/GLC: those are addressing and cache hints, and Sonic Frontiers' stage kernels issue
+// the op with both clear (#3048). Returns the dimension-specific mip VGPR when requested. The
+// caller must still establish that the resource's image is materialized with the levels that
+// operand can select.
 bool rdna2_mimg_dynamic_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
