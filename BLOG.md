@@ -30,6 +30,15 @@ shortest sleep there is. Fixed alongside `select()`-as-sleep, which was the last
 resolving on Windows' ~15.6 ms scheduler tick.
 [#3038](https://github.com/mattias800/prosper/issues/3038)
 
+### On Windows, every `sinf` the guest ever called returned whatever was left lying in xmm0
+
+No picture — this one is Windows-only and invisible on the box we develop on. The import trampoline
+that converts a guest call to the host ABI moved integer registers and nothing else, so a float
+argument, everything behind it, and every float *return* were wrong: 78 functions, most of them the
+maths library. It now builds the conversion from each handler's own declaration, and a new test
+executes the real trampoline bytes across the ABI boundary on any machine.
+[#2955](https://github.com/mattias800/prosper/issues/2955)
+
 ### The "exotic" image instruction blocking a Stray draw was an ordinary one, spelled differently
 
 A three-dword `image_load_mip` had been rejecting a whole Stray fragment shader, and the extra dword

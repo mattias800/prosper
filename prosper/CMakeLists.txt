@@ -2157,6 +2157,16 @@ if(TARGET prosper_core)
     add_test(NAME hle_stack_args_guest_fs COMMAND test_hle_stack_args --guest-fs)
   endif()
 
+  # #2955: the guest(SysV) -> host(Microsoft x64) import bridge. CROSS-PLATFORM on purpose, and that
+  # is the point rather than an accident: the bridge's placement rules are a pure function of a
+  # handler's signature, so they can be asserted anywhere, and on any x86-64 host the emitted bytes
+  # can additionally be EXECUTED across the SysV/Microsoft boundary via __attribute__((ms_abi)).
+  # Gating this on WIN32 would leave the one defect it exists to catch visible only on the platform
+  # nobody develops on. Its non-x86-64 arm still checks the tables.
+  add_executable(test_sysv_ms_bridge tests/host/abi/test_sysv_ms_bridge.cpp)
+  target_link_libraries(test_sysv_ms_bridge PRIVATE prosper_core)
+  add_test(NAME sysv_ms_bridge COMMAND test_sysv_ms_bridge)
+
   # sceImeUpdate must invoke the guest key handler on the CALLER's guest %fs, not the host %fs the
   # import stub swapped in (#1286: Evergate SIGSEGV at eboot+0xaf8431 on a key press). Drives the real
   # import path on an activated guest TCB; a no-op pass off Linux.
