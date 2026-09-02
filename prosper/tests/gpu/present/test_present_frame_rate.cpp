@@ -388,6 +388,180 @@ void dense_signature_pins_the_gpu_path() {
     present_reset();
 }
 
+
+// #3027. `frame_rate_between` deliberately leaves active_fraction unfilled, and the header now says
+// why. This arm is the "why", asserted rather than asserted-about: the FIRST option on the issue was
+// to difference the two snapshots' `active_seconds`, which looks derivable and is not.
+//
+// `active_seconds` is a whole-run RECOMPUTATION against the CURRENT median interval, not an
+// accumulator, so the cutoff that decided which intervals counted moves as the run goes on. Three
+// constructed runs, all with the naive difference computed exactly as the rejected option would
+// have. The negative one is the proof that the quantity is ill-formed; the two positive ones are the
+// dangerous ones, because they are plausible and they read as the "produced nothing" shape.
+void a_windowed_active_share_cannot_be_differenced() {
+    // (i) NON-MONOTONIC. 1 fps for 200 s, then 60 fps: the median drops to 16.7 ms, the 1 s
+    // intervals stop qualifying, and the whole-run figure FALLS.
+    {
+        FrameRateCounter c;
+        double t = 0;
+        uint8_t v = 0;
+        for (int i = 0; i < 201; i++) { c.observe(signature_of(frame(v++)), t); t += 1.0; }
+        const PresentRateSnapshot a = snapshot_of(c, t);
+        for (int i = 0; i < 1000; i++) { c.observe(signature_of(frame(v++)), t); t += 1.0 / 60.0; }
+        const PresentRateSnapshot b = snapshot_of(c, t);
+        CHECK(b.active_seconds < a.active_seconds,
+              "active_seconds can DECREASE between two readings -- it is not an accumulator");
+        const double naive = (b.active_seconds - a.active_seconds) / (b.now_seconds - a.now_seconds);
+        CHECK(naive < 0,
+              "...so differencing it yields a NEGATIVE active fraction, which is not a share of "
+              "anything -- this is why option 1 on #3027 was rejected");
+    }
+    // (ii) A PERFECT 60 fps WINDOW READ AS DEAD. 1 fps for 100 s, then 100 s of unbroken 60 fps.
+    // Every frame in the window is new and on time; the naive difference still says ~0% active.
+    {
+        FrameRateCounter c;
+        double t = 0;
+        uint8_t v = 0;
+        for (int i = 0; i < 100; i++) { c.observe(signature_of(frame(v++)), t); t += 1.0; }
+        const PresentRateSnapshot a = snapshot_of(c, t);
+        for (int i = 0; i < 6000; i++) { c.observe(signature_of(frame(v++)), t); t += 1.0 / 60.0; }
+        const PresentRateSnapshot b = snapshot_of(c, t);
+        const FrameRate window = frame_rate_between(a, b);
+        CHECK(window.distinct == 6000 && window.distinct_fps > 55 && window.distinct_fps < 65,
+              "the window really did hold 6000 new frames at ~60 fps");
+        const double naive = (b.active_seconds - a.active_seconds) / window.window_seconds;
+        CHECK(naive < 0.05,
+              "...and the naive difference calls it under 5% active -- the R-Type Delta shape, "
+              "manufactured out of a healthy window");
+    }
+    // (iii) A HEALTHY-AND-SLOW WINDOW READ AS DEAD. The "we have work to do" bucket is the one this
+    // project has most titles in, so getting it wrong is not a corner case.
+    {
+        FrameRateCounter c;
+        double t = 0;
+        uint8_t v = 0;
+        for (int i = 0; i < 6000; i++) { c.observe(signature_of(frame(v++)), t); t += 1.0 / 60.0; }
+        const PresentRateSnapshot a = snapshot_of(c, t);
+        for (int i = 0; i < 100; i++) { c.observe(signature_of(frame(v++)), t); t += 1.0; }
+        const PresentRateSnapshot b = snapshot_of(c, t);
+        const FrameRate window = frame_rate_between(a, b);
+        CHECK(window.distinct == 100 && window.distinct_fps > 0.9 && window.distinct_fps < 1.1,
+              "the window really did hold 100 new frames at ~1 fps");
+        const double naive = (b.active_seconds - a.active_seconds) / window.window_seconds;
+        CHECK(naive < 0.05, "...and the naive difference calls that under 5% active too");
+    }
+
+    // The field that lets a consumer tell a measurement from a default. Without it, `0` means both
+    // "this run produced nothing" and "nobody filled this in", which is the ambiguity #3027 is.
+    PresentRateSnapshot x, y;
+    x.now_seconds = 0;
+    y.published = 60; y.distinct = 60; y.now_seconds = 1.0;
+    CHECK(!frame_rate_between(x, y).active_fraction_measured,
+          "a differenced window says its active fraction is NOT measured");
+    FrameRateCounter run;
+    for (int i = 0; i < 120; i++) run.observe(signature_of(frame(static_cast<uint8_t>(i))), i / 60.0);
+    CHECK(frame_rate_since_first_publication(snapshot_of(run, 2.0)).active_fraction_measured,
+          "...and a whole-run rate says it IS");
+    // The compact form must not claim "0% active" -- a verdict about the run -- from a window.
+    const FrameRate one_frame_window = [] {
+        PresentRateSnapshot a, b;
+        a.now_seconds = 0;
+        b.published = 60; b.distinct = 1; b.now_seconds = 1.0;
+        return frame_rate_between(a, b);
+    }();
+    CHECK(format_frame_rate_short(one_frame_window, 1920, 1080) == "-- fps  1920x1080",
+          "the compact form drops the '0% active' claim when the fraction was never measured");
+}
+
+// #3027, THE ARM. Two runs whose LAST SECOND is identical -- same publications, same zero distinct
+// frames, same duration -- and which differ only in what the title did before it. One is a static
+// menu reached after twenty seconds of 60 fps gameplay; the other never produced a second frame at
+// all, which is the R-Type Delta (#2783) failure. A reader has to be able to tell them apart, and
+// the bare predicate provably cannot: it is shown here returning true for both.
+void the_unchanged_picture_verdict_separates_static_from_dead() {
+    // (a) A STATIC MENU. 1200 real frames at 60 fps, then one second of the last picture republished.
+    FrameRateCounter menu;
+    double t = 0;
+    uint8_t v = 0;
+    for (int i = 0; i < 1200; i++) { menu.observe(signature_of(frame(v++)), t); t += 1.0 / 60.0; }
+    const PresentRateSnapshot menu_before = snapshot_of(menu, t);
+    const uint64_t held = signature_of(frame(static_cast<uint8_t>(v - 1)));   // the picture on screen
+    for (int i = 0; i < 60; i++) { menu.observe(held, t); t += 1.0 / 60.0; }
+    const PresentRateSnapshot menu_after = snapshot_of(menu, t);
+
+    // (b) A TITLE THAT PRODUCED NOTHING. Identical publication count and identical timing; the
+    // content never changed after the first frame.
+    FrameRateCounter dead;
+    double t2 = 0;
+    const uint64_t only = signature_of(frame(200));
+    for (int i = 0; i < 1200; i++) { dead.observe(only, t2); t2 += 1.0 / 60.0; }
+    const PresentRateSnapshot dead_before = snapshot_of(dead, t2);
+    for (int i = 0; i < 60; i++) { dead.observe(only, t2); t2 += 1.0 / 60.0; }
+    const PresentRateSnapshot dead_after = snapshot_of(dead, t2);
+
+    const FrameRate menu_window = frame_rate_between(menu_before, menu_after);
+    const FrameRate dead_window = frame_rate_between(dead_before, dead_after);
+
+    // The premise: the two WINDOWS are the same measurement, so anything that separates the cases
+    // has to come from outside the window. If this ever stops holding, the arm below is passing for
+    // a reason that has nothing to do with the fix.
+    CHECK(menu_window.published == 60 && dead_window.published == 60,
+          "both windows published 60 frames");
+    CHECK(menu_window.distinct == 0 && dead_window.distinct == 0,
+          "...and neither carried a single new frame");
+    CHECK(frame_rate_is_mostly_unchanged(menu_window) && frame_rate_is_mostly_unchanged(dead_window),
+          "the BARE predicate fires identically on both -- it cannot tell a menu from a dead title");
+
+    const UnchangedPicture menu_verdict = unchanged_picture(menu_window, menu_after);
+    const UnchangedPicture dead_verdict = unchanged_picture(dead_window, dead_after);
+
+    // THE DISCRIMINATION. Not "the field is populated" -- the two verdicts must DIFFER.
+    CHECK(menu_verdict.change != dead_verdict.change,
+          "the windowed verdict separates the two cases the bare predicate cannot");
+    CHECK(menu_verdict.change == PictureChange::static_picture,
+          "a title that produced 1200 frames and then stopped is a STATIC PICTURE");
+    CHECK(dead_verdict.change == PictureChange::nothing_produced,
+          "a title that never produced a second frame is NOTHING PRODUCED -- the #2783 shape");
+
+    // ...and the evidence travels with the verdict, which is the contract the header states.
+    CHECK(menu_verdict.run_typical_measured && menu_verdict.run_typical_fps > 55 &&
+              menu_verdict.run_typical_fps < 65,
+          "the static case carries the run's real 60 fps");
+    CHECK(menu_verdict.run_active_fraction > 0.9 && menu_verdict.run_distinct == 1200,
+          "...its active share and the population behind it");
+    CHECK(!dead_verdict.run_typical_measured && dead_verdict.run_typical_fps == 0 &&
+              dead_verdict.run_active_fraction == 0 && dead_verdict.run_distinct == 1,
+          "the dead case has no rate, 0% active, and one distinct frame");
+
+    const std::string menu_text = format_unchanged_picture(menu_verdict);
+    const std::string dead_text = format_unchanged_picture(dead_verdict);
+    CHECK(menu_text != dead_text, "and the two print differently -- a reader can act on the line");
+    CHECK(menu_text.find("picture not changing") == 0 && dead_text.find("picture not changing") == 0,
+          "both still lead with the observation, which is all the metric can see");
+    CHECK(menu_text.find("nothing produced") == std::string::npos &&
+              dead_text.find("nothing produced") != std::string::npos,
+          "only the dead one says nothing was produced");
+    CHECK(dead_text.find("-- fps") != std::string::npos && dead_text.find("0.0 fps") == std::string::npos,
+          "the absent rate is '--', never '0.0' -- reporting a number here would be a measurement "
+          "where none exists");
+    CHECK(menu_text.find(" fps,") != std::string::npos && menu_text.find("% active") != std::string::npos &&
+              menu_text.find("1200 distinct") != std::string::npos,
+          "the static one carries rate, active share and population on the line");
+
+    // A window that is producing gets no line at all: the verdict is not a permanent warning.
+    FrameRateCounter live;
+    double t3 = 0;
+    uint8_t w = 0;
+    for (int i = 0; i < 60; i++) { live.observe(signature_of(frame(w++)), t3); t3 += 1.0 / 60.0; }
+    const PresentRateSnapshot live_before = snapshot_of(live, t3);
+    for (int i = 0; i < 60; i++) { live.observe(signature_of(frame(w++)), t3); t3 += 1.0 / 60.0; }
+    const PresentRateSnapshot live_after = snapshot_of(live, t3);
+    const UnchangedPicture live_verdict =
+        unchanged_picture(frame_rate_between(live_before, live_after), live_after);
+    CHECK(live_verdict.change == PictureChange::changing, "a live window is not warned about");
+    CHECK(format_unchanged_picture(live_verdict).empty(), "...and prints nothing");
+}
+
 } // namespace
 
 int main() {
@@ -398,6 +572,8 @@ int main() {
     std::printf("== a title that pauses (the arm) ==\n"); a_title_that_pauses_reports_its_producing_rate();
     std::printf("== estimator accuracy ==\n");           interval_estimator_is_accurate();
     std::printf("== window arithmetic ==\n");            window_math();
+    std::printf("== windowed active share (#3027) ==\n"); a_windowed_active_share_cannot_be_differenced();
+    std::printf("== static vs dead (the arm, #3027) ==\n"); the_unchanged_picture_verdict_separates_static_from_dead();
     std::printf("== present-layer wiring ==\n");         present_layer_wiring();
     std::printf("== dense signature (GPU path) ==\n"); dense_signature_pins_the_gpu_path();
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

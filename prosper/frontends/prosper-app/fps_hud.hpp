@@ -39,11 +39,15 @@ inline bool fps_window_due(double window_start_seconds, double now_seconds, doub
 
 // The HUD's lines, newest measurement first.
 //
-// `distinct_total` is the run's cumulative distinct-frame count, shown so the rate has a population
-// beside it: "0.4 fps" from three frames is not the same claim as "0.4 fps" from four hundred.
+// `rate` is the ROLLING window; `run` is the cumulative snapshot its later end was read from. Both,
+// because the two answer different questions and the HUD reports both. From `run` come the
+// population beside the rate ("0.4 fps" from three frames is not the same claim as "0.4 fps" from
+// four hundred) and -- the part that cannot come from the window at all -- whether a picture that
+// has stopped changing belongs to a title that HAS produced frames or to one that never did
+// (gpu/present/present_frame_rate.hpp; #3027).
 inline std::vector<std::string> fps_hud_lines(const prosper::gpu::FrameRate& rate,
                                               uint32_t width, uint32_t height,
-                                              uint64_t distinct_total) {
+                                              const prosper::gpu::PresentRateSnapshot& run) {
     char headline[96], detail[160];
     if (!rate.measured) {
         std::snprintf(headline, sizeof headline, "-- fps");
@@ -53,7 +57,7 @@ inline std::vector<std::string> fps_hud_lines(const prosper::gpu::FrameRate& rat
     std::snprintf(headline, sizeof headline, "%.1f fps", rate.distinct_fps);
     std::snprintf(detail, sizeof detail, "%.1f presented   %ux%u   %llu frames",
                   rate.presented_fps, width, height,
-                  static_cast<unsigned long long>(distinct_total));
+                  static_cast<unsigned long long>(run.distinct));
     std::vector<std::string> lines{headline, detail};
     // Stated in words, not left to be inferred from two numbers. The whole failure mode is a reader
     // taking the healthy-looking number, so this has to be prose rather than arithmetic.
@@ -62,8 +66,15 @@ inline std::vector<std::string> fps_hud_lines(const prosper::gpu::FrameRate& rat
     // frame are indistinguishable from this metric by construction, and an earlier wording asserted
     // the second -- which fired on a rung-6 title's own title screen. The HUD reports what it can
     // see.
-    if (prosper::gpu::frame_rate_is_mostly_unchanged(rate))
-        lines.emplace_back("picture not changing");
+    //
+    // What it CAN see, once the run snapshot is in hand, is the one thing that separates those two
+    // for a reader: whether this title has produced frames at all. The window cannot say -- inside
+    // one second a menu and a freeze are identical -- so the verdict is classified against the run
+    // and printed with the run's own rate, active share and distinct count beside it. That figure is
+    // required by present_frame_rate.hpp and used to be unprintable here (#3027).
+    const std::string note =
+        prosper::gpu::format_unchanged_picture(prosper::gpu::unchanged_picture(rate, run));
+    if (!note.empty()) lines.emplace_back(note);
     return lines;
 }
 
