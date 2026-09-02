@@ -1146,11 +1146,19 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
         std::lock_guard lock(announce_mutex);
         first = announced.insert({program_address, phase}).second;
     }
-    if (first)
+    if (first) {
+        char scope[128] = "every back-edge traversal";
+        if (settings.only_ordinal != ComputeTripBoundSettings::kAllOrdinals)
+            snprintf(scope, sizeof scope,
+                     "ONLY traversals about to dispatch ordinal %u (see this phase's dispatch map)",
+                     settings.only_ordinal);
         fprintf(stderr,
                 "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
-                "bounded at %u iterations (DIAGNOSTIC: truncates guest control flow)\n",
-                static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound);
+                "bounded at %u iterations counting %s "
+                "(DIAGNOSTIC: truncates guest control flow)\n",
+                static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound,
+                scope);
+    }
     return bound;
 }
 
@@ -5038,14 +5046,25 @@ bool emit_cfg_state_machine(
     // split — so a DIRECT dispatcher printed "bounded" and then emitted an unbounded loop. An
     // announced-but-inert lever is worse than no lever: it invites exactly the reading that the
     // instrument was applied, which is how a null result gets published as evidence.
+    const uint32_t cfg_trip_only_ordinal = compute_trip_bound_settings().only_ordinal;
     auto apply_trip_bound = [&](uint32_t keep_going) {
         if (!trip_var) return keep_going;
-        const uint32_t next_trip =
-            b.ibin(Op_IAdd, b.load_function(b.t_u32, trip_var), b.uconst(1));
-        b.store_function(trip_var, next_trip);
         // Updated on EVERY back-edge traversal, not only on the hit, so the extremes describe the
         // whole run rather than its final instant.
         const uint32_t dispatch_now = b.load_function(b.t_u32, pc_var);
+        // PROSPER_CFG_TRIP_BOUND_ORDINAL=K counts only the traversals about to dispatch ordinal K.
+        // Unselected traversals still run -- they simply do not advance the counter -- so a cap
+        // aimed at one guest loop leaves every other loop in the same program running to its own
+        // natural end. That is what makes a NEGATIVE arm mean something: the loop was capped and the
+        // device still died, so this loop is not the runaway.
+        const uint32_t counts =
+            cfg_trip_only_ordinal == ComputeTripBoundSettings::kAllOrdinals
+                ? 0u
+                : b.ucmp(Op_IEqual, dispatch_now, b.uconst(cfg_trip_only_ordinal));
+        const uint32_t previous_trip = b.load_function(b.t_u32, trip_var);
+        const uint32_t incremented = b.ibin(Op_IAdd, previous_trip, b.uconst(1));
+        const uint32_t next_trip = counts ? b.sel(counts, incremented, previous_trip) : incremented;
+        b.store_function(trip_var, next_trip);
         const uint32_t old_min = b.load_function(b.t_u32, dispatch_min_var);
         b.store_function(dispatch_min_var,
                          b.sel(b.ucmp(Op_ULessThan, dispatch_now, old_min), dispatch_now, old_min));
@@ -5060,27 +5079,57 @@ bool emit_cfg_state_machine(
         // Predicated on "still nominally running AND the bound just ran out", so a loop that exits
         // normally writes nothing and the ABSENCE of a record is itself an answer.
         const uint32_t hit = b.land(keep_going, b.logical_not(under_bound));
-        // EVERY field is published with a device-scope atomic, including the two that are
-        // invocation-invariant. Concurrent non-atomic stores of the same value are still a data race
-        // by the memory model, and "they happen to agree" is not a publication protocol -- it is the
-        // same reasoning that made the last-writer range look coherent. Max is idempotent for a flag
-        // and for a compile-time constant, so this costs nothing and removes the exception.
-        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 0),
-                                    b.uconst(1), hit);
-        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 1),
-                                    b.uconst(cfg_phase), hit);
-        // Fields 2..4 are per-invocation and must be REDUCED, not overwritten. The deleted field
-        // here was the dispatcher ordinal at the instant one invocation hit the cap: a single
-        // sample, unusable for the question ("is it cycling?"), and the field whose label was
-        // published wrongly twice. The span it belonged to is what actually answers that, so only
-        // the span survives -- and as true extremes over every invocation rather than whichever
-        // wrote last.
-        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 2),
-                                    next_trip, hit);
-        b.compute_gds_atomic_minmax(Op_AtomicUMin, b.uconst(kComputeTripWitnessDword + 3),
-                                    b.load_function(b.t_u32, dispatch_min_var), hit);
-        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 4),
-                                    b.load_function(b.t_u32, dispatch_max_var), hit);
+        // THE WITNESS IS COMPUTE-ONLY, AND THE BOUND IS NOT. Only the compute executor binds the
+        // internal GDS buffer (kComputeInternalGdsBinding, gpu_executor.cpp) and only the compute
+        // host prepares/reads/restores its top dwords. A graphics pipeline binds nothing at that
+        // slot, so emitting the witness in a vertex or fragment module declares a descriptor the
+        // pipeline layout does not have -- which does not merely lose the record, it can stop the
+        // instrumented draw from being created at all. That failure mode is the exact one this
+        // instrument exists to prevent: the draw disappears, the device survives, and the run reads
+        // as "the bound fixed it" when the bound never executed. So bound the loop in every stage,
+        // publish only where a reader exists, and say which case this is (#3193).
+        if (b.is_compute) {
+            // EVERY field is published with a device-scope atomic, including the two that are
+            // invocation-invariant. Concurrent non-atomic stores of the same value are still a data race
+            // by the memory model, and "they happen to agree" is not a publication protocol -- it is the
+            // same reasoning that made the last-writer range look coherent. Max is idempotent for a flag
+            // and for a compile-time constant, so this costs nothing and removes the exception.
+            b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 0),
+                                        b.uconst(1), hit);
+            b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 1),
+                                        b.uconst(cfg_phase), hit);
+            // Fields 2..4 are per-invocation and must be REDUCED, not overwritten. The deleted field
+            // here was the dispatcher ordinal at the instant one invocation hit the cap: a single
+            // sample, unusable for the question ("is it cycling?"), and the field whose label was
+            // published wrongly twice. The span it belonged to is what actually answers that, so only
+            // the span survives -- and as true extremes over every invocation rather than whichever
+            // wrote last.
+            b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 2),
+                                        next_trip, hit);
+            b.compute_gds_atomic_minmax(Op_AtomicUMin, b.uconst(kComputeTripWitnessDword + 3),
+                                        b.load_function(b.t_u32, dispatch_min_var), hit);
+            b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 4),
+                                        b.load_function(b.t_u32, dispatch_max_var), hit);
+        } else {
+            // Announced once per program, not per back-edge, and phrased as what the run CANNOT
+            // tell you: without a witness, a surviving device is evidence about the bound only if
+            // the draw is independently shown to have still executed (the census counts it).
+            static std::mutex graphics_note_mutex;
+            static std::set<uint64_t> graphics_noted;
+            bool first_note = false;
+            {
+                std::lock_guard lock(graphics_note_mutex);
+                first_note = graphics_noted.insert(b.diagnostic.program_address).second;
+            }
+            if (first_note)
+                fprintf(stderr,
+                        "[cfg-trip-bound] program 0x%llx is a GRAPHICS stage: the back edge IS "
+                        "bounded, but no witness is emitted (the internal GDS buffer is bound by "
+                        "the compute executor only). A surviving device therefore does not by "
+                        "itself prove the cap was reached -- confirm the draw still ran, e.g. with "
+                        "PROSPER_DRAW_PROGRAM_CENSUS.\n",
+                        static_cast<unsigned long long>(b.diagnostic.program_address));
+        }
         return b.land(keep_going, under_bound);
     };
     if (direct_dispatch) {

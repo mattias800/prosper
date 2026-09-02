@@ -84,6 +84,7 @@ int main() {
     set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
     set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
     set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
+    set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
 
     constexpr uint32_t kLanes = 128;
     const size_t kWords = sizeof(kExecWalk) / sizeof(kExecWalk[0]);
@@ -195,8 +196,18 @@ int main() {
     {
         const ComputeTripBoundSettings armed = compute_trip_bound_settings();
         CHECK(armed.bound == kBound && armed.only_program == kSyntheticProgram &&
-                  armed.only_phase == 0u,
+                  armed.only_phase == 0u &&
+                  armed.only_ordinal == ComputeTripBoundSettings::kAllOrdinals,
               "compute_trip_bound_settings reports the complete armed selector state");
+        // A selector the struct under-reports is a selector the cache key cannot see, so every new
+        // one is asserted here as well as where it is used (#3193).
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "7");
+        CHECK(compute_trip_bound_settings().only_ordinal == 7u,
+              "and it reports the ordinal selector, which the cache key must mix in");
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
+        CHECK(compute_trip_bound_settings().only_ordinal ==
+                  ComputeTripBoundSettings::kAllOrdinals,
+              "clearing the ordinal selector restores every-ordinal counting");
     }
 
     // Aimed at EVERY program — and this kernel is still not bounded, which is the documented scope
@@ -406,6 +417,123 @@ int main() {
           "and the trip count it reports reaches the bound");
     CHECK(witness_readable && witness_gds[hit_slot + 3] <= witness_gds[hit_slot + 4],
           "with a dispatch-range whose atomic minimum does not exceed its atomic maximum");
+
+    // --- PROSPER_CFG_TRIP_BOUND_ORDINAL: cap ONE guest loop inside a multi-loop program (#3193) ---
+    //
+    // WHY THIS EXISTS. The dispatcher emits ONE back edge for a whole program, so a plain bound can
+    // only say "some loop here runs away". Astro Bot's world-map pixel shader 0x5008f1400 has four
+    // guest loops behind one dispatcher, and answering WHICH one needs a cap that counts only the
+    // traversals about to re-enter a chosen loop's header ordinal.
+    //
+    // The fixture above is the right shape for it: two overlapping EXEC loops, so its dispatcher
+    // re-enters more than one header, and it terminates on its own so an inert cap yields a wrong
+    // VALUE rather than a hung queue.
+    //
+    // A bound of ONE is deliberate. It makes the cap fire on the FIRST counted traversal, so the
+    // negative arm below cannot pass merely because the fixture was too short to reach a larger
+    // bound -- exactly the "the lever never moved" reading this whole diagnostic exists to refuse.
+    {
+        constexpr uint32_t kScopedBound = 1;
+        const size_t witness_hit = kComputeTripWitnessDword;
+        auto scoped_module = [&](const char* ordinal) {
+            set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+            set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+            set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", ordinal);
+            return recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        };
+
+        // (a) THE ARM THAT FAILS WITHOUT THE GATE. An ordinal this program does not have must leave
+        //     the cap completely inert: same answer as unbounded, and no witness record. Delete the
+        //     ordinal comparison and every traversal counts again, so a bound of one truncates the
+        //     run on its first back edge and BOTH of these fail.
+        const std::vector<uint32_t> scoped_absent = scoped_module("250");
+        CHECK(!scoped_absent.empty(), "the ordinal-scoped module recompiles");
+        std::vector<uint32_t> absent_gds;
+        const std::vector<float> ran_absent =
+            prosper::test::run_compute(scoped_absent, dispatcher_input, kLanes, kLanes,
+                                       {}, {}, nullptr, 64, nullptr, &absent_gds);
+        bool absent_matches_free = ran_absent.size() == ran_free.size();
+        for (size_t lane = 0; lane < ran_absent.size() && absent_matches_free; ++lane)
+            absent_matches_free = std::fabs(ran_absent[lane] - ran_free[lane]) < 0.5f;
+        CHECK(absent_matches_free,
+              "a cap scoped to an ordinal the program does not have is INERT (the run matches the "
+              "unbounded result, so the scope is honoured rather than ignored)");
+        CHECK(absent_gds.size() > witness_hit && absent_gds[witness_hit] == 0u,
+              "and it records no witness hit, because the counter never advanced");
+
+        // (b) THE POSITIVE CONTROL, and it is built HERE rather than drawn from the arm above.
+        //     A negative that cannot be shown to be reachable is not a negative. Sweep the ordinals
+        //     the fixture can actually have and require at least one scoped cap to fire; without it,
+        //     (a) would also pass against an implementation that simply never emits a cap at all.
+        int fired_ordinal = -1;
+        uint32_t fired_trips = 0;
+        for (uint32_t ordinal = 0; ordinal < 12 && fired_ordinal < 0; ++ordinal) {
+            const std::vector<uint32_t> scoped = scoped_module(std::to_string(ordinal).c_str());
+            if (scoped.empty()) continue;
+            std::vector<uint32_t> scoped_gds;
+            const std::vector<float> ran_scoped =
+                prosper::test::run_compute(scoped, dispatcher_input, kLanes, kLanes,
+                                           {}, {}, nullptr, 64, nullptr, &scoped_gds);
+            if (scoped_gds.size() > witness_hit + 2 && scoped_gds[witness_hit] == 1u) {
+                fired_ordinal = static_cast<int>(ordinal);
+                fired_trips = scoped_gds[witness_hit + 2];
+            }
+        }
+        if (fired_ordinal >= 0)
+            printf("  ordinal-scoped cap fired at ordinal %d after %u counted traversals\n",
+                   fired_ordinal, fired_trips);
+        CHECK(fired_ordinal >= 0,
+              "at least one ordinal-scoped cap DOES fire on this fixture (the positive control for "
+              "the inert arm above)");
+
+        // (c) The selector's VALUE must reach the emitter, not merely its set/unset state.
+        CHECK(scoped_module("0") != scoped_module("1"),
+              "two different ordinal selections produce two different modules");
+
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+    }
+
+    // --- the witness is COMPUTE-only, and the bound is not (#3193) --------------------------------
+    //
+    // Only the compute executor binds the internal GDS buffer, so emitting the witness from a
+    // graphics module declares a descriptor the graphics pipeline layout does not have. That does
+    // not merely lose the record: it can stop the instrumented draw being created, and a draw that
+    // never runs leaves the device alive -- which reads as "the bound fixed it" when the bound never
+    // executed. Astro Bot's hang lives in a FRAGMENT dispatcher, so this is the stage that matters.
+    //
+    // The fixture is the same overlapping-EXEC-loop kernel with a colour export appended, so the
+    // only variable between the two arms is the stage. Appending after the last instruction leaves
+    // every branch target inside the kernel unchanged.
+    {
+        std::vector<uint32_t> fragment_loops(kDispatcherLoops,
+                                             kDispatcherLoops + kDispatcherWords - 1);
+        fragment_loops.push_back(0x7E000280u);   // v_mov_b32 v0, 0
+        fragment_loops.push_back(0x7E0602F2u);   // v_mov_b32 v3, 1.0
+        fragment_loops.push_back(0xF800180Fu);   // exp mrt0, v0, v1, v2, v3 done vm
+        fragment_loops.push_back(0x03020100u);
+        fragment_loops.push_back(0xBF810000u);   // s_endpgm
+
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        const std::vector<uint32_t> fragment_bounded = recompile_fragment(
+            fragment_loops.data(), fragment_loops.size(), nullptr, nullptr, UINT32_MAX, nullptr,
+            false, {RecompileDiagnosticStage::Fragment, 0x5008f1400ull});
+        CHECK(!fragment_bounded.empty() && fragment_bounded[0] == 0x07230203u,
+              "the fragment dispatcher fixture recompiles with the bound armed");
+        // The PAIR is the assertion. Either half alone is satisfiable by doing nothing: dropping the
+        // cap as well as the witness would pass the first, and emitting both would pass the second.
+        CHECK(!fragment_bounded.empty() && !spirv_writes_trip_witness(fragment_bounded),
+              "a bounded GRAPHICS module emits NO compute-GDS witness (binding 127 is bound by the "
+              "compute executor only, so declaring it here can kill the very draw under test)");
+        CHECK(!fragment_bounded.empty() && compares_against_bound(fragment_bounded, kBound),
+              "and its back edge is still capped, so the graphics arm is a real lever rather than a "
+              "silently disarmed one");
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+    }
 
     // Independent of the scan above: the bound's VALUE must reach the emitter, not merely its
     // armed/disarmed state. Two different bounds must produce two different modules.

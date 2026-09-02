@@ -687,6 +687,7 @@ struct ShaderCompileKey {
                trip_bound.bound == other.trip_bound.bound &&
                trip_bound.only_program == other.trip_bound.only_program &&
                trip_bound.only_phase == other.trip_bound.only_phase &&
+               trip_bound.only_ordinal == other.trip_bound.only_ordinal &&
                has_resource_table == other.has_resource_table &&
                force_position_w == other.force_position_w &&
                capture_position == other.capture_position &&
@@ -749,6 +750,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.trip_bound.bound);
         hash = hash_mix(hash, key.trip_bound.only_program);
         hash = hash_mix(hash, key.trip_bound.only_phase);
+        hash = hash_mix(hash, key.trip_bound.only_ordinal);
         hash = hash_mix(hash, key.has_resource_table);
         hash = hash_mix(hash, key.force_position_w);
         hash = hash_mix(hash, key.capture_position);
