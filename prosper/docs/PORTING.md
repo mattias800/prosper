@@ -612,10 +612,12 @@ edge cases are tracked separately in #697.
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
 
-### Ruled out — the Windows guest timed waits
+### Ruled out — the guest timed-wait family, and its CI
 
 One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home for the
-`#3013`/`#3022`/`#3044`/`#3056` family; the *per-primitive* measurements live in those issues.
+`#3013`/`#3022`/`#3044`/`#3056`/`#3067` family; the *per-primitive* measurements live in those
+issues. Most of it is Windows, because that is where the defects were — but the CI rows at the
+end are macOS/Rosetta, so do not read the section as Windows-only.
 
 - **"Every guest timed wait resolves on the winpthreads master tick."** True of the SLEEP family and
   of `sem_timedwait`, which is what #3013 measured with a probe outside prosper — and NOT true of the
@@ -638,6 +640,37 @@ One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home
   condvar's clock, so one object answered the same question two ways (#3056, fixed in #3235). Neither
   a realtime nor a monotonic clock can discriminate that in a test, because the old path was
   self-consistent for both; the virtual clock can, and does.
+- **"The `kernel_sem_timedwait` failure on the macOS/Rosetta job is unresolved between a flaky test
+  and a change to the runner image."** Neither, and it was never open: the FAILING JOB'S OWN LOG
+  names the arm and the number. `[FAIL] and returned inside one winpthreads tick of the request, not
+  after it` / `(timeout took 13.58 ms via none)` — the test's ARM 3 **12 ms wall-clock ceiling**,
+  against a 13.58 ms wait on the path #3044 deliberately left alone: `k_sem_timedwait`'s `#ifndef
+  _WIN32` branch, which on Darwin is `posix_shim.hpp`'s `prosper_sem_timedwait`, i.e. one
+  `pthread_cond_timedwait` against a `CLOCK_REALTIME` deadline (Darwin has no unnamed POSIX
+  semaphores at all). A 5 ms request served in 13.58 ms is that kernel wait's own latency under
+  binary translation on a shared runner, not a prosper defect and not something the branch under
+  test could reach. #3066 had already replaced that ceiling with a 500 ms stub/hang guard and made the
+  MECHANISM arm the discriminator; it merged 2026-08-27 at 08:22 UTC, **49 minutes after** #3067 was
+  filed at 07:33, and nobody joined the two up. Character: **timing-sensitive**, on a bound the
+  file's own header now argues cannot discriminate anything at all. Five consecutive `main` jobs on
+  2026-09-02 pass it. (#3067)
+- **"The 1.02 s and 1.22 s failure durations point at ARM 4 waiting out its one-second timeout."**
+  They point the other way, and the sign is inverted: on that runner EVERY test linking
+  `prosper_core` costs ~1.4 s in process start plus `register_builtin_hle()` — `kernel_nanosleep`
+  1.48 s, `hle_functions_registered` 1.48 s — so `kernel_sem_timedwait` passes in **1.08, 1.20,
+  1.35, 1.47 and 1.52 s** across five green `main` jobs on 2026-09-02. The reported 1.22 s failure
+  sits INSIDE that distribution and the 1.02 s one is below its minimum: the duration carries no
+  signal, and an ARM 4 that ran to its one-second timeout would have read ~2.4 s. A ctest per-test
+  duration under binary translation measures startup, not the wait inside it. Instrument trap 249.
+  (#3067)
+- **"A green CI job records the margin its timing tests cleared."** It did not, on any platform.
+  `test_kernel_sem_timedwait` prints `(timeout took %.2f ms via %s)` specifically so a margin can be
+  quoted from a log — and every job ran `ctest --output-on-failure`, which prints a test's output
+  only when it FAILS. So the figure existed exactly on the runs where something was already wrong,
+  and the headroom on the green runs either side of a near-miss was unrecoverable without reddening
+  the job first. Fixed by the `timing-margin` ctest label plus a verbose re-run step in the Linux,
+  Windows MinGW and macOS jobs (#3067); `-L <label>` with `--no-tests=error` fails the step if the
+  label is ever dropped, measured at exit 8 versus exit 0 without the flag.
 
 **Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
 `cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
