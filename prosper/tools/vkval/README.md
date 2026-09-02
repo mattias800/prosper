@@ -22,19 +22,87 @@ Either fix in shader or update the VkImageViewType to VK_IMAGE_VIEW_TYPE_2D.
 
 That is the difference the guard buys.
 
+## Synchronization validation — `--sync`
+
+**It is a separate check set, and the default run does not include it.** Core validation checks how
+each call is *used*; synchronization validation models the hazards *between* calls — the barriers,
+the subpass dependencies, the layout transitions — and it is what sees prosper's synchronization.
+Add `--sync` to switch it on:
+
+```bash
+python3 tools/vkval/vk_validation_scan.py --build-dir prosper/build-linux --sync
+```
+
+Until #3248 it ran nowhere, which is why five real hazards had accumulated unseen. All five are
+fixed; a `--sync` run of the whole suite is clean, and any new one fails the gate like any other id.
+
+**It has its own positive control, because it has its own way of silently not running.** Syncval is
+switched on by a layer SETTING, not by loading anything extra, so a spelling this layer version does
+not recognise is ignored — and the layer still loads, so the scanner's existing loader proof says
+nothing about it. A clean sync verdict would then be indistinguishable from a check set that never
+armed. `tools/vkval/sync_probe.cpp` (target `vkval_sync_probe`) therefore commits **one deliberate
+write-after-write**, and `--sync` refuses to report anything until that hazard comes back. Two
+spellings are tried, one at a time — `VK_LAYER_VALIDATE_SYNC` (current) and `VK_LAYER_ENABLES`
+(deprecated) — and the first that arms is the one the run uses. They must not be set together:
+layers 1.4.341 answers that with `Validation Warning: [ VALIDATION-SETTINGS ]`, which this scanner's
+own parser then reads as an unaccounted-for finding.
+
+`vkval_sync_probe` is deliberately **not** a ctest: it exists to be invalid.
+
+### What it costs
+
+Measured 2026-09-02, Fedora 44 / layers 1.4.341 / Mesa RADV STRIX_HALO, whole ctest suite:
+**112.09 s core-only against 113.58 s with syncval**, 343 tests either way. That is 1.4%, and it is
+inside this box's noise — the same suite re-run under other lanes' load moved individual tests by
+±7 s, and the one test that looked expensive (`rdna2_to_spirv_exec`, +11 s in the first pair)
+measured 18.5/31.8/19.1 s core against 46.4/16.0/12.5 s sync over three alternating runs, i.e. the
+two ranges overlap completely. **So the honest statement is that no syncval cost is separable from
+machine load here, not that it is free.** The suite is dominated by CPU-side unit tests; a workload
+that records far more GPU commands per second could pay more.
+
+### What it still cannot see
+
+Syncval is not a general oracle for synchronization. It cannot observe a CPU read through a mapped
+pointer, so it does not see a missing host-availability barrier on a readback (#2944): measured with
+that defect deliberately live, it produced zero messages while demonstrably armed (the same setting
+over the whole suite produced 5 hazards at the time). `docs/GRAPHICS.md` § Ruled out carries both
+halves of that measurement. Nor does it see a path no test executes — which is a second blind spot
+`--sync` does not fix on its own, and is why `render_diagnostic_paths` exists (below).
+
+### Why it is not on CI yet — measured, not assumed
+
+**The driver is not a variable.** RADV (STRIX_HALO) and lavapipe report the identical hazard set on
+layers 1.4.341: same ids, same counts, same tests. That is expected — syncval models the recorded
+commands rather than consulting the driver, the same reason "try another GPU" cannot discriminate the
+`08600` class described further down.
+
+**The LAYER VERSION is.** Built and scanned inside `podman run ubuntu:24.04` with the runner's own
+packages (`vulkan-validationlayers 1.3.275.0`, `mesa-vulkan-drivers 25.2.8`, i.e. lavapipe), a
+`--sync` run of this tree reports a **sixth** hazard that 1.4.341 does not report at all:
+
+```
+SYNC-HAZARD-WRITE-AFTER-READ  x4  [shadow_compare_render]
+vkCmdEndRenderPass():  Hazard WRITE_AFTER_READ in subpass 0 for attachment 1 depth aspect during
+store with storeOp VK_ATTACHMENT_STORE_OP_STORE. (usage: SYNC_LATE_FRAGMENT_TESTS_DEPTH_STENCIL_
+ATTACHMENT_WRITE, prior_usage: SYNC_FRAGMENT_SHADER_SHADER_SAMPLED_READ, ...)
+```
+
+The driver is held constant across that comparison — lavapipe both times — so the variable is
+isolated to the layer version. The path it names is the same-pass depth feedback of #1186, which
+`render_runner.h` enables **only** when no draw in the pass can write depth (`depth_may_be_written`)
+and which puts the attachment in a depth-read-only layout, so the depth aspect the store op names is
+not writable. Whether 1.3.275 or 1.4.341 is right about that is not established here, and it is not
+this guard's place to guess: switching the shared gate on today would either redden every concurrent
+lane's PR or require an allow-list entry for a finding nobody has settled. `--sync` is therefore
+opt-in, and the enablement is tracked with that question in **#3255**.
+
 ## What it does NOT cover
 
-**Synchronization validation is off.** The scan enables the layer's default (core) checks only, so
-nothing in this tree has ever gated on prosper's barriers. Turning it on
-(`VK_LAYER_VALIDATE_SYNC=1`) reports real hazards this guard cannot see — measured 2026-09-02, 5
-`SYNC-HAZARD` messages across 2 tests, filed as #3248 with the one that lives in the render backend.
-Enabling it here is a decision that has not been taken, because those findings would have to be
-fixed or allow-listed first.
-
-Syncval is also not a general oracle for synchronization. It cannot observe a CPU read through a
-mapped pointer, so it does not see a missing host-availability barrier on a readback (#2944):
-measured in the same session with that defect deliberately live, it produced zero messages while
-demonstrably armed. `docs/GRAPHICS.md` § Ruled out carries both halves of that measurement.
+**A path no test executes.** The guard observes ctest, so code that only runs under an environment
+variable is invisible to it however it is configured. `PROSPER_GEOM_PROBE` and `PROSPER_DRAW_ISO`
+were both misusing Vulkan for exactly this reason (#3248); the `render_diagnostic_paths` ctest case
+now runs them once so the layer sees them. **A new env-gated render path needs a line there in the
+change that adds it**, or this guard cannot cover it.
 
 ## Running it
 

@@ -53,6 +53,25 @@ Consequences for anything you change in it:
   invalidate half stays in this header, with the allocator that can actually return non-coherent
   memory. Its counter is process-wide and shared with the compute guard,
   `live_compute_host_read_barrier`.
+- **Two writes to the same image are not ordered by a barrier that names some other image** (#3248).
+  Any `vkCmdPipelineBarrier` between them supplies the execution dependency, and an execution
+  dependency is not enough for write-after-write: the first write also has to be made available.
+  `record_transfer_write_after_write_barrier()` is that dependency. The mip-assembly path had a
+  full-image clear followed by per-level copies with barriers only on the copy sources, which is
+  the shape to look for whenever a path writes one destination from several commands.
+  Unfalsifiable from output, and worse than the readback case: assembly clears to black on purpose,
+  so a clear that lands after a copy produces exactly what a correct run produces for a level the
+  guest never rendered. The guard is `mip_assembly_barrier`.
+- **A diagnostic in here is a Vulkan API user like any other, and until #3248 no test ran one.**
+  `PROSPER_GEOM_PROBE` and `PROSPER_DRAW_ISO` record real commands; because no ctest case armed
+  them, `tools/vkval` could not see their misuse however it was configured, and both were misusing
+  Vulkan *and* misreporting because of it. `render_diagnostic_paths` runs both once so the layer
+  does see them. Arm a new env-gated render path there in the same change that adds it — and note
+  the arming has to come from the ctest ENVIRONMENT, not `setenv()` inside the test, because these
+  names are cached one-shot reads. `PROSPER_DRAW_ISO` is **improved, not fixed**: its re-render now
+  records the same dynamic state as the pass it isolates, but still omits that pass's per-draw
+  `vkCmdClearAttachments` depth/stencil clear, so a submit carrying a guest depth clear is isolated
+  against different depth contents. The layer cannot see that half.
 
 ## Adding to it
 

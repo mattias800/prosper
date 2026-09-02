@@ -354,6 +354,15 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME tools_usage_text
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_usage_text.py"
                    --selftest --root "${CMAKE_SOURCE_DIR}")
+  # The merge gate (#3259). Its arms are all REFUSALS, and a gate that refuses everything would
+  # satisfy every one of them -- so the suite leads with an all-pass positive control, and each
+  # refusal asserts on the REASON rather than on the boolean. One arm reconstructs a merge that
+  # actually went wrong: a red `Windows MinGW` read as green because a shell split the check NAME
+  # on whitespace and landed on `MinGW` where the status belongs (#3234). The stale-head arm is
+  # NOT a reconstruction -- #3259 first cited #3243 as one and that was wrong on the dates -- it
+  # guards a state this repository produces routinely, since every lane pushes after CI starts.
+  add_test(NAME pr_merge_gate
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
   # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
   # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
@@ -2581,6 +2590,15 @@ if(TARGET prosper_core)
       add_executable(vkprobe tools/vkprobe/vkprobe.cpp)
       target_link_libraries(vkprobe PRIVATE Vulkan::Vulkan)
 
+      # vkval_sync_probe (#3248): the positive control for `vk_validation_scan.py --sync`. It
+      # commits one deliberate write-after-write so the scanner can prove SYNCHRONIZATION validation
+      # is armed before reporting a sync verdict -- loading the layer proves only that CORE checks
+      # run, and a sync setting the layer version does not recognise produces exactly the output of
+      # a clean sync run. Deliberately NOT registered as a ctest: it exists to be invalid, and the
+      # gate it feeds fails on any hazard the ledger does not carry.
+      add_executable(vkval_sync_probe tools/vkval/sync_probe.cpp)
+      target_link_libraries(vkval_sync_probe PRIVATE Vulkan::Vulkan)
+
       # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
       # data remains gitignored, renders it through the same live backend, and checks the captured hash.
       add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
@@ -2790,6 +2808,39 @@ if(TARGET prosper_core)
       target_include_directories(test_host_read_barrier PRIVATE frontends)
       target_link_libraries(test_host_read_barrier PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME host_read_barrier COMMAND test_host_read_barrier)
+
+      # #3248: the mip-assembly path cleared the destination image and then copied into it with no
+      # memory dependency between the two writes. Structural for a sharper reason than the readback
+      # above -- assembly clears to BLACK deliberately, so a clear that lands after a copy produces
+      # exactly what a correct run produces for a missing level. No content assertion can separate
+      # them; the negative control is an ordinary upload, which has no clear-then-copy pair.
+      add_executable(test_mip_assembly_barrier tests/render/test_mip_assembly_barrier.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_mip_assembly_barrier PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_mip_assembly_barrier PRIVATE frontends)
+      target_link_libraries(test_mip_assembly_barrier PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME mip_assembly_barrier COMMAND test_mip_assembly_barrier)
+
+      # #3248: PROSPER_GEOM_PROBE and PROSPER_DRAW_ISO record Vulkan commands that no test executed,
+      # so tools/vkval could not see them however it was configured. This case runs both once. Its
+      # own assertions pin the arming decisions; the SPEC misuse they used to commit is caught by
+      # running the suite under the validation layer, which is only possible because this exists.
+      add_executable(test_render_diagnostic_paths tests/render/test_render_diagnostic_paths.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_render_diagnostic_paths PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_render_diagnostic_paths PRIVATE frontends)
+      target_link_libraries(test_render_diagnostic_paths PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME render_diagnostic_paths COMMAND test_render_diagnostic_paths)
+      # Armed HERE rather than with setenv() inside the test. PROSPER_GEOM_PROBE is a cached
+      # one-shot read (PROSPER_ENV_VALUE), so a test that sets it after something has read it arms
+      # nothing while still passing -- which `cached_env_arming_logic` refuses by name. The test
+      # ENVIRONMENT is in place before the process starts, so read order cannot make it vacuous, and
+      # the test fails loudly when run without it. PROSPER_ISO_AT must name a pixel inside the
+      # 32x32 frame the test renders.
+      set_tests_properties(render_diagnostic_paths PROPERTIES ENVIRONMENT
+                           "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames")
 
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
       add_executable(test_compute_address_watch tests/gpu/test_compute_address_watch.cpp)
