@@ -398,6 +398,15 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     // also what the single-shot form did, so a wall-clock step DURING the wait changes nothing it
     // did not already change.
     //
+    // That substitution is only worth anything if steady_clock's OWN resolution is fine, and this
+    // tree does have evidence for that where it has none for CLOCK_REALTIME -- which is the point,
+    // not a detail. `kernel_sem_timedwait` drives a 5 ms guest wait through #3044's 500 us
+    // sleep_until_steady_ns slices, i.e. about ten steady_clock reads and ten short high-resolution
+    // sleeps, and the Windows MinGW CI job reports the whole case at **0.03 s**, measured by ctest
+    // from outside the process. A 15.6 ms-granular steady_clock cannot express a 500 us slice at
+    // all and would put that case above ~0.15 s. So the loop's exit condition rests on a clock this
+    // project measures rather than on one it assumes (raised in review of #3235).
+    //
     // What this does NOT fix, stated because the mechanism is the same one: the INITIAL budget is
     // still a difference of two CLOCK_REALTIME readings, so a coarse realtime clock can put it out
     // by up to one of its ticks in either direction, exactly as before. Removing that needs the
@@ -605,6 +614,16 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex) {
     // quantifies and the reason the coarse regime exists; a flat 2 ms would blunt exactly the short
     // contention this is trying to serve. There is no deadline here -- an untimed lock waits as long
     // as it must -- so the "remaining" clamp is passed the maximum and never binds.
+    //
+    // THE POLL INTERVAL IS ALSO THE GUEST-EXCEPTION DELIVERY LATENCY HERE, which is a better reason
+    // for this change than timed-wait accuracy is. This loop takes no wait registration -- there is
+    // no register_wait call in it -- so a thread parked here is invisible to interrupt_guest_wait
+    // and can notice a pending stop only at the dispatch call below, once per poll. That is exactly
+    // what the paragraph at the top of this function means by keeping the wait cooperative:
+    // IL2CPP's stop-the-world could not reach a thread contending a guest mutex any sooner than the
+    // next ::Sleep(1) tick. 15.6 ms -> 0.5-2 ms is therefore an improvement in GC delivery latency,
+    // not only in what the timed-wait census attributes to a condition wait (raised in review of
+    // #3235).
     const uint64_t start_ns = steady_now_ns();
     for (;;) {
         const int result = pthread_mutex_trylock(mutex);

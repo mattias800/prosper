@@ -2985,8 +2985,6 @@ HLE(k_cond_timedwait_sce) {
     // guest-controlled and `a2 * 1000` wraps above ~1.8e16 us, which would report a 5,800-year
     // request as a short one. Diagnostic-only, but a census that misreports its own input is the
     // shape CLAUDE.md's instrument-trap list exists for.
-    hle::WaitCensusScope census(hle::WaitKind::CondTimedwaitSce,
-                                prosper::host::timeout_ns_from_us(a2));
     // #3056: the relative interval is measured on the CONDVAR'S OWN CLOCK, which is what its POSIX
     // sibling k_cond_timedwait already does (guest_cond_snapshot -> interruptible_cond_clock_timedwait).
     // This spelling used to hardcode CLOCK_REALTIME through abs_deadline_us(), so the SAME condition
@@ -3008,6 +3006,14 @@ HLE(k_cond_timedwait_sce) {
     const prosper::host::WaitDeadline abs = prosper::host::abs_deadline_from_rel_us(
         prosper::host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec}, a2);
     const timespec dl{(time_t)abs.sec, (long)abs.nsec};
+    // The census scope opens HERE, after the clock read that can fail, not before it: an early
+    // return would otherwise record a call with the guest's full requested interval and an actual
+    // duration of nothing, pulling the reported ratio toward zero on a path where no wait happened
+    // at all. An instrument that counts its own failures as fast waits is the shape CLAUDE.md's
+    // trap list exists for (raised in review of #3235). The clock read it now excludes is a few
+    // hundred nanoseconds against a millisecond-scale request.
+    hle::WaitCensusScope census(hle::WaitKind::CondTimedwaitSce,
+                                prosper::host::timeout_ns_from_us(a2));
     int rc = interruptible_cond_clock_timedwait(c, m, dl, clock_id, nullptr,
                                                 kGuestMutexCondWaitBookkeeping);
     // sce_pthread_rc passes the already-encoded ETIMEDOUT through untouched, and encodes the rest.
