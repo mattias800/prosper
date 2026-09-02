@@ -31,9 +31,15 @@ int main() {
     const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
     if (ctx.ok && ctx.queue != VK_NULL_HANDLE) {
         CHECK(prosper::test::render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS,
-              "with the gate OPEN the wrapper reaches the driver and succeeds");
+              "with the gate OPEN render_locked_queue_wait_idle reaches the driver and succeeds");
+        // Both wrappers need an open-gate arm, or one of them could be hard-coded to fail and still
+        // pass the refusal arm below. An empty submit (submitCount 0, pSubmits ignored, no fence) is
+        // a legal no-op that reaches the driver and returns VK_SUCCESS.
+        CHECK(prosper::test::render_locked_queue_submit(ctx.queue, 0, nullptr, VK_NULL_HANDLE) ==
+                  VK_SUCCESS,
+              "with the gate OPEN render_locked_queue_submit reaches the driver and succeeds");
     } else {
-        printf("  [note] no render device on this host; the open-gate arm did not run\n");
+        printf("  [note] no render device on this host; the open-gate arms did not run\n");
     }
 
     gpu_submit_gate_begin_shutdown();

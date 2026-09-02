@@ -9224,12 +9224,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // uncontended CAS per dispatch. On a refusal nothing reaches the driver and
         // `submission_entered` deliberately stays false: no submission happened, so the ordinary
         // cleanup() below is correct rather than the retain-everything device-lost path.
-        VkResult compute_submit_rc;
+        VkResult compute_submit_rc = VK_SUCCESS;
+        bool submit_gate_refused = false;
         {
             prosper::GpuSubmitRegion submit_gate;
             std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
             if (!submit_gate.admitted()) {
-                compute_submit_rc = VK_ERROR_DEVICE_LOST;
+                submit_gate_refused = true;
             } else {
                 if (prosper::gpu::shared_present_active()) lk.lock();
                 g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -9239,6 +9240,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ? VK_ERROR_DEVICE_LOST
                     : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
             }
+        }
+        if (submit_gate_refused) {
+            // Leave the loop WITHOUT routing this through vk_ok(). A refusal is not a device loss
+            // and must not be reported as one: vk_note_failure would latch ctx.device_lost and print
+            // "fatal Vulkan device loss stage=queue-submit ... disabling live compute for this
+            // process", and decline() would add a `reason=queue-submit` row to the decline census --
+            // a census whose counts are quoted as evidence elsewhere in this project. Manufacturing
+            // one of those at every shutdown would be exactly the phantom-defect instrument the
+            // charter warns about. `submission_entered` stays false, so the ordinary cleanup() below
+            // runs, which is correct: nothing was submitted.
+            if (trace) std::fprintf(stderr, "[compute]   dispatch not submitted: shutting down\n");
+            break;
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");

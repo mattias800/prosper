@@ -148,9 +148,12 @@ int main() {
 
     // --- the frontend's own sequence: close, then drain to zero with live traffic --------------
     //
-    // This is the shape prosper-app uses. Threads are submitting when shutdown begins; the drain
-    // must reach zero, which is only possible BECAUSE new regions are refused. Without the refusal
-    // this is exactly the race the issue describes, and the drain below would time out.
+    // This is the shape prosper-app uses. Threads are submitting when shutdown begins and the drain
+    // must still reach zero, which in a build that did not refuse would be a race rather than a
+    // guarantee. Note honestly which assertion carries that: the drain check below is
+    // PROBABILISTIC — an un-refusing build could in principle be sampled at a transient all-out
+    // instant — while `refusals > 0` is the deterministic one, and it is what goes red when
+    // begin_shutdown() is mutated to a no-op.
     {
         gpu_submit_gate_reset();
         constexpr int kThreads = 6;

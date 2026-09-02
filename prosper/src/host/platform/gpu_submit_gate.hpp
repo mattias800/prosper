@@ -14,11 +14,22 @@
 // already inside to come out. The frontend runs both before its _Exit.
 //
 // What it does NOT do, stated plainly so nobody mistakes it for the fix. It BOUNDS the window; it
-// does not close it. A thread that is already inside vkQueueSubmit when shutdown begins is still
-// waited for, and if it never returns the drain times out and we _Exit exactly as before — no worse
-// than today, but no better either. The real fix is the cooperative stop the frontend's own comment
-// names as unimplemented: run_entry() observes the stop flag, stops at a submission boundary, and
-// the thread is JOINED, after which an ordinary drain and teardown are safe.
+// does not close it, in two separate senses.
+//
+//   1. A thread that is already inside vkQueueSubmit when shutdown begins is still waited for, and
+//      if it never returns the drain times out and we _Exit exactly as before — no worse than today,
+//      but no better either.
+//   2. It covers VkQueue calls only. `__drm_exec_lock_obj` is amdgpu's GEM reservation-lock helper,
+//      and command submission is not the only ioctl that reaches it: the GEM-VA path behind
+//      vkAllocateMemory / vkBind*Memory / vkFreeMemory does too, and the guest thread makes those
+//      calls ungated on every batch. So a drained gate does not prove the guest thread is outside
+//      every drm_exec ioctl. CONFIDENCE: MED — argued from the driver's structure, not measured
+//      here. Recorded because if the freeze recurs after this landed, the honest first reading is
+//      "the gate never covered that path", not "the gate failed".
+//
+// The real fix for both is the cooperative stop the frontend's own comment names as unimplemented:
+// run_entry() observes the stop flag, stops at a submission boundary, and the thread is JOINED,
+// after which an ordinary drain and teardown are safe.
 //
 // Deliberately dependency-free (no Vulkan, no OS/windowing headers) so it lives in prosper_core and
 // is callable from the offscreen backend, the live compute path, the present blit and the app

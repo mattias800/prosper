@@ -56,7 +56,20 @@ bool gpu_submit_gate_try_enter() {
 }
 
 void gpu_submit_gate_leave() {
-    g_state.fetch_sub(kOneRegion, std::memory_order_seq_cst);
+    // Saturating rather than a bare fetch_sub. A mispaired leave would otherwise wrap the count to
+    // ~2^62, after which every drain in the process times out (or, with a negative timeout, never
+    // returns) — a silent, permanent breakage of the one thing this file exists to do. Unreachable
+    // today (GpuSubmitRegion is the only caller and it leaves only when it was admitted), so this
+    // guards a future misuse rather than a live defect. The successful exchange is seq_cst because
+    // notify_if_idle()'s argument depends on it.
+    uint64_t state = g_state.load(std::memory_order_acquire);
+    for (;;) {
+        if (region_count(state) == 0) return;   // mispaired leave: refuse to underflow
+        if (g_state.compare_exchange_weak(state, state - kOneRegion,
+                                          std::memory_order_seq_cst,
+                                          std::memory_order_acquire))
+            break;
+    }
     notify_if_idle();
 }
 
