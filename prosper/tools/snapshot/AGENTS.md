@@ -218,10 +218,11 @@ booting anything:
 
 ```
   guard                      last verified          configuration
-  gris-gameplay              NEVER VERIFIED         dump=PPSA09804-app0 min_colors=1200 ...
-  terminator-boot            2026-08-03 human  30d  dump=PPSA25872-app0 min_colors=300 ...
+  some-gameplay              NEVER VERIFIED         dump=PPSAxxxxx-app0 min_colors=12000 min_frames=20 min_changes=20 references=16
+  other-gameplay             2026-08-31 human    1d dump=PPSAxxxxx-app0 min_colors=12000 min_frames=20 min_changes=20 references=16
+  third-gameplay             2026-07-23 agent   40d dump=PPSAxxxxx-app0 min_colors=12000 min_frames=20 min_changes=20 references=16
 
-  17 guards: 15 never verified, 1 agent-verified, 1 human-verified
+  3 guards: 1 never verified, 1 agent-verified, 1 human-verified
 ```
 
 `list` also takes guard names, so `snapshot.py list gris-gameplay` answers "when was this last
