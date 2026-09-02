@@ -22,7 +22,7 @@ include it. `render_draw_pass_rgba` is therefore a live render path — a wrong 
 silently drops real rendered content in a real game, and "it is under `tests/`" has misled reviewers
 into treating changes here as test-only (#3210 had to say so explicitly in its own body).
 
-Two consequences for anything you change in it:
+Consequences for anything you change in it:
 
 - **Dropping a pass or skipping a draw is a VISIBLE regression** when the condition can fire on a
   healthy device. Guard on the API's own `VkResult`, not on a heuristic, and say in the PR what a
@@ -39,6 +39,12 @@ Two consequences for anything you change in it:
   caches' other entry points (`invalidate_persistent_color_target*`,
   `readback_persistent_color_target`, `snapshot_persistent_ds_images`, and the frontend's direct
   iteration of both), so do not add a new one without reading #3240.
+- **A readback has TWO halves and they are independent** (#2944). Any device write the CPU then maps
+  and reads needs `record_host_read_barrier()` — the availability operation into the host domain,
+  which a fence wait does not perform — and, when the memory may be non-coherent,
+  `invalidate_mapped_readback()`. Coherent memory still needs the first. Neither half can be checked
+  by reading the pixels back: on every driver here the unsynchronized code returns correct bytes, so
+  the guard is `host_read_barrier`, which asserts the barrier was RECORDED.
 
 ## Adding to it
 
