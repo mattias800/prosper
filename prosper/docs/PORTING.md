@@ -608,7 +608,8 @@ edge cases are tracked separately in #697.
    float still gets the historical fixed integer shuffle, byte for byte. `printf`-family handlers are
    deliberately NOT converted — they are real host variadics, reached by the same fixed path as
    before, and a variadic Microsoft x64 call additionally wants each FP argument duplicated into the
-   integer register; that remains open and unmeasured.
+   integer register. That is #3246, open and unmeasured; a `CallSignature` cannot describe it at all,
+   because the argument list is whatever the format string says at run time.
 4. **VEH recovery hardening for genuine stack-overflow faults.** #633 added a tested assembly recovery
    entry with valid Microsoft-x64 shadow space/alignment, but a truly exhausted guest stack still needs
    a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
@@ -618,7 +619,7 @@ edge cases are tracked separately in #697.
    `strtod`/`strtof` in `hle_libc.cpp` — and those now register through `Hle::register_typed`. The
    remaining cast targets pass and return integers and pointers, which both conventions place
    identically. What is still unaudited is the *other* half of the original question: whether a cast
-   target's argument COUNT exceeds ten, which the fixed path silently truncates.
+   target's argument COUNT exceeds ten, which the fixed path silently truncates. #3246 carries it.
 
 ### Ruled out — the Windows import trampoline's floating-point arguments
 
