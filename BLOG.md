@@ -19,6 +19,23 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-02
+
+### Astro Bot's world-map GPU hang is one loop in the pixel shader, and we can now point at it
+
+No picture: the world map still renders only the nebula backdrop. What is new is that the hang has
+a mechanism instead of a suspect. The draw that kills the GPU was named by its *vertex* program, but
+that program has no loop at all — it is 8 straight-line blocks. Its *pixel* partner is a 136,875-word
+module with exactly one loop, the state machine prosper builds for shaders whose control flow it
+cannot structurize, and that loop never ends: capping it at 4,096 iterations takes a deterministic
+53-device-loss run to zero, while capping it at a million leaves the crash exactly where it was.
+
+A new per-loop cap then narrowed it further, to one of the four loops inside that shader — a
+per-screen-tile walk down a linked list of lights that is supposed to stop at `0xffffffff` and never
+does ([#3193][i3193]).
+
+[i3193]: https://github.com/mattias800/prosper/issues/3193
+
 ## 2026-09-01
 
 ### The shader that hangs Astro Bot's world map can now be pulled out of a run by name

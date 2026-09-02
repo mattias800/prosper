@@ -1976,6 +1976,15 @@ inline ComputeTripBoundSettings compute_trip_bound_settings() {
         if (phase_end && !*phase_end && parsed_phase <= 0xfffffffeull)
             settings.only_phase = static_cast<uint32_t>(parsed_phase);
     }
+    // PROSPER_CFG_TRIP_BOUND_ORDINAL=K — count only traversals about to dispatch ordinal K.
+    // See ComputeTripBoundSettings::only_ordinal for why a per-loop cap is the thing that localizes
+    // a runaway inside a program whose dispatcher serves several guest loops (#3193).
+    if (const char* ordinal = getenv("PROSPER_CFG_TRIP_BOUND_ORDINAL"); ordinal && *ordinal) {
+        char* ordinal_end = nullptr;
+        const unsigned long long parsed_ordinal = strtoull(ordinal, &ordinal_end, 0);
+        if (ordinal_end && !*ordinal_end && parsed_ordinal <= 0xfffffffeull)
+            settings.only_ordinal = static_cast<uint32_t>(parsed_ordinal);
+    }
     return settings;
 }
 
