@@ -49,6 +49,28 @@ using Kind = ArgLocation::Kind;
 namespace {
 int g_fail = 0;
 
+// Compile-time coverage for the deducer, checked by every build on every platform. The argument is
+// only ever a TYPE to signature_of, so a null pointer is enough and no symbol is referenced.
+template <class F> constexpr CallSignature deduced() { return signature_of(static_cast<F>(nullptr)); }
+static_assert(deduced<void (*)(float, int*, int*)>().count == 3);
+static_assert(deduced<void (*)(float, int*, int*)>().sse_mask == 0b001);
+static_assert(!deduced<void (*)(float, int*, int*)>().sse_return);
+static_assert(deduced<void (*)(float, int*, int*)>().needs_conversion());
+static_assert(deduced<float (*)(const char*, char**)>().sse_mask == 0);
+static_assert(deduced<float (*)(const char*, char**)>().sse_return);
+static_assert(deduced<float (*)(const char*, char**)>().needs_conversion());
+static_assert(deduced<int32_t (*)(void*, uint32_t, void*, float, float, void*, void*)>().count == 7);
+static_assert(deduced<int32_t (*)(void*, uint32_t, void*, float, float, void*, void*)>().sse_mask
+              == 0b0011000);
+static_assert(!deduced<int32_t (*)(void*, uint32_t, void*, float, float, void*, void*)>().sse_return);
+// The one shape that must NOT be recorded: no float anywhere, so the historical bridge stands.
+static_assert(deduced<uint64_t (*)(void*, uint64_t, void*)>().sse_mask == 0);
+static_assert(!deduced<uint64_t (*)(void*, uint64_t, void*)>().needs_conversion());
+// A void return is not an SSE return -- and it is the shape that caught a portability defect in the
+// deducer, because `sizeof(void)` is a GCC extension that clang rightly rejects.
+static_assert(!deduced<void (*)()>().sse_return);
+static_assert(!deduced<void (*)()>().needs_conversion());
+
 void fail(const char* what, const char* detail) {
     fprintf(stderr, "FAIL %-46s: %s\n", what, detail);
     ++g_fail;

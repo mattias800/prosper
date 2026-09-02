@@ -63,11 +63,21 @@ template <class T>
 inline constexpr bool is_sse_arg_v =
     std::is_same_v<std::remove_cv_t<T>, float> || std::is_same_v<std::remove_cv_t<T>, double>;
 
+namespace detail {
+// A class template with an explicit `void` specialization, NOT a `||`-guarded variable template: a
+// variable template's initializer is instantiated whole, so `sizeof(T)` is ill-formed for `void` no
+// matter what precedes it in the expression. GCC hides this — it accepts `sizeof(void)` as an
+// extension worth 1 — and clang does not, so the void-returning handlers (`sincosf`, `sincos`)
+// broke the macOS build and nothing else.
 template <class T>
-inline constexpr bool is_abi_scalar_v =
-    (std::is_pointer_v<std::remove_cv_t<T>> || std::is_arithmetic_v<std::remove_cv_t<T>> ||
-     std::is_enum_v<std::remove_cv_t<T>>) &&
-    !std::is_same_v<std::remove_cv_t<T>, long double> && sizeof(T) <= 8;
+struct AbiScalar : std::bool_constant<
+    (std::is_pointer_v<T> || std::is_arithmetic_v<T> || std::is_enum_v<T>) &&
+    !std::is_same_v<T, long double> && sizeof(T) <= 8> {};
+template <> struct AbiScalar<void> : std::false_type {};
+} // namespace detail
+
+template <class T>
+inline constexpr bool is_abi_scalar_v = detail::AbiScalar<std::remove_cv_t<T>>::value;
 
 template <class R, class... A>
 constexpr CallSignature signature_of(R (*)(A...)) {
