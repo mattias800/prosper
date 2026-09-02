@@ -45,3 +45,21 @@ something that cannot be undone by rerunning it, prefer being wrong in the direc
 exit non-zero on anything unrecognised, treat an empty result as void rather than clean, and use a
 distinct exit status for "could not evaluate" so it can never be confused with "evaluated, and the
 answer is no".
+
+## Verifying a prose correction: normalise whitespace before grepping
+
+A phrase you are removing from documentation will often be **hard-wrapped across a line break**, and
+`grep` is line-oriented, so it reports zero and you believe the phrase is gone. This is not
+hypothetical: correcting one wrong claim across this PR's files took three review rounds, and a
+*different* file survived each round for exactly this reason. `grep 'checks describe'` returned
+nothing while the phrase sat in `CLAUDE.md`, split after "the head the checks".
+
+    # what actually answers "is this phrase still anywhere?"
+    for f in $(git diff --name-only origin/main...HEAD); do
+        n=$(tr '\n' ' ' < "$f" | tr -s ' ' | grep -o 'the phrase' | wc -l)
+        [ "$n" -gt 0 ] && echo "STILL PRESENT in $f ($n)"
+    done
+
+The same applies to any claim, figure or citation you are retracting. A single-line grep is fine for
+code, where the thing you are looking for rarely wraps; it is close to useless for prose in this
+repository, which wraps at about 100 columns.

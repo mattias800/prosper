@@ -883,8 +883,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       answers look plausible, which is the whole danger. Use `--json name,state,bucket`.
     - Both rules, plus "an empty check list is VOID rather than green", are implemented in
       `prosper/tools/ci/pr_merge_gate.py` — `python3 prosper/tools/ci/pr_merge_gate.py <PR>` exits 0
-      only when every check passed, none is pending, at least one passed, and the head the checks
-      describe is the branch tip. It exits **2** when it could not evaluate, so "the gate could not
+      only when every check passed, none is pending, at least one passed, and the PR's recorded
+      head is still the branch tip. It exits **2** when it could not evaluate, so "the gate could not
       run" is never confused with "the gate said no".
 - **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
   improvement may merge without matching work in every other frontend unless the issue explicitly promises

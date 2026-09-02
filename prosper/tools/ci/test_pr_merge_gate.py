@@ -278,14 +278,6 @@ print("\n-- a failure while REPORTING is 'could not evaluate', not 'said no'")
 # The guard used to wrap collect() only, so an exception in render()/print() escaped and the
 # interpreter exited 1 -- the exact masquerade the code comment warns about. Reachable without a
 # mutation: `pr_merge_gate.py N | head -1` raises BrokenPipeError on the print.
-class ExplodingRender:
-    def __init__(self, inner):
-        self.inner = inner
-
-    def __call__(self, cmd, cwd):
-        return self.inner(cmd, cwd)
-
-
 _real_render = pr_merge_gate.GateResult.render
 try:
     def _boom(self, pr):
@@ -303,6 +295,40 @@ finally:
     pr_merge_gate.GateResult.render = _real_render
 case("...and the gate still works afterwards",
      run_main(FakeGh(GREEN_CHECKS, VIEW, LS_ONE)), 0)
+
+print("\n-- the HUMAN report is an interface too, and its CONTENT was pinned by nothing")
+# The thirteenth mutation, from review. Five mutations to render() left the suite 44/44 green:
+# pass count always 0, BLOCKING lines dropped, head line dropped, reasons dropped, and `=> GREEN`
+# printed unconditionally. That last one reproduces #3234 with new machinery -- the exit code is
+# correct and the report a person reads says GREEN over a failing check.
+#
+# It is on-thesis rather than a coverage nit: this tool's own docstring says it reports COUNTS
+# because "a count is falsifiable, an exit code alone is not", and until now the suite pinned the
+# exit code and not the count. After the --json arms landed, the MACHINE output was better verified
+# than the one a human acts on, which is exactly backwards.
+_, report = run_main_capture(FakeGh(
+    '[{"name": "Docs", "bucket": "pass", "state": "S"},'
+    ' {"name": "Windows MinGW", "bucket": "fail", "state": "F"},'
+    ' {"name": "macOS (x86_64 / Rosetta 2)", "bucket": "pending", "state": "P"},'
+    ' {"name": "Progress tracker", "bucket": "skipping", "state": "K"}]',
+    VIEW, LS_ONE), ["3234"])
+case("the report states the real counts",
+     "pass=1 fail=1 pending=1 skipping=1" in report, True)
+case("...names the failing check on a BLOCKING line",
+     "BLOCKING: Windows MinGW (fail)" in report, True)
+case("...names what it is still waiting on",
+     "pending:  macOS (x86_64 / Rosetta 2)" in report, True)
+case("...shows the head it verified", "head matches branch tip" in report, True)
+case("...gives the reason it refused",
+     "check(s) failed or were cancelled" in report and "still pending" in report, True)
+# The one that matters most: a report reading GREEN over a failing check would be #3234 again,
+# with the exit code correct and the human misled.
+case("...and does NOT say GREEN", "=> GREEN" in report, False)
+case("...it says NOT MERGEABLE", "=> NOT MERGEABLE" in report, True)
+
+_, green_report = run_main_capture(FakeGh(GREEN_CHECKS, VIEW, LS_ONE), ["1"])
+case("a passing PR's report says GREEN", "=> GREEN" in green_report, True)
+case("...and carries no BLOCKING line", "BLOCKING:" in green_report, False)
 
 print()
 if FAILURES:
