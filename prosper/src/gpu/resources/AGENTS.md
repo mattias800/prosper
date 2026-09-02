@@ -22,6 +22,13 @@ Turns descriptors into resolved, bindable resources, and answers questions about
   this is the one derivation that recovers them. It is deliberately read by **both** the backend
   that creates the image and the recompiler that lowers `IMAGE_LOAD_MIP` — if those two ever answer
   the level count differently, a shader fetches a level that was never created.
+- `atomic_image_staging` — the two byte counts an R32_UINT storage image has once it is lowered to a
+  linear atomic SSBO, and the reason they differ. `linear_bytes` is the tightly packed extent the
+  shader indexes; `slice_bytes`/`guest_bytes` are what the guest surface physically occupies once
+  tile or row-pitch padding is counted. Every guest-side question — the readability probe, the
+  source pointer's bound, the write-back notification — must be asked with the PHYSICAL one, because
+  the per-layer detile steps `slice_bytes` per layer. Asking with the logical extent under-bounds
+  rather than failing, which is why the split is named here instead of living as a local expression.
 - `gpu_resources` — the resolved resource layer over guest memory.
 - `compressed_source_authority` — who is authoritative for a compressed surface's bytes.
 - `metadata_kind_correlation` — correlating a surface's metadata kind with how it is used.

@@ -2673,6 +2673,86 @@ inline bool consume_render_texture_create_failure_once() {
     return true;
 }
 
+// #3180: the COLOR-TARGET vkCreateImage sites, the milder siblings of #3045's two.
+//
+// Each of the six already guarded the HANDLE before touching it further (`if (!img) return out;`),
+// so unlike #3045 none of them fed a definitely-null image into a Vulkan call. What they did do is
+// discard the VkResult, which left two smaller problems:
+//
+//   * the guard rested on a driver CONVENTION, not on the spec. Every implementation leaves
+//     `pImage` at VK_NULL_HANDLE when vkCreateImage fails, but Vulkan does not require it, so a
+//     conforming driver that left the slot untouched would walk straight past `if (!img)`. Testing
+//     the result FIRST and the handle second removes that dependency at no cost.
+//   * a failure was silent. The pass returned an empty frame with nothing in the run log, so
+//     "the device refused a 4K attachment" and "the draw list was empty" produced the same
+//     evidence, and the real VkResult -- the one fact that separates them -- was thrown away.
+//
+// The control flow is deliberately unchanged: every site still returns from the pass exactly where
+// it did. This adds a report, and one rate-limited counter shared by all six so a device failing
+// every target cannot flood a run log.
+enum class RenderColorTargetCreateSite : uint32_t {
+    None = 0,
+    Slot0,              // primary slot-0 (the pass's own color target)
+    Slot0Fallback,      // slot-0 retry as a transient image after a persistent-cache budget miss
+    Slot1,              // primary slot-1 (MRT1's independent guest identity)
+    Slot1Fallback,      // slot-1's budget-miss retry
+    SlotExtra,          // primary MRT slots 2..7
+    SlotExtraFallback,  // an MRT slot's budget-miss retry
+};
+
+inline const char* render_color_target_site_name(RenderColorTargetCreateSite site) {
+    switch (site) {
+        case RenderColorTargetCreateSite::Slot0:             return "slot0";
+        case RenderColorTargetCreateSite::Slot0Fallback:     return "slot0-fallback";
+        case RenderColorTargetCreateSite::Slot1:             return "slot1";
+        case RenderColorTargetCreateSite::Slot1Fallback:     return "slot1-fallback";
+        case RenderColorTargetCreateSite::SlotExtra:         return "slot-extra";
+        case RenderColorTargetCreateSite::SlotExtraFallback: return "slot-extra-fallback";
+        default:                                             return "none";
+    }
+}
+
+// Deterministic one-shot injection, the site-selective twin of the sampled-texture hook above and
+// for the same reason: these requests are ordinary 2D color attachments at the caller's own extent,
+// so no real device can be made to refuse one on demand. Arming a site makes the NEXT create at
+// exactly that site report VK_ERROR_OUT_OF_DEVICE_MEMORY without calling the driver. The production
+// path never arms this state.
+inline RenderColorTargetCreateSite& render_color_target_create_failure_storage() {
+    static thread_local RenderColorTargetCreateSite armed = RenderColorTargetCreateSite::None;
+    return armed;
+}
+
+inline void inject_render_color_target_create_failure_once(RenderColorTargetCreateSite site) {
+    render_color_target_create_failure_storage() = site;
+}
+
+inline bool consume_render_color_target_create_failure(RenderColorTargetCreateSite site) {
+    RenderColorTargetCreateSite& armed = render_color_target_create_failure_storage();
+    if (armed != site || site == RenderColorTargetCreateSite::None) return false;
+    armed = RenderColorTargetCreateSite::None;
+    return true;
+}
+
+// Create a color target, reporting the driver's own verdict. Returns VK_SUCCESS with a non-null
+// `out_image`, or a failure code with `out_image` forced to VK_NULL_HANDLE so the caller's existing
+// handle guard stays correct whatever the driver left behind.
+inline VkResult create_color_target_image(VkDevice dev, const VkImageCreateInfo& ci,
+                                          RenderColorTargetCreateSite site, VkImage* out_image) {
+    const VkResult result = consume_render_color_target_create_failure(site)
+        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+        : vkCreateImage(dev, &ci, nullptr, out_image);
+    if (result == VK_SUCCESS && *out_image) return VK_SUCCESS;
+    *out_image = VK_NULL_HANDLE;
+    static std::atomic<uint32_t> color_target_create_failure_logs{0};
+    if (color_target_create_failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+        std::fprintf(stderr,
+                     "[color-target-create-failed] site=%s vkCreateImage result=%d extent=%ux%u "
+                     "fmt=%d usage=0x%x -- dropping the pass\n",
+                     render_color_target_site_name(site), (int)result,
+                     ci.extent.width, ci.extent.height, (int)ci.format, (unsigned)ci.usage);
+    return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+}
+
 // Create, populate, and unmap one transient storage buffer. Every partial failure tears down in
 // Vulkan lifetime order (buffer before any bound memory) and leaves both outputs null. Returning the
 // exact failed step lets the caller report the binding before substituting a safe zero-word buffer.
@@ -4903,8 +4983,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                       (persistent_color ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u) |
                       ((seed_rgba || persistent_color) ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-        vkCreateImage(dev, &imgci, nullptr, &img);
-        if (!img) {
+        // #3180: the result is the primary test, the handle the secondary one.
+        if (create_color_target_image(dev, imgci, RenderColorTargetCreateSite::Slot0,
+                                      &img) != VK_SUCCESS) {
             if (cached_color) persistent_color_target_cache().erase(color_key);
             return out;
         }
@@ -4935,8 +5016,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color = false;
                 imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                               (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-                vkCreateImage(dev, &imgci, nullptr, &img);
-                if (!img) return out;
+                if (create_color_target_image(dev, imgci,
+                                              RenderColorTargetCreateSite::Slot0Fallback,
+                                              &img) != VK_SUCCESS)
+                    return out;
                 vkGetImageMemoryRequirements(dev, img, &ir);
                 iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
             }
@@ -5015,8 +5098,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                           (persistent_color1 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u) |
                           ((effective_seed1 || persistent_color1)
                                ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-        vkCreateImage(dev, &color1_ci, nullptr, &img1);
-        if (!img1) {
+        if (create_color_target_image(dev, color1_ci, RenderColorTargetCreateSite::Slot1,
+                                      &img1) != VK_SUCCESS) {
             if (cached_color1) persistent_color_target_cache().erase(color_key1);
             return out;
         }
@@ -5049,8 +5132,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 color1_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   (effective_seed1 ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-                vkCreateImage(dev, &color1_ci, nullptr, &img1);
-                if (!img1) return out;
+                if (create_color_target_image(dev, color1_ci,
+                                              RenderColorTargetCreateSite::Slot1Fallback,
+                                              &img1) != VK_SUCCESS)
+                    return out;
                 vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
                 color1_allocation.allocationSize = color1_requirements.size;
                 color1_allocation.memoryTypeIndex = pick(color1_requirements.memoryTypeBits, 0);
@@ -5119,8 +5204,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    (cached_extra[slot] ? (VK_IMAGE_USAGE_SAMPLED_BIT |
                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT) : 0u) |
                    (slot_seeded ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-        vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
-        if (!extra_images[slot]) {
+        if (create_color_target_image(dev, ci, RenderColorTargetCreateSite::SlotExtra,
+                                      &extra_images[slot]) != VK_SUCCESS) {
             if (cached_extra[slot]) {
                 persistent_color_target_cache().erase(extra_keys[slot]);
                 cached_extra[slot] = nullptr;
@@ -5155,8 +5240,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cached_extra[slot] = nullptr;
                 ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                            (slot_seeded ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-                vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
-                if (!extra_images[slot]) return out;
+                if (create_color_target_image(dev, ci,
+                                              RenderColorTargetCreateSite::SlotExtraFallback,
+                                              &extra_images[slot]) != VK_SUCCESS)
+                    return out;
                 vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
                 allocation.allocationSize = requirements.size;
                 allocation.memoryTypeIndex = pick(requirements.memoryTypeBits, 0);

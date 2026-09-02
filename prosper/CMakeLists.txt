@@ -2045,6 +2045,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_image_identity PRIVATE prosper_core)
   add_test(NAME image_identity COMMAND test_image_identity)
 
+  # #3195: the atomic-image LOGICAL/PHYSICAL staging extents, extracted from execute_item.
+  add_executable(test_atomic_image_staging tests/gpu/agc/test_atomic_image_staging.cpp)
+  target_link_libraries(test_atomic_image_staging PRIVATE prosper_core)
+  add_test(NAME atomic_image_staging COMMAND test_atomic_image_staging)
+
   # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
   # direction binds the guest image with the wrong element type, so every arm has a rejection
   # partner -- including atomics, which are never a native storage image however well formats match.
@@ -2688,6 +2693,15 @@ if(TARGET prosper_core)
       target_include_directories(test_multidraw_render PRIVATE frontends)
       target_link_libraries(test_multidraw_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME multidraw_render COMMAND test_multidraw_render)
+
+      # #3180: a failed color-target vkCreateImage must name its site and the real VkResult. Same
+      # block as the other render_runner.h tests -- it needs the `tests` and `frontends` include
+      # roots and a real Vulkan device.
+      add_executable(test_color_target_create_failure tests/gpu/test_color_target_create_failure.cpp)
+      target_include_directories(test_color_target_create_failure PRIVATE tests)
+      target_include_directories(test_color_target_create_failure PRIVATE frontends)
+      target_link_libraries(test_color_target_create_failure PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME color_target_create_failure COMMAND test_color_target_create_failure)
 
       # Indexed draws (#64): vkCmdDrawIndexed from a BackendDraw's index data — the [0,1,2,2,3,0] quad
       # must match the retired perimeter-fan rendering pixel-exact, and indices must really be applied.

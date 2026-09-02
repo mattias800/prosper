@@ -782,10 +782,118 @@ no throughput improvement is claimed. The run produced no image artifact and mak
 correctness claim, so no screenshot is attached. Retained evidence is outside git under
 `<EVIDENCE_ROOT>/astro-1732-memory-gds-37eb14e/` and the complete audit trail is on #1732.
 
+## The world-map GPU reset is a non-terminating loop in the PIXEL shader (2026-09-02)
+
+Measured on master `c1987cdf` plus the ordinal-scoped trip bound this section describes, with
+`tools/screenshot`, native 3840x2160, no pad script,
+`PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, `--seconds 30 --count 5 --timeout 170`.
+"Losses" counts `[backend] GRAPHICS submission failed` lines. See #3193.
+
+#3193 named the hanging DRAW by its vertex program `0x5008efd00`, and said in its own caveats that
+the evidence could not separate the two stages of that draw. It is the **pixel** half:
+`0x5008f1400`.
+
+**The vertex program cannot hang.** Its recompiled module has **zero `OpLoopMerge`** -- one function,
+8 basic blocks, 4 `OpBranch` plus 3 `OpBranchConditional`, no loop of any kind -- and the guest's own
+413-dword stream has no backward branch (`shader_inspect`). A loop-free shader is not a candidate.
+
+**The pixel program has exactly one loop, and it is prosper's.** `0x5008f1400` is 3,210 dwords /
+2,292 instructions with **four backward branches**, so both structured loop emitters reject it and
+`emit_cfg_state_machine` lowers the whole program to one SPIR-V loop over an **89-case `OpSwitch`**.
+That single `OpLoopMerge` is the only loop in a 136,875-word module.
+
+Capping that back edge removes the reset, and the dose-response identifies it as a runaway rather
+than a slow shader:
+
+| `PROSPER_CFG_TRIP_BOUND` on `0x5008f1400` | losses | pixel-distinct | max pixel stale | target draw still ran |
+| --- | --- | --- | --- | --- |
+| unset (control) | 53 | 3 / 5 | 60.0 s | yes, 4,096+ |
+| 1,000,000 | 52 | 3 / 5 | 60.0 s | yes, 8,192+ |
+| **4,096** | **0** | **5 / 5** | **0.0 s** | yes, 2,048+ |
+
+A cap can only change the outcome by being REACHED, so the loop ran at least 4,096 dispatcher
+iterations in the control; at 1,000,000 the device still dies. The control's frames collapse to **1
+distinct colour** from the 90 s sample onward while the capped run holds 548,400-565,669 distinct
+colours to the end.
+
+**Which of the four guest loops.** `PROSPER_CFG_TRIP_BOUND_ORDINAL=K` (added with this work) counts
+only the traversals about to re-enter dispatch ordinal K, so each loop's header can be capped alone.
+Headers, from the phase-0 dispatch map the arm prints:
+
+| arm | ordinal | guest pc | guest loop | losses |
+| --- | --- | --- | --- | --- |
+| A | 30 | header 1154, back edge 1262 | `v_cmpx`/`readfirstlane` waterfall on `v[9:10]` | 59 |
+| C | 42 | header 1897, back edge 2540 | outer waterfall on `v[55:56]` | 108 |
+| **B** | **45** | **header 1911, back edge 2538** | **scalar list walk** | **0** |
+| D | 63 | header 2690, back edge 2997 | counted `for (s20 = s8; s20 < s8 + s9; ++s20)` | 64 |
+
+One positive, three negatives, and the negatives are informative rather than merely quiet: a cap on a
+loop that terminates on its own is inert, so an arm that still dies has excluded its loop. The
+ordering agrees -- loop D begins at pc 2690, past loop C's exit at 2541, so an invocation stuck in
+loop B never reaches D and a cap on D could not rescue it. That is exactly what arm D shows.
+
+**What loop B is.** A per-tile light-list walk:
+
+```text
+1911: v_mov_b32 v55, 0                    ; header
+1913: s_cmp_lg_u32 -1, s107               ; SCC = (link != 0xffffffff)
+1914: s_cbranch_scc0 -> 2539              ; THE ONLY EXIT
+1917: s106 = s107 << 3                    ; record = link * 8 bytes
+1920: s_buffer_load_dword s14, s[0:3], s106     ; record word 0 (type tag in 0x70000000)
+1926: s_buffer_load_dword s66, s[0:3], s106     ; record word 1 -> the NEXT link
+ ...
+2537: s_mov_b32 s107, s66
+2538: s_branch -> 1911
+```
+
+The first link comes from a tile lookup at pc 1909, indexed
+`((s107 >> 16) + s64 * (s107 & 0xffff)) * 4` into a **32,400-dword** scalar buffer -- exactly
+`3840/16 x 2160/16` screen tiles -- with `s107` seeded from the interpolant `v5`. The list buffer
+itself resolves to 8,294,400 dwords.
+
+**The hazard that makes this fail closed in the wrong direction.** Both link loads are lowered by
+`bounded_cbuf_load` (`src/gpu/recompiler/rdna2_emit_alu.cpp`), which clamps the dword index and
+returns **0** for an out-of-range read -- RDNA2's own OOB contract for a bounded V#, so the lowering
+is faithful. But this walk's terminator is `0xffffffff`, and **zero is a valid link**. Any
+out-of-range read, or any run of zeros where the list should be, converts a bounded walk into an
+unbounded one with no error anywhere. The open question is therefore *why the link chain never
+reaches `0xffffffff`* -- a wrong index, a mis-resolved descriptor, or a light-list buffer the
+producing pass never populated -- not whether the recompiled control flow is right.
+
+Filed as #3214. The trip bound is a diagnostic and is **not** a fix: it truncates guest
+control flow and the world map still shows only its nebula backdrop (#1459) with it armed.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
+
+- **"The world-map GPU reset is caused by the vertex program `0x5008efd00`."** False, and #3193 said
+  in its own caveats that the draw-level A/B could not separate the draw's two stages. The vertex
+  module contains **zero `OpLoopMerge`** and its guest stream has no backward branch, so it cannot
+  hang; the pixel half `0x5008f1400` does, and capping only that program's dispatcher back edge takes
+  a deterministic 53-loss control to **0**. Skipping the draw remains a valid bisection lever -- it
+  just names a draw, not a stage. #3193, 2026-09-02.
+
+- **"The Astro Bot reset is not the CFG dispatcher path."** False for this failure, and the note that
+  said so was measured somewhere else. It was taken with `PROSPER_CFG_TRIP_BOUND` armed on Astro's
+  **compute** programs, whose relevance was the then-current hypothesis; the hang is in a **fragment**
+  program, and until #3193 named the draw there was no reason to arm it there. `0x5008f1400` lowers
+  through `emit_cfg_state_machine` and its only loop is that dispatcher's. The general lesson is the
+  one the instrument's own comment already carries: a null from a program the bound did not cover
+  means *not measured*. 2026-09-02.
+
+- **"The runaway is one of the pixel shader's two `readfirstlane` waterfall loops (guest pc 1154 and
+  1897), because a per-invocation `readfirstlane` cannot pick a matching lane."** False, twice over.
+  The emitted SPIR-V shows the identity lowering makes each waterfall's inner test `v5 == v5` --
+  always true -- so the body runs and clears the handle, and both loops terminate. Measured: capping
+  their header ordinals (30 and 42) leaves **59** and **108** losses. The runaway is the scalar
+  light-list walk at pc 1911. 2026-09-02.
+
+- **"The runaway is the counted loop at guest pc 2690 (`for (s20 = s8; s20 < s8 + s9; ++s20)`), whose
+  bound comes from scalar reads."** False: capping its header ordinal (63) leaves **64**
+  losses. It also cannot be, by ordering -- it begins past loop C's exit, so an invocation stuck in
+  the pc-1911 walk never reaches it. 2026-09-02.
 
 - **"The post-#1927 retained address DMA writes guest memory at `0x24`, so it can genuinely overlap
   every later guest label wait."** False on exact candidate `37eb14e7` for #1732. Raw operands and

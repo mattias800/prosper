@@ -21,6 +21,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### Astro Bot's world-map GPU hang is one loop in the pixel shader, and we can now point at it
+
+No picture: the world map still renders only the nebula backdrop. What is new is that the hang has
+a mechanism instead of a suspect. The draw that kills the GPU was named by its *vertex* program, but
+that program has no loop at all — it is 8 straight-line blocks. Its *pixel* partner is a 136,875-word
+module with exactly one loop, the state machine prosper builds for shaders whose control flow it
+cannot structurize, and that loop never ends: capping it at 4,096 iterations takes a deterministic
+53-device-loss run to zero, while capping it at a million leaves the crash exactly where it was.
+
+A new per-loop cap then narrowed it further, to one of the four loops inside that shader — a
+per-screen-tile walk down a linked list of lights that is supposed to stop at `0xffffffff` and never
+does ([#3193][i3193]).
+
+[i3193]: https://github.com/mattias800/prosper/issues/3193
+
 ### An F9 capture now owns the whole mip chain, so the fetch that stops Sonic Frontiers can be studied offline
 
 No picture — this one is a tool. Compute images carry the guest's declared mip chain since
