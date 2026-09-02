@@ -30,6 +30,17 @@ new barrier leaves a 439-assertion compute test, including a byte-exact image wr
 green.
 [#3249](https://github.com/mattias800/prosper/issues/3249)
 
+### The five hazards nobody could see, and two instruments that were answering wrongly
+
+No picture. Vulkan's synchronization validation had never run anywhere in this project, and switching
+it on found five real hazards — including a mip chain being cleared and copied into with nothing
+ordering the two writes, whose corruption would have looked exactly like the black level the clear is
+deliberately there to produce. Two env-gated diagnostics turned out to be misusing Vulkan too, and
+both were misreporting because of it: the geometry probe was arming on shaders it could not capture
+and calling the resulting silence "the draw produced no primitives", and the draw-isolation pass was
+naming a culprit draw while re-rendering under different state from the pass it was isolating.
+[#3248](https://github.com/mattias800/prosper/issues/3248)
+
 ### Every frame we have ever read back was read without asking the GPU to hand it over
 
 No picture, and that is the finding: on this hardware a readback with no host-availability barrier

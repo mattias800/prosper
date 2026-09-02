@@ -810,8 +810,8 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   produced **5 SYNC-HAZARD messages** (one READ-AFTER-WRITE in `vulkan_triangle_render`, four
   WRITE-AFTER-WRITE in `texture_mip_render`), so syncval was armed and reporting; it simply cannot
   observe a CPU read through a mapped pointer, which is the access the missing dependency protects.
-  Those 5 are a separate, real finding (#3248) and are invisible to `tools/vkval`, which does not
-  enable syncval. #2944.
+  Those 5 are a separate, real finding (#3248) and are invisible to `tools/vkval`, which did not
+  enable syncval. `--sync` now does; the sentence above is still true of what it can see. #2944.
 - **HOST_COHERENT memory does NOT exempt a readback from the host-domain dependency.** Coherence
   removes the need for `vkInvalidateMappedMemoryRanges`; it does not perform the availability
   operation. The two halves are independent, and the backend had only the second: three of the seven
@@ -843,6 +843,46 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   retain their previous contents"). So the comparator baselines and the depth-bits bridge staging
   buffer — neither of which is mapped by the binding that writes it — are host-read later anyway. The
   invariant is per-allocation, not per-binding. #3249.
+- **All five hazards syncval reported were REAL. None was a layer false positive, and none was safe
+  by other means.** Classified individually before fixing, because "silence the layer" is the wrong
+  answer for a hazard that is genuinely covered:
+  * the four `SYNC-HAZARD-WRITE-AFTER-WRITE` in `texture_mip_render` are one defect seen four times
+    (two assembled-chain renders x two copied levels). A `vkCmdPipelineBarrier` does sit between the
+    clear and each copy, so an EXECUTION dependency exists — but every one of them names the copy
+    SOURCE image, and write-after-write additionally needs the first write made available on the
+    DESTINATION. One `VkImageMemoryBarrier` over the cleared range closes all four;
+  * the one `SYNC-HAZARD-READ-AFTER-WRITE` in `vulkan_triangle_render` is the implicit final subpass
+    dependency being weaker than it looks: with no dependency declared, Vulkan supplies
+    `srcStage = ALL_COMMANDS -> dstStage = BOTTOM_OF_PIPE` with `dstAccessMask = 0`, which orders
+    execution and makes nothing visible, so the following `vkCmdCopyImageToBuffer` reads the
+    attachment unsynchronized against the pass's own finalLayout transition. Same defect #2945 fixed
+    inside `render_draw_pass_rgba`.
+  Both were confirmed by mutation rather than by reading: removing each fix returns its exact
+  message, and adding it removes it. #3248.
+- **The driver is not a variable for these hazards, so a lavapipe/RADV disagreement is not the
+  reason to distrust one.** Measured 2026-09-02, layers 1.4.341, whole ctest suite: RADV
+  (STRIX_HALO) and lavapipe report the identical set — same 2 ids, same 5 messages, same 2 tests.
+  Syncval models the recorded commands rather than consulting the driver, which is also why "try
+  another GPU" cannot discriminate this class (the same reason recorded for `08600` in
+  `tools/vkval/README.md`). #3248.
+- **A pixel assertion is blind to the mip-assembly hazard for a sharper reason than usual, and a
+  content test can never be written for it.** Assembly clears to black deliberately so a level the
+  guest never rendered stays unavailable instead of being derived from a neighbour. A clear landing
+  after a copy therefore yields a black level — byte-identical to what a *correct* run produces for
+  a missing level. Measured: with the barrier removed, `texture_mip_render` passes, including its
+  "missing final renderer mip remains black" assertion. #3248.
+- **The LAYER VERSION is a variable even though the driver is not — so "syncval is clean" needs the
+  version stated.** With all five fixed, a `--sync` run inside `podman run ubuntu:24.04` carrying the
+  CI runner's own packages (validation layers **1.3.275**, mesa 25.2.8 = lavapipe) reports a SIXTH
+  hazard that 1.4.341 reports on neither driver: `SYNC-HAZARD-WRITE-AFTER-READ` x4 in
+  `shadow_compare_render`, on the same-pass depth feedback of #1186 — a depth store op said to
+  conflict with the in-subpass sampled read. The driver is held constant across that comparison
+  (lavapipe both times), which isolates the variable to the layer version. **Not classified**: the
+  path is enabled only when no draw in the pass can write depth and the attachment sits in a
+  depth-read-only layout, so either 1.3.275 ignores the read-only layout or a subpass
+  SELF-dependency is genuinely missing (the `VK_SUBPASS_EXTERNAL` pair from #2945 cannot order
+  anything inside subpass 0). Deliberately not allow-listed and not "fixed" with a barrier: it is
+  why `--sync` is opt-in rather than the CI gate. #3255.
 
 ## The renderer is not deterministic on frozen input (2026-08-23) — #2945
 
