@@ -150,7 +150,7 @@ were confirmed as legitimate frustum culls.
    decoded address modes, instead of a hard-threshold single tap). Offline proof:
    `lit_frame.prgcap` replayed through `gpu_replay --recompile-raw` renders smooth navy walls,
    real carpet-runner art, and no rings (frame:
-   `docs/screenshots/issue-1287-hall-materials-fixed.png`, #1287 comment 2026-07-26).
+   `docs/screenshots/issue-1287-hall-materials-fixed.webp`, #1287 comment 2026-07-26).
    The prior "lives in the light-accumulation/falloff math" reading was wrong — the ruled-out list
    (shadow-plane content, caster bias, mips/LOD, sampler filters) was correct but incomplete;
    the interpolant path had not been suspected.
@@ -172,7 +172,7 @@ were confirmed as legitimate frustum culls.
    Buffer size correlates exactly (454 KiB healthy; 1.45-3.0 MiB collapsed; the 1.66 MiB stream
    that straddled the clamp lost precisely the vertices past it). Uploading the declared range
    drops vanished draws to 27/248 and renders the hall at oracle parity
-   (`docs/screenshots/issue-1427-oracle-before-after.png`). The old bisection range recorded here
+   (`docs/screenshots/issue-1427-oracle-before-after.webp`). The old bisection range recorded here
    (operations 1100-1200) was a red herring produced by the isolated-draw depth trap — do not
    resume it. The residual 27/248 `GEOMETRY-VANISH` draws were each checked with
    `PROSPER_GEOM_PROBE`: all wrote their expected finite vertex count, retained real positional

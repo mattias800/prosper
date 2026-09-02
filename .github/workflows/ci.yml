@@ -300,7 +300,11 @@ jobs:
       - name: Verify committed screenshots are within the size convention
         run: |
           python3 -m pip install --quiet Pillow
-          python3 prosper/tools/screenshots/shrink.py --check assets/screenshots
+          # BOTH image trees. `prosper/docs/screenshots` was missed by the first pass and was
+          # still 53 MB of 1080p PNG (3-5.6 MiB each) with nothing watching it -- a gate that
+          # covers one of two directories is how the second one grows back.
+          python3 prosper/tools/screenshots/shrink.py --check \
+            assets/screenshots prosper/docs/screenshots
 
       # The other half of the numbering contract, and until now nobody checked it. The table's value
       # is that other files point AT it by number, and roughly half of those references are

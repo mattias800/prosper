@@ -88,9 +88,9 @@ The route documentation and committed app screenshots are in:
 - `scripts/astrobot/README.md`
 - `scripts/astrobot/reach-first-level.pad`
 - `scripts/astrobot/reach-first-level-windows.pad`
-- `docs/screenshots/issue-825-astrobot-linux-sony-presents.png`
-- `docs/screenshots/issue-825-astrobot-windows-sony-presents.png`
-- `docs/screenshots/issue-825-astrobot-windows-title.png`
+- `docs/screenshots/issue-825-astrobot-linux-sony-presents.webp`
+- `docs/screenshots/issue-825-astrobot-windows-sony-presents.webp`
+- `docs/screenshots/issue-825-astrobot-windows-title.webp`
 
 Those screenshots prove frontend/video/control-flow milestones. They do not prove that the current
 headless title render is correct.

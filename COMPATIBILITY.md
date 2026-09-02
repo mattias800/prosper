@@ -200,14 +200,14 @@ The scripted route reaches the first tutorial room. See the [tracker](https://gi
 
 ## GRIS — `PPSA09804`
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1356-gris-title.png" alt="GRIS — title screen"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1356-gris-title.webp" alt="GRIS — title screen"></p>
 <p align="center"><img src="assets/screenshots/gris.webp" alt="GRIS — opening gameplay"></p>
 
 The opening fall leads into native 1920×1080 gameplay with scripted input and audio. See the [tracker](https://github.com/mattias800/prosper/issues/1869).
 
 ## Space Adventure Cobra — The Awakening — `PPSA17337`
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png" alt="Space Adventure Cobra — title screen"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp" alt="Space Adventure Cobra — title screen"></p>
 <p align="center"><img src="assets/screenshots/space-adventure-cobra.webp" alt="Space Adventure Cobra — tutorial combat"></p>
 
 The route reaches the native 1920×1080 desert tutorial combat scene with audio. See the [tracker](https://github.com/mattias800/prosper/issues/1870).
