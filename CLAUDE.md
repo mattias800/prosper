@@ -868,6 +868,22 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       reports rows, with a `commit_id` that is no longer on the branch. Compare each review's `commit_id`
       against the current head; if it is stale, establish by **content** (`git diff <reviewed-sha> <head>`)
       whether the approval still applies rather than assuming in either direction.
+    - **The same detachment applies to CI CHECKS, and that half cost a merge.** On #3243 GitHub's
+      recorded PR head froze while the branch advanced two commits; no run was ever queued for the
+      newer ones, `gh pr checks` reported green for the frozen head, and the merge carried code CI
+      had never seen. So compare `headRefOid` against `git ls-remote origin refs/heads/<branch>`
+      before merging, not only the reviews' `commit_id`.
+    - **Never gate on the TEXT output of `gh pr checks`.** Its columns are tab-separated and this
+      repository's check names contain spaces — `Windows App`, `Linux App Package`,
+      `macOS (x86_64 / Rosetta 2)` — so splitting on whitespace puts the second *word of the name*
+      where the status belongs. A shell gate doing that merged #3234 with a red `Windows MinGW`;
+      an `awk '$2=="pass"'` written the same day counted 2 passing checks where 8 passed. Both
+      answers look plausible, which is the whole danger. Use `--json name,state,bucket`.
+    - Both rules, plus "an empty check list is VOID rather than green", are implemented in
+      `prosper/tools/ci/pr_merge_gate.py` — `python3 prosper/tools/ci/pr_merge_gate.py <PR>` exits 0
+      only when every check passed, none is pending, at least one passed, and the head the checks
+      describe is the branch tip. It exits **2** when it could not evaluate, so "the gate could not
+      run" is never confused with "the gate said no".
 - **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
   improvement may merge without matching work in every other frontend unless the issue explicitly promises
   parity or a shared public contract requires it. Unaffected platforms must still retain existing behavior and

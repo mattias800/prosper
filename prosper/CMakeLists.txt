@@ -340,6 +340,16 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME tools_usage_text
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_usage_text.py"
                    --selftest --root "${CMAKE_SOURCE_DIR}")
+  # The merge gate (#3259). Its arms are all REFUSALS, and a gate that refuses everything would
+  # satisfy every one of them -- so the suite leads with an all-pass positive control, and each
+  # refusal asserts on the REASON rather than on the boolean. Two arms reconstruct merges that
+  # actually went wrong: a red `Windows MinGW` read as green because a shell split the check NAME
+  # on whitespace and landed on `MinGW` where the status belongs (#3234), and an all-green result
+  # describing a PR head the branch had moved two commits past (#3243). Both are shapes this
+  # repository produces routinely -- check names here contain spaces, and every lane pushes after
+  # CI starts -- so neither arm is hypothetical.
+  add_test(NAME pr_merge_gate
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
   # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
   # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
