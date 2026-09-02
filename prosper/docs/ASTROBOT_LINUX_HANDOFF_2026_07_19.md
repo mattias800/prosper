@@ -860,7 +860,7 @@ unbounded one with no error anywhere. The open question is therefore *why the li
 reaches `0xffffffff`* -- a wrong index, a mis-resolved descriptor, or a light-list buffer the
 producing pass never populated -- not whether the recompiled control flow is right.
 
-Filed as #ASTROFOLLOWUP. The trip bound is a diagnostic and is **not** a fix: it truncates guest
+Filed as #3214. The trip bound is a diagnostic and is **not** a fix: it truncates guest
 control flow and the world map still shows only its nebula backdrop (#1459) with it armed.
 
 ## Ruled out
