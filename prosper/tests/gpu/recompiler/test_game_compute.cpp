@@ -31,7 +31,10 @@
 #endif
 
 #if defined(__linux__)
+#include <csignal>
 #include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <sys/wait.h>
 #endif
 
 using namespace prosper::gpu;
@@ -43,6 +46,96 @@ static int fails = 0;
 // that quietly stops executing assertions shows up as a drop rather than as unchanged green.
 static int checks = 0;
 #define CHECK(c, msg) do { ++checks; if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
+
+#if defined(__linux__)
+// ---------------------------------------------------------------------------------------------
+// #3156: this suite arms real page-protection write watches, so it needs the one production
+// signal behaviour that services them.
+//
+// `guest_write_watch_set_fault_onstack(true)` is an ASSERTION to the watch layer: "a SIGSEGV
+// handler is installed, it runs on a sigaltstack, and it will service a write fault on a page I
+// armed". This binary made that assertion in seven places while installing no handler at all, and
+// compensated by calling `guest_write_watch_notify_host_write()` at the write sites it knew about.
+// That works only while nothing arms a watch the test did not anticipate. It stopped working at
+// `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1`, where the compute cache arms on a first
+// acquisition: `large_result[0] ^= 0xffffffffu;` (the "externally changed buffer" step) then stored
+// into a page the cache had just made read-only, and the process died -- `notl 0x0(%r13)` at a
+// page-aligned mmap address, with `#0 main ()` as the whole backtrace. So the one setting that
+// exercises promotion was the one setting the harness could not host, and nobody could measure
+// promotion here.
+//
+// Deliberately NOT `prosper::install_trap_handler()`. That installs the guest-image fault
+// machinery -- hardware breakpoints, the null-page companion mapping, lazy commit, guest-%fs
+// scoping, siglongjmp recovery -- none of which this suite has any guest for. Model the single
+// production behaviour that matters (exec_image_linux.cpp's write-watch branch) and keep every
+// other fault fatal and loud, following `tests/host/test_dmem.cpp`'s precedent.
+namespace {
+
+// Distinct from the suite's own 1-on-assertion-failure so a fault can never be read as a FAIL, and
+// from the production worker-fault _exit(90).
+constexpr int kUnexpectedFaultExit = 86;
+
+void write_watch_segv_handler(int sig, siginfo_t* info, void* context) {
+#if defined(__x86_64__)
+    // Production offers only WRITE faults to the watch (it tests the page-fault error code's bit
+    // 1). An armed page keeps PROT_READ, so a read fault is never a watch event; leaving it fatal
+    // here keeps the handler from resuming a fault it cannot actually have caused.
+    const bool write_fault =
+        context != nullptr &&
+        (static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+#else
+    const bool write_fault = context != nullptr;
+#endif
+    if (sig == SIGSEGV && write_fault && info != nullptr && info->si_addr != nullptr &&
+        prosper::host::guest_write_watch_handle_fault(
+            reinterpret_cast<uint64_t>(info->si_addr)))
+        return;
+    // Not a page we armed. Returning here would re-execute the faulting instruction forever and
+    // turn a real defect into a hang; a handler that swallows is worse than the crash it replaced.
+    static constexpr char message[] = "test_game_compute: unexpected SIGSEGV (not an armed "
+                                      "write-watch page)\n";
+    (void)!write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(kUnexpectedFaultExit);
+}
+
+bool install_write_watch_segv_handler() {
+    // The watch layer only arms when the handler is on an alternate stack: it resolves a fault by
+    // returning, so without SA_ONSTACK the kernel writes the signal frame into the faulting store's
+    // SysV red zone.
+    static uint8_t alternate_stack[256 * 1024];
+    stack_t stack{};
+    stack.ss_sp = alternate_stack;
+    stack.ss_size = sizeof(alternate_stack);
+    struct sigaction action{};
+    action.sa_sigaction = write_watch_segv_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    return sigaltstack(&stack, nullptr) == 0 && sigaction(SIGSEGV, &action, nullptr) == 0;
+}
+
+// Arm 2 of the harness fix. Proves the handler is scoped rather than absorbing: a write fault on a
+// page nothing armed must still end the process loudly. Run in a child so the proof is executable
+// rather than a comment. `alarm` bounds the "handler wrongly resumed" case, which would otherwise
+// re-execute the store forever and hang ctest instead of failing it.
+int unarmed_fault_child_status() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        alarm(20);
+        void* mapping = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) _exit(70);
+        *static_cast<volatile uint8_t*>(mapping) = 0x11;
+        _exit(0);   // reached only if the handler swallowed the fault
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return -1;
+    return status;
+}
+
+} // namespace
+#endif  // __linux__
 
 static int file_descriptor(FILE* file) {
 #ifdef _WIN32
@@ -85,6 +178,56 @@ int main() {
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
     setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
     setenv("PROSPER_NO_DISK_PIPELINE_CACHE", "1", 1);
+#endif
+
+#if defined(__linux__)
+    // #3156. Install before anything can arm a watch -- every `set_fault_onstack(true)` below is a
+    // promise that this handler exists, and the compute cache arms on its own schedule, not the
+    // test's.
+    CHECK(install_write_watch_segv_handler(),
+          "write-watch SIGSEGV handler installed on an alternate stack");
+
+    // Arm 1: the fault path is serviced in THIS binary. A raw architectural store into an armed
+    // page, with no `guest_write_watch_notify_host_write` hook to disarm it first -- exactly the
+    // shape that killed the process at PROMOTE_HITS=1. The store must land, the watch must read
+    // Dirty, and the run must continue.
+    {
+        constexpr size_t fault_probe_bytes = 4096;
+        auto* fault_probe = static_cast<uint8_t*>(mmap(
+            nullptr, fault_probe_bytes, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(fault_probe != MAP_FAILED, "map write-watch fault-probe range");
+        if (fault_probe != MAP_FAILED) {
+            std::memset(fault_probe, 0x24, fault_probe_bytes);
+            prosper::host::guest_write_watch_set_fault_onstack(true);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                reinterpret_cast<uint64_t>(fault_probe), fault_probe_bytes, 0x7f0000,
+                0x3 /* SCE CPU_READ|CPU_WRITE */);
+            auto probe_watch = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(fault_probe), fault_probe_bytes);
+            CHECK(static_cast<bool>(probe_watch) &&
+                      probe_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "fault probe arms a page-protection watch that starts Unchanged");
+            *static_cast<volatile uint8_t*>(fault_probe + 64) = 0x5a;
+            CHECK(fault_probe[64] == 0x5a,
+                  "an unhooked CPU store into an armed page is serviced and lands");
+            CHECK(probe_watch.query() == prosper::host::GuestWriteWatchQuery::Dirty,
+                  "the serviced fault marks the armed watch Dirty");
+            probe_watch.reset();
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                reinterpret_cast<uint64_t>(fault_probe), fault_probe_bytes);
+            prosper::host::guest_write_watch_set_fault_onstack(false);
+            munmap(fault_probe, fault_probe_bytes);
+        }
+
+        // Arm 2: the handler is scoped, not absorbing. A write fault on a page nothing armed must
+        // still kill the process loudly, or this fix would trade a deterministic crash for silently
+        // green runs over corrupt memory.
+        const int unarmed_status = unarmed_fault_child_status();
+        CHECK(unarmed_status >= 0 && WIFEXITED(unarmed_status) &&
+                  WEXITSTATUS(unarmed_status) == kUnexpectedFaultExit,
+              "a write fault on an unarmed page remains fatal and reported");
+    }
 #endif
     const bool adaptive_storage_result_validation_enabled =
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
@@ -6434,6 +6577,28 @@ int main() {
                                   diagnostic.find("result=VK_ERROR_DEVICE_LOST(-4)") + 1) ==
                       std::string::npos,
               "device loss is unconditional and identifies the first observed guest dispatch");
+    }
+
+    // #3155: report the write-watch census this run produced, and pin the structural identities
+    // that make it readable. The numbers themselves are workload-dependent and are deliberately NOT
+    // asserted -- this suite is not The Plucky Squire -- but a census whose buckets do not partition
+    // its own denominator is an instrument nobody should quote, and that IS checkable here.
+    {
+        const auto census = prosper::frontend::live_compute_write_watch_census();
+        char census_line[512];
+        const size_t census_used = prosper::frontend::format_write_watch_census(
+            census, census_line, sizeof census_line);
+        if (census_used) std::fwrite(census_line, 1, census_used, stdout);
+        CHECK(census.decisions > 0,
+              "the suite consults the write-watch promotion policy at least once");
+        CHECK(census.stability_0 + census.stability_1 + census.stability_2 +
+                  census.stability_3_plus == census.decisions,
+              "census stability buckets partition the decisions they are a fraction of");
+        CHECK(census.granted <= census.threshold_met &&
+                  census.budget_refused == census.threshold_met - census.granted,
+              "a granted promotion is a subset of the threshold-eligible ones");
+        CHECK(census.exact_compares > 0 && census.exact_compare_bytes > 0,
+              "the suite reaches the full byte comparison the census exists to measure");
     }
 
     if (fails) {
