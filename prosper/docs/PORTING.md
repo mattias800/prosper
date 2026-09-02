@@ -660,9 +660,11 @@ end are macOS/Rosetta, so do not read the section as Windows-only.
   1.48 s, `hle_functions_registered` 1.48 s — so `kernel_sem_timedwait` passes in **1.08, 1.20,
   1.35, 1.47 and 1.52 s** across five green `main` jobs on 2026-09-02. The reported 1.22 s failure
   sits INSIDE that distribution and the 1.02 s one is below its minimum: the duration carries no
-  signal, and an ARM 4 that ran to its one-second timeout would have read ~2.4 s. A ctest per-test
-  duration under binary translation measures startup, not the wait inside it. Instrument trap 249.
-  (#3067)
+  signal, and an ARM 4 that ran to its one-second timeout would have read ~2.4 s. Settled outright by
+  the macOS job on the fix's own PR (run `33667200036`), which passes `kernel_sem_timedwait` in
+  **1.02 sec** — the exact duration of one of the two failures the issue was filed on. A ctest
+  per-test duration under binary translation measures startup, not the wait inside it; the second,
+  warm-cache run in the same job reads 0.24 s for the same test. Instrument trap 249. (#3067)
 - **"A green CI job records the margin its timing tests cleared."** It did not, on any platform.
   `test_kernel_sem_timedwait` prints `(timeout took %.2f ms via %s)` specifically so a margin can be
   quoted from a log — and every job ran `ctest --output-on-failure`, which prints a test's output
@@ -670,7 +672,13 @@ end are macOS/Rosetta, so do not read the section as Windows-only.
   and the headroom on the green runs either side of a near-miss was unrecoverable without reddening
   the job first. Fixed by the `timing-margin` ctest label plus a verbose re-run step in the Linux,
   Windows MinGW and macOS jobs (#3067); `-L <label>` with `--no-tests=error` fails the step if the
-  label is ever dropped, measured at exit 8 versus exit 0 without the flag.
+  label is ever dropped, measured at exit 8 versus exit 0 without the flag. First green run carrying
+  the figures (`33667200036`): a 5 ms guest `sem_timedwait` served in 5.06 ms on Linux, **5.32 ms
+  via `win32-high-resolution-timer`** on Windows — #3044's fix observed on CI rather than on one
+  developer's box — and **45.73 ms** on Rosetta, 10.9x inside its 500 ms bound. The same run shows
+  `kernel_cond_timedwait_clock`'s 20 ms arm taking **156.18 ms** on Rosetta, a 7.8x overshoot that
+  leaves 12.8x against its 2 s bound: comfortable, much less comfortable than a 2 s bound reads, and
+  previously unmeasured anywhere.
 
 **Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
 `cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
