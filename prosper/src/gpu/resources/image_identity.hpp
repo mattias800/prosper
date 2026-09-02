@@ -78,6 +78,14 @@ inline bool shader_resource_same_view(const ShaderResource& a, const ShaderResou
            a.srgb == b.srgb &&
            shader_resource_same_host_backing(a, b) &&
            a.host_data_size == b.host_data_size &&
+           // #3202: how far the backing extends BELOW the pointer is part of its extent, so two
+           // bindings that own different amounts of the same allocation are not the same image.
+           // Unlike #3205's provenance this is not derived and is populated uniformly -- zero
+           // everywhere except a replayed resource, and identical for two replayed descriptors at
+           // one address -- so the only case it separates is the one that must be separated: a
+           // `--override-resource` replacement, which owns the selected level and nothing under it,
+           // bound alongside the unreplaced descriptor it shadows.
+           a.host_data_prefix_bytes == b.host_data_prefix_bytes &&
            shader_resource_same_dcc_identity(a, b);
 }
 

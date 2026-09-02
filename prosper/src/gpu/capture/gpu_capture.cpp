@@ -18,6 +18,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/present/videoout_present.hpp"
 
@@ -140,13 +141,20 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // MANY levels a T# declares; these say WHERE they are, which nothing else preserves once
 // image_base_level_view has shifted gpu_addr/width/height onto the SELECTED level.
 //
-// What this does NOT yet do, so nobody plans around it: a replayed resource is host_data-backed and
-// its blob covers only the selected level's footprint, and the chain derivation declines any
-// host_data resource -- so gpu_replay still refuses IMAGE_LOAD_MIP exactly as it did before v57.
-// Making replay materialize the chain needs the capture to own the whole ALLOCATION's bytes, which
-// is a separate change. This tail is the descriptor half of it, recorded now so the placement is
-// not lost from every capsule taken in the meantime. Pre-v57 files leave all five zero, read
-// everywhere as "not modelled".
+// The BYTES half landed separately (#3202) and needs NO format version of its own, which is worth
+// saying because the obvious reading is that it must. A tiled chain stores level zero last, so the
+// rest of the allocation lies below the address the descriptor names; `collect_intervals` now
+// extends that resource's captured range down to the allocation base, and the resource's existing
+// serialized `blob_offset` is then already the count of owned bytes preceding `gpu_addr`. Replay
+// publishes it as `ShaderResource::host_data_prefix_bytes` and the chain derivation accepts a
+// host-backed resource whose span covers the whole allocation. Nothing new is written to the file.
+//
+// A capsule taken BEFORE that change reads back with a `blob_offset` that does not reach the
+// allocation base, so the derivation declines and the capsule replays exactly as it always did --
+// one level, IMAGE_LOAD_MIP refused. That is the intended outcome: a capture that cannot express
+// the chain must keep declining visibly rather than fetching levels it does not own. Pre-v57 files
+// leave all five placement fields zero, read everywhere as "not modelled", and decline earlier
+// still.
 constexpr uint32_t kVersion = 57;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
@@ -887,10 +895,16 @@ bool capture_has_internal_gds_descriptor(const GpuCaptureFile& capture) {
     return false;
 }
 
+// `own_mip_chain_allocations` extends a materializable mip chain's range to the WHOLE guest
+// allocation (#3202). A tiled chain stores level zero last, so the other levels sit BELOW the
+// address the descriptor names and the ordinary per-resource range cannot reach them; without this
+// a capsule replays with a single-level image and gpu_replay declines IMAGE_LOAD_MIP. It is a
+// parameter rather than unconditional because it grows the capture, and a capture that fails is
+// worse than one that cannot study this one operation -- see the caller's fallback.
 bool collect_intervals(const std::vector<DrawItem>& draws,
                        const std::vector<ComputeItem>& computes,
                        const std::vector<GpuState::DmaCopy>& dma_copies,
-                       uint64_t resource_limit_bytes,
+                       uint64_t resource_limit_bytes, bool own_mip_chain_allocations,
                        std::vector<Interval>& intervals, std::string& error) {
     uint64_t total = 0;
     auto add_table = [&](const ShaderResourceTable* t,
@@ -953,6 +967,19 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                     return false;
                 }
                 intervals.push_back({r.gpu_addr, r.gpu_addr + n});
+                // The rest of a declared mip chain lives below gpu_addr. Own it too, so replay can
+                // materialize the same levels the live backend does. Merged with the range above,
+                // so an over-large or under-anchored span is skipped rather than made to fail: the
+                // capsule then replays exactly as it did before this change.
+                uint64_t chain_prefix = 0, chain_bytes = 0;
+                if (own_mip_chain_allocations &&
+                    prosper::gpu::shader_resource_compute_mip_chain_allocation(
+                        r, chain_prefix, chain_bytes) &&
+                    chain_prefix <= r.gpu_addr && chain_bytes <= max_blob_bytes() &&
+                    chain_bytes >= chain_prefix &&
+                    r.gpu_addr - chain_prefix <= std::numeric_limits<uint64_t>::max() - chain_bytes)
+                    intervals.push_back({r.gpu_addr - chain_prefix,
+                                         r.gpu_addr - chain_prefix + chain_bytes});
             }
             n = dcc_metadata_footprint(r);
             if (n) {
@@ -1070,6 +1097,7 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         // branch just as the scalar path has always done.
         c.resource.host_data = nullptr;
         c.resource.host_data_size = 0;
+        c.resource.host_data_prefix_bytes = 0;
         c.resource.dcc_metadata_host_data = nullptr;
         c.resource.dcc_metadata_host_data_size = 0;
         if (!include_resource_data)
@@ -2371,8 +2399,21 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             [](const auto& entry) { return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY"; }))
         out.metadata.renderer_env.emplace_back("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
     std::vector<Interval> intervals;
-    if (include_resource_data &&
-        !collect_intervals(draws, computes, dma_copies, resource_limit_bytes, intervals, error)) return false;
+    if (include_resource_data) {
+        // Prefer owning each materializable mip chain's whole allocation (#3202), but never let
+        // that extension be the reason a capture fails: it can only push the total over the
+        // resource budget, and a capsule that omits the chain still replays everything it always
+        // did. Retry without it and report THAT failure, so the error a user sees is the one they
+        // would have seen before this change.
+        std::string chain_error;
+        if (!collect_intervals(draws, computes, dma_copies, resource_limit_bytes,
+                               /*own_mip_chain_allocations=*/true, intervals, chain_error)) {
+            intervals.clear();
+            if (!collect_intervals(draws, computes, dma_copies, resource_limit_bytes,
+                                   /*own_mip_chain_allocations=*/false, intervals, error))
+                return false;
+        }
+    }
     for (auto& x : intervals) {
         GpuCaptureBlob b; b.guest_addr = x.begin; b.bytes.resize(static_cast<size_t>(x.end - x.begin), 0);
         b.bytes_read = std::min<uint64_t>(reader(x.begin, b.bytes.data(), b.bytes.size()), b.bytes.size());
@@ -5125,10 +5166,16 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     out.resource_instances.reserve(resource_reference_count * 2);
     std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
     std::map<uint32_t, size_t> internal_instance_by_binding;
+    // `prefix_bytes`, when supplied, receives how many bytes of the SAME allocation precede
+    // `guest_addr` inside this blob. That is exactly `blob_offset`: a blob's byte i is the guest
+    // byte at `blob.guest_addr + i` by construction (`collect_intervals` merges ranges and reads
+    // them contiguously, and blob dedup only shares byte-identical content), so the bytes before
+    // the resource's own address really are the guest's bytes at those addresses. A tiled mip
+    // chain needs them -- it stores level zero last (#3202).
     auto bind_range = [&](uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
                           uint64_t need, uint8_t*& host_data, uint64_t& host_data_size,
                           const char* invalid_error, const char* exceeds_error,
-                          const char* offset_error) {
+                          const char* offset_error, uint64_t* prefix_bytes = nullptr) {
         if (blob_index == 0xFFFFFFFFu) return true;
         if (blob_index >= out.blobs.size() || blob_offset > out.blobs[blob_index].bytes.size()) {
             error = invalid_error; return false;
@@ -5144,6 +5191,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         auto& instance = out.resource_instances[it->second].bytes;
         host_data = instance.data() + blob_offset;
         host_data_size = need;
+        if (prefix_bytes) *prefix_bytes = blob_offset;
         return true;
     };
     auto table = [&](const GpuCapturedTable& src, bool allow_packed_pointer,
@@ -5152,6 +5200,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         dst = std::make_shared<ShaderResourceTable>();
         for (const auto& x : src.resources) {
             ShaderResource r = x.resource; r.host_data = nullptr; r.host_data_size = 0;
+            r.host_data_prefix_bytes = 0;
             for (ShaderBufferTableEntry& entry : r.table_entries) {
                 entry.host_data = nullptr;
                 entry.host_data_size = 0;
@@ -5237,7 +5286,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                             r.host_data, r.host_data_size,
                             "resource references an invalid capture blob",
                             "resource footprint exceeds capture blob",
-                            "resource blob offset exceeds its logical address")) return false;
+                            "resource blob offset exceeds its logical address",
+                            &r.host_data_prefix_bytes)) return false;
             if (!bind_range(x.metadata_blob_index, x.metadata_blob_offset, r.metadata_addr,
                             x.metadata_size, r.dcc_metadata_host_data,
                             r.dcc_metadata_host_data_size,
