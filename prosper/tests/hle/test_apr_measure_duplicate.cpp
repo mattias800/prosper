@@ -1,26 +1,34 @@
 // test_apr_measure_duplicate — sceAmprMeasureCommandSizeReadFile's compatibility read (#3245).
 //
 // That call's firmware contract is pure sizing (20, or 24 for a wide file offset). prosper also
-// performs the described read, because DOLL's older SDK wrapper consumes the destination from the
-// measure and never records a ReadFile for it. The read used to fire for EVERY title whose file id
-// resolved, so a title that also submits the read normally paid for the same bytes twice — 13,925
-// duplicate reads and 582 MB in a 3-minute Stray boot — and got them written into its destination
-// before it had recorded the command.
+// performs the described read, on the recorded grounds that an older SDK wrapper consumes the
+// destination from the measure and never records a ReadFile for it. The read used to fire for EVERY
+// title whose file id resolved, so a title that also submits the read normally paid for the same
+// bytes twice — 13,925 duplicate reads and 582 MB in a 3-minute Stray boot — and got them written
+// into its destination before it had recorded the command.
 //
-// The two arms this has to keep apart cannot be told apart AT the measure call: both pass a valid
-// id, a real destination and a real size. What separates them is what happens next, so that is what
-// the suppression keys on, and that is what the cases below drive:
+// The two patterns this has to keep apart cannot be told apart AT the measure call: both pass a
+// valid id, a real destination and a real size. What separates them is what happens next, so that
+// is what the suppression keys on, and that is what the cases below drive:
 //
-//   * DOLL:  measure -> (the guest consumes dst) -> no submit of that read.   Must still deliver.
-//   * Stray: measure -> submit of the IDENTICAL read.                          Redundant from then on.
+//   * consume-from-the-measure: measure -> guest reads dst -> no submit.  Must still deliver.
+//   * submit-what-it-measures:  measure -> submit of the IDENTICAL read.  Redundant from then on.
+//
+// The arms are named after the PATTERNS, not after titles, and deliberately so. An earlier version
+// called the first one "the DOLL arm" — but replaying the pairing predicate over four of DOLL's own
+// PROSPER_FILELOG boots shows DOLL pairs at submit #13 and has ZERO measured reads lacking an
+// identical submit, i.e. DOLL is the SECOND pattern. Both titles this work is about turn out to be
+// the second pattern; the first is the shape the suppression must never break if a title has it,
+// which is a claim about the mechanism and not about anybody's traffic.
 //
 // Every delivery assertion pre-poisons the destination with a byte the fixture cannot produce at
 // that offset, so "the callee wrote nothing" and "the callee wrote the right thing" are distinct
 // observations rather than both reading as zero.
 //
-// Registered TWICE in CMake: once by default and once with PROSPER_APR_MEASURE_READ=always. The
-// second run asserts the OPPOSITE outcome for the Stray case, which is what shows the lever moved —
-// a suppression that never suppressed would pass the always-run and fail the default one.
+// Registered THREE times in CMake — default, PROSPER_APR_MEASURE_READ=always, and =never. The
+// always-run asserts the OPPOSITE outcome for the submit-what-it-measures case, which is what shows
+// the lever moved: a suppression that never suppressed would pass the always-run and fail the
+// default one. The never-run covers the third mode, which nothing else executes.
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +45,7 @@
 namespace prosper {
 uint32_t prosper_apr_register(const std::string& path, uint64_t size);
 void prosper_apr_reset_for_test();
+bool prosper_apr_mixed_pattern_warned_for_test();
 }
 using namespace prosper;
 
@@ -69,6 +78,7 @@ struct Dest {
 int main() {
     const char* mode_env = std::getenv("PROSPER_APR_MEASURE_READ");
     const bool forced_always = mode_env && std::strcmp(mode_env, "always") == 0;
+    const bool forced_never  = mode_env && std::strcmp(mode_env, "never") == 0;
     std::printf("== test_apr_measure_duplicate (PROSPER_APR_MEASURE_READ=%s) ==\n",
                 mode_env ? mode_env : "<unset, auto>");
     register_builtin_hle();
@@ -114,19 +124,42 @@ int main() {
     CHECK(measure(0, 0, 0, 0xffffffffffull, 0, 0) == 24,
           "a wide file offset answers 24 bytes");
 
-    // ---- DOLL arm: a measure with no following submit still delivers ---------------------------
+    // ---- Unsubmitted-measure arm: a measure with no following submit still delivers -------------
+    // This is a MECHANISM arm and is deliberately not named after a title. It used to be called the
+    // "DOLL arm", which claimed authority it had not earned: replaying the pairing predicate over
+    // four of DOLL's own PROSPER_FILELOG boots shows DOLL pairs at submit #13 and is a
+    // submits-everything-it-measures title (0 unmatched measures across all four runs), not the
+    // consume-from-the-measure shape this arm models. The shape is still the one the suppression
+    // must never break, whichever title turns out to have it.
+    //
     // Driven twice. The second call is the one that matters: if the suppression latched on anything
-    // other than an actual submit pairing, this is where DOLL breaks.
+    // other than an actual submit pairing, this is where it breaks.
     constexpr size_t doll_off = 64, doll_size = 96;
     Dest doll1, doll2;
     doll1.poison();
-    CHECK(measure(id_a, doll1.addr(), doll_size, doll_off, 0, 0) == 20 &&
-              doll1.holds(doll_off, doll_size),
-          "DOLL arm: a measure with no submit delivers the container's bytes");
-    doll2.poison();
-    CHECK(measure(id_a, doll2.addr(), doll_size, doll_off + 128, 0, 0) == 20 &&
-              doll2.holds(doll_off + 128, doll_size),
-          "DOLL arm: a SECOND unsubmitted measure still delivers (no spurious latch)");
+    const uint64_t first_measure = measure(id_a, doll1.addr(), doll_size, doll_off, 0, 0);
+    if (forced_never) {
+        CHECK(first_measure == 20 && doll1.untouched(doll_size),
+              "PROSPER_APR_MEASURE_READ=never: the compatibility read never fires");
+    } else {
+        CHECK(first_measure == 20 && doll1.holds(doll_off, doll_size),
+              "unsubmitted-measure arm: a measure with no submit delivers the container's bytes");
+        doll2.poison();
+        CHECK(measure(id_a, doll2.addr(), doll_size, doll_off + 128, 0, 0) == 20 &&
+                  doll2.holds(doll_off + 128, doll_size),
+              "unsubmitted-measure arm: a SECOND unsubmitted measure still delivers (no spurious latch)");
+    }
+    if (forced_never) {
+        // The rest of the file drives the pairing latch, which `never` bypasses entirely. Its one
+        // contract -- the read never happens, the sizing answer is still right -- is asserted above.
+        CHECK(measure(0, 0, 0, 0xffffffffffull, 0, 0) == 24,
+              "PROSPER_APR_MEASURE_READ=never: the sizing answer is still the contract");
+        prosper_apr_reset_for_test();
+        std::remove(path_a_storage.c_str());
+        std::remove(path_b_storage.c_str());
+        std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
+        return fails ? 1 : 0;
+    }
 
     // ---- A submit that does NOT match the measured read must not latch either -------------------
     // Same container, same destination, a different range. If the pairing were keyed loosely -- on
@@ -188,6 +221,51 @@ int main() {
               "a DIFFERENT container keeps its compatibility read after the first one paired");
     }
 
+    // ---- The detector: the one case this heuristic gets wrong must announce itself ---------------
+    // The suppression's DECISION is loud, but its CONSEQUENCE would be silent -- a container that
+    // mixes submitted and unsubmitted measured reads gets an unwritten destination and, without
+    // this, no message. So a suppressed measure that leaves the ring having never been claimed by a
+    // submit warns once, loudly. Both arms are needed: the designed case must stay quiet, or the
+    // warning is noise that will be ignored the one time it matters.
+    //
+    // Ring is 64 entries, so more than that many suppressed records are needed to evict the first.
+    constexpr size_t kRing = 64, kEvict = kRing + 8;
+    {
+        // Arm A -- the DESIGNED case: suppressed measures that ARE each submitted. Must not warn.
+        CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+              "detector: quiet before any suppressed measure goes unclaimed");
+        Dest d;
+        for (size_t i = 0; i < kEvict; ++i) {
+            const size_t off = 2048 + i * 4, size = 32;
+            d.poison();
+            measure(id_a, d.addr(), size, off, 0, 0);
+            read_file_guest(cb, 0, record, id_a, d.addr(), size, off, 0, 0);
+        }
+        CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+              "detector: stays quiet when every suppressed measure is duly submitted");
+    }
+    {
+        // Arm B -- the MIXED pattern: suppressed measures that are never submitted. Must warn.
+        //
+        // Under PROSPER_APR_MEASURE_READ=always the correct outcome INVERTS, and that is the point
+        // rather than an exemption: nothing is suppressed in that mode, so no measure can be lost
+        // and the detector must stay silent. A detector that fired here would be reporting a
+        // data-loss event on a run where every byte was delivered -- the false positive that would
+        // teach the next reader to ignore the warning.
+        Dest d;
+        for (size_t i = 0; i < kEvict; ++i) {
+            d.poison();
+            measure(id_a, d.addr(), 32, 2560 + i * 4, 0, 0);
+        }
+        if (forced_always) {
+            CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+                  "detector: cannot false-positive under =always, where nothing is suppressed");
+        } else {
+            CHECK(prosper_apr_mixed_pattern_warned_for_test(),
+                  "detector: warns when a suppressed measure is never submitted (the mixed pattern)");
+        }
+    }
+
     // ---- The test hook really does clear the latch ----------------------------------------------
     // Without this, a later case in this process would inherit id_a's pairing, and the arms above
     // would be order-dependent in a way nothing would report.
@@ -199,6 +277,8 @@ int main() {
         CHECK(measure(id_again, reset_dest.addr(), doll_size, doll_off, 0, 0) == 20 &&
                   reset_dest.holds(doll_off, doll_size),
               "prosper_apr_reset_for_test clears the pairing latch as well as the registry");
+        CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+              "prosper_apr_reset_for_test clears the detector's once-only latch too");
     }
 
     prosper_apr_reset_for_test();

@@ -1595,6 +1595,9 @@ if(TARGET prosper_core)
   add_test(NAME apr_measure_duplicate_forced COMMAND test_apr_measure_duplicate)
   set_tests_properties(apr_measure_duplicate_forced PROPERTIES
                        ENVIRONMENT "PROSPER_APR_MEASURE_READ=always")
+  add_test(NAME apr_measure_duplicate_never COMMAND test_apr_measure_duplicate)
+  set_tests_properties(apr_measure_duplicate_never PROPERTIES
+                       ENVIRONMENT "PROSPER_APR_MEASURE_READ=never")
 
   add_executable(test_ampr_measure tests/hle/test_ampr_measure.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.

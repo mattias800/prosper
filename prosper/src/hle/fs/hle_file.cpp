@@ -2346,26 +2346,57 @@ extern "C" void prosper_apr_chain_reset(uint64_t cb) {
 // same argument shape. It IS visible immediately afterwards -- if a submit arrives for exactly the
 // (file id, dst, offset, size) a measure just described, that title records and submits its
 // measured reads, so the compatibility read was redundant. That is self-calibrating: it costs one
-// duplicate per APR file id and then turns itself off, needs no per-title or per-SDK knowledge, and
-// cannot fire for DOLL, whose measured reads are never submitted through the ReadFile NID -- if
-// they were, prosper would already have served them eagerly there and the compatibility read would
-// never have been needed.
+// duplicate per APR file id and then turns itself off, and needs no per-title or per-SDK knowledge.
+//
+// DOLL IS NOT EXEMPT FROM THIS, and an earlier version of this comment claimed it was -- "cannot
+// fire for DOLL, whose measured reads are never submitted through the ReadFile NID". That is
+// FALSE, and DOLL's own PROSPER_FILELOG boots say so. Replaying this exact predicate over four of
+// them: container id=6 pairs at submit #13 in every run, and from there 1,253 / 1,254 / 1,724 /
+// 1,731 of each run's compatibility reads are suppressed.
+//
+// The same replay is why the suppression is nonetheless SAFE for DOLL -- for the opposite reason to
+// the one that was asserted. Asking whether any measured read lacks an identical submit ANYWHERE in
+// the log, which is precisely the mixed pattern that would break:
+//
+//     run1  1,254 measures  1,254 matched  0 unmatched
+//     run2  1,255           1,255          0
+//     run3  1,725           1,725          0
+//     run4  1,732           1,732          0
+//
+// DOLL submits everything it measures, so when the heuristic fires on it, it is right. Stray is the
+// same shape (id=1 pairs at submit #4; 13,922 of 13,923 suppressed; 0 unmatched over three logs).
+//
+// The consequence is worth stating rather than burying: the documented reason this read exists --
+// an older SDK wrapper that consumes the destination while prosper does not execute the encoded
+// commands -- IS NO LONGER VISIBLE in DOLL's traffic. prosper serves the ReadFile submit eagerly
+// now, and DOLL does submit. Whether the read is needed at all is what PROSPER_APR_MEASURE_READ=never
+// tests; removing it is not this change's job, but re-asserting a premise its own evidence
+// contradicts would have been a defect.
 //
 // Keyed per APR FILE ID rather than globally so a title with a mixed pattern loses the
 // compatibility read only for the container that demonstrated the pairing.
 // CONFIDENCE: HIGH on the duplication (measured, #3245) and on the suppression being safe for any
-// title whose measured reads are submitted. MED that no title mixes both patterns within one
-// container -- that is the one case this heuristic would get wrong, it cannot be checked without
-// running such a title, and PROSPER_APR_MEASURE_READ=always is the one-variable A/B if a title ever
-// regresses. `never` exists for the opposite arm (does a title depend on the read at all?).
+// title whose measured reads are submitted -- which now includes DOLL and Stray by replay, 0
+// unmatched measures across seven logs and two titles. MED that no title mixes both patterns within
+// one container: two titles is not the corpus, and a log replay cannot see what a title does with
+// bytes that arrive at submit time rather than measure time. The mixed pattern is DETECTED rather
+// than merely feared -- see apr_measure_note_unmatched below -- and PROSPER_APR_MEASURE_READ=always
+// is the one-variable A/B if a title ever regresses. `never` is the opposite arm (does any title
+// still depend on this read at all?).
 namespace {
-struct AprMeasuredRead { uint32_t id; uint64_t dst, offset, size; };
+struct AprMeasuredRead {
+    uint32_t id; uint64_t dst, offset, size;
+    bool live = false;        // this slot has been written since the last reset
+    bool suppressed = false;  // recorded AFTER the container paired, i.e. its read was skipped
+    bool matched = false;     // a submit for exactly this tuple has since arrived
+};
 PROSPER_HEAP_MUTEX(g_apr_measure_mx);
 constexpr size_t kAprMeasureRingMax = 64;   // only the IMMEDIATE pairing matters; Stray's is adjacent
 std::array<AprMeasuredRead, kAprMeasureRingMax> g_apr_recent_measures{};
 size_t g_apr_recent_measures_used = 0;      // grows to kAprMeasureRingMax, then the ring wraps
 size_t g_apr_recent_measures_next = 0;
 std::map<uint32_t, bool> g_apr_measure_paired;   // file id -> a submit matched one of its measures
+bool g_apr_mixed_pattern_warned = false;         // the detector below fires at most once
 
 // auto (default) = the latch above; always = never suppress; never = never do the compatibility
 // read. Read once: an env lookup per streamed asset is itself a cost on this path.
@@ -2387,9 +2418,16 @@ AprMeasureMode apr_measure_mode() {
 
 static void apr_measure_reset_for_test() {
     std::lock_guard lk(g_apr_measure_mx);
+    g_apr_recent_measures.fill(AprMeasuredRead{});
     g_apr_recent_measures_used = 0;
     g_apr_recent_measures_next = 0;
     g_apr_measure_paired.clear();
+    g_apr_mixed_pattern_warned = false;
+}
+// Test seam for the detector below: has the mixed-pattern warning fired?
+bool prosper_apr_mixed_pattern_warned_for_test() {
+    std::lock_guard lk(g_apr_measure_mx);
+    return g_apr_mixed_pattern_warned;
 }
 
 // True when this container's measured reads have been shown to arrive again through the submit
@@ -2405,10 +2443,45 @@ static bool apr_measure_read_suppressed(uint32_t id) {
     return it != g_apr_measure_paired.end() && it->second;
 }
 
-// Remember a read the measure path just served, so a matching submit can identify the pairing.
-static void apr_measure_record(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
+// Remember a measured read, so a matching submit can identify the pairing -- and so the ONE case
+// this heuristic gets wrong can announce itself.
+//
+// THE DETECTOR. The suppression's decision is loud (one unconditional line per container) but its
+// consequence would otherwise be silent: a title that mixes both patterns within one container gets
+// an unwritten destination and no message, because the suppressed-measure log line sits behind
+// filelog(). PROSPER_APR_MEASURE_READ=always is a recovery, not a detector -- it only helps someone
+// who already suspects this.
+//
+// So recording CONTINUES after a container pairs (the read is skipped; only the bookkeeping stays),
+// every entry carries whether a submit later claimed it, and an entry that leaves the ring having
+// been suppressed AND never matched is warned about, once, loudly. Nothing else produces that
+// signature: a pre-pairing entry ages out unmatched all the time and is not suppressed, and a
+// suppressed entry that a submit claimed is the designed case. Keeping the scan alive after pairing
+// costs a 64-entry compare per submit -- ~900k integer comparisons across a 3-minute Stray boot,
+// which is not measurable next to the 583 MB of file I/O this removes.
+//
+// Known blind spot, stated rather than left to be discovered: up to kAprMeasureRingMax entries are
+// still in the ring when the process exits and are never adjudicated, so a title that mixes the two
+// patterns FEWER than 64 measures before quitting would not warn.
+static void apr_measure_warn_mixed_locked(const AprMeasuredRead& lost) {
+    if (g_apr_mixed_pattern_warned) return;
+    g_apr_mixed_pattern_warned = true;
+    fprintf(stderr,
+            "[apr] WARNING: sceAmprMeasureCommandSizeReadFile's compatibility read was suppressed "
+            "for APR container id=%u, but the read (dst=0x%llx off=0x%llx size=%llu) was never "
+            "submitted -- so those bytes were never delivered. This container mixes measured reads "
+            "it submits with measured reads it consumes directly, which is the one pattern the "
+            "suppression gets wrong (#3245). Re-run with PROSPER_APR_MEASURE_READ=always to restore "
+            "the old behaviour, and please report the title. Further occurrences are silent.\n",
+            lost.id, (unsigned long long)lost.dst, (unsigned long long)lost.offset,
+            (unsigned long long)lost.size);
+}
+static void apr_measure_record(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size,
+                               bool suppressed) {
     std::lock_guard lk(g_apr_measure_mx);
-    g_apr_recent_measures[g_apr_recent_measures_next] = AprMeasuredRead{ id, dst, offset, size };
+    AprMeasuredRead& slot = g_apr_recent_measures[g_apr_recent_measures_next];
+    if (slot.live && slot.suppressed && !slot.matched) apr_measure_warn_mixed_locked(slot);
+    slot = AprMeasuredRead{ id, dst, offset, size, /*live=*/true, suppressed, /*matched=*/false };
     g_apr_recent_measures_next = (g_apr_recent_measures_next + 1) % kAprMeasureRingMax;
     if (g_apr_recent_measures_used < kAprMeasureRingMax) g_apr_recent_measures_used++;
 }
@@ -2419,14 +2492,14 @@ static void apr_measure_record(uint32_t id, uint64_t dst, uint64_t offset, uint6
 static bool apr_measure_note_submit(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
     if (apr_measure_mode() != AprMeasureMode::Auto) return false;
     std::lock_guard lk(g_apr_measure_mx);
-    // Already paired: the ring holds nothing for this container any more (its measures stop
-    // recording once suppressed), so skip the scan. This runs on EVERY submit -- 14,255 of them in
-    // a 3-minute Stray boot -- and after the first pairing it is the only case left.
-    if (auto it = g_apr_measure_paired.find(id); it != g_apr_measure_paired.end() && it->second)
-        return false;
+    // The scan deliberately continues after a container has paired: marking the entry is what lets
+    // the detector in apr_measure_record tell "suppressed and never submitted" from "suppressed and
+    // duly submitted". An early-out here would make the mixed pattern undetectable, which is the
+    // whole failure mode this heuristic has.
     for (size_t i = 0; i < g_apr_recent_measures_used; i++) {
-        const AprMeasuredRead& m = g_apr_recent_measures[i];
-        if (m.id != id || m.dst != dst || m.offset != offset || m.size != size) continue;
+        AprMeasuredRead& m = g_apr_recent_measures[i];
+        if (!m.live || m.id != id || m.dst != dst || m.offset != offset || m.size != size) continue;
+        m.matched = true;
         bool& paired = g_apr_measure_paired[id];
         const bool first = !paired;
         paired = true;
@@ -4157,6 +4230,10 @@ HLE(f_apr_measure_read_file) {
     // and would deliver them BEFORE the guest recorded the command. The sizing answer is unchanged;
     // only the read is dropped. See the block beside apr_measure_read_suppressed.
     if (apr_measure_read_suppressed((uint32_t)a0)) {
+        // Record it anyway. The read is skipped; the bookkeeping is what lets a suppressed measure
+        // that NO submit ever claims be detected and warned about rather than silently losing its
+        // bytes (see apr_measure_record's detector).
+        apr_measure_record((uint32_t)a0, a1, a3, a2, /*suppressed=*/true);
         if (filelog())
             fprintf(stderr, "[apr] measure-read id=%llu %s -> %llu bytes (compatibility read "
                             "suppressed: this container submits its measured reads)\n",
@@ -4212,7 +4289,7 @@ HLE(f_apr_measure_read_file) {
     // Record what was delivered, so a submit of the identical read can identify the pairing and
     // retire this container's compatibility read (#3245). Recorded only on a read that actually
     // landed: a failed one has not made the submit redundant.
-    if (copied) apr_measure_record((uint32_t)a0, a1, a3, a2);
+    if (copied) apr_measure_record((uint32_t)a0, a1, a3, a2, /*suppressed=*/false);
     if (filelog())
         fprintf(stderr, "[apr] measure-read compatibility id=%llu %s -> dst=0x%llx "
                         "off=0x%llx size=%llu %s; measured=%llu\n",
