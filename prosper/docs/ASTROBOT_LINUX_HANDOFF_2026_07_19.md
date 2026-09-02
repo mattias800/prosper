@@ -863,10 +863,150 @@ producing pass never populated -- not whether the recompiled control flow is rig
 Filed as #3214. The trip bound is a diagnostic and is **not** a fix: it truncates guest
 control flow and the world map still shows only its nebula backdrop (#1459) with it armed.
 
+## The light-list arena prosper hands that pixel shader is ENTIRELY ZERO (2026-09-02)
+
+Measured on master `bbf84773` plus `PROSPER_DRAW_LINKSCAN` (this work), with `tools/screenshot`,
+native 3840x2160, no pad script, `PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`,
+`--seconds 30 --count 5 --timeout 170`. See #3214.
+
+#3193 named the hanging draw and the section above named the loop: a per-tile light-list walk at
+guest pc 1911..2538 in the pixel program `0x5008f1400`, whose only exit is `link == 0xffffffff`.
+This is the cause, and it is upstream of the shader entirely.
+
+**Both buffers that walk reads contain nothing but zeros.** Censused from the exact dwords prosper
+uploads -- not from guest memory -- at the FIRST draw of that program, and again on five later
+draws:
+
+| PS binding | guest addr | declared | uploaded | zero dwords | terminator dwords | other |
+| --- | --- | --- | --- | --- | --- | --- |
+| 44 (tile heads) | `0x553ba3a50` | 129,600 B | 32,400 dw | **32,400** | 0 | 0 |
+| 45 (light records) | `0x551be0000` | 33,177,600 B | 8,294,400 dw | **8,294,400** | 0 | 0 |
+
+32,400 dwords is exactly `3840/16 x 2160/16` screen tiles, so binding 44 is the head table the walk
+starts from and binding 45 is the record pool it chases. Both addresses reproduce EXACTLY across two
+independent runs, so the allocation is deterministic and this is not a torn read.
+
+**Why an all-zero arena is a non-terminating walk rather than an empty scene.** `bounded_cbuf_load`
+returns architectural zero out of range, faithfully -- but this walk's terminator is `0xffffffff`,
+so **zero is a valid link**. Every tile head is 0, so every invocation starts at record 0; record 0's
+successor dword is 0; so the walk is a one-node self-loop that nothing inside the shader can end. The
+census says exactly that: `terminating=0 cyclic=4147200 cycle-nodes=1`, and the single cycle member
+is `link=0 -> next=0`. There is no ring to find and no corrupted chain -- the pool is simply empty,
+and an empty pool of this shape is an INFINITE list, not a zero-length one.
+
+**Nothing ever wrote either range.** With `PROSPER_WRITER_PROVENANCE=1` armed, every scan reports
+`last writer NONE` for both ranges, against a history holding 1,127 distinct ranges -- far below its
+65,536-event cap, so nothing was evicted -- and a recorder summary showing all four recorders firing
+heavily: `color=90 compute-buffer=36667 dma-data=14280 write-data=57661`. The negative is therefore
+about the guest, not about the instrument. Read it with `writer_provenance.hpp`'s scope list: guest
+CPU stores are invisible to all four recorders, and a SKIPPED compute dispatch records nothing
+however the switches are set.
+
+**What this settles among #3214's four candidates.** (1) and (2) cannot be the cause and (4) is
+false in the sense that mattered; (3) -- the list was never populated -- is what is left, and it is
+now measured rather than suspected. The four `## Ruled out` rows below carry the evidence.
+
+**The producer, and why it never ran.** `PROSPER_COMPUTE_BINDS=551be0000,553ba3a50` names it in one
+run:
+
+```
+[compute-binds] 0x551be0000 bound by program=0x5006e8500 binding=14 class=0 ... outcome=skipped-descriptors
+[compute-binds] 0x553ba3a50 bound by program=0x5006e8500 binding=20 class=0 ... outcome=skipped-descriptors
+```
+
+`0x5006e8500` is a 240x135x1 dispatch at 8x8 local size -- one workgroup per screen tile -- and it
+binds both halves of the arena. `PROSPER_COMPUTE_PROGRAM_CENSUS=1` gives the ratio the once-per-program
+skip line cannot: **executed=0, skipped=918.** It has never run, on any boot.
+
+The reason is one line, and it is prosper's:
+
+```
+[compute] skip invalid descriptor contract for program 0x5006e8500
+[compute-descriptor] missing runtime binding binding=127 expected=storage-buffer actual=unknown ...
+```
+
+Binding 127 is `kComputeInternalGdsBinding`. The recompiler HARD-CODES it whenever a program touches
+GDS (`declare_internal_gds`), so it is part of the emitted module's ABI -- and
+`assign_convention_bindings` was renumbering every resource in the table, the internal GDS buffer
+included. The module therefore declared set 0 binding 127 while the table carried that buffer at some
+sequential number, the descriptor-contract check correctly rejected the pair, and the dispatch was
+declined. `0x5006e8500` uses `ds_append` with GDS=1 (six `0xd8fa...` packets, exactly the encoding
+`rdna2_decode.cpp` documents) to build the per-tile lists, so it could never survive that check.
+
+Five programs are declined this way on every Astro Bot boot: `0x5006e8500`, `0x5006eac00`,
+`0x5006eb500`, `0x5006ec700`, `0x500702f00` -- all five with the same `binding=127` issue.
+
+**The gap was already known and was patched one instance at a time.** The trip-bound witness needs the
+same binding-127 resource, and its injection sits AFTER `assign_convention_bindings`, at table
+finalization, with a comment describing this exact symptom ("the emitted module declared binding 127
+while the table did not carry it"). That fixed the witness. The guest's own GDS buffer is pushed
+beside the `uses_gds` test, upstream of the renumber, and was never fixed.
+
+**With the reserved binding preserved:** zero `skip invalid descriptor contract` lines, `0x5006e8500`
+executes, and the world-map GPU reset does not happen.
+
+| arm | `[compute] skip invalid descriptor contract` | `0x5006e8500` | GRAPHICS submission failures | pixel-distinct | max pixel stale |
+| --- | --- | --- | --- | --- | --- |
+| control (master `bbf84773`) | 5 programs | executed 0 / skipped 918 | 65 | 3 / 5 | 60.0 s |
+| control, replication | 5 programs | -- | 62 | 3 / 5 | 60.0 s |
+| control, replication | 5 programs | executed 0 / skipped 918 | 57 | 2 / 5 | 60.0 s |
+| **with the fix** | **0** | **executes** | **0** | **4 / 5** | **30.0 s** |
+
+And the arena the census found empty is now a correctly built per-tile light list. Same instrument,
+same encoding, four scans:
+
+| PS binding | zero dwords | terminator dwords | other | self-walk |
+| --- | --- | --- | --- | --- |
+| 44 (tile heads), before | 32,400 | 0 | 0 | `terminating=0 cyclic=16200` |
+| 44 (tile heads), after | **0** | 0 | **32,400** | heads, values `0x2..0x17baf` |
+| 45 (light records), before | 8,294,400 | 0 | 0 | `terminating=0 cyclic=4147200` |
+| 45 (light records), after | 8,100,001 | **32,400** | 161,999 | **`terminating=4147200 cyclic=0`**, longest chain 3 |
+
+Exactly 32,400 terminator dwords in the record pool -- one per screen tile -- so every tile's list
+ends where the shader looks for it. Every record now terminates and none is cyclic. (The self-walk of
+binding 44 still reports `cyclic`, correctly: a head TABLE is not a record pool, and its
+`oob-starts=16200` says the interpretation does not apply. Read the histogram for that buffer, not
+the walk.)
+
+**What is NOT fixed.** The world map renders and animates for the whole run, but geometry is blown
+out to white in places and the lighting is not right yet -- see `BLOG.md`'s 2026-09-02 entry for the
+frames. The run is also much slower (2.2 fps against the control's pre-loss rate), which is expected
+in direction -- five previously-declined dispatch families now do real work, one of them 240x135x64
+threads -- but the magnitude is unmeasured. And one compute program is still declined,
+`0x500571000` (executed 0 / skipped 239, 1x1x1 groups at 16x16 local); it does not appear in any
+control run's census, so it is reached only now that the earlier passes run.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
+
+- **"The tile index is wrong -- `v5` does not carry what the guest expects, so the head lookup lands
+  outside the 32,400-dword tile buffer or on the wrong tile."** Cannot be the cause of the
+  non-termination, whatever `v5` carries. All 32,400 head dwords are zero (`PROSPER_DRAW_LINKSCAN`,
+  six scans across two runs), so no index selects a terminator and every index selects the same
+  self-loop at record 0. An index defect would have to make a correct head wrong; there are no
+  correct heads. #3214, 2026-09-02.
+
+- **"A descriptor is mis-resolved -- the tile buffer or the record buffer resolves with the wrong
+  base or `num_records`, so in-range guest indices clamp."** False for `num_records` and for
+  truncation: both descriptors resolve at exactly their declared sizes (129,600 and 33,177,600
+  bytes), the upload is not short (`declared == uploaded_dw * 4`, and no `[buffer-truncated]` line
+  appears), and **no walk left the buffer at all** -- `oob-starts=0` on every scan of both bindings.
+  A clamp cannot explain a runaway when nothing clamps. The two allocations are also adjacent and
+  reproduce byte-identically across runs, which is what a real light-list arena looks like. #3214,
+  2026-09-02.
+
+- **"The guest's list is genuinely cyclic in prosper's copy, as GTA V's `0x413dc6700` was."** False
+  in the sense the GTA V precedent means. There is no ring: `cycle-nodes=1`, and the single member is
+  `link=0 -> next=0`, the degenerate self-loop that an all-zero pool produces by construction. The
+  arithmetic is the same -- the walk never terminates -- but the cause is an unwritten buffer, not a
+  corrupted chain, and only the second has a producer to go and fix. #3214, 2026-09-02.
+
+- **"A trip bound on the pc-1911 walk is a candidate fix."** It is not, and the reason is now
+  concrete rather than a general objection to truncating guest control flow: the shader is being
+  handed no lights at all, so a bounded walk renders the same absent lighting as an unbounded one,
+  only without the device loss. #3214, 2026-09-02.
 
 - **"The world-map GPU reset is caused by the vertex program `0x5008efd00`."** False, and #3193 said
   in its own caveats that the draw-level A/B could not separate the draw's two stages. The vertex

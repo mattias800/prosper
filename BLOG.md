@@ -21,6 +21,33 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### Astro Bot's world map is lit, and no longer takes the GPU down with it
+
+The world map now renders and keeps animating for the whole run, where before it froze on a white
+screen a minute in — that freeze was a RADV device reset, and it is gone (0 submission failures
+against 65, 62 and 57 on three control runs).
+
+![Astro Bot at 3840x2160, the world map 90 s into a default launch: a deep-space field of stars and drifting pale-blue shards, light shafts crossing the frame, coloured confetti and green fragments down the left edge, all of it animating](assets/screenshots/astro-bot-worldmap-lit.png)
+
+![The same run at 150 s: the camera has moved, a large white-and-red framed panel now fills the lower half and the starfield continues behind it -- the frame is still changing, not frozen](assets/screenshots/astro-bot-worldmap-lit-later.png)
+
+This is what the same route showed before, at the same moment — the frozen frame after the reset:
+
+![The control run at 150 s: a completely white frame. The GPU was reset at around 75 s and every frame after it is this same picture](assets/screenshots/astro-bot-worldmap-device-reset-frozen.png)
+
+The cause was one line of binding policy. When a guest compute program uses GDS, the recompiler
+hard-codes descriptor binding 127 for it — but prosper's binding assignment renumbered every
+resource in the table, that one included, so the emitted shader asked for binding 127 and the
+runtime table no longer had it. The descriptor check correctly refused the pair and the dispatch was
+declined, every time, for the life of the process. Five of Astro Bot's compute programs were
+disabled that way on every boot, one of them the pass that builds the per-tile light lists — so the
+world-map pixel shader was handed an arena of nothing but zeros, and because its walk stops on
+`0xffffffff` rather than on zero, an empty list is an infinite one. The shader looped until the
+driver killed the device. [#3214](https://github.com/mattias800/prosper/issues/3214)
+
+The geometry is blown out white in places and the lighting is not yet right — that is the next thing.
+
+
 ### Astro Bot's world-map GPU hang is one loop in the pixel shader, and we can now point at it
 
 No picture: the world map still renders only the nebula backdrop. What is new is that the hang has

@@ -4,6 +4,7 @@
 // descriptor types at one binding -> layout-creation failure, the draw disappears (#157). Constant/
 // vertex buffers are assigned first (2/3+), matching the common cbufs-first shaders byte-for-byte.
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"   // kComputeInternalGdsBinding
 #include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -228,6 +229,50 @@ int main() {
         CHECK(select(sizeless, kBase + 1) == 0, "a size-0 resource spans exactly one byte");
         ShaderResource unbased = sampled; unbased.gpu_addr = 0;
         CHECK(select(unbased, kBase) == 0, "a resource with no guest base never matches");
+    }
+
+    // THE RESERVED INTERNAL GDS BINDING (#3214). The recompiler hard-codes
+    // kComputeInternalGdsBinding when a program touches GDS, so it is part of the emitted module's
+    // ABI and this policy must not renumber it. When it did, the module declared set 0 binding 127
+    // while the table carried that buffer elsewhere, the descriptor contract rejected the pair, and
+    // EVERY GDS-using compute dispatch in the title was declined for the life of the process --
+    // which on Astro Bot left the world-map light-list arena unwritten and hung the GPU.
+    {
+        ShaderResourceTable t;
+        ShaderResource gds = res(RC::ConstantBuffer);
+        gds.binding = kComputeInternalGdsBinding;
+        // Deliberately LAST, which is where the executor pushes it, and deliberately a
+        // ConstantBuffer, which is the class the first assignment loop claims.
+        t.resources = { res(RC::ConstantBuffer), res(RC::Texture), gds };
+        assign_convention_bindings(t, 2);
+        CHECK(t.resources[2].binding == kComputeInternalGdsBinding,
+              "the reserved internal GDS binding survives assignment");
+        CHECK(t.resources[0].binding == 2, "the ordinary constant buffer still gets binding 2");
+        CHECK(t.resources[1].binding >= 4, "the texture is still pushed off the hardwired 2/3");
+        CHECK(t.resources[0].binding != t.resources[2].binding &&
+                  t.resources[1].binding != t.resources[2].binding,
+              "and nothing else is given the reserved binding");
+    }
+
+    // The counters must also STEP OVER the reserved binding, or a table large enough to reach it
+    // hands it out to an ordinary buffer and collides with the recompiler's hardwired declaration.
+    // 127 is reachable from the PS base (32) with 95 buffers, which is not a hypothetical shape.
+    {
+        ShaderResourceTable t;
+        const uint32_t base = 2;
+        const size_t count = kComputeInternalGdsBinding - base + 4;
+        for (size_t i = 0; i < count; ++i) t.resources.push_back(res(RC::ConstantBuffer));
+        assign_convention_bindings(t, base);
+        std::set<uint32_t> seen;
+        bool reserved_handed_out = false, duplicate = false;
+        for (const auto& r : t.resources) {
+            if (r.binding == kComputeInternalGdsBinding) reserved_handed_out = true;
+            if (!seen.insert(r.binding).second) duplicate = true;
+        }
+        CHECK(!reserved_handed_out,
+              "a table long enough to reach binding 127 is not given it");
+        CHECK(!duplicate, "and stepping over it does not duplicate any other binding");
+        CHECK(seen.size() == count, "every resource still receives its own binding");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
