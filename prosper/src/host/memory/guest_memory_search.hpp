@@ -28,6 +28,12 @@
 // copy. If the guest re-tiled, swizzled, decompressed or otherwise transformed the payload, the
 // bytes are no longer the same bytes and no needle length will find them. An empty result therefore
 // means "no verbatim copy in the scanned ranges", never "the data does not exist".
+//
+// And one thing the ENUMERATION cannot see, which is worse because it looks clean: if
+// /proc/self/maps cannot be opened there are no ranges, and a scan of no ranges reports zero of
+// everything -- zero hits, zero unreadable, no budget cut, no cap. Every honesty signal reads
+// negative. That is the unconditional result on any host without /proc, so the scope carries an
+// explicit `enumeration_failed`, and a caller must check it before publishing a null.
 
 #include <cstddef>
 #include <cstdint>
@@ -50,24 +56,40 @@ struct MemorySearchHit {
 };
 
 struct MemorySearchScope {
+    // BYTES FETCHED, not distinct bytes covered: consecutive chunks overlap by needle_len-1 and the
+    // overlap is fetched (and charged to the budget) twice. The difference is ~255 bytes per 4 MiB.
     uint64_t bytes_scanned = 0;
     uint64_t bytes_unreadable = 0;
-    uint32_t ranges_scanned = 0;
+    uint32_t ranges_scanned = 0;     // ranges the scan actually fetched from
     uint32_t ranges_unreadable = 0;
     bool budget_exhausted = false;   // the scan stopped early: an empty result proves nothing
     bool hits_capped = false;        // more hits exist than were reported
+    // The range list itself could not be built (guest_memory_search only). Without this a host with
+    // no /proc/self/maps returns a null that looks like a thorough one.
+    bool enumeration_failed = false;
 };
 
 // Read [addr, addr+len) into `out`. Returns false if the range cannot be read, in which case the
 // chunk is accounted as unreadable and skipped -- it is never treated as zeros.
 using MemoryFetch = std::function<bool(uint64_t addr, uint8_t* out, size_t len)>;
 
+// The fetch size the scan uses. Exported so a test can place a needle exactly ON a chunk boundary
+// without hard-coding a constant that can silently drift out from under it -- a straddle case that
+// stops straddling still passes, and then nothing at all tests the overlap.
+size_t memory_search_chunk_bytes();
+
 // Scan `ranges` for `needle`. A location matches when its first `prefix_len` bytes equal the
 // needle's; `full` is set on the hit when all `needle_len` bytes match too. `prefix_len` must be
 // >= 1 and <= `needle_len`.
 //
 // `byte_budget` bounds the work (0 = unbounded). `max_hits` bounds the output; when it is reached
-// the scan stops and `hits_capped` is set.
+// the scan stops and `hits_capped` is set. Hits are APPENDED to `out` -- it is never cleared, so a
+// reused vector eats into its own cap.
+//
+// At the END of a range there may be room for the prefix and not for the whole needle; such a
+// location is a hit with `full == false`, because the contract above is about the prefix. Interior
+// chunk boundaries never produce that case -- the overlap covers them. A range shorter than
+// `prefix_len` is skipped without a fetch.
 MemorySearchScope memory_search_ranges(const std::vector<MemorySearchRange>& ranges,
                                        const MemoryFetch& fetch,
                                        const uint8_t* needle, size_t prefix_len, size_t needle_len,

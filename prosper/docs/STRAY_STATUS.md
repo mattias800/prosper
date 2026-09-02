@@ -400,13 +400,22 @@ drops still discard the background.
     the data is demonstrably present, then a second scan at the flip, so an empty second result is
     falsifiable rather than void. Control finds the payload at exactly one guest address, the
     destination itself; the post-flip scan finds it at no guest address at all. Run with a **16-byte**
-    needle (`PROSPER_ZEROWATCH_FIND_PREFIX=16`), the length that survives Gen5 tiling -- an 8x8
-    Morton micro-tile keeps two consecutive BC1 blocks adjacent and moves the third four elements
-    away -- so this is not merely a statement about untiled copies. **What it cannot see:** a payload
-    the guest decompressed or re-encoded is not the same bytes at any needle length, so the null
-    means "no verbatim guest copy", never "the data does not exist". Scanning wider *does* find these
-    payloads in prosper's own host-side buffers, which is exactly why the scan is bounded to guest
-    space -- prosper holding a copy answers nothing about where the guest put it. #3142.
+    needle (`PROSPER_ZEROWATCH_FIND_PREFIX=16`), the length that survives Gen5 tiling, so this is not
+    merely a statement about untiled copies. That length is derived from prosper's own swizzle
+    tables rather than from a generic Z-order reading, because the generic reading gets it wrong:
+    `src/gpu/texture/tile.cpp:149` puts an 8-byte element (BC1) in an **8x4** micro-tile, not 8x8
+    (8x8 is the 4-byte case), and `tile.cpp:275`'s bit order for 8-byte elements
+    (`x0 y0 y1 x1 x2 y2 x3 y3 x4`) puts a row's first four blocks at byte offsets 0, 8, **64**, 72 --
+    so two consecutive blocks stay adjacent and the third is eight elements away, not four.
+    **Two conditions on that survival, both real:** the 16-byte run must start on an EVEN block (an
+    odd one spans elements 1 and 8, 56 bytes apart), which is why the needle offsets are 16-aligned;
+    and 16-alignment relative to the destination is 16-alignment relative to the SURFACE only if the
+    surface starts 16-aligned inside the buffer, which a file read cannot tell us. **What it cannot
+    see at all:** a payload the guest decompressed or re-encoded is not the same bytes at any needle
+    length, so the null means "no verbatim guest copy", never "the data does not exist". Scanning
+    wider *does* find these payloads in prosper's own host-side buffers, which is exactly why the
+    scan is bounded to guest space -- prosper holding a copy answers nothing about where the guest
+    put it. #3142, #3243.
   - **These destinations are a recycled pool, which is why "was it reused?" has to be asked
     per-address.** Over one 90 s boot, **1,147 of 9,631** distinct APR destinations receive reads
     from two or more different file offsets. #3142.

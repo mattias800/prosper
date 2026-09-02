@@ -1,11 +1,16 @@
-// memory_search_ranges(): the chunking, overlap and de-duplication that a guest-memory content
+// memory_search_ranges(): the chunking, overlap and range-end handling that a guest-memory content
 // scan depends on, exercised against a synthetic address space so no live guest is needed.
 //
 // The case that matters is the STRADDLING one. A chunked scanner that forgets its overlap finds
 // every needle except the ones that cross a chunk boundary, and on a real scan that is a silent
 // partial blindness: the result is still a plausible-looking hit list, so nothing about the output
-// says the scan was incomplete. It is exactly the shape that makes a "not found" wrong. Each case
-// below therefore places a needle deliberately, and the fixture reports where it put it.
+// says the scan was incomplete. It is exactly the shape that makes a "not found" wrong.
+//
+// That case is therefore built against `memory_search_chunk_bytes()` rather than a copied constant,
+// and it ASSERTS that the placement really straddles. Review of #3243 measured why: with the chunk
+// size raised to 8 MiB and a hard-coded 4 MiB in the test, the needle lands in the middle of chunk 0,
+// the case silently becomes a duplicate of the mid-chunk one, and the overlap can then be deleted
+// outright with the suite still green.
 //
 // The fetch callback counts its calls and can refuse a range, so the unreadable accounting and the
 // budget cut-off are asserted too -- both produce an empty hit list, and a caller that cannot tell
@@ -73,9 +78,12 @@ std::vector<uint8_t> needle_bytes(size_t n) {
 }  // namespace
 
 int main() {
-    const size_t kChunk = 4u << 20;          // must match the implementation's chunk size
+    // NOT a copied constant: see the header note. A straddle case that stops straddling still
+    // passes, and then nothing tests the overlap at all.
+    const size_t kChunk = memory_search_chunk_bytes();
     const size_t kNeedle = 256;
     const std::vector<uint8_t> needle = needle_bytes(kNeedle);
+    check(kChunk > kNeedle * 4, "fixture: the chunk is large enough for these placements");
 
     // --- 1. A needle in the middle of one chunk is found, once, with full=true ------------------
     {
@@ -90,20 +98,41 @@ int main() {
         check(!hits.empty() && hits[0].full, "mid-chunk: full match");
         check(sc.ranges_scanned == 1 && sc.ranges_unreadable == 0, "mid-chunk: scope");
         check(!sc.budget_exhausted && !sc.hits_capped, "mid-chunk: no truncation");
+        check(!sc.enumeration_failed, "mid-chunk: enumeration not flagged");
     }
 
     // --- 2. THE STRADDLING CASE: a needle spanning a chunk boundary is still found, exactly once
-    // A scanner without overlap reports zero here; one that overlaps but does not de-duplicate
-    // reports two. Both are wrong in ways a live run cannot distinguish from the truth.
+    // A scanner without overlap reports zero here. The placement is asserted to straddle, so this
+    // case cannot quietly degrade into a second copy of case 1 if the chunk size changes.
     {
         FakeSpace s{0x400000000ull, filler(kChunk * 2)};
         const size_t at = kChunk - kNeedle / 2;      // half in chunk 0, half in chunk 1
+        check(at < kChunk && at + kNeedle > kChunk, "straddle: the placement really straddles");
         memcpy(s.bytes.data() + at, needle.data(), kNeedle);
         std::vector<MemorySearchHit> hits;
         memory_search_ranges(s.ranges(), s.fetch(), needle.data(), kNeedle, kNeedle, 0, 64, hits);
         check(hits.size() == 1, "straddle: exactly one hit, got " + std::to_string(hits.size()));
         check(!hits.empty() && hits[0].addr == s.base + at, "straddle: hit address");
         check(!hits.empty() && hits[0].full, "straddle: full match");
+    }
+
+    // --- 2b. Every placement across the boundary, not just one --------------------------------
+    // One placement can be right by luck; the whole crossing window cannot. Each offset is asserted
+    // to be found exactly once at the right address, which covers the de-duplication as well as the
+    // coverage: an overlap without de-duplication reports two hits somewhere in this sweep.
+    {
+        const size_t lo = kChunk - kNeedle - 2, hi = kChunk + 2;
+        for (size_t at = lo; at <= hi; ++at) {
+            FakeSpace s{0x400000000ull, filler(kChunk * 2)};
+            memcpy(s.bytes.data() + at, needle.data(), kNeedle);
+            std::vector<MemorySearchHit> hits;
+            memory_search_ranges(s.ranges(), s.fetch(), needle.data(), kNeedle, kNeedle, 0, 64, hits);
+            if (hits.size() != 1 || hits[0].addr != s.base + at || !hits[0].full) {
+                check(false, "boundary sweep at +" + std::to_string(at) + ": hits=" +
+                                 std::to_string(hits.size()));
+                break;
+            }
+        }
     }
 
     // --- 3. A needle ending exactly at the last byte of the range is found ----------------------
@@ -115,6 +144,15 @@ int main() {
         memory_search_ranges(s.ranges(), s.fetch(), needle.data(), kNeedle, kNeedle, 0, 64, hits);
         check(hits.size() == 1, "range-end: exactly one hit, got " + std::to_string(hits.size()));
         check(!hits.empty() && hits[0].addr == s.base + at, "range-end: hit address");
+    }
+
+    // --- 3b. A needle at offset ZERO of a range ------------------------------------------------
+    {
+        FakeSpace s{0x400000000ull, filler(kChunk / 2)};
+        memcpy(s.bytes.data(), needle.data(), kNeedle);
+        std::vector<MemorySearchHit> hits;
+        memory_search_ranges(s.ranges(), s.fetch(), needle.data(), kNeedle, kNeedle, 0, 64, hits);
+        check(hits.size() == 1 && hits[0].addr == s.base, "range-start: found at offset 0");
     }
 
     // --- 4. A prefix-only copy is reported as a hit with full=false -----------------------------
@@ -133,6 +171,40 @@ int main() {
         std::vector<MemorySearchHit> strict;
         memory_search_ranges(s.ranges(), s.fetch(), needle.data(), kNeedle, kNeedle, 0, 64, strict);
         check(strict.empty(), "prefix: strict search finds nothing");
+    }
+
+    // --- 4b. PREFIX MODE AT A RANGE END, the case a needle-length bound silently loses ---------
+    // In prefix mode a hit needs `prefix_len` bytes, not `needle_len`. A scanner that bounds its
+    // last chunk by the needle cannot see the final needle_len-1 bytes of any range -- 255 bytes per
+    // mapping, invisible, and contradicting what the header says a match is. Every placement in the
+    // window is swept, and each must be reported with full=false since the needle cannot fit.
+    {
+        const size_t kPrefix = 16;
+        FakeSpace s{0x400000000ull, filler(kChunk / 4)};
+        const size_t end = s.bytes.size();
+        for (size_t at = end - kNeedle + 1; at + kPrefix <= end; ++at) {
+            std::vector<uint8_t> saved(s.bytes.begin() + (long)at, s.bytes.end());
+            memcpy(s.bytes.data() + at, needle.data(), std::min(kNeedle, end - at));
+            std::vector<MemorySearchHit> hits;
+            memory_search_ranges(s.ranges(), s.fetch(), needle.data(), kPrefix, kNeedle, 0, 64, hits);
+            bool ok = hits.size() == 1 && hits[0].addr == s.base + at && !hits[0].full;
+            memcpy(s.bytes.data() + at, saved.data(), saved.size());
+            if (!ok) {
+                check(false, "prefix-at-range-end at +" + std::to_string(at) + ": hits=" +
+                                 std::to_string(hits.size()));
+                break;
+            }
+        }
+        // ...and a range too short for the whole needle but long enough for the prefix is still
+        // scanned rather than skipped.
+        FakeSpace tiny{0x500000000ull, filler(kNeedle / 2)};
+        memcpy(tiny.bytes.data() + 8, needle.data(), kPrefix);
+        std::vector<MemorySearchHit> th;
+        MemorySearchScope tsc = memory_search_ranges(tiny.ranges(), tiny.fetch(), needle.data(),
+                                                     kPrefix, kNeedle, 0, 64, th);
+        check(th.size() == 1 && th[0].addr == tiny.base + 8 && !th[0].full,
+              "short range: prefix hit found");
+        check(tsc.ranges_scanned == 1, "short range: counted as scanned");
     }
 
     // --- 5. A needle that is absent is absent (the null this instrument exists to publish) ------
@@ -179,6 +251,35 @@ int main() {
         check(!sc2.budget_exhausted, "budget: unbounded scan is not marked truncated");
     }
 
+    // --- 7b. A range the budget abandons before its first fetch is not counted as scanned ------
+    {
+        FakeSpace a{0x400000000ull, filler(kChunk)};
+        FakeSpace b{0x500000000ull, filler(kChunk)};
+        memcpy(b.bytes.data() + 64, needle.data(), kNeedle);
+        std::vector<MemorySearchRange> two{{a.base, a.base + a.bytes.size()},
+                                           {b.base, b.base + b.bytes.size()}};
+        const MemoryFetch fetch = [&](uint64_t addr, uint8_t* out, size_t len) -> bool {
+            const FakeSpace& s = addr >= b.base ? b : a;
+            if (addr < s.base || addr + len > s.base + s.bytes.size()) return false;
+            memcpy(out, s.bytes.data() + (addr - s.base), len);
+            return true;
+        };
+        std::vector<MemorySearchHit> hits;
+        MemorySearchScope sc = memory_search_ranges(two, fetch, needle.data(), kNeedle, kNeedle,
+                                                    /*byte_budget=*/1, 64, hits);
+        check(hits.empty() && sc.budget_exhausted, "budget/2-ranges: stopped and said so");
+        check(sc.ranges_scanned == 1,
+              "budget/2-ranges: only the range actually read is counted, got " +
+                  std::to_string(sc.ranges_scanned));
+        // Unbounded, both ranges are scanned and the second range's needle is found -- which is what
+        // makes the count above a statement about the budget rather than about the range list.
+        std::vector<MemorySearchHit> all;
+        MemorySearchScope sc2 = memory_search_ranges(two, fetch, needle.data(), kNeedle, kNeedle,
+                                                     0, 64, all);
+        check(all.size() == 1 && all[0].addr == b.base + 64, "2-ranges: second range is searched");
+        check(sc2.ranges_scanned == 2, "2-ranges: both counted");
+    }
+
     // --- 8. Two copies are both reported, and max_hits caps visibly ----------------------------
     {
         FakeSpace s{0x400000000ull, filler(kChunk * 2)};
@@ -194,12 +295,12 @@ int main() {
         check(capped.size() == 1 && sc.hits_capped, "two copies: cap is reported");
     }
 
-    // --- 9. A range shorter than the needle is skipped rather than mis-read --------------------
+    // --- 9. A range shorter than the PREFIX is skipped rather than mis-read --------------------
     {
-        FakeSpace s{0x400000000ull, filler(64)};
+        FakeSpace s{0x400000000ull, filler(8)};
         std::vector<MemorySearchHit> hits;
         MemorySearchScope sc = memory_search_ranges(s.ranges(), s.fetch(), needle.data(),
-                                                    kNeedle, kNeedle, 0, 64, hits);
+                                                    16, kNeedle, 0, 64, hits);
         check(hits.empty() && sc.ranges_scanned == 0, "short range: skipped");
         check(s.fetches == 0, "short range: never fetched");
     }

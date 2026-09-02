@@ -2747,7 +2747,9 @@ struct ZeroWatchEntry {
     // an engine does NOT carry into a tiled texture -- so a scan seeded only from it would report
     // "the payload did not move" for a payload whose pixels moved. seed_deep is pixel data.
     uint8_t seed_deep[256] = {0};
-    uint64_t seed_deep_off = 0;
+    // Where the two FIND needles were copied from. 16-ALIGNED, unlike seed_off -- see
+    // zerowatch_find_prefix() for why the alignment is what makes a 16-byte needle survive tiling.
+    uint64_t find_off = 0, find_deep_off = 0;
     bool has_seed_deep = false;
     // The SOURCE's own non-zero census over the same 16 windows the flip profile reads, so a window
     // that is zero in the destination can be told apart from a window the payload never filled.
@@ -2821,11 +2823,24 @@ int zerowatch_find_budget() {
 }
 
 // How many leading bytes of the seed window must match. 32 is the default; 16 is the length that
-// SURVIVES Gen5 tiling, which is the reason it is tunable at all. An 8x8-element micro-tile stores
-// its elements in Morton order, so for a block-compressed surface elements (0,0) and (1,0) -- two
-// consecutive 8-byte BC1 blocks, i.e. 16 bytes -- stay adjacent, while (2,0) lands four elements
-// away. A 32-byte needle therefore reports "absent" for a payload the guest merely re-tiled, and a
-// 16-byte one does not. Shorter than 16 is not offered: below that the needle stops being evidence.
+// SURVIVES Gen5 tiling, which is the reason it is tunable at all.
+//
+// Derived from prosper's own swizzle tables, not from a generic Z-order intuition -- the generic one
+// gets this wrong. `src/gpu/texture/tile.cpp:149` gives the SW_256B_S micro-tile dimensions per
+// element size: BC1 is 8 bytes per block, so its micro-tile is 8x4 ELEMENTS, not 8x8 (8x8 is the
+// 4-BYTE case). `tile.cpp:275` gives the within-tile bit order for an 8-byte element as
+// `x0 y0 y1 x1 x2 y2 x3 y3 x4`, so the element index is x0 | y0<<1 | y1<<2 | x1<<3 | x2<<4 and the
+// first four blocks of a row land at elements 0, 1, 8, 9 -- byte offsets 0, 8, 64, 72.
+//
+// So two consecutive BC1 blocks (16 bytes) stay contiguous through tiling and four (32 bytes) do
+// not: a 32-byte needle reports "absent" for a payload the guest merely re-tiled, and a 16-byte one
+// does not. THE 16-BYTE RUN MUST START ON AN EVEN BLOCK -- an odd one spans elements 1 and 8, which
+// are 56 bytes apart -- so the seed offsets below are 16-aligned. That makes the needle
+// even-block-aligned relative to the DESTINATION; it is even-block-aligned relative to the surface
+// only if the surface itself starts 16-aligned within the buffer, which prosper cannot know from a
+// file read. State that condition wherever this null is quoted.
+//
+// Shorter than 16 is not offered: below that the needle stops being evidence.
 size_t zerowatch_find_prefix() {
     static size_t v = [] {
         const char* e = getenv("PROSPER_ZEROWATCH_FIND_PREFIX");
@@ -2851,8 +2866,10 @@ void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, u
     //
     // Never skip the destination itself. A hit AT the destination is the most informative thing the
     // control arm can produce -- it proves the scanner reaches the exact mapping in question -- and
-    // at AFTER-ZERO time its absence is the fact being reported. The APR staging buffer is
-    // munmapped by then, so the needle cannot find its own source.
+    // at AFTER-ZERO time its absence is the fact being reported. The needle cannot find ITSELF
+    // either: it is `e.seed`, which lives in `g_zw` and in the poll thread's copy of the entry, and
+    // what keeps both out of the haystack is the [0x100000000, kGuestAutoMapLimit) bound -- not the
+    // APR staging buffer's munmap, which an earlier version of this comment credited.
     const prosper::host::MemorySearchScope sc = prosper::host::guest_memory_search(
         /*lo=*/0x100000000ull, /*hi=*/0x40000000000ull,
         /*skip_begin=*/0, /*skip_end=*/0,
@@ -2877,6 +2894,14 @@ void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, u
             (unsigned long long)(sc.bytes_unreadable >> 20),
             sc.budget_exhausted ? " TRUNCATED-BY-BUDGET" : "",
             sc.hits_capped ? " HIT-CAP-REACHED" : "");
+    // The one scope signal not visible in the numbers above: with no ranges enumerated the line
+    // reads zero of everything, which is exactly what a thorough null looks like.
+    if (sc.enumeration_failed) {
+        if (found_out) *found_out = false;
+        fprintf(stderr, "[zerowatch-find] dst=0x%llx ENUMERATION FAILED -- no guest ranges were "
+                        "listed, so the result above is VOID, not a null\n",
+                (unsigned long long)e.dst);
+    }
 }
 
 // HOW MUCH went away. A WENT-ZERO verdict is a statement about ONE 256-byte window, and #3142 read
@@ -2936,6 +2961,14 @@ void zerowatch_poll_forever() {
                 uint32_t w[64];
                 if (!zw_read256(e.dst + e.seed_off, w)) {
                     e.reported = true;
+                    // MUST be stamped here too. diag_now_us() is CLOCK_MONOTONIC since boot, so a
+                    // t_reported left at 0 puts every re-profile threshold in the past and fires
+                    // both of them on the next two 50 ms polls -- printing a `+10s` and a `+45s`
+                    // profile for a range that can no longer be read, whose every window is `??`
+                    // and whose summary then reads `lost=0 kept=0`. That is the least true thing
+                    // that line can say about a range which has just gone away entirely, and it is
+                    // the exact shape trap 248 exists for.
+                    e.t_reported = prosper::diagnostics::diag_now_us();
                     fprintf(stderr,
                             "[zerowatch] t=%llu dst=0x%llx WENT-UNMAPPED after %.3fs  maps=%s\n",
                             (unsigned long long)prosper::diagnostics::diag_now_us(),
@@ -3008,9 +3041,9 @@ void zerowatch_poll_forever() {
         // Outside the lock: see the note at the top of this function.
         for (auto& p : pending_find) {
             bool found = false, found_deep = false;
-            zw_find(p.first, p.second, p.first.seed, p.first.seed_off, "first", &found);
+            zw_find(p.first, p.second, p.first.seed, p.first.find_off, "first", &found);
             if (p.first.has_seed_deep)
-                zw_find(p.first, p.second, p.first.seed_deep, p.first.seed_deep_off, "deep",
+                zw_find(p.first, p.second, p.first.seed_deep, p.first.find_deep_off, "deep",
                         &found_deep);
             if (strcmp(p.second, "CONTROL") == 0) {
                 std::lock_guard<std::mutex> lk(g_zw_mx);
@@ -3060,21 +3093,30 @@ void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* pat
     // #3142: keep the payload's own bytes at the seeded window so PROSPER_ZEROWATCH_FIND can search
     // for them later. Copied from the SOURCE, which is the oracle -- the destination is what the
     // question is about.
-    memcpy(e.seed, p8 + e.seed_off, sizeof e.seed);
+    // 16-ALIGNED, not 4-aligned: see zerowatch_find_prefix(). A 16-byte needle survives Gen5 tiling
+    // only when it starts on an even BC1 block, so an offset the seed-window formula happened to
+    // leave at 4 or 8 mod 16 would make the tiling-survival claim false three times in four. The
+    // WENT-ZERO probe keeps using seed_off, which stays comparable with the window formula the other
+    // APR instruments use; only the FIND needle moves.
+    e.find_off = e.seed_off & ~(uint64_t)15;
+    memcpy(e.seed, p8 + e.find_off, sizeof e.seed);
     for (uint32_t w = 0; w < 16; ++w) {
         const uint64_t off = (((size - 256ull) / 15ull) * w) & ~(uint64_t)3;
+        // memcpy rather than a reinterpreting cast: `src` is a byte buffer with no established
+        // alignment at this site, and the loops either side of this one already read it as bytes.
+        uint32_t sw[64];
+        memcpy(sw, p8 + off, sizeof sw);
         uint32_t nzw = 0;
-        const uint32_t* sw = (const uint32_t*)(p8 + off);
         for (uint32_t k = 0; k < 64; ++k) if (sw[k]) ++nzw;
         e.src_profile[w] = (uint8_t)nzw;
     }
     for (int w = 7; w >= 0; --w) {
-        const uint64_t off = (((size - 256ull) / 7ull) * (uint32_t)w) & ~(uint64_t)3;
-        if (off <= e.seed_off) break;
+        const uint64_t off = ((((size - 256ull) / 7ull) * (uint32_t)w) & ~(uint64_t)3) & ~(uint64_t)15;
+        if (off <= e.find_off) break;
         bool nz = false;
         for (uint32_t k = 0; k < 256 && !nz; ++k) if (p8[off + k]) nz = true;
         if (!nz) continue;
-        e.seed_deep_off = off;
+        e.find_deep_off = off;
         e.has_seed_deep = true;
         memcpy(e.seed_deep, p8 + off, sizeof e.seed_deep);
         break;
