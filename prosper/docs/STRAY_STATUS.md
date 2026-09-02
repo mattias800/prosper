@@ -370,12 +370,55 @@ drops still discard the background.
 - **"The range is zeroed some time during the ~65 s before the shader reads it."** Falsified, and the
   65 s was an artifact of when the *shader* happened to look rather than of when the data went away.
   `PROSPER_ZEROWATCH` polls each armed destination every 50 ms and reports the transition itself: the
-  data is gone **0.5–2.3 s** after its load, and the defect therefore **reproduces in a 2-minute run**
-  rather than the 7-minute title route — it happens during asset load, long before the title screen.
+  watched **256-byte window** is zero **0.5–2.3 s** after its load, and the defect therefore
+  **reproduces in a 2-minute run** rather than the 7-minute title route — it happens during asset
+  load, long before the title screen. **This row said "the data is gone", which is a claim about the
+  whole range that the instrument never tested — read the CORRECTION bullet below before quoting
+  it: on most of these destinations the payload is still there.**
   At the instant of the flip the mapping is *unchanged*: still `rw-s` on the dmem memfd at the same
   file offset, so it is neither unmapped nor re-pointed. And because that mapping is `MAP_SHARED` on a
   memfd, reading the mapping **is** reading the file — there is no "stale view" case, so the content
   itself was zeroed. #3142, #3145.
+  - **CORRECTION (2026-09-02, #3142): "the data is gone" is a statement about ONE 256-byte window,
+    and of the payload it is false in the common case.** `PROSPER_ZEROWATCH` arms on the *first*
+    non-zero window of a payload -- window 0 in every case measured -- and its WENT-ZERO verdict
+    reads that single window. It now profiles **16** windows across each destination at the instant
+    of the flip and again at +10 s and +45 s, against the source's own per-window census so an
+    always-empty window is not counted as a loss. That separates two populations the one-window
+    verdict had merged. On a 120 s boot (`PROSPER_NULL_PAGE=1`, no input): **11 of 14** destinations
+    still hold most of their payload 45 s after their own WENT-ZERO (`kept` 4-15 of 16 windows),
+    **3 of 14** end genuinely all-zero, and one destination's zeroed window reads **non-zero again**
+    at +10 s. So what the guest clears about a second after a load is, in the common case, the
+    chunk's header; the asset body survives. The 2-minute reproduction and the 0.5-2.3 s figure are
+    unaffected -- they are correct about window 0. What is withdrawn is the inference from them to
+    "the range", which is what made this look like a memory-lifetime defect across the board. The
+    fully-cleared minority is the class this issue's own subject case belongs to, and the log now
+    separates it in one line instead of requiring a second instrument.
+  - **No verbatim relocation: the payload has exactly ONE guest-visible copy while it is live, and
+    none afterwards.** `PROSPER_ZEROWATCH_FIND=N` searches the whole guest address space
+    (`[0x100000000, kGuestAutoMapLimit)`) for the payload's own bytes -- a control scan taken while
+    the data is demonstrably present, then a second scan at the flip, so an empty second result is
+    falsifiable rather than void. Control finds the payload at exactly one guest address, the
+    destination itself; the post-flip scan finds it at no guest address at all. Run with a **16-byte**
+    needle (`PROSPER_ZEROWATCH_FIND_PREFIX=16`), the length that survives Gen5 tiling, so this is not
+    merely a statement about untiled copies. That length is derived from prosper's own swizzle
+    tables rather than from a generic Z-order reading, because the generic reading gets it wrong:
+    `src/gpu/texture/tile.cpp:149` puts an 8-byte element (BC1) in an **8x4** micro-tile, not 8x8
+    (8x8 is the 4-byte case), and `tile.cpp:275`'s bit order for 8-byte elements
+    (`x0 y0 y1 x1 x2 y2 x3 y3 x4`) puts a row's first four blocks at byte offsets 0, 8, **64**, 72 --
+    so two consecutive blocks stay adjacent and the third is eight elements away, not four.
+    **Two conditions on that survival, both real:** the 16-byte run must start on an EVEN block (an
+    odd one spans elements 1 and 8, 56 bytes apart), which is why the needle offsets are 16-aligned;
+    and 16-alignment relative to the destination is 16-alignment relative to the SURFACE only if the
+    surface starts 16-aligned inside the buffer, which a file read cannot tell us. **What it cannot
+    see at all:** a payload the guest decompressed or re-encoded is not the same bytes at any needle
+    length, so the null means "no verbatim guest copy", never "the data does not exist". Scanning
+    wider *does* find these payloads in prosper's own host-side buffers, which is exactly why the
+    scan is bounded to guest space -- prosper holding a copy answers nothing about where the guest
+    put it. #3142, #3243.
+  - **These destinations are a recycled pool, which is why "was it reused?" has to be asked
+    per-address.** Over one 90 s boot, **1,147 of 9,631** distinct APR destinations receive reads
+    from two or more different file offsets. #3142.
   - **The writer is the guest's own libc, and that reclassifies the whole issue.** With #3147's
     re-baseline mode the write trace observes the window it previously could not, and attributes
     **64 of 64 events to `libc.prx`** — guest code — storing sequentially from the buffer base at a
@@ -421,6 +464,16 @@ drops still discard the background.
     order is not happens-before (the ordering above is a shared monotonic stamp, not line distance);
     **236**, a verifier that compares populations instead of content reports MATCH on entirely
     different bytes, and passes a mutation arm while doing so.
+
+- **"prosper performs the APR read at command-RECORD time where real hardware performs it at SUBMIT,
+  so the guest's own preparation of the destination lands on top of bytes that should not be there
+  yet."** Falsified by the guest's own call order, and worth recording because the code comment in
+  `apr_execute_read` ("prosper serves every read eagerly") invites exactly this hypothesis.
+  `PROSPER_AMPRLOG` + `PROSPER_FILELOG` show `sceAmprAprCommandBufferReadFile` followed immediately,
+  on the same guest thread with no intervening guest work, by `H896Pt-yB4I(CbSetEqueue)` and
+  `sceKernelAprSubmitCommandBufferAndGetResult` (`-> token=0x209f (bound)`). Record and submit are
+  microseconds apart while the clear is 0.5-2.3 s later, so deferring the read to submit cannot move
+  it. #3142.
 
 - **"The biggest dropped stage is the title-screen background."** Falsified: `0x3011560000` was the
   largest single loss on this route — one instruction discarding **1536 full-screen 3840×2160 draws
