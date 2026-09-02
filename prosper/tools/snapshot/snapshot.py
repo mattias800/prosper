@@ -14,8 +14,13 @@ diagnostic hashes live in the repo (snapshots.json), never game imagery.
 Usage:
   snapshot.py check  [name ...]   # compare captures to baselines; exit 1 on any diff/error
   snapshot.py verify [name ...]   # capture twice and retain multiple local review images
-  snapshot.py update NAME --reviewed  # approve an inspected exact-hash candidate
-  snapshot.py list
+  snapshot.py update NAME --reviewed [--verified-by=human]  # approve an inspected candidate
+  snapshot.py list [name ...]     # inventory, including when each baseline was last verified
+
+`update --reviewed` is the only command that writes snapshots.json, and the only one that stamps
+`verified_at`/`verified_by`. `check` never stamps: checking a baseline is not verifying it, and a
+routine check that refreshed the date would silently launder a baseline nobody re-reviewed.
+`verified_by` defaults to `agent`; `human` must be asserted with `--verified-by=human`.
 
 Env overrides:
   PROSPER_GAME_ROOT   dir holding the <dump> subdirs   (default: the main checkout root)
@@ -33,6 +38,7 @@ collapse without rejecting subtle pixel improvements.
 """
 import sys, os, json, time, hashlib, math, struct, subprocess, tempfile, shutil, signal, ctypes, errno
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROSPER_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
@@ -236,6 +242,149 @@ def save_manifest(m):
     with open(MANIFEST, "w") as f:
         json.dump(m, f, indent=2)
         f.write("\n")
+
+
+# --- Baseline verification provenance ------------------------------------------------------------
+#
+# `verified_at` / `verified_by` record WHEN a baseline was last established from inspected images
+# and WHO asserted that inspection. They are provenance about the baseline, not part of its
+# contract, and three properties make them worth trusting:
+#
+#   * Their ABSENCE is meaningful. A guard with no `verified_at` has never had one recorded, which
+#     is the useful signal in its own right and exactly the state `gris-gameplay` was in when its
+#     stale baseline started failing on master (#3148). Nothing backfills them: a date guessed out
+#     of `review` prose or git history would read as a recorded fact while being an inference.
+#   * Only `update --reviewed` writes them. `check` must never stamp — see stamp_verification.
+#   * `agent` is the default and `human` cannot be reached by accident. See stamp_verification.
+VERIFIED_BY_AGENT = "agent"
+VERIFIED_BY_HUMAN = "human"
+VERIFIED_BY_VALUES = (VERIFIED_BY_AGENT, VERIFIED_BY_HUMAN)
+
+
+def utc_timestamp(now=None):
+    """The single spelling of an instant this manifest stores: ISO 8601, UTC, second resolution.
+
+    Deliberately not a bare date like the one `review` prose carries: a manifest field exists to be
+    sorted and compared, and an unqualified local date cannot be either without knowing the zone.
+    """
+    now = now or datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_verified_at(stamp):
+    """Return an aware datetime, or None when the field is absent or unreadable.
+
+    Unreadable is reported rather than raised, and never quietly repaired. A hand-edited manifest
+    must not make `list` unusable, and a value nobody can parse must not be rendered as though it
+    were a date somebody could.
+    """
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def verification_age_days(stamp, now=None):
+    """Whole days between `stamp` and now, or None when the stamp is absent/unreadable."""
+    parsed = parse_verified_at(stamp)
+    if parsed is None:
+        return None
+    return ((now or datetime.now(timezone.utc)).astimezone(timezone.utc) - parsed).days
+
+
+def stamp_verification(entry, verified_by=VERIFIED_BY_AGENT, now=None):
+    """Record who established this baseline and when.
+
+    The default is `agent`, and reaching `human` by accident is deliberately impossible. The tool
+    cannot observe who ran it, so `human` has to be ASSERTED (`update ... --verified-by=human`).
+    The asymmetry is the point: a falsely recorded human review is far worse than a falsely
+    recorded agent one, because the entire value of the field is that a human-reviewed baseline
+    may be trusted further than a machine-approved one. Nothing here consults a TTY, `$USER`, an
+    environment variable, or whether stdin is interactive — every one of those is a proxy for
+    "somebody was probably there", and a proxy is what would make the field a lie.
+    """
+    if verified_by not in VERIFIED_BY_VALUES:
+        raise ValueError(f"verified_by must be one of {VERIFIED_BY_VALUES}, not {verified_by!r}")
+    entry["verified_at"] = utc_timestamp(now)
+    entry["verified_by"] = verified_by
+    return entry
+
+
+def format_verification(entry, now=None):
+    """One compact column for `list`. Absence must not be able to read as a date."""
+    stamp = entry.get("verified_at")
+    if not stamp:
+        return "NEVER VERIFIED"
+    who = entry.get("verified_by")
+    who_text = who if who in VERIFIED_BY_VALUES else f"?{who}"
+    parsed = parse_verified_at(stamp)
+    if parsed is None:
+        return f"UNPARSEABLE {who_text}"
+    return (f"{parsed.astimezone(timezone.utc).strftime('%Y-%m-%d')} {who_text:<5} "
+            f"{verification_age_days(stamp, now):>4}d")
+
+
+# --- Command-line options -------------------------------------------------------------------------
+#
+# The CLI is a four-verb `sys.argv` test rather than argparse, so guard names are POSITIONAL and
+# anything else on the command line is read as one. `--reviewed` used to be special-cased inside
+# cmd_update and every other dash token fell through to `select`, which reported it as an unknown
+# SNAPSHOT NAME -- or, for `list`, ignored it silently, because cmd_list never looked at its
+# arguments at all. That is the wrong failure for a flag that decides whether a baseline is
+# recorded as human-verified, so options are parsed once, here, and an unrecognised or malformed
+# one is refused before any command runs.
+#
+# Maps command -> {option: takes_a_value}.
+COMMAND_OPTIONS = {
+    "check": {},
+    "update": {"--reviewed": False, "--verified-by": True},
+    "verify": {},
+    "list": {},
+}
+
+
+def _option_error(command, message):
+    print(f"[{command}] {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def split_options(command, tokens):
+    """Split `tokens` into (options, guard names), refusing anything unrecognised.
+
+    A guard name never begins with `-`, so a leading dash is an unambiguous option marker. Both
+    malformed shapes fail loudly rather than being absorbed: a value on a boolean option, and a
+    missing value on one that needs it.
+    """
+    spec = COMMAND_OPTIONS.get(command, {})
+    options, names = {}, []
+    for token in tokens:
+        if not token.startswith("-"):
+            names.append(token)
+            continue
+        key, separator, value = token.partition("=")
+        if key not in spec:
+            accepted = ", ".join(sorted(spec)) if spec else "no options"
+            _option_error(command, f"unknown option {token}; {command} accepts {accepted}")
+        if spec[key] and not separator:
+            _option_error(command, f"{key} needs a value: {key}=<value>")
+        if not spec[key] and separator:
+            _option_error(command, f"{key} takes no value")
+        options[key] = value if spec[key] else True
+    return options, names
+
+
+def resolve_verified_by(options):
+    """`agent` unless a human explicitly asserts otherwise. See stamp_verification."""
+    value = options.get("--verified-by")
+    if value is None:
+        return VERIFIED_BY_AGENT
+    if value not in VERIFIED_BY_VALUES:
+        _option_error("update",
+                      f"--verified-by={value} is not one of {', '.join(VERIFIED_BY_VALUES)}")
+    return value
 
 
 def pixel_hash(bmp_path):
@@ -677,9 +826,14 @@ def reset_review_evidence(name):
 
 
 def entry_fingerprint(entry):
+    # Everything `verify` captured against, and nothing an approval itself writes. `verified_at`
+    # and `verified_by` join `review` here for the same reason `review` is here: `update` writes
+    # them, so including them would make a SECOND `update NAME --reviewed` refuse its own candidate
+    # with "snapshot configuration changed after verify" and demand a fresh two-capture run.
     stable = {k: v for k, v in entry.items()
               if k not in ("hash", "dims", "review", "structural_references",
-                           "perceptual_references", "min_nonblack_ratio")}
+                           "perceptual_references", "min_nonblack_ratio",
+                           "verified_at", "verified_by")}
     raw = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -700,7 +854,7 @@ def save_exact_candidate(entry, first, second, pixel_digest, dims):
     return first_out, second_out
 
 
-def approve_exact_candidate(entry):
+def approve_exact_candidate(entry, verified_by=VERIFIED_BY_AGENT):
     path = os.path.join(REVIEW_DIR, entry["name"], "candidate.json")
     if not os.path.isfile(path):
         raise RuntimeError(f"no reviewed candidate at {path}; run verify first")
@@ -714,6 +868,9 @@ def approve_exact_candidate(entry):
     entry["dims"] = candidate["dims"]
     entry["review"] = (f"Pixel evidence approved with snapshot.py update --reviewed on "
                        f"{time.strftime('%Y-%m-%d')}")
+    # Stamped inside the approval rather than by its caller, so no path can establish a baseline
+    # without recording who established it and when.
+    stamp_verification(entry, verified_by)
 
 
 def save_content_candidate(entry, summaries):
@@ -759,7 +916,7 @@ def save_content_candidate(entry, summaries):
         f.write("\n")
 
 
-def approve_content_candidate(entry):
+def approve_content_candidate(entry, verified_by=VERIFIED_BY_AGENT):
     path = os.path.join(REVIEW_DIR, entry["name"], "candidate.json")
     if not os.path.isfile(path):
         raise RuntimeError(f"no reviewed candidate at {path}; run verify first")
@@ -782,6 +939,7 @@ def approve_content_candidate(entry):
     entry["review"] = (
         f"Approved {candidate['evidence_count']} composited images from two independent runs on "
         f"{time.strftime('%Y-%m-%d')}; intended scene, layers, and progression visually confirmed.")
+    stamp_verification(entry, verified_by)
 
 
 def capture(entry, run_log=None):
@@ -993,8 +1151,14 @@ def select(m, names):
     return snaps
 
 
-def cmd_list(m, names):
-    for s in m["snapshots"]:
+def cmd_list(m, names, options=None):
+    # `list` is where a stale or never-verified baseline is supposed to become obvious WITHOUT
+    # booting anything, so the verification column sits second — beside the name, not at the end of
+    # a 110-column line where nobody scans. "NEVER VERIFIED" cannot be mistaken for a date.
+    selected = select(m, names)
+    print(f"  {'guard':<26} {'last verified':<22} configuration")
+    tally = {"never": 0, VERIFIED_BY_AGENT: 0, VERIFIED_BY_HUMAN: 0, "other": 0}
+    for s in selected:
         if "min_colors" in s:
             mode = (f"min_colors={s['min_colors']} "
                     f"min_frames={s.get('min_qualifying_frames', 2)} "
@@ -1003,13 +1167,33 @@ def cmd_list(m, names):
         else:
             mode = (f"frame={s.get('frame', 'MISSING')} "
                     f"hash={'set' if s.get('hash') else 'MISSING'}")
-        print(f"  {s['name']:<28} dump={s['dump']} {mode}")
+        if not s.get("verified_at"):
+            tally["never"] += 1
+        elif s.get("verified_by") in VERIFIED_BY_VALUES:
+            tally[s["verified_by"]] += 1
+        else:
+            tally["other"] += 1
+        print(f"  {s['name']:<26} {format_verification(s):<22} dump={s['dump']} {mode}")
+    summary = (f"{len(selected)} guard{'' if len(selected) == 1 else 's'}: "
+               f"{tally['never']} never verified, "
+               f"{tally[VERIFIED_BY_AGENT]} agent-verified, {tally[VERIFIED_BY_HUMAN]} human-verified")
+    if tally["other"]:
+        summary += f", {tally['other']} with an unrecognised verified_by"
+    print(f"\n  {summary}")
 
 
-def cmd_update(m, names):
+def cmd_update(m, names, options=None):
     # Exact hashes require two identical verify captures plus explicit review of the saved images.
-    reviewed = "--reviewed" in names
-    names = [n for n in names if n != "--reviewed"]
+    options = options or {}
+    reviewed = "--reviewed" in options
+    verified_by = resolve_verified_by(options)
+    # An unnamed `update --reviewed` would sweep every guard in the manifest and stamp each one
+    # with a verification nobody performed — the precise failure the `verified_by` asymmetry exists
+    # to prevent, reached by a typo rather than by a lie. Approval is per-guard by construction
+    # (each reads its own review/NAME/candidate.json), so requiring the name costs nothing.
+    if not names:
+        _option_error("update", "name at least one guard; `update --reviewed` with no name would "
+                                "approve and stamp every entry in the manifest")
     rc = 0
     for s in select(m, names):
         try:
@@ -1019,18 +1203,19 @@ def cmd_update(m, names):
                           f"both runs, then rerun update {s['name']} --reviewed", file=sys.stderr)
                     rc = 1
                     continue
-                approve_content_candidate(s)
+                approve_content_candidate(s, verified_by)
                 print(f"[update] {s['name']}: approved "
-                      f"{len(s['structural_references'])} structural references")
+                      f"{len(s['structural_references'])} structural references "
+                      f"verified_by={s['verified_by']} at {s['verified_at']}")
                 continue
             if not reviewed:
                 print(f"[update] {s['name']}: REFUSED — run verify, inspect both review images, "
                       f"then rerun update {s['name']} --reviewed", file=sys.stderr)
                 rc = 1
                 continue
-            approve_exact_candidate(s)
+            approve_exact_candidate(s, verified_by)
             print(f"[update] {s['name']}: approved {s['dims'][0]}x{s['dims'][1]} "
-                  f"hash={s['hash'][:16]}…")
+                  f"hash={s['hash'][:16]}… verified_by={s['verified_by']}")
         except Exception as e:
             print(f"[update] {s['name']}: ERROR {e}", file=sys.stderr)
             rc = 1
@@ -1038,7 +1223,7 @@ def cmd_update(m, names):
     return rc
 
 
-def cmd_verify(m, names):
+def cmd_verify(m, names, options=None):
     rc = 0
     for s in select(m, names):
         temps = []
@@ -1118,7 +1303,7 @@ def cmd_verify(m, names):
     return rc
 
 
-def cmd_check(m, names):
+def cmd_check(m, names, options=None):
     os.makedirs(FAIL_DIR, exist_ok=True)
     rc = 0
     for s in select(m, names):
@@ -1198,17 +1383,18 @@ def cmd_check(m, names):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("check", "update", "verify", "list"):
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMAND_OPTIONS:
         print(__doc__)
         sys.exit(2)
-    cmd, names = sys.argv[1], sys.argv[2:]
+    cmd = sys.argv[1]
+    options, names = split_options(cmd, sys.argv[2:])
     m = load_manifest()
     runner = {"check": cmd_check, "update": cmd_update, "verify": cmd_verify, "list": cmd_list}[cmd]
     if cmd in ("check", "verify"):
         with snapshot_run_lock(cmd, names):
-            rc = runner(m, names)
+            rc = runner(m, names, options)
     else:
-        rc = runner(m, names)
+        rc = runner(m, names, options)
     sys.exit(rc or 0)
 
 
