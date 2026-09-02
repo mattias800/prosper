@@ -466,6 +466,70 @@ int main() {
         }
     }
 
+    // sceAgcAcbDispatchIndirect carries a WHOLE 64-bit argument address, not a byte offset from a
+    // base, because the async-compute ring has no base to offset from: libSceAgc 3.20 exports 36
+    // sceAgcAcb* entry points and not one of them sets an indirect-argument base. Sharing the DCB
+    // builder for both NIDs truncated the address to 32 bits and then added the DCB's base (zero on
+    // that ring), so every async indirect dispatch resolved to an unmapped low address and was
+    // skipped for the life of the process — Astro Bot's world map lost its 0x500571000 consumer this
+    // way on every boot (#3218).
+    //
+    // The arm that makes this a behaviour test rather than a decode test is the ADDRESS ITSELF. It
+    // is Astro Bot's own argument allocation, used verbatim, precisely BECAUSE its upper half is
+    // nonzero: a truncating builder still reproduces the low 32 bits, so an address that fits in 32
+    // bits would pass either way. Nothing dereferences it — the command processor retains an
+    // indirect argument address and the executor reads it much later — so it needs no mapping, and
+    // an ordinary heap allocation would not have served: measured here, the test process's heap
+    // lands below 4 GiB (0x345cccd0), which is exactly the case this arm must not be.
+    {
+        auto acb_dispatch_indirect = Hle::lookup("j3EtxFkSIhQ");
+        auto dcb_dispatch_indirect = Hle::lookup("CtB+A9-VxO0");
+        auto set_indirect_base = Hle::lookup("RmaJwLtc8rY");
+        CHECK(acb_dispatch_indirect && dcb_dispatch_indirect && set_indirect_base,
+              "ACB and DCB indirect dispatch builders are registered separately");
+        if (acb_dispatch_indirect && dcb_dispatch_indirect && set_indirect_base) {
+            const uint64_t args_addr = 0x5074063c0ull;   // Astro Bot's own, upper half 0x5
+            CHECK(args_addr > UINT32_MAX,
+                  "the argument address has a nonzero upper half, so truncation is observable");
+            uint32_t acb_buffer[64] = {};
+            Dcb acb{};
+            acb.bottom = acb_buffer; acb.top = acb_buffer + 64;
+            acb.cursor_up = acb_buffer; acb.cursor_down = acb_buffer + 64;
+            const uint64_t AID = reinterpret_cast<uint64_t>(&acb);
+            // No SetBase: the ACB has none, and the packet must not need one.
+            acb_dispatch_indirect(AID, args_addr, /*modifier*/ 0x21ull, 0, 0, 0);
+            const size_t acb_dwords = static_cast<size_t>(acb.cursor_up - acb_buffer);
+            GpuState acb_state;
+            run_cb(acb_buffer, acb_dwords, acb_state);
+            if (acb_state.dispatches.size() == 1)
+                printf("       acb args_addr=0x%llx want=0x%llx\n",
+                       (unsigned long long)acb_state.dispatches[0].indirect_args_addr,
+                       (unsigned long long)args_addr);
+            CHECK(acb_state.dispatches.size() == 1 && acb_state.dispatches[0].indirect &&
+                  acb_state.dispatches[0].indirect_args_addr == args_addr,
+                  "ACB indirect dispatch resolves to the whole address with no base");
+            CHECK(acb_state.dispatches.size() == 1 && acb_state.dispatches[0].modifier == 0x21ull,
+                  "ACB indirect dispatch retains its 64-bit dispatch modifier");
+            CHECK(acb_state.indirect_compute_base == 0,
+                  "an ACB indirect dispatch sets no indirect-argument base");
+            // The DCB form is unchanged and still base-relative, so the split cannot have been made
+            // by turning every DispatchIndirect into an absolute address.
+            uint32_t dcb_buffer[64] = {};
+            Dcb dcb{};
+            dcb.bottom = dcb_buffer; dcb.top = dcb_buffer + 64;
+            dcb.cursor_up = dcb_buffer; dcb.cursor_down = dcb_buffer + 64;
+            const uint64_t DID = reinterpret_cast<uint64_t>(&dcb);
+            set_indirect_base(DID, /*compute*/ 1, args_addr, 0, 0, 0);
+            dcb_dispatch_indirect(DID, /*byte offset*/ 16, /*modifier*/ 1, 0, 0, 0);
+            const size_t dcb_dwords = static_cast<size_t>(dcb.cursor_up - dcb_buffer);
+            GpuState dcb_state;
+            run_cb(dcb_buffer, dcb_dwords, dcb_state);
+            CHECK(dcb_state.dispatches.size() == 1 &&
+                  dcb_state.dispatches[0].indirect_args_addr == args_addr + 16,
+                  "DCB indirect dispatch is still base + byte offset");
+        }
+    }
+
     // Compute is not executed yet, but each DispatchDirect must retain its exact register state so
     // producer-provenance diagnostics can resolve the bound shader and resources (#524).
     {

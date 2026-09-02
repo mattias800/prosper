@@ -4917,7 +4917,12 @@ void GpuState::apply(const Pm4Command& c) {
             d.state = last_snapshot_;
             d.command_order = command_order;
             d.indirect = true;
-            if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
+            // The ACB form carries the whole address (see R_DISPATCH_INDIRECT_ADDR): the
+            // async-compute ring has no base register, so adding `indirect_compute_base` here would
+            // be adding the DCB's unrelated base to a complete address.
+            if (c.indirect_address_absolute)
+                d.indirect_args_addr = c.indirect_address;
+            else if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
                 d.indirect_args_addr = indirect_compute_base + c.indirect_offset;
             // Recover a low-only argument address against the learned VA aperture.
             //
@@ -4945,7 +4950,8 @@ void GpuState::apply(const Pm4Command& c) {
             // skipped as "unreadable arguments"; with it on, 0 are, and the probe found the raw low
             // address unmapped and `aperture | low` mapped on 49 of 49. That is a real signal about
             // where those arguments live, and it is still not provenance.
-            if (aperture_recovery_enabled() && !indirect_compute_base && d.indirect_args_addr &&
+            if (aperture_recovery_enabled() && !c.indirect_address_absolute &&
+                !indirect_compute_base && d.indirect_args_addr &&
                 !guest_readable(d.indirect_args_addr, 3u * sizeof(uint32_t))) {
                 const uint64_t aperture = g_indirect_va_aperture.load(std::memory_order_relaxed);
                 const uint64_t recovered =

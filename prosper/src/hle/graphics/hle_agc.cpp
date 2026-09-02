@@ -77,7 +77,8 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d,
                    R_JUMP = 0x1e, R_SET_PRED = 0x1f,
                    R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
-                   R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23;
+                   R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23,
+                   R_DISPATCH_INDIRECT_ADDR = 0x24;
 constexpr uint32_t R_NUM = 0x40;
 
 // --- Packet sizes, in DWORDS, shared by each builder and its sceAgc*GetSize (#1143, #1748, #1756) ---
@@ -100,6 +101,10 @@ constexpr uint32_t kDwDrawIndexOffset    = 3;
 constexpr uint32_t kDwDrawIndexIndirect  = 4;
 constexpr uint32_t kDwDispatch           = 6;
 constexpr uint32_t kDwDispatchIndirect   = 4;
+// The ACB form is one dword larger because it carries a whole 64-bit address where the DCB form
+// carries a 32-bit offset. prosper answers sceAgcAcbDispatchIndirectGetSize as well as building the
+// packet, so the guest reserves exactly this.
+constexpr uint32_t kDwAcbDispatchIndirect = 5;
 // DMA_DATA is 7: header + dst lo/hi, srcOrImm lo/hi, numBytes, selectors — exactly the RDNA2
 // `DMA_DATA` field list, with no slot to spare. It was 9 because it also carried the #312 build-time
 // snapshot of the destination qword: prosper's own invention, not a decoded guest field, so removing
@@ -332,6 +337,7 @@ const char* dcb_subop_name(uint32_t r) {
         case R_STALL_COMMAND_BUFFER_PARSER: return "StallCommandBufferParser";
         case R_DRAW_INDEX_INDIRECT:        return "DrawIndexIndirect";
         case R_DISPATCH_INDIRECT:          return "DispatchIndirect";
+        case R_DISPATCH_INDIRECT_ADDR:     return "AcbDispatchIndirect";
         // A raw allocate_dw with no sub-op (CbNop's 1-dword form, the type-2 filler). Without its own
         // case it would print as "(op-carried)" and be indistinguishable from a real op-carried packet.
         case kDcbDiagRaw:                  return "raw-allocate";
@@ -3083,11 +3089,34 @@ HLE(agc_dcb_draw_index_indirect) {
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
     return reinterpret_cast<uint64_t>(cmd);
 }
-HLE(agc_cb_dispatch_indirect) {
+HLE(agc_dcb_dispatch_indirect) {
     uint32_t* cmd; if (!begin_packet(a0, kDwDispatchIndirect, IT_NOP, R_DISPATCH_INDIRECT, &cmd)) return 0;
     cmd[1] = static_cast<uint32_t>(a1);
     cmd[2] = static_cast<uint32_t>(a2);
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    return reinterpret_cast<uint64_t>(cmd);
+}
+
+// sceAgcAcbDispatchIndirect (NID j3EtxFkSIhQ) — the same operation on the ASYNC COMPUTE ring, and
+// NOT the same packet. `a1` is the argument buffer's whole 64-bit GPU virtual address, not a byte
+// offset, because there is nothing on that ring for an offset to be relative to: libSceAgc 3.20
+// exports 36 sceAgcAcb* entry points and none of them sets an indirect-argument base — the library's
+// only setter is sceAgcDcbSetBaseIndirectArgs, which takes a Dcb. CONFIDENCE: HIGH (the absence of
+// an ACB SetBase is a property of the 3.20 export table, and Astro Bot's live stream is decisive:
+// its q=2 DispatchIndirect packets carried exactly the LOW 32 BITS of the four argument allocations
+// its Dcb announces at full width in the same run — 0x5074063c0, 0x5074063e0, 0x50740a520,
+// 0x50740a540 — so the argument is an address whose upper half this builder used to drop.)
+//
+// Sharing agc_dcb_dispatch_indirect for both NIDs truncated that address to 32 bits and then
+// resolved it against the DCB's base, which is zero on the async ring: every async indirect dispatch
+// resolved to an unmapped low address and was skipped for the life of the process (#3218).
+HLE(agc_acb_dispatch_indirect) {
+    uint32_t* cmd;
+    if (!begin_packet(a0, kDwAcbDispatchIndirect, IT_NOP, R_DISPATCH_INDIRECT_ADDR, &cmd)) return 0;
+    cmd[1] = static_cast<uint32_t>(a1);
+    cmd[2] = static_cast<uint32_t>(a1 >> 32u);
+    cmd[3] = static_cast<uint32_t>(a2);
+    cmd[4] = static_cast<uint32_t>(a2 >> 32u);
     return reinterpret_cast<uint64_t>(cmd);
 }
 
@@ -3326,6 +3355,7 @@ HLE(agc_jump_patch_target) {
 }
 
 HLE(agc_dispatch_indirect_get_size)   { (void)a0; return kDwDispatchIndirect * 4u; }
+HLE(agc_acb_dispatch_indirect_get_size) { (void)a0; return kDwAcbDispatchIndirect * 4u; }
 HLE(agc_dma_data_get_size)            { (void)a0; return kDwDmaData * 4u; }
 HLE(agc_event_write_get_size)         { (void)a0; return kDwEventWrite * 4u; }
 HLE(agc_set_index_buffer_get_size)    { (void)a0; return kDwSetIndexBuffer * 4u; }
@@ -3358,7 +3388,7 @@ void register_agc_hle() {
     RN("MlEw1feXcjg", agc_patch_release_mem_data);      // ReleaseMem packet: set the data payload
     RN("Ikfdt-rIqCE", agc_jump_patch_target);            // Jump packet: fill in target + dword count (#2711 Q5)
     RN("w8HVkEeXPv8", agc_dispatch_indirect_get_size);   // sceAgcDcbDispatchIndirectGetSize
-    RN("PxKWV2fVAps", agc_dispatch_indirect_get_size);   // sceAgcAcbDispatchIndirectGetSize
+    RN("PxKWV2fVAps", agc_acb_dispatch_indirect_get_size);   // sceAgcAcbDispatchIndirectGetSize
     RN("2ccJz9LQI+w", agc_dma_data_get_size);            // sceAgcDcbDmaDataGetSize
     RN("M0ttm8h7SKA", agc_dma_data_get_size);            // sceAgcAcbDmaDataGetSize
     RN("C4l9fB17t8w", agc_event_write_get_size);         // sceAgcDcbEventWriteGetSize
@@ -3466,8 +3496,8 @@ void register_agc_hle() {
     RN("RmaJwLtc8rY", agc_dcb_set_base_indirect_args);       // graphics/compute indirect base
     RN("u2T2DiA5hRI", agc_dcb_stall_command_buffer_parser); // parser visibility barrier
     RN("t1vNu082-jM", agc_dcb_draw_index_indirect);         // indexed indirect draw
-    RN("CtB+A9-VxO0", agc_cb_dispatch_indirect);            // DCB indirect compute dispatch
-    RN("j3EtxFkSIhQ", agc_cb_dispatch_indirect);            // ACB sibling
+    RN("CtB+A9-VxO0", agc_dcb_dispatch_indirect);           // sceAgcDcbDispatchIndirect (offset)
+    RN("j3EtxFkSIhQ", agc_acb_dispatch_indirect);           // sceAgcAcbDispatchIndirect (address)
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)
     RN("-RnpfpxIhec", agc_acb_dma_data);        // sceAgcAcbDmaData — async-compute sibling (#312)
     RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset
