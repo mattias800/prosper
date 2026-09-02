@@ -40,8 +40,14 @@ python3 prosper/tools/screenshots/shrink.py assets/screenshots        # re-encod
 python3 prosper/tools/screenshots/shrink.py --check assets/screenshots # report only; exit 1 if any
 ```
 
-Run it on any capture before committing it. `--check` is the form to put in a gate if this ever
-starts drifting again; it exits non-zero when a file would change.
+Run it on any capture before committing it. **`--check` is wired into CI** (the `Docs` job, which
+already has Python and needs no build): a PR that commits a 4K capture fails there. It exits
+non-zero when any file would change, and skips a file that is already WebP and within the width cap,
+so a conforming tree goes green — a gate that always reports work to do is one nobody can satisfy,
+and would be switched off.
+
+`.webp` is itself a candidate suffix, deliberately: without that the gate notices only the wrong
+container and waves through a 3840-wide WebP, which is still ~10x the target and most of the cost.
 
 WebP rather than PNG because these are photographic game frames: PNG is lossless, so lighting
 gradients cannot compress, which is exactly why the originals were enormous. Palette-quantising to

@@ -36,7 +36,10 @@ try:
 except ImportError:
     sys.exit("shrink: Pillow is required (python3 -m pip install Pillow)")
 
-SOURCE_SUFFIXES = (".png", ".bmp", ".jpg", ".jpeg")
+# .webp is included so an ALREADY-WebP file that is still 4K is caught too. Without it the
+# gate below only notices the wrong container and waves through an oversized one, which is
+# most of the cost: a 3840-wide WebP is still ~10x the target.
+SOURCE_SUFFIXES = (".png", ".bmp", ".jpg", ".jpeg", ".webp")
 
 
 def candidates(paths):
@@ -55,6 +58,12 @@ def shrink_one(path, max_width, quality, dry_run):
     before = os.path.getsize(path)
     with Image.open(path) as im:
         width, height = im.size
+        # Already conforming: right container AND within the width cap. Skipped rather than
+        # re-encoded, so `--check` is a usable gate (a run that always reports work to do is a
+        # gate nobody can go green against) and repeated runs cannot degrade a file by
+        # re-compressing it lossily over and over.
+        if path.lower().endswith(".webp") and width <= max_width:
+            return None
         # Never upscale: a capture already at or below the cap keeps its pixels, and only the
         # encoding changes.
         if width > max_width:
