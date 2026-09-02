@@ -21,6 +21,22 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### The shader-conformance scanner stopped carrying its own copy of the RDNA2 decoder
+
+No picture in this one — the finding is that `shader_histo` has been reading past the end of an
+array on every eboot with an undecodable instruction, and segfaulting outright on 4 of the 55 local
+dumps. Its hand-written list of RDNA2 format names went one entry short when `VOP3P` was added to
+the enum, so `VOP3P` printed as "UNK" and `Unknown` indexed off the end
+([#3229](https://github.com/mattias800/prosper/issues/3229)).
+
+We found it while deleting a different copy of decoder knowledge: `shader_conformance/scan.py`
+carried a Python port of the recompiler's instruction-length rules so it could tell an image
+instruction from an operand dword that looks like one. It now calls prosper's real decoder instead
+([#3184](https://github.com/mattias800/prosper/issues/3184)). The port turned out to be exactly
+right — 11,266 real shaders out of the dump library, 199,521 image instructions, zero disagreements
+— which is the point: a copy that is correct today is still the one nobody updates tomorrow.
+
+
 ### Astro Bot's world map is lit, and no longer takes the GPU down with it
 
 The world map now renders and keeps animating for the whole run, where before it froze on a white
