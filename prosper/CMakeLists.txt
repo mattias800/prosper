@@ -408,14 +408,24 @@ if(Python3_Interpreter_FOUND)
   # The shader-conformance scanner (#3036), registered because its whole value is a CLEAN result
   # and its original failure mode was manufacturing one: a capture that yielded zero examined
   # shaders exited 0, and findings could be attributed to a capture whose dumps had all failed.
-  # The suite is hermetic -- it drives the scanner end to end against a stub gpu_replay and a
-  # `spirv-dis` shim, so it needs neither a GPU nor the Vulkan toolchain, and it pins the exit
-  # contract (0 clean / 1 mismatch / 2 could-not-scan) rather than only the two parsers. Ten
-  # mutations of the logic it covers, including `DIM_ARRAYED` dropping the 2D_ARRAY case that is
-  # the tool's entire reason to exist, each turn it red.
-  add_test(NAME shader_conformance_scan_logic
-           COMMAND "${Python3_EXECUTABLE}"
-                   "${CMAKE_SOURCE_DIR}/tools/shader_conformance/scan.py" "--self-test")
+  # It drives the scanner end to end against a stub gpu_replay and a `spirv-dis` shim, so it needs
+  # neither a GPU nor the Vulkan toolchain, and it pins the exit contract (0 clean / 1 mismatch /
+  # 2 could-not-scan) rather than only the two parsers. Ten mutations of the logic it covers,
+  # including `DIM_ARRAYED` dropping the 2D_ARRAY case that is the tool's entire reason to exist,
+  # each turn it red.
+  #
+  # It needs the BUILT `shader_inspect` since #3184: the scanner's MIMG walk is now prosper's own
+  # RDNA2 decoder rather than a Python port of its length rules, so the decode arms exercise
+  # `rdna2_decode.cpp` itself and a change to its length dispatch reddens this suite. Guarded on
+  # `TARGET prosper_core` because that is what governs the executable; the generator expression
+  # resolves against the target added later in this file. Without the binary the suite exits 2
+  # (could not test) rather than reporting a pass.
+  if(TARGET prosper_core)
+    add_test(NAME shader_conformance_scan_logic
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/shader_conformance/scan.py" "--self-test"
+                     "--mimg-decoder" "$<TARGET_FILE:shader_inspect>")
+  endif()
   # stack_profile's frame classifier, against RECORDED gdb output. Deliberately needs no gdb and no
   # ptrace: an end-to-end variant would skip silently wherever ptrace is unavailable, and a silently
   # skipped test is indistinguishable from a passing one. What it pins is the case that already
@@ -1712,6 +1722,13 @@ if(TARGET prosper_core)
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
   add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
+
+  # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
+  # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
+  # then cannot tell which arms moved. This reports every arm independently.
+  add_executable(test_entry_m0_dispatcher tests/gpu/recompiler/test_entry_m0_dispatcher.cpp)
+  target_link_libraries(test_entry_m0_dispatcher PRIVATE prosper_core)
+  add_test(NAME entry_m0_dispatcher COMMAND test_entry_m0_dispatcher)
 
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
   add_executable(test_dynfetch_fold tests/gpu/recompiler/test_dynfetch_fold.cpp)

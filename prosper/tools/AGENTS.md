@@ -405,6 +405,11 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
   instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a
   failed shader's CFG can be mapped without hand-counting variable-length instructions.
+  **`--mimg-sites` is the machine-readable half (#3184)**: one `mimg-site pc=… op=… dim=…` line per
+  image instruction and nothing else, so a tool that needs to know where the MIMG instructions are
+  never has to carry its own port of the RDNA2 length rules. `shader_conformance/scan.py` did carry
+  one, and now consumes this instead. The trailing `mimg-sites-end` line is a completion sentinel —
+  a real empty census must never look like a process that died before printing.
   **And it answers "which opcode?", never "which value?" (#2132).** A fold that stops early looks
   identical whether it ran out of modelled opcodes or out of *readable data* — the reject line is the
   same — and a disassembler can only see the first. Sonic Racing: CrossWorlds' failing vertex fetch

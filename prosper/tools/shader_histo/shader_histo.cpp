@@ -13,6 +13,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <vector>
 
@@ -84,9 +85,20 @@ int main(int argc, char** argv) {
     }
     printf("shaders=%d  total_insts=%zu  distinct(fmt,op)=%zu  unknown=%zu\n", shaders, total, histo.size(), unknown);
     // Memory/interp/export formats show op=0x0 (their sub-opcodes are not decoded yet — format count only).
-    const char* fn[] = {"SOP2","SOP1","SOPK","SOPC","SOPP","SMEM","VOP2","VOP1","VOPC","VOP3",
-                        "VINTRP","DS","MUBUF","MTBUF","MIMG","FLAT","EXP","UNK"};
-    for (auto& [k, c] : histo) printf("  %-6s op=0x%-4x x%u\n", fn[k.first], k.second, c);
+    // One entry per Rdna2Format value, in enum order, INCLUDING the terminal Unknown. This table is
+    // indexed by a decoded format, so it must cover the enum exactly: it went one short when VOP3P
+    // was inserted before Unknown, which labelled every VOP3P instruction "UNK" and read one past
+    // the end for Unknown itself -- 4 of 55 local dumps segfaulted on it, and the rest printed
+    // whatever the out-of-bounds pointer landed on (#3229). The static_assert is the guard that
+    // makes the next enum addition a build failure instead of a garbage label, and `format_name`
+    // bounds every lookup so even a bypassed assert is a visible "?" rather than a crash.
+    static const char* const fn[] = {"SOP2","SOP1","SOPK","SOPC","SOPP","SMEM","VOP2","VOP1","VOPC",
+                                     "VOP3","VINTRP","DS","MUBUF","MTBUF","MIMG","FLAT","EXP",
+                                     "VOP3P","UNK"};
+    static_assert(std::size(fn) == (size_t)Rdna2Format::Unknown + 1,
+                  "shader_histo's format names must cover every Rdna2Format value");
+    auto format_name = [](int f) { return f < 0 || (size_t)f >= std::size(fn) ? "?" : fn[f]; };
+    for (auto& [k, c] : histo) printf("  %-6s op=0x%-4x x%u\n", format_name(k.first), k.second, c);
 
     // --- Recompiler coverage report (how much of the real shaders we can translate today) ---
     // Two numbers: the table-LESS floor (what this compute-shell/no-table pass exercises), and the
@@ -102,6 +114,6 @@ int main(int argc, char** argv) {
            shaders_full, shaders_full_ctx, shaders);
     printf("  top blockers (first TRULY-unsupported inst per shader -- table-dependent shapes excluded):\n");
     for (auto& [k, c] : blockers)
-        printf("    %-6s op=0x%-4x blocks %u shader(s)\n", k.first < 0 ? "?" : fn[k.first], k.second, c);
+        printf("    %-6s op=0x%-4x blocks %u shader(s)\n", format_name(k.first), k.second, c);
     return 0;
 }
