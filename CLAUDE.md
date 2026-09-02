@@ -868,11 +868,13 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       reports rows, with a `commit_id` that is no longer on the branch. Compare each review's `commit_id`
       against the current head; if it is stale, establish by **content** (`git diff <reviewed-sha> <head>`)
       whether the approval still applies rather than assuming in either direction.
-    - **The same detachment applies to CI CHECKS, and that half cost a merge.** On #3243 GitHub's
-      recorded PR head froze while the branch advanced two commits; no run was ever queued for the
-      newer ones, `gh pr checks` reported green for the frozen head, and the merge carried code CI
-      had never seen. So compare `headRefOid` against `git ls-remote origin refs/heads/<branch>`
-      before merging, not only the reviews' `commit_id`.
+    - **The same detachment applies to CI CHECKS**, which the bullet above does not cover: a branch
+      pushed after its checks started leaves `gh` reporting green for a commit that is no longer
+      what would merge. So compare `headRefOid` against `git ls-remote origin refs/heads/<branch>`
+      before merging, not only the reviews' `commit_id`. **No merge here is known to have been lost
+      this way** — #3243 was first written up as one and that was wrong on the dates (its head *was*
+      the tip at merge; the extra commits were authored minutes later), so treat this as a cheap
+      precaution rather than a scar. What actually let #3243 through was the review half above.
     - **Never gate on the TEXT output of `gh pr checks`.** Its columns are tab-separated and this
       repository's check names contain spaces — `Windows App`, `Linux App Package`,
       `macOS (x86_64 / Rosetta 2)` — so splitting on whitespace puts the second *word of the name*

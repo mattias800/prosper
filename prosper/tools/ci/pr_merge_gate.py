@@ -14,12 +14,19 @@ is exactly what makes them dangerous. So this tool consumes `--json name,state,b
 the text form, and `parse_checks` rejects a payload that is not that JSON shape rather than
 falling back to a looser parse.
 
-**CI green can describe a commit that would not merge.** GitHub's recorded PR head can lag the
-branch: on #3243 it froze while the branch advanced two commits, no run was ever queued for the
-newer ones, and the merge carried code CI had never seen. `CLAUDE.md` records this detachment for
-*reviews* ("a rebase or a new push detaches every review from head"); it applies identically to
-*checks*, and that half was written down nowhere. So the head the checks describe is compared
-against the real branch tip, and a mismatch refuses however green the checks are.
+**CI green can describe a commit that would not merge.** A branch pushed after its checks started
+leaves `gh` reporting green for a commit that is no longer what a merge would take. `CLAUDE.md`
+records this detachment for *reviews* ("a rebase or a new push detaches every review from head");
+the same applies to *checks*. So the PR's recorded head is compared against the real branch tip and
+a mismatch refuses however green the checks are.
+
+This rule is here on its own merits, and it is worth being precise about what it has NOT done. An
+earlier version of this file claimed it would have caught #3243. **That claim was false** and was
+withdrawn after review: #3243's head *was* the branch tip when it merged, all eleven checks on that
+exact commit were green fifteen seconds earlier, and the two commits that made the branch look
+advanced were authored minutes AFTER the merge. What let that PR through was the review half, not
+CI, and no head comparison would have helped. The error was inferring that a gap seen *now* existed
+*at merge time* -- so the rule stands, but this tool claims no save it did not make.
 
 **An empty check list is VOID, not green.** Immediately after a push, `gh pr checks` can report
 nothing at all. "No checks failed" and "no checks ran" are the same answer to a naive `fail == 0`
@@ -175,19 +182,46 @@ def _run(cmd, cwd):
     return p.stdout
 
 
+def resolve_tip(ls_output, branch):
+    """Pick the tip for exactly `refs/heads/<branch>` out of `git ls-remote` output.
+
+    `git ls-remote origin refs/heads/foo` matches by SUFFIX, so a branch literally named
+    `bar/refs/heads/foo` comes back on the same query. Taking the first line would then compare
+    against the wrong branch and could report GREEN for one that was never checked. Improbable,
+    but a gate whose failure mode is a false GREEN does not get to rely on improbability.
+    """
+    want = "refs/heads/%s" % branch
+    hits = []
+    for line in ls_output.splitlines():
+        if "\t" not in line:
+            continue
+        sha, ref = line.split("\t", 1)
+        if ref.strip() == want:
+            hits.append(sha.strip())
+    if not hits:
+        raise GateError("branch %s has no remote tip -- deleted, or never pushed?" % branch)
+    if len(hits) > 1:
+        raise GateError("branch %s resolved to %d tips" % (branch, len(hits)))
+    return hits[0]
+
+
 def collect(pr, repo_dir):
     checks = parse_checks(_run(["gh", "pr", "checks", str(pr), "--json", "name,state,bucket"], repo_dir))
     view = _run(["gh", "pr", "view", str(pr), "--json", "headRefOid,headRefName"], repo_dir)
     try:
         info = json.loads(view)
-        pr_head, branch = info["headRefOid"], info["headRefName"]
-    except (ValueError, KeyError) as exc:
-        raise GateError("could not read PR head: %s" % exc)
-    ls = _run(["git", "ls-remote", "origin", "refs/heads/%s" % branch], repo_dir)
-    tip = ls.split("\t")[0].strip() if ls.strip() else ""
-    if not tip:
-        raise GateError("branch %s has no remote tip -- deleted, or never pushed?" % branch)
-    return checks, pr_head, tip
+    except ValueError as exc:
+        raise GateError("could not parse PR view: %s" % exc)
+    pr_head, branch = info.get("headRefOid"), info.get("headRefName")
+    # A null/absent head is NOT a reason to skip the comparison. Treating it as "no head
+    # information" made the gate print no head line at all and exit 0 -- a silent GREEN exactly
+    # where the verification should have been.
+    if not isinstance(pr_head, str) or not pr_head.strip():
+        raise GateError("PR %s reports no headRefOid -- cannot verify what would merge" % pr)
+    if not isinstance(branch, str) or not branch.strip():
+        raise GateError("PR %s reports no headRefName -- cannot resolve the branch tip" % pr)
+    tip = resolve_tip(_run(["git", "ls-remote", "origin", "refs/heads/%s" % branch], repo_dir), branch)
+    return checks, pr_head.strip(), tip
 
 
 def main(argv=None):
@@ -201,6 +235,15 @@ def main(argv=None):
     except GateError as exc:
         # Exit 2, never 1: "the gate could not run" must be distinguishable from "the gate said no".
         print("GATE #%d: COULD NOT EVALUATE -- %s" % (args.pr, exc), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 -- deliberate catch-all, see below
+        # An UNEXPECTED exception is also "could not evaluate", and it must not escape. Letting a
+        # traceback propagate exits 1, which this tool defines as "the gate said no" -- so a bug in
+        # the gate would masquerade as a considered refusal, and worse, a caller keying on 1-vs-2
+        # would mis-route it. Mutation testing found exactly this: a mutant that let a null head
+        # through raised AttributeError deep in collect() and surfaced as a plain rc=1.
+        print("GATE #%d: COULD NOT EVALUATE -- unexpected %s: %s"
+              % (args.pr, type(exc).__name__, exc), file=sys.stderr)
         return 2
     res = evaluate(checks, head, tip)
     if args.json:

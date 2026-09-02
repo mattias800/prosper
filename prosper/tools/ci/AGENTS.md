@@ -35,9 +35,12 @@ harder half for a boolean gate: because nearly every arm is a refusal, and a gat
 
 ## A note on gates that decide something irreversible
 
-`pr_merge_gate.py` exists because two PRs merged wrongly on one day (#3259), and neither cause was
-carelessness — a check name containing a space was read as a status, and CI reported green for a
-commit the branch had moved past. Both readings looked plausible. When a check here decides
+`pr_merge_gate.py` exists because a PR merged red (#3234) when a shell gate split `gh pr checks`'s
+tab-separated output on whitespace and read the second word of `Windows MinGW` as a status — a
+reading that looked entirely plausible. Its head-vs-tip rule is a precaution rather than a scar:
+#3259 originally cited #3243 as a second incident and that was **wrong on the dates**, which is
+itself the lesson worth keeping — the claim was withdrawn only because a reviewer dated the commits
+against `mergedAt` instead of trusting a frozen-looking PR record. When a check here decides
 something that cannot be undone by rerunning it, prefer being wrong in the direction of refusing:
 exit non-zero on anything unrecognised, treat an empty result as void rather than clean, and use a
 distinct exit status for "could not evaluate" so it can never be confused with "evaluated, and the

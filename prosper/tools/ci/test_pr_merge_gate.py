@@ -24,7 +24,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pr_merge_gate import GateError, evaluate, parse_checks  # noqa: E402
+import pr_merge_gate  # noqa: E402
+from pr_merge_gate import GateError, evaluate, parse_checks, resolve_tip  # noqa: E402
 
 FAILURES = []
 
@@ -123,9 +124,107 @@ for label, payload in [
     except GateError:
         case(label + " is rejected", "GateError", "GateError")
 
-print("\n-- head comparison is skipped only when the caller supplies no heads")
+print("\n-- evaluate() without heads is the PURE contract, not a reachable gate state")
+# evaluate() is deliberately usable without head information so the arms above can drive it. That
+# is NOT a state a real run can reach: collect() raises before returning a null head, and the
+# main() arms below pin that. Keeping this arm without that note previously read as blessing a
+# silent GREEN with no head verification.
 res = evaluate(parse_checks(rows(("Linux", "pass"))), None, None)
 case("no head information given -> checks alone decide", res.ok, True)
+
+
+# ---------------------------------------------------------------------------------------------
+# The I/O layer. Everything above drives evaluate(), which is pure -- and a suite that stops there
+# leaves collect() and main() pinned by NOTHING. Review demonstrated five mutations in those two
+# functions that the pure-function arms could not see, two of them fatal:
+#
+#     return 2  -> return 0   in main's `except GateError`   : exit 0 on ANY tooling failure
+#     `0 if res.ok else 1` -> `0`                            : a gate that APPROVES EVERYTHING
+#
+# The second is the mirror of the flaw the arms above defend against. Those arms guard against a
+# gate stuck at "no"; nothing guarded against one stuck at "yes", because no arm ever called main().
+# `_run` is the single process boundary, so monkeypatching it covers both functions with no
+# production seam.
+# ---------------------------------------------------------------------------------------------
+
+print("\n-- resolve_tip matches the ref EXACTLY, not by suffix")
+LS_ONE = "aaaa1111\trefs/heads/topic\n"
+LS_DECOY = "bbbb2222\trefs/heads/other/refs/heads/topic\naaaa1111\trefs/heads/topic\n"
+case("a single exact match resolves", resolve_tip(LS_ONE, "topic"), "aaaa1111")
+# git ls-remote matches by SUFFIX, so this decoy really does come back on the same query. Taking
+# line 1 would compare against a branch nobody asked about -- and report GREEN for it.
+try:
+    case("a suffix decoy on line 1 does not win", resolve_tip(LS_DECOY, "topic"), "aaaa1111")
+except GateError as exc:
+    # Reported as a named failure rather than an escaping traceback: a suffix-matching
+    # implementation raises here (two hits) instead of returning the wrong sha, and a suite that
+    # dies with a stack trace tells the reader far less than one that names the arm.
+    case("a suffix decoy on line 1 does not win", "GateError: %s" % exc, "aaaa1111")
+for label, out, br in [("no match refuses", "", "topic"),
+                       ("only a suffix decoy refuses", "bbbb2222\trefs/heads/x/refs/heads/topic\n", "topic")]:
+    try:
+        resolve_tip(out, br); case(label, "returned", "GateError")
+    except GateError:
+        case(label, "GateError", "GateError")
+
+
+class FakeGh:
+    """Stands in for `_run`, keyed on the command being asked for."""
+
+    def __init__(self, checks_json, view_json, ls_out, fail_on=None):
+        self.checks_json, self.view_json, self.ls_out, self.fail_on = checks_json, view_json, ls_out, fail_on
+
+    def __call__(self, cmd, cwd):
+        joined = " ".join(cmd)
+        if self.fail_on and self.fail_on in joined:
+            raise GateError("simulated failure of %s" % self.fail_on)
+        if cmd[0] == "git":
+            return self.ls_out
+        if "checks" in cmd:
+            return self.checks_json
+        return self.view_json
+
+
+GREEN_CHECKS = '[{"name": "Windows App", "bucket": "pass", "state": "S"}]'
+RED_CHECKS = '[{"name": "Windows MinGW", "bucket": "fail", "state": "F"}]'
+VIEW = '{"headRefOid": "aaaa1111", "headRefName": "topic"}'
+
+
+def run_main(fake, argv=("1",)):
+    real = pr_merge_gate._run
+    pr_merge_gate._run = fake
+    try:
+        return pr_merge_gate.main(list(argv))
+    finally:
+        pr_merge_gate._run = real
+
+
+print("\n-- main() exit codes: the arms that pin a gate stuck at YES")
+case("all green, head == tip -> exit 0",
+     run_main(FakeGh(GREEN_CHECKS, VIEW, LS_ONE)), 0)
+# Without this arm, replacing main's return with a bare `return 0` passes the whole suite.
+case("a FAILING check -> exit 1, never 0",
+     run_main(FakeGh(RED_CHECKS, VIEW, LS_ONE)), 1)
+case("head behind the branch tip -> exit 1, never 0",
+     run_main(FakeGh(GREEN_CHECKS, VIEW, "cccc3333\trefs/heads/topic\n")), 1)
+
+print("\n-- main() distinguishes 'could not run' from 'said no'")
+# `return 2 -> return 0` here means every auth failure, network failure and malformed payload
+# reports a clean merge. This is the single most dangerous mutation in the file.
+case("gh failure -> exit 2, not 0 and not 1",
+     run_main(FakeGh(GREEN_CHECKS, VIEW, LS_ONE, fail_on="pr checks")), 2)
+case("git ls-remote failure -> exit 2",
+     run_main(FakeGh(GREEN_CHECKS, VIEW, LS_ONE, fail_on="ls-remote")), 2)
+case("a malformed check payload -> exit 2",
+     run_main(FakeGh("not json at all", VIEW, LS_ONE)), 2)
+
+print("\n-- a PR with no usable head must REFUSE, not silently skip the head check")
+# Previously headRefOid: null left pr_head=None, evaluate skipped the comparison, render() printed
+# no head line, and the gate exited 0 -- a silent GREEN precisely where the verification belonged.
+for label, view in [("headRefOid null", '{"headRefOid": null, "headRefName": "topic"}'),
+                    ("headRefOid empty", '{"headRefOid": "", "headRefName": "topic"}'),
+                    ("headRefName missing", '{"headRefOid": "aaaa1111"}')]:
+    case(label + " -> exit 2, never 0", run_main(FakeGh(GREEN_CHECKS, view, LS_ONE)), 2)
 
 print()
 if FAILURES:
