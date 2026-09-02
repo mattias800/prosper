@@ -95,7 +95,10 @@ MemorySearchScope memory_search_ranges(const std::vector<MemorySearchRange>& ran
                         h.addr = addr;
                         // `full` needs the whole needle to be PRESENT as well as equal. At a range
                         // end it may not be, and claiming a full match over bytes that were never
-                        // read is the one answer this instrument must never give.
+                        // read is the one answer this instrument must never give. It is also a
+                        // BOUNDS guard, not only a correctness one: when a range's last chunk is
+                        // exactly `chunk` bytes, an unguarded memcmp of needle_len from `off` reads
+                        // past the end of `buf`.
                         h.full = off + needle_len <= want &&
                                  memcmp(hit, needle, needle_len) == 0;
                         out.push_back(h);
