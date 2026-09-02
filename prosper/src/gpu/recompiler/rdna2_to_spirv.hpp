@@ -77,9 +77,20 @@ bool compute_trip_witness_active(uint64_t program_address);
 // would let a target and a non-target with identical bodies share one compiled module.
 struct ComputeTripBoundSettings {
     static constexpr uint32_t kAllPhases = 0xffffffffu;
+    static constexpr uint32_t kAllOrdinals = 0xffffffffu;
     uint32_t bound = 0;              // 0 = disarmed; nothing is emitted and modules are unchanged
     uint64_t only_program = 0;       // 0 = every program
     uint32_t only_phase = kAllPhases; // kAllPhases = every dispatcher phase
+    // PROSPER_CFG_TRIP_BOUND_ORDINAL=K — count only the back-edge traversals that are ABOUT TO
+    // dispatch ordinal K, so one guest loop inside a multi-loop program can be capped alone.
+    //
+    // The dispatcher emits ONE back edge for a whole program, so a plain bound answers "does some
+    // loop here run away" and cannot say which. A program with several guest loops therefore needs
+    // one arm per candidate: cap the ordinal that is each loop's HEADER (read it off the dispatch
+    // map the arm prints), and the loop whose cap changes the outcome is the one that runs away.
+    // A cap on a loop that terminates on its own is inert, which is exactly what makes the negative
+    // arms informative rather than merely quiet.
+    uint32_t only_ordinal = kAllOrdinals;
 };
 ComputeTripBoundSettings compute_trip_bound_settings();
 
