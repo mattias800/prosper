@@ -8,6 +8,7 @@
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/texture/seed_reprove.hpp"
 #include "shared/device/vulkan_device_select.hpp"
+#include "shared/texture/write_watch_census.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger compute timing
 #include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
@@ -348,6 +349,31 @@ void report_alias_census() {
                  static_cast<unsigned long long>(c.seed_ranges),
                  static_cast<unsigned long long>(c.write_ranges));
 }
+// #3155 write-watch promotion census (see shared/texture/write_watch_census.hpp for why it is
+// counted from inside the decision rather than by interposing on memcmp).
+//
+// Counting is unconditional; only the report is gated on PROSPER_WATCH_PROMOTE_CENSUS. Unlike the
+// alias census above -- whose counters are deliberately non-atomic because it instruments a
+// per-dispatch path it must not perturb -- these fire at most a few times per cached resource, on
+// a path whose expensive branch is a multi-megabyte memcmp, so a relaxed atomic add is free by
+// comparison and lets a test read the totals from another thread.
+prosper::frontend::WriteWatchCensus g_write_watch_census;
+
+bool write_watch_census_report_enabled() {
+    static const bool on = std::getenv("PROSPER_WATCH_PROMOTE_CENSUS") != nullptr;
+    return on;
+}
+
+void report_write_watch_census() {
+    // 1 KiB, not 512: the two lines carry thirteen counters plus three MiB figures, which fits 512
+    // only while the counters stay under about ten digits. Truncation is graceful but silently
+    // drops the second line, which is the one carrying the cost partition.
+    char line[1024];
+    const size_t used = prosper::frontend::format_write_watch_census(
+        g_write_watch_census.snapshot(), line, sizeof line);
+    if (used) std::fwrite(line, 1, used, stderr);
+}
+
 std::atomic<uint64_t> g_dcc_forced_seed_allocation_reuses{0};
 std::atomic<uint64_t> g_dcc_post_writeback_replacements{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
@@ -1085,6 +1111,50 @@ uint32_t compute_write_watch_promotion_validations() {
     return value;
 }
 
+// The size half of the promotion policy, which this path has never used.
+//
+// `should_promote_write_watch`'s contract is "promote large sources only after repeated unchanged
+// reuse; smaller sources still arm immediately", and the renderer's texture cache spells that as
+// PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB (default 8 MiB) -- so a 1-8 MiB texture there arms on
+// first sight. The compute call site has always passed a literal 1, which makes
+// `source_bytes < defer_min_bytes` false for every real source and leaves the stability ladder as
+// the only route to a watch.
+//
+// Whether that asymmetry is deliberate is genuinely open (#3155): a compute source may be a storage
+// RESULT that changes every frame, where arming an unproven watch is wasted mprotect/fault/rearm
+// work, but the same cache also holds ordinary sampled inputs at a 1 MiB crossover -- and #3155
+// measured 87% of this path's compare bytes in 512 KiB-4 MiB sources, exactly the band the renderer
+// exempts. Answering it needs production numbers, so this exists to make the A/B an environment
+// sweep instead of a patch. THE DEFAULT IS THE HISTORICAL LITERAL and changes nothing:
+//   unset  -> 1 byte, i.e. every source must climb the ladder (today's behaviour)
+//   =8192  -> 8 MiB, renderer parity
+//   =0     -> defer nothing; every source arms on first acquisition
+// Pair it with PROSPER_WATCH_PROMOTE_CENSUS, which reports what each setting actually bought.
+size_t compute_write_watch_defer_min_bytes() {
+    static const size_t value = [] {
+        constexpr size_t historical_default = 1;
+        const char* text = std::getenv("PROSPER_COMPUTE_WATCH_DEFER_MIN_KB");
+        if (!text || !*text) return historical_default;
+        // Refuse a malformed value LOUDLY and keep the default. A bare `strtoull` answers 0 for
+        // anything non-numeric, and 0 here means "defer nothing" -- the most aggressive setting on
+        // the knob. A typo must cost you the experiment, never hand you a different one you did not
+        // ask for and cannot see in the run's own output.
+        char* end = nullptr;
+        const uint64_t kib = std::strtoull(text, &end, 10);
+        if (end == text || (end && *end)) {
+            std::fprintf(stderr,
+                         "[watch-policy] PROSPER_COMPUTE_WATCH_DEFER_MIN_KB='%s' is not a number "
+                         "-- the compute defer minimum stays at its default and NOTHING is being "
+                         "A/B'd\n",
+                         text);
+            return historical_default;
+        }
+        return static_cast<size_t>(
+            std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
+    }();
+    return value;
+}
+
 size_t compute_write_watch_promotion_budget_bytes() {
     static const size_t value = [] {
         const char* text = std::getenv("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB");
@@ -1766,7 +1836,15 @@ struct VulkanComputeContext {
 
     void begin_write_watch_promotions() {
         write_watch_promotion_budget.reset(compute_write_watch_promotion_budget_bytes());
+        if (!write_watch_census_report_enabled()) return;
+        // Report periodically as well as at exit, for the same reason the alias census does: a
+        // bounded run is usually stopped with SIGTERM, whose default action skips atexit entirely,
+        // and an atexit-only census then yields a clean run and no number.
+        if (++write_watch_census_submits % 256 == 0) report_write_watch_census();
+        static const bool once = [] { std::atexit(report_write_watch_census); return true; }();
+        (void)once;
     }
+    uint64_t write_watch_census_submits = 0;
 
     bool may_promote_write_watch_before_exact(size_t source_bytes,
                                               uint32_t stable_validations) {
@@ -1774,10 +1852,19 @@ struct VulkanComputeContext {
             compute_write_watch_promotion_validations();
         const uint32_t prospective_stability = update_write_watch_stability(
             stable_validations, true, promotion_validations);
-        return should_promote_write_watch(
-                   source_bytes, prospective_stability, 1,
-                   promotion_validations) &&
-               write_watch_promotion_budget.try_consume(source_bytes);
+        // The defer minimum defaults to the historical literal 1, which makes the policy's size
+        // exemption unreachable and leaves the stability ladder as the only route to a watch. See
+        // compute_write_watch_defer_min_bytes() for why that is an open question rather than an
+        // obvious defect, and do not change its default without production census numbers -- #3155
+        // has already retracted one measurement and closed one PR that retuned this mechanism.
+        const bool threshold_met = should_promote_write_watch(
+            source_bytes, prospective_stability, compute_write_watch_defer_min_bytes(),
+            promotion_validations);
+        const bool granted =
+            threshold_met && write_watch_promotion_budget.try_consume(source_bytes);
+        g_write_watch_census.record_promotion_decision(
+            stable_validations, threshold_met, granted);
+        return granted;
     }
 
     enum class SnapshotReason { Unattributed, HostData, ReadModifyWrite, ContentChanged };
@@ -1859,6 +1946,8 @@ struct VulkanComputeContext {
         }
         dirty_watch_chunks = static_cast<uint32_t>(dirty_chunks.size());
         upload_skipped = submit_unchanged || (watches_complete && dirty_chunks.empty());
+        if (submit_unchanged) g_write_watch_census.record_journal_skip(key.bytes);
+        else if (upload_skipped) g_write_watch_census.record_watch_skip(key.bytes);
         if (!upload_skipped) {
             // Establish the mutation boundary before the authoritative guest-byte comparison.
             // Arming after memcmp would leave a compare-to-arm gap where a concurrent guest CPU
@@ -1874,16 +1963,24 @@ struct VulkanComputeContext {
             if (watches_complete) {
                 bool changed = false;
                 auto* destination = static_cast<uint8_t*>(mapped);
+                // One census record per ACQUISITION, carrying the summed dirty-chunk bytes, so the
+                // three proofs stay a partition of the same denominator. This partial compare is
+                // exactly what an armed watch buys on the buffer path: the clean chunks are never
+                // read.
+                uint64_t compared_bytes = 0;
                 for (size_t index : dirty_chunks) {
                     const ComputeBufferWriteWatchChunk& chunk = cached.write_watches[index];
+                    compared_bytes += chunk.bytes;
                     if (std::memcmp(destination + chunk.offset, source + chunk.offset,
                                     chunk.bytes) == 0)
                         continue;
                     std::memcpy(destination + chunk.offset, source + chunk.offset, chunk.bytes);
                     changed = true;
                 }
+                g_write_watch_census.record_exact_compare(compared_bytes);
                 upload_skipped = !changed;
             } else {
+                g_write_watch_census.record_exact_compare(key.bytes);
                 const bool changed = !compute_buffers_equal(mapped, source, key.bytes);
                 if (changed) copy_compute_buffer(mapped, source, key.bytes);
                 upload_skipped = !changed;
@@ -2104,10 +2201,21 @@ struct VulkanComputeContext {
                     key.gpu_addr, key.guest_bytes);
             }
         }
-        const bool exact_unchanged = cached.content_valid && !submit_unchanged &&
-            !watch_unchanged && source &&
-            cached.source_snapshot.size() == key.guest_bytes &&
-            std::memcmp(cached.source_snapshot.data(), source, key.guest_bytes) == 0;
+        // Same predicate as before, split so the census can count the comparison WHERE IT RUNS.
+        // Recording at the consumer would over-count: the chain reaches `exact_unchanged` through
+        // several branches that never touch a byte (no source, no retained snapshot, a snapshot of
+        // the wrong size, an entry whose content is not valid).
+        bool exact_unchanged = false;
+        if (cached.content_valid && !submit_unchanged && !watch_unchanged && source &&
+            cached.source_snapshot.size() == key.guest_bytes) {
+            g_write_watch_census.record_exact_compare(key.guest_bytes);
+            exact_unchanged =
+                std::memcmp(cached.source_snapshot.data(), source, key.guest_bytes) == 0;
+        } else if (submit_unchanged) {
+            g_write_watch_census.record_journal_skip(key.guest_bytes);
+        } else if (watch_unchanged) {
+            g_write_watch_census.record_watch_skip(key.guest_bytes);
+        }
         upload_skipped = submit_unchanged || watch_unchanged || exact_unchanged;
         cached.validation_epoch = validation_epoch;
         cached.validation_result = upload_skipped;
@@ -10509,6 +10617,10 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
 
 uint64_t live_compute_buffer_gpu_result_skips() {
     return g_buffer_gpu_result_skips.load(std::memory_order_relaxed);
+}
+
+WriteWatchCensusSnapshot live_compute_write_watch_census() {
+    return g_write_watch_census.snapshot();
 }
 
 uint64_t live_compute_sampled_image_upload_skips() {
