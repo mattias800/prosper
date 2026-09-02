@@ -280,6 +280,14 @@ struct FrameRate {
     // Share of the window spent producing frames at roughly the typical rate, in [0, 1]. Always
     // shown beside typical_fps: on its own the headline could describe two frames half a second
     // apart in an otherwise dead run, and this is the field that says so.
+    //
+    // `active_fraction_measured` says whether the number below is a MEASUREMENT or an unset default,
+    // and it exists because 0 otherwise means two incompatible things. On a run rate 0% is the
+    // load-bearing verdict "this title produced nothing"; on a differenced window it means only that
+    // the field was never filled, because frame_rate_between cannot fill it (see there). Anything
+    // that prints the fraction -- or that reports frame_rate_is_mostly_unchanged, whose contract is
+    // to print it -- has to test this first. #3027.
+    bool active_fraction_measured = false;
     double active_fraction = 0;
 };
 
@@ -291,10 +299,29 @@ FrameRate frame_rate_since_first_publication(const PresentRateSnapshot& snapshot
 // Window = [earlier, later]. Returns an unmeasured result if the counters moved backwards, which
 // can only mean a reset happened between the two readings.
 //
-// `typical_fps` and `active_fraction` are NOT filled in here, and `typical_measured` stays false: a
-// histogram accumulated since process start cannot be differenced. Callers that want a live rate
-// over a short window (prosper-app's HUD) should use `distinct_fps`, which over a one-second window
-// is not meaningfully an average of anything.
+// `typical_fps` and `active_fraction` are NOT filled in here; `typical_measured` and
+// `active_fraction_measured` both stay false. Callers that want a live rate over a short window
+// (prosper-app's HUD) should use `distinct_fps`, which over a one-second window is not meaningfully
+// an average of anything.
+//
+// TWO INDEPENDENT REASONS, AND THE SECOND IS THE ONE THAT SETTLES IT (#3027).
+//
+// 1. `active_seconds` is a whole-run RECOMPUTATION, not an accumulator, so it cannot be differenced.
+//    Each snapshot re-derives it against the CURRENT median interval, and that cutoff moves as the
+//    run goes on -- so the quantity subtracted at the near end is not the quantity added at the far
+//    one. Measured on the counter itself (the arm in tests/gpu/present pins all three):
+//      * 201 publications at 1 fps then 1000 at 60 fps takes active_seconds from 200.000 s to
+//        16.650 s, so the difference is NEGATIVE: -183.4 s across a 16.7 s window, "-1100% active";
+//      * a window holding 6000 consecutive frames at a perfect 60 fps differences to 1.0% active;
+//      * a window holding 100 frames at a healthy-and-slow 1 fps differences to 0.02%.
+//    The last two are the dangerous ones: they are positive, plausible, and read as exactly the
+//    "produced nothing" shape this metric exists to flag.
+// 2. Even a perfectly differenceable active share would answer the wrong question. The distinction
+//    active_fraction protects -- "a static menu that HAS produced frames" against "a title that has
+//    produced nothing" -- is a property of the RUN, not of the window. Inside one second the two are
+//    indistinguishable by construction, because in both cases nothing changed during that second. No
+//    statistic computed from the window alone can separate them; the answer lives in the cumulative
+//    snapshot. That is what `unchanged_picture` below takes, and why it takes it.
 FrameRate frame_rate_between(const PresentRateSnapshot& earlier, const PresentRateSnapshot& later);
 
 // Two lines. The first is the headline and its qualifier and nothing else; the second is every
@@ -310,6 +337,11 @@ std::string format_frame_rate(const FrameRate& rate);
 // A compact form for burning into an image or drawing in a HUD:
 // "18.5 fps  62% active  3840x2160". Falls back to the run average when the typical rate is not
 // available (a short window, or frame_rate_between), and to "--" when nothing was produced.
+//
+// The "0% active" that accompanies "--" is a MEASUREMENT -- it is the sentence "this run produced
+// nothing" -- so it is emitted only when `active_fraction_measured` says the fraction was computed.
+// A differenced window gets "-- fps  WxH" with no active claim, because one second of stillness is
+// not evidence about the run (#3027).
 std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint32_t height);
 
 // True when publications kept arriving but almost none of them carried new content.
@@ -331,7 +363,16 @@ std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint3
 //
 // `active_fraction` is what separates (a) from (b): a static menu still produced frames before it
 // arrived, so its active share is non-zero; a title that produced nothing has an absent typical rate
-// and 0% active. Any caller that reports this predicate must report that alongside it.
+// and 0% active. Any caller that reports this predicate must report that alongside it -- WHICH IS
+// POSSIBLE EXACTLY WHEN `rate.active_fraction_measured` IS TRUE, i.e. when the rate came from
+// `frame_rate_since_first_publication`. Those are tools/screenshot's summary line and its manifest;
+// they print the fraction on the spot, and this predicate is theirs.
+//
+// A WINDOWED CALLER MUST NOT REPORT THIS PREDICATE BARE -- use `unchanged_picture` below. Until
+// #3027 the requirement above was stated unconditionally, which made it unsatisfiable for every
+// caller of `frame_rate_between`: it demanded a field that constructor cannot fill, for the two
+// reasons spelled out there. So the requirement stands, and the windowed form of it takes the
+// cumulative snapshot as an ARGUMENT rather than leaving it as an instruction nobody could follow.
 //
 // The thresholds are named parameters so nobody has to guess what "almost none" meant, and the
 // predicate keys on the FRACTION rather than an absolute rate because titles here legitimately run
@@ -339,6 +380,50 @@ std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint3
 bool frame_rate_is_mostly_unchanged(const FrameRate& rate,
                                     uint64_t min_published = 30,
                                     double max_distinct_fraction = 0.5);
+
+// The windowed form of that predicate, and the reason this file has two.
+//
+// A rolling window can see that the picture stopped changing. It cannot see whether the title ever
+// produced anything, because within one second a static menu and a re-served retained frame are the
+// same bytes. So the classification takes BOTH: the window that fired the predicate, and the
+// cumulative snapshot that says what the run has managed so far. The second argument is not a
+// convenience -- it IS the disambiguating figure the contract above demands, made impossible to
+// omit.
+enum class PictureChange : uint8_t {
+    changing,          // the window carried new content -- there is nothing to report
+    static_picture,    // unchanged across this window, and the run HAS produced frames: case (b)
+    nothing_produced,  // unchanged, and the run has produced nothing at all: the case (a) shape
+};
+
+// The verdict and the run-wide evidence for it in one value, so a caller cannot hold the first
+// without the second. The `run_*` fields come from frame_rate_since_first_publication(run) and are
+// filled whatever the verdict is.
+struct UnchangedPicture {
+    PictureChange change = PictureChange::changing;
+    bool run_typical_measured = false;   // false => fewer than two distinct frames in the WHOLE run
+    double run_typical_fps = 0;
+    double run_active_fraction = 0;
+    uint64_t run_distinct = 0;
+};
+
+// `window` is what frame_rate_between returned; `run` is the cumulative snapshot the window's later
+// end was read from. The two thresholds are frame_rate_is_mostly_unchanged's, unchanged.
+//
+// `nothing_produced` keys on the RUN having no typical rate -- which is literally the "absent
+// typical rate and 0% active" the paragraph above names -- rather than on a threshold somebody
+// tuned. The borderline case (two distinct frames a long way apart) is left LEGIBLE rather than
+// arbitrated: the formatter prints the rate, the share and the distinct COUNT, so a reader can see
+// the population a verdict rests on instead of inheriting a hidden cutoff.
+UnchangedPicture unchanged_picture(const FrameRate& window, const PresentRateSnapshot& run,
+                                   uint64_t min_published = 30,
+                                   double max_distinct_fraction = 0.5);
+
+// The line a caller prints for that verdict; empty for `changing`. It always carries the run
+// figures, which is the entire point -- the words on their own are what was ambiguous:
+//
+//   picture not changing; run so far 59.4 fps, 96% active, 1204 distinct
+//   picture not changing; run so far -- fps, 0% active, 1 distinct (nothing produced yet)
+std::string format_unchanged_picture(const UnchangedPicture& picture);
 
 // ---- process-wide counters, fed by the present layer ---------------------------------------
 //

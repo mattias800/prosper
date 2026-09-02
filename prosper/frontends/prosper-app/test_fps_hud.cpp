@@ -8,6 +8,7 @@
 
 using namespace prosper::frontend;
 using prosper::gpu::FrameRate;
+using prosper::gpu::FrameRateCounter;
 using prosper::gpu::PresentRateSnapshot;
 using prosper::gpu::frame_rate_between;
 
@@ -26,6 +27,38 @@ FrameRate window(uint64_t published, uint64_t distinct, double seconds) {
     return frame_rate_between(a, b);
 }
 
+PresentRateSnapshot snapshot_of(const FrameRateCounter& counter, double now_seconds) {
+    PresentRateSnapshot s;
+    s.published = counter.published();
+    s.distinct = counter.distinct();
+    s.first_publication_seconds = counter.first_publication_seconds();
+    s.last_publication_seconds = counter.last_publication_seconds();
+    s.typical_interval_seconds = counter.typical_interval_seconds();
+    s.active_seconds = counter.active_seconds();
+    s.interval_samples = counter.interval_samples();
+    s.now_seconds = now_seconds;
+    return s;
+}
+
+// The cumulative counters the HUD is handed alongside the window. Built with the REAL accumulator
+// rather than by filling a struct in: a hand-written "produced nothing" snapshot is just the
+// interval fields left at zero, which would prove nothing about the code that reads them.
+PresentRateSnapshot run_that_produced(uint64_t distinct_frames) {
+    FrameRateCounter counter;
+    double t = 0;
+    for (uint64_t i = 0; i < distinct_frames; i++) { counter.observe(i + 1, t); t += 1.0 / 60.0; }
+    return snapshot_of(counter, t);
+}
+
+// One picture, republished from the first frame to the last: no interval was ever measured, so the
+// run has no typical rate and no active seconds. The R-Type Delta (#2783) shape.
+PresentRateSnapshot run_that_produced_nothing(uint64_t published) {
+    FrameRateCounter counter;
+    double t = 0;
+    for (uint64_t i = 0; i < published; i++) { counter.observe(7, t); t += 1.0 / 60.0; }
+    return snapshot_of(counter, t);
+}
+
 bool contains(const std::vector<std::string>& lines, const std::string& needle) {
     for (const std::string& line : lines)
         if (line.find(needle) != std::string::npos) return true;
@@ -39,7 +72,8 @@ int main() {
     // both at 60 the headline check could not tell "the headline is the distinct rate" from "the
     // headline is the presented rate", and the claim would rest entirely on the frozen arm below.
     {
-        const std::vector<std::string> lines = fps_hud_lines(window(60, 55, 1.0), 1920, 1080, 3600);
+        const std::vector<std::string> lines =
+            fps_hud_lines(window(60, 55, 1.0), 1920, 1080, run_that_produced(3600));
         CHECK(lines.size() == 2, "a healthy title gets two lines");
         CHECK(lines[0] == "55.0 fps", "the headline is the DISTINCT rate, not the presented one");
         CHECK(contains(lines, "60.0 presented"), "the presented rate is shown and labelled");
@@ -50,7 +84,8 @@ int main() {
 
     // THE ARM. Identical publication rate; the content never changes. The headline must NOT read 60.
     {
-        const std::vector<std::string> lines = fps_hud_lines(window(60, 0, 1.0), 3840, 2160, 1);
+        const std::vector<std::string> lines =
+            fps_hud_lines(window(60, 0, 1.0), 3840, 2160, run_that_produced_nothing(1260));
         CHECK(lines[0] == "0.0 fps",
               "a frozen title's HEADLINE is 0.0 fps, not the 60 it is publishing");
         CHECK(contains(lines, "60.0 presented"),
@@ -62,11 +97,40 @@ int main() {
               "from a re-served retained frame here, and naming the second manufactures a defect");
     }
 
+    // #3027, THE ARM. The same window twice -- 60 publications, not one of them new -- with only the
+    // RUN behind it changed. present_frame_rate.hpp requires the run's active share beside this
+    // verdict precisely because these two are the same picture and completely different news, and
+    // until now the HUD could not supply it: `frame_rate_between` does not fill active_fraction, so
+    // the requirement was unmeetable and the line said the same thing in both cases.
+    {
+        const FrameRate frozen = window(60, 0, 1.0);
+        const std::vector<std::string> menu =
+            fps_hud_lines(frozen, 1920, 1080, run_that_produced(1200));
+        const std::vector<std::string> dead =
+            fps_hud_lines(frozen, 1920, 1080, run_that_produced_nothing(1260));
+
+        CHECK(menu[0] == "0.0 fps" && dead[0] == menu[0],
+              "the headline is identical -- the WINDOW genuinely cannot tell these apart");
+        CHECK(menu.size() == 3 && dead.size() == 3, "both get the picture-not-changing line");
+        CHECK(menu[2] != dead[2], "...and that line SEPARATES them, which is the whole fix");
+        CHECK(menu[2].find("nothing produced") == std::string::npos &&
+                  dead[2].find("nothing produced") != std::string::npos,
+              "only the title that never produced a second frame is reported as such");
+        CHECK(menu[2].find("% active") != std::string::npos &&
+                  menu[2].find("1200 distinct") != std::string::npos,
+              "the static case carries the run's rate, active share and population -- the figure "
+              "the contract asks for, now actually printed");
+        CHECK(dead[2].find("-- fps") != std::string::npos &&
+                  dead[2].find("0.0 fps") == std::string::npos,
+              "the dead case reports an ABSENT rate, never a zero one");
+    }
+
     // A title genuinely running slowly is NOT a frozen one, and must not be labelled as one. This is
     // the arm that stops the warning being keyed on an absolute rate: prosper has titles that
     // legitimately run at ~1 fps, and calling those frozen would make the warning noise.
     {
-        const std::vector<std::string> lines = fps_hud_lines(window(1, 1, 1.0), 3840, 2160, 42);
+        const std::vector<std::string> lines =
+            fps_hud_lines(window(1, 1, 1.0), 3840, 2160, run_that_produced(42));
         CHECK(lines[0] == "1.0 fps", "a genuinely 1 fps title reports 1.0 fps");
         CHECK(!contains(lines, "not changing"),
               "a slow-but-live title is not warned about -- every publication carried content");
@@ -75,7 +139,8 @@ int main() {
     // Before anything is published there is no rate. "-- fps" is a different claim from "0.0 fps",
     // and a HUD that showed 0.0 during boot would look like a hang.
     {
-        const std::vector<std::string> lines = fps_hud_lines(FrameRate{}, 0, 0, 0);
+        const std::vector<std::string> lines =
+            fps_hud_lines(FrameRate{}, 0, 0, PresentRateSnapshot{});
         CHECK(lines[0] == "-- fps", "nothing published yet shows no rate rather than zero");
         CHECK(contains(lines, "no frames published yet"), "...and says why");
     }
