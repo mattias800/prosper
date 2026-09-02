@@ -7,6 +7,8 @@
 #ifndef _WIN32
 #include <sys/uio.h>
 #include <unistd.h>
+// Darwin has no process_vm_readv; the shim supplies it (and is a no-op on Linux).
+#include "host/platform/posix_shim.hpp"
 #endif
 
 namespace prosper::host {
