@@ -1357,6 +1357,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 entry_resource.stride = table_entry.stride;
                 entry_resource.host_data = table_entry.host_data;
                 entry_resource.host_data_size = table_entry.host_data_size;
+                // A table entry's backing is its own allocation; the parent's prefix does not apply.
+                entry_resource.host_data_prefix_bytes = 0;
                 entry_resource.table_index_count = 0u;
                 entry_resource.table_entry_stride = 0u;
                 entry_resource.table_index_sgpr = UINT32_MAX;

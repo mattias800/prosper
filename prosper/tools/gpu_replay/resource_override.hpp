@@ -250,6 +250,9 @@ inline bool apply_resource_override(gpu::GpuReplayFrame& replay,
     // as long as any copy of the table does.
     copied_table->owned_diagnostic_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
+    // A replacement is a self-contained snapshot of the selected level only: nothing precedes it.
+    // Leaving the captured prefix would authorize a read before the start of this buffer (#3202).
+    copied_table->resources[target.resource_index].host_data_prefix_bytes = 0;
     selected_table = std::move(copied_table);
     applied = std::move(result);
     error.clear();
@@ -354,6 +357,9 @@ inline bool apply_compute_resource_override(
     // as long as any copy of the table does.
     copied_table->owned_diagnostic_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
+    // A replacement is a self-contained snapshot of the selected level only: nothing precedes it.
+    // Leaving the captured prefix would authorize a read before the start of this buffer (#3202).
+    copied_table->resources[target.resource_index].host_data_prefix_bytes = 0;
     selected_table = std::move(copied_table);
     applied = std::move(result);
     error.clear();

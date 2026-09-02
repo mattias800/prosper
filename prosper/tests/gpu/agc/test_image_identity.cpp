@@ -97,6 +97,26 @@ int main() {
               "...but with a chain declared, differing provenance is a different view");
     }
 
+    // --- #3202: how far the host backing reaches below the pointer is part of its extent --------
+    {
+        ShaderResource a = base_descriptor(), b = base_descriptor();
+        uint8_t backing[64]{};
+        a.host_data = b.host_data = backing + 32;
+        a.host_data_size = b.host_data_size = 32;
+        CHECK(shader_resource_same_view(a, b, shape, shape, true),
+              "two descriptors over one host backing are the same view");
+        // A `--override-resource` replacement owns the selected level and nothing below it, while
+        // the descriptor it shadows owns the whole allocation. Same address, same forward size --
+        // only the prefix separates them, and it must.
+        a.host_data_prefix_bytes = 32;
+        CHECK(!shader_resource_same_view(a, b, shape, shape, true),
+              "#3202: a backing that owns bytes below the pointer is not the same image as one "
+              "that does not");
+        b.host_data_prefix_bytes = 32;
+        CHECK(shader_resource_same_view(a, b, shape, shape, true),
+              "...and matching prefixes are the same image again");
+    }
+
     // --- dcc identity -------------------------------------------------------------------------
     {
         ShaderResource a = base_descriptor(), b = base_descriptor();

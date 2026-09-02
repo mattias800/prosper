@@ -570,14 +570,24 @@ changes nothing.
   `BASE_LEVEL` (`mip_chain_*`), because `gpu_addr`/`width`/`height` have already been shifted onto
   the selected level and nothing downstream could recover the rest. Captures serialize them at
   format v57; a pre-v57 file reads as "not modelled" and fails closed to one level.
-  **`gpu_replay` still declines this op**, and v57 does not change that: a replayed resource is
-  `host_data`-backed and its blob covers only the selected level, so the derivation fails closed
-  there. Materializing the chain on replay needs the capture to own the whole allocation's bytes —
-  a separate change, tracked as **#3202**. Do not take a capsule expecting to study the fetch
-  offline yet.
+  **`gpu_replay` gets the chain too, from capsules taken since #3202** — and needed no new format
+  version to do it. A tiled chain stores level zero *last*, so the rest of the allocation lies
+  below the address the descriptor names; the capture writer now extends that resource's captured
+  range down to the allocation base, and the resource's already-serialized blob offset is then the
+  count of owned bytes preceding `gpu_addr`. Replay publishes it as
+  `ShaderResource::host_data_prefix_bytes`, and the one derivation both consumers read accepts a
+  host-backed resource **only** when its span covers the whole allocation. A capsule taken before
+  that change does not, so it still replays with a single-level image and still refuses
+  `IMAGE_LOAD_MIP` — visibly, which is the required behaviour: a capture that cannot express the
+  chain must decline rather than fetch levels it does not own. Re-grab the frame rather than
+  re-reading an old bundle.
 * **Reject-by-default.** Linear chains, a selected level packed in the tail, layered or volume
-  views, DCC, block-compressed and converting formats, a shifted `BASE_LEVEL`, and `host_data`
-  backing all keep the historical single-level image. A binding whose shape cannot carry the chain
+  views, DCC, block-compressed and converting formats, a shifted `BASE_LEVEL`, and a `host_data`
+  backing that does not cover the whole allocation all keep the historical single-level image.
+  (That last term was an outright refusal of every `host_data` resource until #3202; it is now a
+  coverage test, and everything that owns only the selected level — a `--override-resource`
+  replacement, a compute-internal snapshot, a synthetic fixture, a pre-#3202 capsule — still fails
+  it.) A binding whose shape cannot carry the chain
   (imported/renderer-owned surfaces above all) is declined **fail-visibly** rather than silently
   built with fewer levels than its compiled module addresses. **That decline is wider than it
   needs to be** — it does not depend on the module actually issuing `IMAGE_LOAD_MIP`, because the
@@ -613,6 +623,7 @@ to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
+| Making `gpu_replay` materialize the declared mip chain needs a new capture-format version, because the placement the reader must know is not in the file | **Falsified.** The placement *is* in the file, and had been since before v57: `collect_intervals` anchors a resource's captured range at an interval whose `begin` may sit below `gpu_addr`, and `assign_blob_range` already serializes `blob_offset = gpu_addr - interval.begin` — which is exactly the count of owned bytes preceding the descriptor's address, because a blob's byte *i* is the guest byte at `blob.guest_addr + i` by construction. Only the *writer* had to change (own the allocation, not the selected level); the reader publishes an existing serialized number as `host_data_prefix_bytes`. Pre-#3202 capsules fail closed on the same number without a version gate. #3202 |
 | All three scene-target-width kernels are blocked by `s_cbranch_execz` — a stronger claim than #2790's census, which records it for two of the three | **Partly falsified — two of the three moved, one never did.** The `V_LSHL_ADD_U32` allowlist entry the census predates has landed, and re-measuring on `d2b2e4d3` shows `0x2005717e00` and `0x200571bd00` no longer rejecting on `s_cbranch_execz` at pc=28 but on `image_load_mip` at **pc=81** — "a reject PC names where a fact was consumed, not where it was lost", exactly as that commit predicted. `0x2005714000` did **not** move: the census already recorded it at pc=33 `image_load_mip`, byte-identical. So all three of THESE THREE kernels now stop on the SAME instruction — which narrows this particular group to one unimplemented operation, and is **not** a claim that the title's world needs only that: `image_load_mip` is the first blocker of at least two (see the section above, and #2859 for the `s_getpc_b64` half that has since landed). Their `[mimg-mip]` profiles are identical too — `img_dim=5/1 mips=12 addr=0x2026900000 2048x2048`. Note `image_get_resinfo` at pc=73 belongs to `0x2005a13f00` / `0x2006e24000`, **not** to any of these three; an earlier revision of this row mis-attributed it by pairing separately-collected program and reject lists. #2790, #3048 |
 | `boot_trace` cannot position a flip-anchored route because it prints no flip counter | **NOT a falsification — this row was wrong and is retracted.** It was written from a 180 s arm that produced 155 lines with no flip marker, but the arm simply had no counter switch enabled. Two exist, both in `src/hle` and so linked into `boot_trace`: `PROSPER_PAD_SCRIPT_LOG=1` prints `[pad-script] elapsed=… frame=<flips since first poll> read=… buttons=…`, i.e. the route's own flip position per input (`hle_pad.cpp`, `docs/INPUT_REPLAY.md`), and `PROSPER_PROGRESS=<secs>` prints `flips=` from `prosper_vo_flip_count()`. Structurally it could not have been true either: `fN` anchors are resolved by `pad_frame_now()` reading that same counter in every frontend. Kept as a row because the mistake is the reusable part — **a null from an instrument whose switch was never thrown is not evidence**, and this document already says four times over that the CPU-only `boot_trace` arm IS the fast loop and does reach the stage. The operational note I attached to it does **not** stand either: I saw one `boot_trace` survive a plain `timeout`, but the tree says the opposite (`hle_agc.cpp` — "a `timeout`-bounded diagnostic run dies on SIGTERM") and this document's own recipe uses `timeout --foreground -s TERM -k 5s`. I first attributed that to the missing `--foreground` flag; **that explanation is backwards** — GNU `timeout` *without* `--foreground` signals the whole process group, which is the more lethal configuration, so omitting it cannot explain a survivor. The observation stands unexplained; use the established recipe and do not build on it. ([#2790](https://github.com/mattias800/prosper/issues/2790), and PR #3049 which retracted this row.) |
 | The unregistered `libSceFont` surface is why some of this title's text or UI fails to draw | **Falsified, by counting.** This dump names `libSceFont` and `libSceFontFt` only as `_stub_weak` entries in its dynamic library table, and its eboot and every `sce_module/*.prx` import **zero** of the 156 NIDs those two libraries export. Positive control on the same sweep in the same run: *Metaphor* 25, *Astro Bot* 54. Confirmed by the authoritative instrument too — `self_dump --import-slots` reports 0 import slots here against 25 / 54 there. A library named in a binary is not a library called from it. #2951 |

@@ -53,6 +53,28 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource);
 // not exist, so both must read this one function (the #2265 lesson).
 uint32_t shader_resource_compute_mip_chain_levels(const ShaderResource& resource);
 
+// The guest ALLOCATION a materializable chain is read from, independent of where its bytes come
+// from: `total_bytes` is the whole allocation and `prefix_bytes` is how much of it lies BELOW
+// `gpu_addr` (a tiled chain stores level zero last, so that is almost all of it). False leaves both
+// outputs zero and means the resource keeps the historical single-level image.
+//
+// The capture writer calls this to decide how much to own; `shader_resource_compute_mip_chain_levels`
+// answers from the same derivation whether a host-backed span owns enough. A capsule that captured
+// less than this reports one level on replay rather than fetching levels it does not have (#3202).
+bool shader_resource_compute_mip_chain_allocation(const ShaderResource& resource,
+                                                  uint64_t& prefix_bytes, uint64_t& total_bytes);
+
+// Does this resource's HOST backing own the whole allocation `plan` describes -- the prefix below
+// `gpu_addr` as well as the selected level and everything above it? Guest-memory-backed resources
+// never ask: they are bounded by `guest_readable` against the same span instead.
+//
+// One derivation, two consumers, for the same reason as the level count itself: the backend
+// dereferences `host_data - levels[0].byte_offset` before it uploads, and the level count decides
+// whether the compiled module may address those levels at all. If those two disagreed the module
+// would fetch a level from bytes nobody proved were owned.
+bool shader_resource_host_data_covers_mip_chain(const ShaderResource& resource,
+                                                const MipChainPlan& plan);
+
 // The complete chain implied by a level-zero extent (floor(log2(max(w,h))) + 1).
 uint32_t full_mip_chain_levels(uint32_t width, uint32_t height);
 
