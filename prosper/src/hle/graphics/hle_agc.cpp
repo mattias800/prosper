@@ -3100,7 +3100,7 @@ HLE(agc_dcb_dispatch_indirect) {
 // sceAgcAcbDispatchIndirect (NID j3EtxFkSIhQ) — the same operation on the ASYNC COMPUTE ring, and
 // NOT the same packet. `a1` is the argument buffer's whole 64-bit GPU virtual address, not a byte
 // offset, because there is nothing on that ring for an offset to be relative to: libSceAgc 3.20
-// exports 36 sceAgcAcb* entry points and none of them sets an indirect-argument base — the library's
+// exports 35 sceAgcAcb* entry points and none of them sets an indirect-argument base — the library's
 // only setter is sceAgcDcbSetBaseIndirectArgs, which takes a Dcb. CONFIDENCE: HIGH (the absence of
 // an ACB SetBase is a property of the 3.20 export table, and Astro Bot's live stream is decisive:
 // its q=2 DispatchIndirect packets carried exactly the LOW 32 BITS of the four argument allocations
