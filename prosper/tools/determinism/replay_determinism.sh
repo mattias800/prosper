@@ -157,9 +157,19 @@ run_subject() {   # <round> <cond> <peers> <arm-spec>
     # shellcheck disable=SC2086 -- $extra and $capture_flag are deliberate argument lists
     timeout 900 "$replay" $capture_flag "$capture" $extra "$img" > "$log" 2>&1; rc=$?
     t1=$(date +%s%N)
-    h=$(grep -oE '^\[gpureplay\] output=[0-9x]+ target=[0-9a-f]+ draw=[0-9]+ bytes=[0-9]+ hash=[0-9a-f]+' \
-        "$log" | grep -oE 'hash=[0-9a-f]+' | tail -1)
-    h=${h#hash=}
+    # A bundle prints one `bundle-submit=<id> ... hash=<h>` line per submit and NO final `output=`
+    # line, so a bundle replay recorded by the output line alone has no value at all -- and #2945's
+    # own headline measurement is per-submit ("submit 3537 gave 5 distinct hashes, submit 3540 gave
+    # 1"). Join the per-submit hashes in submit order and record that: a change in ANY submit is a
+    # distinct value, and the value names which submit moved.
+    h=$(grep -E '^\[gpureplay\] bundle-submit=[0-9]+ .* hash=[0-9a-f]+$' "$log" \
+        | sed -E 's/^\[gpureplay\] bundle-submit=([0-9]+) .* hash=([0-9a-f]+)$/\1:\2/' \
+        | paste -sd'|' -)
+    if [ -z "$h" ]; then
+        h=$(grep -oE '^\[gpureplay\] output=[0-9x]+ target=[0-9a-f]+ draw=[0-9]+ bytes=[0-9]+ hash=[0-9a-f]+' \
+            "$log" | grep -oE 'hash=[0-9a-f]+' | tail -1)
+        h=${h#hash=}
+    fi
     emit "$round" "$cond" "$p" subject "$label/$name" "${h:-none}" "$rc" "$(( (t1 - t0) / 1000000 ))"
     rm -f "$img"
 }
