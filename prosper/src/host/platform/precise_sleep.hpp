@@ -22,6 +22,30 @@ enum class SleepBackend {
 // immediately if the deadline has already passed.
 void sleep_until_steady_ns(uint64_t deadline_ns);
 
+// The largest steady-clock deadline the POSIX backend can actually WAIT for, applied to every
+// deadline it is handed (#3038).
+//
+// `sleep_until_steady_ns` takes an UNSIGNED nanosecond count, while the `std::chrono::nanoseconds`
+// its POSIX backend converts to has a SIGNED rep -- so a deadline past INT64_MAX wraps to a
+// time_point in the PAST and the sleep returns instantly. Measured, not inferred: before this
+// clamp, `sleep_until_steady_ns(INT64_MAX + 1)` and `sleep_until_steady_ns(UINT64_MAX)` both
+// returned in 0 ms on Linux/glibc.
+//
+// It is reachable, because the whole guest-sleep family SATURATES a guest-supplied interval to
+// UINT64_MAX rather than wrapping it (guest_interval_from_timespec below, guest_ns_from and
+// timeout_ns_from_us) -- deliberately, so a hostile value cannot turn a long sleep into a short
+// one. Without this clamp that saturation lands right back on an instant return, which is the
+// failure it was written to prevent, and on the select()/pselect() path it is #1660's defect
+// exactly: a sleep that returns at once becomes a 9-million-call-per-second spin.
+//
+// INT64_MAX nanoseconds is ~292 years of steady-clock uptime, so no wait a caller can distinguish
+// from "forever" is shortened by the clamp. It also makes the two platforms agree: the Windows
+// backend already blocks for such a deadline (its arithmetic is unsigned throughout and its
+// millisecond safety net saturates to INFINITE).
+constexpr uint64_t clamp_deadline_to_signed_rep(uint64_t deadline_ns) {
+    return deadline_ns > (uint64_t)INT64_MAX ? (uint64_t)INT64_MAX : deadline_ns;
+}
+
 // The post-condition sleep_until_steady_ns() promises on EVERY backend: never return before
 // `now_ns() >= deadline_ns`. A single OS sleep primitive is not trusted to hit this on its own -- a
 // waitable timer can signal marginally early, and so can the ::Sleep()-backed fallback used when no
@@ -284,6 +308,72 @@ constexpr uint64_t wait_timeout_ms_ceil(WaitDeadline now, WaitDeadline deadline,
     // whole purpose is to saturate should not have a reachable-only-by-luck wrap in it (raised in
     // review of #3235).
     return frac_ms > max_ms - whole_ms ? max_ms : whole_ms + frac_ms;
+}
+
+
+// ---------------------------------------------------------------------------
+// The RELATIVE guest sleep intervals' conversion (#3038).
+//
+// nanosleep() and select()/pselect()'s pure-sleep shape are all handed a guest {seconds,
+// sub-seconds} pair and have to turn it into one nanosecond count. Two things go wrong when that
+// is written inline at the call site, and hle_kernel_time.cpp's select()/pselect() had both:
+//
+//  1. TRUNCATION. Assembling a HOST `struct timespec` out of guest fields narrows tv_nsec through
+//     `long`, which is 32 bits on Windows x64 (MinGW-w64 is LLP64) against the guest's 64. Every
+//     LEGAL value fits in the low half, so it is correct by luck; an out-of-range one is silently
+//     re-mapped INTO range instead of being refused. A tv_usec of 4,294,968 -- 4.29 s -- becomes a
+//     704 ns sleep that way, six million times short. Taking int64_t parameters and returning a
+//     uint64_t count removes the host layout from the path entirely, and the same expression is
+//     then exercised on both platforms rather than only on the one that happens to be wide enough.
+//     Same class as the WaitDeadline fields above, and the reason those are int64_t too.
+//  2. NO RANGE RULE. k_nanosleep and k_cond_timedwait (hle_kernel.cpp) both refuse a negative or
+//     out-of-[0, 1e9) guest field before touching it; select()/pselect() did not, and left the
+//     host nanosleep to notice -- which is the same answer only for as long as the narrowing above
+//     leaves the value out of range.
+//
+// `valid` is a REFUSAL, not an error code: the caller must not sleep at all. That is what these
+// call sites already did on a host wide enough to see the value, because the host nanosleep
+// returned EINVAL instantly, and preserving it matters in both directions. Carrying an
+// out-of-range field into the total instead turns a garbage 0x7fff... into a near-infinite sleep,
+// i.e. a hang where there used to be an immediate return -- the comment on k_nanosleep's own guard
+// records that being got wrong once already.
+struct GuestInterval {
+    bool     valid = false;   // false: out of range -- do not sleep at all
+    uint64_t ns    = 0;       // saturating total; meaningless unless `valid`
+};
+
+// A guest `struct timespec` -- the guest is FreeBSD x86-64, so both fields are 64-bit, and they are
+// taken here as the two int64s they are rather than through any host struct.
+//
+// Saturating, for the reason guest_ns_from() (#3022) and timeout_ns_from_us() (#3069) already state
+// for this family: the fields arrive from guest memory and a wrap turns a long sleep into a short
+// one. Consequence-free at the one call site that can reach it -- a saturated count is 584 years,
+// and the sleep it produces is indistinguishable from the one the guest asked for -- and having one
+// member of the family saturate while its siblings wrap is an inconsistency the next reader has to
+// re-derive.
+constexpr GuestInterval guest_interval_from_timespec(int64_t sec, int64_t nsec) {
+    constexpr uint64_t kNsMax   = ~0ull;
+    constexpr uint64_t kSecMax  = kNsMax / 1000000000ull;   // 18446744073
+    constexpr uint64_t kNsecRem = kNsMax % 1000000000ull;   // 709551615
+    if (sec < 0 || nsec < 0 || nsec >= 1000000000ll) return GuestInterval{false, 0};
+    const uint64_t s = (uint64_t)sec, n = (uint64_t)nsec;
+    // The second disjunct is the boundary the first one misses: s == kSecMax passes a bare
+    // `s > kSecMax` test, and then `+ n` overflows for n > kNsecRem and wraps a 584-year sleep into
+    // a short one -- the long-to-short direction this clamp exists to prevent.
+    if (s > kSecMax || (s == kSecMax && n > kNsecRem)) return GuestInterval{true, kNsMax};
+    return GuestInterval{true, s * 1000000000ull + n};
+}
+
+// A guest `struct timeval`, whose sub-second field is MICROseconds; POSIX puts select()'s tv_usec
+// in [0, 1e6).
+//
+// The range check happens BEFORE the multiply and the multiply is 64-bit, which is the whole of
+// #3038's second defect: `(long)(tv_usec * 1000)` multiplied first and narrowed second, so a
+// tv_usec above ~2.1e6 overflowed the 32-bit product with nothing having refused it. Here the
+// product of an accepted tv_usec is below 1e9 by construction, so it cannot overflow at all.
+constexpr GuestInterval guest_interval_from_timeval(int64_t sec, int64_t usec) {
+    if (usec < 0 || usec >= 1000000ll) return GuestInterval{false, 0};
+    return guest_interval_from_timespec(sec, usec * 1000ll);
 }
 
 }  // namespace prosper::host

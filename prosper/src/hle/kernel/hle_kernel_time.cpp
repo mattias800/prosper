@@ -444,9 +444,16 @@ static inline void guest_sleep_ns(uint64_t ns) {
 }
 
 // Saturating, for the same reason k_nanosleep saturates: the argument is guest-controlled and a wrap
-// turns a long sleep into a short one. Benign in consequence here -- a wrapped deadline lands in the
-// past and precise_sleep returns at once -- but having one of these three saturate and the others
-// wrap is an inconsistency the next reader has to re-derive, so they all do.
+// turns a long sleep into a short one. Having one of these three saturate and the others wrap would
+// be an inconsistency the next reader has to re-derive, so they all do.
+//
+// This comment used to add that saturating was "benign in consequence here -- a wrapped deadline
+// lands in the past and precise_sleep returns at once". That was TRUE and was not benign: it meant
+// the clamp handed its own failure mode straight back, since an instant return for a 584-year
+// request is exactly the short sleep being prevented. #3038 measured it (0 ms for both INT64_MAX+1
+// and UINT64_MAX) and fixed it in precise_sleep's POSIX backend, which now clamps the deadline to
+// the largest its signed chrono rep can hold rather than wrapping it. A saturated interval now
+// blocks, on Linux as it already did on Windows.
 static inline uint64_t guest_ns_from(uint64_t value, uint64_t ns_per_unit) {
     const uint64_t kNsMax = ~0ull;
     return value > kNsMax / ns_per_unit ? kNsMax : value * ns_per_unit;
@@ -482,7 +489,11 @@ HLE(k_sleep_s)  { const uint64_t ns = guest_ns_from(a0, 1000000000ull);
 HLE(k_nanosleep){
     if (!a0) return 0;
     const int64_t* req = (const int64_t*)P(a0);
-    const int64_t  sec = req[0], nsec = req[1];
+    // The range rule and the saturating conversion both live in guest_interval_from_timespec
+    // (precise_sleep.hpp) since #3038, where select()/pselect() call the same function rather than
+    // carrying a second, narrower copy of this arithmetic. The behaviour is unchanged; what moved
+    // is where it can be tested from.
+    //
     // A malformed request returns WITHOUT sleeping, which is what this entry point already did: the
     // old body handed the guest struct straight to the host nanosleep, and POSIX makes a tv_nsec
     // outside [0, 1e9) EINVAL -- so the host refused instantly and the HLE returned 0 having slept
@@ -491,23 +502,15 @@ HLE(k_nanosleep){
     // sleep: a hang where there used to be an immediate return. Returning an error instead would be
     // the opposite new failure mode, for guests that currently see success. Same range rule as
     // hle_kernel.cpp:1313, which validates the guest timespec it is handed.
-    if (sec < 0 || nsec < 0 || nsec >= 1000000000ll) {
+    const prosper::host::GuestInterval want =
+        prosper::host::guest_interval_from_timespec(req[0], req[1]);
+    if (!want.valid) {
         // Zeroed rather than left untouched (the host would have left it) so a guest reading the
         // remainder after a refused request cannot resume on uninitialised memory.
         if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }
         return 0;
     }
-    // Saturating, and the second disjunct is the boundary the first one misses: sec == kNsMax/1e9
-    // passes a bare `sec > kNsMax/1e9` test, and then `+ nsec` overflows for nsec > kNsMax%1e9 and
-    // wraps a 584-year sleep into a short one -- the long-to-short direction this clamp exists to
-    // prevent. tv_sec is guest-controlled, so the boundary is reachable by a hostile value.
-    const uint64_t kNsMax   = ~0ull;
-    const uint64_t kSecMax  = kNsMax / 1000000000ull;      // 18446744073
-    const uint64_t kNsecRem = kNsMax % 1000000000ull;      // 709551615
-    const uint64_t want_ns =
-        ((uint64_t)sec > kSecMax || ((uint64_t)sec == kSecMax && (uint64_t)nsec > kNsecRem))
-            ? kNsMax : (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
-    { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want_ns); guest_sleep_ns(want_ns); }
+    { hle::WaitCensusScope c(hle::WaitKind::Nanosleep, want.ns); guest_sleep_ns(want.ns); }
     if (a1) { int64_t* rem = (int64_t*)P(a1); rem[0] = 0; rem[1] = 0; }   // slept in full
     return 0;
 }
@@ -536,26 +539,42 @@ HLE(k_nanosleep){
 // success-shaped answer-we-cannot-honour that caused this bug. Log it loudly and fail.
 // CONFIDENCE: HIGH on the sleep shape (arguments observed live); the descriptor shape is
 // intentionally unimplemented, not unknown.
+//
+// #3038: honouring the timeout means honouring the length of it, on both platforms. The timeout is
+// now converted in 64 bits and waited out on an absolute steady-clock deadline like the rest of the
+// guest sleep family (#3022), not on a host `struct timespec` handed to nanosleep. The Oregon Trail
+// evidence below is a 3 s sleep, where a ~15.6 ms tick is noise; an inter-pass sleep of a few
+// milliseconds through the same call is where it is not.
 namespace {
 // True for the pure-sleep shape: no descriptor may be examined.
 bool select_is_pure_sleep(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds) {
     return (int64_t)nfds <= 0 && readfds == 0 && writefds == 0 && exceptfds == 0;
 }
 
-// Sleep the FULL duration. A bare nanosleep returns early on a signal, and prosper delivers signals
-// on its own (the SIGSEGV fault handler), so a short sleep would reintroduce a faster spin.
-void sleep_full(struct timespec want) {
-    while (want.tv_sec > 0 || want.tv_nsec > 0) {
-        struct timespec rem{0, 0};
-        if (nanosleep(&want, &rem) == 0) return;
-        if (errno != EINTR) return;
-        want = rem;
-    }
-}
+// Sleep the FULL interval the guest asked for, on an ABSOLUTE deadline.
+//
+// This was a raw `nanosleep` retry loop until #3038, and the loop's own purpose survives its
+// removal. It existed because a bare nanosleep returns early on a signal and prosper delivers
+// signals of its own (the SIGSEGV fault handler), so a short sleep would reintroduce the spin #1660
+// removed. An absolute deadline subsumes that: on POSIX guest_sleep_ns ends in libstdc++'s own
+// EINTR-restarting nanosleep loop, and on Windows sleep_until_steady_ns re-reads the clock after
+// every wait and goes again. What the loop could NOT do is get off the winpthreads ~15.6 ms master
+// tick that #3013 measured and #3022 routed the other three sleep entry points off -- an inter-pass
+// sleep of a few milliseconds through select() was served in ~15.6 ms, and this path was the last
+// one still on it.
+//
+// One caveat, because it is a real difference rather than a wash: PROSPER_GUEST_SLEEP_LEGACY=1
+// restores guest_sleep_ns's single pre-#3013 `nanosleep`, which does NOT restart on EINTR -- so
+// under that lever a signal can truncate this wait where the loop above resumed it. The lever
+// exists only to keep #3013's A/B reproducible and is not a supported runtime configuration
+// (CLAUDE.md's PROSPER_UD_TAIL_ALIGN precedent).
+void sleep_full_ns(uint64_t ns) { guest_sleep_ns(ns); }
 
 // A NULL timeout in the pure-sleep shape means "block forever". Sleep in bounded chunks rather than
-// one unbounded call so the process still responds to termination.
-void sleep_forever() { for (;;) sleep_full(timespec{1, 0}); }
+// one unbounded call so the process still responds to termination. Not censused: the requested
+// interval here is prosper's own chunk size, not anything the guest asked for, so counting it would
+// report a 1.00 ratio for a wait that has no guest-supplied duration at all.
+void sleep_forever() { for (;;) sleep_full_ns(1000000000ull); }
 
 uint64_t select_unsupported(const char* fn, uint64_t nfds,
                             uint64_t readfds, uint64_t writefds, uint64_t exceptfds) {
@@ -595,8 +614,23 @@ HLE(k_select) {
     if (!select_is_pure_sleep(a0, a1, a2, a3)) return select_unsupported("select", a0, a1, a2, a3);
     if (!a4) sleep_forever();
     else {
-        const int64_t* tv = (const int64_t*)P(a4);   // struct timeval { time_t sec; suseconds_t usec; }
-        sleep_full(timespec{ (time_t)tv[0], (long)(tv[1] * 1000) });
+        // Indexed as two int64s and converted in 64 bits, never assembled into a HOST timespec:
+        // `(long)(tv[1] * 1000)` narrowed the product to 32 bits on Windows x64 and multiplied
+        // before it narrowed, so an out-of-range tv_usec could land back INSIDE the legal range as
+        // a far shorter sleep (#3038). An out-of-range field is now REFUSED -- no sleep, and still
+        // return 0 -- which is what this call already did on a host wide enough to see the value,
+        // because the host nanosleep saw the out-of-range tv_nsec and returned EINVAL instantly.
+        // Returning -1/EINVAL instead would be the more POSIX answer and is deliberately not done
+        // here: it is a guest-visible contract change for titles that currently see success, with
+        // no way to verify it from this side.
+        // struct timeval { int64 tv_sec; int64 tv_usec; }
+        const int64_t* tv = (const int64_t*)P(a4);
+        const prosper::host::GuestInterval want =
+            prosper::host::guest_interval_from_timeval(tv[0], tv[1]);
+        if (want.valid) {
+            hle::WaitCensusScope c(hle::WaitKind::Select, want.ns);
+            sleep_full_ns(want.ns);
+        }
     }
     return 0;   // timed out with nothing ready — the correct answer for a descriptor-free wait
 }
@@ -607,8 +641,14 @@ HLE(k_pselect) {
     if (!select_is_pure_sleep(a0, a1, a2, a3)) return select_unsupported("pselect", a0, a1, a2, a3);
     if (!a4) sleep_forever();
     else {
+        // struct timespec { int64 tv_sec; int64 tv_nsec; }
         const int64_t* ts = (const int64_t*)P(a4);
-        sleep_full(timespec{ (time_t)ts[0], (long)ts[1] });
+        const prosper::host::GuestInterval want =
+            prosper::host::guest_interval_from_timespec(ts[0], ts[1]);
+        if (want.valid) {
+            hle::WaitCensusScope c(hle::WaitKind::Select, want.ns);
+            sleep_full_ns(want.ns);
+        }
     }
     return 0;
 }

@@ -672,6 +672,32 @@ One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home
   a realtime nor a monotonic clock can discriminate that in a test, because the old path was
   self-consistent for both; the virtual clock can, and does.
 
+- **"`sleep_full` is on the winpthreads tick, and its `select`/`pselect` callers truncate the guest
+  timespec through a 32-bit host `long`."** BOTH halves held on `origin/main` at `637e65f9`, and
+  they are not the same kind of defect. The tick half was real and is fixed (#3038): `sleep_full`
+  was the last guest sleep still on a bare `nanosleep`, so an inter-pass sleep of a few
+  milliseconds through `select(0, NULL, NULL, NULL, &tv)` — the idiom #1660 caught live — was
+  served in ~15.6 ms on Windows. The truncation half is real *as written* and its practical
+  consequence is **smaller than it reads**: every LEGAL value fits in 32 bits of nanoseconds
+  (`tv_nsec < 1e9`, `tv_usec * 1000 < 1e9`), so no in-range guest value was ever mis-served by it
+  on any platform. What it actually produced was a platform DIVERGENCE on out-of-range input —
+  Windows re-mapped such a value back INTO range and slept a wrong short interval (a `tv_usec` of
+  4,294,968, i.e. 4.29 s, became 704 ns), where Linux refused it. Do not quote it as a live
+  wrong-duration defect for any observed title; the platform-independent consequence of the same
+  expression is the other one, that `tv_usec * 1000` was a signed multiply on a guest-controlled
+  `int64_t` with no prior range check.
+- **"Saturating a guest-supplied interval to `UINT64_MAX` is a safe upper clamp."** It was not, and
+  the guard handed back its own failure mode: `sleep_until_steady_ns` takes an unsigned nanosecond
+  deadline while its POSIX backend converts to `std::chrono::nanoseconds`, whose rep is **signed**,
+  so any deadline past `INT64_MAX` wrapped into the past and the sleep returned **instantly**.
+  Measured on Linux/glibc before the fix — `sleep_until_steady_ns(INT64_MAX + 1)` and
+  `sleep_until_steady_ns(UINT64_MAX)` both returned in 0 ms — so a 584-year request became a busy
+  spin, which is exactly the short sleep the saturation exists to prevent, and on the
+  `select`/`pselect` path it is #1660's defect verbatim. Windows was already correct here (its
+  backend's arithmetic is unsigned throughout and its millisecond safety net saturates to
+  `INFINITE`). Fixed in #3038 by clamping the deadline to `INT64_MAX` in the POSIX backend; the
+  same probe then blocks past a 20 s bound instead of returning at 0 ms.
+
 **Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
 `cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
 -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DCMAKE_SYSTEM_NAME=Windows

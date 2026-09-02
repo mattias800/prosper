@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### A guest asking to sleep for 584 years was served in zero milliseconds
+
+No picture — the finding is that prosper's guest sleeps saturate a hostile interval to the largest
+unsigned nanosecond count, and the clock underneath then reads that as a *signed* one and hands back
+a deadline in the past. So the clamp written to stop a long sleep becoming a short one produced the
+shortest sleep there is. Fixed alongside `select()`-as-sleep, which was the last guest sleep still
+resolving on Windows' ~15.6 ms scheduler tick.
+[#3038](https://github.com/mattias800/prosper/issues/3038)
+
 ### On Windows, every `sinf` the guest ever called returned whatever was left lying in xmm0
 
 No picture — this one is Windows-only and invisible on the box we develop on. The import trampoline
