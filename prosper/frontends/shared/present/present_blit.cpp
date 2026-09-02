@@ -3,6 +3,7 @@
 #include "shared/present/present_blit_policy.hpp"
 #include "fixtures/render_runner.h"            // render_vk_ctx()
 #include "gpu/execute/gpu_execute.hpp"        // shared_present_submit_mutex / shared_present_active
+#include "host/platform/gpu_submit_gate.hpp"    // #3225: refuse submits once the frontend shuts down
 #include <mutex>
 #include <cstdio>
 #include <cstring>
@@ -194,6 +195,12 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     vkResetFences(s.dev, 1, &s.blit_fence);
     VkResult sr;
     {
+        // #3225: this runs on the GUEST thread (see the header), so it is a chokepoint the shutdown
+        // gate has to cover too. Refused once prosper-app begins shutting down, and then nothing
+        // reaches the driver — the caller falls back to the CPU present path, which is the existing
+        // behaviour for any failed blit submit and is harmless on the last frame before exit.
+        prosper::GpuSubmitRegion submit_gate;
+        if (!submit_gate.admitted()) return false;
         // Serialize the host submit CALL against prosper-app's present submits on the shared queue.
         std::unique_lock<std::mutex> qlk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
         if (prosper::gpu::shared_present_active()) qlk.lock();

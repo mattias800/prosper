@@ -26,6 +26,7 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_write_watch.hpp"
+#include "host/platform/gpu_submit_gate.hpp"  // #3225: refuse submits once the frontend shuts down
 
 #include <vulkan/vulkan.h>
 
@@ -9216,16 +9217,41 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (trace) std::fprintf(stderr, "[compute]   submitting dispatch\n");
         // #1270: when prosper-app presents on this same (shared) queue, serialize the submit CALL against
         // its present submits. No-op relaxed atomic load until the app adopts the shared queue.
-        VkResult compute_submit_rc;
+        // #3225: the GPU submit gate refuses a NEW dispatch once prosper-app has begun shutting
+        // down, so its bounded drain can reach zero before std::_Exit — a thread caught inside an
+        // amdgpu submission at exit_group() parks in __drm_exec_lock_obj and freezes the host
+        // compositor. The gate is open for the whole life of a running title, so this is one
+        // uncontended CAS per dispatch. On a refusal nothing reaches the driver and
+        // `submission_entered` deliberately stays false: no submission happened, so the ordinary
+        // cleanup() below is correct rather than the retain-everything device-lost path.
+        VkResult compute_submit_rc = VK_SUCCESS;
+        bool submit_gate_refused = false;
         {
+            prosper::GpuSubmitRegion submit_gate;
             std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
-            if (prosper::gpu::shared_present_active()) lk.lock();
-            g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
-            submission_entered = true;
-            compute_submit_rc = g_force_next_queue_submit_device_lost_for_test.exchange(
-                                    false, std::memory_order_acq_rel)
-                ? VK_ERROR_DEVICE_LOST
-                : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
+            if (!submit_gate.admitted()) {
+                submit_gate_refused = true;
+            } else {
+                if (prosper::gpu::shared_present_active()) lk.lock();
+                g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
+                submission_entered = true;
+                compute_submit_rc = g_force_next_queue_submit_device_lost_for_test.exchange(
+                                        false, std::memory_order_acq_rel)
+                    ? VK_ERROR_DEVICE_LOST
+                    : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
+            }
+        }
+        if (submit_gate_refused) {
+            // Leave the loop WITHOUT routing this through vk_ok(). A refusal is not a device loss
+            // and must not be reported as one: vk_note_failure would latch ctx.device_lost and print
+            // "fatal Vulkan device loss stage=queue-submit ... disabling live compute for this
+            // process", and decline() would add a `reason=queue-submit` row to the decline census --
+            // a census whose counts are quoted as evidence elsewhere in this project. Manufacturing
+            // one of those at every shutdown would be exactly the phantom-defect instrument the
+            // charter warns about. `submission_entered` stays false, so the ordinary cleanup() below
+            // runs, which is correct: nothing was submitted.
+            if (trace) std::fprintf(stderr, "[compute]   dispatch not submitted: shutting down\n");
+            break;
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
@@ -9265,7 +9291,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
             // to success; this item stays failed either way, which is the conservative choice for a
             // dispatch whose results we can no longer trust.
-            if (!ctx.device_lost) {
+            // #3225: gated like the submit above, and for a second reason as well as the first.
+            // This is a guest-thread queue call, so the frontend's drain must be able to see it and
+            // wait for it; and vkDeviceWaitIdle (which the frontend runs after that drain) requires
+            // host access to every VkQueue to be externally synchronized, which an ungated
+            // vkQueueWaitIdle here would break. Refused, we simply do not drain — `completion_proven`
+            // stays false, which is the same conservative outcome this path already takes when the
+            // device is lost.
+            prosper::GpuSubmitRegion drain_gate;
+            if (!ctx.device_lost && drain_gate.admitted()) {
                 std::unique_lock<std::mutex> qlk(
                     prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
                 if (prosper::gpu::shared_present_active()) qlk.lock();

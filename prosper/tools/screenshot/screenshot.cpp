@@ -50,6 +50,7 @@
 #include "host/memory/guest_write_watch.hpp"
 #include "host/image/boot_program.hpp"       // boot_program
 #include "host/image/exec_image.hpp"         // run_entry
+#include "host/platform/gpu_submit_gate.hpp" // #3225: drain guest GPU submits before _exit
 #include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
 #include "gpu/present/present_frame_rate.hpp" // distinct-guest-frame framerate (NOT a present rate)
 #include "overlay_text.hpp"                   // --fps-overlay: burn the rate into the image
@@ -972,5 +973,20 @@ int main(int argc, char** argv) {
     // reports here; the asymmetry was silent, because a diagnostic that produces no output looks
     // exactly like one that found nothing. Report before exiting, as prosper-app does.
     prosper::host::guest_dmem_write_trace_report();
+    // #3225: same shape as prosper-app's exit -- a detached guest thread and a raw _exit. _exit
+    // becomes exit_group(), and a thread inside an amdgpu command submission at that moment cannot
+    // be torn down until it returns from the kernel; it parks in __drm_exec_lock_obj on a GEM
+    // reservation nobody will release, leaving an unreapable process whose lock the rest of the
+    // system's DRM work queues behind. Closing the gate stops NEW guest submissions (they return
+    // VK_ERROR_DEVICE_LOST, which every submission site handles as "not submitted") so this bounded
+    // drain can reach zero. It BOUNDS the window rather than closing it: a thread already inside
+    // vkQueueSubmit is waited for, and if it never returns the drain expires and we exit as before.
+    prosper::gpu_submit_gate_begin_shutdown();
+    constexpr int kGuestSubmitDrainMs = 2000;
+    if (!prosper::gpu_submit_gate_drain(kGuestSubmitDrainMs))
+        fprintf(stderr,
+                "[shot] guest GPU submissions did not drain within %d ms (%d still in flight); "
+                "exiting anyway\n",
+                kGuestSubmitDrainMs, prosper::gpu_submit_gate_in_flight());
     _exit(verdict.exit_code);   // the guest thread is detached and running guest code; don't block on teardown
 }
