@@ -17,6 +17,30 @@ python3 tools/snapshot/snapshot.py check dead-cells-splash
 python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 ```
 
+## Guards that are NOT currently a regression signal
+
+A red guard is only evidence about your change if the guard itself is sound. Two are not, and a lane
+that treats either as a regression will spend a session chasing its own tools. **Selection is
+positional** — `snapshot.py check <name> [<name>...]`; there is no `--only` flag.
+
+- **`gris-gameplay` — do not run it, and do not act on it.** Project-owner decision, 2026-09-02: its
+  baseline has not been updated and *GRIS* is to be verified by hand instead. It fails on master
+  independently of any branch (#3148), and it has now been seen failing at two *different* points in
+  the route — stuck on the publisher splash with `structural matches 0 of 60`, and separately with
+  the character visible and SSIM 0.12-0.14 against every baseline. Neither is a rendering
+  regression. Exclude it from any subset you run, and if you run the full matrix, do not report its
+  failure as a finding.
+- **`terminator-boot` clears its own threshold by exactly zero frames** (#3208): 14 consecutive
+  content matches against a required 15 in one sweep, and exactly 15 in the next, on builds whose
+  difference cannot affect that title's boot timing. Its menu arrives ~42 s into a hard 62 s window,
+  so one second of extra boot latency flips the verdict. A failure reading
+  `consecutive content matches 14 < 15` is indistinguishable from a real regression that dropped one
+  menu frame, and it is almost always the former.
+
+Neither entry means the guarded title is broken, and neither should be "fixed" by lowering a
+threshold — that trades a false alarm for a guard that asserts less. Both need a re-profiled window
+against the current boot, which is its own reviewed baseline change.
+
 ## Contract
 
 - Local only. Game dumps and captured imagery must never be committed.
