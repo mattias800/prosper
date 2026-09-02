@@ -2027,6 +2027,11 @@ int main(int argc, char** argv) {
     // collapsed must show the collapse. `fpsWindow` is re-based every kFpsWindowSeconds.
     constexpr double kFpsWindowSeconds = 1.0;
     prosper::gpu::PresentRateSnapshot fpsWindow = prosper::gpu::present_rate_snapshot();
+    // The cumulative reading the window was closed against. Kept because "the picture is not
+    // changing" cannot be reported honestly from a window alone: separating a static menu from a
+    // title that has produced nothing is a question about the RUN (#3027). Held here rather than
+    // re-snapshotted at each print site so the HUD and the stderr lines cannot disagree.
+    prosper::gpu::PresentRateSnapshot fpsRun = fpsWindow;
     prosper::gpu::FrameRate fpsRate;
     std::vector<std::string> fpsLines;
     // The extent last presented through the GPU path, for the HUD's resolution field (#3010).
@@ -2729,13 +2734,14 @@ int main(int argc, char** argv) {
                                                   kFpsWindowSeconds)) {
                 fpsRate = prosper::gpu::frame_rate_between(fpsWindow, now);
                 fpsWindow = now;
+                fpsRun = now;
                 // present_frame_width/height are fed by the CPU publish path and read 0 under GPU
                 // present, so the HUD showed "0x0" there. Prefer the extent actually presented.
                 fpsLines = prosper::frontend::fps_hud_lines(
                     fpsRate,
                     gpuPresentedW ? gpuPresentedW : gpu::present_frame_width(),
                     gpuPresentedH ? gpuPresentedH : gpu::present_frame_height(),
-                    now.distinct);
+                    now);
             }
         }
         // Only a HUD that has something to say is passed down; an empty list leaves both present
@@ -2788,26 +2794,30 @@ int main(int argc, char** argv) {
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
                         double s = std::chrono::duration<double>(now - t0).count();
-                        // present_frame_rate.hpp says any caller of frame_rate_is_mostly_unchanged
-                        // must report active_fraction beside it, to separate "a static menu that HAS
-                        // produced frames" from "a title producing nothing". frame_rate_between
-                        // cannot supply it (:290 leaves it unfilled by construction), so the
-                        // PRESENTED rate printed on this same line carries that job: a non-zero
-                        // presented rate is exactly the evidence that frames are still arriving.
-                        // Recorded as #3027 rather than left as a silent divergence.
                         // The PRESENTED rate, and -- when --fps armed the content sample (#3010) --
-
                         // the DISTINCT rate beside it. Both, because they answer different questions:
                         // a title whose picture is frozen still presents at 60, and this line alone
                         // read healthy right through the Windows splash stall in #3011.
-                        char distinct[64] = "";
-                        if (showFps && fpsRate.measured)
-                            snprintf(distinct, sizeof distinct, ", %.1f distinct%s",
-                                     fpsRate.distinct_fps,
-                                     prosper::gpu::frame_rate_is_mostly_unchanged(fpsRate)
-                                         ? " PICTURE NOT CHANGING" : "");
+                        //
+                        // The "picture not changing" verdict is classified against `fpsRun` -- the
+                        // cumulative snapshot -- and not against the one-second window.
+                        // present_frame_rate.hpp requires the run's active share beside that verdict,
+                        // and a differenced window cannot supply it; this line used to lean on its own
+                        // presented rate to carry that job, which was an accident of the formatting
+                        // rather than anything the contract could check (#3027).
+                        std::string distinct;
+                        if (showFps && fpsRate.measured) {
+                            char measured[48];
+                            snprintf(measured, sizeof measured, ", %.1f distinct",
+                                     fpsRate.distinct_fps);
+                            distinct = measured;
+                            const std::string note = prosper::gpu::format_unchanged_picture(
+                                prosper::gpu::unchanged_picture(fpsRate, fpsRun));
+                            if (!note.empty()) distinct += " -- " + note;
+                        }
                         fprintf(stderr, "[app] %.1f fps (%llu frames, gpu-present%s)\n",
-                                (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown, distinct);
+                                (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown,
+                                distinct.c_str());
 
                         t0 = now; mark = shown;
                     }
@@ -2900,16 +2910,21 @@ int main(int argc, char** argv) {
                         } else {
                             // Same two rates as the GPU branch (#3010), so a run can be compared
                             // across present paths. Here the distinct rate comes from the CPU
-                            // publish hash rather than from a sampled grid.
-                            char distinct[64] = "";
-                            if (showFps && fpsRate.measured)
-                                snprintf(distinct, sizeof distinct, ", %.1f distinct%s",
-                                         fpsRate.distinct_fps,
-                                         prosper::gpu::frame_rate_is_mostly_unchanged(fpsRate)
-                                             ? " PICTURE NOT CHANGING" : "");
+                            // publish hash rather than from a sampled grid. Same run-classified
+                            // verdict too, for the reason given in that branch (#3027).
+                            std::string distinct;
+                            if (showFps && fpsRate.measured) {
+                                char measured[48];
+                                snprintf(measured, sizeof measured, ", %.1f distinct",
+                                         fpsRate.distinct_fps);
+                                distinct = measured;
+                                const std::string note = prosper::gpu::format_unchanged_picture(
+                                    prosper::gpu::unchanged_picture(fpsRate, fpsRun));
+                                if (!note.empty()) distinct += " -- " + note;
+                            }
                             fprintf(stderr, "[app] %.1f fps (%llu frames%s)\n",
                                     (shown - mark) / (s > 0 ? s : 1),
-                                    (unsigned long long)shown, distinct);
+                                    (unsigned long long)shown, distinct.c_str());
                         }
 
                         t0 = now; mark = shown;

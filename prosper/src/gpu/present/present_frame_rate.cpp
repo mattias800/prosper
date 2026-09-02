@@ -162,8 +162,12 @@ FrameRate frame_rate_since_first_publication(const PresentRateSnapshot& s) {
         r.typical_measured = true;
         r.typical_fps = 1.0 / s.typical_interval_seconds;
     }
-    if (r.window_seconds > 0)
+    if (r.window_seconds > 0) {
         r.active_fraction = std::min(1.0, s.active_seconds / r.window_seconds);
+        // Measured, not defaulted -- this is the one constructor that can say so. A 0 here is the
+        // verdict "the run produced nothing"; a 0 from frame_rate_between is an unfilled field.
+        r.active_fraction_measured = true;
+    }
     return r;
 }
 
@@ -211,7 +215,13 @@ std::string format_frame_rate(const FrameRate& rate) {
 std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint32_t height) {
     char text[160];
     if (!rate.measured || (!rate.typical_measured && rate.distinct <= 1)) {
-        std::snprintf(text, sizeof text, "-- fps  0%% active  %ux%u", width, height);
+        // "0% active" asserts that the run produced nothing, so it may only be printed when the
+        // fraction was actually measured. A differenced window never measures it (#3027), and one
+        // still second is not evidence about the run.
+        if (rate.active_fraction_measured)
+            std::snprintf(text, sizeof text, "-- fps  0%% active  %ux%u", width, height);
+        else
+            std::snprintf(text, sizeof text, "-- fps  %ux%u", width, height);
         return text;
     }
     if (!rate.typical_measured) {
@@ -228,6 +238,43 @@ std::string format_frame_rate_short(const FrameRate& rate, uint32_t width, uint3
 bool frame_rate_is_mostly_unchanged(const FrameRate& rate, uint64_t min_published,
                                    double max_distinct_fraction) {
     return rate.published >= min_published && rate.distinct_fraction < max_distinct_fraction;
+}
+
+UnchangedPicture unchanged_picture(const FrameRate& window, const PresentRateSnapshot& run,
+                                   uint64_t min_published, double max_distinct_fraction) {
+    UnchangedPicture out;
+    // The run figures are read whatever the verdict, so a caller that keeps the struct around has
+    // them for a later line too, and so the `changing` case is not a different shape of value.
+    const FrameRate run_rate = frame_rate_since_first_publication(run);
+    out.run_typical_measured = run_rate.typical_measured;
+    out.run_typical_fps = run_rate.typical_fps;
+    out.run_active_fraction = run_rate.active_fraction;
+    out.run_distinct = run_rate.distinct;
+    if (!frame_rate_is_mostly_unchanged(window, min_published, max_distinct_fraction)) return out;
+    // The window says the picture stopped; only the run can say whether it ever started. An absent
+    // typical rate over the WHOLE run is the R-Type Delta (#2783) shape; a measured one means the
+    // title produced frames and is now sitting on a picture, which is correct behaviour.
+    out.change = run_rate.typical_measured ? PictureChange::static_picture
+                                           : PictureChange::nothing_produced;
+    return out;
+}
+
+std::string format_unchanged_picture(const UnchangedPicture& picture) {
+    if (picture.change == PictureChange::changing) return {};
+    char text[192];
+    if (picture.change == PictureChange::nothing_produced)
+        // "--", never "0.0": there is no rate, and the module's whole argument is that reporting one
+        // would be a measurement where none exists.
+        std::snprintf(text, sizeof text,
+                      "picture not changing; run so far -- fps, 0%% active, %llu distinct "
+                      "(nothing produced yet)",
+                      static_cast<unsigned long long>(picture.run_distinct));
+    else
+        std::snprintf(text, sizeof text,
+                      "picture not changing; run so far %.1f fps, %.0f%% active, %llu distinct",
+                      picture.run_typical_fps, picture.run_active_fraction * 100.0,
+                      static_cast<unsigned long long>(picture.run_distinct));
+    return text;
 }
 
 void note_present_publication(const uint8_t* pixels, size_t bytes, uint32_t width, uint32_t height) {
