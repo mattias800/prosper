@@ -54,6 +54,12 @@ prosper/tools/determinism/replay_determinism.sh \
 python3 prosper/tools/determinism/replay_determinism_report.py ~/work/campaign.csv
 ```
 
+The work directory (`--work`, default a fresh `mktemp -d`) keeps one log per replay and one per
+control round, named by round. That is deliberate: when a round finally does deviate, its log is the
+only record of what that particular process saw, and a campaign that overwrites them leaves you with
+a hash and nothing to explain it. Rendered `.bmp` outputs are deleted as each replay is scored —
+they are 24 MB apiece at 4K and the hash is what the campaign compares.
+
 Two things the numbers do not say on their own, so say them yourself:
 
 - **Quote the wall-clock span beside the n.** 400 runs inside 173 s are one drift period, not 400
