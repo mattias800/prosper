@@ -30,8 +30,13 @@
 #   replay_determinism.sh --replay <gpu_replay> --capture <file.prgcap|.prgbundle> --out <csv>
 #                         [--rounds N] [--gap S] [--block N] [--load N] [--label NAME]
 #                         [--arm 'LABEL=extra gpu_replay args'] ...
-#                         [--control <vkprobe> --shaders <dir>] [--work <dir>]
-#                         [--peer-wait S]
+#                         [--control <vkprobe> --shaders <dir>] [--control-iterations N]
+#                         [--work <dir>] [--peer-wait S]
+#
+# `--control-iterations` trades sensitivity against cost, and the trade is not the obvious one: the
+# control's failure is per-PROCESS in shape (a run is bad or it is not; inside a bad one most
+# iterations fail), so more ROUNDS beats more iterations per round. Raise it only to make each
+# control process live longer and so overlap more of a short bad window.
 #
 # With no --arm, one arm named `full` replays the whole capture. Repeat --arm for more, e.g.
 #   --arm 'full=' --arm 'draw42=--draw 42'
@@ -45,7 +50,7 @@
 set -u
 
 replay=; capture=; out=; rounds=60; gap=2; block=10; load=0; label=local
-control=; shaders=; work=; peer_wait=300
+control=; shaders=; work=; peer_wait=300; control_iterations=20
 arms=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -62,6 +67,7 @@ while [ $# -gt 0 ]; do
         --shaders)   shaders=$2; shift 2 ;;
         --work)      work=$2; shift 2 ;;
         --peer-wait) peer_wait=$2; shift 2 ;;
+        --control-iterations) control_iterations=$2; shift 2 ;;
         -h|--help)   sed -n '2,45p' "$0"; exit 0 ;;
         *) echo "replay_determinism.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -188,7 +194,7 @@ run_control() {   # <round> <cond> <peers>
     # the first campaign on this issue score 91.6% where the diagnostic indices score 1.2%.
     timeout 300 "$control" --vs "$work/no_ssbo_vs.spv" --fs "$work/minimal_green_fs.spv" \
         --vs-b "$work/index_readback_vs.spv" --fs-b "$work/minimal_green_fs.spv" \
-        --indices 3,4,5 --readback-dwords 16:8 --iterations 20 > "$log" 2>&1
+        --indices 3,4,5 --readback-dwords 16:8 --iterations "$control_iterations" > "$log" 2>&1
     rc=$?
     t1=$(date +%s%N)
     line=$(grep -E '^\[vkprobe\] b: indexed +vertex-index readback' "$log" | head -1)
