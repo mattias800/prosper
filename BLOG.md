@@ -30,6 +30,15 @@ validation, which is armed and reporting five other hazards in the same run, can
 because it has no way to watch the CPU read a mapped pointer.
 [#2944](https://github.com/mattias800/prosper/issues/2944)
 
+### The one setting that made compute validation cheaper was the one our own test binary could not survive
+
+No picture. Cached compute sources are proven unchanged by a full byte compare unless a cheap
+page-protection watch has been armed first, and the only setting that measurably armed them crashed
+`test_game_compute` — because that binary tells the watch layer it has a SIGSEGV handler and never
+installed one. So the mechanism was untestable in the harness that would have proved it, and the crash
+read as a defect in the emulator. The harness now installs the handler, and a census inside the decision
+reports what each setting actually buys.
+
 ### A guest asking to sleep for 584 years was served in zero milliseconds
 
 No picture — the finding is that prosper's guest sleeps saturate a hostile interval to the largest

@@ -102,6 +102,13 @@ bool install_write_watch_segv_handler() {
     // The watch layer only arms when the handler is on an alternate stack: it resolves a fault by
     // returning, so without SA_ONSTACK the kernel writes the signal frame into the faulting store's
     // SysV red zone.
+    //
+    // Main thread only, which is sufficient HERE and would not be in production. `sigaltstack` is
+    // per-thread; production installs one per guest worker from its trampoline. This binary has no
+    // guest, and the only writes into watched guest pages come from the test's own thread or from
+    // backend paths that call `guest_write_watch_notify_host_write` first. The parallel copy/compare
+    // workers touch mapped Vulkan memory, never an armed guest page. If that ever stops being true,
+    // this needs the per-thread install too.
     static uint8_t alternate_stack[256 * 1024];
     stack_t stack{};
     stack.ss_sp = alternate_stack;
@@ -6585,7 +6592,7 @@ int main() {
     // its own denominator is an instrument nobody should quote, and that IS checkable here.
     {
         const auto census = prosper::frontend::live_compute_write_watch_census();
-        char census_line[512];
+        char census_line[1024];
         const size_t census_used = prosper::frontend::format_write_watch_census(
             census, census_line, sizeof census_line);
         if (census_used) std::fwrite(census_line, 1, census_used, stdout);

@@ -452,9 +452,24 @@ immediately, and larger
 sources arm after three exact unchanged validations. Promotions are limited to 8 MiB per ordered submit,
 with at most one source larger than that limit, and adjacent pages are protected in coalesced runs. Set
 `PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB`, `PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS`, or
-`PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB` for controlled A/B runs. Compute buffer/image residency uses the
-same exact-first rule, with `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS` and
-`PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB`. `PROSPER_WRITE_WATCH_MAX_KB` is an emergency host-wide range
+`PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB` for controlled A/B runs.
+
+Compute buffer/image residency uses the same exact-first rule with `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS`
+and `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB` — **but it does not have the "1-8 MiB arm immediately" half**,
+and this paragraph claimed it did until #3155. That path has always passed a defer minimum of **one byte**,
+which makes the size exemption unreachable, so every compute source must climb the stability ladder however
+small it is. `PROSPER_COMPUTE_WATCH_DEFER_MIN_KB` exposes that minimum for A/B (unset = 1 byte, i.e. today's
+behaviour; `=8192` gives renderer parity; `=0` defers nothing). A malformed value is refused loudly and keeps
+the default — unlike the four older variables beside it, where a typo silently selects the most
+aggressive setting (#3253). Whether the asymmetry is right is open —
+see `RENDERER_PERFORMANCE_2026_07.md` § *Compute write-watch promotion census*.
+
+`PROSPER_WATCH_PROMOTE_CENSUS=1` reports what any of those settings actually bought, every 256 submits and
+at exit: how many acquisitions each of the three proofs decided (submit journal, armed page watch, full byte
+compare), the bytes each cost, and the stability counter seen at every promotion decision. Every line is a
+running total and prints its own denominator — read `decisions=` and `validated=` first, because comparing
+two arms' tallies taken at different points in a run is the mistake that produced #3155's retracted numbers.
+`PROSPER_WRITE_WATCH_MAX_KB` is an emergency host-wide range
 limit (zero/unset is unbounded); a declined watch always returns to exact comparison.
 
 Proven-full write-only storage targets at least 16 MiB do not copy their first successful result into

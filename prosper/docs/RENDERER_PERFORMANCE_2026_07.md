@@ -305,6 +305,73 @@ than a repeatable speedup. This is therefore primarily a memory/capacity improve
 frame-rate claim. Dirty or unknown watches deliberately re-decode rather than using a hash, and
 `PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS=1` restores the control behavior for audit/performance comparisons.
 
+## Compute write-watch promotion census (2026-09-02, #3155 / #3156)
+
+The policy the section above describes has **two** levers, and the compute path only ever had one of
+them. `should_promote_write_watch(source_bytes, stability, defer_min_bytes, promote_after)` promotes
+when the source is *smaller* than `defer_min_bytes` **or** the stability ladder has been climbed. The
+renderer's texture cache passes a real `defer_min_bytes` (8 MiB, `PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB`),
+which is what implements "stable 1-8 MiB sources continue to arm immediately" above. The compute call site
+has always passed a literal **1**, making `source_bytes < defer_min_bytes` false for every real source. So
+on that path the size exemption is unreachable and every source, at any size, must accumulate consecutive
+successful full compares.
+
+That is exactly the arm the section above **measured and rejected for textures**: "Deferring every texture
+watch at or above 1 MiB was also rejected … cumulative exact validation rose from 69.7 to 79.2 GiB." It has
+never been measured for compute, where sources include storage *results* that change every frame and arming
+an unproven watch is wasted `mprotect`/fault/rearm work. **Both readings are live; do not change the literal
+without production numbers.**
+
+An in-tree census now produces those numbers. `PROSPER_WATCH_PROMOTE_CENSUS=1` reports, every 256 submits
+and at exit, how many validated acquisitions each of the three proofs decided (submit journal / armed page
+watch / full byte compare), the bytes each cost, and the stability counter seen at every promotion decision.
+`PROSPER_COMPUTE_WATCH_DEFER_MIN_KB` exposes the defer minimum so the A/B is an environment sweep rather
+than a patch; **its default is the historical 1 byte and changes nothing.**
+
+Harness measurement (`test_game_compute`, 46 validated acquisitions — a tiny workload, quoted for its
+*shape*, not its magnitude), one run per arm:
+
+| arm | decisions | stability 0 | threshold met | granted | watch-decided | exact compares |
+| --- | --- | --- | --- | --- | --- | --- |
+| `PROMOTE_HITS=1` | 45 | 38 (84.4%) | 45 | 45 | 3 | 42 |
+| `PROMOTE_HITS=2` | 50 | 39 (78.0%) | 11 | 11 | 1 | 44 |
+| `PROMOTE_HITS=3` (default) | 51 | 39 (76.5%) | 4 | 4 | **0** | 45 |
+| `PROMOTE_HITS=4` | 51 | 39 (76.5%) | 0 | 0 | 0 | 45 |
+| `DEFER_MIN_KB=8192` | 45 | 38 (84.4%) | 45 | 45 | 3 | 42 |
+
+Three things follow, and the first two match the production census posted on #3155 (94.8% of decisions
+taken at stability 0) closely enough to be the same phenomenon at a different scale:
+
+* **The stability counter is at zero for the large majority of decisions**, so `hits` values of 2 and above
+  are gated on a ladder the dominant population never climbs — which is why they measured
+  indistinguishable. `hits=1` differs in *kind*, not degree: it removes the counter from the decision.
+* **At the default, write-watch promotion decides zero acquisitions here.** Every one of the 46 is settled
+  by the submit journal (1) or a full compare (45).
+* **`DEFER_MIN_KB=8192` reproduces `hits=1`'s census exactly** while leaving the ladder's precondition
+  intact for genuinely large sources. So the effect attributed to `hits=1` is reachable through the size
+  exemption instead of by discarding the proof requirement. (On this harness every source is under 8 MiB,
+  so `=8192` and `=0` are the same arm; that will not hold on a title.)
+
+Read the counts, not the bytes: every arm reports `5.0 MiB compared`, because the three compares
+promotion removes here are small ones and the difference is below the report's one-decimal MiB
+resolution. A **byte** claim needs a title, which is the production sweep.
+
+The suite passes all 449 assertions at `hits=1`, at `DEFER_MIN_KB=0` and at `=8192`, which is evidence —
+not proof, the harness is not a title — that arming at stability 0 does not break the exactness contracts
+it checks. `hits >= 4` fails one arm ("validated typed-storage result can be leased by an exact sampled
+descriptor"): that region dispatches four times, so the counter reaches 3 and no more, and the lease needs
+a watch that was actually armed. That failure is the suite depending on promotion firing, which is itself
+evidence the harness now hosts the mechanism.
+
+### Ruled out
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1` is a user-facing trap: a documented switch value that deterministically crashes the emulator | **Falsified.** It crashes exactly one binary, `test_game_compute`, which asserted `guest_write_watch_set_fault_onstack(true)` in seven places while installing no SIGSEGV handler, and compensated only at the write sites it knew about. At `hits=1` the cache arms a watch the test has no hook for and the test's own store into that page is unserviced. The faulting instruction is `notl 0x0(%r13)` — `large_result[0] ^= 0xffffffffu;` — at a page-aligned mmap address. Production installs the handler. With the handler installed in the test, `hits=1` passes 449/449. | #3156, instrument trap 250 |
+| The promotion **threshold** (`PROMOTE_HITS`) is the knob that decides whether compute promotion fires, so retuning it 3→2 is the fix | **Falsified twice, by two different measurements.** #3155's own re-measurement found 2 and 3 indistinguishable (63-65 GB either way) and closed PR #3158 for changing a default with no measured benefit; the census above shows why — 76-84% of decisions are taken at stability 0, where every threshold ≥ 2 refuses identically. The threshold is not the reachable lever; `defer_min_bytes` is, and it is hard-coded to 1. | #3155, #3158 |
+| The 8 MiB per-submit promotion **budget** is what refuses these promotions | **Falsified.** `budget_refused = 0` in all five harness arms, and #3155's production census measured 7 refusals against 58 stability-eligible decisions (12%) with a 1 GB budget changing nothing measurable. | #3155 |
+| Compute buffer/image residency "uses the same exact-first rule" as the texture cache | **Falsified — it was a documentation error in `FRONTEND_APP.md`.** The two paths share `should_promote_write_watch` but not its arguments: the texture path exempts sources under 8 MiB, the compute path exempts nothing. Corrected in the same PR. | #3155 |
+
 ## Syberia block-compressed cube retention (2026-08-03)
 
 Syberia's save/profile screen repeatedly decoded one 2048x2048x6 BC6H cube. A five-second sampling

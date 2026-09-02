@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/execute/gpu_execute.hpp"
+#include "shared/texture/write_watch_census.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -269,6 +270,13 @@ uint64_t live_compute_graphics_import_guest_bytes(
 // Monotonic diagnostic count of writable-buffer results whose exact GPU comparison avoided a host
 // mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
 uint64_t live_compute_buffer_gpu_result_skips();
+// #3155. Running totals of how cached compute sources were proven unchanged -- intra-submit GPU
+// write journal, armed page watch, or a full byte compare -- and of what the promotion policy saw
+// each time it was consulted. Always collected (per acquisition, not per byte);
+// PROSPER_WATCH_PROMOTE_CENSUS additionally prints them every 256 submits and at exit. Read the
+// `decisions=`/`validated=` denominators before any ratio: comparing two arms' totals taken at
+// different points in a run is exactly the mistake that produced this issue's retracted numbers.
+WriteWatchCensusSnapshot live_compute_write_watch_census();
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
