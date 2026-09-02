@@ -415,9 +415,15 @@ def arm_list():
         rc, out = tool(a, 'list')
         check('list exit', rc, 0, out)
         check('one slot listed', out.count('refs/worktree/prosper-stash/default'), 1, out)
+        sha_b = rev(b, 'refs/worktree/prosper-stash/default')
         rc, out = tool(a, 'list', '--all')
         check('list --all exit', rc, 0, out)
-        check('--all reaches the other worktree', str(b) in out, True, out)
+        # Assert on the sha rather than on the path string: git prints a Windows worktree path with
+        # mixed separators (D:\a/_temp/...), so a containment test against pathlib's spelling fails
+        # there for a reason that has nothing to do with the tool.
+        check('--all reaches the other worktree\'s slot', sha_b[:12] in out, True, out)
+        check('--all names the other worktree',
+              os.path.basename(str(b)) in out.replace('\\', '/'), True, out)
 
 
 def main():

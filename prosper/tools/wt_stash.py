@@ -121,7 +121,14 @@ def current_branch():
 
 
 def resolve(ref):
-    rc, out, _ = git_rc('rev-parse', '--verify', '--quiet', ref + '^{commit}')
+    """The commit a slot ref names, or None.
+
+    Deliberately NOT `<ref>^{commit}`: that peeling syntax reaches git mangled on the Windows/MSYS
+    route this project also prescribes, where it resolves nothing and every slot reads as absent --
+    push parked fine and pop then said "no such slot". Everything written here is a commit sha this
+    tool put there itself, so a plain --verify is both sufficient and portable.
+    """
+    rc, out, _ = git_rc('rev-parse', '--verify', '--quiet', ref)
     return out.strip() if rc == 0 else None
 
 
