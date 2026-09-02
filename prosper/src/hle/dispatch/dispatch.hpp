@@ -120,6 +120,13 @@ public:
     // parameter type carries PROSPER_GUEST_ABI, so on Windows an untagged handler is a compile
     // error rather than a stub that silently reads the wrong registers — the tag and the
     // registration cannot drift apart. `A...` is the fixed prefix; the `...` is the real ellipsis.
+    //
+    // ANY DIRECT CALLER MUST USE A PROSPER_GUEST_ABI POINTER TYPE. `Hle::lookup` hands back a bare
+    // address, and calling one of these through an ordinary host-ABI function pointer places the
+    // arguments by the wrong convention — on Windows the first `%s` then dereferences whatever
+    // landed in rdi. Not hypothetical: `test_printf` and `test_guest_log_capture` did exactly that
+    // and SEGFAULTed on the Windows MinGW job the moment these handlers were tagged, and passed
+    // everywhere else. `HleFn` is the wrong type for one of these too.
     template <class R, class... A>
     static void register_guest_abi(const std::string& nid, PROSPER_GUEST_ABI R (*fn)(A..., ...),
                                    const char* name) {

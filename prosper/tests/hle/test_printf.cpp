@@ -15,8 +15,13 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
-using SnprintfFn = int (*)(char*, size_t, const char*, ...);
-using SprintfFn  = int (*)(char*, const char*, ...);
+// PROSPER_GUEST_ABI is what makes the comment above TRUE rather than aspirational. These handlers
+// are compiled in the GUEST's convention (#3246), which on Windows is not the host's -- so an
+// untagged pointer type here would place the arguments by Microsoft x64 rules for a callee reading
+// them by System V, and the first `%s` would dereference whatever landed in `rdi`. It did: this test
+// SEGFAULTed on the Windows MinGW job the moment the handlers were tagged. Empty on Linux/macOS.
+using SnprintfFn = PROSPER_GUEST_ABI int (*)(char*, size_t, const char*, ...);
+using SprintfFn  = PROSPER_GUEST_ABI int (*)(char*, const char*, ...);
 
 int main() {
     printf("== test_printf ==\n");
