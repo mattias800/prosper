@@ -507,9 +507,33 @@ decode, shader recompiler, Vulkan backend — all unit-testable in isolation) pr
 
 ## Ruled out
 
-Cross-title falsifications for the **present / publish path** (what reaches the screen once passes
-have rendered). One line each: the dead hypothesis, the evidence, the link. Extend this rather than
+Cross-title falsifications for the **present / publish path** — what reaches the screen once passes
+have rendered, together with the pass identity that decides which surface receives those pixels in
+the first place. One line each: the dead hypothesis, the evidence, the link. Extend this rather than
 re-deriving — and read it before forming a hypothesis about a frozen, black, or missing frame.
+
+- **The three slot-0 colour-target readers cannot be merged into one accessor as a refactor — the
+  merge is a semantic decision, and it decides what the renderer renders to.** `mrt_color_binding`
+  (array-first, the active-binding rule behind the attachment count and feedback detection),
+  `mrt_pass_color_binding` (named-first, pass identity) and `live_renderer`'s `pass_bases[0]` (the
+  raw named field) agree on every draw any producer emits, so unifying them *looks* free. On a draw
+  whose named and array representations disagree they answer three different ways, and the sharpest
+  case is not the obvious one: with the array naming a surface and the named triple naming none,
+  grouping compares that address while `pass_bases[0]` is **0**, so the winner decides whether the
+  pass renders to the array's surface or to nothing at all. Hand-built instances for all three
+  divergence shapes are in `frontends/shared/tests/test_mrt_binding.cpp`; no producer can emit one,
+  so there is no evidence to pick a winner with. #3026 landed the consumer-side check instead and
+  filed the decision separately. #3026.
+- **"A named/array divergence is inexpressible" is true of captures and live draws and NOT of the
+  tree as a whole — the render fixtures emit them today.** #3023 established that captures cannot
+  carry a divergence (the wire format holds slots 2 and up only, and
+  `restore_legacy_color_target_aliases` re-derives 0/1 from the named triple on load) and that
+  `realize_draw_item` mirrors at its single success exit. That is correct and is why the #3023 fix
+  is a no-op on real content. It does not generalise: a fixture that takes a captured item and
+  updates only the named fields leaves the array holding the capture's original base, and one run of
+  `gpu_capture_render_replay` reports **eight** such draws (`array=0x200000 0x0` against a live named
+  triple). So the enforceable invariant is "the array mirrors the named triple **or is absent**", not
+  equality — a strict-equality guard fires on every legacy and synthetic draw. #3026.
 
 - **A frozen frame with a live guest is not necessarily a guest or a draw problem — check the publish
   gate first.** Sonic Frontiers (PPSA03831) looked dead from t≈140 s with `frame_seq` frozen at 2,081,

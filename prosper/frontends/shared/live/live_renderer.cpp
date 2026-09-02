@@ -7573,6 +7573,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 auto active_color_count = [](const prosper::gpu::DrawItem& draw) {
                     return prosper::frontend::mrt_active_color_count(draw, mrt_format_defined);
                 };
+                // #3026 -- the slot-0/1 alias mirror, checked HERE, at the consumer.
+                //
+                // `DrawItem::color_targets[0]`/`[1]` mirror the named `color0_*`/`color1_*` triples
+                // or are absent; every producer honours that and nothing enforced it. The moment
+                // one does not, the readers below answer differently: this loop's pass target is
+                // the RAW named field (`base`, and `native_w`/`native_h` for the framebuffer
+                // extent), grouping is named-first (`mrt_pass_color_binding`), and the
+                // active-binding rule behind the attachment count and feedback detection is
+                // array-first (`mrt_color_binding`). #3023 is what one such disagreement cost: two
+                // draws rendering to different addresses grouped into one pass, and the second
+                // draw's surface was discarded with no pass, no published pixels and no diagnostic.
+                //
+                // It is checked here and not beside the assignments that establish it because an
+                // assertion at `realize_draw_item`'s success exit would sit two lines below its own
+                // mirror and could never fail. This is the place a divergence would have had to
+                // survive to matter.
+                //
+                // Report-only, deliberately. Which representation should win is undecided, and
+                // deciding it here would change the surface the renderer renders to.
+                for (const auto& alias_draw : items) {
+                    prosper::frontend::mrt_check_color_alias_mirror(
+                        alias_draw,
+                        [](uint32_t slot,
+                           const prosper::gpu::DrawItem::ColorTargetBinding& carried,
+                           const prosper::gpu::DrawItem::ColorTargetBinding& named,
+                           uint64_t ordinal) {
+                            static const bool alias_log =
+                                PROSPER_ENV_VALUE("PROSPER_MRT_ALIAS_LOG") != nullptr;
+                            if (ordinal > 8 && !alias_log) return;
+                            fprintf(stderr,
+                                    "[mrt-alias] c%u array=0x%llx %ux%u vs named=0x%llx %ux%u -- "
+                                    "the pass renders to the NAMED surface; grouping, feedback and "
+                                    "the attachment count may read the other one (#3026) x%llu%s\n",
+                                    slot, (unsigned long long)carried.base, carried.width,
+                                    carried.height, (unsigned long long)named.base, named.width,
+                                    named.height, (unsigned long long)ordinal,
+                                    ordinal == 8 && !alias_log
+                                        ? "  (further reports need PROSPER_MRT_ALIAS_LOG=1)" : "");
+                        });
+                }
                 size_t pass_i = 0;
                 prosper::test::BackendSubmissionBatch backend_submission;
                 if (timing_enabled)

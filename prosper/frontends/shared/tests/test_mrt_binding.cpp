@@ -274,6 +274,154 @@ int main() {
         CHECK(mrt_same_color_pass(array_only, array_only, format_defined, format_at));
     }
 
+    // #3026 -- the named/array mirror for slots 0 and 1, and a guard that CAN fail.
+    //
+    // THE CONVENTION: for the two aliased slots, `DrawItem::color_targets[slot]` either equals the
+    // named `colorN_*` triple or is ABSENT (all three fields zero, the legacy shape the fallback in
+    // `mrt_color_binding` exists for). Every production producer honours it -- `realize_draw_item`'s
+    // success exit and its failure record, the three DrawItem<->capture conversions, and
+    // `restore_legacy_color_target_aliases`, which runs on every capture load because the wire
+    // format carries slots 2 and up only. Nothing checked it, and #3023 is what happens when a
+    // consumer starts depending on which of the two it reads.
+    //
+    // The obvious guard is void, and these arms deliberately do not build it: an assertion inside
+    // `realize_draw_item` would sit two lines below the mirror it verifies, so it would pass forever
+    // and catch nothing. The predicate is checked at the CONSUMER instead -- live_renderer's pass
+    // loop, where the pass target is chosen -- and every divergent instance below is built BY HAND,
+    // because no producer can emit one.
+    {
+        using prosper::frontend::mrt_check_color_alias_mirror;
+        using prosper::frontend::mrt_color_alias_divergences;
+        using prosper::frontend::mrt_color_alias_mirrored;
+        using prosper::frontend::mrt_color_binding;
+        using prosper::frontend::mrt_named_color_alias;
+        using prosper::frontend::mrt_pass_color_binding;
+        using Binding = prosper::gpu::DrawItem::ColorTargetBinding;
+
+        auto same = [](Binding a, Binding b) {
+            return a.base == b.base && a.width == b.width && a.height == b.height;
+        };
+        // THE DEMONSTRATION behind "nothing changes for any reachable draw". Under the convention
+        // every slot-0/1 reader in the renderer returns one triple: grouping's pass identity
+        // (`mrt_pass_color_binding`), the active-binding rule behind the attachment count and
+        // feedback detection (`mrt_color_binding`), and live_renderer's own `pass_bases[0]` plus its
+        // framebuffer extent -- which are the raw named fields, so `mrt_named_color_alias` stands
+        // for them here. Break the convention and they stop agreeing; that is the whole hazard.
+        auto readers_agree = [&](const prosper::gpu::DrawItem& draw, uint32_t slot) {
+            return same(mrt_pass_color_binding(draw, slot), mrt_color_binding(draw, slot)) &&
+                   same(mrt_pass_color_binding(draw, slot), mrt_named_color_alias(draw, slot));
+        };
+
+        // Shape 1: the exact mirror. What `realize_draw_item` and every capture conversion emit.
+        auto mirrored = make_draw();
+        mirrored.color0_base = 0x300000ull;
+        mirrored.color0_width = 32u; mirrored.color0_height = 2u;
+        mirrored.color_targets[0] = {0x300000ull, 32u, 2u};
+        mirrored.color1_base = 0x310000ull;
+        mirrored.color1_width = 32u; mirrored.color1_height = 2u;
+        mirrored.color_targets[1] = {0x310000ull, 32u, 2u};
+        CHECK(mrt_color_alias_mirrored(mirrored, 0) && mrt_color_alias_mirrored(mirrored, 1));
+        CHECK(readers_agree(mirrored, 0) && readers_agree(mirrored, 1));
+
+        // Shape 2: the array ABSENT and the named triple authoritative -- captures through v33, and
+        // the direct/synthetic callers the render fixtures are. The fallback repairs it, so the
+        // readers still agree and this must NOT be reported as a divergence.
+        auto legacy = make_draw();
+        legacy.color0_base = 0x300000ull;
+        legacy.color0_width = 32u; legacy.color0_height = 2u;
+        CHECK(mrt_color_alias_mirrored(legacy, 0) && mrt_color_alias_mirrored(legacy, 1));
+        CHECK(readers_agree(legacy, 0) && readers_agree(legacy, 1));
+
+        // Shape 3: a draw that names no slot-0 surface at all. Both representations empty.
+        auto unbound = make_draw();
+        CHECK(mrt_color_alias_mirrored(unbound, 0) && mrt_color_alias_mirrored(unbound, 1));
+        CHECK(readers_agree(unbound, 0) && readers_agree(unbound, 1));
+
+        // Slots 2 and up have no named alias, so nothing there can diverge -- the array is the only
+        // representation and is authoritative by itself.
+        auto wide = make_draw();
+        wide.color_targets[2].base = kMrt2;
+        CHECK(mrt_color_alias_mirrored(wide, 2));
+
+        // DIVERGENCE A -- a stale array entry beside a live named triple. This is the shape the
+        // render fixtures reach by taking a captured item and updating only the named fields, and
+        // the shape #3023's grouping fix was written against.
+        auto stale_mirror = mirrored;
+        stale_mirror.color_targets[0].base = 0x200000ull;   // an earlier target, never cleared
+        stale_mirror.color_targets[0].width = 0u;
+        stale_mirror.color_targets[0].height = 0u;
+        CHECK(!mrt_color_alias_mirrored(stale_mirror, 0));
+        CHECK(!readers_agree(stale_mirror, 0));
+        // Named-first grouping and the renderer agree; the active-binding rule does not, so a
+        // feedback test on this draw answers about a surface the pass never renders to.
+        CHECK(mrt_pass_color_binding(stale_mirror, 0).base == 0x300000ull);
+        CHECK(mrt_color_binding(stale_mirror, 0).base == 0x200000ull);
+
+        // DIVERGENCE B -- the sharpest one, and the reason the unifying accessor is a semantic
+        // decision rather than a refactor: here GROUPING and TARGET SELECTION disagree. The array
+        // names a surface, the named triple names none, so grouping compares 0x500000 while
+        // live_renderer's `pass_bases[0]` -- the raw named field -- is 0.
+        auto array_only = make_draw();
+        array_only.color_targets[0].base = 0x500000ull;
+        CHECK(!mrt_color_alias_mirrored(array_only, 0));
+        CHECK(!readers_agree(array_only, 0));
+        CHECK(mrt_pass_color_binding(array_only, 0).base == 0x500000ull);
+        CHECK(mrt_named_color_alias(array_only, 0).base == 0u);
+
+        // DIVERGENCE C -- same address, different EXTENT. A base-only comparison would miss it, and
+        // the extent is half of an attachment's identity: it is what stops two packed mip levels
+        // sharing one Vulkan attachment.
+        auto extent_only = mirrored;
+        extent_only.color_targets[0].width = 16u;
+        extent_only.color_targets[0].height = 16u;
+        CHECK(!mrt_color_alias_mirrored(extent_only, 0));
+        CHECK(mrt_color_alias_mirrored(extent_only, 1));   // slot 1 is untouched and still mirrors
+
+        // DIVERGENCE D -- slot 1 diverges on its own. The resolve path takes its destination from
+        // the raw named `color1_base` (#3025), so this slot carries the same hazard as slot 0.
+        auto slot1_diverges = mirrored;
+        slot1_diverges.color_targets[1].base = 0x999000ull;
+        CHECK(!mrt_color_alias_mirrored(slot1_diverges, 1));
+        CHECK(mrt_color_alias_mirrored(slot1_diverges, 0));
+
+        // The consumer's entry point: it names the diverging slot and both representations, and it
+        // counts. `test_gpu_capture_render` asserts the live renderer actually calls this, which is
+        // the part a predicate test cannot establish.
+        uint32_t reported_slot = 99u;
+        Binding reported_carried{}, reported_named{};
+        uint64_t reported_ordinal = 0u;
+        const uint64_t before = mrt_color_alias_divergences();
+        const uint32_t diverged = mrt_check_color_alias_mirror(
+            stale_mirror, [&](uint32_t slot, const Binding& carried, const Binding& named,
+                              uint64_t ordinal) {
+                reported_slot = slot; reported_carried = carried; reported_named = named;
+                reported_ordinal = ordinal;
+            });
+        CHECK(diverged == 1u && reported_slot == 0u && reported_ordinal == before + 1u);
+        CHECK(reported_carried.base == 0x200000ull && reported_named.base == 0x300000ull &&
+              reported_named.width == 32u && reported_named.height == 2u);
+        CHECK(mrt_color_alias_divergences() == before + 1u);
+
+        // ... and the three producer shapes report nothing, so the guard is not a constant.
+        uint32_t spurious = 0;
+        auto count_spurious = [&](uint32_t, const Binding&, const Binding&, uint64_t) {
+            ++spurious;
+        };
+        CHECK(mrt_check_color_alias_mirror(mirrored, count_spurious) == 0u);
+        CHECK(mrt_check_color_alias_mirror(legacy, count_spurious) == 0u);
+        CHECK(mrt_check_color_alias_mirror(unbound, count_spurious) == 0u);
+        CHECK(spurious == 0u && mrt_color_alias_divergences() == before + 1u);
+
+        // Both slots of one draw are reported, once each.
+        auto both_diverge = stale_mirror;
+        both_diverge.color_targets[1].base = 0x999000ull;
+        uint32_t both_reports = 0;
+        CHECK(mrt_check_color_alias_mirror(
+                  both_diverge, [&](uint32_t, const Binding&, const Binding&, uint64_t) {
+                      ++both_reports; }) == 2u);
+        CHECK(both_reports == 2u && mrt_color_alias_divergences() == before + 3u);
+    }
+
     // #3025 -- the resolve DESTINATION is part of a resolve pass's identity.
     //
     // These arms establish the mechanism, not the outcome. The load-bearing assertion for this fix
