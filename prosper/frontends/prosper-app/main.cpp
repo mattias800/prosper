@@ -2982,6 +2982,14 @@ int main(int argc, char** argv) {
             // (the main loop uses the shared-present submit mutex for the same reason at the
             // swapchain-resize wait above). A timed-out drain means a guest submit may still be
             // live, so waiting would both violate that and be the very block we are avoiding.
+            //
+            // Note what this wait does and does not cost. It is UNBOUNDED — on a title that has
+            // hung a GPU job it returns only when the amdgpu watchdog resets the device, adding
+            // seconds to a close — and it is not protecting a teardown, because the _Exit below
+            // destroys no Vulkan object. What it buys is that already-submitted guest work is off
+            // the device before the process dies. That is a deliberate trade of a bounded, visible
+            // delay against the unbounded, invisible one this whole path exists to prevent; if it
+            // ever becomes the bigger nuisance, deleting it is safe and loses only that guarantee.
             if (vk.device) vkDeviceWaitIdle(vk.device);
         } else {
             fprintf(stderr,
