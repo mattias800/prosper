@@ -1745,6 +1745,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_entry_m0_dispatcher PRIVATE prosper_core)
   add_test(NAME entry_m0_dispatcher COMMAND test_entry_m0_dispatcher)
 
+  # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
+  # now admit. Both directions, in its own binary for the same reason as the file above.
+  add_executable(test_entry_vcc_dead tests/gpu/recompiler/test_entry_vcc_dead.cpp)
+  target_link_libraries(test_entry_vcc_dead PRIVATE prosper_core)
+  add_test(NAME entry_vcc_dead COMMAND test_entry_vcc_dead)
+
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
   add_executable(test_dynfetch_fold tests/gpu/recompiler/test_dynfetch_fold.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
