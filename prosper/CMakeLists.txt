@@ -2694,6 +2694,20 @@ if(TARGET prosper_core)
       set_tests_properties(gds_scan_memo_disabled PROPERTIES
                            ENVIRONMENT "PROSPER_NO_GDS_SCAN_MEMO=1")
 
+      # The backend's persistent-resource domain lock (#2953). Carries its own positive control --
+      # an unguarded arm that proves the overlap detector fires at all -- so a clean zero in the
+      # guarded arms cannot be read as "the threads never overlapped".
+      add_executable(test_backend_persistent_resource_lock
+                     tests/render/test_backend_persistent_resource_lock.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_backend_persistent_resource_lock PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_backend_persistent_resource_lock PRIVATE frontends)
+      target_link_libraries(test_backend_persistent_resource_lock
+                            PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME backend_persistent_resource_lock
+               COMMAND test_backend_persistent_resource_lock)
+
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
       add_executable(test_compute_address_watch tests/gpu/test_compute_address_watch.cpp)
       target_link_libraries(test_compute_address_watch PRIVATE prosper_core Vulkan::Vulkan)

@@ -288,6 +288,17 @@ One line per hypothesis this work killed, so nobody re-derives it at full cost.
   appeared to falsify the fix under that lever was executed against a **stale `screenshot` binary**
   — only the `boot_trace` target had been rebuilt. Recorded because the arm looked like a clean
   negative and was not; rebuild every frontend, not the one you are about to run.
+- **The `job_render_0` crash inside `persistent_texture_images.find()` cannot have come from two
+  concurrent `sceAgcDriverSubmitDcb` folds — that path is already serialised, and had been since
+  #278.** Both AGC submit entry points (`agc_driver_submit_dcb` and `submit_dcb_stream`, i.e.
+  `SubmitDcb`/`SubmitDcbFinal`/`SubmitAcb`) take `g_agc_state_mu` before folding and hold it across
+  `execute_submit_work`, which is what invokes the render backend; the 2 ms deferred-flush watchdog
+  thread takes the same mutex. So a second thread reaching the backend's persistent caches has to
+  arrive by some other route, and looking for one *between two submits* is a dead end. The lock
+  added in #2953 is not a duplicate of that one: it lives in `render_runner.h`, which `gpu_replay`,
+  `boot_trace` and every Vulkan test compile **without linking the HLE at all**, so on those
+  frontends nothing was serialising the domain. What remains open is which route the observed
+  thread took; `backend_persistent_resource_peak_in_flight()` now answers that on any run. #2953.
 
 ## Instruments this work added
 

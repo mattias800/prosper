@@ -739,7 +739,7 @@ struct PersistentPipeline {
 // static that function owns. It does NOT cover the colour-target and depth/stencil caches' OTHER
 // entry points -- `invalidate_persistent_color_target*`, `readback_persistent_color_target`,
 // `snapshot_persistent_ds_images` and the frontend's direct iteration of both caches -- which are
-// reachable without this lock and are tracked separately. Nor is the multi-segment loop in
+// reachable without this lock and are tracked in #3240. Nor is the multi-segment loop in
 // `render_draws_rgba` atomic: the guard is released between segments, which is the same granularity
 // two consecutive submits already have.
 //
