@@ -296,6 +296,24 @@ removed the writer and the test still passed. So:
 Worked example and the surviving arms: `prosper/tests/hle/test_font_render.cpp`. Recorded as
 instrument trap 227 in `GAME_COMPAT_ORCHESTRATION.md`.
 
+## Ruled out — an indeterminate value cannot be asserted on, so a test cannot cover it
+
+Sibling of the sentinel section above, and the same class one step further out: there, a *written*
+poison value could be mistaken for a real one; here there is no value at all.
+
+- **A regression test cannot demonstrate that a handle was UNINITIALIZED rather than null.** #3210's
+  two worst sites (`VkRenderPass rp;` / `VkFramebuffer fb;` in `tests/fixtures/render_runner.h`) read
+  an uninitialized automatic on a failed create. Reading one is undefined behaviour with no
+  observable value an assertion can name, and in practice this box's RADV *does* leave the output
+  handle null — so an "unfixed code crashed" arm would be unreproducible and would prove nothing
+  about a driver that behaves differently. Measured: with the fix's control flow intact, deleting
+  *every* pre-call `*out = VK_NULL_HANDLE;` **and** both caller-side initializers leaves
+  `test_render_object_create_failure` fully green (build rc 0, test rc 0). What the test does cover
+  is the half that has observable behaviour — that the failure is reported and the pass is dropped;
+  a mutation that reports and then continues past the failure segfaults the process at the first
+  injected render. The initialization half is established by reading the code, and that is the
+  honest ceiling for this class rather than a gap to be closed with a cleverer test.
+
 ## Rule of thumb
 
 Prefer the cheapest layer that can catch a given bug: pure structural asserts for translation logic,

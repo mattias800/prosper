@@ -2703,6 +2703,17 @@ if(TARGET prosper_core)
       target_link_libraries(test_color_target_create_failure PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME color_target_create_failure COMMAND test_color_target_create_failure)
 
+      # #3210: the render pass, framebuffer, image-view, sampler and shader-module creates in the
+      # same pass. Two of them wrote UNINITIALIZED handles that were then used unchecked. Same
+      # block and same reason as the test above -- `tests` and `frontends` include roots plus a
+      # real Vulkan device.
+      add_executable(test_render_object_create_failure
+                     tests/gpu/test_render_object_create_failure.cpp)
+      target_include_directories(test_render_object_create_failure PRIVATE tests)
+      target_include_directories(test_render_object_create_failure PRIVATE frontends)
+      target_link_libraries(test_render_object_create_failure PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME render_object_create_failure COMMAND test_render_object_create_failure)
+
       # Indexed draws (#64): vkCmdDrawIndexed from a BackendDraw's index data — the [0,1,2,2,3,0] quad
       # must match the retired perimeter-fan rendering pixel-exact, and indices must really be applied.
       add_executable(test_indexed_render tests/gpu/state/test_indexed_render.cpp)
