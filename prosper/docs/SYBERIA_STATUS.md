@@ -77,14 +77,14 @@ t=180/185 s were black; every composited sample from t=190.0 through 222.7 s con
 - distinct colours stay between **139,946 and 144,452** while `frame_seq` advances 1 → 43;
 - every composited CRC differs, consistent with the scene's animated light/fog rather than a stale
   plateau; and
-- the direct t=201.1 s frontend capture is `assets/screenshots/syberia-profile.png`.
+- the direct t=201.1 s frontend capture is `assets/screenshots/syberia-profile.webp`.
 
 This is a visible improvement over the recorded unmodified baseline (670,815 non-black pixels and a
 black right ~55%), but not correctness: the restored HDR scene is substantially overexposed. The
 title therefore remains rung 3 and the exposure/gameplay-composite work remains open.
 
 `scripts/syberia/reach-gameplay.pad` continues from there. It is **validated by the run that produced
-`assets/screenshots/syberia-title.png` and `assets/screenshots/syberia-gameplay.png`** — do not change
+`assets/screenshots/syberia-title.webp` and `assets/screenshots/syberia-gameplay.webp`** — do not change
 it without re-running:
 
 | t | state |

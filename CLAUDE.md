@@ -670,6 +670,14 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       covering eight titles shows eight titles, not one — that happened, and the other seven captures
       sat in `assets/screenshots/` invisible to the only audience they existed for. A picture costs a
       reader nothing to skip and everything to not have. Never economise here.
+    - **Economise on BYTES, never on count.** A committed capture is a **1920-wide WebP**, not a 4K
+      PNG — run `prosper/tools/screenshots/shrink.py <file>` before committing it. Measured
+      2026-09-02: `assets/screenshots` was **398 MiB of a 621 MiB pack** while all source, docs and
+      tests in the entire history came to **18 MiB**, so images were ~96% of the repository, and the
+      cause was resolution rather than quantity. Re-encoding the same 140 frames took them to
+      **14.2 MiB** with small UI text still legible. At the old size GitHub's 10 GB ceiling arrives
+      in about four years; at this one it does not. This does not soften the bullet above — show
+      every picture you have, just do not ship each one at 2.5 MiB.
     - **Words: one sentence saying what now works.** *"We now reach correct rendering of the Sonic
       Frontiers title screen."* Then the screenshot. A second sentence only if the picture misleads
       without one — a defect you want noticed, or a caveat about what is being seen. Say what you are

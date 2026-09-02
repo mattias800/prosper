@@ -58,7 +58,7 @@ frame at 222.3 seconds. The long
 pause is an evidence-gathering aid, not a claim that the guest requires that
 delay. No character was entered, no normal game-save artifact was created, and
 gameplay remains unvalidated. The representative unmodified capture is
-[`../../../assets/screenshots/dragon-quest-vii-name-entry.png`](../../../assets/screenshots/dragon-quest-vii-name-entry.png).
+[`../../../assets/screenshots/dragon-quest-vii-name-entry.webp`](../../../assets/screenshots/dragon-quest-vii-name-entry.webp).
 
 This name-entry state ran at roughly 5.5 rendered FPS during a shared-GPU run,
 with intermittent white/blue washed frames around otherwise coherent keyboard

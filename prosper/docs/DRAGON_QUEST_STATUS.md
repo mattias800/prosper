@@ -209,7 +209,7 @@ intentional: it allowed a clean frame to anchor the selected `1: Unused` prompt 
 | 204–252 s | player-name keyboard, intermittently mixed with white/blue washed samples |
 
 The representative image is
-[`assets/screenshots/dragon-quest-vii-name-entry.png`](../../assets/screenshots/dragon-quest-vii-name-entry.png),
+[`assets/screenshots/dragon-quest-vii-name-entry.webp`](../../assets/screenshots/dragon-quest-vii-name-entry.webp),
 an unmodified native Linux `tools/screenshot` PNG from 222.3 seconds. The run was stopped after establishing
 this state; no character was entered and no gameplay claim is made.
 
@@ -716,7 +716,7 @@ next. Unmasked, that background flip alone scores 56 on a window whose map is pi
 
 Visually: across the first stick window the quest-marker house that sat centre-left ends up
 upper-right, a cliff face enters from the left, and the minimap scrolls to match.
-`assets/screenshots/dragon-quest-vii-walked-to-cliff.png` is that frame.
+`assets/screenshots/dragon-quest-vii-walked-to-cliff.webp` is that frame.
 
 ### The composite: geometry is correct, the lit-material shading is not
 

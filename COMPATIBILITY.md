@@ -78,7 +78,7 @@ Last updated: 2026-08-28
 | *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — the title screen renders continuously on a default launch (40/40 samples over 200 s), and a routed run passes it on Cross and plays the **complete intro cinematic** in full colour to t≈65 s. The first level does not render. **The route needs an isolated `PROSPER_SAVE0`/`PROSPER_SAVEDATA_DIR`**: resuming a stale save at the shared default location turns the whole run black and looks exactly like a composite defect ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/unbound-PPSA03274/` | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
-| *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.png`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
+| *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.webp`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
 
 ## At a glance
 
@@ -171,44 +171,44 @@ is the authoritative place for current compatibility status and development hist
 
 ## The Messenger — `PPSA24651`
 
-<p align="center"><img src="assets/screenshots/messenger-title.png" alt="The Messenger — title screen"></p>
-<p align="center"><img src="assets/screenshots/messenger.png" alt="The Messenger — first level gameplay"></p>
+<p align="center"><img src="assets/screenshots/messenger-title.webp" alt="The Messenger — title screen"></p>
+<p align="center"><img src="assets/screenshots/messenger.webp" alt="The Messenger — first level gameplay"></p>
 
 The opening route reaches the first level with player, terrain, effects, dialogue, and foreground
 composition at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1865).
 
 ## Dead Cells — `PPSA15552`
 
-<p align="center"><img src="assets/screenshots/dead-cells-title.png" alt="Dead Cells — main menu"></p>
-<p align="center"><img src="assets/screenshots/dead-cells.png" alt="Dead Cells — Prisoners' Quarters gameplay"></p>
+<p align="center"><img src="assets/screenshots/dead-cells-title.webp" alt="Dead Cells — main menu"></p>
+<p align="center"><img src="assets/screenshots/dead-cells.webp" alt="Dead Cells — Prisoners' Quarters gameplay"></p>
 
 The route reaches a controllable, full-colour Prisoners' Quarters scene. See the [tracker](https://github.com/mattias800/prosper/issues/1866).
 
 ## Blasphemous 2 — `PPSA13579`
 
-<p align="center"><img src="assets/screenshots/blasphemous2-title.png" alt="Blasphemous 2 — title screen"></p>
-<p align="center"><img src="assets/screenshots/blasphemous2.png" alt="Blasphemous 2 — first playable room"></p>
+<p align="center"><img src="assets/screenshots/blasphemous2-title.webp" alt="Blasphemous 2 — title screen"></p>
+<p align="center"><img src="assets/screenshots/blasphemous2.webp" alt="Blasphemous 2 — first playable room"></p>
 
 The opening route passes the cinematic and reaches a complete first room at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1867).
 
 ## Evergate — `PPSA01885`
 
-<p align="center"><img src="assets/screenshots/evergate-title.png" alt="Evergate — title screen"></p>
-<p align="center"><img src="assets/screenshots/evergate.png" alt="Evergate — first tutorial room gameplay"></p>
+<p align="center"><img src="assets/screenshots/evergate-title.webp" alt="Evergate — title screen"></p>
+<p align="center"><img src="assets/screenshots/evergate.webp" alt="Evergate — first tutorial room gameplay"></p>
 
 The scripted route reaches the first tutorial room. See the [tracker](https://github.com/mattias800/prosper/issues/1868).
 
 ## GRIS — `PPSA09804`
 
 <p align="center"><img src="prosper/docs/screenshots/issue-1356-gris-title.png" alt="GRIS — title screen"></p>
-<p align="center"><img src="assets/screenshots/gris.png" alt="GRIS — opening gameplay"></p>
+<p align="center"><img src="assets/screenshots/gris.webp" alt="GRIS — opening gameplay"></p>
 
 The opening fall leads into native 1920×1080 gameplay with scripted input and audio. See the [tracker](https://github.com/mattias800/prosper/issues/1869).
 
 ## Space Adventure Cobra — The Awakening — `PPSA17337`
 
 <p align="center"><img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png" alt="Space Adventure Cobra — title screen"></p>
-<p align="center"><img src="assets/screenshots/space-adventure-cobra.png" alt="Space Adventure Cobra — tutorial combat"></p>
+<p align="center"><img src="assets/screenshots/space-adventure-cobra.webp" alt="Space Adventure Cobra — tutorial combat"></p>
 
 The route reaches the native 1920×1080 desert tutorial combat scene with audio. See the [tracker](https://github.com/mattias800/prosper/issues/1870).
 
@@ -220,10 +220,10 @@ screenshots above are the reviewed pre-regression state, not a capture of master
 
 ## Sonic Origins — `PPSA05325`
 
-<p align="center"><img src="assets/screenshots/sonic-origins-title-screen.png" alt="Sonic Origins — title screen"></p>
-<p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.png" alt="Sonic Origins — the boot auto-save notice, which waits for Cross"></p>
-<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.png" alt="Sonic Origins — the SONIC TEAM logo from the decoded intro"></p>
-<p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.png" alt="Sonic Origins — SEGA logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-title-screen.webp" alt="Sonic Origins — title screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-autosave-notice.webp" alt="Sonic Origins — the boot auto-save notice, which waits for Cross"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo-blue.webp" alt="Sonic Origins — the SONIC TEAM logo from the decoded intro"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.webp" alt="Sonic Origins — SEGA logo"></p>
 
 *All four are direct, unmodified `tools/screenshot` captures — headless Linux/RADV, native 3840×2160,
 no render-scale or frame-skip acceleration, master `f856e7a8`. The SEGA logo, SONIC TEAM logo and
@@ -268,13 +268,13 @@ See [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_B
 
 ## Sonic Frontiers — `PPSA03831`
 
-<p align="center"><img src="assets/screenshots/sonic-frontiers-title-screen.png" alt="Sonic Frontiers — title screen"></p>
-<p align="center"><img src="assets/screenshots/sonic-frontiers-main-menu.png" alt="Sonic Frontiers — main menu"></p>
-<p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.png" alt="Sonic Frontiers — SEGA logo"></p>
-<p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.png" alt="Sonic Frontiers — middleware credits"></p>
-<p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.png" alt="Sonic Frontiers — opening logo sequence"></p>
-<p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.png" alt="Sonic Frontiers — Sonic Team logo"></p>
-<p align="center"><img src="assets/screenshots/sonic-frontiers-autosave-notice.png" alt="Sonic Frontiers — auto-save notice"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-title-screen.webp" alt="Sonic Frontiers — title screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-main-menu.webp" alt="Sonic Frontiers — main menu"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.webp" alt="Sonic Frontiers — SEGA logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.webp" alt="Sonic Frontiers — middleware credits"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.webp" alt="Sonic Frontiers — opening logo sequence"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.webp" alt="Sonic Frontiers — Sonic Team logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-autosave-notice.webp" alt="Sonic Frontiers — auto-save notice"></p>
 
 A default launch with no input reaches the game's whole opening sequence at 3840×2160 — the SEGA
 logo, the Cyber Space intro, the Sonic Team logo and the middleware credits — then the auto-save
@@ -304,7 +304,7 @@ and the Needle stack is shared with *Sonic Origins* and *Sonic Racing: CrossWorl
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
-<p align="center"><img src="assets/screenshots/sonic-crossworlds-title.png" alt="Sonic Racing: CrossWorlds — title screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-crossworlds-title.webp" alt="Sonic Racing: CrossWorlds — title screen"></p>
 
 The title screen, composited by the live renderer at 3840×2160 — the full 3D scene, every character,
 the track and the UI.
@@ -326,22 +326,22 @@ black, and the sequence eventually holds on white. See
 
 ## Terminator 2D: NO FATE — `PPSA25872`
 
-<p align="center"><img src="assets/screenshots/terminator-title.png" alt="Terminator 2D: NO FATE — main menu"></p>
-<p align="center"><img src="assets/screenshots/terminator.png" alt="Terminator 2D: NO FATE — attract-mode gameplay"></p>
+<p align="center"><img src="assets/screenshots/terminator-title.webp" alt="Terminator 2D: NO FATE — main menu"></p>
+<p align="center"><img src="assets/screenshots/terminator.webp" alt="Terminator 2D: NO FATE — attract-mode gameplay"></p>
 
 The main menu and attract-mode gameplay are verified. See the [tracker](https://github.com/mattias800/prosper/issues/1872).
 
 ## Blue Prince — `PPSA25009`
 
-<p align="center"><img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen"></p>
-<p align="center"><img src="assets/screenshots/blue-prince-hall.png" alt="Blue Prince — Mount Holly entrance-hall gameplay"></p>
+<p align="center"><img src="assets/screenshots/blue-prince-title.webp" alt="Blue Prince — title screen"></p>
+<p align="center"><img src="assets/screenshots/blue-prince-hall.webp" alt="Blue Prince — Mount Holly entrance-hall gameplay"></p>
 
 The manor entrance hall renders with real 3D gameplay content. See the [tracker](https://github.com/mattias800/prosper/issues/1808).
 
 ## Grand Theft Auto V — `PPSA04263`
 
-<p align="center"><img src="assets/screenshots/gta5-title.png" alt="Grand Theft Auto V — title screen"></p>
-<p align="center"><img src="assets/screenshots/gta5-main-menu.png" alt="Grand Theft Auto V — main menu"></p>
+<p align="center"><img src="assets/screenshots/gta5-title.webp" alt="Grand Theft Auto V — title screen"></p>
+<p align="center"><img src="assets/screenshots/gta5-main-menu.webp" alt="Grand Theft Auto V — main menu"></p>
 
 The title and STORY/ONLINE main menu render. A checked-in pad route also reaches Story Mode gameplay:
 the HUD, radar and tutorial text are visible, but the 3D world is still black. See the
@@ -350,80 +350,80 @@ the HUD, radar and tutorial text are visible, but the 3D world is still black. S
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-title.png" alt="Dragon Quest VII Reimagined — title screen"></p>
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-entry.png" alt="Dragon Quest VII Reimagined — name entry"></p>
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-confirmation.png" alt="Dragon Quest VII Reimagined — name confirmation"></p>
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-onboarding.png" alt="Dragon Quest VII Reimagined — first-run setup"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-title.webp" alt="Dragon Quest VII Reimagined — title screen"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-entry.webp" alt="Dragon Quest VII Reimagined — name entry"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-name-confirmation.webp" alt="Dragon Quest VII Reimagined — name confirmation"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-onboarding.webp" alt="Dragon Quest VII Reimagined — first-run setup"></p>
 
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.png" alt="Dragon Quest VII Reimagined — the Estard coast in the opening chapter"></p>
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-pilchard-bay-gameplay.png" alt="Dragon Quest VII Reimagined — free field control in Pilchard Bay: the player character stands outside a harbour house with a quest marker over its door and a rowing boat beached to the right, the circular minimap at bottom-left and the party status block (Lv.1, HP 22, MP 7) at bottom-right. Colour is severely degraded — the composite blows the buildings to white and crushes the ground to navy — but the scene is structurally complete."></p>
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-walked-to-cliff.png" alt="Dragon Quest VII Reimagined — the same Pilchard Bay harbour after a left-stick window: the quest-marker house that stood centre-left is now upper-right and a cliff face has entered from the left, with the minimap scrolled to match. The player has walked."></p>
-<p align="center"><img src="assets/screenshots/dragon-quest-vii-field-hud.png" alt="Dragon Quest VII Reimagined — the Pilchard Bay location banner on entering the area, with the field HUD live: minimap, quest marker and party status. The world behind it is largely lost to the composite collapse."></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.webp" alt="Dragon Quest VII Reimagined — the Estard coast in the opening chapter"></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-pilchard-bay-gameplay.webp" alt="Dragon Quest VII Reimagined — free field control in Pilchard Bay: the player character stands outside a harbour house with a quest marker over its door and a rowing boat beached to the right, the circular minimap at bottom-left and the party status block (Lv.1, HP 22, MP 7) at bottom-right. Colour is severely degraded — the composite blows the buildings to white and crushes the ground to navy — but the scene is structurally complete."></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-walked-to-cliff.webp" alt="Dragon Quest VII Reimagined — the same Pilchard Bay harbour after a left-stick window: the quest-marker house that stood centre-left is now upper-right and a cliff face has entered from the left, with the minimap scrolled to match. The player has walked."></p>
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-field-hud.webp" alt="Dragon Quest VII Reimagined — the Pilchard Bay location banner on entering the area, with the field HUD live: minimap, quest marker and party status. The world behind it is largely lost to the composite collapse."></p>
 
 The title, new-save flow, and first-run setup render at native 3840×2160 with audio, and a scripted route continues past them: the game creates a real adventure log (`GameSaveData000.dat`), loads Estard’s persistent level and the chapter-1 sequence, and runs the opening story over a rendered 3D world. **`reach-field-control.pad` now reaches the field state in Pilchard Bay** — minimap, party block, area-entry banner and the player character — across 144 frames spanning 588 s, and `probe-locomotion.pad` measures free movement: the minimap changes in 8 of 8 stick windows against 0 of 8 neutral. What was in the way was the route’s patience, not a control: the opening chapter needs ~450 confirms and every earlier route gave it ~40, which yielded **zero** field frames. **The geometry and the 2D/UI path are correct; the lit-material shading is not** — buildings, cliffs and the boat blow to white while the water crushes far too dark. 25% of field frames render a recognisable scene in run 3 and 56% in run 4; the rest collapse to uniform white, black, or a flat blue speckle. See the [tracker](https://github.com/mattias800/prosper/issues/1874).
 
 ## Alex Kidd in Miracle World DX — `PPSA02664`
 
-<p align="center"><img src="assets/screenshots/alex-kidd.png" alt="Alex Kidd in Miracle World DX — first level"></p>
+<p align="center"><img src="assets/screenshots/alex-kidd.webp" alt="Alex Kidd in Miracle World DX — first level"></p>
 
 The first level renders at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1875).
 
 ## New Joe &amp; Mac: Caveman Ninja — `PPSA02801`
 
-<p align="center"><img src="assets/screenshots/joe-mac-menu.png" alt="New Joe &amp; Mac — arcade menu"></p>
-<p align="center"><img src="assets/screenshots/joe-mac.png" alt="New Joe &amp; Mac — level 1 gameplay"></p>
+<p align="center"><img src="assets/screenshots/joe-mac-menu.webp" alt="New Joe &amp; Mac — arcade menu"></p>
+<p align="center"><img src="assets/screenshots/joe-mac.webp" alt="New Joe &amp; Mac — level 1 gameplay"></p>
 
 The title, menus, and level 1 render at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1876).
 
 ## Asterix &amp; Obelix: Slap Them All! — `PPSA08576`
 
-<p align="center"><img src="assets/screenshots/asterix-slap-them-all.png" alt="Asterix &amp; Obelix: Slap Them All! — first forest level"></p>
+<p align="center"><img src="assets/screenshots/asterix-slap-them-all.webp" alt="Asterix &amp; Obelix: Slap Them All! — first forest level"></p>
 
 The first forest level renders on the initial route with no title-specific changes. See the [tracker](https://github.com/mattias800/prosper/issues/1877).
 
 ## Summer Sports Games — `PPSA03416`
 
-<p align="center"><img src="assets/screenshots/summer-sports-games.png" alt="Summer Sports Games — athletics event"></p>
+<p align="center"><img src="assets/screenshots/summer-sports-games.webp" alt="Summer Sports Games — athletics event"></p>
 
 The mode-select flow reaches live 3D athletics at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1878).
 
 ## Worms Armageddon: Anniversary Edition — `PPSA20052`
 
-<p align="center"><img src="assets/screenshots/worms-armageddon-title.png" alt="Worms Armageddon — title screen"></p>
-<p align="center"><img src="assets/screenshots/worms-armageddon-gameplay.png" alt="Worms Armageddon — match gameplay"></p>
+<p align="center"><img src="assets/screenshots/worms-armageddon-title.webp" alt="Worms Armageddon — title screen"></p>
+<p align="center"><img src="assets/screenshots/worms-armageddon-gameplay.webp" alt="Worms Armageddon — match gameplay"></p>
 
 The scripted route reaches a live match at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1879).
 
 ## Earthion — `PPSA28061`
 
-<p align="center"><img src="assets/screenshots/earthion-title-menu.png" alt="Earthion — title screen and main menu"></p>
+<p align="center"><img src="assets/screenshots/earthion-title-menu.webp" alt="Earthion — title screen and main menu"></p>
 
 The route reaches the title screen, main menu, and HOW TO PLAY page in full colour at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1880).
 
 ## Bendy and the Ink Machine — `PPSA27616`
 
-<p align="center"><img src="assets/screenshots/bendy-title.png" alt="Bendy and the Ink Machine — main menu"></p>
-<p align="center"><img src="assets/screenshots/bendy-gameplay.png" alt="Bendy and the Ink Machine — Chapter 1 gameplay"></p>
+<p align="center"><img src="assets/screenshots/bendy-title.webp" alt="Bendy and the Ink Machine — main menu"></p>
+<p align="center"><img src="assets/screenshots/bendy-gameplay.webp" alt="Bendy and the Ink Machine — Chapter 1 gameplay"></p>
 
 The route reaches first-person Chapter 1 gameplay at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1881).
 
 ## The Plucky Squire — `PPSA15319`
 
-<p align="center"><img src="assets/screenshots/plucky-squire-title.png" alt="The Plucky Squire — title screen"></p>
+<p align="center"><img src="assets/screenshots/plucky-squire-title.webp" alt="The Plucky Squire — title screen"></p>
 
 The title and save-file/play-style menus render at native 3840×2160; the current route does not reach chapter one. See the [tracker](https://github.com/mattias800/prosper/issues/1882).
 
 ## The Pathless — `PPSA01826`
 
-<p align="center"><img src="assets/screenshots/pathless-title.png" alt="The Pathless — title screen"></p>
+<p align="center"><img src="assets/screenshots/pathless-title.webp" alt="The Pathless — title screen"></p>
 
 The title screen renders at native 2560×1440. Gameplay has not yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1883).
 
 ## ArcRunner — `PPSA21406`
 
-<p align="center"><img src="assets/screenshots/arcrunner-title-screen.png" alt="ArcRunner — the title screen at 3840×2160, on the throttled route"></p>
-<p align="center"><img src="assets/screenshots/arcrunner-intro-space-station.png" alt="ArcRunner — the intro cinematic's Titan-class space station (colours are wrong: see #2094)"></p>
-<p align="center"><img src="assets/screenshots/arcrunner-intro-city.png" alt="ArcRunner — the intro cinematic's neon street (colours are wrong: see #2094)"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-title-screen.webp" alt="ArcRunner — the title screen at 3840×2160, on the throttled route"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-intro-space-station.webp" alt="ArcRunner — the intro cinematic's Titan-class space station (colours are wrong: see #2094)"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-intro-city.webp" alt="ArcRunner — the intro cinematic's neon street (colours are wrong: see #2094)"></p>
 
 The whole intro cinematic renders at 4K — the Titan-class station against its nebula, the rainy neon street, and the population card — with 1,901 of 1,908 video frames succeeding. **Past the cinematic the title reaches its title screen and holds it**, unchanged for 176 s of a 288 s run.
 
@@ -431,7 +431,7 @@ The whole intro cinematic renders at 4K — the Titan-class station against its 
 
 **This needs `PROSPER_SUBMIT_STALL_US=1500`, and that is a diagnostic lever rather than a fix.** On the default route the title faults before the cinematic: 17 runs out of 17, against 0 out of 4 with the stall applied. Every graphics subsystem the cinematic exercises works; what remains is a submit-timing race, tracked as [#1226](https://github.com/mattias800/prosper/issues/1226) with a dose-response experiment in [#2084](https://github.com/mattias800/prosper/issues/2084). See the [tracker](https://github.com/mattias800/prosper/issues/1817).
 
-<p align="center"><img src="assets/screenshots/arcrunner-title-screen-default-route.png" alt="ArcRunner — the title screen at 3840×2160 on the default route, with the post-submit visibility contract armed"></p>
+<p align="center"><img src="assets/screenshots/arcrunner-title-screen-default-route.webp" alt="ArcRunner — the title screen at 3840×2160 on the default route, with the post-submit visibility contract armed"></p>
 
 **The race is now named, and the throttle is no longer needed to get past it.** prosper's post-submit completion-visibility contract — which holds a submit's completion writes private until the submit call returns, so a guest can never observe a half-retired frame — is armed only for titles that request SDK version 13 or later. ArcRunner requests version 10, so on this title prosper's own label writes become visible *in the middle of the fold that produced them*, and the guest's command-chunk recycler is released early: it rebuilds labels whose initialisation packets prosper has not executed yet. With the contract forced on and **no** throttle, the default route runs 260 s, delivers 1,977 of the movie's 1,908 video frames, faults zero times, and renders the title screen above. The same change rescues *Crisis Core*, the other title with this failure, which is also SDK 10.
 
@@ -439,9 +439,9 @@ This is not yet counted as a title screen on a default launch, because it still 
 
 ## Asterix &amp; Obelix: Babylon Mission — `PPSA30490`
 
-<p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.png" alt="Asterix &amp; Obelix: Babylon Mission — narrated intro cutscene"></p>
-<p align="center"><img src="assets/screenshots/asterix-babylon-title.png" alt="Asterix &amp; Obelix: Babylon Mission — title screen and main menu"></p>
-<p align="center"><img src="assets/screenshots/asterix-babylon-gameplay.png" alt="Asterix &amp; Obelix: Babylon Mission — the World_3_10 harbour level, both character portraits with heart meters, Asterix and Obelix among NPCs with parallax and water"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.webp" alt="Asterix &amp; Obelix: Babylon Mission — narrated intro cutscene"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-title.webp" alt="Asterix &amp; Obelix: Babylon Mission — title screen and main menu"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-gameplay.webp" alt="Asterix &amp; Obelix: Babylon Mission — the World_3_10 harbour level, both character portraits with heart meters, Asterix and Obelix among NPCs with parallax and water"></p>
 
 Both publisher logo movies, the narrated intro cutscene and the title screen with its `ADVENTURE` / `OPTIONS` menu render at native 1920×1080, and the route crosses them into the `World_3_10` harbour level — both character portraits with heart meters, Asterix and Obelix in a composed scene with NPCs, parallax, water and rotating Roman-helmet collectibles, inspected over 43 samples in 430 s with no black or flat frame.
 
@@ -449,10 +449,10 @@ Both publisher logo movies, the narrated intro cutscene and the title screen wit
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
-<p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta — the opening movie's R-9 hangar shot in full colour"></p>
-<p align="center"><img src="assets/screenshots/rtype-delta-title.png" alt="R-Type Delta: HD Boosted — title screen"></p>
-<p align="center"><img src="assets/screenshots/rtype-delta-force-select.png" alt="R-Type Delta — attract-mode demonstration, the R-9 and its Force device"></p>
-<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.png" alt="R-Type Delta — stage 1 gameplay: the R-9 and its Force device over the sunset cityscape, enemy formations, and the BEAM and score HUD"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.webp" alt="R-Type Delta — the opening movie's R-9 hangar shot in full colour"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-title.webp" alt="R-Type Delta: HD Boosted — title screen"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-force-select.webp" alt="R-Type Delta — attract-mode demonstration, the R-9 and its Force device"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.webp" alt="R-Type Delta — stage 1 gameplay: the R-9 and its Force device over the sunset cityscape, enemy formations, and the BEAM and score HUD"></p>
 
 The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour, and the run continues into the **title screen**, the attract-mode demonstration and **stage 1 gameplay**.
 
@@ -468,47 +468,47 @@ The title's input worker sleeps 400 ms before its first `sceUserServiceGetEvent`
 
 ## Nikoderiko: The Magical World — `PPSA23760`
 
-<p align="center"><img src="assets/screenshots/nikoderiko-title.png" alt="Nikoderiko — title screen"></p>
+<p align="center"><img src="assets/screenshots/nikoderiko-title.webp" alt="Nikoderiko — title screen"></p>
 
 The warning screen, publisher logo, title screen, and EULA render at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1885).
 
 ## The Oregon Trail — `PPSA19244`
 
-<p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.png" alt="The Oregon Trail — Gameloft splash"></p>
-<p align="center"><img src="assets/screenshots/oregon-trail-health-warning.png" alt="The Oregon Trail — health/epilepsy warning screen"></p>
-<p align="center"><img src="assets/screenshots/oregon-trail-title-screen.png" alt="The Oregon Trail — title screen"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.webp" alt="The Oregon Trail — Gameloft splash"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-health-warning.webp" alt="The Oregon Trail — health/epilepsy warning screen"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-title-screen.webp" alt="The Oregon Trail — title screen"></p>
 
 A default launch renders the legal popup, the Gameloft splash and the health warning at native 3840×2160, and reaches the **title screen** with its "Press any button" prompt, correctly composited. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
 
 ## Greak: Memories of Azur — `PPSA02849`
 
-<p align="center"><img src="assets/screenshots/greak-title.png" alt="Greak: Memories of Azur — title screen"></p>
-<p align="center"><img src="assets/screenshots/greak.png" alt="Greak: Memories of Azur — first-level gameplay"></p>
+<p align="center"><img src="assets/screenshots/greak-title.webp" alt="Greak: Memories of Azur — title screen"></p>
+<p align="center"><img src="assets/screenshots/greak.webp" alt="Greak: Memories of Azur — first-level gameplay"></p>
 
 The scripted route reaches sustained first-level gameplay at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1887).
 
 ## Rugrats: Adventure in Gameland — `PPSA23396`
 
-<p align="center"><img src="assets/screenshots/rugrats-title.png" alt="Rugrats — title and game-mode selector"></p>
-<p align="center"><img src="assets/screenshots/rugrats.png" alt="Rugrats — first nursery level"></p>
+<p align="center"><img src="assets/screenshots/rugrats-title.webp" alt="Rugrats — title and game-mode selector"></p>
+<p align="center"><img src="assets/screenshots/rugrats.webp" alt="Rugrats — first nursery level"></p>
 
 The route reaches the first nursery level at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1888).
 
 ## Syberia: Remastered — `PPSA30140`
 
-<p align="center"><img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu"></p>
-<p align="center"><img src="assets/screenshots/syberia-title.png" alt="Syberia: Remastered — title screen"></p>
-<p align="center"><img src="assets/screenshots/syberia-gameplay.png" alt="Syberia: Remastered — first playable scene"></p>
+<p align="center"><img src="assets/screenshots/syberia-profile.webp" alt="Syberia: Remastered — profile-select menu"></p>
+<p align="center"><img src="assets/screenshots/syberia-title.webp" alt="Syberia: Remastered — title screen"></p>
+<p align="center"><img src="assets/screenshots/syberia-gameplay.webp" alt="Syberia: Remastered — first playable scene"></p>
 
 The validated route reaches the title screen and first playable scene with real GPU draws. See the [tracker](https://github.com/mattias800/prosper/issues/1811).
 
 ## Tales of Graces f Remastered — `PPSA19991`
 
-<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay.png" alt="Tales of Graces f Remastered — Lhant Hill prologue gameplay"></p>
-<p align="center"><img src="assets/screenshots/tales-graces-f-publisher.png" alt="Tales of Graces f Remastered — publisher logo"></p>
-<p align="center"><img src="assets/screenshots/tales-graces-f-criware.png" alt="Tales of Graces f Remastered — CRIWARE logo"></p>
-<p align="center"><img src="assets/screenshots/tales-graces-f-title-no-input.png" alt="Tales of Graces f Remastered — title screen reached with no input"></p>
-<p align="center"><img src="assets/screenshots/tales-graces-f-options.png" alt="Tales of Graces f Remastered — options screen"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay.webp" alt="Tales of Graces f Remastered — Lhant Hill prologue gameplay"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-publisher.webp" alt="Tales of Graces f Remastered — publisher logo"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-criware.webp" alt="Tales of Graces f Remastered — CRIWARE logo"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-title-no-input.webp" alt="Tales of Graces f Remastered — title screen reached with no input"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-options.webp" alt="Tales of Graces f Remastered — options screen"></p>
 
 *The title-screen frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
 **default launch with no input route**, no render-scale or frame-skip acceleration, master
@@ -523,16 +523,16 @@ The route [`prosper/scripts/talesgraces/reach-gameplay.pad`](prosper/scripts/tal
 
 ## Astro Bot — `PPSA21564`
 
-<p align="center"><img src="assets/screenshots/astro-bot-title.png" alt="Astro Bot — title screen"></p>
-<p align="center"><img src="assets/screenshots/astro-bot-opening-cinematic.png" alt="Astro Bot — opening sequence"></p>
-<p align="center"><img src="assets/screenshots/astro-bot-worldmap-background.png" alt="Astro Bot — world-map backdrop"></p>
+<p align="center"><img src="assets/screenshots/astro-bot-title.webp" alt="Astro Bot — title screen"></p>
+<p align="center"><img src="assets/screenshots/astro-bot-opening-cinematic.webp" alt="Astro Bot — opening sequence"></p>
+<p align="center"><img src="assets/screenshots/astro-bot-worldmap-background.webp" alt="Astro Bot — world-map backdrop"></p>
 
 The opening sequence and ASTRO BOT title card render at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1809) for current visual and performance work.
 
 ## Metaphor: ReFantazio — `PPSA20800`
 
-<p align="center"><img src="assets/screenshots/metaphor-language-select.png" alt="Metaphor: ReFantazio — the language-selection screen, twelve languages in white serif type with English highlighted by a blue brush-stroke"></p>
-<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.png" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book"></p>
+<p align="center"><img src="assets/screenshots/metaphor-language-select.webp" alt="Metaphor: ReFantazio — the language-selection screen, twelve languages in white serif type with English highlighted by a blue brush-stroke"></p>
+<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.webp" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book"></p>
 
 A default 3840×2160 launch reaches the loading mascot and then the language-selection screen, and
 holds it: 12 of 12 samples distinct over 60 s with the guest still running. Every glyph above is
@@ -545,21 +545,21 @@ Until 2026-08-23 the title died of a divide-by-zero five seconds into every boot
 
 ## The Forgotten City — `PPSA03026`
 
-<p align="center"><img src="assets/screenshots/forgotten-city-title.png" alt="The Forgotten City — title screen"></p>
+<p align="center"><img src="assets/screenshots/forgotten-city-title.webp" alt="The Forgotten City — title screen"></p>
 
 The direct native 3840×2160 frontend capture reaches the title screen and its `Press Any Button` prompt, through the full white splash, Unreal Engine and Film Victoria logo cards, legal text and autosave notice. Gameplay has not yet been reached, and the run is bounded by two intermittent guest-heap faults. See the [tracker](https://github.com/mattias800/prosper/issues/1890).
 
 ## Tactics Ogre: Reborn — `PPSA03839`
 
-<p align="center"><img src="assets/screenshots/tactics-ogre-title.png" alt="Tactics Ogre: Reborn — title screen"></p>
-<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-gameplay.png" alt="Tactics Ogre: Reborn — first tutorial battle"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-title.webp" alt="Tactics Ogre: Reborn — title screen"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-gameplay.webp" alt="Tactics Ogre: Reborn — first tutorial battle"></p>
 
 The route reaches the first tutorial battle with real GPU draws at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1892).
 
 ## Little Nightmares III — `PPSA05143`
 
-<p align="center"><img src="assets/screenshots/little-nightmares-3-boot-splash.png" alt="Little Nightmares III — developer splash from the boot sequence"></p>
-<p align="center"><img src="assets/screenshots/little-nightmares-3-title-screen.png" alt="Little Nightmares III — title screen"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-3-boot-splash.webp" alt="Little Nightmares III — developer splash from the boot sequence"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-3-title-screen.webp" alt="Little Nightmares III — title screen"></p>
 
 The boot splash sequence and the title screen render at native 3840×2160 on a default launch, with the
 logo, the player slot and the Start prompt all legible. The render-thread stall that used to end the run
@@ -580,9 +580,9 @@ where they are on first use. See the [tracker](https://github.com/mattias800/pro
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
-<p align="center"><img src="assets/screenshots/crisis-core-title.png" alt="Crisis Core Reunion — title screen"></p>
-<p align="center"><img src="assets/screenshots/crisis-core-main-menu.png" alt="Crisis Core Reunion — main menu"></p>
-<p align="center"><img src="assets/screenshots/crisis-core-voice-language.png" alt="Crisis Core Reunion — voice-language selection"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-title.webp" alt="Crisis Core Reunion — title screen"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-main-menu.webp" alt="Crisis Core Reunion — main menu"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-voice-language.webp" alt="Crisis Core Reunion — voice-language selection"></p>
 
 The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run, completes
 engine bootstrap, and streams real content from the 8.49 GB IoStore container. The declined-GPU-submit freeze
@@ -604,15 +604,15 @@ published frames select a non-scanout composite source while the real screen exi
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
-<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-title.png" alt="The House of the Dead 2: Remake — title screen"></p>
-<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-gameplay.png" alt="The House of the Dead 2: Remake — Training 1 gameplay"></p>
+<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-title.webp" alt="The House of the Dead 2: Remake — title screen"></p>
+<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-gameplay.webp" alt="The House of the Dead 2: Remake — Training 1 gameplay"></p>
 
 The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, and interaction effects at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1896).
 
 ## Bendy and the Dark Revival — `PPSA27624`
 
-<p align="center"><img src="assets/screenshots/bendy-dark-revival-gameplay.png" alt="Bendy and the Dark Revival — Chapter 1 gameplay with the NEW OBJECTIVE HUD"></p>
-<p align="center"><img src="assets/screenshots/bendy-dark-revival-title.png" alt="Bendy and the Dark Revival — title screen"></p>
+<p align="center"><img src="assets/screenshots/bendy-dark-revival-gameplay.webp" alt="Bendy and the Dark Revival — Chapter 1 gameplay with the NEW OBJECTIVE HUD"></p>
+<p align="center"><img src="assets/screenshots/bendy-dark-revival-title.webp" alt="Bendy and the Dark Revival — title screen"></p>
 
 The route [`prosper/scripts/bendy-dark-revival-PPSA27624/reach-gameplay.pad`](prosper/scripts/bendy-dark-revival-PPSA27624/reach-gameplay.pad)
 crosses the multi-language photosensitivity warning, the title screen and the BEGIN menu into **Chapter 1** at native
@@ -626,7 +626,7 @@ The menu's background video is still not composited, so the BEGIN menu sits on a
 
 ## Beneath — `PPSA27640`
 
-<p align="center"><img src="assets/screenshots/beneath-gameplay.png" alt="Beneath — the opening dive aboard the science ship, with the waypoint HUD reading 21m and a character subtitle on screen"></p>
+<p align="center"><img src="assets/screenshots/beneath-gameplay.webp" alt="Beneath — the opening dive aboard the science ship, with the waypoint HUD reading 21m and a character subtitle on screen"></p>
 
 A direct, unmodified native 1920×1080 frontend capture reaches gameplay: the scripted route
 (`prosper/scripts/beneath-PPSA27640/reach-gameplay.pad`) drives the title screen, `NEW GAME`, the
@@ -641,7 +641,7 @@ See [`prosper/docs/BENEATH_STATUS.md`](prosper/docs/BENEATH_STATUS.md) and the
 
 ## Unbound: Worlds Apart — `PPSA03274`
 
-<p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.png" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-title-screen.webp" alt="Unbound: Worlds Apart — the title screen at 3840x2160: the UNBOUND / Worlds Apart wordmark in a pale carved typeface over a dark blue forest, a cloaked figure standing left of a glowing blue portal, with a Cross-button prompt below"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
 The title screen renders complete — wordmark, character, portal and prompt glyph — and on current
@@ -652,12 +652,12 @@ waiting for Cross.
 See [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and
 the [tracker](https://github.com/mattias800/prosper/issues/2886).
 
-<p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic-village.png" alt="Unbound: Worlds Apart — a later moment of the intro cinematic at 3840x2160: a sunlit village clearing of thatched huts strung with orange bunting, tall trees and fireflies, pink mushrooms in the foreground grass and the small red-cloaked character at the right, with a prompt reading Press Square to skip"></p>
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic-village.webp" alt="Unbound: Worlds Apart — a later moment of the intro cinematic at 3840x2160: a sunlit village clearing of thatched huts strung with orange bunting, tall trees and fireflies, pink mushrooms in the foreground grass and the small red-cloaked character at the right, with a prompt reading Press Square to skip"></p>
 
 A second, later frame of the same cinematic, captured with an isolated save on master `4ce6e11e` —
 the evidence that this title's black frames were the save and not the renderer.
 
-<p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic.png" alt="Unbound: Worlds Apart — the intro cinematic at 3840x2160: the cloaked blue-hooded character Soli standing beside a golden deer in a teal moonlit forest clearing, thatched huts and bunting behind them, purple mushrooms and grass in the foreground, and a prompt reading Press Square to skip"></p>
+<p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic.webp" alt="Unbound: Worlds Apart — the intro cinematic at 3840x2160: the cloaked blue-hooded character Soli standing beside a golden deer in a teal moonlit forest clearing, thatched huts and bunting behind them, purple mushrooms and grass in the foreground, and a prompt reading Press Square to skip"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160, driven by
 [`prosper/scripts/unbound-PPSA03274/reach-first-level.pad`](prosper/scripts/unbound-PPSA03274/reach-first-level.pad).
@@ -676,7 +676,7 @@ too, so there is no regression here — only a dirty save
 
 ## BALAN WONDERWORLD — `PPSA02058`
 
-<p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.png" alt="BALAN WONDERWORLD — the language-select screen at 3840x2160: a Language Settings heading over a red and gold theatre interior, with 24 language buttons in three columns, English highlighted in cyan, and a prompt bar reading Change Language and Select Language"></p>
+<p align="center"><img src="assets/screenshots/balan-wonderworld-language-select.webp" alt="BALAN WONDERWORLD — the language-select screen at 3840x2160: a Language Settings heading over a red and gold theatre interior, with 24 language buttons in three columns, English highlighted in cyan, and a prompt bar reading Change Language and Select Language"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
 This is the game's own first-boot language menu, not its title screen: all 24 labels render,
@@ -686,9 +686,9 @@ including CJK, Thai, Greek, Cyrillic and Arabic, and the prompt bar names the bu
 [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2882).
 
-<p align="center"><img src="assets/screenshots/balan-wonderworld-main-menu.png" alt="BALAN WONDERWORLD — the main menu at 3840x2160: a red and gold theatre interior with a lit proscenium and drawn curtains, a menu column on the right reading Language Settings, Settings, Credits and Copyright Information, and a 2021 Square Enix copyright line"></p>
+<p align="center"><img src="assets/screenshots/balan-wonderworld-main-menu.webp" alt="BALAN WONDERWORLD — the main menu at 3840x2160: a red and gold theatre interior with a lit proscenium and drawn curtains, a menu column on the right reading Language Settings, Settings, Credits and Copyright Information, and a 2021 Square Enix copyright line"></p>
 
-<p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.png" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
+<p align="center"><img src="assets/screenshots/balan-wonderworld-prologue.webp" alt="BALAN WONDERWORLD — the opening story cutscene at 3840x2160: Leo and Emma standing in a city park at golden hour, a basketball court with graffiti-covered fencing behind them, children playing, trees and a brick building in the background, and speaker cabinets flanking the frame"></p>
 
 Direct, unmodified `tools/screenshot` captures at 3840×2160, driven by
 [`prosper/scripts/balan-PPSA02058/reach-title-and-prologue.pad`](prosper/scripts/balan-PPSA02058/reach-title-and-prologue.pad).
@@ -701,7 +701,7 @@ decode of any kind. No stage asset loads in a 717 s run, so this is not yet game
 
 ## Stray — `PPSA02101`
 
-<p align="center"><img src="assets/screenshots/stray-brightness-calibration.png" alt="Stray — the brightness-calibration screen at 3840x2160: three grey cat-head silhouettes at increasing brightness on black, instruction text above them, a 16-step slider below, and Defaults and Accept prompts in the lower right"></p>
+<p align="center"><img src="assets/screenshots/stray-brightness-calibration.webp" alt="Stray — the brightness-calibration screen at 3840x2160: three grey cat-head silhouettes at increasing brightness on black, instruction text above them, a 16-step slider below, and Defaults and Accept prompts in the lower right"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
 The BlueTwelve Studio logo plays and the game's own brightness-calibration screen renders in full,
@@ -718,7 +718,7 @@ evidence. See
 
 ## Little Nightmares II — `PPSA02154`
 
-<p align="center"><img src="assets/screenshots/little-nightmares-2-tarsier-logo.png" alt="Little Nightmares II — the Tarsier Studios logo at 3840x2160: a white condensed serif wordmark centred on a dark grey vignetted background"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-2-tarsier-logo.webp" alt="Little Nightmares II — the Tarsier Studios logo at 3840x2160: a white condensed serif wordmark centred on a dark grey vignetted background"></p>
 
 A direct, unmodified `tools/screenshot` capture at 3840×2160 on a default launch with no pad input.
 The boot logo sequence advances — Bandai Namco, then Tarsier Studios, then Unreal Engine — through

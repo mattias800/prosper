@@ -38,7 +38,7 @@ intro cinematic ≈ shots 20–70, Day One yard ≈ 90–115, front door/vestibu
 capture-armed runs pace 2.4–4× slower — budget `--count 730` to pass renderer submit 3300.
 The `blue-prince-title` snapshot route guards the title screen. The `blue-prince-hall` route guards
 the native 1920×1080 entrance hall with a progressing, cross-run-validated content plateau; its
-reviewed live capture is published as `assets/screenshots/blue-prince-hall.png`.
+reviewed live capture is published as `assets/screenshots/blue-prince-hall.webp`.
 
 ## Landed fixes this arc (evidence on the linked issues/PRs)
 
