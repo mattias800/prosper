@@ -817,6 +817,32 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   operation. The two halves are independent, and the backend had only the second: three of the seven
   readback sites already invalidated (they may be backed by non-coherent HOST_CACHED memory) while
   none had the barrier. #2944.
+- **The same blindness holds for the COMPUTE backend, and it is measured there too.** A dispatch
+  result is checked by VALUE rather than by pixel, so it is tempting to think a byte-exact assertion
+  would catch a missing availability operation. It does not. With `live_compute.cpp`'s dispatch-result
+  barrier deleted, `game_compute_exec` (**439 assertions**, including a byte-exact Unorm8 storage-image
+  writeback) and `live_compute_descriptor_array` both still **pass**, and so does
+  `live_compute_host_read_barrier`'s own "wrote the result back to guest memory" arm — only its
+  structural arm goes red. #3249.
+- **The live compute allocator cannot hand out non-coherent memory, so NO compute site needed a new
+  invalidate.** A real negative result, and the opposite of the render backend's: `host_memory_type`
+  tries `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` and falls back to `HOST_VISIBLE|HOST_COHERENT` — the
+  cached tier is `wanted | HOST_CACHED`, not `HOST_CACHED` alone — so every allocation the compute
+  path maps is coherent. 0 of its 6 host-read sites want `vkInvalidateMappedMemoryRanges`; all of
+  them want the dependency. #3249.
+- **The compute path's end-of-command-buffer image restore does not incidentally supply the
+  dependency.** Every borrowed image is handed back with a `COMPUTE_SHADER|TRANSFER -> ALL_COMMANDS`
+  barrier before `vkEndCommandBuffer`, which looks like it would cover everything.
+  `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` does **not** include `VK_PIPELINE_STAGE_HOST_BIT`, and that
+  barrier's destination access mask does not include `VK_ACCESS_HOST_READ_BIT`. #3249.
+- **A device write with no host read in its OWN dispatch is still not exempt, because the compute
+  memory POOL recycles host-visible allocations across bindings and submits.** This is why #3249's
+  own producer list was short. `release_memory` returns an allocation to `memory_pool.available` and
+  `allocate_memory` hands it to any later binding of the same memory type, where the host maps it and
+  reads the retained contents to decide whether an upload is needed ("Pooled host-visible allocations
+  retain their previous contents"). So the comparator baselines and the depth-bits bridge staging
+  buffer — neither of which is mapped by the binding that writes it — are host-read later anyway. The
+  invariant is per-allocation, not per-binding. #3249.
 
 ## The renderer is not deterministic on frozen input (2026-08-23) — #2945
 

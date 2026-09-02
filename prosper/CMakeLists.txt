@@ -2694,6 +2694,18 @@ if(TARGET prosper_core)
       target_link_libraries(test_live_compute_descriptor_array PRIVATE prosper_live_renderer)
       add_test(NAME live_compute_descriptor_array COMMAND test_live_compute_descriptor_array)
 
+      # #3249: a dispatch result the host maps and reads needs an AVAILABILITY operation, not just a
+      # fence. Registered beside the descriptor-array case because both drive the real backend
+      # through execute_live_compute_items; it cannot live in the platform-independent block since
+      # prosper_live_renderer exists only where Vulkan was found.
+      add_executable(test_live_compute_host_read_barrier
+                     tests/shared/live/test_live_compute_host_read_barrier.cpp)
+      # Spells a `shared/...` include, which resolves from `frontends`.
+      target_include_directories(test_live_compute_host_read_barrier PRIVATE frontends)
+      target_link_libraries(test_live_compute_host_read_barrier PRIVATE prosper_live_renderer)
+      add_test(NAME live_compute_host_read_barrier
+               COMMAND test_live_compute_host_read_barrier)
+
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/gpu/recompiler/test_spirv_builder.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.

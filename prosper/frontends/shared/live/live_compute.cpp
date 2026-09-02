@@ -15,6 +15,7 @@
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -8656,7 +8657,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (bi.depth_bits_source) {
                 // D32 and R32_UINT have the same four-byte texel payload but are not Vulkan
                 // view-compatible. Preserve the guest's raw-bit alias with two transfer copies:
-                // depth image -> device buffer -> integer image. The buffer is never host-mapped.
+                // depth image -> device buffer -> integer image. This binding never host-maps the
+                // buffer -- but its ALLOCATION returns to the shared host-visible pool, where a
+                // later binding maps it and reads the retained contents to decide whether an upload
+                // is needed (`compute_buffers_equal(mapped, source, ...)`). So the transfer write
+                // below still needs the #3249 availability operation before the submit ends.
                 const bool source_already_general = [&] {
                     for (size_t prior = 0; prior < i; ++prior) {
                         const BoundImage& candidate = images[prior];
@@ -8711,6 +8716,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 vkCmdCopyImageToBuffer(command, bi.depth_bits_image,
                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                        staging[i], 1, &source_copy);
+                prosper::gpu::record_host_read_barrier(command, staging[i]);   // #3249
                 VkBufferMemoryBarrier buffer_ready{
                     VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
                 buffer_ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -8945,6 +8951,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 ctx.dispatch_timestamp_pool, 2);
+        // #3249: the guest writeback below maps every writable buffer and READS it. The fence
+        // proves the shader finished; it does not make those writes available to the host domain.
+        // Recorded here because the dispatch is the last device WRITE to these buffers -- the
+        // comparator and the baseline copy that follow only read them. Nothing later in this
+        // command buffer invalidates that, so the dependency is correct at this point.
+        for (const BoundBuffer& buffer : buffers) {
+            if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
+            prosper::gpu::record_host_read_barrier(command, buffer.buffer,
+                                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                   VK_ACCESS_SHADER_WRITE_BIT);
+        }
         // Storage images: copy the written texels back into the staging buffer for guest writeback.
         // When this private image was seeded from an exact borrowed renderer target, copy the final
         // result back to that same image as well. The CPU writeback below remains mandatory for
@@ -8972,6 +8989,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                   bi.array_layers > 1 ? 1u : bi.texel_depth};
             vkCmdCopyImageToBuffer(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    staging[i], 1, &region);
+            // #3249: the storage-image writeback maps this staging buffer and reads every texel.
+            // TRANSFER, not COMPUTE_SHADER: the shader wrote the IMAGE, the copy above wrote this
+            // buffer, and the source scope has to name the write that actually produced the bytes.
+            prosper::gpu::record_host_read_barrier(command, staging[i]);
             if (bi.mirror_result_to_imported) {
                 const BoundImage& mirror = images[bi.seed_from_imported];
                 VkImageMemoryBarrier mirror_to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -9100,6 +9121,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 2, barriers, 0, nullptr);
             VkBufferCopy copy{0, 0, bytes};
             vkCmdCopyBuffer(command, current, baseline, 1, &copy);
+            // #3249: a retained baseline is compared on the GPU and never mapped through THIS
+            // binding, but its allocation is pooled and recycled into buffers that the host does
+            // map and read. Every device write into pooled host-visible memory is made available
+            // before the submit ends, so no later reader can see it stale.
+            prosper::gpu::record_host_read_barrier(command, baseline);
         };
         for (BoundBuffer& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX || !buffer.writable || !buffer.result_baseline ||
@@ -9118,15 +9144,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  image.exact_result_bytes, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
         if (!compare_targets.empty()) {
-            VkBufferMemoryBarrier flags{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            flags.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            flags.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            flags.srcQueueFamilyIndex = flags.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            flags.buffer = compare_flags;
-            flags.size = compare_targets.size() * ctx.compare_flag_stride();
-            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &flags,
-                                 0, nullptr);
+            // The comparator's flag word is the one host read on this path that always had its
+            // availability operation (it is the site #2944 cited as correct). Routed through the
+            // shared helper since #3249 so the file has ONE spelling of the rule; whole-buffer
+            // scope replaces the exact flag span, which is wider and equally valid.
+            prosper::gpu::record_host_read_barrier(command, compare_flags,
+                                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                   VK_ACCESS_SHADER_WRITE_BIT);
+            // The comparator also REWRITES each differing baseline in place, so that shader write
+            // is the last device write to those buffers. Same pooled-recycling reason as the
+            // transfer-written baselines above.
+            for (const CompareTarget& target : compare_targets)
+                prosper::gpu::record_host_read_barrier(command, target.baseline,
+                                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                       VK_ACCESS_SHADER_WRITE_BIT);
         }
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
