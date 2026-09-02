@@ -1162,6 +1162,67 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
     return bound;
 }
 
+namespace {
+
+// #3231 — is the CFG region's ENTRY-BLOCK VCC value dead?
+//
+// The dispatcher stores one value into `vcc_var` before its loop, then dispatches block 0 first,
+// exactly once, with every invocation active (`selector = active ? pc : UINT32_MAX`, and
+// `active_var` is seeded true when the caller has no partial-workgroup extent). So that stored
+// value is observable only until block 0 overwrites it: if block 0 DEFINES the complete VCC pair
+// before any instruction in it can read VCC, nothing anywhere in the region can see the entry
+// value, and persisting `false` for it invents nothing. Block 0's own `save_state` publishes the
+// real definition before the iteration's common phases run, so the two direct `vcc_var` readers
+// (portable readlane into 106, and the vote-to-VCC merge) see it too.
+//
+// This is deliberately narrow, because the failure the caller's gate prevents is silent-wrong
+// rather than a crash. What it does NOT admit:
+//   * anything but a `v_cmp_*` (VOPC, never `v_cmpx_*`) whose destination is the VCC pair. That is
+//     the one encoding that defines both words for every lane in a single instruction, and it is
+//     the form the live evidence uses. A VOP3B carry-out into VCC, a 64-bit scalar write of the
+//     pair, and `v_cmpx_*`'s EXEC write are all left rejected.
+//   * a b32 write of vcc_lo or vcc_hi alone — half the pair would still carry the entry value, so
+//     the scan stops there rather than continuing to a later full define.
+//   * an entry block that reads VCC first, in ANY form. "Reads" is over-approximated: the implicit
+//     consumers this file already enumerates for the mask-domain analyses, plus any operand that
+//     can name a word of the pair — including a wide scalar read rooted low enough to reach s106.
+//     An operand the decoder left stale is read too (all four source slots, not `n_src`), because
+//     over-reading only ever moves the answer to "not dead".
+//
+// `lo`/`hi` are the entry block's half-open pc range as the dispatcher itself partitions it
+// (`starts[0]` and `starts[1]`), so a block split by a branch target, or by one of the synchronized
+// cross-lane events that each get their own block, shortens the window rather than widening it.
+bool entry_block_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins,
+                                             uint32_t lo, uint32_t hi) {
+    auto may_name_vcc = [](const Operand& operand) {
+        if (operand.kind == OperandKind::Special)
+            return operand.value == 106 || operand.value == 107;
+        // The widest scalar operand is an eight-word T#, so a root as low as s99 still covers s106.
+        // Treat every scalar operand at or above that root as touching the pair.
+        if (operand.kind == OperandKind::SGPR) return operand.value >= 99;
+        return false;
+    };
+    for (const auto& in : ins) {
+        if (in.pc < lo) continue;
+        if (in.pc >= hi || in.is_end) return false;
+        // Sources before the define: the defining compare may itself read a VCC word as scalar data.
+        for (const Operand& source : in.src)
+            if (may_name_vcc(source)) return false;
+        if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07))
+            return false;                       // s_cbranch_vccz / s_cbranch_vccnz
+        if (in.fmt == Rdna2Format::VOP2 &&
+            (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a)))
+            return false;                       // e32 cndmask and the carry-in/out forms
+        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+            !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105))
+            return true;                        // the define: v_cmp_* into VCC
+        if (may_name_vcc(in.dst) || may_name_vcc(in.sdst)) return false;
+    }
+    return false;
+}
+
+}  // namespace
+
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -3478,7 +3539,26 @@ bool emit_cfg_state_machine(
     // sees a real mask. It is therefore safe to persist false while that lifetime is absent/dead;
     // load_state keeps the placeholder out of RegState on those entries. Other modes retain the
     // old fail-visible contract because they have no equivalent proof.
-    if (!initial.vcc && !proven_wave32_masks)
+    // #3231: the entry value can also be provably DEAD. Astro Bot's world-map lighting consumer
+    // `0x500571000` recycles the physical VCC words as scalar data before its final barrier phase,
+    // then re-defines the pair with `v_cmp_le_u32 vcc, s12, v24` at the top of that phase's entry
+    // block — pc 322, ahead of the block's first VCC read at 323 and its terminator at 325. Nothing
+    // can observe what the dispatcher stored, so the old blanket refusal cost the title a
+    // full-screen lighting pass for no correctness gain.
+    //
+    // Restricted to Wave64 COMPUTE, which is where the evidence is and where a second, independent
+    // mechanism already stands behind this one: `load_state` only loads `vcc_var` into `state.vcc`
+    // for a block whose `wave64_b64_mask_in` MUST set contains 106, and that set seeds 106 only
+    // `if (initial.vcc)`. An absent entry VCC therefore reaches a consumer as *no value* (a
+    // fail-visible reject) rather than as a fabricated `false`. Fragment Wave64 has the same
+    // backstop but no live case, and every other stage has neither, so all of them keep the old
+    // contract. A partial-workgroup extent is excluded as well: its padded invocations never
+    // dispatch block 0, so they would keep the placeholder instead of the caller's value.
+    const bool entry_vcc_dead = !initial.vcc && !proven_wave32_masks &&
+        b.is_compute && b.wave_size == 64 && !initial_active &&
+        entry_block_defines_vcc_before_any_read(
+            ins, starts.front(), starts.size() > 1 ? starts[1] : UINT32_MAX);
+    if (!initial.vcc && !proven_wave32_masks && !entry_vcc_dead)
         return reject_cfg(ins.front().pc, "missing-entry-vcc");
     b.store_function(vcc_var, initial.vcc ? initial.vcc : no);
     b.store_function(exec_var, initial.exec);

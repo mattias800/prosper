@@ -1197,3 +1197,15 @@ than re-deriving a dead answer at full cost.
   **458 successes and zero device losses**. The cap is `PROSPER_MAX_DISPATCH_GROUPS=N`, also **added in
   PR #1752 and not on master** — it is a diagnostic that computes wrong results and must never be used
   as a fix.
+- **"`0x500571000`'s `missing-entry-vcc` refusal is protecting a live entry VCC value."** False,
+  decoded rather than argued (#3231). `shader_inspect` on the program's own dumped bytes
+  (`exec_cs_500571000.bin`, 3,596 dwords / 2,374 instructions) puts `s_barrier` at pc 220 and pc 313,
+  so the region the dispatcher declined at pc 314 is the **final barrier phase**, and its entry block
+  runs pc 314 to its `s_cbranch_execz` terminator at pc 325. Inside it: pc 314/317 are SMEM loads,
+  pc 320 is a `v_cmp` into **s10** (an ordinary SGPR mask, not VCC — the issue body omits it),
+  **pc 322 is `VOPC op=0xc3 dst=special:106`, the first instruction in the region to touch VCC at
+  all**, and only then do pc 323 (`s_<logical>_b64 vcc, vcc, s[10:11]`) and pc 324
+  (`s_mov_b64 exec, vcc`) read it. Nothing on any path could observe what the dispatcher stored at
+  function entry, so the gate was refusing a whole full-screen lighting consumer for a value that is
+  dead. Relaxed for exactly that shape in #3231; the refusal stands for every entry block that reads
+  VCC first, writes only half the pair, or leaves the define to a successor block.
