@@ -8,7 +8,8 @@ likeness to reviewed references, stable dimensions, non-black coverage, and opti
 
 Game dumps and captured images are local and gitignored, so this cannot run in
 CI. Only reviewed 16x9 luminance signatures, diagnostic hashes, coarse content
-thresholds, routes, and review notes live in `snapshots.json`.
+thresholds, routes, review notes, and verification provenance live in
+`snapshots.json`.
 
 ## Run
 
@@ -92,6 +93,17 @@ entry can define:
 - `dims`: expected scaled framebuffer dimensions.
 - `review`: factual record of the evidence that a person inspected when the
   guard was introduced or materially changed.
+- `verified_at`: ISO 8601 UTC instant of the last approval,
+  `2026-09-02T12:34:56Z`. Written only by `update --reviewed`. Sortable and
+  comparable, which the date inside `review` prose is not.
+- `verified_by`: `agent` or `human`. Defaults to `agent`; `human` requires
+  `update NAME --reviewed --verified-by=human` and is never inferred from a TTY,
+  `$USER`, or the environment. Recording a human review that did not happen is
+  the failure this default exists to prevent.
+
+Both are absent on baselines adopted before the fields existed, and nothing
+backfills them: absence means "never recorded", which is the signal a stale
+guard needs. `snapshot.py list` prints them with an age in days.
 
 The checker measures every complete frame in the evidence window. It does not
 compare exact pixels. It computes the established Structural Similarity Index
@@ -126,16 +138,20 @@ inspected image evidence:
 4. For a content guard, confirm the threshold has a conservative margin below
    the observed valid range. Never lower a threshold just to make a failure pass.
 5. After inspecting every image, run
-   `python3 tools/snapshot/snapshot.py update NAME --reviewed`. Content mode
+   `python3 tools/snapshot/snapshot.py update NAME --reviewed`, adding
+   `--verified-by=human` only when a person did the inspecting. Content mode
    records the reviewed structural references and a conservative non-black
-   floor; exact mode records the verified pixel hash. `update` refuses stale,
-   incomplete, or unverified candidates.
+   floor; exact mode records the verified pixel hash; both record `verified_at`
+   and `verified_by`. `update` refuses stale, incomplete, or unverified
+   candidates, and refuses to run without a guard name.
 6. Run `check NAME` once more. Commit only the manifest and route, never the
    local review/failure images or game data.
 
 Repeat this review when the route, evidence window, expected scene, dimensions,
 hash, or threshold changes materially. Ordinary `check` runs need no manual
-inspection unless they fail.
+inspection unless they fail — and `check` deliberately does not touch
+`verified_at`, because a check that refreshed the date would make a baseline
+nobody re-read look freshly reviewed.
 
 ## Current Matrix
 
