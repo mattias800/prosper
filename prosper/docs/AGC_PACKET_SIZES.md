@@ -126,7 +126,8 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | `DcbDrawIndexOffset` | 3 | `DRAW_INDEX_OFFSET_2` | 5 | LOW | prosper emits **fewer** — safe direction |
 | `DcbDrawIndexIndirect` | 4 | `DRAW_INDEX_INDIRECT` | 6 | LOW | fewer — safe direction |
 | `CbDispatch` | 6 | `DISPATCH_DIRECT` | 5 | LOW | no title evidence |
-| `Dcb/AcbDispatchIndirect` | 4 | `DISPATCH_INDIRECT` | 3–4 | LOW | no title evidence |
+| `DcbDispatchIndirect` | 4 | `DISPATCH_INDIRECT` | 3–4 | LOW | no title evidence |
+| `AcbDispatchIndirect` | **5** | `DISPATCH_INDIRECT` (MEC, address form) | 4 | MED | **one dword LARGER than the Dcb form, deliberately** (#3218). The ACB carries a whole 64-bit argument address, not an offset: libSceAgc 3.20 has 36 `sceAgcAcb*` exports and no SetBase among them, so nothing on that ring defines a base. Astro Bot's async-compute stream is the live half — its packets carried exactly the low 32 bits of the argument allocations its Dcb announces at full width in the same run. prosper answers `sceAgcAcbDispatchIndirectGetSize` too, so the guest reserves 5 |
 | `Dcb/AcbEventWrite` | 4 | `EVENT_WRITE` (address form) | 4 | MED | address-carrying form (#132) |
 | `DcbWriteData` | 5 + n | `WRITE_DATA` | 4 + n | LOW | one dword over; no title evidence |
 | `DcbSetIndexBuffer` | 3 | `INDEX_BASE` | 3 | MED | — |

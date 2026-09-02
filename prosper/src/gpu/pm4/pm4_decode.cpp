@@ -181,6 +181,20 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 1) c.indirect_offset = pl[0];
                     if (npl >= 3) c.dispatch_modifier = lo_hi(pl + 1);
                     break;
+                case R_DISPATCH_INDIRECT_ADDR:
+                    // sceAgcAcbDispatchIndirect: payload [0..1] = the argument buffer's whole
+                    // 64-bit address, [2..3] = the 64-bit ShaderDispatchModifier. The ACB has no
+                    // SetBase in the whole library, so there is nothing for an offset to be
+                    // relative to; a short packet is left non-absolute and therefore resolves to
+                    // address 0, which the executor already rejects, rather than silently becoming
+                    // a base-relative offset.
+                    c.kind = K::DispatchIndirect;
+                    if (npl >= 2) {
+                        c.indirect_address = lo_hi(pl);
+                        c.indirect_address_absolute = true;
+                    }
+                    if (npl >= 4) c.dispatch_modifier = lo_hi(pl + 2);
+                    break;
                 case R_INDEX_BASE:
                     // sceAgcDcbSetIndexBuffer -> bind the index buffer base address. payload: [0..1]=addr.
                     c.kind = K::SetIndexBase;

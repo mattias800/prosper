@@ -981,6 +981,36 @@ control run's census, so it is reached only now that the earlier passes run.
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
 
+- **"The world map's truncated indirect-argument address (`0x74063c0`) comes from a low-only
+  `sceAgcDcbSetBaseIndirectArgs` that had no VA aperture to inherit."** False, and this was the
+  reading `command_processor.cpp`'s own comment recorded ("Astro alternates 0x5074063c0 and
+  0x074063c0 for the same compute argument allocation"). A bounded always-on diagnostic on both
+  halves of the path reports **0 truncated SetBase events** in a 190 s routed boot that produced
+  **24 unreadable-argument events**, and every one of the 24 is `q=2 base=0x0 offset=0x74063c0
+  BASE-UNSET`. The alternation is real but it is between two different *packets*: the Dcb's SetBase
+  names the allocation at full width and the **ACB's DispatchIndirect names it with the low half**,
+  because `sceAgcAcbDispatchIndirect` carries an address rather than an offset and prosper was
+  truncating it. See #3218.
+
+- **"`0x500571000` is declined for a descriptor, resource or binding reason."** False. The reason is
+  printed ungated on any routed run since #2412: `[compute] skip unsupported program 0x500571000
+  reason=compute-cfg-reject pc=314 reason=missing-entry-vcc` — the CFG dispatcher's entry-state gate
+  in `src/gpu/recompiler/rdna2_emit_cfg.cpp`, which refuses to synthesize an entry VCC value outside
+  a proven Wave32 mask domain. Its `[compute-table]` dump shows a fully resolved 40-binding table
+  with no unmatchable rows. See #3218.
+
+- **"#3218's premise — that the world map renders lit but blown out to white — reproduces on a
+  current checkout."** Not reproduced, over four runs, and this is a reproduction gap rather than a
+  falsification of the original observation. Three runs on `main` (one of them #3218's exact command,
+  `PROSPER_DRAW_LINKSCAN` included) and one on **#3217's own head** all show the same thing: the
+  `worldmap` level loads at ~65 s, the 90/120/150 s samples are the pre-existing nebula backdrop
+  (#1459) — mean luma 96.1 and 17.7% of pixels at or above 200, against the committed
+  `astro-bot-worldmap-background` image's 98.6 / 18.1% — and from 180 s the frame is a flat
+  near-black whose brightest pixel is `(6, 20, 32)`. No lit shards, no white panel, and **0 GRAPHICS
+  submission failures**, so #3217's device-loss fix is present and working. The light lists are
+  well-formed on these runs too (`records=4147200 terminating=4147200 cyclic=0`). Whatever put the
+  BLOG's lit frames on screen is not on the wall-clock route here. See #3218.
+
 - **"The tile index is wrong -- `v5` does not carry what the guest expects, so the head lookup lands
   outside the 32,400-dword tile buffer or on the wrong tile."** Cannot be the cause of the
   non-termination, whatever `v5` carries. All 32,400 head dwords are zero (`PROSPER_DRAW_LINKSCAN`,

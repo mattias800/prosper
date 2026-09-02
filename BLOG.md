@@ -36,6 +36,14 @@ instruction from an operand dword that looks like one. It now calls prosper's re
 right — 11,266 real shaders out of the dump library, 199,521 image instructions, zero disagreements
 — which is the point: a copy that is correct today is still the one nobody updates tomorrow.
 
+### Every async-compute indirect dispatch a PS5 game makes was being thrown away
+
+No picture — this one is invisible until you look for it, which is the point. `sceAgcAcbDispatchIndirect`
+hands prosper the *address* of its dispatch arguments, not an offset, because the async-compute ring
+has no base register to offset from; we were sharing the graphics ring's builder, which kept 32 bits
+of that address and threw the rest away. Astro Bot's world map lost a full-screen lighting pass to it
+on every boot, and so would any other title that dispatches from the async queue.
+[#3218](https://github.com/mattias800/prosper/issues/3218)
 
 ### Astro Bot's world map is lit, and no longer takes the GPU down with it
 

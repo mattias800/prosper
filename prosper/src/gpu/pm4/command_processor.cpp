@@ -4499,6 +4499,22 @@ void GpuState::apply(const Pm4Command& c) {
                 // see the recovery at the DispatchIndirect site, which is gated on readability.
                 if (base > UINT32_MAX)
                     g_indirect_va_aperture.store(base >> 32, std::memory_order_relaxed);
+                // Name a truncated base WITHOUT PROSPER_INDIRECTLOG, bounded. A low-only update with
+                // no upper half to inherit silently disables every indirect operation that consumes
+                // it: the executor later reports only "unreadable arguments at 0x<sum>", which says
+                // nothing about which half was lost or which packet lost it. Same reasoning as the
+                // ungated `[compute] skip … reason=` line — a diagnostic reachable only through a
+                // switch that perturbs the route is not reachable.
+                if (low_only && !inherited) {
+                    static std::atomic<int> truncated{0};
+                    if (truncated.fetch_add(1) < 24)
+                        fprintf(stderr,
+                                "[agc] indirect-args base TRUNCATED: %s packet=0x%llx has no upper "
+                                "half and the current base (0x%llx) has none to inherit\n",
+                                c.indirect_shader_type == 0 ? "graphics" : "compute",
+                                (unsigned long long)c.indirect_base,
+                                (unsigned long long)previous);
+                }
                 // PROSPER_INDIRECTLOG: what the guest actually sends, because the fail-closed branch
                 // below it is silent. A low-only SetBase with no prior aperture leaves the base
                 // truncated, the executor then rejects the argument buffer as unreadable, and the
@@ -4901,7 +4917,12 @@ void GpuState::apply(const Pm4Command& c) {
             d.state = last_snapshot_;
             d.command_order = command_order;
             d.indirect = true;
-            if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
+            // The ACB form carries the whole address (see R_DISPATCH_INDIRECT_ADDR): the
+            // async-compute ring has no base register, so adding `indirect_compute_base` here would
+            // be adding the DCB's unrelated base to a complete address.
+            if (c.indirect_address_absolute)
+                d.indirect_args_addr = c.indirect_address;
+            else if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
                 d.indirect_args_addr = indirect_compute_base + c.indirect_offset;
             // Recover a low-only argument address against the learned VA aperture.
             //
@@ -4929,7 +4950,8 @@ void GpuState::apply(const Pm4Command& c) {
             // skipped as "unreadable arguments"; with it on, 0 are, and the probe found the raw low
             // address unmapped and `aperture | low` mapped on 49 of 49. That is a real signal about
             // where those arguments live, and it is still not provenance.
-            if (aperture_recovery_enabled() && !indirect_compute_base && d.indirect_args_addr &&
+            if (aperture_recovery_enabled() && !c.indirect_address_absolute &&
+                !indirect_compute_base && d.indirect_args_addr &&
                 !guest_readable(d.indirect_args_addr, 3u * sizeof(uint32_t))) {
                 const uint64_t aperture = g_indirect_va_aperture.load(std::memory_order_relaxed);
                 const uint64_t recovered =
@@ -4944,6 +4966,25 @@ void GpuState::apply(const Pm4Command& c) {
                                 (unsigned long long)recovered, (unsigned)c.queue_origin);
                     d.indirect_args_addr = recovered;
                 }
+            }
+            // Split the sum WITHOUT PROSPER_INDIRECTLOG, bounded, and only for the packets that are
+            // already lost. The executor's "unreadable arguments at 0x…" prints the sum alone, which
+            // cannot separate "the base was never set on this queue" (base 0, offset carries a whole
+            // low address) from "the base arrived truncated" (base low-only, offset small) — and
+            // those two have different fixes. The readability probe runs only while the bound is
+            // unspent, so a title with thousands of indirect dispatches pays for 24 of them.
+            {
+                static std::atomic<int> unreadable{0};
+                if (unreadable.load(std::memory_order_relaxed) < 24 && d.indirect_args_addr &&
+                    !guest_readable(d.indirect_args_addr, 3u * sizeof(uint32_t)) &&
+                    unreadable.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] indirect dispatch args UNREADABLE: q=%u base=0x%llx offset=0x%x "
+                            "-> args=0x%llx%s\n",
+                            (unsigned)c.queue_origin,
+                            (unsigned long long)indirect_compute_base, c.indirect_offset,
+                            (unsigned long long)d.indirect_args_addr,
+                            indirect_compute_base ? "" : "  BASE-UNSET");
             }
             // PROSPER_INDIRECTLOG: base and offset SEPARATELY, plus the queue. The executor's
             // "unreadable arguments at 0x…" message prints only the sum, which cannot distinguish a

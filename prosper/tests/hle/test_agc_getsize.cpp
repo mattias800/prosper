@@ -79,7 +79,10 @@ int main() {
         { "DrawIndexIndirect",  "mStuvI0zOtc", "t1vNu082-jM", 4, 0, 0, 0, 0, 0 },
         { "Dispatch",           "Abendgtz+3o", "k3GhuSNmBLU", 6, 0, 0, 0, 0, 0 },
         { "DispatchIndirect/D", "w8HVkEeXPv8", "CtB+A9-VxO0", 4, 0, 0, 0, 0, 0 },
-        { "DispatchIndirect/A", "PxKWV2fVAps", "j3EtxFkSIhQ", 4, 0, 0, 0, 0, 0 },
+        // The ACB form is 5, not 4: it carries a whole 64-bit argument address where the DCB form
+        // carries a 32-bit offset, because no sceAgcAcb* export sets an indirect-argument base
+        // (#3218). Sharing the DCB builder truncated that address to 32 bits.
+        { "DispatchIndirect/A", "PxKWV2fVAps", "j3EtxFkSIhQ", 5, 0, 0, 0, 0, 0 },
         { "DmaData/Dcb",        "2ccJz9LQI+w", "WmAc2MEj6Io", 7, 0, 0, 0, 0, 0 },
         { "DmaData/Acb",        "M0ttm8h7SKA", "-RnpfpxIhec", 7, 0, 0, 0, 0, 0 },
         { "EventWrite/Dcb",     "C4l9fB17t8w", "aJf+j5yntiU", 4, 0, 0, 0, 0, 0 },

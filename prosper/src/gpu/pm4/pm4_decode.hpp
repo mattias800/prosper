@@ -48,6 +48,13 @@ enum : uint32_t {
     // or compute (1); the following indirect packet carries a byte offset into that buffer.
     R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
     R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23,
+    // The ACB form of the same dispatch. sceAgcAcbDispatchIndirect carries a WHOLE GPU virtual
+    // address rather than an offset, because the async-compute ring has no base register to offset
+    // from: libSceAgc 3.20 exports 36 sceAgcAcb* entry points and not one of them is a SetBase.
+    // (The only setter in the library is sceAgcDcbSetBaseIndirectArgs.) So this packet is a
+    // different operation from R_DISPATCH_INDIRECT and gets its own encoding rather than sharing
+    // one whose payload cannot hold an address.
+    R_DISPATCH_INDIRECT_ADDR = 0x24,
     R_NUM = 0x40,
 };
 
@@ -101,6 +108,11 @@ struct Pm4Command {
     uint32_t indirect_shader_type = 0;       // SetBase: 0=graphics, 1=compute
     uint64_t indirect_base = 0;              // SetBase: guest argument-buffer address
     uint32_t indirect_offset = 0;            // Draw/Dispatch: byte offset from selected base
+    // R_DISPATCH_INDIRECT_ADDR only: the argument buffer's whole 64-bit guest address, with no
+    // base to add. `indirect_offset` is meaningless on that form and stays zero, so a consumer
+    // that reads the wrong one gets an obviously wrong address instead of a plausible one.
+    uint64_t indirect_address = 0;
+    bool indirect_address_absolute = false;
 
     // DrawIndex/DrawIndexAuto modifier. Both custom HLE packets retain the shader's trailing
     // 64-bit ShaderDrawModifier; DrawIndex additionally carries an index-buffer address.
