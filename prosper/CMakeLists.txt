@@ -2732,6 +2732,20 @@ if(TARGET prosper_core)
       add_test(NAME backend_persistent_resource_lock
                COMMAND test_backend_persistent_resource_lock)
 
+      # #2944: every GPU readback in the render backend is host-read after a fence wait, and a fence
+      # orders execution rather than performing the availability operation into the host domain.
+      # Structural by necessity -- on a coherent desktop driver the UNFIXED code returns correct
+      # pixels, so the assertion is that the barrier is RECORDED, with a no-readback negative control
+      # so the counter cannot be satisfied by any render at all. Same include roots and same real
+      # Vulkan device as the render_runner.h tests above.
+      add_executable(test_host_read_barrier tests/render/test_host_read_barrier.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_host_read_barrier PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_host_read_barrier PRIVATE frontends)
+      target_link_libraries(test_host_read_barrier PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME host_read_barrier COMMAND test_host_read_barrier)
+
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
       add_executable(test_compute_address_watch tests/gpu/test_compute_address_watch.cpp)
       target_link_libraries(test_compute_address_watch PRIVATE prosper_core Vulkan::Vulkan)

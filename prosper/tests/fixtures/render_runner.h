@@ -3947,6 +3947,68 @@ inline bool invalidate_mapped_readback(const RenderVkCtx& ctx, VkDeviceMemory me
     return vkInvalidateMappedMemoryRanges(ctx.dev, 1, &range) == VK_SUCCESS;
 }
 
+// The OTHER half of a readback, and a separate operation from the invalidate above.
+//
+// Waiting a fence -- or vkQueueWaitIdle -- orders EXECUTION. It does not perform the availability
+// operation that moves a transfer (or shader, or transform-feedback) write into the HOST domain.
+// Vulkan requires an explicit dependency for that: dstStageMask = VK_PIPELINE_STAGE_HOST_BIT with
+// dstAccessMask = VK_ACCESS_HOST_READ_BIT (#2944).
+//
+// Coherent memory does not exempt a readback from it. HOST_COHERENT removes the need for
+// vkInvalidateMappedMemoryRanges; it does not remove the need for the dependency. So the two halves
+// are independent: non-coherent memory needs both, coherent memory needs this one.
+//
+// Every driver this project runs on completes the availability anyway, which is exactly why the gap
+// survived unnoticed -- the pixels come back correct and nothing says the code was wrong. The fix is
+// spec conformance, not a chase after a visible symptom.
+struct HostReadBarrier {
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    VkPipelineStageFlags src_stages = 0;
+    VkPipelineStageFlags dst_stages = 0;
+};
+
+// Pure, so the masks can be asserted with no device (`host_read_barrier` ctest case). The buffer
+// scope is whole-buffer: a readback buffer holding several slots (the MRT frame buffer writes up to
+// eight colour offsets into one allocation) is made available in one dependency.
+inline HostReadBarrier host_read_barrier_for(
+        VkBuffer buffer,
+        VkPipelineStageFlags src_stages = VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VkAccessFlags src_access = VK_ACCESS_TRANSFER_WRITE_BIT) {
+    HostReadBarrier host_read{};
+    host_read.barrier.srcAccessMask = src_access;
+    host_read.barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host_read.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host_read.barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host_read.barrier.buffer = buffer;
+    host_read.barrier.offset = 0;
+    host_read.barrier.size = VK_WHOLE_SIZE;
+    host_read.src_stages = src_stages;
+    host_read.dst_stages = VK_PIPELINE_STAGE_HOST_BIT;
+    return host_read;
+}
+
+// How many host-read barriers this process has recorded. Exists so a test can prove the barrier
+// reached the command buffer on a path it drives: without it the fix is unfalsifiable here, because
+// on a coherent desktop driver the UNFIXED code reads back correct pixels. Relaxed and process-wide
+// -- it is an instrument, never a control input.
+inline std::atomic<uint64_t>& backend_host_read_barrier_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+// Record the availability dependency for one readback buffer. Call it after the LAST device write
+// into that buffer in a command buffer, and before the host maps and reads it.
+inline void record_host_read_barrier(
+        VkCommandBuffer command, VkBuffer buffer,
+        VkPipelineStageFlags src_stages = VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VkAccessFlags src_access = VK_ACCESS_TRANSFER_WRITE_BIT) {
+    if (!command || !buffer) return;
+    const HostReadBarrier host_read = host_read_barrier_for(buffer, src_stages, src_access);
+    vkCmdPipelineBarrier(command, host_read.src_stages, host_read.dst_stages, 0,
+                         0, nullptr, 1, &host_read.barrier, 0, nullptr);
+    backend_host_read_barrier_count().fetch_add(1, std::memory_order_relaxed);
+}
+
 // CONTRACT: a pure TRANSFER_DST (readback) buffer may be backed by HOST_CACHED memory that is NOT
 // HOST_COHERENT. Call invalidate_mapped_readback() after mapping and before reading one, and do not
 // host-WRITE through such a mapping without a flush. Any usage including TRANSFER_SRC is always
@@ -4066,6 +4128,10 @@ inline BackendSubmissionState submit_persistent_ds_transfer(
                                static_cast<VkDeviceSize>(width) * height * 4);
     if (copy_stencil) copy_plane(VK_IMAGE_ASPECT_STENCIL_BIT,
                                  static_cast<VkDeviceSize>(width) * height);
+    // #2944: on the READBACK direction the caller maps `buffer` and reads it after the fence below.
+    // The fence orders execution; this makes the copy available to the host. The UPLOAD direction is
+    // the mirror image -- the host wrote and the device reads -- so it needs no host-read dependency.
+    if (!upload) record_host_read_barrier(command, buffer);
 
     barrier.oldLayout = transfer_layout;
     barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -4178,6 +4244,7 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     copy.imageExtent = {width, height, 1};
     vkCmdCopyImageToBuffer(command, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            buffer, 1, &copy);
+    record_host_read_barrier(command, buffer);   // #2944
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.newLayout = saved_layout;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -9021,6 +9088,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    // #2944: the geometry probe maps both transform-feedback buffers below. Transform feedback does
+    // not write through the transfer stage, so this pair carries its own source scope -- the vertex
+    // records and the counter the extension writes at vkCmdEndTransformFeedbackEXT. Recorded here
+    // rather than beside p_endxfb because a buffer memory barrier is not permitted inside a render
+    // pass instance.
+    if (geom_active) {
+        record_host_read_barrier(cmd, geom_buf, VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+                                 VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT);
+        record_host_read_barrier(cmd, geom_counter, VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+                                 VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT);
+    }
     // PROSPER_BUFFER_ECHO=1 (#2945) -- ground truth for "what did the GPU see in this draw's
     // storage buffers". Every other instrument reads the HOST side: PROSPER_BUFLOG prints the source
     // words, --dump-resource prints the capture's bytes, and both were byte-identical across runs
@@ -9099,12 +9177,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             ++echo_count;
             vkCmdCopyBuffer(cmd, dv[d].ibuf, echo_buffer, 1, &copy);
         }
-        VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read,
-                             0, nullptr, 0, nullptr);
+        record_host_read_barrier(cmd, echo_buffer);   // #2944
     }
     backend_pass_timing_end(cmd);   // #2333
     // Fence waits used to provide the device-memory dependency between every target call. Batched
@@ -9222,6 +9295,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         copy.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
         vkCmdCopyImageToBuffer(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                upload.staging, 1, &copy);
+        record_host_read_barrier(cmd, upload.staging);   // #2944
         VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -9273,6 +9347,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    rb, 1, &extra_copy);
         }
+        // #2944: one whole-buffer dependency covers every colour slot copied above -- they are
+        // offsets into one allocation, which the host maps and reads once the batch completes.
+        record_host_read_barrier(cmd, rb);
         auto restore_persistent_color = [&](bool persistent, bool readback, VkImage image) {
             if (!persistent || !readback) return;
             VkImageMemoryBarrier to_sample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -9779,6 +9856,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
                 vkCmdEndRenderPass(c2);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
+                record_host_read_barrier(c2, rb);   // #2944
                 const bool recorded = vkEndCommandBuffer(c2) == VK_SUCCESS;
                 const bool fence_reset = recorded &&
                     vkResetFences(dev, 1, &iso_fence) == VK_SUCCESS;

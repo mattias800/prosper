@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### Every frame we have ever read back was read without asking the GPU to hand it over
+
+No picture, and that is the finding: on this hardware a readback with no host-availability barrier
+comes back looking perfectly correct, so nothing has ever complained. Deleting the barrier we just
+added leaves the pixel check green and only the structural check red — and Vulkan's synchronization
+validation, which is armed and reporting five other hazards in the same run, cannot see it either,
+because it has no way to watch the CPU read a mapped pointer.
+[#2944](https://github.com/mattias800/prosper/issues/2944)
+
 ### A guest asking to sleep for 584 years was served in zero milliseconds
 
 No picture — the finding is that prosper's guest sleeps saturate a hostile interval to the largest

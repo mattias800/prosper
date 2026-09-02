@@ -22,6 +22,20 @@ Either fix in shader or update the VkImageViewType to VK_IMAGE_VIEW_TYPE_2D.
 
 That is the difference the guard buys.
 
+## What it does NOT cover
+
+**Synchronization validation is off.** The scan enables the layer's default (core) checks only, so
+nothing in this tree has ever gated on prosper's barriers. Turning it on
+(`VK_LAYER_VALIDATE_SYNC=1`) reports real hazards this guard cannot see — measured 2026-09-02, 5
+`SYNC-HAZARD` messages across 2 tests, filed as #3248 with the one that lives in the render backend.
+Enabling it here is a decision that has not been taken, because those findings would have to be
+fixed or allow-listed first.
+
+Syncval is also not a general oracle for synchronization. It cannot observe a CPU read through a
+mapped pointer, so it does not see a missing host-availability barrier on a readback (#2944):
+measured in the same session with that defect deliberately live, it produced zero messages while
+demonstrably armed. `docs/GRAPHICS.md` § Ruled out carries both halves of that measurement.
+
 ## Running it
 
 ```bash

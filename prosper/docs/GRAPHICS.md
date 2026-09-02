@@ -795,6 +795,28 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   than a dozen samples per arm to say anything — twelve-run arms of one unchanged binary produced
   10/12 and 5/12 for `descriptor_array_render` on the same afternoon. Only the 0/30 pair is a stable
   discriminator. #2937.
+- **Correct pixels are not evidence that a readback is synchronized, and this is the reason #2944
+  survived unnoticed for the life of the backend.** Every readback buffer in the render backend is
+  host-visible memory this platform's driver keeps coherent enough that the *unfixed* code returns
+  the right bytes. Measured directly: with the host-read barrier deleted from the composited-frame
+  readback, `test_host_read_barrier`'s pixel assertion ("the pass rendered and read back a full
+  frame") still **passes** while the structural assertion goes red. So a readback test that checks
+  content can never discriminate here — assert that the barrier is RECORDED. #2944.
+- **Synchronization validation does not detect a missing host-read barrier — do not reach for it as
+  the oracle for this class.** Measured 2026-09-02, Fedora 44 / validation layers 1.4.341 / Mesa
+  RADV STRIX_HALO, with the composited-frame barrier deleted so the defect was live:
+  `VK_LAYER_VALIDATE_SYNC=1` over `test_pipeline_render` and `test_host_read_barrier` produced
+  **zero** messages. The lever is proven to move — the same setting over the whole ctest suite
+  produced **5 SYNC-HAZARD messages** (one READ-AFTER-WRITE in `vulkan_triangle_render`, four
+  WRITE-AFTER-WRITE in `texture_mip_render`), so syncval was armed and reporting; it simply cannot
+  observe a CPU read through a mapped pointer, which is the access the missing dependency protects.
+  Those 5 are a separate, real finding (#3248) and are invisible to `tools/vkval`, which does not
+  enable syncval. #2944.
+- **HOST_COHERENT memory does NOT exempt a readback from the host-domain dependency.** Coherence
+  removes the need for `vkInvalidateMappedMemoryRanges`; it does not perform the availability
+  operation. The two halves are independent, and the backend had only the second: three of the seven
+  readback sites already invalidated (they may be backed by non-coherent HOST_CACHED memory) while
+  none had the barrier. #2944.
 
 ## The renderer is not deterministic on frozen input (2026-08-23) — #2945
 
