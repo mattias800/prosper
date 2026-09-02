@@ -7599,7 +7599,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rdna2_mimg_dynamic_mip_shape(in, &dynamic_mip_vgpr) &&
                 in.mimg_dim == SQ_DIM_2D &&
                 prosper::gpu::shader_resource_uses_ordinary_2d_image(*res, true, false, false) &&
-                !res->unnormalized && !res->depth_compare && !res->in_mip_tail &&
+                // `in_mip_tail` used to be refused here as well. It no longer is (#3134): a
+                // tail-packed selected level is a MODELLED placement, and the level count above is
+                // the authority on it -- `shader_resource_mip_chain_plan` admits the tail only
+                // after proving its own in-block coordinates equal the ones the descriptor decode
+                // published, and reports one level otherwise. Repeating the test here would have
+                // kept refusing the whole small-texture class (Stray's 32x32 six-level pyramid is
+                // smaller than one 64 KiB macroblock, so EVERY one of its levels is in the tail)
+                // for a placement the backend now uploads.
+                !res->unnormalized && !res->depth_compare &&
                 res->sample_count == 1u && !res->compression_enabled;
             // IMAGE_LOAD_MIP's final address is a real guest mip selector. Specialize it away only
             // after the per-use fold and the materialized-resource checks agree. The 2D_ARRAY form
@@ -7636,7 +7644,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  "proven_zero_mip=%d img_dim=%u/%u samples=%u mips=%u mip_tail=%d "
                                  "compressed=%d array_in_gfx=%d addr=0x%llx %ux%ux%u "
                                  "dataformat=%d ncomp=%u "
-                                 "tile=%u dmask=0x%x unorm=%u glc=%u layer_stride=%u\n",
+                                 "tile=%u dmask=0x%x unorm=%u glc=%u layer_stride=%u "
+                                 "dyn_shape=%d nsa=%u materialized_mips=%u compute=%d\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  (int)rdna2_mimg_zero_mip_shape(in),
                                  (int)res->proven_zero_mip, res->img_dim, in.mimg_dim,
@@ -7647,7 +7656,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  res->depth, (int)res->format, res->num_components,
                                  res->tile_mode, in.mimg_dmask,
                                  (unsigned)in.mimg_unorm, (unsigned)in.mimg_glc,
-                                 res->layer_stride_bytes);
+                                 res->layer_stride_bytes,
+                                 // The DYNAMIC route's own inputs. Without these the line names
+                                 // only the zero-mip specialization's terms, and an investigation
+                                 // reading it cannot tell "the address encoding is not modelled"
+                                 // (#3134's original state) from "the chain is not materialized on
+                                 // this stage" -- which are different pieces of work.
+                                 (int)rdna2_mimg_dynamic_mip_shape(in), in.mimg_nsa,
+                                 materialized_mip_levels, (int)b.is_compute);
                 ok = false;
                 return true;
             }

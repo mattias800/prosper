@@ -524,3 +524,25 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   may unblock some OTHER draw that shares it but addresses a genuinely single-mip resource; it does
   **not** close #3134 on its own. Full detail: `docs/RECOMPILER_REMAINING.md` § Ruled out. #3134,
   #2818.
+- **"The three-dword `IMAGE_LOAD_MIP` is an exotic packet that needs its own lowering."** Falsified.
+  NSA is an address ENCODING, not a different operation, and the defect was the emitter's
+  expected-address-count rule: `rdna2_mimg_dynamic_mip_shape` derived the mip register as
+  `VADDR + n`, which is only true for the consecutive form, so it declined every NSA packet rather
+  than name the wrong VGPR. Assembled by hand through llvm-mc gfx1030, the NSA and consecutive forms
+  carry the SAME address vector (`[x, y, mip]` at 2D, `[x, y, slice, mip]` at 2D_ARRAY); the
+  emitter's own coordinate gather already read NSA generically. It is now read as an encoding and
+  lowers through the #3048 dynamic-LOD path, with an executed arm that puts the mip in v7 while v2 —
+  the register the old arithmetic would have named — holds zero. The second half of the same fix:
+  `shader_resource_mip_chain_plan` refused any resource whose SELECTED level is packed in the shared
+  mip tail, which refused this resource's whole class rather than a corner (32x32 at four bytes per
+  texel is smaller than one 64 KiB macroblock, so all six levels are in the tail); it is now admitted
+  after proving the plan's in-block coordinates equal the ones `agc_shader_layout` published. #3134.
+- **STILL OPEN, and this is what now holds fragment `0x30be800000`:** both halves above are
+  compute-path facts, and this is a FRAGMENT stage. The graphics texture path uploads exactly one
+  level (its chain is *generated* by a `vkCmdBlitImage` cascade, gated to `VK_FORMAT_R8G8B8A8_UNORM`)
+  and has no native sampled decode for `R16G16_UINT` at all — `backend_color_format` falls through to
+  `VK_FORMAT_R8G8B8A8_UNORM` for it, so an integer fetch on this resource would read converted texels
+  even at level zero. The reject line now says which of the two it is: `[mimg-mip] … dyn_shape=1
+  nsa=1 materialized_mips=1 compute=0`. The disassembly is unambiguous that the level is genuinely
+  dynamic — `v_min_i32 / v_max_i32` clamp a log2-derived LOD into `v5`, and the x/y coordinates are
+  shifted right by that same `v5` — so `Lod=0` remains the wrong answer. #3134, #2818.

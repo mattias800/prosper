@@ -72,9 +72,15 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
     if (resource.cls != ResourceClass::Texture) return plan;
     if (resource.declared_mip_levels < 2u || resource.sample_count != 1u) return plan;
     // A selected level that is itself packed in the shared tail leaves `gpu_addr` at the allocation
-    // base while every sibling level shares that same block; the offsets below assume the ordinary
-    // "selected level owns a disjoint byte range" form and must not be applied to it.
-    if (resource.in_mip_tail) return plan;
+    // base while every sibling level shares that same block. That is a DIFFERENT placement from the
+    // ordinary "selected level owns a disjoint byte range" form, not an unmodelled one: the element
+    // coordinates that address it inside the block come from the same AddrLib derivation
+    // (`TiledMipLevelLayout::tail_x/tail_y`), and `agc_shader_layout` already publishes the selected
+    // level's own pair as `mip_tail_x/mip_tail_y`. It is admitted here (#3134 -- Stray's 32x32
+    // R16G16_UINT six-level pyramid is entirely inside one tail block, so refusing the tail refused
+    // the whole resource class), and the agreement between the two derivations is PROVEN below
+    // rather than assumed: if they named different bytes, `gpu_addr` and `levels[0]` would disagree
+    // about where the selected level is.
     // A layered or volume view selects one slice of a per-slice chain, and a compressed base is not
     // ordinary tiled texels at any level. Both remain fail-closed.
     if (resource.depth != 1u || resource.layer_stride_bytes || resource.layer_mip_offset_bytes)
@@ -136,8 +142,16 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
             return {};
     }
     // The selected level must be the one the resource's own fields describe, or `gpu_addr` and
-    // `levels[0]` name different bytes.
-    if (plan.levels[0].in_tail) return {};
+    // `levels[0]` name different bytes. For a tail-packed selected level that means the two
+    // independent derivations -- this plan's, and the descriptor decode's -- must agree on the
+    // in-block placement as well as on the fact of being in the tail.
+    if (plan.levels[0].in_tail != resource.in_mip_tail) return {};
+    if (plan.levels[0].in_tail &&
+        (plan.levels[0].byte_offset != 0u ||
+         plan.levels[0].tail_x != resource.mip_tail_x ||
+         plan.levels[0].tail_y != resource.mip_tail_y ||
+         plan.levels[0].tail_block_bytes != resource.mip_tail_bytes))
+        return {};
     plan.valid = true;
     plan.level_count = level_count;
     plan.allocation_bytes = allocation_bytes;
