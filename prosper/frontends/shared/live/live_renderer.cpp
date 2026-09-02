@@ -5,6 +5,8 @@
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "gpu/diagnostics/draw_program_skip.hpp"          // PROSPER_SKIP_DRAW_PROGRAM / census
+#include "gpu/diagnostics/link_list_census.hpp"          // PROSPER_DRAW_LINKSCAN
+#include "gpu/capture/writer_provenance.hpp"              // who last wrote a censused range
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/rtt/rtt_injection.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -7233,6 +7235,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             auto& program_skip = prosper::gpu::draw_program_skip_selector();
             const bool program_skip_armed = program_skip.armed();
             const bool program_census = prosper::gpu::draw_program_census_enabled();
+            // PROSPER_DRAW_LINKSCAN: the graphics counterpart of PROSPER_COMPUTE_PARENTSCAN.
+            // Hoisted for the same reason as the two above -- disarmed it is one bool.
+            auto& link_scan = prosper::gpu::draw_link_scan_selector();
+            const bool link_scan_armed = prosper::gpu::draw_link_scan_enabled();
             auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group) {
                 std::vector<prosper::test::BackendDraw> bds;
                 // Once per call, not once per draw -- see the note on descriptor_validate_mode above
@@ -7384,6 +7390,156 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (unsigned long long)sighting.distinct,
                                     bd.vcount, bd.indices.size(), it.ps.topology,
                                     (unsigned long long)it.color0_base);
+                    }
+                    // PROSPER_DRAW_LINKSCAN: census the LINKED LISTS this draw's scalar buffers
+                    // contain, taken from the exact bytes prosper is about to upload -- not from
+                    // guest memory, because the question is what the SHADER sees. Ordered with the
+                    // other observers and before the skip, for the trap-166 reason below.
+                    if (link_scan_armed &&
+                        link_scan.matches(it.vs_guest_addr, it.vs_chain_guest_addr,
+                                          it.fs_guest_addr)) {
+                        const auto& lcfg = prosper::gpu::draw_link_scan_settings();
+                        const uint32_t* heads_words = nullptr; size_t heads_count = 0;
+                        const uint32_t* rec_words = nullptr;   size_t rec_count = 0;
+                        size_t buffers_seen = 0;
+                        for (const auto& fr : bd.R) {
+                            if (fr.is_texture() || fr.is_storage_image) continue;
+                            const uint32_t* words = fr.buffer_words_data();
+                            const size_t nwords = fr.buffer_word_count();
+                            if (!words || nwords == 0) continue;
+                            ++buffers_seen;
+                            // The DECLARED descriptor beside the UPLOADED bytes. A short upload is
+                            // the mis-resolved-descriptor case and is invisible in the census alone:
+                            // the shader reads zeros past the end and a zero link is not an exit.
+                            uint64_t res_addr = 0; uint32_t res_declared = 0; int res_cls = -1;
+                            const prosper::gpu::ShaderResourceTable* table =
+                                fr.set == 0 ? it.vrt.get() : it.prt.get();
+                            if (table)
+                                for (const auto& r : table->resources)
+                                    if (r.binding == fr.binding) {
+                                        res_addr = r.gpu_addr; res_declared = r.size;
+                                        res_cls = static_cast<int>(r.cls);
+                                        break;
+                                    }
+                            if (fr.set == 1 && fr.binding == lcfg.heads_binding) {
+                                heads_words = words; heads_count = nwords;
+                            }
+                            if (fr.set == 1 && fr.binding == lcfg.records_binding) {
+                                rec_words = words; rec_count = nwords;
+                            }
+                            bool exhausted = false;
+                            const uint32_t scan_ordinal = link_scan.should_scan(
+                                it.fs_guest_addr, fr.set, fr.binding,
+                                lcfg.max_scans_per_buffer, &exhausted);
+                            if (!scan_ordinal) {
+                                if (exhausted)
+                                    fprintf(stderr,
+                                            "[linkscan] capped ps=0x%llx set=%u binding=%u "
+                                            "addr=0x%llx after %u scan(s) -- later draws of this "
+                                            "buffer are NOT scanned\n",
+                                            (unsigned long long)it.fs_guest_addr, fr.set,
+                                            fr.binding, (unsigned long long)res_addr,
+                                            lcfg.max_scans_per_buffer);
+                                continue;
+                            }
+                            const std::span<const uint32_t> span(words, nwords);
+                            const auto hist = prosper::gpu::histogram_words(
+                                span, lcfg.encoding.terminator);
+                            const auto self = prosper::gpu::census_self_walk(span, lcfg.encoding);
+                            fprintf(stderr,
+                                    "[linkscan] ps=0x%llx draw#%llu scan=%u set=%u binding=%u "
+                                    "cls=%d addr=0x%llx declared=%u uploaded_dw=%zu | "
+                                    "hist zero=%u term=%u other=%u first_other=[%u]=0x%08x "
+                                    "other_range=0x%08x..0x%08x | self-walk stride=%u next=+%u "
+                                    "term=0x%08x records=%u starts=%u terminating=%u cyclic=%u "
+                                    "cycle-nodes=%u oob-starts=%u longest=%u\n",
+                                    (unsigned long long)it.fs_guest_addr,
+                                    (unsigned long long)it.draw_index, scan_ordinal, fr.set,
+                                    fr.binding, res_cls, (unsigned long long)res_addr, res_declared,
+                                    nwords, hist.zero, hist.terminator, hist.other,
+                                    hist.first_other_index, hist.first_other_value, hist.min_other,
+                                    hist.max_other, lcfg.encoding.record_stride_dwords,
+                                    lcfg.encoding.next_dword_offset, lcfg.encoding.terminator,
+                                    self.records, self.starts, self.terminating, self.cyclic,
+                                    self.cycle_nodes, self.oob_starts, self.longest);
+                            for (uint32_t k = 0; k < self.sample_count; ++k)
+                                fprintf(stderr,
+                                        "[linkscan]   cycle-member[%u] link=%u -> next=%u\n", k,
+                                        self.sample_link[k], self.sample_next[k]);
+                            // WHO last wrote these bytes. An all-zero buffer has two completely
+                            // different causes -- a producer that never ran, and a producer that
+                            // ran and wrote zeros -- and the census alone cannot tell them apart.
+                            // The recorder summary is printed with the answer, unconditionally,
+                            // because a bounded and per-kind-gated history makes "no writer"
+                            // a statement about the INSTRUMENT unless the reader can see which
+                            // recorders fired (writer_provenance.hpp's scope list, #2111).
+                            if (res_addr && res_declared) {
+                                if (!prosper::gpu::writer_provenance_enabled()) {
+                                    static bool provenance_note = false;
+                                    if (!provenance_note) {
+                                        provenance_note = true;
+                                        fprintf(stderr,
+                                                "[linkscan]   writer provenance is OFF -- set "
+                                                "PROSPER_WRITER_PROVENANCE=1 to learn whether an "
+                                                "all-zero buffer was never written or was written "
+                                                "with zeros\n");
+                                    }
+                                } else {
+                                    const auto writer = prosper::gpu::last_guest_write_overlap(
+                                        res_addr, res_declared);
+                                    if (writer)
+                                        fprintf(stderr,
+                                                "[linkscan]   last writer binding=%u kind=%s "
+                                                "addr=0x%llx size=%llu submit=%llu item=%llu "
+                                                "order=%llu identity=0x%llx | recorders %s\n",
+                                                fr.binding,
+                                                prosper::gpu::guest_writer_kind_name(writer->kind),
+                                                (unsigned long long)writer->addr,
+                                                (unsigned long long)writer->size,
+                                                (unsigned long long)writer->submit,
+                                                (unsigned long long)writer->item,
+                                                (unsigned long long)writer->order,
+                                                (unsigned long long)writer->identity,
+                                                prosper::gpu::guest_write_recorder_summary());
+                                    else
+                                        fprintf(stderr,
+                                                "[linkscan]   last writer binding=%u NONE -- no "
+                                                "recorded write overlaps 0x%llx+%u | history=%zu "
+                                                "recorders %s\n",
+                                                fr.binding, (unsigned long long)res_addr,
+                                                res_declared,
+                                                prosper::gpu::guest_write_history_size(),
+                                                prosper::gpu::guest_write_recorder_summary());
+                                }
+                            }
+                        }
+                        if (heads_words && rec_words) {
+                            const auto heads = prosper::gpu::census_head_walk(
+                                std::span<const uint32_t>(rec_words, rec_count),
+                                std::span<const uint32_t>(heads_words, heads_count),
+                                lcfg.encoding);
+                            fprintf(stderr,
+                                    "[linkscan] ps=0x%llx draw#%llu HEAD-WALK heads_binding=%u "
+                                    "(%zu dw) records_binding=%u (%zu dw) starts=%u "
+                                    "terminating=%u cyclic=%u cycle-nodes=%u oob-starts=%u "
+                                    "longest=%u\n",
+                                    (unsigned long long)it.fs_guest_addr,
+                                    (unsigned long long)it.draw_index, lcfg.heads_binding,
+                                    heads_count, lcfg.records_binding, rec_count, heads.starts,
+                                    heads.terminating, heads.cyclic, heads.cycle_nodes,
+                                    heads.oob_starts, heads.longest);
+                        }
+                        // Silence would otherwise be indistinguishable between "the program never
+                        // drew" and "it drew with no buffers at all". Say which, once.
+                        if (buffers_seen == 0) {
+                            static std::set<uint64_t> no_buffer_reported;
+                            if (no_buffer_reported.insert(it.fs_guest_addr).second)
+                                fprintf(stderr,
+                                        "[linkscan] ps=0x%llx draw#%llu matched but has NO storage "
+                                        "buffer resources -- nothing to census\n",
+                                        (unsigned long long)it.fs_guest_addr,
+                                        (unsigned long long)it.draw_index);
+                        }
                     }
                     // PROSPER_SKIP_DRAW_PROGRAM: withhold this draw from the GPU because one of its
                     // programs is named. LAST in the per-draw build on purpose -- instrument trap

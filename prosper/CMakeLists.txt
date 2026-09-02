@@ -1684,6 +1684,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_draw_program_skip PRIVATE prosper_core)
   add_test(NAME draw_program_skip COMMAND test_draw_program_skip)
 
+  # PROSPER_DRAW_LINKSCAN: the CPU-side census of the linked lists a draw's scalar buffers contain
+  # (the graphics counterpart of PROSPER_COMPUTE_PARENTSCAN). Pure analysis + selector -- no Vulkan.
+  add_executable(test_link_list_census tests/gpu/diagnostics/test_link_list_census.cpp)
+  target_link_libraries(test_link_list_census PRIVATE prosper_core)
+  add_test(NAME link_list_census COMMAND test_link_list_census)
+
   add_executable(test_shader_dump_filter tests/gpu/diagnostics/test_shader_dump_filter.cpp)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
