@@ -602,15 +602,47 @@ edge cases are tracked separately in #697.
    `PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE=1`.
    Exact fixed maps whose virtual and physical 64 KiB deltas differ still use the private fallback, and
    partial unmap needs a section-aware implementation.
-3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args 1-9 are converted
-   and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
-   formatters / `printf`-family) — add float-arg conversion when a title needs it.
+3. ~~**Validate/repair the guest→HLE ABI trampoline for XMM/float args.**~~ Done (#2955). The bridge
+   is signature-driven: `src/host/abi/` carries the two placement tables and emits the trampoline
+   from the handler's own C++ declaration, which `Hle::register_typed` preserves. A handler with no
+   float still gets the historical fixed integer shuffle, byte for byte. `printf`-family handlers are
+   deliberately NOT converted — they are real host variadics, reached by the same fixed path as
+   before, and a variadic Microsoft x64 call additionally wants each FP argument duplicated into the
+   integer register; that remains open and unmeasured.
 4. **VEH recovery hardening for genuine stack-overflow faults.** #633 added a tested assembly recovery
    entry with valid Microsoft-x64 shadow space/alignment, but a truly exhausted guest stack still needs
    a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
-5. **Audit the `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
-   and so route correctly through the trampoline, but confirm none are raw host functions relying on
-   host-ABI arg passing.
+5. ~~**Audit the `(HleFn)`-cast handlers**~~ Done for the floating-point question (#2955): a sweep of
+   `src/hle` for a `float` or `double` in a registered handler's parameter or return list finds 78
+   NIDs — the `libSceFont` scale/slant/weight/render group and the whole libm bank plus
+   `strtod`/`strtof` in `hle_libc.cpp` — and those now register through `Hle::register_typed`. The
+   remaining cast targets pass and return integers and pointers, which both conventions place
+   identically. What is still unaudited is the *other* half of the original question: whether a cast
+   target's argument COUNT exceeds ten, which the fixed path silently truncates.
+
+### Ruled out — the Windows import trampoline's floating-point arguments
+
+One line per falsified hypothesis, per `CLAUDE.md`. The mechanism and the fix are #2955.
+
+- **"Only four handlers are affected, all in `src/hle/util/hle_font.cpp`; nothing else in 700+
+  registered NIDs declares a float parameter."** False — that was #2955's own opening census, and it
+  missed an order of magnitude. `hle_libc.cpp` registers the entire libm bank (`sinf`, `pow`, `fmod`,
+  `ldexpf`, `frexp`, `sincosf`, `modf`, …) plus `strtod`/`strtof` through the same `Hle::register_fn`
+  and therefore the same trampoline: **78** registered NIDs declare a float or double, not four. The
+  census missed them because it grepped for handlers whose *parameter list* mentions `float` in the
+  files it expected to find them in, and the libm thunks are one-liners in a 900-line libc file.
+  Counted by the built binary in `tests/host/abi/test_sysv_ms_bridge.cpp`, which fails if the number
+  is zero rather than trusting a grep.
+- **"An all-float signature is safe, because both conventions place SSE arguments in xmm0.. in
+  order."** True of the ARGUMENTS and false of the call. The trampoline runs a host checkpoint call
+  AFTER the handler returns and saves only `rax` across it, so every float- or double-returning
+  handler — `sinf`, `pow`, `strtof`, all of them — handed the guest whatever that call happened to
+  leave in xmm0. Demonstrated by executing the emitted bytes with a checkpoint that clobbers xmm0:
+  the historical path returns the clobber pattern, the signature-driven path returns the value.
+- **"Adding xmm moves to the positional integer shuffle fixes it."** False by construction and pinned
+  by test: an SSE argument's xmm number under System V is its index among the SSE arguments, and
+  under Microsoft x64 it is its index among ALL arguments. `(handle, float, float)` must move
+  xmm0/xmm1 to xmm1/xmm2, and every integer argument behind a float shifts as well.
 
 ### Ruled out — the Windows guest timed waits
 
@@ -661,7 +693,8 @@ natively under MSYS2/UCRT64 exactly as the CI `Windows MinGW` job does.
 3. **macOS port:** `exec_image_darwin.cpp`, x86_64 preset, MoltenVK + SDL3 frontend. Exit
    criterion: the pure test suite + a dump-gated boot test green under Rosetta on this laptop.
 4. **Windows native hardening:** keep extending gameplay coverage beyond the completed substrate,
-   then address physical-memory aliasing, XMM import arguments, and remaining VEH edge cases.
+   then address physical-memory aliasing and remaining VEH edge cases. (XMM import arguments are
+   done — #2955.)
 5. **Android packaging:** Box64 + rootfs + Turnip APK, Kotlin shell. After macOS/Windows ship.
 6. **Hedge track (background):** validate the Linux-VM-on-macOS route (Rosetta-for-Linux or
    FEX/muvm + Venus) before macOS 28 removes general Rosetta.

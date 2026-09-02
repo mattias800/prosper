@@ -24,6 +24,7 @@
 #include "host/x86/x86_read_decode.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "host/abi/sysv_ms_bridge.hpp"    // #2955: signature-driven SysV->MS x64 import bridge
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
 #include "host/symbols/il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 
@@ -294,33 +295,9 @@ namespace {
     inline uint64_t cur_tid() { return (uint64_t)GetCurrentThreadId(); }
     inline uint64_t page_up(uint64_t v) { return (v + 0xfffull) & ~0xfffull; }
 
-    // Import-stub machine code. Unlike Linux (where host ABI == guest SysV, so the stub is a bare
-    // tail-jump with args intact), Windows handlers are Microsoft x64, so the stub is a TRAMPOLINE
-    // that converts the guest's SysV integer arguments to MS x64 before calling the handler:
-    //   SysV in: rdi rsi rdx rcx r8 r9 [guest rsp+8]...[guest rsp+32] (a0..a9)
-    //   MS out:  rcx rdx r8 r9 [rsp+20]...[rsp+48] (+32B shadow, stack args a4..a9)
-    // Return value is rax in both ABIs. This handles integer/pointer args (the whole HleFn surface);
-    // XMM/float args (e.g. some libc formatters) are NOT converted yet — see docs/PORTING.md.
-    // The pad + four copied guest stack args + 0x30-byte outgoing area consume 0x58 bytes (8 mod 16),
-    // so a normally-entered stub (RSP%16==8) has RSP%16==0 at its handler call site. The ABI
-    // conformance test verifies args 1-10 and alignment.
-    size_t emit_sysv_to_ms_prologue(uint8_t* p) {
-        static const uint8_t seq[] = {
-            0x50,                              // push rax             ; alignment pad
-            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a9
-            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a8
-            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a7
-            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a6
-            0x48,0x83,0xEC,0x30,              // sub rsp,0x30         ; shadow + a4/a5
-            0x4C,0x89,0x44,0x24,0x20,         // mov [rsp+0x20],r8    ; MS 5th arg = a4
-            0x4C,0x89,0x4C,0x24,0x28,         // mov [rsp+0x28],r9    ; MS 6th arg = a5
-            0x49,0x89,0xC9,                   // mov r9,rcx           ; MS 4th = a3  (save before rcx clobbered)
-            0x49,0x89,0xD0,                   // mov r8,rdx           ; MS 3rd = a2  (save before rdx clobbered)
-            0x48,0x89,0xF2,                   // mov rdx,rsi          ; MS 2nd = a1
-            0x48,0x89,0xF9,                   // mov rcx,rdi          ; MS 1st = a0
-        };
-        memcpy(p, seq, sizeof seq); return sizeof seq;
-    }
+    // The unimplemented-import stub's return checkpoint: stash rax, run the pending-guest-exception
+    // hook, restore rax. prosper_on_unimpl returns an integer and takes no float, so this local copy
+    // needs none of the signature handling the real bridge does.
     size_t emit_hle_return_checkpoint(uint8_t* p, uint64_t return_hook = 0) {
         size_t o = 0;
         p[o++] = 0x48; p[o++] = 0x89; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x20;
@@ -338,14 +315,21 @@ namespace {
                                                                         // mov rax,[rsp+0x20]
         return o;
     }
-    size_t emit_impl(uint8_t* p, uint64_t fn, uint64_t return_hook) {
-        size_t o = emit_sysv_to_ms_prologue(p);
-        p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
-        p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax
-        o += emit_hle_return_checkpoint(p + o, return_hook);
-        p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x58;    // discard outgoing args + pad
-        p[o++] = 0xC3;                                                 // ret
-        return o;
+    // Import-stub machine code. Unlike Linux (where host ABI == guest SysV, so the stub is a bare
+    // tail-jump with args intact), Windows handlers are Microsoft x64, so the stub is a TRAMPOLINE
+    // that re-places the guest's SysV arguments before calling the handler. The bytes themselves are
+    // chosen by host/abi/sysv_ms_bridge.cpp, which is compiled on every platform so the placement
+    // rules can be asserted and EXECUTED by a test that does not need a Windows host (#2955); the
+    // registry supplies the handler's declared signature, without which a floating-point argument —
+    // and every argument after it — cannot be placed at all.
+    size_t emit_impl(uint8_t* p, uint64_t fn, uint64_t return_hook,
+                     const abi::CallSignature& signature) {
+        abi::BridgeParams params;
+        params.handler     = fn;
+        params.checkpoint  = (uint64_t)(uintptr_t)&dispatch_pending_guest_exception;
+        params.return_hook = return_hook;
+        params.signature   = signature;
+        return abi::emit_sysv_to_ms_bridge(p, params);
     }
     size_t emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
         size_t o = 0;
@@ -1208,11 +1192,18 @@ bool map_image(const LoadedImage& img, std::string* err) {
 // The one place a slot's stub bytes are chosen. install_stubs and append_stubs (#639) must emit
 // byte-identical stubs for the same slot, or a runtime-loaded module's imports would take a
 // different path into the HLE than the pre-linked ones.
-static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx) {
+static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx, size_t capacity) {
     HleFn fn = Hle::lookup(s.nid);
     const uint64_t return_hook = (uint64_t)(uintptr_t)Hle::return_hook_of(s.nid);
-    return fn ? emit_impl(slot, (uint64_t)fn, return_hook)
-              : emit_unimpl(slot, idx, (uint64_t)&prosper_on_unimpl);
+    // Stage, then copy. The bridge's length depends on the handler's declared signature, and a stub
+    // that does not fit its slot must be REPORTED rather than written: emitting straight into the
+    // table would already have overrun the next slot by the time the caller compared the length.
+    uint8_t staged[abi::kMaxBridgeBytes];
+    const size_t emitted =
+        fn ? emit_impl(staged, (uint64_t)fn, return_hook, Hle::signature_of_nid(s.nid))
+           : emit_unimpl(staged, idx, (uint64_t)&prosper_on_unimpl);
+    if (emitted <= capacity) memcpy(slot, staged, emitted);
+    return emitted;
 }
 
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
@@ -1240,7 +1231,8 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
 
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
-        const size_t emitted = emit_one_stub(base + i * stub_size, slots[i], (uint32_t)i);
+        const size_t emitted = emit_one_stub(base + i * stub_size, slots[i], (uint32_t)i,
+                                             (size_t)stub_size);
         if (emitted > stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
@@ -1276,7 +1268,8 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     }
     for (uint64_t i = first_new; i < n; i++) {
         const size_t emitted =
-            emit_one_stub((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size), slots[i], (uint32_t)i);
+            emit_one_stub((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size), slots[i],
+                          (uint32_t)i, (size_t)g_stub_size);
         if (emitted > g_stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
     }
     g_nstubs = n;
