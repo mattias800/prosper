@@ -2689,6 +2689,15 @@ if(TARGET prosper_core)
       target_link_libraries(test_multidraw_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME multidraw_render COMMAND test_multidraw_render)
 
+      # #3180: a failed color-target vkCreateImage must name its site and the real VkResult. Same
+      # block as the other render_runner.h tests -- it needs the `tests` and `frontends` include
+      # roots and a real Vulkan device.
+      add_executable(test_color_target_create_failure tests/gpu/test_color_target_create_failure.cpp)
+      target_include_directories(test_color_target_create_failure PRIVATE tests)
+      target_include_directories(test_color_target_create_failure PRIVATE frontends)
+      target_link_libraries(test_color_target_create_failure PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME color_target_create_failure COMMAND test_color_target_create_failure)
+
       # Indexed draws (#64): vkCmdDrawIndexed from a BackendDraw's index data — the [0,1,2,2,3,0] quad
       # must match the retired perimeter-fan rendering pixel-exact, and indices must really be applied.
       add_executable(test_indexed_render tests/gpu/state/test_indexed_render.cpp)
