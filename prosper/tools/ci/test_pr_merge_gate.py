@@ -4,9 +4,15 @@
 Nothing here touches the network. `evaluate()` and `parse_checks()` are pure, so every arm drives
 them with synthetic payloads shaped exactly like `gh pr checks --json name,state,bucket` emits.
 
-The two arms that matter most are RECONSTRUCTIONS of merges that actually went wrong (#3259), not
-invented cases: #3234's red `Windows MinGW` and #3243's frozen PR head. An arm built from a real
-incident cannot be satisfied by a scenario nobody encounters.
+One arm is a RECONSTRUCTION of a merge that actually went wrong (#3259): #3234's red
+`Windows MinGW`, read as green because a shell split the check NAME on whitespace. An arm built
+from a real incident cannot be satisfied by a scenario nobody encounters.
+
+The stale-head arm is NOT one, and saying so matters because an earlier version of this file
+claimed it was. #3259 originally cited #3243 as a second incident; #3243's head was in fact the
+branch tip when it merged, with every check green on that exact commit. That arm guards a state
+this repository produces routinely -- every lane pushes after CI starts -- which is a weaker
+warrant than a reconstruction, and it should not borrow one it does not have.
 
 HOW TO TELL A REAL ARM FROM ONE THAT REDDENS NOTHING (borrowed from test_trap_number.py, and
 applied here):
@@ -20,6 +26,7 @@ all-pass matching-head case -- whose failure would expose a gate stuck at "no". 
 are what make a refusal meaningful; either alone is void.
 """
 
+import json
 import os
 import sys
 
@@ -76,12 +83,13 @@ res = evaluate(parse_checks(rows(
 )), HEAD, HEAD)
 case("multi-word passing names count once each, not per word", res.counts["pass"], 3)
 
-print("\n-- CI green on a commit that would not merge (the #3243 class)")
-# Every check passes. The only thing wrong is that they describe a commit the branch has moved
-# past -- which is precisely the state that merged an unreviewed 239-byte overread.
+print("\n-- CI green on a commit that would not merge")
+# Every check passes. The only thing wrong is that the recorded head is a commit the branch has
+# moved past, so nothing verified what would actually merge. No merge here is known to have been
+# lost this way (see the docstring); the arm guards the state, not a scar.
 res = evaluate(parse_checks(rows(("Docs", "pass"), ("Linux", "pass"))), OTHER, HEAD)
 case("all-green on a stale head still REFUSES", res.ok, False)
-case("...for the head-mismatch reason specifically", refused_for(res, "CI never saw what would merge"), True)
+case("...for the head-mismatch reason specifically", refused_for(res, "nothing verified what would merge"), True)
 case("...and no check is blamed, because none failed", res.blocking, [])
 
 print("\n-- an empty or unverified result is VOID, not green")
@@ -225,6 +233,76 @@ for label, view in [("headRefOid null", '{"headRefOid": null, "headRefName": "to
                     ("headRefOid empty", '{"headRefOid": "", "headRefName": "topic"}'),
                     ("headRefName missing", '{"headRefOid": "aaaa1111"}')]:
     case(label + " -> exit 2, never 0", run_main(FakeGh(GREEN_CHECKS, view, LS_ONE)), 2)
+
+print("\n-- --json is an exit path too, and nothing pinned it")
+# The tenth mutation: `return 0` inserted before the --json print left the whole suite green,
+# because no arm ever passed --json. That path is not decorative -- it is the machine-readable
+# record of what a gate refused, so anything built on it inherits whatever this arm does not check.
+import io  # noqa: E402
+import contextlib  # noqa: E402
+
+
+def run_main_capture(fake, argv):
+    buf = io.StringIO()
+    real = pr_merge_gate._run
+    pr_merge_gate._run = fake
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = pr_merge_gate.main(list(argv))
+    finally:
+        pr_merge_gate._run = real
+    return rc, buf.getvalue()
+
+
+rc, out = run_main_capture(FakeGh(RED_CHECKS, VIEW, LS_ONE), ["1", "--json"])
+case("--json on a failing PR still exits 1", rc, 1)
+try:
+    payload = json.loads(out)
+except ValueError:
+    payload = None
+case("...and emits parseable JSON", isinstance(payload, dict), True)
+case("...whose ok is False", (payload or {}).get("ok"), False)
+# The reasons list is the override record a caller would quote, so pin that it is populated.
+case("...and whose reasons say why", bool((payload or {}).get("reasons")), True)
+rc, out = run_main_capture(FakeGh(GREEN_CHECKS, VIEW, LS_ONE), ["1", "--json"])
+case("--json on a green PR exits 0", rc, 0)
+# Parsed defensively: a bare json.loads here CRASHES the suite under any mutant that suppresses
+# the --json print, which costs every arm below it and reports as a traceback instead of a name.
+try:
+    green_ok = json.loads(out).get("ok")
+except ValueError:
+    green_ok = "<not JSON>"
+case("...with ok True", green_ok, True)
+
+print("\n-- a failure while REPORTING is 'could not evaluate', not 'said no'")
+# The guard used to wrap collect() only, so an exception in render()/print() escaped and the
+# interpreter exited 1 -- the exact masquerade the code comment warns about. Reachable without a
+# mutation: `pr_merge_gate.py N | head -1` raises BrokenPipeError on the print.
+class ExplodingRender:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, cmd, cwd):
+        return self.inner(cmd, cwd)
+
+
+_real_render = pr_merge_gate.GateResult.render
+try:
+    def _boom(self, pr):
+        raise KeyError("render blew up")
+    pr_merge_gate.GateResult.render = _boom
+    # The escape is caught HERE and turned into a value, not left to propagate. Without this, a
+    # build whose catch-all is missing kills the suite with a traceback -- which is red, but names
+    # nothing and takes every arm below it with it. An arm should say what broke.
+    try:
+        rc_render = run_main(FakeGh(GREEN_CHECKS, VIEW, LS_ONE))
+    except BaseException as exc:  # noqa: BLE001
+        rc_render = "escaped %s" % type(exc).__name__
+    case("an exception while rendering -> exit 2, never 1", rc_render, 2)
+finally:
+    pr_merge_gate.GateResult.render = _real_render
+case("...and the gate still works afterwards",
+     run_main(FakeGh(GREEN_CHECKS, VIEW, LS_ONE)), 0)
 
 print()
 if FAILURES:

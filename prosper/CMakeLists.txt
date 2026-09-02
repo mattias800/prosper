@@ -342,12 +342,11 @@ if(Python3_Interpreter_FOUND)
                    --selftest --root "${CMAKE_SOURCE_DIR}")
   # The merge gate (#3259). Its arms are all REFUSALS, and a gate that refuses everything would
   # satisfy every one of them -- so the suite leads with an all-pass positive control, and each
-  # refusal asserts on the REASON rather than on the boolean. Two arms reconstruct merges that
+  # refusal asserts on the REASON rather than on the boolean. One arm reconstructs a merge that
   # actually went wrong: a red `Windows MinGW` read as green because a shell split the check NAME
-  # on whitespace and landed on `MinGW` where the status belongs (#3234), and an all-green result
-  # describing a PR head the branch had moved two commits past (#3243). Both are shapes this
-  # repository produces routinely -- check names here contain spaces, and every lane pushes after
-  # CI starts -- so neither arm is hypothetical.
+  # on whitespace and landed on `MinGW` where the status belongs (#3234). The stale-head arm is
+  # NOT a reconstruction -- #3259 first cited #3243 as one and that was wrong on the dates -- it
+  # guards a state this repository produces routinely, since every lane pushes after CI starts.
   add_test(NAME pr_merge_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at

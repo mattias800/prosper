@@ -38,7 +38,9 @@ Usage:
     pr_merge_gate.py <pr-number> [--repo-dir DIR] [--json]
 
 Exit status: 0 only when every check has passed, none is pending, at least one passed, and the
-head the checks describe is the branch tip. Any other state exits 1 and says which rule refused.
+PR's recorded head is still the branch tip. Any other state exits 1 and says which rule refused.
+(`gh pr checks --json` carries no SHA, so the checks are the ones GitHub associates with the PR;
+what is compared is the PR's recorded head, not a SHA read off the checks themselves.)
 Network or tooling failure exits 2 -- distinguishable from a refusal, because "the gate could not
 run" must never be confused with "the gate said no".
 """
@@ -157,7 +159,7 @@ def evaluate(checks, pr_head=None, branch_tip=None):
         reasons.append("%d check(s) still pending" % len(pending))
     if pr_head is not None and branch_tip is not None and pr_head != branch_tip:
         reasons.append(
-            "the checks describe %s but the branch tip is %s -- CI never saw what would merge"
+            "the PR's recorded head is %s but the branch tip is %s -- nothing verified what would merge"
             % (pr_head[:8], branch_tip[:8])
         )
 
@@ -230,28 +232,29 @@ def main(argv=None):
     ap.add_argument("--repo-dir", default=".", help="repository to run gh/git in")
     ap.add_argument("--json", action="store_true", help="emit the verdict as JSON")
     args = ap.parse_args(argv)
+    # The guard spans EVERYTHING, not just collect(). Reporting is inside it because a failure
+    # while rendering or writing the verdict is still "could not evaluate": an exception escaping
+    # from render() or from print() exits 1, which this tool defines as "the gate said no", so a
+    # bug in the gate would masquerade as a considered refusal. That is not hypothetical and does
+    # not need a mutation to reach -- `pr_merge_gate.py N | head -1` raises BrokenPipeError on the
+    # print, which an earlier revision let escape.
     try:
         checks, head, tip = collect(args.pr, args.repo_dir)
+        res = evaluate(checks, head, tip)
+        if args.json:
+            print(json.dumps({"ok": res.ok, "counts": res.counts, "reasons": res.reasons,
+                              "blocking": res.blocking, "pending": res.pending,
+                              "pr_head": res.pr_head, "branch_tip": res.branch_tip}, indent=2))
+        else:
+            print(res.render(args.pr))
     except GateError as exc:
         # Exit 2, never 1: "the gate could not run" must be distinguishable from "the gate said no".
         print("GATE #%d: COULD NOT EVALUATE -- %s" % (args.pr, exc), file=sys.stderr)
         return 2
-    except Exception as exc:  # noqa: BLE001 -- deliberate catch-all, see below
-        # An UNEXPECTED exception is also "could not evaluate", and it must not escape. Letting a
-        # traceback propagate exits 1, which this tool defines as "the gate said no" -- so a bug in
-        # the gate would masquerade as a considered refusal, and worse, a caller keying on 1-vs-2
-        # would mis-route it. Mutation testing found exactly this: a mutant that let a null head
-        # through raised AttributeError deep in collect() and surfaced as a plain rc=1.
+    except Exception as exc:  # noqa: BLE001 -- deliberate catch-all, see above
         print("GATE #%d: COULD NOT EVALUATE -- unexpected %s: %s"
               % (args.pr, type(exc).__name__, exc), file=sys.stderr)
         return 2
-    res = evaluate(checks, head, tip)
-    if args.json:
-        print(json.dumps({"ok": res.ok, "counts": res.counts, "reasons": res.reasons,
-                          "blocking": res.blocking, "pending": res.pending,
-                          "pr_head": res.pr_head, "branch_tip": res.branch_tip}, indent=2))
-    else:
-        print(res.render(args.pr))
     return 0 if res.ok else 1
 
 

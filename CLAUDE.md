@@ -870,11 +870,11 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       whether the approval still applies rather than assuming in either direction.
     - **The same detachment applies to CI CHECKS**, which the bullet above does not cover: a branch
       pushed after its checks started leaves `gh` reporting green for a commit that is no longer
-      what would merge. So compare `headRefOid` against `git ls-remote origin refs/heads/<branch>`
-      before merging, not only the reviews' `commit_id`. **No merge here is known to have been lost
-      this way** — #3243 was first written up as one and that was wrong on the dates (its head *was*
-      the tip at merge; the extra commits were authored minutes later), so treat this as a cheap
-      precaution rather than a scar. What actually let #3243 through was the review half above.
+      what would merge, and every lane here pushes after CI starts. So compare `headRefOid` against
+      `git ls-remote origin refs/heads/<branch>` before merging, not only the reviews' `commit_id`.
+      One command, and the state is routine. (As of 2026-09-02 no merge here is known to have been
+      lost this way; #3259 first cited #3243 and that was wrong on the dates. The rule stands on the
+      hazard, not on a scar — full account in `prosper/tools/ci/AGENTS.md`.)
     - **Never gate on the TEXT output of `gh pr checks`.** Its columns are tab-separated and this
       repository's check names contain spaces — `Windows App`, `Linux App Package`,
       `macOS (x86_64 / Rosetta 2)` — so splitting on whitespace puts the second *word of the name*
