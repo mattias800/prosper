@@ -624,7 +624,7 @@ One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home
   #678/#690 cooperative-exception work described above; winpthreads' `pthread_cond_timedwait` is only
   in the POSIX `#else`, which does not compile on Windows at all. So the ~15.6 ms winpthreads tick is
   not what quantizes `scePthreadCondTimedwait`. #3056's own body says it "still delegates to
-  winpthreads' `pthread_cond_timedwait`"; it does not, and the correction is #3078.
+  winpthreads' `pthread_cond_timedwait`"; it does not, and the correction is #3235.
 - **"...so #3056's 2.29x is an arithmetic defect."** It is not. `WaitOnAddress` takes a `DWORD`
   **millisecond** timeout, and the conversion rounds UP because a condition wait may never report
   `ETIMEDOUT` before its deadline. The censused 0.818 ms request therefore becomes a 1 ms wait by
@@ -635,7 +635,7 @@ One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home
 - **A relative µs timeout is NOT clock-free.** `scePthreadCondTimedwait`'s interval is spent in the
   condition variable's own registered clock — `SCE_KERNEL_CLOCK_VIRTUAL`/`_PROF` are process CPU time,
   not wall time. The Sony spelling hardcoded `CLOCK_REALTIME` while its POSIX sibling resolved the
-  condvar's clock, so one object answered the same question two ways (#3056, fixed in #3078). Neither
+  condvar's clock, so one object answered the same question two ways (#3056, fixed in #3235). Neither
   a realtime nor a monotonic clock can discriminate that in a test, because the old path was
   self-consistent for both; the virtual clock can, and does.
 

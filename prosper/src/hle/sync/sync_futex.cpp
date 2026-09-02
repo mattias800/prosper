@@ -379,39 +379,65 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
 
-    // Wait to the ABSOLUTE deadline, re-reading the clock after a timeout instead of trusting one
-    // OS wait to land on it -- the post-condition sleep_until_steady_ns() composes for the same
-    // reason (#3074). It is reachable here without any OS misbehaviour: `deadline` is a
-    // CLOCK_REALTIME point while the kernel wait counts interrupt time, so a wall-clock step makes
-    // the two disagree, and the single-shot form then reported ETIMEDOUT before the guest's deadline
-    // had passed. pthread_cond_timedwait may not do that -- a guest reads ETIMEDOUT as "it did not
-    // happen", so an early one is a false negative rather than mere imprecision.
+    // Give the wait a POST-CONDITION it can be held to: never report ETIMEDOUT before the interval
+    // the guest asked for has actually elapsed. The single-shot form had none and could not state
+    // one -- it made one OS wait and reported ETIMEDOUT for whatever came back, including a FALSE
+    // that is not a timeout at all. A guest reads ETIMEDOUT as "it did not happen", so an early one
+    // is a false negative rather than imprecision. This is the shape sleep_until_steady_ns()
+    // composes for exactly the same reason (#3074): a single OS wait is not trusted to satisfy the
+    // contract on its own, so the caller re-checks and re-arms.
     //
-    // A wake is still reported as a wake at once, spurious or not: the only thing re-armed is a
-    // TIMEOUT that arrived early. That leaves the guest-exception interruption path exactly as it
-    // was (interrupt_guest_wait wakes this address without changing its value, and the dispatch
-    // below still runs), and the loop cannot spin -- each iteration waits at least one millisecond,
-    // and a WaitOnAddress failure that is not ERROR_TIMEOUT leaves the loop instead of retrying it.
+    // THE BUDGET IS COMPUTED ONCE FROM CLOCK_REALTIME AND THEN SPENT AGAINST steady_clock, and that
+    // split is the load-bearing part rather than an implementation detail. Re-reading
+    // CLOCK_REALTIME inside the loop would make the EXIT CONDITION depend on that clock's
+    // resolution: where it advances coarsely, a sub-millisecond wait would re-arm until it ticked,
+    // which is the tick quantization #3013 -> #3022 -> #3044 exists to remove, reintroduced by the
+    // loop meant to improve accuracy. Nothing in this tree measures mingw-w64's CLOCK_REALTIME
+    // resolution, so the loop must not depend on it. steady_clock is QueryPerformanceCounter and
+    // cannot fail to advance, so the loop is bounded by construction. Computing the budget once is
+    // also what the single-shot form did, so a wall-clock step DURING the wait changes nothing it
+    // did not already change.
     //
-    // The conversion itself is prosper::host::wait_timeout_ms_ceil, in precise_sleep.hpp beside the
-    // rest of this family's pure timing arithmetic, so a fake-clock test reaches it on every host
-    // rather than only where this branch compiles (#3056). Its rounding UP is what keeps a
-    // sub-millisecond remainder from becoming a zero-millisecond wait.
+    // What this does NOT fix, stated because the mechanism is the same one: the INITIAL budget is
+    // still a difference of two CLOCK_REALTIME readings, so a coarse realtime clock can put it out
+    // by up to one of its ticks in either direction, exactly as before. Removing that needs the
+    // relative Sony form to stop round-tripping through an absolute realtime deadline, which is a
+    // change to this function's signature and its POSIX callers, not to its body.
+    //
+    // THE FIRST WaitOnAddress ALWAYS HAPPENS, even for a zero budget: that call is a value check as
+    // well as a wait, returning TRUE at once when the sequence already differs. Skipping it for an
+    // already-expired deadline would report ETIMEDOUT for a condvar that HAD been signalled --
+    // reachable, because dispatch_pending_guest_exception() above can run an entire guest handler
+    // between latching `expected` and reading the clock. A wake is otherwise reported as a wake
+    // immediately, spurious or not, so the guest-exception interruption path is untouched
+    // (interrupt_guest_wait wakes this address without changing its value).
+    //
+    // The conversion is prosper::host::wait_timeout_ms_ceil, in precise_sleep.hpp beside the rest of
+    // this family's pure arithmetic, so a fake-clock test reaches it on every host rather than only
+    // where this branch compiles (#3056). Its rounding UP is what keeps a sub-millisecond remainder
+    // from becoming a zero-millisecond wait.
+    timespec now{};
+    clock_gettime(CLOCK_REALTIME, &now);
+    uint64_t remaining_ms = host::wait_timeout_ms_ceil(
+        host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec},
+        host::WaitDeadline{(int64_t)deadline->tv_sec, (int64_t)deadline->tv_nsec},
+        (uint64_t)(INFINITE - 1));
+    // <= (INFINITE-1) * 1e6 ns, so neither the multiply nor the sum can wrap.
+    const uint64_t budget_end_ns = steady_now_ns() + remaining_ms * 1000000ull;
     bool signaled = false;
     for (;;) {
-        timespec now{};
-        clock_gettime(CLOCK_REALTIME, &now);
-        const uint64_t timeout_ms = host::wait_timeout_ms_ceil(
-            host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec},
-            host::WaitDeadline{(int64_t)deadline->tv_sec, (int64_t)deadline->tv_nsec},
-            (uint64_t)(INFINITE - 1));
-        if (timeout_ms == 0) break;   // the deadline really has passed -> ETIMEDOUT below
         if (WaitOnAddress((volatile void*)&slot->sequence, &expected,
-                          sizeof(expected), (DWORD)timeout_ms) != FALSE) {
+                          sizeof(expected), (DWORD)remaining_ms) != FALSE) {
             signaled = true;
             break;
         }
-        if (GetLastError() != ERROR_TIMEOUT) break;   // not a timeout; reported as it was before
+        // Not a timeout: the wait did not happen and waiting again will not make it happen. Still
+        // reported as ETIMEDOUT, which is what the single-shot form did -- changing it to EINVAL
+        // would be a guest-visible contract change with no way to verify it from here.
+        if (GetLastError() != ERROR_TIMEOUT) break;
+        const uint64_t now_ns = steady_now_ns();
+        if (now_ns >= budget_end_ns) break;   // the budget really is spent -> ETIMEDOUT below
+        remaining_ms = (budget_end_ns - now_ns + 999999ull) / 1000000ull;
     }
     dispatch_pending_guest_exception();
     if (const int injected = consume_cond_wait_failure(

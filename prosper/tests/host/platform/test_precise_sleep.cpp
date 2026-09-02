@@ -541,6 +541,31 @@ int main() {
         // max_ms is a parameter so the saturation is reachable without INFINITE; check it binds.
         CHECK(host::wait_timeout_ms_ceil({0, 0}, {10, 0}, 5) == 5,
               "max_ms binds wherever the caller sets it, not only at INFINITE - 1");
+
+        // A max_ms near UINT64_MAX, where the SUM of the whole and fractional parts is what wraps
+        // rather than the multiply. Raised in review of #3235: a trailing `ms > max_ms ? max_ms : ms`
+        // reads a wrapped tiny value as being under the limit and returns it. Not reachable from the
+        // production caller (which passes INFINITE-1) -- asserted because a function whose whole
+        // purpose is saturating should not have a wrap that only luck keeps unreachable.
+        //
+        // The input is chosen, not guessed: the seconds bound keeps spans up to `max_ms / 1000`
+        // seconds, whose whole-millisecond part is `(max_ms/1000)*1000` -- which for max_ms =
+        // UINT64_MAX leaves only 615 ms of headroom below the maximum. A fractional part of
+        // 1000 ms (any nanosecond remainder at all, rounded up from 0.999999999 s) therefore
+        // overshoots, and an unbounded `whole + frac` wraps to 384. An earlier revision of this arm
+        // used a 1 ns remainder, whose frac_ms is 1 and fits in the 615 -- so it passed the mutation
+        // and asserted nothing. That is recorded because it is this file's own recurring failure:
+        // an arm whose INPUT cannot reach the case it names.
+        {
+            const uint64_t huge = ~0ull;
+            const uint64_t at_bound = huge / 1000ull;         // the largest whole-second span kept
+            const uint64_t r = host::wait_timeout_ms_ceil(
+                {0, 0}, {(int64_t)at_bound, 999999999}, huge);
+            CHECK(r == huge,
+                  "a sum that would exceed a near-UINT64_MAX max_ms saturates rather than wrapping");
+            CHECK(r >= at_bound * 1000ull,
+                  "...so the answer is never LESS than the whole-seconds part it already earned");
+        }
     }
 
     // 17. THE TWO FUNCTIONS COMPOSED, which is the real call sequence: a guest hands over a relative

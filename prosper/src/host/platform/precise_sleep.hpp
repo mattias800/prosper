@@ -273,10 +273,17 @@ constexpr uint64_t wait_timeout_ms_ceil(WaitDeadline now, WaitDeadline deadline,
         nanos += kNsPerSec;
         seconds -= 1;
     }
-    // Bound BEFORE multiplying, so `seconds * 1000` cannot overflow for any span.
+    // Bound BEFORE multiplying, so `seconds * 1000` cannot overflow for any span...
     if (seconds > max_ms / 1000ull) return max_ms;
-    const uint64_t ms = seconds * 1000ull + ((uint64_t)nanos + 999999ull) / 1000000ull;
-    return ms > max_ms ? max_ms : ms;
+    const uint64_t whole_ms = seconds * 1000ull;                       // <= max_ms, by the bound
+    const uint64_t frac_ms = ((uint64_t)nanos + 999999ull) / 1000000ull;   // 0..1000
+    // ...and bound the SUM the same way rather than adding and clamping afterwards. A trailing
+    // `ms > max_ms ? max_ms : ms` looks equivalent and is not: for a max_ms near UINT64_MAX the
+    // addition itself wraps, and the clamp then reads a tiny number as being under the limit.
+    // Unreachable from the one production caller, which passes INFINITE-1 -- but a function whose
+    // whole purpose is to saturate should not have a reachable-only-by-luck wrap in it (raised in
+    // review of #3235).
+    return frac_ms > max_ms - whole_ms ? max_ms : whole_ms + frac_ms;
 }
 
 }  // namespace prosper::host
