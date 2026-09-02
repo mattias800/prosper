@@ -330,6 +330,25 @@ _, green_report = run_main_capture(FakeGh(GREEN_CHECKS, VIEW, LS_ONE), ["1"])
 case("a passing PR's report says GREEN", "=> GREEN" in green_report, True)
 case("...and carries no BLOCKING line", "BLOCKING:" in green_report, False)
 
+# The fourteenth mutation: `"matches" if same else "DOES NOT MATCH"` -> `"matches"` survived
+# everything above, printing `head matches branch tip (pr=fd1dbb92 tip=1144bea7)` -- a line that
+# contradicts itself on its own text. Less dangerous than the always-GREEN mutant, because the
+# refusal reason and the verdict both refute it, but it is one arm.
+_, stale_report = run_main_capture(
+    FakeGh(GREEN_CHECKS, VIEW, "cccc3333\trefs/heads/topic\n"), ["1"])
+case("a stale head's report says DOES NOT MATCH", "DOES NOT MATCH" in stale_report, True)
+case("...and does not also claim it matches", "head matches" in stale_report, False)
+
+# The --json payload's counts, for the same reason the human report's counts are pinned: this
+# tool's argument for reporting them at all is that a count is falsifiable and an exit code is not.
+_, jr = run_main_capture(FakeGh(
+    '[{"name": "Docs", "bucket": "pass", "state": "S"},'
+    ' {"name": "Windows MinGW", "bucket": "fail", "state": "F"}]', VIEW, LS_ONE), ["1", "--json"])
+jp = json.loads(jr)
+case("--json carries the real counts", (jp["counts"]["pass"], jp["counts"]["fail"]), (1, 1))
+case("...names the blocking check", ["Windows MinGW", "fail"] in jp["blocking"], True)
+case("...and both SHAs it compared", (jp["pr_head"], jp["branch_tip"]), ("aaaa1111", "aaaa1111"))
+
 print()
 if FAILURES:
     for f in FAILURES:
