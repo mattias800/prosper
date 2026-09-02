@@ -210,8 +210,18 @@ run_control() {   # <round> <cond> <peers>
         return 0
     fi
     ok=$(printf '%s' "$line" | grep -oE '\[--,--,--,4,5,6,--,--\] x[0-9]+' | grep -oE '[0-9]+$')
-    total=$(printf '%s' "$line" | grep -oE 'x[0-9]+' | sed 's/x//' | paste -sd+ | bc)
+    # Sum the per-pattern counts with awk rather than `paste | bc`: bc is not always installed, and
+    # an empty total would compare unequal to ok and report a control FAILURE on every round --
+    # turning "the control never fired" into "the control always fired", which is exactly the
+    # inversion this campaign exists to prevent. A total that does not parse is did-not-run.
+    total=$(printf '%s' "$line" | grep -oE 'x[0-9]+' | sed 's/x//' \
+            | awk '{ n += $1 } END { if (NR > 0) print n }')
     ok=${ok:-0}
+    if [ -z "$total" ] || [ "$total" -le 0 ] 2>/dev/null; then
+        emit "$round" "$cond" "$p" control "$label/vkprobe" "did-not-run:unparsed-readback" 2 \
+             "$(( (t1 - t0) / 1000000 ))"
+        return 0
+    fi
     if [ "$ok" = "$total" ]; then
         emit "$round" "$cond" "$p" control "$label/vkprobe" pass 0 "$(( (t1 - t0) / 1000000 ))"
     else
