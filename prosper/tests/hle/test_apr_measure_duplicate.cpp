@@ -1,0 +1,209 @@
+// test_apr_measure_duplicate — sceAmprMeasureCommandSizeReadFile's compatibility read (#3245).
+//
+// That call's firmware contract is pure sizing (20, or 24 for a wide file offset). prosper also
+// performs the described read, because DOLL's older SDK wrapper consumes the destination from the
+// measure and never records a ReadFile for it. The read used to fire for EVERY title whose file id
+// resolved, so a title that also submits the read normally paid for the same bytes twice — 13,925
+// duplicate reads and 582 MB in a 3-minute Stray boot — and got them written into its destination
+// before it had recorded the command.
+//
+// The two arms this has to keep apart cannot be told apart AT the measure call: both pass a valid
+// id, a real destination and a real size. What separates them is what happens next, so that is what
+// the suppression keys on, and that is what the cases below drive:
+//
+//   * DOLL:  measure -> (the guest consumes dst) -> no submit of that read.   Must still deliver.
+//   * Stray: measure -> submit of the IDENTICAL read.                          Redundant from then on.
+//
+// Every delivery assertion pre-poisons the destination with a byte the fixture cannot produce at
+// that offset, so "the callee wrote nothing" and "the callee wrote the right thing" are distinct
+// observations rather than both reading as zero.
+//
+// Registered TWICE in CMake: once by default and once with PROSPER_APR_MEASURE_READ=always. The
+// second run asserts the OPPOSITE outcome for the Stray case, which is what shows the lever moved —
+// a suppression that never suppressed would pass the always-run and fail the default one.
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "fixtures/test_scratch.h"
+#include "host/image/exec_image.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+
+namespace prosper {
+uint32_t prosper_apr_register(const std::string& path, uint64_t size);
+void prosper_apr_reset_for_test();
+}
+using namespace prosper;
+
+static int fails = 0;
+#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
+                              else        { std::printf("  [ok]   %s\n", msg); } } while (0)
+
+// The plain ReadFile takes its file offset in a stack slot, so it is entered the way the guest
+// enters it. sysv_abi is a no-op on Linux and forces the guest convention on MinGW.
+using GuestReadFile = uint64_t(__attribute__((sysv_abi)) *)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                                            uint64_t, uint64_t, uint64_t, uint64_t,
+                                                            uint64_t);
+
+static std::array<uint8_t, 4096> g_fixture{};
+
+// One destination per case, always poisoned before use.
+struct Dest {
+    std::array<uint8_t, 1024> bytes{};
+    void poison() { bytes.fill(0x5A); }
+    uint64_t addr() { return (uint64_t)(uintptr_t)bytes.data(); }
+    bool holds(size_t offset, size_t size) const {
+        return std::memcmp(bytes.data(), g_fixture.data() + offset, size) == 0;
+    }
+    bool untouched(size_t size) const {
+        for (size_t i = 0; i < size; ++i) if (bytes[i] != 0x5A) return false;
+        return true;
+    }
+};
+
+int main() {
+    const char* mode_env = std::getenv("PROSPER_APR_MEASURE_READ");
+    const bool forced_always = mode_env && std::strcmp(mode_env, "always") == 0;
+    std::printf("== test_apr_measure_duplicate (PROSPER_APR_MEASURE_READ=%s) ==\n",
+                mode_env ? mode_env : "<unset, auto>");
+    register_builtin_hle();
+
+    HleFn measure = Hle::lookup("vWU-odnS+fU");
+    CHECK(measure != nullptr, "sceAmprMeasureCommandSizeReadFile is registered");
+    if (!measure) { std::printf("== FAIL ==\n"); return 1; }
+
+    // ---- Fixtures: two distinct containers, so the per-container scoping can be exercised -------
+    const std::string path_a_storage =
+        prosper_test::test_scratch_file("prosper-test-apr-measure-dup-a.tmp");
+    const std::string path_b_storage =
+        prosper_test::test_scratch_file("prosper-test-apr-measure-dup-b.tmp");
+    for (size_t i = 0; i < g_fixture.size(); ++i) g_fixture[i] = (uint8_t)(i * 61u + 17u);
+    bool written = true;
+    for (const std::string& p : { path_a_storage, path_b_storage }) {
+        FILE* f = std::fopen(p.c_str(), "wb");
+        if (!f) { written = false; continue; }
+        written = std::fwrite(g_fixture.data(), 1, g_fixture.size(), f) == g_fixture.size() &&
+                  std::fclose(f) == 0 && written;
+    }
+    CHECK(written, "wrote both APR container fixtures");
+
+    std::string stub_error;
+    const std::vector<ImportSlot> slots = {{"libSceAmpr", "mQ16-QdKv7k"}};
+    CHECK(install_stubs(slots, 0x720000000ull, 96, &stub_error) && stub_error.empty(),
+          "generated the executable AMPR ReadFile import stub");
+    auto read_file_guest = reinterpret_cast<GuestReadFile>(static_cast<uintptr_t>(stub_addr(0)));
+
+    prosper_apr_reset_for_test();
+    const uint32_t id_a = prosper_apr_register(path_a_storage, g_fixture.size());
+    const uint32_t id_b = prosper_apr_register(path_b_storage, g_fixture.size());
+    CHECK(id_a != 0 && id_b != 0 && id_a != id_b, "registered two distinct APR containers");
+
+    std::array<uint8_t, 0x48> request{};
+    const uint64_t cb = (uint64_t)(uintptr_t)request.data();
+    std::array<uint64_t, 3> completion{};
+    const uint64_t record = (uint64_t)(uintptr_t)completion.data();
+
+    // ---- The sizing answer is the contract, and it never changes ------------------------------
+    CHECK(measure(0, 0, 0, 0xffffffffull, 0, 0) == 20,
+          "an unregistered sizing query stays pure and answers 20 bytes");
+    CHECK(measure(0, 0, 0, 0xffffffffffull, 0, 0) == 24,
+          "a wide file offset answers 24 bytes");
+
+    // ---- DOLL arm: a measure with no following submit still delivers ---------------------------
+    // Driven twice. The second call is the one that matters: if the suppression latched on anything
+    // other than an actual submit pairing, this is where DOLL breaks.
+    constexpr size_t doll_off = 64, doll_size = 96;
+    Dest doll1, doll2;
+    doll1.poison();
+    CHECK(measure(id_a, doll1.addr(), doll_size, doll_off, 0, 0) == 20 &&
+              doll1.holds(doll_off, doll_size),
+          "DOLL arm: a measure with no submit delivers the container's bytes");
+    doll2.poison();
+    CHECK(measure(id_a, doll2.addr(), doll_size, doll_off + 128, 0, 0) == 20 &&
+              doll2.holds(doll_off + 128, doll_size),
+          "DOLL arm: a SECOND unsubmitted measure still delivers (no spurious latch)");
+
+    // ---- A submit that does NOT match the measured read must not latch either -------------------
+    // Same container, same destination, a different range. If the pairing were keyed loosely -- on
+    // the file id alone, say -- this would retire the compatibility read and the next arm would
+    // read as a pass for the wrong reason.
+    {
+        constexpr size_t m_off = 512, m_size = 64;
+        Dest near_miss;
+        near_miss.poison();
+        CHECK(measure(id_a, near_miss.addr(), m_size, m_off, 0, 0) == 20 &&
+                  near_miss.holds(m_off, m_size),
+              "near-miss arm: the measure delivered");
+        // Submit the same destination and size at a DIFFERENT offset.
+        CHECK(read_file_guest(cb, 0, record, id_a, near_miss.addr(), m_size, m_off + 8, 0, 0) == 0,
+              "near-miss arm: a submit of a different range succeeds");
+        Dest after;
+        after.poison();
+        CHECK(measure(id_a, after.addr(), m_size, m_off + 256, 0, 0) == 20 &&
+                  after.holds(m_off + 256, m_size),
+              "near-miss arm: a non-identical submit does NOT retire the compatibility read");
+    }
+
+    // ---- Stray arm: measure, then the IDENTICAL submit, retires the compatibility read ----------
+    constexpr size_t stray_off = 1024, stray_size = 200;
+    {
+        Dest first;
+        first.poison();
+        CHECK(measure(id_a, first.addr(), stray_size, stray_off, 0, 0) == 20 &&
+                  first.holds(stray_off, stray_size),
+              "Stray arm: the first measure delivers (the one duplicate this costs)");
+        CHECK(read_file_guest(cb, 0, record, id_a, first.addr(), stray_size, stray_off, 0, 0) == 0,
+              "Stray arm: the identical submit re-delivers the same bytes");
+    }
+    {
+        // A NEW read on the same container, measured after the pairing was observed.
+        Dest later;
+        later.poison();
+        const uint64_t measured = measure(id_a, later.addr(), stray_size, stray_off + 512, 0, 0);
+        CHECK(measured == 20, "Stray arm: the sizing answer is unchanged by the suppression");
+        if (forced_always) {
+            CHECK(later.holds(stray_off + 512, stray_size),
+                  "Stray arm under PROSPER_APR_MEASURE_READ=always: the read still fires");
+        } else {
+            CHECK(later.untouched(stray_size),
+                  "Stray arm: the compatibility read is suppressed once the container has paired");
+        }
+        // Whatever the mode, the submit path is untouched and remains the real delivery.
+        CHECK(read_file_guest(cb, 0, record, id_a, later.addr(), stray_size, stray_off + 512, 0,
+                              0) == 0 && later.holds(stray_off + 512, stray_size),
+              "Stray arm: the submit delivers the bytes the measure no longer does");
+    }
+
+    // ---- Scoping: the suppression is per container, not global ---------------------------------
+    {
+        Dest other;
+        other.poison();
+        CHECK(measure(id_b, other.addr(), doll_size, doll_off, 0, 0) == 20 &&
+                  other.holds(doll_off, doll_size),
+              "a DIFFERENT container keeps its compatibility read after the first one paired");
+    }
+
+    // ---- The test hook really does clear the latch ----------------------------------------------
+    // Without this, a later case in this process would inherit id_a's pairing, and the arms above
+    // would be order-dependent in a way nothing would report.
+    prosper_apr_reset_for_test();
+    {
+        const uint32_t id_again = prosper_apr_register(path_a_storage, g_fixture.size());
+        Dest reset_dest;
+        reset_dest.poison();
+        CHECK(measure(id_again, reset_dest.addr(), doll_size, doll_off, 0, 0) == 20 &&
+                  reset_dest.holds(doll_off, doll_size),
+              "prosper_apr_reset_for_test clears the pairing latch as well as the registry");
+    }
+
+    prosper_apr_reset_for_test();
+    std::remove(path_a_storage.c_str());
+    std::remove(path_b_storage.c_str());
+    std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
+    return fails ? 1 : 0;
+}

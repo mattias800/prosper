@@ -26,6 +26,7 @@
 #include <optional>      // #1205: sandbox_normalize_subpath escape check
 #include <mutex>
 #include <atomic>        // sceKernelAio* submit-id/state table
+#include <array>       // #3245: the bounded recent-measure ring
 #include <map>
 #include <utility>
 #include <vector>
@@ -2221,10 +2222,16 @@ uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
     g_apr_files.push_back({ path, size });
     return (uint32_t)g_apr_files.size();
 }
+// Defined with the measure-read suppression state further down; the test hook below clears it too,
+// because that state is process-global and a stale latch would carry from one case into the next.
+static void apr_measure_reset_for_test();
 // Test hook: drop all registered containers (the registry is process-global).
 void prosper_apr_reset_for_test() {
-    std::lock_guard lk(g_apr_mx);
-    g_apr_files.clear();
+    {
+        std::lock_guard lk(g_apr_mx);
+        g_apr_files.clear();
+    }
+    apr_measure_reset_for_test();
 }
 // Find resolved host paths whose TOTAL size equals `size`. Returns the match count and sets
 // *out_path to the first match. The read path resolves the real APR file id first; it may use this
@@ -2314,6 +2321,118 @@ extern "C" void prosper_apr_chain_reset(uint64_t cb) {
     if (!cb) return;
     std::lock_guard lk(g_apr_chain_mx);
     g_apr_chains.erase(cb);
+}
+
+// --- sceAmprMeasureCommandSizeReadFile's compatibility read: when it is still needed ------------
+// The firmware contract for that call is pure SIZING -- it answers 20 or 24. prosper also performs
+// the described read and DMAs it into the guest destination, because DOLL's (PPSA17942) older SDK
+// wrapper consumes the destination from the measure call and never records a ReadFile command for
+// it, so the measure is prosper's only hook on those bytes. That is a real, live requirement; see
+// docs/UE4_APR_IOSTORE_BRINGUP.md.
+//
+// The problem (#3245) is that the gate was only "does the file id resolve", so the read fired for
+// EVERY APR title. On a title that also submits the read normally the same bytes are pread and
+// DMA'd into the same guest address twice: measured on Stray (PPSA02101), a 3-minute boot did
+// 13,925 compatibility reads delivering 582,619,946 bytes, and 97% of them were re-delivered
+// moments later by the submit path from an identical (dst, offset, size).
+//
+// It is not only waste. A sizing call writing to the guest's destination puts bytes there before
+// the guest has recorded the read command, let alone submitted it. On Stray that window is
+// microseconds on one thread, but a title that measures a batch and prepares its destinations
+// afterwards would have prosper's bytes land first and then be overwritten -- silent corruption,
+// not a slowdown. So the narrow answer is the correct one on both counts.
+//
+// WHAT DISTINGUISHES THE TWO TITLES is not visible at the measure call: DOLL and Stray pass the
+// same argument shape. It IS visible immediately afterwards -- if a submit arrives for exactly the
+// (file id, dst, offset, size) a measure just described, that title records and submits its
+// measured reads, so the compatibility read was redundant. That is self-calibrating: it costs one
+// duplicate per APR file id and then turns itself off, needs no per-title or per-SDK knowledge, and
+// cannot fire for DOLL, whose measured reads are never submitted through the ReadFile NID -- if
+// they were, prosper would already have served them eagerly there and the compatibility read would
+// never have been needed.
+//
+// Keyed per APR FILE ID rather than globally so a title with a mixed pattern loses the
+// compatibility read only for the container that demonstrated the pairing.
+// CONFIDENCE: HIGH on the duplication (measured, #3245) and on the suppression being safe for any
+// title whose measured reads are submitted. MED that no title mixes both patterns within one
+// container -- that is the one case this heuristic would get wrong, it cannot be checked without
+// running such a title, and PROSPER_APR_MEASURE_READ=always is the one-variable A/B if a title ever
+// regresses. `never` exists for the opposite arm (does a title depend on the read at all?).
+namespace {
+struct AprMeasuredRead { uint32_t id; uint64_t dst, offset, size; };
+PROSPER_HEAP_MUTEX(g_apr_measure_mx);
+constexpr size_t kAprMeasureRingMax = 64;   // only the IMMEDIATE pairing matters; Stray's is adjacent
+std::array<AprMeasuredRead, kAprMeasureRingMax> g_apr_recent_measures{};
+size_t g_apr_recent_measures_used = 0;      // grows to kAprMeasureRingMax, then the ring wraps
+size_t g_apr_recent_measures_next = 0;
+std::map<uint32_t, bool> g_apr_measure_paired;   // file id -> a submit matched one of its measures
+
+// auto (default) = the latch above; always = never suppress; never = never do the compatibility
+// read. Read once: an env lookup per streamed asset is itself a cost on this path.
+enum class AprMeasureMode { Auto, Always, Never };
+AprMeasureMode apr_measure_mode() {
+    static const AprMeasureMode mode = [] {
+        const char* v = getenv("PROSPER_APR_MEASURE_READ");
+        if (!v || !*v) return AprMeasureMode::Auto;
+        if (!strcmp(v, "always")) return AprMeasureMode::Always;
+        if (!strcmp(v, "never"))  return AprMeasureMode::Never;
+        if (strcmp(v, "auto") != 0)
+            fprintf(stderr, "[apr] PROSPER_APR_MEASURE_READ='%s' is not one of auto|always|never "
+                            "-- using auto\n", v);
+        return AprMeasureMode::Auto;
+    }();
+    return mode;
+}
+}  // namespace
+
+static void apr_measure_reset_for_test() {
+    std::lock_guard lk(g_apr_measure_mx);
+    g_apr_recent_measures_used = 0;
+    g_apr_recent_measures_next = 0;
+    g_apr_measure_paired.clear();
+}
+
+// True when this container's measured reads have been shown to arrive again through the submit
+// path, so the compatibility read would only duplicate one.
+static bool apr_measure_read_suppressed(uint32_t id) {
+    switch (apr_measure_mode()) {
+        case AprMeasureMode::Always: return false;
+        case AprMeasureMode::Never:  return true;
+        case AprMeasureMode::Auto:   break;
+    }
+    std::lock_guard lk(g_apr_measure_mx);
+    auto it = g_apr_measure_paired.find(id);
+    return it != g_apr_measure_paired.end() && it->second;
+}
+
+// Remember a read the measure path just served, so a matching submit can identify the pairing.
+static void apr_measure_record(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
+    std::lock_guard lk(g_apr_measure_mx);
+    g_apr_recent_measures[g_apr_recent_measures_next] = AprMeasuredRead{ id, dst, offset, size };
+    g_apr_recent_measures_next = (g_apr_recent_measures_next + 1) % kAprMeasureRingMax;
+    if (g_apr_recent_measures_used < kAprMeasureRingMax) g_apr_recent_measures_used++;
+}
+
+// A submit for a read the measure path already delivered: from here on this container does not need
+// the compatibility read. Returns true the FIRST time a container pairs, so the caller can say so
+// once instead of once per asset.
+static bool apr_measure_note_submit(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
+    if (apr_measure_mode() != AprMeasureMode::Auto) return false;
+    std::lock_guard lk(g_apr_measure_mx);
+    // Already paired: the ring holds nothing for this container any more (its measures stop
+    // recording once suppressed), so skip the scan. This runs on EVERY submit -- 14,255 of them in
+    // a 3-minute Stray boot -- and after the first pairing it is the only case left.
+    if (auto it = g_apr_measure_paired.find(id); it != g_apr_measure_paired.end() && it->second)
+        return false;
+    for (size_t i = 0; i < g_apr_recent_measures_used; i++) {
+        const AprMeasuredRead& m = g_apr_recent_measures[i];
+        if (m.id != id || m.dst != dst || m.offset != offset || m.size != size) continue;
+        bool& paired = g_apr_measure_paired[id];
+        const bool first = !paired;
+        paired = true;
+        return first;
+    }
+    return false;
 }
 // "Which guest code asked for the file that is not there?" — the question every missing-asset
 // bring-up investigation reaches, and the one a path alone cannot answer. A resolve MISS names the
@@ -3620,6 +3739,15 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size;
 #endif
     }
+    // #3245: a submit for exactly the read a measure just delivered proves this container records
+    // and submits its measured reads, so its compatibility read is a duplicate from here on. Placed
+    // before the platform split because the fact is host-independent, and before apr_execute_read
+    // because the pairing is about what the guest ASKED for, not about whether the read succeeded.
+    if (apr_measure_note_submit((uint32_t)id, a4, offset, requested_size))
+        fprintf(stderr, "[apr] %s: the measure-size call's compatibility read is redundant here "
+                        "(this submit re-delivers a read sceAmprMeasureCommandSizeReadFile already "
+                        "served) -- suppressing it for this container. PROSPER_APR_MEASURE_READ="
+                        "always restores it.\n", host.c_str());
     // #2139: this was Linux-only because the discriminator read the guest stack directly, which the
     // Windows import bridge makes impossible — its stub converts SysV->MS-x64 and CALLs the handler,
     // inserting a frame plus shadow space (the #672 class of bug). But that same bridge already
@@ -4024,6 +4152,17 @@ HLE(f_apr_measure_read_file) {
                     (unsigned long long)a0, (unsigned long long)measured);
         return measured;
     }
+    // #3245: this container has already been shown to submit the reads it measures, so the
+    // compatibility read below would deliver bytes the submit path re-delivers moments later --
+    // and would deliver them BEFORE the guest recorded the command. The sizing answer is unchanged;
+    // only the read is dropped. See the block beside apr_measure_read_suppressed.
+    if (apr_measure_read_suppressed((uint32_t)a0)) {
+        if (filelog())
+            fprintf(stderr, "[apr] measure-read id=%llu %s -> %llu bytes (compatibility read "
+                            "suppressed: this container submits its measured reads)\n",
+                    (unsigned long long)a0, host.c_str(), (unsigned long long)measured);
+        return measured;
+    }
 
     uint64_t file_size = 0;
 #ifndef _WIN32
@@ -4070,6 +4209,10 @@ HLE(f_apr_measure_read_file) {
         ::free(staging);
     }
 #endif
+    // Record what was delivered, so a submit of the identical read can identify the pairing and
+    // retire this container's compatibility read (#3245). Recorded only on a read that actually
+    // landed: a failed one has not made the submit redundant.
+    if (copied) apr_measure_record((uint32_t)a0, a1, a3, a2);
     if (filelog())
         fprintf(stderr, "[apr] measure-read compatibility id=%llu %s -> dst=0x%llx "
                         "off=0x%llx size=%llu %s; measured=%llu\n",

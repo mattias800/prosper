@@ -231,6 +231,20 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   neither NID string occurs anywhere in DOLL's 91 MB or Stray's 33 MB `PROSPER_FILELOG` boot logs.
   So the refusal's blast radius is 22 linked titles rather than none.
   [#2926](https://github.com/mattias800/prosper/issues/2926).
+- **"The measure-size call's compatibility read is DOLL-specific in effect, because only DOLL needs
+  it" — false, measured 2026-09-02.** `f_apr_measure_read_file` gated the read on nothing but "does
+  the file id resolve", so it ran for every APR title. *Stray* (`PPSA02101`), 180 s, `PROSPER_FILELOG=1`:
+  **13,925** compatibility reads delivering **582,619,946 bytes**, against 14,255 submits delivering
+  603,329,577 — roughly **97% of the measure-path bytes re-delivered** by the submit path from an
+  identical `(dst, offset, size)` moments later, plus an extra `mmap`/`munmap` per read. The
+  correctness half matters more than the cost: a *sizing* call filling the destination puts bytes
+  there before the guest has recorded the read command, so a title that measures a batch and
+  prepares its destinations afterwards would have prosper's bytes land first and then be overwritten.
+  Also **do not "fix" this by suppressing the second delivery of an identical pair**: the measure
+  comes FIRST and the submit is the authoritative one, so an order-agnostic duplicate filter
+  suppresses the wrong half. The pairing is used only as evidence that the container submits what it
+  measures, and the suppression is keyed per container.
+  [#3245](https://github.com/mattias800/prosper/issues/3245).
 
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
 
@@ -1459,7 +1473,12 @@ The shared contract is now explicit:
   query; DOLL's non-null queue/id pair also registers the APR completion source.
 - `vWU-odnS+fU` always returns 20 or 24 according to the file-offset width. An unregistered id is a
   pure Sonic sizing query; a valid registered APR file id also performs DOLL's range-checked eager
-  read on both Linux and Windows.
+  read on both Linux and Windows. **Narrowed 2026-09-02 (#3245):** that eager read is now retired
+  per APR container once a submit is seen re-delivering a read the measure already served, because
+  it fired for every APR title and duplicated 582 MB in a 3-minute *Stray* boot. DOLL's arm is
+  untouched — it never submits the reads it measures, which is why the read exists. The sizing
+  answer is unchanged in every case, and `PROSPER_APR_MEASURE_READ=always|never|auto` is the A/B
+  lever.
 - `4fgtGfXDrFc` retains the independent 32-byte conservative size used by Sonic; A/B testing proved
   it is not part of DOLL's regression.
 
