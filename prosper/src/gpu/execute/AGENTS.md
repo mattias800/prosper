@@ -9,6 +9,13 @@ Where a decoded draw or dispatch becomes real GPU work.
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
+- `host_read_barrier` — the availability half of a GPU→CPU readback: the `HOST_READ`/`HOST_BIT`
+  dependency that a fence wait does **not** perform (#2944/#3249). Header-only and deliberately
+  backend-agnostic, because both Vulkan backends need it and they live in different trees — the
+  offscreen render backend (`tests/fixtures/render_runner.h`, which re-exports it into
+  `prosper::test`) and the live compute backend (`frontends/shared/live/live_compute.cpp`). The
+  *other* half, `vkInvalidateMappedMemoryRanges`, is not here: it belongs with whichever allocator
+  can hand out non-coherent memory, which today is only the render backend's.
 - `mb3_freelist` — answers "is this guest pointer a free MallocBinned3 block". **Nothing in this
   folder calls it**: `gpu_executor.cpp` has no reference, and the callers are
   `src/gpu/pm4/command_processor.cpp`, `src/hle/graphics/hle_agc.cpp`,

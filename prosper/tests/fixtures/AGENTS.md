@@ -17,8 +17,10 @@ Two kinds live here and they are worth telling apart:
 ## `render_runner.h` is NOT test-only, and the directory name is the trap
 
 It is the project's **offscreen Vulkan backend**, and the shipping frontend compiles it:
-`frontends/shared/live/live_renderer.cpp`, `live_compute.cpp` and `present/present_blit.cpp` all
-include it. `render_draw_pass_rgba` is therefore a live render path — a wrong failure path in it
+`frontends/shared/live/live_renderer.cpp` and `present/present_blit.cpp` include it. (This line used
+to name `live_compute.cpp` as a third includer. It is not one — checked with the preprocessor, not
+with grep: `-M` over that translation unit's own compile command lists no `render_runner.h`. The
+compute backend is a separate Vulkan backend that shares the device, not this header.) `render_draw_pass_rgba` is therefore a live render path — a wrong failure path in it
 silently drops real rendered content in a real game, and "it is under `tests/`" has misled reviewers
 into treating changes here as test-only (#3210 had to say so explicitly in its own body).
 
@@ -45,6 +47,12 @@ Consequences for anything you change in it:
   `invalidate_mapped_readback()`. Coherent memory still needs the first. Neither half can be checked
   by reading the pixels back: on every driver here the unsynchronized code returns correct bytes, so
   the guard is `host_read_barrier`, which asserts the barrier was RECORDED.
+  Since #3249 the availability half lives in `src/gpu/execute/host_read_barrier.hpp` and is only
+  **re-exported** into `prosper::test` here, because the live compute backend needs the identical
+  rule for its dispatch results and two spellings of it is how the next site gets missed. The
+  invalidate half stays in this header, with the allocator that can actually return non-coherent
+  memory. Its counter is process-wide and shared with the compute guard,
+  `live_compute_host_read_barrier`.
 
 ## Adding to it
 

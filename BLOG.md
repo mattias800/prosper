@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-02
 
+### The same thing was true of every compute dispatch, and the doc said that half was already right
+
+No picture again. The note we filed while fixing the graphics readback said the compute backend was
+one of the two places in the tree that already got this right — it isn't: the barrier it has is on
+the comparator's one-word flag, not on the dispatch results that become guest memory. Deleting the
+new barrier leaves a 439-assertion compute test, including a byte-exact image writeback, entirely
+green.
+[#3249](https://github.com/mattias800/prosper/issues/3249)
+
 ### Every frame we have ever read back was read without asking the GPU to hand it over
 
 No picture, and that is the finding: on this hardware a readback with no host-availability barrier
