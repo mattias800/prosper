@@ -68,7 +68,10 @@ Consequences for anything you change in it:
   Vulkan *and* misreporting because of it. `render_diagnostic_paths` runs both once so the layer
   does see them. Arm a new env-gated render path there in the same change that adds it — and note
   the arming has to come from the ctest ENVIRONMENT, not `setenv()` inside the test, because these
-  names are cached one-shot reads.
+  names are cached one-shot reads. `PROSPER_DRAW_ISO` is **improved, not fixed**: its re-render now
+  records the same dynamic state as the pass it isolates, but still omits that pass's per-draw
+  `vkCmdClearAttachments` depth/stencil clear, so a submit carrying a guest depth clear is isolated
+  against different depth contents. The layer cannot see that half.
 
 ## Adding to it
 

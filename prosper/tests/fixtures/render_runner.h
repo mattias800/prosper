@@ -9106,6 +9106,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // reporting which draw paints a pixel -- a diagnostic answering about a render that is not the
     // one it is isolating. The validation layer says so directly, VUID-vkCmdDraw-None-07831 and
     // -07832, but no ctest exercised the path so nothing ever saw it. One recorder, both loops.
+    //
+    // WHAT IS STILL DIFFERENT, because a diagnostic described as fixed is one nobody re-checks: the
+    // isolation loop does NOT replay the per-draw vkCmdClearAttachments depth/stencil clear a few
+    // lines below. A submit whose draws carry a guest depth or stencil clear is therefore still
+    // isolated against different depth contents from the pass it is naming a culprit in. Dynamic
+    // state was the part the layer could see; this part it cannot, and it is not fixed here.
     auto record_draw_dynamic_state = [](VkCommandBuffer command, const DV& v) {
         vkCmdSetViewport(command, 0, 1, &v.viewport);
         vkCmdSetScissor(command, 0, 1, &v.scissor);

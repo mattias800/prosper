@@ -222,6 +222,12 @@ int main() {
     VKCHECK(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit (draw)");
     VKCHECK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000), "vkWaitForFences");
 
+    // #3257: this map is a host read of a device write with no availability operation into the host
+    // domain -- the #2944 class, still open here. Waiting the fence above orders EXECUTION only.
+    // Deliberately left for #3257 rather than fixed in passing: the fixtures that carry this pattern
+    // want sweeping together, since one corrected example beside several uncorrected ones is barely
+    // better than none. Neither the pixel assertions below nor synchronization validation can see
+    // it (measured, #2944) -- do not read this file's green run as evidence about that class.
     void* mapped = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mapped);
     const uint8_t* px = (const uint8_t*)mapped;
     auto at = [&](uint32_t x, uint32_t y) { return px + ((size_t)y * W + x) * 4; };

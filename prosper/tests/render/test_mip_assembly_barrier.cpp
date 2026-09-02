@@ -14,15 +14,20 @@
 //     which is exactly what a CORRECT run produces for a missing level. The corruption is
 //     indistinguishable from the intended output, so no content assertion can separate them.
 //     Measured, not assumed: `texture_mip_render` passes identically with and without the barrier.
-//   * It DOES fail without the fix. The assertion is STRUCTURAL: the barrier must be RECORDED
-//     between the clear and the first copy, and arm 1 pins what it says.
+//   * It DOES fail without the fix. The assertion is STRUCTURAL: arm 1 pins the barrier's masks,
+//     layouts and subresource scope exactly, and arm 2 requires one to be RECORDED on the assembly
+//     path. Measured: deleting the call leaves arm 2 at zero and the case goes red.
+//   * It CANNOT see ORDER, and that limit is worth stating precisely because the arm above reads as
+//     if it could. Arm 2 reads a process-wide counter, so it catches the barrier being DELETED and
+//     nothing else: a barrier MOVED out from between the clear and the copies -- after the loop, or
+//     into the wrong branch -- still increments it and passes all three arms with the hazard fully
+//     restored. Pinning the position would need a command-buffer recorder this fixture does not
+//     have. The oracle for ordering is the layer: `vk_validation_scan.py --sync` reports the hazard
+//     on the unfixed tree and nothing on the fixed one, measured both ways. That scan is opt-in and
+//     is NOT what CI runs (#3255), so a relocation would reach master unless somebody runs it.
 //   * Arm 3 is the discriminator, not decoration. A texture upload that is NOT an assembled mip
 //     chain must record none, so a counter bumped anywhere on the upload path would satisfy arm 2
 //     while proving nothing.
-//
-// The semantic oracle is the layer, not this file: `vk_validation_scan.py --sync` reports the
-// hazard on the unfixed tree and nothing on the fixed one. This case exists so the fix cannot be
-// undone by someone who does not run that scan.
 
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"
