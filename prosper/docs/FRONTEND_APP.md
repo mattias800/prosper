@@ -451,17 +451,25 @@ page-protection write watch: texture sources below 1 MiB stay on exact compariso
 immediately, and larger
 sources arm after three exact unchanged validations. Promotions are limited to 8 MiB per ordered submit,
 with at most one source larger than that limit, and adjacent pages are protected in coalesced runs. Set
-`PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB`, `PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS`, or
-`PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB` for controlled A/B runs.
+`PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB`, `PROSPER_TEXTURE_WRITE_WATCH_MIN_KB`,
+`PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS`, or `PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB` for controlled
+A/B runs.
+
+**Every one of these takes a plain decimal integer and nothing else, and a malformed value is refused
+on stderr while the default stands (#3253).** That is not pedantry about input: on each of them **0 is
+a meaningful and maximally aggressive setting** — defer nothing, no size floor, promote on first sight,
+unbounded arming — and a bare `strtoull` answers 0 for anything it cannot parse. So `=8mb`, `=8 KB` or
+a stray quote used to select the *opposite* arm from the one you asked for, with nothing in the run's
+output saying so. No sign, no `0x`, no units, no surrounding whitespace; unset takes the default in
+silence.
 
 Compute buffer/image residency uses the same exact-first rule with `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS`
 and `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB` — **but it does not have the "1-8 MiB arm immediately" half**,
 and this paragraph claimed it did until #3155. That path has always passed a defer minimum of **one byte**,
 which makes the size exemption unreachable, so every compute source must climb the stability ladder however
 small it is. `PROSPER_COMPUTE_WATCH_DEFER_MIN_KB` exposes that minimum for A/B (unset = 1 byte, i.e. today's
-behaviour; `=8192` gives renderer parity; `=0` defers nothing). A malformed value is refused loudly and keeps
-the default — unlike the four older variables beside it, where a typo silently selects the most
-aggressive setting (#3253). Whether the asymmetry is right is open —
+behaviour; `=8192` gives renderer parity; `=0` defers nothing). Like the rest of the family since #3253, a
+malformed value is refused loudly and keeps the default. Whether the asymmetry is right is open —
 see `RENDERER_PERFORMANCE_2026_07.md` § *Compute write-watch promotion census*.
 
 `PROSPER_WATCH_PROMOTE_CENSUS=1` reports what any of those settings actually bought, every 256 submits and
@@ -478,7 +486,9 @@ if another architectural writer invalidates it, the next invocation takes ordina
 establishes the exact baseline needed for later identical-result skips. A failed attempt to replace a
 host result fallback with a GPU baseline invalidates that obsolete fallback before returning. Partial,
 readable, and replay-owned targets retain their original exact contract. Set
-`PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` to retune the crossover. The broader
+`PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` to retune the crossover — it validated its input before #3253 but
+fell back in silence, which fails the other way: a typo left you measuring the default while believing
+you had moved it. The broader
 `PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` control restores immediate storage-result snapshots.
 
 A sampled image that successfully imports an authoritative renderer-owned Vulkan image does not validate,

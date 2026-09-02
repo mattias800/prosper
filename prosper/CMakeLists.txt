@@ -1273,7 +1273,9 @@ if(TARGET prosper_core)
   add_test(NAME capture_compute_policy COMMAND test_capture_compute_policy)
 
   add_executable(test_write_watch_policy frontends/shared/tests/test_write_watch_policy.cpp)
-  target_include_directories(test_write_watch_policy PRIVATE frontends)
+  # `src` as well as `frontends`: the knobs' strict parsing lives in diagnostics/env_numeric.hpp,
+  # and it is asserted here beside the policy whose sentinels make a typo dangerous (#3253).
+  target_include_directories(test_write_watch_policy PRIVATE frontends src)
   add_test(NAME write_watch_policy COMMAND test_write_watch_policy)
 
   add_executable(test_texture_decode_diagnostic

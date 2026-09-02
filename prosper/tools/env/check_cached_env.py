@@ -55,11 +55,25 @@ def armed_callee(name: str) -> bool:
     low = name.lower()
     if "env" not in low:
         return False
-    if low in ("getenv", "std_getenv"):          # a READ is the fix, not the defect
+    if low in ENV_READERS:                       # a READ is the fix, not the defect
         return False
     if name.startswith("PROSPER_ENV_"):          # the caching macros themselves
         return False
     return True
+
+
+# Callees that contain "env" and READ rather than write. Deliberately an explicit list rather than a
+# looser pattern: the heuristic above is conservative on purpose, and the cost of widening it wrongly
+# is a silently vacuous test, which is the entire defect class this gate exists for.
+#
+# `env_u64_or_default` (diagnostics/env_numeric.hpp) takes the variable's NAME as a literal first
+# argument purely so a refusal can name it, and the value as the second -- so a caller passing a
+# literal name is reading, not arming, and `test_write_watch_policy.cpp` does exactly that with three
+# names production caches (#3253).
+ENV_READERS = frozenset((
+    "getenv", "std_getenv",
+    "env_u64_or_default", "env_u64_or_default_capped",
+))
 
 SCAN_DIRS = ("src", "frontends", "tools", "tests")
 SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp")
@@ -186,6 +200,9 @@ SELF_TESTS = [
     ('const char* v = PROSPER_ENV_VALUE("PROSPER_BAR");', ["PROSPER_BAR"], []),
     ('PROSPER_ENV_VALUE( "PROSPER_SPACED" )', ["PROSPER_SPACED"], []),
     ('setenv("PROSPER_BAZ", "1", 1);', [], ["PROSPER_BAZ"]),
+    # A reader that names the variable so it can report a refusal is NOT an arming (#3253).
+    ('env_u64_or_default("PROSPER_READ_ONLY", text, 8192);', [], []),
+    ('prosper::diag::env_u64_or_default_capped("PROSPER_READ_ONLY2", v, 8, 99);', [], []),
     ('_putenv_s("PROSPER_QUX", "1");', [], ["PROSPER_QUX"]),
     ('unsetenv("PROSPER_QUUX");', [], ["PROSPER_QUUX"]),
     # The WRAPPER forms. These are the cases the first version of this checker missed, which let it
