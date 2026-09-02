@@ -97,6 +97,7 @@ std::string show(const ArgLocation& l) {
                                  "r8","r9","r10","r11" };
     char buf[32];
     switch (l.kind) {
+    case Kind::None:   return "none";
     case Kind::IntReg: return l.reg < 12 ? gpr[l.reg] : "gpr?";
     case Kind::SseReg: snprintf(buf, sizeof buf, "xmm%u", (unsigned)l.reg); return buf;
     case Kind::Stack:  snprintf(buf, sizeof buf, "stack%u", (unsigned)l.slot); return buf;
@@ -203,6 +204,12 @@ void check_tables() {
                     sse_reg(5), sse_reg(6), sse_reg(7), stack(0), stack(1) },
                   { sse_reg(0), sse_reg(1), sse_reg(2), sse_reg(3), stack(4),
                     stack(5), stack(6), stack(7), stack(8), stack(9) });
+
+    // Past the end of a signature both tables answer None, not a plausible stack slot 0.
+    if (sysv_arg_location(sig_of({ I, F }), 2).kind != Kind::None)
+        fail("out-of-range SysV query", "answered with a location instead of None");
+    if (ms_arg_location(sig_of({ I, F }), 2).kind != Kind::None)
+        fail("out-of-range MS query", "answered with a location instead of None");
 
     // A signature with no declaration places nowhere; the bridge falls back to its fixed shuffle.
     if (sig_of({ I, I }).needs_conversion())
@@ -316,6 +323,19 @@ PROSPER_TEST_HOST_ABI uint64_t h_wide(uint64_t a0, uint64_t a1, uint64_t a2, uin
     g_rec.d[4]=a4; g_rec.d[5]=a5; g_rec.u[6]=a6; g_rec.u[7]=a7;
     g_rec.d[8]=a8; g_rec.u[9]=a9; g_rec.n = 10;
     return 0xFEEDFACEull;
+}
+// The widest shape the deducer permits, chosen to reach the three placements nothing else does:
+// a guest argument SPILLED by System V's eight-xmm limit (floats 8 and 9), a source displacement
+// past 0x7f so the encoder must pick disp32, and the rax scratch a stack-to-stack copy needs.
+PROSPER_TEST_HOST_ABI double h_spill(float a0, float a1, float a2, float a3, float a4, float a5,
+                                     float a6, float a7, float a8, float a9,
+                                     uint64_t a10, uint64_t a11) {
+    g_rec = {};
+    const float f[10] = { a0,a1,a2,a3,a4,a5,a6,a7,a8,a9 };
+    for (unsigned i = 0; i < 10; ++i) g_rec.d[i] = f[i];
+    g_rec.u[10] = a10; g_rec.u[11] = a11;
+    g_rec.n = 12;
+    return 4242.5;
 }
 // The historical integer-only path: guest a0..a9, all integers, no declared signature.
 PROSPER_TEST_HOST_ABI uint64_t h_ten(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -496,6 +516,25 @@ void check_executed() {
         }
     }
 
+    // --- System V's own spill area, and a displacement that needs disp32 ------------------------
+    {
+        using Guest = PROSPER_TEST_GUEST_ABI double (*)(float, float, float, float, float, float,
+                                                        float, float, float, float,
+                                                        uint64_t, uint64_t);
+        const CallSignature sig = sig_of({ F, F, F, F, F, F, F, F, F, F, I, I },
+                                         /*sse_return=*/true);
+        uint8_t* code = build_bridge("spill bridge", (uint64_t)(uintptr_t)&h_spill, sig);
+        if (code) {
+            const double r = ((Guest)code)(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, 6.5f, 7.5f,
+                                           8.5f, 9.5f, 0x3010, 0x3011);
+            const char* n = "executed 10 floats + 2 integers";
+            if (r != 4242.5) fail(n, "double return did not survive the bridge");
+            for (unsigned i = 0; i < 10; ++i) expect_d(n, i, g_rec.d[i], 0.5 + (double)i);
+            expect_u(n, 10, g_rec.u[10], 0x3010);
+            expect_u(n, 11, g_rec.u[11], 0x3011);
+        }
+    }
+
     // --- the historical integer path still delivers a0..a9 --------------------------------------
     // This is the no-op half of the change: with no declared signature the bridge emits exactly what
     // it always did, and the ~700 handlers registered by cast must be unaffected.
@@ -582,6 +621,17 @@ void check_sizes_and_no_op() {
             fail("declared signature exceeds the stub slot", d);
         }
     }
+    // A hand-built CallSignature wider than the emitter models must be refused, not written.
+    // signature_of cannot produce one, but register_fn_with_signature takes a raw value, so the
+    // guard has to be in the emitter. An impossible length is the fail-visible answer: install_stubs
+    // compares it against the slot and reports, and nothing has been copied.
+    CallSignature too_wide{};
+    too_wide.declared = true;
+    too_wide.count = kMaxArgs + 1;
+    too_wide.sse_mask = 1;
+    if (bridge_size(too_wide, false) <= kMaxBridgeBytes)
+        fail("over-wide signature", "was emitted instead of refused");
+
     // Vacuous otherwise: a registry with no declared signature would pass the loop by doing nothing,
     // and would also mean the typed registrations are not reaching the registry at all.
     if (declared == 0)

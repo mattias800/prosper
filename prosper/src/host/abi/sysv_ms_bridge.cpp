@@ -94,11 +94,11 @@ ArgLocation sysv_arg_location(const CallSignature& sig, unsigned arg) {
         else if (sse) ++sses;
         else ++ints;
     }
-    return {};
+    return {};   // past the end of the signature -> Kind::None
 }
 
 ArgLocation ms_arg_location(const CallSignature& sig, unsigned arg) {
-    if (arg >= sig.count) return {};
+    if (arg >= sig.count) return {};   // past the end of the signature -> Kind::None
     if (arg >= 4) return { ArgLocation::Kind::Stack, 0, uint8_t(arg) };
     return sig.arg_class(arg) == ArgClass::Sse
                ? ArgLocation{ ArgLocation::Kind::SseReg, uint8_t(arg), 0 }
@@ -152,6 +152,14 @@ size_t emit_sysv_to_ms_bridge(uint8_t* out, const BridgeParams& params) {
 
     // Signature-driven path. Reached only by a handler that declares a floating-point argument or
     // return, i.e. one the historical path cannot place.
+    //
+    // Refuse a signature wider than the emitter is sized for, rather than writing past the caller's
+    // staging buffer. signature_of rejects this at compile time, but register_fn_with_signature
+    // takes a raw CallSignature, so the guard has to live next to the buffer it protects. An
+    // impossible length is the fail-visible answer: install_stubs compares it against the slot,
+    // reports "generated Windows ABI bridge exceeds stub_size", and nothing has been written.
+    if (sig.count > kMaxArgs) return kMaxBridgeBytes + 1;
+
     const uint32_t frame = frame_bytes(sig);
     const uint32_t rax_slot = outgoing_bytes(sig);
     const uint32_t xmm_slot = rax_slot + 8;
@@ -176,6 +184,8 @@ size_t emit_sysv_to_ms_bridge(uint8_t* out, const BridgeParams& params) {
         const ArgLocation dst = ms_arg_location(sig, i);
         const uint32_t src_off = src.kind == ArgLocation::Kind::Stack ? guest_stack_off(src.slot) : 0;
         switch (dst.kind) {
+        case ArgLocation::Kind::None:
+            break;   // unreachable: the loop never runs past sig.count
         case ArgLocation::Kind::IntReg:
             if (src.kind == ArgLocation::Kind::Stack) mov_reg_mem(b, dst.reg, src_off);
             else if (src.reg != dst.reg)              mov_reg_reg(b, dst.reg, src.reg);

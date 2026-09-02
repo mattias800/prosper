@@ -161,14 +161,17 @@ Two ABI facts worth keeping, both derived rather than assumed:
   self-consistent whatever Sony's absolute convention is, because prosper supplies both the metrics
   and the baseline the caller subtracts.
 
-**Windows carries a known, named gap here** ([#2955](https://github.com/mattias800/prosper/issues/2955)):
-the import-stub trampoline converts SysV to the MS ABI by remapping integer registers **only**, so
-a handler declared with the guest's float arguments in place would read the two pointers after them
-out of the wrong slots and write through garbage. The Windows arm therefore takes the five integer
-arguments the trampoline does place correctly and renders at the line-box origin — correct for a
-one-glyph-per-surface caller like this one, and never an out-of-bounds write. The same trampoline
-gap already mis-delivers `sceFontSetScalePixel`, `sceFontSetEffectSlant` and
-`sceFontSetEffectWeight`; it predates this work.
+**Windows used to carry a named gap here, and it is fixed**
+([#2955](https://github.com/mattias800/prosper/issues/2955)): the import-stub trampoline converted
+SysV to the MS ABI by remapping integer registers **only**, so a handler declared with the guest's
+float arguments in place read the two pointers after them out of the wrong slots and wrote through
+garbage. This library carried a Windows arm that took the five integer arguments the trampoline did
+place correctly and rendered at the line-box origin — correct for a one-glyph-per-surface caller
+like this one, and never an out-of-bounds write, but a workaround in the handler rather than a fix
+in the bridge. The bridge is now signature-driven (`src/host/abi/`), the Windows arm is gone, and
+`sceFontSetScalePixel`, `sceFontSetEffectSlant` and `sceFontSetEffectWeight` are delivered correctly
+too. What is verified is the bridge, on Linux and on the Windows CI host; a live guest calling this
+library on a Windows desktop is still unobserved.
 
 ## Where it stops now
 

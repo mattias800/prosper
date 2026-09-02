@@ -23,10 +23,12 @@ enum : uint8_t {
     kR8  = 8, kR9  = 9, kR10 = 10, kR11 = 11,
 };
 
-// Where one argument lives under one convention.
+// Where one argument lives under one convention. `None` is the default and the answer to a query
+// past the end of a signature: an out-of-range argument must not come back looking like a plausible
+// stack slot, which is the shape a future caller would act on without noticing.
 struct ArgLocation {
-    enum class Kind : uint8_t { IntReg, SseReg, Stack };
-    Kind    kind = Kind::Stack;
+    enum class Kind : uint8_t { None, IntReg, SseReg, Stack };
+    Kind    kind = Kind::None;
     uint8_t reg  = 0;   // IntReg: GPR encoding above. SseReg: xmm ordinal.
     uint8_t slot = 0;   // Stack: 8-byte slot ordinal within that convention's own argument area.
 
@@ -55,9 +57,17 @@ struct BridgeParams {
     CallSignature signature{};
 };
 
-// Upper bound on the bytes emit_sysv_to_ms_bridge writes, for a caller's staging buffer. The stub
-// table's own slot size is smaller (loader/linker.hpp), and install_stubs rejects a stub that does
-// not fit — so a caller must stage into this and copy only what fits.
+// Upper bound on the bytes emit_sysv_to_ms_bridge writes, for a caller's staging buffer. Measured
+// worst case over every signature the type system permits (kMaxArgs arguments, every class mask,
+// both return classes) is ~170 bytes, so 256 leaves real headroom.
+//
+// The STUB SLOT is much smaller — 96 bytes (loader/linker.hpp's LinkedProgram::stub_size), which the
+// historical integer path exactly fills when a return hook is present. The practical ceiling for a
+// float-bearing signature is therefore around eight arguments; the largest one registered today is
+// the seven-argument sceFontRenderCharGlyphImage at 85 bytes with a hook. A signature that does not
+// fit is refused visibly by install_stubs rather than silently truncated, and
+// tests/host/abi/test_sysv_ms_bridge.cpp sweeps every signature the live registry declares — but a
+// boot failure naming "generated Windows ABI bridge exceeds stub_size" means the slot, not a bug.
 inline constexpr size_t kMaxBridgeBytes = 256;
 
 // Emit the bridge for one import. Returns the number of bytes written (<= kMaxBridgeBytes).

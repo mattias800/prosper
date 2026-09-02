@@ -93,7 +93,7 @@ constexpr CallSignature signature_of(R (*)(A...)) {
     s.count = static_cast<uint8_t>(sizeof...(A));
     unsigned i = 0;
     ((s.sse_mask |= static_cast<uint16_t>(static_cast<unsigned>(is_sse_arg_v<A>) << i), ++i), ...);
-    s.sse_return = std::is_same_v<R, float> || std::is_same_v<R, double>;
+    s.sse_return = is_sse_arg_v<R>;   // strips cv, exactly as the argument classes do
     return s;
 }
 

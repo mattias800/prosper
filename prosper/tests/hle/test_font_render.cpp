@@ -184,29 +184,22 @@ int main() {
 
     auto P = [](const void* p) { return (uint64_t)(uintptr_t)p; };
 
-    // Call sceFontRenderCharGlyphImage through the SAME shape the platform registers.
+    // Call sceFontRenderCharGlyphImage through its real seven-argument shape, on every platform.
     //
-    // This is not portability boilerplate -- it is the finding itself, and it cost a red Windows
-    // CI run to learn. The Windows registration takes only the five INTEGER arguments, because the
-    // import trampoline remaps integer registers and never touches xmm (#2955). A test that calls
-    // the SysV seven-argument shape against it hands the handler `metrics` and `result` out of r9
-    // and the shadow stack -- garbage pointers it then writes through. That is a **SegFault**, and
-    // it is precisely the arbitrary write the Windows arm of hle_font.cpp exists to avoid; the
-    // first version of this test demonstrated it on CI rather than in the emulator.
+    // This used to have a five-integer Windows arm, because hle_font.cpp had one: the import
+    // trampoline remapped integer registers and never touched xmm, so a seven-argument
+    // registration handed the handler `metrics` and `result` out of the wrong slots -- garbage
+    // pointers it then wrote through. That is a **SegFault**, and this test found it on CI rather
+    // than in the emulator, twice: once when the workaround was missing and once when it was
+    // removed and this call site still spelled the workaround's shape.
     //
-    // The pen is ignored on Windows, and every assertion below still holds there, because the pen
-    // Metaphor passes (`-h_bearing_x`, `h_bearing_y - baseline`) puts the glyph at the surface
-    // origin -- which is exactly where the no-pen path draws it.
+    // Both are gone with #2955. Note what this lambda does and does not exercise: it calls the
+    // handler DIRECTLY, so both sides use the host ABI and the trampoline is not involved at all.
+    // The trampoline is tests/host/abi/test_sysv_ms_bridge.cpp's subject.
     auto call_render = [](HleFn fn, void* f, uint32_t code, void* surf, float x, float y,
                           void* metrics, void* result) -> int32_t {
-#if defined(_WIN32)
-        (void)x; (void)y;
-        return ((int32_t (*)(void*, uint32_t, void*, void*, void*))fn)(f, code, surf, metrics,
-                                                                       result);
-#else
         return ((int32_t (*)(void*, uint32_t, void*, float, float, void*, void*))fn)(
             f, code, surf, x, y, metrics, result);
-#endif
     };
 
     const std::vector<uint8_t> ttf = build_test_font();
@@ -373,14 +366,8 @@ int main() {
     if (render_horiz) {
         auto call_h = [&](void* surf, float x, float y, void* metrics,
                           void* result) -> int32_t {
-#if defined(_WIN32)
-            (void)x; (void)y;
-            return ((int32_t (*)(void*, uint32_t, void*, void*, void*))render_horiz)(
-                face, 'A', surf, metrics, result);
-#else
             return ((int32_t (*)(void*, uint32_t, void*, float, float, void*, void*))render_horiz)(
                 face, 'A', surf, x, y, metrics, result);
-#endif
         };
 
         std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
@@ -403,11 +390,10 @@ int main() {
         for (uint8_t b : surf_bytes) if (b) ++coveredh;
         CHECK(coveredh > 500,
               "the horizontal variant actually rasterizes into the surface");
-#if !defined(_WIN32)
         // The pen floats must be consumed as placement: shift the pen and the drawn region
         // moves with it. Without this arm an implementation that ignores xmm0/xmm1 and always
-        // draws at the origin would pass every check above. Windows is exempt by design --
-        // its trampoline (#2955) delivers integers only, and the Win arm renders at origin.
+        // draws at the origin would pass every check above. Runs on every platform since #2955 --
+        // Windows used to be exempt because its arm of the handler dropped the pen.
         std::fill(surf_bytes.begin(), surf_bytes.end(), 0);
         uint8_t resulth2[0x40];
         std::memset(resulth2, kPoison, sizeof(resulth2));
@@ -422,7 +408,6 @@ int main() {
                 }
         CHECK(covered_shifted > 500 && first_col_shifted >= 16,
               "shifting the pen shifts the drawn glyph (the float args are real placement)");
-#endif
     }
     // --- lifecycle ---------------------------------------------------------------------------
     CHECK(memory_term(P(mem), 0, 0, 0, 0, 0) == 0, "MemoryTerm releases the memory descriptor");
