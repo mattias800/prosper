@@ -7757,12 +7757,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const VkFormat format0 = pass_formats[0];
                     const VkFormat format1 = base1
                         ? pass_formats[1] : VK_FORMAT_UNDEFINED;
-                    // A MODE=RESOLVE draw shares color0_base with the scene it resolves and reports
-                    // active_color1()==0 (it exports nothing), so without keying the group on cb_resolve
-                    // it could merge with the scene draws; the resolve-copy `continue` below would then
-                    // silently drop any ordinary draws grouped after it. Key on it so a resolve is always
-                    // its own pass.
-                    const bool resolve0 = items[pass_i].ps.cb_resolve;
                     // The DEPTH/STENCIL attachment is part of a pass's target identity, not just its
                     // colour attachments.
                     //
@@ -7795,8 +7789,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (ds_identity(draw) != ds0) return false;
                         return true;
                     };
+                    // A MODE=RESOLVE draw is answered by a COPY below, not by a render, so its
+                    // pass identity is the source/destination pair that copy acts with rather than
+                    // the attachment set `same_targets` compares. `mrt_same_resolve_pass` carries
+                    // that whole rule -- keeping a resolve out of a scene group, and keeping two
+                    // resolves with different destinations out of each other's (#3025) -- and its
+                    // header states why each half exists.
                     while (pass_i < items.size() && same_targets(items[pass_i]) &&
-                           items[pass_i].ps.cb_resolve == resolve0) {
+                           prosper::frontend::mrt_same_resolve_pass(pass_head, items[pass_i])) {
                         pass.push_back(&items[pass_i]); ++pass_i;
                     }
 
@@ -8000,10 +8000,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (PROSPER_ENV_ON("PROSPER_MSAA_LOG"))
                                 fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
                                         (unsigned long long)rsrc, (unsigned long long)rdst, rw, rh);
-                        } else if (PROSPER_ENV_VALUE("PROSPER_MSAA_LOG")) {
-                            fprintf(stderr, "[msaa] resolve SKIP src=0x%llx dst=0x%llx (%s)\n",
-                                    (unsigned long long)rsrc, (unsigned long long)rdst,
-                                    !rsrc || !rdst ? "missing base" : "source has no rendered surface");
+                        } else {
+                            // A resolve that performs no copy is DROPPED RENDERED CONTENT: the
+                            // destination keeps whatever it held before, and every later census
+                            // reads it as "written by nothing". Report it unconditionally, bounded
+                            // like the copy-failure warning above, so the one remaining way a
+                            // resolve can produce nothing is fail-visible rather than silent.
+                            // PROSPER_MSAA_LOG still reports every occurrence.
+                            static std::atomic<int> skipped{0};
+                            if (PROSPER_ENV_VALUE("PROSPER_MSAA_LOG") ||
+                                skipped.fetch_add(1) < 8)
+                                fprintf(stderr, "[msaa] resolve SKIP src=0x%llx dst=0x%llx (%s)\n",
+                                        (unsigned long long)rsrc, (unsigned long long)rdst,
+                                        !rsrc || !rdst ? "missing base"
+                                                       : "source has no rendered surface");
                         }
                         if (timing_enabled) ++pending_timing.resolve_n;
                         continue;   // resolve is a copy, not an ordinary-draw render

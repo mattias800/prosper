@@ -1129,6 +1129,76 @@ int main() {
               "later pass samples the GREEN pixels retained from color attachment 1");
     }
 
+    // #3025 -- consecutive MSAA resolves into DIFFERENT destinations.
+    //
+    // A CB_COLOR_CONTROL.MODE=RESOLVE draw is answered by a copy of the already-rendered
+    // `color0_base` surface into `color1_base`, and the copy is performed ONCE for the pass, from
+    // the group's first draw. Slot 1 is inactive on every resolve (a fixed-function resolve exports
+    // nothing, so `color1_write_mask` is 0), so before this fix the colour-identity predicate could
+    // not separate two resolves and `cb_resolve` -- a boolean -- did not either: two adjacent
+    // resolves sharing a source and naming different destinations became one pass, one copy was
+    // performed, and the second destination was discarded with no copy, no render and no diagnostic.
+    //
+    // LOAD-BEARING ASSERTION: "a second resolve into a different destination receives the resolved
+    // pixels". It reads the second DESTINATION SURFACE'S CONTENTS and requires them to equal the
+    // source's, byte for byte. Weaker forms were deliberately not used -- a pass count cannot see
+    // which destination was written, and the mere existence of a target entry does not show it
+    // received the scene. The first-destination arm beside it is the control: it passes both before
+    // and after the fix, so a run where BOTH fail is a broken fixture rather than this defect.
+    //
+    // No title is known to emit this shape (Blue Prince, the title the resolve path was built for,
+    // separates its resolves with ordinary draws so they never group), so this construction is the
+    // whole evidence for the fix -- built by hand here rather than drawn from a capture.
+    {
+        constexpr uint64_t RESOLVE_SRC = 0x1a00000ull;
+        constexpr uint64_t RESOLVE_DST1 = 0x1a10000ull;
+        constexpr uint64_t RESOLVE_DST2 = 0x1a20000ull;
+        constexpr uint32_t RW = 32, RH = 32;
+
+        DrawItem resolve_source = replay.items[0];   // the MSAA scene the guest resolves
+        resolve_source.color0_base = RESOLVE_SRC;
+        resolve_source.color0_width = RW;
+        resolve_source.color0_height = RH;
+
+        DrawItem resolve_first = resolve_source;
+        resolve_first.ps.cb_resolve = true;
+        resolve_first.color1_base = RESOLVE_DST1;
+        resolve_first.color1_width = RW;
+        resolve_first.color1_height = RH;
+        resolve_first.ps.color1_write_mask = 0;       // a fixed-function resolve exports nothing
+
+        DrawItem resolve_second = resolve_first;
+        resolve_second.color1_base = RESOLVE_DST2;    // ... into a DIFFERENT destination
+
+        render_submit_items({resolve_source, resolve_first, resolve_second}, W, H);
+
+        LiveTargetSnapshot resolve_src_snapshot, resolve_dst1, resolve_dst2;
+        const bool src_read = read_live_render_target(RESOLVE_SRC, resolve_src_snapshot) &&
+            resolve_src_snapshot.pixels &&
+            resolve_src_snapshot.width == RW && resolve_src_snapshot.height == RH;
+        // Anti-triviality: the equality below must not be satisfiable by two blank surfaces. If the
+        // source rendered nothing there is no content for a resolve to move and the arms after this
+        // one would pass for a reason that has nothing to do with grouping.
+        bool src_has_content = false;
+        if (src_read)
+            for (size_t i = 0; i + 3 < resolve_src_snapshot.pixels->size(); i += 4)
+                if ((*resolve_src_snapshot.pixels)[i] > 0x40) { src_has_content = true; break; }
+        CHECK(src_read && src_has_content,
+              "the resolve source renders non-blank content for the resolves to move");
+
+        const bool dst1_read = read_live_render_target(RESOLVE_DST1, resolve_dst1) &&
+            resolve_dst1.pixels && resolve_dst1.width == RW && resolve_dst1.height == RH;
+        CHECK(src_read && dst1_read &&
+                  *resolve_dst1.pixels == *resolve_src_snapshot.pixels,
+              "the first resolve destination receives the resolved pixels");
+
+        const bool dst2_read = read_live_render_target(RESOLVE_DST2, resolve_dst2) &&
+            resolve_dst2.pixels && resolve_dst2.width == RW && resolve_dst2.height == RH;
+        CHECK(src_read && dst2_read &&
+                  *resolve_dst2.pixels == *resolve_src_snapshot.pixels,
+              "a second resolve into a different destination receives the resolved pixels");
+    }
+
     render_submit_items({producer}, W, H);
     const uint64_t producer_center = producer.color0_base +
         (static_cast<uint64_t>(producer.color0_width) + producer.color0_width / 2u) * 4u;
