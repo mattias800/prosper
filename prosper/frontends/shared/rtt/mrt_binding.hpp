@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 #include "gpu/execute/gpu_execute.hpp"
@@ -13,13 +14,20 @@
 // classified stale named state as a live binding, which denies the authoritative direct-GPU path and
 // — when no CPU snapshot exists — degrades to guest bytes rather than to a slower correct source.
 //
-// One asymmetry this header does NOT itself resolve: for SLOT 0 the two read different
-// representations. Grouping takes slot 0's identity from the named fields (see
-// `mrt_same_color_pass`), because that is where live_renderer takes the address it renders to,
-// while feedback stays array-first through `mrt_active_color`. They agree because every producer
-// mirrors `color_targets[0]` from the named triple, not because anything here enforces it — so a
-// producer that ever filled the two independently would break the agreement without this header
-// changing.
+// One asymmetry this header does NOT resolve: for SLOTS 0 AND 1 its readers consult different
+// representations. Pass identity is named-first (`mrt_pass_color_binding`), because that is where
+// live_renderer takes the address it renders to; the active-binding rule that feeds grouping's
+// attachment count and feedback detection is array-first (`mrt_color_binding`). They agree because
+// every producer keeps `color_targets[0]`/`[1]` a mirror of the named triple — or leaves it absent —
+// not because either rule enforces it.
+//
+// `mrt_color_alias_mirrored` is that convention written down, and `mrt_check_color_alias_mirror` is
+// how a consumer checks it AT THE POINT OF USE. Deliberately not at the producers: an assertion
+// beside `realize_draw_item`'s mirror would sit two lines below the assignment it verifies and
+// could never fail, which is worse than no check because it reads as coverage (#3026). Which
+// representation should win when they disagree is UNDECIDED — no producer emits a divergence, so
+// there is no evidence to decide it, and deciding would change the surface the renderer renders to.
+// The check therefore reports and changes nothing.
 //
 // The rule: a slot is active when it has a base, a non-zero write mask, and a format the backend
 // accepts. That last term is TOTAL in the current backend -- `backend_color_format` maps every
@@ -33,19 +41,104 @@
 // different and wrong rule: a genuinely masked-off slot then inherits a stale named mask.
 //
 // That "ONLY" scopes to the active-binding rule and does not extend to slot 0's PASS IDENTITY,
-// which is named-first for the reason given at `mrt_same_color_pass`.
+// which is named-first for the reason given at `mrt_pass_color_binding`.
 namespace prosper::frontend {
+
+// The named `color0_*` / `color1_*` triple a slot aliases. `DrawItem` predates the complete array
+// and only ever grew compatibility fields for the first two attachments, so slots 2 and up have no
+// named alias and answer with an empty binding; every caller in this header guards that.
+inline prosper::gpu::DrawItem::ColorTargetBinding mrt_named_color_alias(
+    const prosper::gpu::DrawItem& draw, uint32_t slot) {
+    if (slot == 0)
+        return prosper::gpu::DrawItem::ColorTargetBinding{
+            draw.color0_base, draw.color0_width, draw.color0_height};
+    if (slot == 1)
+        return prosper::gpu::DrawItem::ColorTargetBinding{
+            draw.color1_base, draw.color1_width, draw.color1_height};
+    return prosper::gpu::DrawItem::ColorTargetBinding{};
+}
 
 inline prosper::gpu::DrawItem::ColorTargetBinding mrt_color_binding(
     const prosper::gpu::DrawItem& draw, uint32_t slot) {
     auto binding = draw.color_targets[slot];
-    if (!binding.base && !binding.width && !binding.height && slot == 0)
-        binding = prosper::gpu::DrawItem::ColorTargetBinding{
-            draw.color0_base, draw.color0_width, draw.color0_height};
-    else if (!binding.base && !binding.width && !binding.height && slot == 1)
-        binding = prosper::gpu::DrawItem::ColorTargetBinding{
-            draw.color1_base, draw.color1_width, draw.color1_height};
+    if (!binding.base && !binding.width && !binding.height && slot < 2u)
+        binding = mrt_named_color_alias(draw, slot);
     return binding;
+}
+
+// THE surface a colour pass renders to, for one slot -- pass IDENTITY, as distinct from the
+// active-binding rule above.
+//
+// Slot 0 is taken from the NAMED triple whenever it names a surface, because that is the surface
+// the pass actually renders to: live_renderer takes `pass_bases[0]` from `color0_base` and the
+// framebuffer extent from `color0_width`/`color0_height`, while every slot above 0 goes through the
+// array. Reading slot 0's identity from the array instead makes GROUPING and TARGET SELECTION
+// consult different representations of one attachment -- and two draws that render to DIFFERENT
+// addresses then share a pass, so the second draw's target is silently discarded and its pixels are
+// never published (#3023).
+//
+// On captured and live draws the two representations are identical, so this costs nothing there.
+// For captures a divergence is not merely absent but INEXPRESSIBLE: the wire format carries slots 2
+// and up only, and `restore_legacy_color_target_aliases` re-derives slots 0/1 from the named triple
+// on every load. For live draws the same mirror sits at the single success exit of
+// `realize_draw_item`. The two differ only for a caller that builds a DrawItem directly and updates
+// the named aliases alone: exactly the shape that mirror exists to repair, and the shape the render
+// fixtures construct. Falling back to `mrt_color_binding` when `color0_base` is 0 keeps the previous
+// answer for a draw that names no slot-0 surface at all.
+inline prosper::gpu::DrawItem::ColorTargetBinding mrt_pass_color_binding(
+    const prosper::gpu::DrawItem& draw, uint32_t slot) {
+    if (slot == 0 && draw.color0_base) return mrt_named_color_alias(draw, 0);
+    return mrt_color_binding(draw, slot);
+}
+
+// Does an aliased slot's ARRAY entry still mirror its named triple?
+//
+// THE CONVENTION, written down. For slots 0 and 1 `DrawItem::color_targets[slot]` must either equal
+// the named `colorN_*` triple or be ABSENT (all three fields zero, the legacy shape the fallback in
+// `mrt_color_binding` exists for). Every producer honours it -- `realize_draw_item`'s success exit
+// and its failure record, the three DrawItem<->capture conversions, and
+// `restore_legacy_color_target_aliases` on every capture load -- and until #3026 nothing checked it.
+//
+// Given the convention, all four slot-0 readers return the same triple: this header's
+// `mrt_color_binding` and `mrt_pass_color_binding`, live_renderer's `pass_bases[0]`, and
+// live_renderer's framebuffer extent. Break it and they answer three different ways, which is the
+// class #3023 was one instance of. Slots 2 and up have no named alias, so nothing there can diverge.
+inline bool mrt_color_alias_mirrored(const prosper::gpu::DrawItem& draw, uint32_t slot) {
+    if (slot > 1u) return true;
+    const auto& carried = draw.color_targets[slot];
+    if (!carried.base && !carried.width && !carried.height) return true;   // absent, not divergent
+    const auto named = mrt_named_color_alias(draw, slot);
+    return carried.base == named.base && carried.width == named.width &&
+           carried.height == named.height;
+}
+
+// How many aliased slots this process has observed diverging. Exposed so a test can assert the
+// CONSUMER saw a hand-built divergence, not merely that the predicate above can compute one -- the
+// distinction this header already records under `mrt_direct_serves`, where tests that exercised the
+// helper instead of the decision stayed green while production was reverted.
+inline std::atomic<uint64_t>& mrt_color_alias_divergence_counter() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+inline uint64_t mrt_color_alias_divergences() {
+    return mrt_color_alias_divergence_counter().load(std::memory_order_relaxed);
+}
+
+// Check both aliased slots of one draw where a consumer is about to act on them. `report` receives
+// the slot, the carried array entry, the named alias, and this divergence's process-wide ordinal;
+// the caller owns it, so this header stays free of I/O and of any rate-limit policy. Returns how
+// many slots diverged -- 0 for every draw any production producer emits.
+template <typename Report>
+uint32_t mrt_check_color_alias_mirror(const prosper::gpu::DrawItem& draw, Report report) {
+    uint32_t diverged = 0;
+    for (uint32_t slot = 0; slot < 2u; ++slot) {
+        if (mrt_color_alias_mirrored(draw, slot)) continue;
+        ++diverged;
+        report(slot, draw.color_targets[slot], mrt_named_color_alias(draw, slot),
+               mrt_color_alias_divergence_counter().fetch_add(1, std::memory_order_relaxed) + 1u);
+    }
+    return diverged;
 }
 
 // Raw guest format for a slot, with the same named-field fallback. Left as the raw value so callers
@@ -102,35 +195,14 @@ template <typename FormatDefined, typename FormatAt>
 bool mrt_same_color_pass(const prosper::gpu::DrawItem& first,
                          const prosper::gpu::DrawItem& candidate,
                          FormatDefined format_defined, FormatAt format_at) {
-    // Slot 0 is compared on the NAMED triple whenever it names a surface, because that is the
-    // surface the pass actually renders to: live_renderer takes `pass_bases[0]` from `color0_base`,
-    // while every slot above 0 goes through the array. Reading slot 0's identity from the array
-    // instead makes GROUPING and TARGET SELECTION consult different representations of one
-    // attachment -- and two draws that render to DIFFERENT addresses then share a pass, so the
-    // second draw's target is silently discarded and its pixels are never published.
-    //
-    // On captured and live draws the two representations are identical, so this is a no-op there.
-    // For captures a divergence is not merely absent but INEXPRESSIBLE: the wire format carries
-    // slots 2 and up only, and `restore_legacy_color_target_aliases` re-derives slots 0/1 from the
-    // named triple on every load. For live draws the same mirror sits at the single success exit of
-    // `realize_draw_item`. Neither is asserted anywhere, which is the one soft spot -- they are
-    // conventions held by every producer rather than a checked invariant.
-    //
-    // The two differ only for a caller that builds a DrawItem directly and populates the named
-    // aliases alone: exactly the shape `realize_draw_item`'s mirror exists to repair, and the shape
-    // the render fixtures construct. Falling back to `mrt_color_binding` when `color0_base` is 0
-    // keeps the previous answer for a draw that names no slot-0 surface at all.
-    auto pass_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-        if (slot == 0 && draw.color0_base)
-            return prosper::gpu::DrawItem::ColorTargetBinding{
-                draw.color0_base, draw.color0_width, draw.color0_height};
-        return mrt_color_binding(draw, slot);
-    };
+    // Slot 0's identity is the surface the pass RENDERS to, which is `mrt_pass_color_binding` --
+    // named-first -- and not the active-binding rule. That distinction is the whole of #3023; the
+    // reasoning, and why it costs nothing on captured or live draws, is on that function.
     const uint32_t count = mrt_active_color_count(first, format_defined);
     if (mrt_active_color_count(candidate, format_defined) != count) return false;
     for (uint32_t slot = 0; slot < count; ++slot) {
-        const auto a = pass_binding(first, slot);
-        const auto b = pass_binding(candidate, slot);
+        const auto a = mrt_pass_color_binding(first, slot);
+        const auto b = mrt_pass_color_binding(candidate, slot);
         const uint64_t a_base = slot == 0 ? a.base
             : mrt_active_color(first, slot, format_defined);
         const uint64_t b_base = slot == 0 ? b.base

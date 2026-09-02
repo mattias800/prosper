@@ -7,6 +7,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
+#include "shared/rtt/mrt_binding.hpp"
 #include "fixtures/render_runner.h"
 
 #include <algorithm>
@@ -1197,6 +1198,69 @@ int main() {
         CHECK(src_read && dst2_read &&
                   *resolve_dst2.pixels == *resolve_src_snapshot.pixels,
               "a second resolve into a different destination receives the resolved pixels");
+    }
+
+    // #3026 -- the named/array colour-target mirror for slots 0/1, checked at the CONSUMER.
+    //
+    // `DrawItem::color_targets[0]`/`[1]` mirror the named `color0_*`/`color1_*` triples, or are
+    // absent. Every producer honours it and nothing enforced it. The moment one does not, the
+    // renderer's readers answer differently: the pass renders to the RAW named field, grouping is
+    // named-first, and the active-binding rule behind the attachment count and feedback detection is
+    // array-first -- which is the class #3023 was one instance of.
+    //
+    // These arms establish the two things a predicate test cannot: that the live renderer actually
+    // performs the check where it chooses the pass target, and that the check is DETECT-ONLY -- it
+    // does not move the surface the pass renders to. The divergent draw is built by hand, because no
+    // producer can emit one.
+    {
+        constexpr uint64_t ALIAS_MIRRORED = 0x1b00000ull;   // named == array: every producer's shape
+        constexpr uint64_t ALIAS_NAMED    = 0x1b20000ull;   // the surface the divergent pass renders to
+        constexpr uint64_t ALIAS_ARRAY    = 0x1b10000ull;   // a second representation, naming another
+        constexpr uint32_t AW = 32, AH = 32;
+
+        DrawItem alias_mirrored = replay.items[0];
+        alias_mirrored.color0_base = ALIAS_MIRRORED;
+        alias_mirrored.color0_width = AW; alias_mirrored.color0_height = AH;
+        alias_mirrored.color_targets[0] = {ALIAS_MIRRORED, AW, AH};
+
+        const uint64_t alias_before_mirrored = prosper::frontend::mrt_color_alias_divergences();
+        render_submit_items({alias_mirrored}, W, H);
+        CHECK(prosper::frontend::mrt_color_alias_divergences() == alias_before_mirrored,
+              "a mirrored slot-0 alias -- the shape every producer emits -- reports no divergence");
+
+        LiveTargetSnapshot alias_mirrored_snapshot;
+        const bool alias_mirrored_read =
+            read_live_render_target(ALIAS_MIRRORED, alias_mirrored_snapshot) &&
+            alias_mirrored_snapshot.pixels && alias_mirrored_snapshot.width == AW &&
+            alias_mirrored_snapshot.height == AH;
+        // Anti-triviality: the pixel equality below must not be satisfiable by two blank surfaces.
+        bool alias_mirrored_content = false;
+        if (alias_mirrored_read)
+            for (size_t i = 0; i + 3 < alias_mirrored_snapshot.pixels->size(); i += 4)
+                if ((*alias_mirrored_snapshot.pixels)[i] > 0x40) {
+                    alias_mirrored_content = true; break;
+                }
+        CHECK(alias_mirrored_read && alias_mirrored_content,
+              "the mirrored control renders non-blank content into its named surface");
+
+        DrawItem alias_divergent = alias_mirrored;
+        alias_divergent.color0_base = ALIAS_NAMED;          // the named triple names one surface ...
+        alias_divergent.color_targets[0].base = ALIAS_ARRAY;   // ... and the array another
+
+        const uint64_t alias_before_divergent = prosper::frontend::mrt_color_alias_divergences();
+        render_submit_items({alias_divergent}, W, H);
+        CHECK(prosper::frontend::mrt_color_alias_divergences() > alias_before_divergent,
+              "the live renderer reports the divergence where it chooses the pass target");
+
+        LiveTargetSnapshot alias_named_snapshot, alias_array_snapshot;
+        const bool alias_named_read = read_live_render_target(ALIAS_NAMED, alias_named_snapshot) &&
+            alias_named_snapshot.pixels && alias_named_snapshot.width == AW &&
+            alias_named_snapshot.height == AH;
+        CHECK(alias_mirrored_read && alias_named_read &&
+                  *alias_named_snapshot.pixels == *alias_mirrored_snapshot.pixels,
+              "the guard is detect-only: the pass still renders to the NAMED surface, unchanged");
+        CHECK(!read_live_render_target(ALIAS_ARRAY, alias_array_snapshot),
+              "the divergent array entry receives nothing, exactly as before the guard");
     }
 
     render_submit_items({producer}, W, H);
