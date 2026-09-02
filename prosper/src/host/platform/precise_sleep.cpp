@@ -65,9 +65,13 @@ uint64_t steady_now_ns() {
 }
 
 void sleep_until_with_std(uint64_t deadline_ns) {
+    // std::chrono::nanoseconds' rep is SIGNED, so a deadline past INT64_MAX would wrap to a
+    // time_point in the past and this sleep would return instantly. See
+    // clamp_deadline_to_signed_rep() in the header for why that is reachable and why clamping ~292
+    // years out is indistinguishable from the deadline it replaces (#3038).
     std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::nanoseconds(deadline_ns))));
+            std::chrono::nanoseconds(clamp_deadline_to_signed_rep(deadline_ns)))));
 }
 
 }  // namespace

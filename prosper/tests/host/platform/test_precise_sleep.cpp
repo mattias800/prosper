@@ -23,6 +23,13 @@
 // them -- the only handle on that arithmetic was to call the real HLE and time it, which
 // test_kernel_sem_timedwait.cpp's header records at length cannot discriminate anything here.
 //
+// ARMS 18-21 (#3038) cover a THIRD set, the conversion from a guest {seconds, sub-seconds} pair to
+// one nanosecond count that nanosleep(), select() and pselect() now share. What they replace was a
+// HOST `struct timespec` assembled at the call site, whose `long tv_nsec` is 32 bits on Windows x64
+// against the guest's 64 -- so the case under test is one this host's own types cannot express, and
+// arm 21 models the narrowing explicitly (and asserts the model narrows) rather than relying on a
+// cast that is a no-op here.
+//
 // The cases the fake clock buys, none of which a wall-clock test can produce on demand: an early
 // wakeup, a deadline already in the past, a clock that runs backwards, the slice clamp binding, and
 // arithmetic within a few nanoseconds of UINT64_MAX. Mutation results are in the PR.
@@ -56,6 +63,12 @@ static void fake_sleep_fixed_step(uint64_t /*deadline_ns*/) {
     ++g_sleep_calls;
     g_fake_now_ns += g_sleep_step_ns;
 }
+
+// MinGW-w64's `long tv_nsec` (#3038), modelled rather than spelled `(long)`: on THIS host `long` is
+// 64 bits, so the platform whose behaviour is under test is the one platform where the real cast
+// does nothing. Written as a conversion through uint32_t and back so it is well-defined and
+// identical on every host, and asserted to actually narrow in arm 21 before it is trusted.
+static int64_t narrow_to_win_long(int64_t v) { return (int64_t)(int32_t)(uint32_t)v; }
 
 // ---------------------------------------------------------------------------
 // A driver for sem_poll_step() (#3069) that reproduces the real poll loop's structure exactly --
@@ -593,6 +606,214 @@ int main() {
         const host::WaitDeadline zero = host::abs_deadline_from_rel_us(now, 0);
         CHECK(host::wait_timeout_ms_ceil(now, zero, kMaxMs) == 0,
               "a zero-microsecond request is already expired, not rounded up to 1 ms");
+    }
+
+
+    // -----------------------------------------------------------------------
+    // ARMS 18-21 (#3038) — the RELATIVE guest sleep intervals' conversion:
+    // guest_interval_from_timespec() and guest_interval_from_timeval(), which nanosleep(),
+    // select() and pselect() all now share.
+    //
+    // Same extraction rationale as arms 5-11 and 12-17, one step further out: what these replace
+    // was not merely inline, it was a HOST `struct timespec` built out of guest fields at the call
+    // site. On this platform that struct is wide enough and the arithmetic is right; on Windows x64
+    // `long tv_nsec` is 32 bits and it is not. So the case being tested is one this host's own
+    // types cannot express — which is exactly why the narrowing is MODELLED explicitly below rather
+    // than left to the compiler to demonstrate, and why the model is asserted to actually narrow
+    // before it is used as a foil (CLAUDE.md: construct one positive instance of the class by hand,
+    // outside whatever produced the null).
+    //
+    // What these arms deliberately do NOT claim: that a title's observed behaviour changes. Every
+    // LEGAL guest value fits in 32 bits of nanoseconds, so the truncation was correct by luck for
+    // any in-range input, and the defect it produced is an out-of-range value being silently
+    // re-mapped INTO range on one platform and refused on the other. The consequence that is
+    // platform-independent is the other one: `tv_usec * 1000` was a signed multiply on a
+    // guest-controlled int64 with no prior range check, i.e. undefined behaviour, and the range
+    // check now precedes the multiply so it cannot overflow at all.
+
+    // 18. THE TIMESPEC RANGE RULE, which is the same one k_nanosleep and hle_kernel.cpp's
+    //     k_cond_timedwait already applied and select()/pselect() did not.
+    {
+        const host::GuestInterval ok = host::guest_interval_from_timespec(3, 500000000ll);
+        CHECK(ok.valid && ok.ns == 3500000000ull,
+              "an in-range timespec converts to the exact nanosecond total");
+        CHECK(host::guest_interval_from_timespec(0, 0).valid &&
+              host::guest_interval_from_timespec(0, 0).ns == 0,
+              "a zero interval is VALID and zero, not a refusal");
+        CHECK(host::guest_interval_from_timespec(0, 999999999ll).ns == 999999999ull,
+              "the largest legal nanosecond field converts exactly");
+        CHECK(!host::guest_interval_from_timespec(0, 1000000000ll).valid,
+              "one nanosecond past a whole second is out of range and REFUSED, not carried");
+        CHECK(!host::guest_interval_from_timespec(-1, 0).valid, "a negative tv_sec is refused");
+        CHECK(!host::guest_interval_from_timespec(0, -1).valid, "a negative tv_nsec is refused");
+        CHECK(!host::guest_interval_from_timespec(INT64_MIN, INT64_MIN).valid,
+              "the most negative pair representable is refused rather than reinterpreted");
+        CHECK(!host::guest_interval_from_timespec(5, INT64_MAX).valid,
+              "a garbage 0x7fff... tv_nsec is refused, NOT turned into a near-infinite sleep");
+        // A refusal carries no interval, so a caller that ignored `valid` would sleep zero rather
+        // than some arbitrary residue. Fail-safe in the direction that matters: an unslept wait is
+        // a spin (loud), a wrongly long one is a hang (silent).
+        CHECK(host::guest_interval_from_timespec(5, INT64_MAX).ns == 0,
+              "...and a refused conversion reports a zero interval, never a residue");
+    }
+
+    // 19. THE TIMESPEC SATURATION BOUNDARY. tv_sec is guest-controlled, so the boundary where
+    //     sec * 1e9 + nsec would wrap is reachable by a hostile value, and a wrap there is the
+    //     long-to-short direction (a 584-year sleep becoming a short one).
+    {
+        constexpr uint64_t kNsMax   = ~0ull;
+        constexpr int64_t  kSecMax  = (int64_t)(kNsMax / 1000000000ull);   // 18446744073
+        constexpr int64_t  kNsecRem = (int64_t)(kNsMax % 1000000000ull);   // 709551615
+
+        const host::GuestInterval exact = host::guest_interval_from_timespec(kSecMax, kNsecRem);
+        CHECK(exact.valid && exact.ns == kNsMax,
+              "the largest exactly representable interval converts to UINT64_MAX, not a wrap");
+        const host::GuestInterval below = host::guest_interval_from_timespec(kSecMax, kNsecRem - 1);
+        CHECK(below.valid && below.ns == kNsMax - 1,
+              "one nanosecond below it is still exact, so the clamp is not binding early");
+        // THE BOUNDARY THE SIMPLER GUARD MISSES: sec == kSecMax passes a bare `sec > kSecMax`, and
+        // the addition of nsec is then what overflows.
+        const host::GuestInterval over = host::guest_interval_from_timespec(kSecMax, kNsecRem + 1);
+        CHECK(over.valid && over.ns == kNsMax,
+              "one nanosecond ABOVE it saturates on the addition, never wrapping to a short sleep");
+        CHECK(host::guest_interval_from_timespec(kSecMax + 1, 0).ns == kNsMax,
+              "and a seconds field past the bound saturates on the multiply");
+        CHECK(host::guest_interval_from_timespec(INT64_MAX, 999999999ll).ns == kNsMax,
+              "the widest legal pair saturates instead of wrapping");
+        // Nothing in the legal domain ever shortens: monotonic in the seconds field. The list must
+        // be ASCENDING -- an earlier revision put 1e12 before kSecMax (1.8e10) and the arm reddened
+        // on its own input, which is the cheap end of the failure this file's arm-16 comment
+        // records: an arm whose input does not express the property it names.
+        bool monotonic = true;
+        uint64_t prev = 0;
+        const int64_t seconds[] = {0, 1, 3, 1000, 1000000, 1000000000, kSecMax, INT64_MAX};
+        for (int64_t s : seconds) {
+            const host::GuestInterval r = host::guest_interval_from_timespec(s, 0);
+            if (!r.valid || r.ns < prev) { monotonic = false; break; }
+            prev = r.ns;
+        }
+        CHECK(monotonic, "the conversion never decreases as the requested seconds grow");
+    }
+
+    // 20. THE TIMEVAL CONVERSION, and the multiply that used to precede its range check. select()'s
+    //     sub-second field is MICROseconds, and `(long)(tv_usec * 1000)` did the multiply first --
+    //     signed overflow on a guest-controlled int64 with nothing having refused it.
+    {
+        const host::GuestInterval ok = host::guest_interval_from_timeval(3, 0);
+        CHECK(ok.valid && ok.ns == 3000000000ull,
+              "the argument #1660 captured live -- select(0,NULL,NULL,NULL,{3,0}) -- is 3 s");
+        CHECK(host::guest_interval_from_timeval(0, 999999ll).ns == 999999000ull,
+              "the largest legal tv_usec converts exactly, with the multiply in 64 bits");
+        CHECK(host::guest_interval_from_timeval(0, 150000ll).ns == 150000000ull,
+              "the 150 ms request test_select_sleep drives through the HLE converts to 150 ms");
+        CHECK(!host::guest_interval_from_timeval(0, 1000000ll).valid,
+              "a whole second of tv_usec is out of POSIX range and refused");
+        CHECK(!host::guest_interval_from_timeval(0, -1).valid, "a negative tv_usec is refused");
+        CHECK(!host::guest_interval_from_timeval(-1, 0).valid, "a negative tv_sec is refused");
+        CHECK(!host::guest_interval_from_timeval(0, INT64_MAX).valid,
+              "a tv_usec whose x1000 product would overflow int64 is refused BEFORE the multiply");
+        // The two spellings must agree wherever their domains overlap; select() and pselect() are
+        // the same idiom and a divergence between them would be #1873's class one layer down.
+        bool agree = true;
+        for (int64_t us : {0ll, 1ll, 999ll, 1000ll, 5330ll, 16667ll, 150000ll, 999999ll}) {
+            for (int64_t s : {0ll, 3ll, 1000000ll}) {
+                const host::GuestInterval a = host::guest_interval_from_timeval(s, us);
+                const host::GuestInterval b = host::guest_interval_from_timespec(s, us * 1000ll);
+                if (a.valid != b.valid || a.ns != b.ns) { agree = false; break; }
+            }
+        }
+        CHECK(agree,
+              "select's timeval and pselect's timespec agree identically on the shared domain");
+    }
+
+    // 21. THE 32-BIT NARROWING ITSELF — the case this host's own `long` cannot produce.
+    //
+    // `narrow_to_win_long()` models MinGW-w64's `long tv_nsec` (LLP64: 32 bits, where the guest's
+    // FreeBSD x86-64 field is 64). It is asserted to actually narrow before it is used, so a
+    // no-op model cannot make these arms pass vacuously.
+    {
+        CHECK(narrow_to_win_long(4294967296ll + 500ll) == 500ll,
+              "the model narrows: 2^32 + 500 ns becomes 500 ns, as `long tv_nsec` does on Win64");
+        CHECK(narrow_to_win_long(999999999ll) == 999999999ll,
+              "...and leaves every LEGAL nanosecond value alone: that is the 'correct by luck'");
+
+        // pselect's shape. A guest tv_nsec of 2^32 + 500 is out of range by any reading, and the
+        // narrowing maps it back INSIDE the legal window as a 500 ns sleep -- accepted on Windows,
+        // refused on Linux, from identical guest bytes.
+        const int64_t nsec_hi = 4294967296ll + 500ll;
+        CHECK(narrow_to_win_long(nsec_hi) >= 0 && narrow_to_win_long(nsec_hi) < 1000000000ll,
+              "an out-of-range tv_nsec narrows back INTO the legal window (the defect itself)");
+        CHECK(!host::guest_interval_from_timespec(0, nsec_hi).valid,
+              "...and the 64-bit conversion refuses it on every platform instead");
+
+        // select's shape, where the multiply happened first. tv_usec = 4,294,968 is 4.29 SECONDS;
+        // its x1000 product narrows to 704, so the old expression served a 4.29 s request with a
+        // 704 ns sleep -- six million times short, and only on Windows.
+        const int64_t usec_hi = 4294968ll;
+        CHECK(narrow_to_win_long(usec_hi * 1000ll) == 704ll,
+              "4,294,968 us -> a 704 ns `long tv_nsec`: the six-million-fold shortening");
+        CHECK(!host::guest_interval_from_timeval(0, usec_hi).valid,
+              "...and the 64-bit conversion refuses it, on Linux and Windows alike");
+
+        // The other side of the same narrowing: a product just past INT32_MAX goes NEGATIVE, which
+        // the host nanosleep rejects -- a different wrong answer from the same expression.
+        CHECK(narrow_to_win_long(2147484ll * 1000ll) < 0,
+              "a tv_usec just above 2.147e6 narrows to a NEGATIVE tv_nsec");
+        CHECK(!host::guest_interval_from_timeval(0, 2147484ll).valid,
+              "...also refused, so one expression no longer has three platform-dependent answers");
+
+        // The whole legal domain, swept: the narrowing is the identity there. This is the arm that
+        // says what the defect was NOT -- no in-range guest value was ever mis-served by it, so
+        // this fix is a robustness and cross-platform-consistency change, not a behaviour change
+        // for any input a title has been observed to pass.
+        bool identity_on_legal = true;
+        for (int64_t nsec = 0; nsec < 1000000000ll; nsec += 7919ll) {
+            if (narrow_to_win_long(nsec) != nsec) { identity_on_legal = false; break; }
+        }
+        CHECK(identity_on_legal,
+              "across the whole legal [0, 1e9) nanosecond range the narrowing is the identity");
+    }
+
+
+    // 22. THE DEADLINE CLAMP (#3038). sleep_until_steady_ns takes an UNSIGNED nanosecond count and
+    //     its POSIX backend converts to std::chrono::nanoseconds, whose rep is SIGNED -- so before
+    //     the clamp a deadline past INT64_MAX wrapped into the past and the sleep returned at once.
+    //     Measured before the fix, not inferred: sleep_until_steady_ns(INT64_MAX + 1) and
+    //     sleep_until_steady_ns(UINT64_MAX) each returned in 0 ms on this host.
+    //
+    //     It is reachable because every conversion in this family SATURATES at UINT64_MAX rather
+    //     than wrapping, so the guard against "a long sleep becomes a short one" was handing back
+    //     the shortest sleep there is. Asserted here as arithmetic rather than as a duration, for
+    //     the reason this whole file exists.
+    {
+        CHECK(host::clamp_deadline_to_signed_rep(0) == 0,
+              "a zero deadline is untouched");
+        CHECK(host::clamp_deadline_to_signed_rep(1700000000000000000ull) == 1700000000000000000ull,
+              "an ordinary deadline (~54 years of uptime) passes through unchanged");
+        CHECK(host::clamp_deadline_to_signed_rep((uint64_t)INT64_MAX) == (uint64_t)INT64_MAX,
+              "the largest representable deadline is exactly on the boundary, not one past it");
+        CHECK(host::clamp_deadline_to_signed_rep((uint64_t)INT64_MAX + 1u) == (uint64_t)INT64_MAX,
+              "one nanosecond past it clamps instead of wrapping to a time_point in the PAST");
+        CHECK(host::clamp_deadline_to_signed_rep(~0ull) == (uint64_t)INT64_MAX,
+              "a saturated UINT64_MAX deadline clamps -- this is the value the family produces");
+        // The property that matters is the SIGN of what the conversion then sees: never negative.
+        bool never_negative = true;
+        const uint64_t probes[] = {0ull, 1ull, (uint64_t)INT64_MAX - 1u, (uint64_t)INT64_MAX,
+                                   (uint64_t)INT64_MAX + 1u, ~0ull / 2u, ~0ull - 1u, ~0ull};
+        for (uint64_t d : probes)
+            if ((int64_t)host::clamp_deadline_to_signed_rep(d) < 0)
+                { never_negative = false; break; }
+        CHECK(never_negative,
+              "no input yields a NEGATIVE signed deadline, which is the whole of the defect");
+        // And the clamp is monotone, so it cannot reorder two deadlines relative to each other.
+        bool monotone = true;
+        for (size_t i = 1; i < sizeof(probes) / sizeof(probes[0]); i++) {
+            const uint64_t lo = probes[i - 1] < probes[i] ? probes[i - 1] : probes[i];
+            const uint64_t hi = probes[i - 1] < probes[i] ? probes[i] : probes[i - 1];
+            if (host::clamp_deadline_to_signed_rep(lo) > host::clamp_deadline_to_signed_rep(hi))
+                { monotone = false; break; }
+        }
+        CHECK(monotone, "clamping never reorders two deadlines");
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

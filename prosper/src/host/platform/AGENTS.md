@@ -23,6 +23,15 @@ Two of them are shutdown-related and are easy to confuse:
   so the drain can reach zero (#3225). It bounds that window rather than closing it, and its own
   header says so — do not let it be described as the fix for the missing join.
 
+One of them is half something else, and worth knowing before you go looking:
+**`precise_sleep.hpp` also holds this family's PURE ARITHMETIC** — deadline conversion, poll
+cadence, saturating guest-interval conversion — extracted from the callers in `src/hle/kernel/` and
+`src/hle/sync/` that use it. That is not scope creep. The arithmetic those callers need is mostly guarded by
+`#ifdef _WIN32` or buried inside an `HLE()` body, so in its original home it could not be compiled
+on a POSIX host at all, let alone driven through its saturating and out-of-range cases; here it is
+`constexpr`, platform-neutral, and exercised by `tests/host/platform/test_precise_sleep.cpp` with a
+fake clock on every platform. Put the next one here too rather than inline at a call site.
+
 New code belongs here only if it is genuinely process-wide, genuinely host-level, and genuinely free
 of OS-integration dependencies. Per-platform *image* mapping and execution live in `src/host/image/`;
 memory and TLS have their own sibling folders.

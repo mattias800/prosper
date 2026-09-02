@@ -869,6 +869,13 @@ if(TARGET prosper_core)
   add_executable(test_select_sleep tests/hle/kernel/test_select_sleep.cpp)
   target_link_libraries(test_select_sleep PRIVATE prosper_core)
   add_test(NAME select_sleep COMMAND test_select_sleep)
+  # This test drives real sleeps through the HLE, and its #3038 arms feed it timeouts a regression
+  # would take LITERALLY: carrying an out-of-range tv_nsec into the total makes 0x7fff... a
+  # 292-year wait, so the failure mode is a wedge rather than a red. Measured while mutation-testing
+  # this PR -- with the range rule removed, test_select_sleep does not return. A bound turns that
+  # into a legible timeout instead of ctest's 25-minute default. The whole run is ~0.5 s, so 60 s is
+  # a hundredfold headroom and cannot flake under load.
+  set_tests_properties(select_sleep PROPERTIES TIMEOUT 60)
 
   # Opt-in flip-paced monotonic clock (#240): exact frame steps, thread-safe first-flip anchor,
   # and no coupling into CLOCK_REALTIME while virtual time is paused between flips.

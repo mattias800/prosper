@@ -29,7 +29,7 @@
 
 namespace prosper::hle {
 
-enum class WaitKind { Usleep, Nanosleep, SleepSeconds, SemTimedwait, CondTimedwait,
+enum class WaitKind { Usleep, Nanosleep, SleepSeconds, Select, SemTimedwait, CondTimedwait,
                      CondTimedwaitSce, MutexTimedlock, Count };
 
 inline const char* wait_kind_name(WaitKind k) {
@@ -37,6 +37,12 @@ inline const char* wait_kind_name(WaitKind k) {
     case WaitKind::Usleep:        return "usleep";
     case WaitKind::Nanosleep:     return "nanosleep";
     case WaitKind::SleepSeconds:  return "sleep(s)";
+    // select() and pselect() share ONE bucket. They are the same idiom -- the descriptor-free
+    // pure-sleep shape #1660 records -- reached through two spellings, and this census answers
+    // "which primitive does this title pace on", to which the spelling is not the answer. Added by
+    // #3038, which took this path off the winpthreads tick: before that it was the one sleep entry
+    // point the census could not see.
+    case WaitKind::Select:        return "select";
     case WaitKind::SemTimedwait:  return "sem_timedwait";
     case WaitKind::CondTimedwait: return "cond_timedwait";
     case WaitKind::CondTimedwaitSce: return "sceCondTimedwait";
