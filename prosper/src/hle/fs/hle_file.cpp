@@ -14,6 +14,7 @@
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "gpu/timeline/gpu_timeline.hpp" // optional exact guest-stdout capture gate
 #include "host/memory/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
+#include "host/memory/guest_memory_search.hpp" // #3142: PROSPER_ZEROWATCH_FIND -- did the payload MOVE?
 #include "host/image/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
 #include <cctype>        // #1237: case-insensitive PROSPER_DENY_SUBSTR matching
 #include <cstdio>
@@ -2736,6 +2737,28 @@ struct ZeroWatchEntry {
     uint64_t seed_off = 0;
     const char* path = "?";
     bool seen_nonzero = false, reported = false;
+    // #3142: a verbatim copy of the SOURCE bytes at seed_off, so that after the range goes quiet the
+    // guest's whole address space can be searched for them. Kept from the source rather than read
+    // back from the destination, for the same reason the seed scan uses the source: the payload is
+    // the oracle, and re-reading the destination would sample whatever is there now.
+    uint8_t seed[256] = {0};
+    // A SECOND window, taken from the LAST non-zero place in the payload rather than the first.
+    // Window 0 of a streamed UE4 chunk is its serialization header, and a header is exactly the part
+    // an engine does NOT carry into a tiled texture -- so a scan seeded only from it would report
+    // "the payload did not move" for a payload whose pixels moved. seed_deep is pixel data.
+    uint8_t seed_deep[256] = {0};
+    uint64_t seed_deep_off = 0;
+    bool has_seed_deep = false;
+    // The SOURCE's own non-zero census over the same 16 windows the flip profile reads, so a window
+    // that is zero in the destination can be told apart from a window the payload never filled.
+    uint8_t src_profile[16] = {0};
+    // The flip profile is one instant. A range whose payload survives the flip can still be cleared
+    // later -- #3142's own subject case was sampled 62 s after its load -- so "only the head went"
+    // has to be re-checked, or it is the same one-sample overreach it corrects.
+    uint64_t t_reported = 0;
+    int reprofiles_done = 0;
+    bool find_control_done = false;      // the "the data IS findable" arm has run
+    bool find_control_found = false;
 };
 std::mutex g_zw_mx;
 std::vector<ZeroWatchEntry> g_zw;
@@ -2766,17 +2789,150 @@ bool zw_read256(uint64_t addr, uint32_t* out) {
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 256;
 }
 
+// DIAGNOSTIC (PROSPER_ZEROWATCH_FIND=N): follow the CONTENT, not the address.
+//
+// #3142 established that these ranges hold their payload and later read zero, and that the writer
+// of the zeros is the guest's own libc. That leaves exactly two readings, and they need opposite
+// fixes: either the engine MOVED the asset and prosper is still pointed at the buffer it moved it
+// out of (a descriptor defect), or the asset exists nowhere afterwards (the engine consumed it into
+// a form prosper never followed). Every instrument on the issue so far samples the ADDRESS, which
+// cannot tell those apart. This one searches the guest's whole readable address space for the
+// payload's own bytes.
+//
+// It runs TWICE per watched range and both runs are load-bearing:
+//   * CONTROL, on the first poll while the data is still there. It must find the payload -- at the
+//     destination itself, and anywhere else the engine has already copied it. If the control finds
+//     nothing, the scanner is not seeing this address space and the second scan's null is void.
+//     This is not a same-source control: the needle is the APR source buffer, and the haystack is
+//     the guest's mappings enumerated from /proc/self/maps, which share no code with it.
+//   * AFTER-ZERO, at the transition. Hits elsewhere name where the engine put the asset.
+//
+// N caps how many ranges are scanned (each costs two full sweeps of guest memory). The scans run on
+// the poll thread and take seconds, so the "WENT-ZERO after Xs" figures in a FIND run are inflated
+// for every OTHER entry -- do not quote timings from a run with this armed.
+int zerowatch_find_budget() {
+    static int v = [] {
+        const char* e = getenv("PROSPER_ZEROWATCH_FIND");
+        if (!e || !*e) return 0;
+        int n = atoi(e);
+        return n > 0 ? n : 1;
+    }();
+    return v;
+}
+
+// How many leading bytes of the seed window must match. 32 is the default; 16 is the length that
+// SURVIVES Gen5 tiling, which is the reason it is tunable at all. An 8x8-element micro-tile stores
+// its elements in Morton order, so for a block-compressed surface elements (0,0) and (1,0) -- two
+// consecutive 8-byte BC1 blocks, i.e. 16 bytes -- stay adjacent, while (2,0) lands four elements
+// away. A 32-byte needle therefore reports "absent" for a payload the guest merely re-tiled, and a
+// 16-byte one does not. Shorter than 16 is not offered: below that the needle stops being evidence.
+size_t zerowatch_find_prefix() {
+    static size_t v = [] {
+        const char* e = getenv("PROSPER_ZEROWATCH_FIND_PREFIX");
+        if (!e || !*e) return (size_t)32;
+        long n = strtol(e, nullptr, 0);
+        if (n < 16 || n > 256) {
+            fprintf(stderr, "[zerowatch-find] PROSPER_ZEROWATCH_FIND_PREFIX=%s is outside 16..256 "
+                            "-- using 32\n", e);
+            return (size_t)32;
+        }
+        return (size_t)n;
+    }();
+    return v;
+}
+
+void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, uint64_t needle_off,
+             const char* window, bool* found_out) {
+    std::vector<prosper::host::MemorySearchHit> hits;
+    // The GUEST's address space only: [0x100000000, kGuestAutoMapLimit). prosper's own host
+    // allocations sit at 0x7f... on this host and a wider scan does find the payload there -- in
+    // prosper's buffers, which answers nothing about where the GUEST put the data and buries the
+    // guest hits under a hit cap. The question is strictly "does a guest-visible copy exist".
+    //
+    // Never skip the destination itself. A hit AT the destination is the most informative thing the
+    // control arm can produce -- it proves the scanner reaches the exact mapping in question -- and
+    // at AFTER-ZERO time its absence is the fact being reported. The APR staging buffer is
+    // munmapped by then, so the needle cannot find its own source.
+    const prosper::host::MemorySearchScope sc = prosper::host::guest_memory_search(
+        /*lo=*/0x100000000ull, /*hi=*/0x40000000000ull,
+        /*skip_begin=*/0, /*skip_end=*/0,
+        needle, zerowatch_find_prefix(), /*needle_len=*/256,
+        /*byte_budget=*/0, /*max_hits=*/32, hits);
+    if (found_out) *found_out = !hits.empty();
+    std::string list;
+    char buf[64];
+    for (const auto& h : hits) {
+        snprintf(buf, sizeof buf, " 0x%llx%s", (unsigned long long)h.addr, h.full ? "" : "(prefix)");
+        list += buf;
+    }
+    fprintf(stderr,
+            "[zerowatch-find] t=%llu %s dst=0x%llx window=%s seed-off=0x%llx prefix=%zu hits=%zu%s%s "
+            "scope=ranges:%u/unreadable:%u scanned:%lluMiB/unreadable:%lluMiB%s%s\n",
+            (unsigned long long)prosper::diagnostics::diag_now_us(), when,
+            (unsigned long long)e.dst, window, (unsigned long long)needle_off,
+            zerowatch_find_prefix(), hits.size(),
+            list.empty() ? "" : " at", list.c_str(),
+            sc.ranges_scanned, sc.ranges_unreadable,
+            (unsigned long long)(sc.bytes_scanned >> 20),
+            (unsigned long long)(sc.bytes_unreadable >> 20),
+            sc.budget_exhausted ? " TRUNCATED-BY-BUDGET" : "",
+            sc.hits_capped ? " HIT-CAP-REACHED" : "");
+}
+
+// HOW MUCH went away. A WENT-ZERO verdict is a statement about ONE 256-byte window, and #3142 read
+// it as a statement about the whole payload. This profiles 16 windows across the destination and
+// prints each beside the SOURCE's own count at the same window, so "the range was zeroed" and "the
+// first page was zeroed" stop being the same log line -- and so a window the payload never filled
+// is not mistaken for one that lost its data.
+void zw_profile(const ZeroWatchEntry& e, const char* when) {
+    char prof[640]; int used = 0;
+    uint32_t zero_windows = 0, live_windows = 0;
+    for (uint32_t w = 0; w < 16; ++w) {
+        const uint64_t off = (((e.size - 256ull) / 15ull) * w) & ~(uint64_t)3;
+        uint32_t dw[64], nzw = 0;
+        if (!zw_read256(e.dst + off, dw)) {
+            used += snprintf(prof + used, sizeof prof - (size_t)used, " w%u=??", w);
+            continue;
+        }
+        for (uint32_t k = 0; k < 64; ++k) if (dw[k]) ++nzw;
+        if (e.src_profile[w]) { if (nzw) ++live_windows; else ++zero_windows; }
+        used += snprintf(prof + used, sizeof prof - (size_t)used, " w%u=%u/%u", w, nzw,
+                         e.src_profile[w]);
+    }
+    fprintf(stderr,
+            "[zerowatch] t=%llu dst=0x%llx zero-profile(%s) payload-windows lost=%u kept=%u "
+            "(dst/src non-zero dwords per 256B window):%s\n",
+            (unsigned long long)prosper::diagnostics::diag_now_us(),
+            (unsigned long long)e.dst, when, zero_windows, live_windows, prof);
+}
+
 // Runs until the process ends, and is never joined. That is safe here only because every exit path
 // in this project is _Exit -- prosper-app, tools/screenshot, and the guest's own _exit and fatal
 // raise -- so no static this thread touches is ever destroyed under it. A normal `return` from main
 // would make this a use-after-free, so if an exit path ever stops being _Exit, this thread needs a
 // stop flag before that lands.
 void zerowatch_poll_forever() {
+    // #3142: the content scans below take SECONDS and must not run under g_zw_mx -- zerowatch_arm()
+    // takes that lock on the APR write path, so holding it across a scan would stall every guest
+    // file read for the duration and change the very load timing this diagnostic reports on.
+    // Entries are copied out under the lock and scanned after it is released.
+    std::vector<std::pair<ZeroWatchEntry, const char*>> pending_find;
+    int find_left = zerowatch_find_budget();
     for (;;) {
         {
             std::lock_guard<std::mutex> lk(g_zw_mx);
             for (auto& e : g_zw) {
-                if (e.reported) continue;
+                if (e.reported) {
+                    // Re-profile a flipped range twice more, so a payload that survived the flip is
+                    // re-checked rather than assumed to have gone on surviving.
+                    static const uint64_t kAt[2] = { 10ull * 1000000, 45ull * 1000000 };
+                    if (e.reprofiles_done < 2 &&
+                        prosper::diagnostics::diag_now_us() - e.t_reported >= kAt[e.reprofiles_done]) {
+                        zw_profile(e, e.reprofiles_done == 0 ? "+10s" : "+45s");
+                        ++e.reprofiles_done;
+                    }
+                    continue;
+                }
                 uint32_t w[64];
                 if (!zw_read256(e.dst + e.seed_off, w)) {
                     e.reported = true;
@@ -2790,7 +2946,16 @@ void zerowatch_poll_forever() {
                 }
                 uint32_t nz = 0;
                 for (uint32_t k = 0; k < 64; ++k) if (w[k]) ++nz;
-                if (nz) { e.seen_nonzero = true; continue; }
+                if (nz) {
+                    e.seen_nonzero = true;
+                    // The control arm, taken while the payload is demonstrably still present.
+                    if (find_left > 0 && !e.find_control_done) {
+                        e.find_control_done = true;
+                        --find_left;
+                        pending_find.push_back({e, "CONTROL"});
+                    }
+                    continue;
+                }
                 // All-zero at the window the payload was non-zero at, so this range HELD data and
                 // no longer does. `seen_nonzero` is guaranteed true for every entry (arming returns
                 // early otherwise), which is why the probe reading `seed_off` rather than offset 0
@@ -2800,6 +2965,7 @@ void zerowatch_poll_forever() {
                 // changed -- and would burn the one-shot write-trace report on a non-event.
                 {
                     e.reported = true;
+                    e.t_reported = prosper::diagnostics::diag_now_us();
                     fprintf(stderr,
                             "[zerowatch] t=%llu dst=0x%llx size=%llu sampled=256B@0x%llx armed-via=%s "
                             "WENT-ZERO after %.3fs  maps=%s\n",
@@ -2818,10 +2984,41 @@ void zerowatch_poll_forever() {
                     // file. There is no "stale view" case for MAP_SHARED to exclude, which makes an
                     // all-zero read proof that the CONTENT was zeroed rather than proof that this
                     // view stopped tracking it.
+                    // HOW MUCH went away. The verdict above is a statement about ONE 256-byte
+                    // window, and #3142 read it as a statement about the whole payload. Profile 16
+                    // windows across the destination at the instant of the flip, so "the range was
+                    // zeroed" and "the first page was zeroed" stop being the same log line. Read
+                    // against the SOURCE's own profile, printed beside it, because a window the
+                    // payload never filled is not evidence of anything.
+                    zw_profile(e, "at-flip");
                     host::guest_dmem_write_trace_report();
+                    // Only worth searching for the payload of a range whose control scan already
+                    // proved the scanner can see it. Without that pairing an empty AFTER-ZERO
+                    // result would be unfalsifiable -- indistinguishable from a scanner that never
+                    // reached this address space at all.
+                    if (e.find_control_done && e.find_control_found)
+                        pending_find.push_back({e, "AFTER-ZERO"});
+                    else if (e.find_control_done)
+                        fprintf(stderr, "[zerowatch-find] dst=0x%llx AFTER-ZERO scan SKIPPED -- its "
+                                        "control scan found nothing, so a null here would be void\n",
+                                (unsigned long long)e.dst);
                 }
             }
         }
+        // Outside the lock: see the note at the top of this function.
+        for (auto& p : pending_find) {
+            bool found = false, found_deep = false;
+            zw_find(p.first, p.second, p.first.seed, p.first.seed_off, "first", &found);
+            if (p.first.has_seed_deep)
+                zw_find(p.first, p.second, p.first.seed_deep, p.first.seed_deep_off, "deep",
+                        &found_deep);
+            if (strcmp(p.second, "CONTROL") == 0) {
+                std::lock_guard<std::mutex> lk(g_zw_mx);
+                for (auto& e : g_zw)
+                    if (e.dst == p.first.dst) e.find_control_found = found || found_deep;
+            }
+        }
+        pending_find.clear();
         struct timespec ts { 0, 50 * 1000 * 1000 };   // 50 ms
         nanosleep(&ts, nullptr);
     }
@@ -2860,6 +3057,28 @@ void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* pat
     // load itself delivered zeros, which `apr_verify_write` reports on the same write. There is no
     // disappearance to watch for.
     if (!e.seen_nonzero) return;
+    // #3142: keep the payload's own bytes at the seeded window so PROSPER_ZEROWATCH_FIND can search
+    // for them later. Copied from the SOURCE, which is the oracle -- the destination is what the
+    // question is about.
+    memcpy(e.seed, p8 + e.seed_off, sizeof e.seed);
+    for (uint32_t w = 0; w < 16; ++w) {
+        const uint64_t off = (((size - 256ull) / 15ull) * w) & ~(uint64_t)3;
+        uint32_t nzw = 0;
+        const uint32_t* sw = (const uint32_t*)(p8 + off);
+        for (uint32_t k = 0; k < 64; ++k) if (sw[k]) ++nzw;
+        e.src_profile[w] = (uint8_t)nzw;
+    }
+    for (int w = 7; w >= 0; --w) {
+        const uint64_t off = (((size - 256ull) / 7ull) * (uint32_t)w) & ~(uint64_t)3;
+        if (off <= e.seed_off) break;
+        bool nz = false;
+        for (uint32_t k = 0; k < 256 && !nz; ++k) if (p8[off + k]) nz = true;
+        if (!nz) continue;
+        e.seed_deep_off = off;
+        e.has_seed_deep = true;
+        memcpy(e.seed_deep, p8 + off, sizeof e.seed_deep);
+        break;
+    }
     g_zw.push_back(e);
     if (!g_zw_thread.exchange(true)) std::thread(zerowatch_poll_forever).detach();
 }
