@@ -20,6 +20,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
+#include "gpu/resources/atomic_image_staging.hpp"  // #3195: the LOGICAL/PHYSICAL atomic-image extent split
 #include "gpu/resources/image_identity.hpp"
 #include "gpu/resources/spirv_storage_match.hpp"  // #3204: SPIR-V/guest storage agreement  // #3204: named image-identity predicates
 #include "gpu/texture/tile.hpp"
@@ -5649,47 +5650,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // #2265: one shared shape test with the lowering gate and the descriptor validator.
             buffers[i].atomic_image = descriptor.atomic_access &&
                 shader_resource_supports_atomic_image_buffer(*resource);
-            buffers[i].atomic_layers = buffers[i].atomic_image
-                ? shader_resource_atomic_image_layers(*resource) : 1u;
-            // LOGICAL staging extent -- what the shader indexes, tightly packed across layers.
-            const uint64_t linear_image_bytes = static_cast<uint64_t>(resource->width) *
-                resource->height * buffers[i].atomic_layers * sizeof(uint32_t);
+            // #3195: the LOGICAL/PHYSICAL extent split is named and tested in
+            // gpu/resources/atomic_image_staging.hpp -- read its header comment before touching
+            // either byte count, because they differ only by tile padding and swapping them
+            // under-bounds the readability probe rather than failing.
+            AtomicImageStagingExtents staging;
             if (buffers[i].atomic_image) {
-                const size_t tight_pitch = static_cast<size_t>(resource->width) * sizeof(uint32_t);
-                // PHYSICAL slice footprint. Deliberately NOT the logical w*h*4: a tiled slice is a
-                // padded, 64 KiB-aligned unit, so using the logical size here would under-bound the
-                // readability probe and the detile source would walk past the region proven
-                // readable. Measured for CrossWorlds' (3840, 2160, bpe 4, tile 27): physical
-                // 33,423,360 against logical 33,177,600, and tiled_mip_chain_bytes -- which is
-                // documented as the array slice stride -- returns the same 33,423,360, so the two
-                // candidate strides agree and the slice needs no further alignment.
-                buffers[i].atomic_slice_bytes = resource->tile_mode
-                    ? tiled_surface_bytes(resource->width, resource->height,
-                                          resource->tile_mode, 0, sizeof(uint32_t))
-                    : (resource->linear_row_pitch_bytes
-                           ? static_cast<size_t>(resource->linear_row_pitch_bytes)
-                           : tight_pitch) * resource->height;
-                const size_t guest_image_bytes =
-                    buffers[i].atomic_slice_bytes * buffers[i].atomic_layers;
-                if (linear_image_bytes > UINT32_MAX ||
-                    (!resource->tile_mode && resource->linear_row_pitch_bytes &&
-                     resource->linear_row_pitch_bytes < tight_pitch) ||
-                    !guest_image_bytes || guest_image_bytes > UINT32_MAX) {
+                staging = atomic_image_staging_extents(*resource);
+                buffers[i].atomic_layers = staging.layers;
+                buffers[i].atomic_slice_bytes = staging.slice_bytes;
+                if (!staging.valid) {
                     skip_buffer(descriptor.binding, resource,
                                 "invalid atomic-image buffer layout");
                     break;
                 }
-                if ((!resource->host_data || resource->host_data_size < guest_image_bytes) &&
+                if ((!resource->host_data || resource->host_data_size < staging.guest_bytes) &&
                     !guest_readable(resource->gpu_addr,
-                                    static_cast<uint32_t>(guest_image_bytes))) {
+                                    static_cast<uint32_t>(staging.guest_bytes))) {
                     skip_buffer(descriptor.binding, resource,
                                 "unreadable atomic-image physical backing");
                     break;
                 }
-                buffers[i].guest_bytes = guest_image_bytes;
+                // The PHYSICAL extent, from here on. Every later guest-side question about this
+                // binding -- the source pointer's bound, the write-back notification -- asks with
+                // it, which is why those sites need no atomic_image special case.
+                buffers[i].guest_bytes = staging.guest_bytes;
             }
             buffers[i].bytes = buffers[i].atomic_image
-                ? static_cast<size_t>(linear_image_bytes)
+                ? static_cast<size_t>(staging.linear_bytes)
                 : static_cast<size_t>(materialization.binding_bytes);
             for (size_t j = 0; j < i; ++j) {
                 const ShaderResource* prior = buffers[j].resource;
@@ -5714,9 +5702,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (buffers[i].alias_of == SIZE_MAX) {
-                const uint8_t* source = buffers[i].atomic_image
-                    ? resource_bytes_for(resource, buffers[i].guest_bytes)
-                    : resource_bytes_for(resource, buffers[i].guest_bytes);
+                // #3195: one call, not a ternary. `guest_bytes` already holds the extent each
+                // path needs -- the PHYSICAL padded footprint for an atomic image (assigned
+                // above), the materialization's logical size otherwise -- so both arms of the
+                // ternary that used to stand here were the same expression. The arms converged
+                // when the non-atomic one adopted the bounded call in "gpu: honor scalar buffer
+                // descriptor bounds"; the atomic arm was never changed, so no extent was dropped.
+                const uint8_t* source = resource_bytes_for(resource, buffers[i].guest_bytes);
                 if (buffers[i].atomic_image) {
                     buffers[i].linear_seed.resize(buffers[i].bytes);
                     // #2265: per-layer 2D detile at the physical slice stride, into a tightly
@@ -9408,9 +9400,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 readback_ok = false;
                 break;
             }
-            uint8_t* destination = buffer.atomic_image
-                ? resource_bytes_for(buffer.resource, buffer.guest_bytes)
-                : resource_bytes_for(buffer.resource, buffer.guest_bytes);
+            // #3195: the write-back mirror of the upload's source bound, and identical for the
+            // same reason -- `guest_bytes` is already per-path.
+            uint8_t* destination = resource_bytes_for(buffer.resource, buffer.guest_bytes);
             const auto* result = static_cast<const uint8_t*>(mapped);
             if (buffer.atomic_image) {
                 if (trace) {
