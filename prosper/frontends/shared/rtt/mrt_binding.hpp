@@ -144,6 +144,43 @@ bool mrt_same_color_pass(const prosper::gpu::DrawItem& first,
     return true;
 }
 
+// Can two consecutive draws share one pass given their FIXED-FUNCTION RESOLVE identity?
+//
+// A CB_COLOR_CONTROL.MODE=RESOLVE draw is not an ordinary draw: live_renderer answers it with a
+// straight copy of the already-rendered `color0_base` surface into `color1_base` and then ends the
+// group, because a resolve is a copy and not a render. Two consequences follow, and the predicate
+// has to carry both.
+//
+// 1. A resolve must never group with an ordinary draw. It shares `color0_base` with the scene it
+//    resolves and reports `mrt_active_color(draw, 1) == 0` -- a fixed-function resolve exports
+//    nothing, so its `color1_write_mask` is 0 and slot 1 contributes no attachment -- so on colour
+//    identity alone it would merge with those scene draws, and the copy's `continue` would then
+//    silently drop every ordinary draw grouped after it.
+//
+// 2. Two resolves must not group unless they resolve into the SAME destination. `cb_resolve` alone
+//    is a boolean and cannot separate one resolve from another, while slot 1 -- the slot the
+//    destination lives in -- is inactive for every resolve and so contributes no discriminating
+//    term to `mrt_same_color_pass`. Consecutive resolves sharing a source and naming DIFFERENT
+//    `color1_base` destinations therefore satisfied every grouping term, became one pass, and had
+//    one copy performed from the group's first draw; every other destination was discarded with no
+//    copy, no render and no diagnostic (#3025). The destination the copy acts with is the raw
+//    `color1_base`, so that is the field the group must be keyed on -- the same principle #3023
+//    established for slot 0: THE IDENTITY A PASS GROUPS ON MUST BE THE IDENTITY IT ACTS WITH.
+//
+// With the destination in the key, every member of a resolve group names one source and one
+// destination, so the single copy the group performs is exactly right for all of them and no member
+// needs its own.
+//
+// Deliberately keyed on the RAW named field rather than on `mrt_active_color(draw, 1, ...)`, for
+// the same reason the copy reads it raw: a fixed-function resolve's slot 1 is never active, so the
+// active-binding rule reports 0 for every resolve and would key the group on a constant.
+inline bool mrt_same_resolve_pass(const prosper::gpu::DrawItem& first,
+                                  const prosper::gpu::DrawItem& candidate) {
+    if (first.ps.cb_resolve != candidate.ps.cb_resolve) return false;
+    if (!first.ps.cb_resolve) return true;
+    return first.color1_base == candidate.color1_base;
+}
+
 // Does this draw bind the sampled VIEW as any ACTIVE colour target? Address alone is insufficient:
 // packed mip tails may give two levels the same guest base even though they are separate Vulkan
 // images. Known, conflicting extents therefore prove that the sampled view is not the attachment.

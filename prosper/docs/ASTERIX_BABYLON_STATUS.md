@@ -649,6 +649,17 @@ HLE registration. #1599, #1884.
   readback. It returned the same `792bed5a3f02a383` uniformly-black pixels and byte-identical BMP as
   operation 4 and the op6 destination. Both resolves therefore copy black to black in this capture;
   neither loses useful color. This is localization evidence only; rung remains 0.
+- **The existing MSAA evidence here already covers #3025 (consecutive resolves grouping into one
+  pass, all but the first destination dropped):** falsified — it cannot, in either direction. This
+  submit has the exact shape the defect needs: four `MODE=RESOLVE` operations at 5, 6, 9 and 10, in
+  two ADJACENT pairs, all four reading one source (`4→5`, `4→6`, `4→9`, `4→10`), so nothing separates
+  a pair into two passes but the destination term #3025 added. But every measurement above reads
+  `792bed5a3f02a383` — uniformly black — for op4's source and for both recorded destinations, so a
+  destination that was never written is byte-identical to one that was, and neither the op6 nor the
+  op10 selector could have distinguished them. Whether ops 5 and 9 name a *different* `color1_base`
+  from their partners is not recorded anywhere, so whether the defect fires on this title is
+  **untested, not ruled out** — re-derive the four raw `color1_base` values from a fresh capture
+  before treating this submit as unaffected. #3025.
 - **An omitted immediately preceding submit as operation 4's black temporal input:** a bounded two-frame
   whole-frame capture contains consecutive submits 180 and 181. Resolve-aware scanning identifies submit
   180 operation 4 as the last semantic writer of submit 181 operation 4's same run-local `0x2033b10000`
