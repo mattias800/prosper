@@ -8,6 +8,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -3958,6 +3959,89 @@ using prosper::gpu::HostReadBarrier;
 using prosper::gpu::host_read_barrier_for;
 using prosper::gpu::backend_host_read_barrier_count;
 using prosper::gpu::record_host_read_barrier;
+
+// Two transfer WRITES to the same image subresource need a MEMORY dependency, not just an execution
+// one (#3248).
+//
+// An execution dependency -- which any vkCmdPipelineBarrier between them provides, whatever image
+// its VkImageMemoryBarrier names -- orders the two commands. It does not make the first write
+// AVAILABLE, so the second write is not ordered against it in the memory-access sense and the final
+// contents of the overlapping region are undefined. Synchronization validation calls this
+// SYNC-HAZARD-WRITE-AFTER-WRITE and it is the shape of the mip-assembly defect in #3248: a full-image
+// vkCmdClearColorImage followed by per-level vkCmdCopyImage, with barriers only on the copy SOURCES.
+//
+// The failure mode is why this is worth a helper rather than an inline barrier. Assembly deliberately
+// clears to BLACK so a level the guest never rendered stays unavailable instead of being invented from
+// a neighbour. If the clear lands after a copy, the level it eats reads as "missing" -- exactly what a
+// correct run produces on purpose -- so the defect cannot be seen in the output it corrupts.
+struct TransferWriteAfterWriteBarrier {
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    VkPipelineStageFlags src_stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+};
+
+// Pure, so the masks and the subresource scope can be asserted with no device
+// (`mip_assembly_barrier` ctest case). No layout transition: both writes happen in
+// TRANSFER_DST_OPTIMAL, and oldLayout == newLayout keeps the contents defined.
+inline TransferWriteAfterWriteBarrier transfer_write_after_write_barrier_for(
+        VkImage image, const VkImageSubresourceRange& range,
+        VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    TransferWriteAfterWriteBarrier waw{};
+    waw.barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    waw.barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    waw.barrier.oldLayout = layout;
+    waw.barrier.newLayout = layout;
+    waw.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    waw.barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    waw.barrier.image = image;
+    waw.barrier.subresourceRange = range;
+    waw.src_stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    waw.dst_stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    return waw;
+}
+
+// How many transfer write-after-write barriers this process has recorded. Same role as
+// backend_host_read_barrier_count(): on every driver this project runs on the UNFIXED code returns
+// correct pixels, so a structural counter is the only thing a test can falsify. Relaxed and
+// process-wide -- an instrument, never a control input.
+inline std::atomic<uint64_t>& backend_transfer_waw_barrier_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+inline void record_transfer_write_after_write_barrier(
+        VkCommandBuffer command, VkImage image, const VkImageSubresourceRange& range,
+        VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    if (!command || !image) return;
+    const TransferWriteAfterWriteBarrier waw =
+        transfer_write_after_write_barrier_for(image, range, layout);
+    vkCmdPipelineBarrier(command, waw.src_stages, waw.dst_stages, 0,
+                         0, nullptr, 0, nullptr, 1, &waw.barrier);
+    backend_transfer_waw_barrier_count().fetch_add(1, std::memory_order_relaxed);
+}
+
+// Diagnostic-arming instruments (#3248). Both are read by the `render_diagnostic_paths` ctest case,
+// which exists so the env-gated render diagnostics execute at least once under the validation layer:
+// they were invisible to tools/vkval for a second reason on top of syncval being off -- no test ran
+// them at all, so the layer never saw the state they record.
+inline std::atomic<uint64_t>& backend_geom_probe_armed_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+// Incremented when the probe was ASKED for a draw whose last pre-rasterization stage does not
+// declare the transform-feedback capture -- the case that used to arm anyway and report the
+// resulting silence as "the draw produced no primitives".
+inline std::atomic<uint64_t>& backend_geom_probe_undeclared_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+// One per PROSPER_DRAW_ISO re-render pass (the kill=-1 baseline plus one per killed draw).
+inline std::atomic<uint64_t>& backend_draw_iso_pass_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
 
 // CONTRACT: a pure TRANSFER_DST (readback) buffer may be backed by HOST_CACHED memory that is NOT
 // HOST_COHERENT. Call invalidate_mapped_readback() after mapping and before reading one, and do not
@@ -8631,6 +8715,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
             vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &missing_level_clear, 1, &missing_level_range);
+            // #3248: the clear and the per-level copies below both WRITE this image, and every
+            // barrier inside the loop names the copy SOURCE. Ordering the two writes needs a memory
+            // dependency on the DESTINATION -- see record_transfer_write_after_write_barrier for why
+            // the resulting corruption is invisible in the output.
+            record_transfer_write_after_write_barrier(cmd, upload.image, missing_level_range);
             for (uint32_t level = 0; level < upload.key.mip_levels; ++level) {
                 const uint32_t level_w = std::max(upload.key.width >> level, 1u);
                 const uint32_t level_h = std::max(upload.key.height >> level, 1u);
@@ -8920,7 +9009,44 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }) && geom_target < draws.size())
             geom_item = static_cast<size_t>(geom_target);
     }
-    const bool geom_probe = geom_item != SIZE_MAX &&
+    // #3248: arm only when the module the backend is about to hand Vulkan actually declares the
+    // capture. Transform feedback records nothing without it, and the probe used to report that
+    // silence as "the draw produced no primitives" -- a wrong answer, not a missing one. Every
+    // refusal below says which precondition failed, so the instrument never returns silently.
+    const bool geom_xfb_declared = geom_item != SIZE_MAX && [&] {
+        // The last pre-rasterization stage is the generated geometry stage when there is one, and
+        // the vertex stage otherwise -- transform feedback captures that stage and no other.
+        const BackendDraw& probed = draws[geom_item];
+        return gpu::spirv_declares_xfb_capture(
+            probed.gs_words().empty() ? probed.vs_words() : probed.gs_words());
+    }();
+    if (geom_item != SIZE_MAX && flush_now) {
+        // Both reasons are reported independently, and the undeclared one is COUNTED independently
+        // of transform-feedback support: it is a property of the module, so a device without the
+        // extension must not make the check look like it passed.
+        // Printed once per process per reason -- a live title flushes many times a second and the
+        // condition cannot change between them, so repeating it would bury the run's real output.
+        // The COUNTERS are exact regardless; they are what the test reads.
+        static std::atomic<bool> said_undeclared{false}, said_no_extension{false};
+        if (!geom_xfb_declared) {
+            backend_geom_probe_undeclared_count().fetch_add(1, std::memory_order_relaxed);
+            if (!said_undeclared.exchange(true, std::memory_order_relaxed))
+                fprintf(stderr,
+                        "[geom-probe] draw=%llu: REFUSING to arm -- the last pre-rasterization "
+                        "stage does not declare OpExecutionMode Xfb, so transform feedback would "
+                        "capture nothing and the result would read as 'no primitives'. The shader "
+                        "must be recompiled with PROSPER_GEOM_PROBE set (and the draw must not take "
+                        "a path that skips the decoration). Reported once per run.\n",
+                        geom_target_label);
+        }
+        if (!ds_ctx.transform_feedback_enabled &&
+            !said_no_extension.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr, "[geom-probe] draw=%llu: REFUSING to arm -- this device has no "
+                            "VK_EXT_transform_feedback, so nothing can be captured. "
+                            "Reported once per run.\n",
+                    geom_target_label);
+    }
+    const bool geom_probe = geom_item != SIZE_MAX && geom_xfb_declared &&
                             ds_ctx.transform_feedback_enabled && flush_now;
     static auto p_bindxfb  = reinterpret_cast<PFN_vkCmdBindTransformFeedbackBuffersEXT>(
         vkGetDeviceProcAddr(dev, "vkCmdBindTransformFeedbackBuffersEXT"));
@@ -8955,6 +9081,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     const bool geom_active = geom_buf != VK_NULL_HANDLE && geom_counter != VK_NULL_HANDLE;
+    if (geom_active) backend_geom_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
 
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     backend_pass_timing_begin(dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits,
@@ -8972,6 +9099,32 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                       if (draws[i].ps && draws[i].ps->color_write_mask) ++n;
                                   return n;
                               }());   // #2333
+    // Every dynamic state these pipelines declare, set once per draw. It is a lambda rather than
+    // eleven inline calls because the PROSPER_DRAW_ISO re-render below replays the SAME pipelines
+    // into a second command buffer, and it set NONE of this (#3248): the isolation pass therefore
+    // ran under undefined viewport, scissor, line width, depth bias and stencil state while
+    // reporting which draw paints a pixel -- a diagnostic answering about a render that is not the
+    // one it is isolating. The validation layer says so directly, VUID-vkCmdDraw-None-07831 and
+    // -07832, but no ctest exercised the path so nothing ever saw it. One recorder, both loops.
+    auto record_draw_dynamic_state = [](VkCommandBuffer command, const DV& v) {
+        vkCmdSetViewport(command, 0, 1, &v.viewport);
+        vkCmdSetScissor(command, 0, 1, &v.scissor);
+        vkCmdSetLineWidth(command, v.line_width);
+        vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
+                          v.depth_bias_slope);
+        vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_FRONT_BIT,
+                                   v.stencil_front.compareMask);
+        vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_BACK_BIT,
+                                   v.stencil_back.compareMask);
+        vkCmdSetStencilWriteMask(command, VK_STENCIL_FACE_FRONT_BIT,
+                                 v.stencil_front.writeMask);
+        vkCmdSetStencilWriteMask(command, VK_STENCIL_FACE_BACK_BIT,
+                                 v.stencil_back.writeMask);
+        vkCmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_BIT,
+                                 v.stencil_front.reference);
+        vkCmdSetStencilReference(command, VK_STENCIL_FACE_BACK_BIT,
+                                 v.stencil_back.reference);
+    };
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -9000,23 +9153,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             ds_ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
-        vkCmdSetViewport(cmd, 0, 1, &v.viewport);
-        vkCmdSetScissor(cmd, 0, 1, &v.scissor);
-        vkCmdSetLineWidth(cmd, v.line_width);
-        vkCmdSetDepthBias(cmd, v.depth_bias_constant, v.depth_bias_clamp,
-                          v.depth_bias_slope);
-        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT,
-                                   v.stencil_front.compareMask);
-        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT,
-                                   v.stencil_back.compareMask);
-        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT,
-                                 v.stencil_front.writeMask);
-        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT,
-                                 v.stencil_back.writeMask);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT,
-                                 v.stencil_front.reference);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT,
-                                 v.stencil_back.reference);
+        record_draw_dynamic_state(cmd, v);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
@@ -9694,8 +9831,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
                 vkUnmapMemory(dev, geom_mem);
             } else if (!written) {
+                // Supportable only because arming proved OpExecutionMode Xfb is present on the last
+                // pre-rasterization stage (#3248); without that check this line was a wrong answer
+                // rather than a null one.
                 fprintf(stderr, "[geom-probe] draw=%llu: transform feedback wrote 0 vertices "
-                                "(draw produced no primitives)\n", geom_target_label);
+                                "(the capture was declared, so the draw produced no primitives)\n",
+                        geom_target_label);
             }
         }
     }
@@ -9800,11 +9941,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 vkCmdBeginRenderPass(c2, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
+                    record_draw_dynamic_state(c2, v);   // #3248: same state as the pass being isolated
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
                     if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
                     else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
                 }
                 vkCmdEndRenderPass(c2);
+                backend_draw_iso_pass_count().fetch_add(1, std::memory_order_relaxed);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
                 record_host_read_barrier(c2, rb);   // #2944
                 const bool recorded = vkEndCommandBuffer(c2) == VK_SUCCESS;

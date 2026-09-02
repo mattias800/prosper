@@ -362,6 +362,24 @@ Existing guest geometry stages cannot yet be rebuilt and are rejected visibly. T
 stage selection while recompiling fresh. Requires `VK_EXT_transform_feedback` (RADV, lavapipe). The captured
 final `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
+**It refuses to arm rather than answering wrongly (#3248).** The decoration is emitted under the
+recompiler's own gate, and several paths skip it — a hand-written fixture shader, a draw that reaches
+the generated geometry stage without the flag, any module the probe did not itself cause to be
+recompiled. Before the check, the probe armed regardless, transform feedback captured nothing, and the
+readback printed *"transform feedback wrote 0 vertices (draw produced no primitives)"* — a **wrong**
+answer, not a missing one, about a draw that did produce primitives. The backend now tests the module
+it is about to hand Vulkan for `OpExecutionMode ... Xfb` and prints
+
+```
+[geom-probe] draw=N: REFUSING to arm -- the last pre-rasterization stage does not declare
+OpExecutionMode Xfb, so transform feedback would capture nothing and the result would read as
+'no primitives'. ...
+```
+
+So a `0 vertices` line now means the draw really emitted none. Note what the check reads: the SPIR-V
+words, not the environment variable that was supposed to have produced them — the variable says what
+was asked for, and the two diverged.
+
 ### Geometry-health line (`[geom-health]`, printed alongside the probe)
 
 The probe also emits a one-line **geometry-health** verdict for draw N, computed from the same

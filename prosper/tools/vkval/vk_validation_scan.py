@@ -23,8 +23,14 @@ That last point is the trap this tool was written around: the validation layer d
 Usage
 -----
     python3 tools/vkval/vk_validation_scan.py --build-dir prosper/build-linux
+    python3 tools/vkval/vk_validation_scan.py --build-dir ... --sync          # + barrier hazards
     python3 tools/vkval/vk_validation_scan.py --build-dir ... --report-only   # measure, never fail
     python3 tools/vkval/vk_validation_scan.py --log LastTest.log              # parse an existing log
+
+`--sync` adds SYNCHRONIZATION validation, which is what sees prosper's barriers (#3248). It is a
+separate check set with a separate way of silently not running, so it carries its own positive
+control: `vkval_sync_probe` commits one deliberate write-after-write and the scan refuses to report
+a sync verdict unless that hazard comes back.
 
 Exit status: 0 when every observed message ID is allow-listed and ctest passed, 1 otherwise.
 """
@@ -162,16 +168,37 @@ def parse_allowlist(path: Path) -> dict[str, Allowed]:
     return allowed
 
 
-def layer_env(base: dict[str, str] | None = None) -> dict[str, str]:
+# Synchronization validation is a separate check set, off by default, switched on by a layer SETTING
+# rather than by loading anything more. Two spellings are in play and neither covers every version in
+# use: VK_LAYER_VALIDATE_SYNC is VVL's current layer-settings name, VK_LAYER_ENABLES is the older
+# validation-features route.
+#
+# They must be used ONE AT A TIME. Setting both on layers 1.4.341 produces
+# `Validation Warning: [ VALIDATION-SETTINGS ]` saying the two mechanisms cannot be mixed and the
+# deprecated one takes precedence -- a message this scanner's own parser then reads as an
+# unaccounted-for finding. So the spelling is CHOSEN by the positive control below rather than
+# sprayed, and a version that understands neither fails loudly instead of scanning nothing.
+SYNC_SETTINGS = {
+    "VK_LAYER_VALIDATE_SYNC": "1",
+    "VK_LAYER_ENABLES": "VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT",
+}
+
+
+def layer_env(base: dict[str, str] | None = None, sync_setting: str | None = None) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
     # VK_LOADER_LAYERS_ENABLE is the loader's current force-enable variable (loader >= 1.3.234).
     # VK_INSTANCE_LAYERS is its deprecated predecessor; set both so the scan works on older loaders.
     env["VK_LOADER_LAYERS_ENABLE"] = LAYER
     env["VK_INSTANCE_LAYERS"] = LAYER
+    # An inherited setting would silently change what a run observes, in either direction.
+    for name in SYNC_SETTINGS:
+        env.pop(name, None)
+    if sync_setting:
+        env[sync_setting] = SYNC_SETTINGS[sync_setting]
     return env
 
 
-def prove_layer_loads(build_dir: Path, probe: str) -> str:
+def prove_layer_loads(build_dir: Path, probe: str, sync_setting: str | None = None) -> str:
     """Fail loudly unless the loader reports inserting the validation layer.
 
     Without this, "no findings" is ambiguous between a clean suite and a layer that never loaded,
@@ -183,7 +210,7 @@ def prove_layer_loads(build_dir: Path, probe: str) -> str:
             f"[vkval] probe binary {exe} is missing — the Vulkan-gated tests were not built, so "
             f"there is nothing for the validation layer to observe (see #1675)"
         )
-    env = layer_env()
+    env = layer_env(sync_setting=sync_setting)
     env["VK_LOADER_DEBUG"] = "layer"
     proc = subprocess.run([str(exe)], cwd=build_dir, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -199,12 +226,57 @@ def prove_layer_loads(build_dir: Path, probe: str) -> str:
     return inserted[0].strip()
 
 
-def run_ctest(build_dir: Path, extra: list[str]) -> tuple[int, str, str]:
+SYNC_PROBE = "vkval_sync_probe"
+SYNC_HAZARD_PREFIX = "SYNC-HAZARD-"
+
+
+def prove_sync_validation_arms(build_dir: Path) -> str:
+    """Return the setting spelling that ARMS syncval, or fail; never return without proving it.
+
+    Proving the layer loaded is not enough for `--sync`, and this is the whole reason the flag has
+    its own control. The layer loads identically whether or not synchronization validation is armed;
+    a setting name the layer version does not recognise is ignored in silence. So "no SYNC-HAZARD
+    messages" is ambiguous between a correctly synchronized suite and a check set that never ran,
+    and the second reading is the one that quietly retires the gate -- the same shape as the
+    `report_flags` trap and the unanchored-parser trap this tool already carries.
+
+    `vkval_sync_probe` commits one write-after-write on purpose. Each spelling is tried ALONE (see
+    SYNC_SETTINGS) and the first one that reports the hazard back is the one the scan then runs with.
+    """
+    exe = build_dir / SYNC_PROBE
+    if not exe.exists():
+        raise SystemExit(
+            f"[vkval] --sync needs the positive control {exe}, which is not built. It is gated on "
+            f"Vulkan being found, exactly like the tests this scan observes (see #1675) - without "
+            f"it a clean sync verdict cannot be distinguished from a check set that never armed."
+        )
+    attempts: list[str] = []
+    for setting in SYNC_SETTINGS:
+        proc = subprocess.run([str(exe)], cwd=build_dir, env=layer_env(sync_setting=setting),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode == 2:
+            raise SystemExit(f"[vkval] the sync positive control could not bring Vulkan up:\n"
+                             f"{proc.stdout.strip()}")
+        hazards = [l for l in proc.stdout.splitlines() if SYNC_HAZARD_PREFIX in l]
+        if hazards:
+            return f"{setting}: {hazards[0].strip()[:160]}"
+        attempts.append(f"        {setting}: no {SYNC_HAZARD_PREFIX}* reported")
+    raise SystemExit(
+        "[vkval] --sync asked for synchronization validation and the deliberate hazard in "
+        f"{SYNC_PROBE} was NOT reported back by ANY known setting spelling, while the layer\n"
+        "        demonstrably loaded. Synchronization validation is therefore not armed and a clean "
+        "sync run would mean nothing.\n" + "\n".join(attempts) + "\n"
+        "        Check what this layer version calls the setting and add it to SYNC_SETTINGS."
+    )
+
+
+def run_ctest(build_dir: Path, extra: list[str],
+              sync_setting: str | None = None) -> tuple[int, str, str]:
     # --no-tests=error closes the "build directory with nothing registered" variant of a silent
     # green; --output-on-failure means a test that fails only under the layer arrives in the CI log
     # with its output attached, not just a summary line.
     cmd = ["ctest", "--timeout", "600", "--no-tests=error", "--output-on-failure"] + extra
-    proc = subprocess.run(cmd, cwd=build_dir, env=layer_env(),
+    proc = subprocess.run(cmd, cwd=build_dir, env=layer_env(sync_setting=sync_setting),
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     log = build_dir / "Testing" / "Temporary" / "LastTest.log"
     if not log.exists():
@@ -223,6 +295,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--allowlist", type=Path, default=here / "allowlist.txt")
     ap.add_argument("--probe", default="test_vulkan_offscreen",
                     help="Vulkan test binary used to prove the layer loads")
+    ap.add_argument("--sync", action="store_true",
+                    help="additionally enable SYNCHRONIZATION validation (barriers and hazards). "
+                         "Proves it armed with tools/vkval/sync_probe.cpp before reporting.")
     ap.add_argument("--report-only", action="store_true",
                     help="print the grouped findings and always exit 0 (measurement mode)")
     ap.add_argument("--ctest-arg", action="append", default=[],
@@ -237,10 +312,19 @@ def main(argv: list[str]) -> int:
         log_text = args.log.read_text(encoding="utf-8", errors="replace")
     else:
         build_dir = args.build_dir.resolve()
+        # Layer first, sync second, and the order is the error message: a missing layer would make
+        # the sync control fail too, with a message about the wrong thing.
         print(f"[vkval] proving {LAYER} loads ...")
         print(f"[vkval]   {prove_layer_loads(build_dir, args.probe)}")
-        print(f"[vkval] running ctest under {LAYER} ...")
-        ctest_rc, ctest_out, log_text = run_ctest(build_dir, args.ctest_arg)
+        sync_setting = None
+        if args.sync:
+            print("[vkval] proving synchronization validation ARMS (deliberate hazard) ...")
+            armed = prove_sync_validation_arms(build_dir)
+            sync_setting = armed.split(":", 1)[0]
+            print(f"[vkval]   {armed}")
+        print(f"[vkval] running ctest under {LAYER}"
+              f"{' + synchronization validation' if args.sync else ''} ...")
+        ctest_rc, ctest_out, log_text = run_ctest(build_dir, args.ctest_arg, sync_setting)
         print(ctest_out.rstrip())
 
     findings = parse_log(log_text)

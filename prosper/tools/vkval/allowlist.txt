@@ -49,6 +49,22 @@
 # UINT-module/UNORM-view mutation reproduces the exact finding on RADV; the reflected numeric-class
 # contract plus raw-uvec4 materialization produces none. The ledger is now 5 ids on the CI runner
 # and 6 on Fedora/RADV.
+#
+# SYNCHRONIZATION VALIDATION (`--sync`, #3248) adds NOTHING to this file, and that is a measured
+# statement rather than an oversight. Switched on for the first time on 2026-09-02 it produced 5
+# SYNC-HAZARD messages under 2 ids -- 4x WRITE-AFTER-WRITE in `texture_mip_render`, 1x
+# READ-AFTER-WRITE in `vulkan_triangle_render` -- identically on RADV STRIX_HALO and on lavapipe.
+# Both were real defects and both were FIXED rather than deferred, so a `--sync` run of the whole
+# suite observes exactly the ids below and no others. A new SYNC-HAZARD id is therefore a new
+# finding, never a pre-existing condition; fix it or give it a line here with its own issue.
+#
+# ONE exception is known and is why `--sync` is not the CI gate: validation layers 1.3.275 (what the
+# runner carries) additionally report `SYNC-HAZARD-WRITE-AFTER-READ` x4 in `shadow_compare_render`,
+# which 1.4.341 does not report on either driver. Measured with the driver held constant (lavapipe
+# both times), so the variable is the layer version and not the GPU. It is deliberately NOT listed
+# here: nobody has established whether it is a layer false positive or a real missing subpass
+# self-dependency, and an allow-list entry is a deferral of a KNOWN defect, not a place to park an
+# unsettled question. #3255.
 
 # ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
 VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Compute module declares a PushConstant block while the layout declares no range (#1710)

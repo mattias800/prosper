@@ -114,8 +114,26 @@ int main() {
     VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1; sub.pColorAttachments = &ar;
+    // #3248: the copy below reads this attachment straight after the render pass ends, and the
+    // pass's STORE plus its finalLayout transition to TRANSFER_SRC_OPTIMAL is a WRITE. Vulkan's
+    // implicit final dependency (present only when none is declared) is
+    // srcStage = ALL_COMMANDS -> dstStage = BOTTOM_OF_PIPE with dstAccessMask = 0, which orders
+    // execution and makes nothing VISIBLE -- so the transfer read of the copy is unsynchronized
+    // against the transition, and synchronization validation reports SYNC-HAZARD-READ-AFTER-WRITE.
+    // One explicit outgoing dependency closes it. The implicit INCOMING default is left alone on
+    // purpose: it is TOP_OF_PIPE -> ALL_COMMANDS with every access flag of the destination stages,
+    // which is already a superset of what a first use of a freshly created image needs. Same defect
+    // #2945 fixed inside render_draw_pass_rgba; this hand-rolled fixture never got the treatment.
+    VkSubpassDependency to_transfer{};
+    to_transfer.srcSubpass = 0;
+    to_transfer.dstSubpass = VK_SUBPASS_EXTERNAL;
+    to_transfer.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_transfer.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    to_transfer.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpci.attachmentCount = 1; rpci.pAttachments = &att; rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 1; rpci.pDependencies = &to_transfer;
     VkRenderPass rp; VKCHECK(vkCreateRenderPass(dev, &rpci, nullptr, &rp), "vkCreateRenderPass");
 
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};

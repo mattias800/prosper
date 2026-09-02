@@ -124,6 +124,33 @@ Test Passed.
 """
 
 
+# Synchronization validation frames a hazard the same way as any other finding, but its identity is
+# a SYNC-HAZARD-* name rather than a VUID — so a parser keyed on "VUID-" would read a clean sync run
+# on a suite full of hazards. Not printed by this test: the scan would read it back out of ctest's
+# log (see run_main).
+SAMPLE_LOG_SYNC = """\
+Start testing: Sep 02 20:00 UTC
+----------------------------------------------------------
+1/1 Testing: texture_mip_render
+1/1 Test: texture_mip_render
+Command: "/build/test_texture_mip_render"
+Directory: /build
+"texture_mip_render" start time: Sep 02 20:00 UTC
+Output:
+----------------------------------------------------------
+Validation Error: [ SYNC-HAZARD-WRITE-AFTER-WRITE ] | MessageID = 0x5c0ec5d6
+vkCmdCopyImage(): WRITE_AFTER_WRITE hazard detected. vkCmdCopyImage writes to VkImage 0x680000000068, which was previously written by vkCmdClearColorImage.
+Objects: 1
+    [0] VkCommandBuffer 0x1234
+
+== PASSED ==
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+End testing: Sep 02 20:00 UTC
+"""
+
+
 def main():
     say("== test_vk_validation_scan ==")
 
@@ -274,6 +301,33 @@ def main():
               "the checked-in allowlist.txt parses, and every entry carries tests and a reason")
         check(sum(1 for a in real.values() if a.expectation == "environment-dependent") == 1,
               "exactly one checked-in entry claims to be environment-dependent")
+
+    # --- --sync: the setting spellings, and the identity a hazard carries (#3248) ---------------
+    #
+    # The two spellings must never be set together: layers 1.4.341 answers that with
+    # `Validation Warning: [ VALIDATION-SETTINGS ]` saying the mechanisms cannot be mixed, and this
+    # scanner's own parser then reads that warning as an unaccounted-for finding. So the scan
+    # chooses one, and this pins that it does.
+    plain = scan.layer_env({})
+    check(not any(name in plain for name in scan.SYNC_SETTINGS),
+          "a default run sets no synchronization-validation setting")
+    for setting in scan.SYNC_SETTINGS:
+        armed = scan.layer_env({}, sync_setting=setting)
+        others = [n for n in scan.SYNC_SETTINGS if n != setting and n in armed]
+        check(armed.get(setting) == scan.SYNC_SETTINGS[setting] and not others,
+              f"--sync sets {setting} ALONE, never together with the other spelling")
+    # An inherited setting would silently change what a run observes, in either direction: a
+    # developer with VK_LAYER_VALIDATE_SYNC exported would get sync checks out of a default scan,
+    # and the "measured without syncval" baseline in the allow-list header would be a fiction.
+    inherited = scan.layer_env({"VK_LAYER_VALIDATE_SYNC": "1"})
+    check("VK_LAYER_VALIDATE_SYNC" not in inherited,
+          "an inherited sync setting is stripped, so a default run means what it says")
+
+    sync_findings = scan.parse_log(SAMPLE_LOG_SYNC)
+    check(list(sync_findings) == ["SYNC-HAZARD-WRITE-AFTER-WRITE"],
+          "a SYNC-HAZARD message is parsed by its own name, not skipped for lacking a VUID")
+    check(sync_findings["SYNC-HAZARD-WRITE-AFTER-WRITE"].tests == {"texture_mip_render"},
+          "and is attributed to the test that produced it")
 
     # The guard must not read its own tail. ctest captures this test's stdout into the same
     # LastTest.log that vk_validation_scan.py parses, so anything printed here that LOOKS like a

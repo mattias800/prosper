@@ -22,6 +22,13 @@ any other instrument reports. Unset, it costs one `empty()` test per draw and ch
 read them before quoting a result. Its companion `PROSPER_DRAW_PROGRAM_CENSUS` is observation only.
 
 - `diagnostic_selectors` — choosing what to observe.
+- `geometry_probe_arming` — whether `PROSPER_GEOM_PROBE` may answer at all: does the module the
+  backend is about to hand Vulkan actually declare the transform-feedback capture? It is the
+  worked example of the first standing caution below. Without it the probe armed on a shader it
+  could not capture, read back a zero counter, and printed "the draw produced no primitives" — a
+  wrong answer rather than a missing one, on a draw that did produce primitives (#3248). Note what
+  it tests: the WORDS, not the environment variable that was supposed to have caused them. The env
+  var says what was asked for; the two diverged.
 - `diag_ratelimit` — rate limiting. **Check a diagnostic's rate limit before quoting its volume as a
   frequency**; several phantom findings came from reading a capped count as a real one.
 - `watch_list`, `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute
