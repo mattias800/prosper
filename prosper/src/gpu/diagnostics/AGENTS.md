@@ -31,6 +31,14 @@ read them before quoting a result. Its companion `PROSPER_DRAW_PROGRAM_CENSUS` i
 - `shader_dump_filter` — `PROSPER_SHADER_DUMP_PROGRAM`, which narrows `PROSPER_SHADER_DUMP_SUCCESS`
   to named guest programs. It fails **open** where the skip selectors fail closed, and the header
   explains why: an empty dump directory reads as "that program never compiled".
+- `link_list_census` — `PROSPER_DRAW_LINKSCAN`, a CPU-side census of the linked lists a graphics
+  draw's scalar buffers contain, taken from the exact bytes prosper is about to upload. Observation
+  only. It is the graphics counterpart of `PROSPER_COMPUTE_PARENTSCAN`, and the one thing to know
+  before reading a result is the model it walks: **an out-of-range scalar buffer load returns
+  architectural zero, and zero is a link, not an exit.** So an unpopulated (all-zero) pool is not an
+  empty list — it is an infinite one, a self-loop at record 0 that no trip bound can end. The
+  histogram is printed beside the walk because "the buffer is all zeros" and "the walk never
+  terminates" are the cause and the symptom, and only the first is actionable.
 
 Two standing cautions, both learned expensively:
 

@@ -6564,15 +6564,47 @@ ComputeResourcePathSpecializationReport specialize_compute_resource_paths(
 // binding (two descriptor types -> layout-creation failure, the draw disappears) (#157). Buffers-
 // first keeps the common cbufs-first shaders' bindings byte-identical (cbufs 2/3, textures 4+).
 // External linkage (declared in gpu_execute.hpp) so the binding policy is unit-testable.
+//
+// ONE binding is NOT this policy's to choose: `kComputeInternalGdsBinding`. The recompiler HARD-CODES
+// it whenever a program touches GDS (`declare_internal_gds` in rdna2_to_spirv_internal.hpp), so it is
+// part of the emitted module's ABI, not a slot to be handed out. A resource that already carries it
+// therefore keeps it, and the running counters step over it so nothing else can be given it either.
+//
+// Without that, a GDS-using COMPUTE program was renumbered out of its own contract: the module
+// declared set 0 binding 127 while the table carried that buffer at some sequential number, and the
+// descriptor-contract check correctly rejected the pair with `missing runtime binding binding=127`.
+// The dispatch was then DECLINED -- every time, for the life of the process. Measured on Astro Bot
+// (#3214): five programs skipped for this reason on every boot, including the world-map light-list
+// producer `0x5006e8500` at 0 executed of 918 dispatches. Its output is the per-tile light list the
+// world-map pixel shader walks, so the shader was handed an all-zero arena, and because that walk
+// terminates on 0xffffffff -- not on zero -- an unwritten arena is an INFINITE list. The device hung
+// and RADV reset it. A binding-assignment policy is exactly the kind of code whose defects surface a
+// very long way from home.
+//
+// The gap was already visible and was patched one instance at a time: the trip-bound witness's own
+// binding-127 resource is injected AFTER this call, at table finalization, with a comment describing
+// this same symptom. That fixed the witness and not the guest's own GDS buffer, which is pushed
+// beside the `uses_gds` test and so still passed through here.
 void assign_convention_bindings(ShaderResourceTable& t, uint32_t first) {
+    const auto reserved = [](const ShaderResource& r) {
+        return r.binding == kComputeInternalGdsBinding;
+    };
     uint32_t next = first;
+    const auto claim = [&next]() {
+        if (next == kComputeInternalGdsBinding) ++next;
+        return next++;
+    };
     for (auto& r : t.resources)
-        if (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer)
-            r.binding = next++;
+        if (!reserved(r) &&
+            (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer))
+            r.binding = claim();
     uint32_t tex_next = next > first + 2 ? next : first + 2;   // reserve the two hardwired cbuf slots
     for (auto& r : t.resources)
-        if (r.cls != ResourceClass::ConstantBuffer && r.cls != ResourceClass::VertexBuffer)
+        if (!reserved(r) &&
+            r.cls != ResourceClass::ConstantBuffer && r.cls != ResourceClass::VertexBuffer) {
+            if (tex_next == kComputeInternalGdsBinding) ++tex_next;
             r.binding = tex_next++;
+        }
 }
 
 std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
@@ -8603,7 +8635,20 @@ std::vector<ComputeItem> realize_compute_dispatches(
             if (logged.insert(code_addr).second) {
                 std::fprintf(stderr, "[compute] skip invalid descriptor contract for program 0x%llx\n",
                              (unsigned long long)code_addr);
-                if (std::getenv("PROSPER_DBG")) for (const auto& issue : report.issues) {
+                // WHICH binding, and why. The detail below existed already and was reachable only
+                // through PROSPER_DBG, whose output on a routed title runs to hundreds of thousands
+                // of lines -- so the one thing a reader needs in order to FIX a declined dispatch
+                // cost a firehose, and the bare skip line above (once per program, by design) was
+                // what people quoted instead. `PROSPER_COMPUTE_DESCRIPTOR_DETAIL=1` is the same
+                // report under its own switch; PROSPER_DBG keeps working unchanged. It fires at most
+                // once per program, so it cannot become a firehose itself.
+                // Motivating case: Astro Bot's world-map light-list producer 0x5006e8500 is declined
+                // here, which is why the pixel shader's per-tile walk chases an all-zero pool and
+                // hangs the device (#3214).
+                static const bool descriptor_detail =
+                    std::getenv("PROSPER_DBG") != nullptr ||
+                    std::getenv("PROSPER_COMPUTE_DESCRIPTOR_DETAIL") != nullptr;
+                if (descriptor_detail) for (const auto& issue : report.issues) {
                     std::fprintf(stderr,
                                  "[compute-descriptor] %s binding=%u expected=%s actual=%s required=%llu available=%llu error=%d\n",
                                  descriptor_issue_name(issue.code), issue.binding,

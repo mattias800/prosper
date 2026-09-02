@@ -1165,6 +1165,46 @@ same dispatch, so the pair in one filename is genuinely one dispatch. Two caveat
 from 3 submits to 9 on a routed run, and **why is not established** — the scan runs before
 `acquire_cached_buffer`, so the obvious "a cache hit skips the hook" explanation is wrong.
 
+**`PROSPER_DRAW_LINKSCAN=0xADDR[,0xADDR...]` — CPU-side census of the LINKED LISTS a graphics draw's
+scalar buffers contain.** The graphics counterpart of `PROSPER_COMPUTE_PARENTSCAN`, and it answers the
+question that instrument answers on compute: a shader that walks a guest list until it sees a terminator
+can only run away because the list it was given is cyclic, or because the list it was given is not the
+list the guest built. Both are properties of BYTES. It censuses the exact bytes prosper is about to
+upload — not guest memory — because the question is what the SHADER sees, and prints, per buffer:
+
+```
+[linkscan] ps=0x5008f1400 draw#71 scan=1 set=1 binding=45 cls=0 addr=0x551be0000 declared=33177600
+           uploaded_dw=8294400 | hist zero=8294400 term=0 other=0 first_other=[4294967295]=0x00000000
+           other_range=0x00000000..0x00000000 | self-walk stride=2 next=+1 term=0xffffffff
+           records=4147200 starts=4147200 terminating=0 cyclic=4147200 cycle-nodes=1 oob-starts=0
+           longest=0
+```
+
+**The one modelling fact to know before reading a result: an out-of-range scalar buffer load returns
+architectural ZERO, and zero is a LINK, not an exit.** So an all-zero pool is not an empty list, it is
+an infinite one — a self-loop at record 0 that no trip bound can end. `terminating`/`cyclic` reflect
+that; `oob-starts` counts the walks that left the buffer at least once, which is the column that
+separates "the guest's list is cyclic" from "prosper's descriptor is short".
+
+`declared` beside `uploaded_dw*4` is the truncation check (#1427's short-upload defect reads as zeros
+past the end and a zero link is not an exit). The `hist` columns separate the two ways a tile can say
+"no lights": a terminator-filled table (correct) and a zero-filled one (a producer that never ran).
+With `PROSPER_WRITER_PROVENANCE=1` each scan also names the **last recorded writer** of the range and
+prints `guest_write_recorder_summary()` beside it, so a "no writer" verdict cannot be read without also
+seeing which recorders fired (`writer_provenance.hpp`'s scope list — guest CPU writes are invisible to
+all of them).
+
+Knobs, all strict-parsed, and a malformed one disarms the whole scan rather than silently censusing
+under a different encoding: `PROSPER_DRAW_LINKSCAN_STRIDE` (dwords per record, default 2),
+`_NEXT` (successor dword within the record, default 1), `_TERM` (default `0xffffffff`), `_MAX` (scans
+per binding, default 2), and the optional cross-buffer walk `_HEADS=<binding>` + `_RECORDS=<binding>`,
+which starts from every dword of the head table and walks the record pool. Naming one half of that pair
+without the other is rejected.
+
+The scan cap is keyed on `(program, set, binding)` and deliberately **not** on the buffer's address: a
+title that reallocates its scratch every frame would buy a fresh budget every frame and the instrument
+would never stop. The address is on every line.
+
 **`PROSPER_COMPUTE_SKIP_PROGRAM=0xADDR[,0xADDR...]` — decline named compute programs.** A bisection
 instrument: one dispatch can take down everything after it (a GPU hang costs the process its compute
 backend), so "which dispatch is responsible?" is worth asking directly instead of by rebuilding. It
