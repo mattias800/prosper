@@ -1834,6 +1834,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
   add_test(NAME guest_memory_map COMMAND test_guest_memory_map)
 
+  # #3142: the chunked guest-memory content scan. The straddling case is the one that earns the
+  # test -- a scanner that drops its overlap still returns a plausible hit list, so the blindness
+  # is invisible in a live run and turns a "not found" into a wrong answer.
+  add_executable(test_guest_memory_search tests/host/memory/test_guest_memory_search.cpp)
+  target_link_libraries(test_guest_memory_search PRIVATE prosper_core)
+  add_test(NAME guest_memory_search COMMAND test_guest_memory_search)
+
   add_executable(test_guest_read_cache_disabled tests/host/memory/test_guest_read_cache_disabled.cpp)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
   add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
