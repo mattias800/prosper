@@ -600,6 +600,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_lifecycle PRIVATE prosper_core)
   add_test(NAME lifecycle_stop_signal COMMAND test_lifecycle)
 
+  # GPU submit gate (#3225): the counted region + bounded drain prosper-app runs before std::_Exit,
+  # so a detached guest thread cannot be killed inside an amdgpu submission (which parks the task in
+  # __drm_exec_lock_obj and takes the host compositor down with it). Pure — no Vulkan, no dump — so
+  # the admission/refusal/drain-timeout contract is asserted on every host, including CI without a
+  # GPU. Its own timing assertions are one-sided (a lower bound on a timeout, an upper bound far
+  # from the deadline), so it does not go red under host load.
+  add_executable(test_gpu_submit_gate tests/host/platform/test_gpu_submit_gate.cpp)
+  target_link_libraries(test_gpu_submit_gate PRIVATE prosper_core)
+  add_test(NAME gpu_submit_gate COMMAND test_gpu_submit_gate)
+
   # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
   add_executable(test_capture_manifest tests/test_capture_manifest.cpp
                                        tools/screenshot/capture_manifest.cpp
@@ -2811,6 +2821,18 @@ if(TARGET prosper_core)
       target_include_directories(test_gpustate_render PRIVATE frontends)
       target_link_libraries(test_gpustate_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME gpustate_render COMMAND test_gpustate_render)
+
+      # #3225: the backend's queue wrappers really consult the shutdown gate. The pure gate test
+      # (gpu_submit_gate) asserts the gate's logic; this asserts the wiring, which needs
+      # render_runner.h. Its positive arm uses a real queue when one exists and is skipped with a
+      # printed note when it does not — the refusal arm needs no device at all.
+      add_executable(test_submit_gate_wiring tests/gpu/test_submit_gate_wiring.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_submit_gate_wiring PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_submit_gate_wiring PRIVATE frontends)
+      target_link_libraries(test_submit_gate_wiring PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME submit_gate_wiring COMMAND test_submit_gate_wiring)
 
       # GPU-executor core (Stage A): GpuState -> execute_gpustate() -> render -> present round-trip.
       add_executable(test_gpu_execute tests/gpu/execute/test_gpu_execute.cpp)

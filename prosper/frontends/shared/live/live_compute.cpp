@@ -26,6 +26,7 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_write_watch.hpp"
+#include "host/platform/gpu_submit_gate.hpp"  // #3225: refuse submits once the frontend shuts down
 
 #include <vulkan/vulkan.h>
 
@@ -9216,16 +9217,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (trace) std::fprintf(stderr, "[compute]   submitting dispatch\n");
         // #1270: when prosper-app presents on this same (shared) queue, serialize the submit CALL against
         // its present submits. No-op relaxed atomic load until the app adopts the shared queue.
+        // #3225: the GPU submit gate refuses a NEW dispatch once prosper-app has begun shutting
+        // down, so its bounded drain can reach zero before std::_Exit — a thread caught inside an
+        // amdgpu submission at exit_group() parks in __drm_exec_lock_obj and freezes the host
+        // compositor. The gate is open for the whole life of a running title, so this is one
+        // uncontended CAS per dispatch. On a refusal nothing reaches the driver and
+        // `submission_entered` deliberately stays false: no submission happened, so the ordinary
+        // cleanup() below is correct rather than the retain-everything device-lost path.
         VkResult compute_submit_rc;
         {
+            prosper::GpuSubmitRegion submit_gate;
             std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
-            if (prosper::gpu::shared_present_active()) lk.lock();
-            g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
-            submission_entered = true;
-            compute_submit_rc = g_force_next_queue_submit_device_lost_for_test.exchange(
-                                    false, std::memory_order_acq_rel)
-                ? VK_ERROR_DEVICE_LOST
-                : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
+            if (!submit_gate.admitted()) {
+                compute_submit_rc = VK_ERROR_DEVICE_LOST;
+            } else {
+                if (prosper::gpu::shared_present_active()) lk.lock();
+                g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
+                submission_entered = true;
+                compute_submit_rc = g_force_next_queue_submit_device_lost_for_test.exchange(
+                                        false, std::memory_order_acq_rel)
+                    ? VK_ERROR_DEVICE_LOST
+                    : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
+            }
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
