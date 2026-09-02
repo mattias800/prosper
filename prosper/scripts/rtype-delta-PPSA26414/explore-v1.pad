@@ -5,7 +5,7 @@
 #
 # OPTIONS is the title screen's own prompt. The title screen renders "PRESS <glyph>" and the glyph
 # is the PS5 OPTIONS icon -- a filled vertical pill with three horizontal lines above it -- read off
-# assets/screenshots/rtype-delta-title.png at 1060,740-1180,870 magnified 4x. It is NOT Cross.
+# assets/screenshots/rtype-delta-title.webp at 1060,740-1180,870 magnified 4x. It is NOT Cross.
 #
 # Anchors are SECONDS from the FIRST PAD POLL (prosper/src/input/pad.cpp: a bare number is seconds,
 # 'f' is flips, 'p' is pad reads). Windows are 0.3 s so a press cannot be missed by a poll gap while

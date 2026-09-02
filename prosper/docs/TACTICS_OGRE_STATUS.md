@@ -29,7 +29,7 @@ Vulkan renderer. A direct 16-second `screenshot`-frontend run retained the Squar
 Factory, and Basiscape logos, then showed the movie's `SQUARE ENIX PRESENTS` card, cloth-covered stone,
 moving pale ribbon/smoke, and lit figure. It produced 16 source-distinct samples and 14 pixel-distinct
 samples, with at most two seconds of pixel staleness. The representative checked-in movie frame is
-`assets/screenshots/tactics-ogre-hevc-movie.png`. This resolves the flat gray/green movie defect
+`assets/screenshots/tactics-ogre-hevc-movie.webp`. This resolves the flat gray/green movie defect
 tracked in [#1903](https://github.com/mattias800/prosper/issues/1903).
 
 Gameplay is not visually complete. Several character sprites remain flat silhouettes, some unit

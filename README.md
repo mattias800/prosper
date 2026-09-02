@@ -20,43 +20,43 @@ Real retail PS5 titles running under prosper on Linux — direct, unmodified cap
 in [Game compatibility](COMPATIBILITY.md).
 
 <p align="center">
-  <img src="assets/screenshots/messenger.png" alt="The Messenger — first level gameplay"><br>
+  <img src="assets/screenshots/messenger.webp" alt="The Messenger — first level gameplay"><br>
   <em><strong>The Messenger</strong> — first level, native 1920×1080</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/dead-cells.png" alt="Dead Cells — Prisoners' Quarters gameplay"><br>
+  <img src="assets/screenshots/dead-cells.webp" alt="Dead Cells — Prisoners' Quarters gameplay"><br>
   <em><strong>Dead Cells</strong> — controllable Prisoners' Quarters</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/blasphemous2.png" alt="Blasphemous 2 — first playable room"><br>
+  <img src="assets/screenshots/blasphemous2.webp" alt="Blasphemous 2 — first playable room"><br>
   <em><strong>Blasphemous 2</strong> — first playable room</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/evergate.png" alt="Evergate — first tutorial room gameplay"><br>
+  <img src="assets/screenshots/evergate.webp" alt="Evergate — first tutorial room gameplay"><br>
   <em><strong>Evergate</strong> — first tutorial room</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/gris.png" alt="GRIS — opening gameplay"><br>
+  <img src="assets/screenshots/gris.webp" alt="GRIS — opening gameplay"><br>
   <em><strong>GRIS</strong> — opening gameplay, native 1920×1080</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile menu with its full-width 3D scene restored; exposure remains incorrect"><br>
+  <img src="assets/screenshots/syberia-profile.webp" alt="Syberia: Remastered — profile menu with its full-width 3D scene restored; exposure remains incorrect"><br>
   <em><strong>Syberia: Remastered</strong> — profile menu and restored 3D scene, still overexposed, native 1920×1080</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/space-adventure-cobra.png" alt="Space Adventure Cobra — tutorial combat"><br>
+  <img src="assets/screenshots/space-adventure-cobra.webp" alt="Space Adventure Cobra — tutorial combat"><br>
   <em><strong>Space Adventure Cobra — The Awakening</strong> — tutorial combat, native 1920×1080</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/blue-prince-hall.png" alt="Blue Prince — Day One entrance hall"><br>
+  <img src="assets/screenshots/blue-prince-hall.webp" alt="Blue Prince — Day One entrance hall"><br>
   <em><strong>Blue Prince</strong> — Day One entrance hall, native 1920×1080</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/terminator.png" alt="Terminator 2D: NO FATE — attract-mode gameplay"><br>
+  <img src="assets/screenshots/terminator.webp" alt="Terminator 2D: NO FATE — attract-mode gameplay"><br>
   <em><strong>Terminator 2D: NO FATE</strong> — attract-mode gameplay</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/dragon-quest-vii-onboarding.png" alt="Dragon Quest VII Reimagined — first-run System Settings 1/4 onboarding"><br>
+  <img src="assets/screenshots/dragon-quest-vii-onboarding.webp" alt="Dragon Quest VII Reimagined — first-run System Settings 1/4 onboarding"><br>
   <em><strong>Dragon Quest VII Reimagined</strong> — first-run System Settings 1/4 onboarding, native 3840×2160</em>
 </p>
 

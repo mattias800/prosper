@@ -51,12 +51,12 @@ runs the guest's `CB_COLOR_CONTROL.MODE = ELIMINATE_FAST_CLEAR` passes — over 
 boot here — as ordinary colour draws that paint over the composite ([#1588](https://github.com/mattias800/prosper/issues/1588)).
 Suppress the colour writes on those draws and the title's own screens appear underneath.
 
-![Beast of Reincarnation — the GAME FREAK developer logo at 3840x2160](../../assets/screenshots/beast-of-reincarnation-game-freak-logo.png)
+![Beast of Reincarnation — the GAME FREAK developer logo at 3840x2160](../../assets/screenshots/beast-of-reincarnation-game-freak-logo.webp)
 
 The **GAME FREAK** developer logo, t≈45 s, direct unmodified `tools/screenshot` capture at
 3840x2160 on Linux/RADV.
 
-![Beast of Reincarnation — the Digital Deluxe bonus dialog with its item list, scrollbar and OK button, at 3840x2160](../../assets/screenshots/beast-of-reincarnation-deluxe-bonus-dialog.png)
+![Beast of Reincarnation — the Digital Deluxe bonus dialog with its item list, scrollbar and OK button, at 3840x2160](../../assets/screenshots/beast-of-reincarnation-deluxe-bonus-dialog.webp)
 
 The title's own **"Digital Deluxe Version bonus received."** dialog, t≈90 s and held to the end of
 the run — the item list (`Big Dipper`, `Black Shiba Skin`, `Special Hat`, `Amber`,
