@@ -353,6 +353,19 @@ def arm_hook():
         hook = Path(main) / '.git' / 'hooks' / 'reference-transaction'
         check('hook landed in the common dir', hook.exists(), True, str(hook))
         check('and is executable', os.access(hook, os.X_OK), True)
+        # The installer proves git honours the hook rather than trusting its own write, and says
+        # so. Assert the claim is present: an installer that reports success on the strength of a
+        # successful `write()` is what shipped a silently-absent guard to Windows in the first
+        # place.
+        check('install verified itself against git', 'verified: git refused' in out, True, out)
+        check('the sentinel it wrote was cleaned up', rev(main, 'refs/stash'), None)
+        # LF endings, asserted on the BYTES. Text-mode writing translates '\n' to os.linesep, so
+        # on Windows the hook lands with CRLF and the shell running it sees a stray CR inside every
+        # token -- present, unrunnable, silent. This arm is the one that catches that directly, and
+        # it is checkable from every platform rather than only from the one that breaks.
+        raw = hook.read_bytes()
+        check('hook is written with LF endings only', b'\r\n' in raw, False)
+        check('and ends in an explicit refusal', raw.rstrip().endswith(b'exit 1'), True)
 
         write(a / 'shared.txt', 'LANE-A\n')
         rc, out, err = git_rc(a, 'stash', 'push', '-m', 'blocked')
