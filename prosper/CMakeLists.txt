@@ -2045,6 +2045,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_image_identity PRIVATE prosper_core)
   add_test(NAME image_identity COMMAND test_image_identity)
 
+  # #3195: the atomic-image LOGICAL/PHYSICAL staging extents, extracted from execute_item.
+  add_executable(test_atomic_image_staging tests/gpu/agc/test_atomic_image_staging.cpp)
+  target_link_libraries(test_atomic_image_staging PRIVATE prosper_core)
+  add_test(NAME atomic_image_staging COMMAND test_atomic_image_staging)
+
   # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
   # direction binds the guest image with the wrong element type, so every arm has a rejection
   # partner -- including atomics, which are never a native storage image however well formats match.
