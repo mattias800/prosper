@@ -54,3 +54,10 @@ gradients cannot compress, which is exactly why the originals were enormous. Pal
 keep the `.png` extension would band those same gradients — so the extension changes and callers are
 rewritten instead, which is mechanical and verifiable (every `assets/screenshots/...` reference must
 resolve; the conversion checked all 511 of them).
+
+## Both trees, not one
+
+`prosper/docs/screenshots/` was missed by the first pass: 45 files, 53 MB, already 1080p but stored
+as **PNG** at 3-5.6 MiB each, and outside the original gate. Re-encoding took it to **3.4 MiB**. A
+gate covering one of two image directories is exactly how the second one grows back, so the CI step
+checks both and any new image tree must be added to it.

@@ -917,19 +917,19 @@ docs(compat): refresh the checked-in visual evidence, and repair two trackers th
 
 ### issue-2731-tales-graces-f-movie-chroma.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.png" alt="issue 2731 tales graces f movie chroma"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp" alt="issue 2731 tales graces f movie chroma"></p>
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.png`](prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.png)
+`29f4db65` · [`prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp`](prosper/docs/screenshots/issue-2731-tales-graces-f-movie-chroma.webp)
 
 ### issue-2734-little-nightmares-3-corrupt-save-modal.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.png" alt="issue 2734 little nightmares 3 corrupt save modal"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp" alt="issue 2734 little nightmares 3 corrupt save modal"></p>
 
 docs(compat): refresh the checked-in visual evidence, and repair two trackers that deny screenshots already on master (#2737)
 
-`29f4db65` · [`prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.png`](prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.png)
+`29f4db65` · [`prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp`](prosper/docs/screenshots/issue-2734-little-nightmares-3-corrupt-save-modal.webp)
 
 ### asterix-babylon-gameplay.png
 
@@ -1101,19 +1101,19 @@ fix(gpu): recognise an AvPlayer chroma plane declared as a one-layer 2D array (#
 
 ### issue-1946-health-warning-before-after.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1946-health-warning-before-after.png" alt="issue 1946 health warning before after"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1946-health-warning-before-after.webp" alt="issue 1946 health warning before after"></p>
 
 fix(agc): offer the render-target-0 blend key on every SDK version — The Oregon Trail's whole UI layer was unblended (#1946) (#2031)
 
-`beeff2ab` · [`prosper/docs/screenshots/issue-1946-health-warning-before-after.png`](prosper/docs/screenshots/issue-1946-health-warning-before-after.png)
+`beeff2ab` · [`prosper/docs/screenshots/issue-1946-health-warning-before-after.webp`](prosper/docs/screenshots/issue-1946-health-warning-before-after.webp)
 
 ### issue-1946-slate-blend-before-after.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1946-slate-blend-before-after.png" alt="issue 1946 slate blend before after"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp" alt="issue 1946 slate blend before after"></p>
 
 fix(agc): offer the render-target-0 blend key on every SDK version — The Oregon Trail's whole UI layer was unblended (#1946) (#2031)
 
-`beeff2ab` · [`prosper/docs/screenshots/issue-1946-slate-blend-before-after.png`](prosper/docs/screenshots/issue-1946-slate-blend-before-after.png)
+`beeff2ab` · [`prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp`](prosper/docs/screenshots/issue-1946-slate-blend-before-after.webp)
 
 ### sonic-crossworlds-sega-logo.png
 
@@ -1415,43 +1415,43 @@ fix(hle): deliver the APR completion event for a zero-tag binding (#1666) (#1667
 
 ### issue-1630-grid-after.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1630-grid-after.png" alt="issue 1630 grid after"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1630-grid-after.webp" alt="issue 1630 grid after"></p>
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-grid-after.png`](prosper/docs/screenshots/issue-1630-grid-after.png)
+`7da42075` · [`prosper/docs/screenshots/issue-1630-grid-after.webp`](prosper/docs/screenshots/issue-1630-grid-after.webp)
 
 ### issue-1630-grid-before.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1630-grid-before.png" alt="issue 1630 grid before"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1630-grid-before.webp" alt="issue 1630 grid before"></p>
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-grid-before.png`](prosper/docs/screenshots/issue-1630-grid-before.png)
+`7da42075` · [`prosper/docs/screenshots/issue-1630-grid-before.webp`](prosper/docs/screenshots/issue-1630-grid-before.webp)
 
 ### issue-1630-library-background-1.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1630-library-background-1.png" alt="issue 1630 library background 1"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1630-library-background-1.webp" alt="issue 1630 library background 1"></p>
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-1.png`](prosper/docs/screenshots/issue-1630-library-background-1.png)
+`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-1.webp`](prosper/docs/screenshots/issue-1630-library-background-1.webp)
 
 ### issue-1630-library-background-2.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1630-library-background-2.png" alt="issue 1630 library background 2"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1630-library-background-2.webp" alt="issue 1630 library background 2"></p>
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-2.png`](prosper/docs/screenshots/issue-1630-library-background-2.png)
+`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-2.webp`](prosper/docs/screenshots/issue-1630-library-background-2.webp)
 
 ### issue-1630-library-background-3.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1630-library-background-3.png" alt="issue 1630 library background 3"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1630-library-background-3.webp" alt="issue 1630 library background 3"></p>
 
 feat(app): per-title background art and focus music in the library (#1647)
 
-`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-3.png`](prosper/docs/screenshots/issue-1630-library-background-3.png)
+`7da42075` · [`prosper/docs/screenshots/issue-1630-library-background-3.webp`](prosper/docs/screenshots/issue-1630-library-background-3.webp)
 
 ### syberia-gameplay.png
 
@@ -1617,211 +1617,211 @@ docs: record GRIS opening gameplay
 
 ### issue-1459-astrobot-blue-fmv-gpu-present.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.png" alt="issue 1459 astrobot blue fmv gpu present"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp" alt="issue 1459 astrobot blue fmv gpu present"></p>
 
 docs: capture Astro Bot blue intro
 
-`3f72a8ce` · [`prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.png`](prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.png)
+`3f72a8ce` · [`prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp`](prosper/docs/screenshots/issue-1459-astrobot-blue-fmv-gpu-present.webp)
 
 ## 2026-07-30
 
 ### issue-1471-library-empty.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1471-library-empty.png" alt="issue 1471 library empty"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1471-library-empty.webp" alt="issue 1471 library empty"></p>
 
 fix(app): address review findings on the library view
 
-`44d1689d` · [`prosper/docs/screenshots/issue-1471-library-empty.png`](prosper/docs/screenshots/issue-1471-library-empty.png)
+`44d1689d` · [`prosper/docs/screenshots/issue-1471-library-empty.webp`](prosper/docs/screenshots/issue-1471-library-empty.webp)
 
 ### issue-1471-library-scrolled.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1471-library-scrolled.png" alt="issue 1471 library scrolled"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1471-library-scrolled.webp" alt="issue 1471 library scrolled"></p>
 
 fix(app): address review findings on the library view
 
-`44d1689d` · [`prosper/docs/screenshots/issue-1471-library-scrolled.png`](prosper/docs/screenshots/issue-1471-library-scrolled.png)
+`44d1689d` · [`prosper/docs/screenshots/issue-1471-library-scrolled.webp`](prosper/docs/screenshots/issue-1471-library-scrolled.webp)
 
 ### issue-1471-library-grid.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1471-library-grid.png" alt="issue 1471 library grid"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1471-library-grid.webp" alt="issue 1471 library grid"></p>
 
 feat(app): draw the game library with Dear ImGui
 
-`7cf767fe` · [`prosper/docs/screenshots/issue-1471-library-grid.png`](prosper/docs/screenshots/issue-1471-library-grid.png)
+`7cf767fe` · [`prosper/docs/screenshots/issue-1471-library-grid.webp`](prosper/docs/screenshots/issue-1471-library-grid.webp)
 
 ### issue-1459-astrobot-linux-indirect-title.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.png" alt="issue 1459 astrobot linux indirect title"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp" alt="issue 1459 astrobot linux indirect title"></p>
 
 gpu: execute AGC indirect work after producers
 
-`e85c527c` · [`prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.png`](prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.png)
+`e85c527c` · [`prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp`](prosper/docs/screenshots/issue-1459-astrobot-linux-indirect-title.webp)
 
 ## 2026-07-29
 
 ### issue-1469-drop-messenger.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1469-drop-messenger.png" alt="issue 1469 drop messenger"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1469-drop-messenger.webp" alt="issue 1469 drop messenger"></p>
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-drop-messenger.png`](prosper/docs/screenshots/issue-1469-drop-messenger.png)
+`3f7f9929` · [`prosper/docs/screenshots/issue-1469-drop-messenger.webp`](prosper/docs/screenshots/issue-1469-drop-messenger.webp)
 
 ### issue-1469-picker-messenger.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1469-picker-messenger.png" alt="issue 1469 picker messenger"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1469-picker-messenger.webp" alt="issue 1469 picker messenger"></p>
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-picker-messenger.png`](prosper/docs/screenshots/issue-1469-picker-messenger.png)
+`3f7f9929` · [`prosper/docs/screenshots/issue-1469-picker-messenger.webp`](prosper/docs/screenshots/issue-1469-picker-messenger.webp)
 
 ### issue-1469-reject-not-a-title.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1469-reject-not-a-title.png" alt="issue 1469 reject not a title"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1469-reject-not-a-title.webp" alt="issue 1469 reject not a title"></p>
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-reject-not-a-title.png`](prosper/docs/screenshots/issue-1469-reject-not-a-title.png)
+`3f7f9929` · [`prosper/docs/screenshots/issue-1469-reject-not-a-title.webp`](prosper/docs/screenshots/issue-1469-reject-not-a-title.webp)
 
 ### issue-1469-relaunch-blasphemous2.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.png" alt="issue 1469 relaunch blasphemous2"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp" alt="issue 1469 relaunch blasphemous2"></p>
 
 docs(app): interactive-open evidence screenshots (#1469)
 
-`3f7f9929` · [`prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.png`](prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.png)
+`3f7f9929` · [`prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp`](prosper/docs/screenshots/issue-1469-relaunch-blasphemous2.webp)
 
 ### issue-1459-astrobot-worldmap-current.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.png" alt="issue 1459 astrobot worldmap current"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp" alt="issue 1459 astrobot worldmap current"></p>
 
 docs: capture current Astro Bot world map
 
-`2e83d1ea` · [`prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.png`](prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.png)
+`2e83d1ea` · [`prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp`](prosper/docs/screenshots/issue-1459-astrobot-worldmap-current.webp)
 
 ### issue-1466-astrobot-direct-tile.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1466-astrobot-direct-tile.png" alt="issue 1466 astrobot direct tile"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp" alt="issue 1466 astrobot direct tile"></p>
 
 perf(gpu): tile mapped storage images directly
 
-`1b8eeed6` · [`prosper/docs/screenshots/issue-1466-astrobot-direct-tile.png`](prosper/docs/screenshots/issue-1466-astrobot-direct-tile.png)
+`1b8eeed6` · [`prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp`](prosper/docs/screenshots/issue-1466-astrobot-direct-tile.webp)
 
 ## 2026-07-26
 
 ### issue-1287-hall-live-fixed.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-live-fixed.png" alt="issue 1287 hall live fixed"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-live-fixed.webp" alt="issue 1287 hall live fixed"></p>
 
 docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
-`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-hall-live-fixed.png`](prosper/docs/screenshots/issue-1287-hall-live-fixed.png)
+`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-hall-live-fixed.webp`](prosper/docs/screenshots/issue-1287-hall-live-fixed.webp)
 
 ### issue-1287-hall-live-vs-oracle.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.png" alt="issue 1287 hall live vs oracle"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp" alt="issue 1287 hall live vs oracle"></p>
 
 docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
-`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.png`](prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.png)
+`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp`](prosper/docs/screenshots/issue-1287-hall-live-vs-oracle.webp)
 
 ### issue-1287-manor-approach-live.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-manor-approach-live.png" alt="issue 1287 manor approach live"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-manor-approach-live.webp" alt="issue 1287 manor approach live"></p>
 
 docs: live Blue Prince gameplay at oracle parity (#1287 rung-5 evidence) (#1438)
 
-`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-manor-approach-live.png`](prosper/docs/screenshots/issue-1287-manor-approach-live.png)
+`ffbb7d74` · [`prosper/docs/screenshots/issue-1287-manor-approach-live.webp`](prosper/docs/screenshots/issue-1287-manor-approach-live.webp)
 
 ### issue-1427-hall-geometry-restored.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1427-hall-geometry-restored.png" alt="issue 1427 hall geometry restored"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp" alt="issue 1427 hall geometry restored"></p>
 
 fix(render): upload a buffer binding's whole declared range, not the first 1 MiB (#1429)
 
-`ad5a840a` · [`prosper/docs/screenshots/issue-1427-hall-geometry-restored.png`](prosper/docs/screenshots/issue-1427-hall-geometry-restored.png)
+`ad5a840a` · [`prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp`](prosper/docs/screenshots/issue-1427-hall-geometry-restored.webp)
 
 ### issue-1427-oracle-before-after.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1427-oracle-before-after.png" alt="issue 1427 oracle before after"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1427-oracle-before-after.webp" alt="issue 1427 oracle before after"></p>
 
 fix(render): upload a buffer binding's whole declared range, not the first 1 MiB (#1429)
 
-`ad5a840a` · [`prosper/docs/screenshots/issue-1427-oracle-before-after.png`](prosper/docs/screenshots/issue-1427-oracle-before-after.png)
+`ad5a840a` · [`prosper/docs/screenshots/issue-1427-oracle-before-after.webp`](prosper/docs/screenshots/issue-1427-oracle-before-after.webp)
 
 ### issue-1287-hall-materials-fixed.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-materials-fixed.png" alt="issue 1287 hall materials fixed"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp" alt="issue 1287 hall materials fixed"></p>
 
 docs: Blue Prince hall with correct materials (#1287 milestone frame) (#1418)
 
-`0f7d9310` · [`prosper/docs/screenshots/issue-1287-hall-materials-fixed.png`](prosper/docs/screenshots/issue-1287-hall-materials-fixed.png)
+`0f7d9310` · [`prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp`](prosper/docs/screenshots/issue-1287-hall-materials-fixed.webp)
 
 ## 2026-07-25
 
 ### issue-1334-hall-default-tonemapped.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1334-hall-default-tonemapped.png" alt="issue 1334 hall default tonemapped"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp" alt="issue 1334 hall default tonemapped"></p>
 
 fix(gpu): GPU-copy the MSAA resolve into the destination persistent image (#1382)
 
-`6479cd5f` · [`prosper/docs/screenshots/issue-1334-hall-default-tonemapped.png`](prosper/docs/screenshots/issue-1334-hall-default-tonemapped.png)
+`6479cd5f` · [`prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp`](prosper/docs/screenshots/issue-1334-hall-default-tonemapped.webp)
 
 ### issue-1287-hall-bundle-tonemapped.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.png" alt="issue 1287 hall bundle tonemapped"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp" alt="issue 1287 hall bundle tonemapped"></p>
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.png`](prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.png)
+`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp`](prosper/docs/screenshots/issue-1287-hall-bundle-tonemapped.webp)
 
 ### issue-1287-hall-magenta-prosper.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-magenta-prosper.png" alt="issue 1287 hall magenta prosper"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp" alt="issue 1287 hall magenta prosper"></p>
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-magenta-prosper.png`](prosper/docs/screenshots/issue-1287-hall-magenta-prosper.png)
+`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp`](prosper/docs/screenshots/issue-1287-hall-magenta-prosper.webp)
 
 ### issue-1287-hall-night-prosper.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-night-prosper.png" alt="issue 1287 hall night prosper"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-night-prosper.webp" alt="issue 1287 hall night prosper"></p>
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-night-prosper.png`](prosper/docs/screenshots/issue-1287-hall-night-prosper.png)
+`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-night-prosper.webp`](prosper/docs/screenshots/issue-1287-hall-night-prosper.webp)
 
 ### issue-1287-hall-nobatch-live.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-nobatch-live.png" alt="issue 1287 hall nobatch live"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp" alt="issue 1287 hall nobatch live"></p>
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-nobatch-live.png`](prosper/docs/screenshots/issue-1287-hall-nobatch-live.png)
+`a3613436` · [`prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp`](prosper/docs/screenshots/issue-1287-hall-nobatch-live.webp)
 
 ### issue-1287-vestibule-prosper.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1287-vestibule-prosper.png" alt="issue 1287 vestibule prosper"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1287-vestibule-prosper.webp" alt="issue 1287 vestibule prosper"></p>
 
 docs: current Blue Prince hall frames for the #1287 oracle request (#1375)
 
-`a3613436` · [`prosper/docs/screenshots/issue-1287-vestibule-prosper.png`](prosper/docs/screenshots/issue-1287-vestibule-prosper.png)
+`a3613436` · [`prosper/docs/screenshots/issue-1287-vestibule-prosper.webp`](prosper/docs/screenshots/issue-1287-vestibule-prosper.webp)
 
 ### issue-1356-gris-title.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1356-gris-title.png" alt="issue 1356 gris title"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1356-gris-title.webp" alt="issue 1356 gris title"></p>
 
 feat: bring GRIS and Cobra to title with audio (#1368)
 
-`8b37be95` · [`prosper/docs/screenshots/issue-1356-gris-title.png`](prosper/docs/screenshots/issue-1356-gris-title.png)
+`8b37be95` · [`prosper/docs/screenshots/issue-1356-gris-title.webp`](prosper/docs/screenshots/issue-1356-gris-title.webp)
 
 ### issue-1356-space-adventure-cobra-title.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png" alt="issue 1356 space adventure cobra title"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp" alt="issue 1356 space adventure cobra title"></p>
 
 feat: bring GRIS and Cobra to title with audio (#1368)
 
-`8b37be95` · [`prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png`](prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png)
+`8b37be95` · [`prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp`](prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.webp)
 
 ### dragon-quest-vii-title.png
 
@@ -1833,19 +1833,19 @@ docs: publish Dragon Quest VII title capture
 
 ### issue-1352-wall-shading-after.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1352-wall-shading-after.png" alt="issue 1352 wall shading after"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1352-wall-shading-after.webp" alt="issue 1352 wall shading after"></p>
 
 fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#1354)
 
-`feb5822d` · [`prosper/docs/screenshots/issue-1352-wall-shading-after.png`](prosper/docs/screenshots/issue-1352-wall-shading-after.png)
+`feb5822d` · [`prosper/docs/screenshots/issue-1352-wall-shading-after.webp`](prosper/docs/screenshots/issue-1352-wall-shading-after.webp)
 
 ### issue-1352-wall-shading-before.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-1352-wall-shading-before.png" alt="issue 1352 wall shading before"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-1352-wall-shading-before.webp" alt="issue 1352 wall shading before"></p>
 
 fix(gpu): DEPTH_CLEAR_ENABLE acts only through the enabled depth-write path (#1354)
 
-`feb5822d` · [`prosper/docs/screenshots/issue-1352-wall-shading-before.png`](prosper/docs/screenshots/issue-1352-wall-shading-before.png)
+`feb5822d` · [`prosper/docs/screenshots/issue-1352-wall-shading-before.webp`](prosper/docs/screenshots/issue-1352-wall-shading-before.webp)
 
 ## 2026-07-24
 
@@ -1957,44 +1957,44 @@ docs: refresh public README + COMPATIBILITY with screenshots and current status
 
 ### issue-897-astrobot-linux-natural-opening-midfade.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.png" alt="issue 897 astrobot linux natural opening midfade"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp" alt="issue 897 astrobot linux natural opening midfade"></p>
 
 docs(astrobot): attach natural Linux graphics captures
 
-`2a09b44d` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.png`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.png)
+`2a09b44d` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-midfade.webp)
 
 ### issue-897-astrobot-linux-natural-opening-visible.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.png" alt="issue 897 astrobot linux natural opening visible"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp" alt="issue 897 astrobot linux natural opening visible"></p>
 
 docs(astrobot): attach natural Linux graphics captures
 
-`2a09b44d` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.png`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.png)
+`2a09b44d` · [`prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp`](prosper/docs/screenshots/issue-897-astrobot-linux-natural-opening-visible.webp)
 
 ## 2026-07-18
 
 ### issue-825-astrobot-windows-sony-presents.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.png" alt="issue 825 astrobot windows sony presents"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp" alt="issue 825 astrobot windows sony presents"></p>
 
 docs(astrobot): attach Windows progress captures
 
-`815a84b2` · [`prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.png`](prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.png)
+`815a84b2` · [`prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp`](prosper/docs/screenshots/issue-825-astrobot-windows-sony-presents.webp)
 
 ### issue-825-astrobot-windows-title.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-825-astrobot-windows-title.png" alt="issue 825 astrobot windows title"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-825-astrobot-windows-title.webp" alt="issue 825 astrobot windows title"></p>
 
 docs(astrobot): attach Windows progress captures
 
-`815a84b2` · [`prosper/docs/screenshots/issue-825-astrobot-windows-title.png`](prosper/docs/screenshots/issue-825-astrobot-windows-title.png)
+`815a84b2` · [`prosper/docs/screenshots/issue-825-astrobot-windows-title.webp`](prosper/docs/screenshots/issue-825-astrobot-windows-title.webp)
 
 ## 2026-07-17
 
 ### issue-825-astrobot-linux-sony-presents.png
 
-<p align="center"><img src="prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.png" alt="issue 825 astrobot linux sony presents"></p>
+<p align="center"><img src="prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp" alt="issue 825 astrobot linux sony presents"></p>
 
 docs(astrobot): attach Linux loading screenshot
 
-`a1395e75` · [`prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.png`](prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.png)
+`a1395e75` · [`prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp`](prosper/docs/screenshots/issue-825-astrobot-linux-sony-presents.webp)
