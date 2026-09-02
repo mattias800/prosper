@@ -161,6 +161,44 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   and destruct-reused buffer pools disjoint. **Do not re-run this sweep to re-establish either half**;
   re-run it only to test a *new* binding-lifetime change.
 
+- **"One of `baQO9ez2gL4` / `ULvXMDz56po` / `Qs1xtplKo0U` / `GuchCTefuZw` carries the APR read RANGE"
+  — false, by the firmware NID database.** `hle_kernel_mem.cpp` carried this as a live hypothesis
+  marked `CONFIDENCE: LOW until captured`: the pak reads want the FPakInfo footer at `filesize-0xdd`,
+  so a per-read `{offset,size}` was assumed to flow through one of the four then-anonymous libSceAmpr
+  NIDs beside the submit. All four are named in `../PS5-3.20_Libs/libSceAmpr.c`, and none of them can
+  carry a range: `sceAmprCommandBufferReset`, `sceAmprCommandBufferClearBuffer`,
+  `sceAmprAprCommandBufferDestructor`, `sceAmprCommandBufferDestructor` — a reset, a clear and two
+  destructors, all buffer-lifetime operations taking a command buffer and nothing else. The range
+  travels in the read builder's own arguments, where prosper already reads it. No capture was needed;
+  one `grep` of the NID database settles it, which is the general lesson. Corrected in
+  [#2928](https://github.com/mattias800/prosper/issues/2928).
+
+- **"`sceAmprCommandBufferReset` is the only closer of the APR gather/scatter chain" — not falsified
+  but VOID: the observation cannot discriminate.** `f_apr_read_gather_scatter` recorded this as
+  `CONFIDENCE: MED` on the strength of Yakuza Kiwami's dispatcher (`eboot+0xdb5fb0`) calling Reset
+  immediately before every chain-opening `ReadFile`. That ordering is equally consistent with "Reset
+  closes the chain" and with "Reset does nothing to it", because the `ReadFile` that follows re-opens
+  the chain either way — so the evidence never bore on the question. Two further facts point the
+  other way: the firmware exports a *separate* `sceAmprAprCommandBufferResetGatherScatterState`
+  (`YPxkUDhgoNI`), which a Reset that already cleared the state would make redundant; and prosper's
+  real closer set was already much wider than the comment claimed — every `ampr_cb_reset` and
+  `ampr_cb_construct` caller closes, **submit included**. The set is kept wide *because* the lifetime
+  is undecided: closing too eagerly refuses a legitimate segment loudly, closing too late serves one
+  from the wrong file silently. Confidence is now recorded as LOW and the set is pinned by
+  `tests/hle/test_apr_gather_scatter.cpp`. [#2928](https://github.com/mattias800/prosper/issues/2928).
+
+- **"An unregistered libSceAmpr read builder is the safe default" — false for this contract.**
+  `sceAmprAprCommandBufferReadFileGather` (`mZSbNJVJpV8`) and `…ReadFileScatter` (`Jg-AgkdJHkk`) were
+  left unregistered on the reasoning that the dispatcher's `return 0` is type-safe. It is not safe
+  *here*: these return an int32 SCE status where 0 is `SCE_OK` — "the read is queued and will
+  deliver" — so an unregistered builder promises bytes and writes none, and the guest cannot tell the
+  result from a successful read of zeros. They now refuse with `0x80020016`, a value the contract
+  already defines. This does **not** license registering a guessed argument layout: gather/scatter
+  DMA vocabulary suggests each names one side and takes the other from the chain, but the two
+  readings differ in which argument disappears and prosper's chain state holds no cursor for the
+  implied side, so even the argument count is unknown.
+  [#2926](https://github.com/mattias800/prosper/issues/2926).
+
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
 
 DOLL now boots fully and runs a **stable frame loop**. Two blockers cleared this session:

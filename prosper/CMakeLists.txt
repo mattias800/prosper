@@ -1561,6 +1561,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_stat_audio PRIVATE prosper_core)
   add_test(NAME apr_stat_audio_gtav COMMAND test_apr_stat_audio)
 
+  # #2926/#2928: the APR read builders' two silent-success shapes -- an unregistered NID answering
+  # SCE_OK from the dispatcher's return-0 default, and a gather/scatter segment reporting success
+  # after its bytes failed to reach the guest destination -- plus the chain closer set, which the
+  # handler's comment used to under-state. Pure: a scratch file and generated import stubs, no dump.
+  add_executable(test_apr_gather_scatter tests/hle/test_apr_gather_scatter.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_apr_gather_scatter PRIVATE tests)
+  target_link_libraries(test_apr_gather_scatter PRIVATE prosper_core)
+  add_test(NAME apr_gather_scatter COMMAND test_apr_gather_scatter)
+
   add_executable(test_ampr_measure tests/hle/test_ampr_measure.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_ampr_measure PRIVATE tests)

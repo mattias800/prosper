@@ -2255,7 +2255,9 @@ int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
 // So: `ReadFile` OPENS a chain on a command buffer and names the file; each `…GatherScatter`
 // APPENDS one (fileOffset -> dst, len) segment to the chain that is currently open on that same
 // command buffer; `sceAmprCommandBufferReset` (which the guest calls immediately before every
-// chain-opening ReadFile) closes it.
+// chain-opening ReadFile) closes it — and so, in prosper, do several other entry points, listed and
+// justified on f_apr_read_gather_scatter. `…ReadFileGather` and `…ReadFileScatter` are NOT
+// implemented: their argument layout has never been derived, so they refuse (#2926).
 //
 // Yakuza Kiwami's own read dispatcher at eboot+0xdb5fb0 is that contract written out. Its two arms
 // are argument-for-argument identical apart from the file id, and which one runs is a single latch
@@ -2303,8 +2305,11 @@ static bool apr_chain_current(uint64_t cb, AprChain* out) {
     *out = it->second;
     return true;
 }
-// sceAmprCommandBufferReset / ClearBuffer / the APR command-buffer destructor close the chain.
-// Called from the Ampr command-buffer layer (hle_kernel_mem.cpp), which owns those entry points.
+// Close the chain open on `cb`. Called from the Ampr command-buffer layer (hle_kernel_mem.cpp),
+// which owns every entry point that does so — Reset, ClearBuffer, both constructors, the 3.20
+// destructor, the explicit …ResetGatherScatterState, AND submit. The full set and why it is that
+// wide (a fail-loud choice, not a derived contract) is enumerated on f_apr_read_gather_scatter
+// below; do not restate it here, and do not narrow it there without reading that block first.
 extern "C" void prosper_apr_chain_reset(uint64_t cb) {
     if (!cb) return;
     std::lock_guard lk(g_apr_chain_mx);
@@ -3790,9 +3795,40 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 // into a record layout we have not established, which is the exact mistake the Terminator 2D note in
 // apr_execute_read records. So: refuse, return the error, log loudly, and leave the record alone.
 // (Review of #2924.)
+// CHAIN LIFETIME — the closer set is WIDER than "Reset", and the comment here used to say it was
+// (#2928). Every path that calls `ampr_cb_reset` or `ampr_cb_construct` in hle_kernel_mem.cpp closes
+// the chain, so the real set is:
+//
+//   sceAmprCommandBufferReset            baQO9ez2gL4   the observed closer
+//   sceAmprCommandBufferClearBuffer      ULvXMDz56po
+//   sceAmprCommandBufferConstructor      8aI7R7WaOlc   rewinds -> the commands the chain named are gone
+//   sceAmprAmmCommandBufferConstructor   EDq5bqCqYpA
+//   sceAmprCommandBufferDestructor       GuchCTefuZw   (via ampr_cb_destroy_320)
+//   sceAmprAprCommandBufferResetGatherScatterState  YPxkUDhgoNI   the explicit one
+//   sceKernelAprSubmitCommandBuffer{,AndGetResult}  eE4Szl8sil8 / ASoW5WE-UPo
+//
+// The last row is the surprising one. It is not a deliberate ABI claim: the submit handler calls
+// `ampr_cb_reset` to rewind the command CURSOR (Pathless reuses completed pool buffers without
+// calling the public Reset), and closing the read chain is a side effect of sharing that helper.
+//
+// It is kept anyway, and the reason is a discriminator that does not exist. Yakuza Kiwami's
+// dispatcher calls Reset immediately BEFORE the chain-opening ReadFile, so the following ReadFile
+// re-establishes the chain either way — the observation is equally consistent with "Reset closes the
+// chain" and with "Reset does not". Nothing observed so far separates them, and the firmware's
+// separate …ResetGatherScatterState export is weak evidence AGAINST Reset being a closer, since a
+// Reset that already cleared the state would make that export redundant.
+//
+// So the closer set is chosen by which way the unknown fails, not by evidence:
+//   * closing too eagerly  -> a legitimate segment is REFUSED, loudly, with the reason printed;
+//   * closing too late     -> a stale chain names the WRONG FILE and the segment is served from it,
+//                             caught by the range guard below only when the wrong file is smaller.
+// The second is the silent-wrong-data outcome this whole handler exists to avoid, so prosper errs
+// toward closing. `tests/hle/test_apr_gather_scatter.cpp` pins the set so it cannot drift silently.
+//
 // CONFIDENCE: HIGH on the argument layout (the guest's two arms are argument-for-argument identical
 // apart from the id) and on the chain being command-buffer state (the firmware's own
-// …ResetGatherScatterState export). MED on chain lifetime: Reset is the only closer observed.
+// …ResetGatherScatterState export). LOW on chain lifetime — not MED, because no observation
+// discriminates: the width above is a deliberate fail-loud choice, not a derived contract.
 HLE(f_apr_read_gather_scatter) {
     (void)a1;
     const uint64_t cb = a0, record = a2, dst = a3, requested = a4, offset = a5;
@@ -3828,6 +3864,20 @@ HLE(f_apr_read_gather_scatter) {
         return 0x80020016ull;
     }
     AprReadOutcome r = apr_execute_read(cb, record, chain.host, dst, requested, offset, chain.fsize);
+    // DELIVERY, not merely a successful host read (#2928). `r.ok` says the bytes came off the host
+    // file; `r.in_dst` says they reached the guest's OWN destination. For the plain ReadFile the
+    // difference is defensible — it has known callsites that consume the completion record's data
+    // pointer and pass no destination at all, and apr_execute_read publishes the staging pointer for
+    // exactly those. This builder has no such callsite and cannot: its segments all target one
+    // command buffer whose record is `cb+0x20` in every observed SDK wrapper, so each segment would
+    // overwrite the previous segment's published pointer there. A multi-segment chain is only
+    // readable through the per-segment `dst`, which is why `dst` is this builder's ONE output.
+    //
+    // So `r.ok && !r.in_dst` is an undelivered segment reported as delivered — the silent-success
+    // class, in a function written to fix a silent success. A zero-length segment is exempt: there
+    // are no bytes to deliver, so nothing was lost (the clamp cannot produce one here anyway, since
+    // the range guard above already rejected `requested > fsize - offset`).
+    const bool delivered = r.ok && (r.size == 0 || r.in_dst);
     if (filelog())
         fprintf(stderr, "[apr] gather-scatter id=%u %s -> dst=0x%llx(%s) off=0x%llx size=%llu "
                         "got=%lld %s\n",
@@ -3835,8 +3885,75 @@ HLE(f_apr_read_gather_scatter) {
                 (unsigned long long)(r.in_dst ? dst : r.published),
                 r.in_dst ? "guest" : "staging",
                 (unsigned long long)r.offset, (unsigned long long)r.size,
-                (long long)r.got, r.ok ? "OK" : "SHORT");
-    return r.ok ? 0 : 0x80020016ull;
+                (long long)r.got, delivered ? "OK" : (r.ok ? "UNDELIVERED" : "SHORT"));
+    if (r.ok && !delivered) {
+        char msg[512];
+        snprintf(msg, sizeof msg, "%llu bytes of %s read but NOT written to dst=0x%llx "
+                 "(off=0x%llx) -- the guest destination is unmapped or unwritable, so the segment "
+                 "is reported as failed rather than served empty",
+                 (unsigned long long)r.size, chain.host.c_str(),
+                 (unsigned long long)dst, (unsigned long long)offset);
+        log_refusal(msg);
+    }
+    return delivered ? 0 : 0x80020016ull;
+}
+
+// libSceAmpr mZSbNJVJpV8 / Jg-AgkdJHkk — sceAmprAprCommandBufferReadFileGather and
+// sceAmprAprCommandBufferReadFileScatter, the two APR read builders of the four whose argument
+// layout is NOT established (#2926).
+//
+// Why they are registered to a REFUSAL rather than left unregistered, and why that is not the
+// "registering a NID can be worse than not" trap: unregistered means the dispatcher's `return 0`,
+// which on this contract is SCE_OK — "the read is queued and will deliver" — while nothing writes
+// the destination. The guest then reads its own buffer and cannot tell an undelivered segment from a
+// successful read of zeros. That is the failure class this whole block exists to prevent, and it is
+// what prosper answers TODAY. These builders return an int32 SCE error code, so 0x80020016 is a
+// value the contract already defines (it is what the other builders return for an unresolvable
+// file) rather than a sentinel read back as data. The refusal is therefore weakly better than the
+// default on every path: a guest that checks gets a truthful failure, and a guest that does not is
+// no worse off than it is now.
+//
+// What must NOT happen is registering a guessed layout. Standard DMA vocabulary (gather = many
+// sources -> one destination, scatter = one source -> many destinations) suggests each of these
+// names one side explicitly and takes the other from the chain, mirroring how …GatherScatter names
+// both and …ReadFile names the file. That is plausible and undeducible: the two readings differ in
+// WHICH argument disappears, and prosper's chain state (AprChain: file id, size, host path) carries
+// no cursor for the implied side to advance, so even the argument COUNT is unknown. Serving a
+// segment against a guessed layout would put real bytes at an address the guest did not name.
+//
+// The evidence that would settle it is the same shape #2924 used for …GatherScatter: a title that
+// imports one of these NIDs, its SDK inline wrapper disassembled (Kiwami's sit adjacently at
+// eboot+0xcc4a40 and 0xcc4a70), and a live PROSPER_FILELOG run confirming the order. Neither
+// PPSA31334 nor PPSA02739 imports them, so nothing observed calls these yet.
+// CONFIDENCE: HIGH that refusing is better than the current answer; the layout is deliberately not
+// claimed at all.
+static uint64_t apr_read_builder_unimplemented(const char* nid, const char* name,
+                                               std::atomic<uint64_t>& seen,
+                                               uint64_t a0, uint64_t a3, uint64_t a4, uint64_t a5) {
+    const uint64_t n = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1)
+        fprintf(stderr, "[apr] %s (%s) is NOT implemented: its argument layout has never been "
+                        "derived from a guest, so the segment is refused rather than served from a "
+                        "guessed one. See issue #2926 -- a wrapper disassembly plus one "
+                        "PROSPER_FILELOG run is all it needs. Further calls are logged only under "
+                        "PROSPER_FILELOG=1.\n", name, nid);
+    if (n == 1 || filelog())
+        fprintf(stderr, "[apr] %s REFUSED (#%llu): a0=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                name, (unsigned long long)n, (unsigned long long)a0, (unsigned long long)a3,
+                (unsigned long long)a4, (unsigned long long)a5);
+    return 0x80020016ull;
+}
+HLE(f_apr_read_gather) {
+    (void)a1; (void)a2;
+    static std::atomic<uint64_t> seen{0};
+    return apr_read_builder_unimplemented("mZSbNJVJpV8", "sceAmprAprCommandBufferReadFileGather",
+                                          seen, a0, a3, a4, a5);
+}
+HLE(f_apr_read_scatter) {
+    (void)a1; (void)a2;
+    static std::atomic<uint64_t> seen{0};
+    return apr_read_builder_unimplemented("Jg-AgkdJHkk", "sceAmprAprCommandBufferReadFileScatter",
+                                          seen, a0, a3, a4, a5);
 }
 
 // libSceAmpr vWU-odnS+fU — sceAmprMeasureCommandSizeReadFile. The exact firmware contract returns
@@ -3983,6 +4100,14 @@ void register_file_hle() {
     // the plain read it takes no stack argument, so it needs no entry shim.
     Hle::register_fn("BVmR1H8l+XI", (HleFn)f_apr_read_gather_scatter,
                      "sceAmprAprCommandBufferReadFileGatherScatter");
+    // The other two read builders (#2926). Registered to a LOUD refusal, not to an implementation:
+    // unregistered would leave them answering SCE_OK from the dispatcher's return-0 default while
+    // writing nothing, which is the silent-wrong-data answer. Contract and evidence gap are on the
+    // handlers above.
+    Hle::register_fn("mZSbNJVJpV8", (HleFn)f_apr_read_gather,
+                     "sceAmprAprCommandBufferReadFileGather");
+    Hle::register_fn("Jg-AgkdJHkk", (HleFn)f_apr_read_scatter,
+                     "sceAmprAprCommandBufferReadFileScatter");
     Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_measure_read_file,
                      "sceAmprMeasureCommandSizeReadFile");
     #undef R
