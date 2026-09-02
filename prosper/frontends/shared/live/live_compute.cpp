@@ -9278,7 +9278,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
             // to success; this item stays failed either way, which is the conservative choice for a
             // dispatch whose results we can no longer trust.
-            if (!ctx.device_lost) {
+            // #3225: gated like the submit above, and for a second reason as well as the first.
+            // This is a guest-thread queue call, so the frontend's drain must be able to see it and
+            // wait for it; and vkDeviceWaitIdle (which the frontend runs after that drain) requires
+            // host access to every VkQueue to be externally synchronized, which an ungated
+            // vkQueueWaitIdle here would break. Refused, we simply do not drain — `completion_proven`
+            // stays false, which is the same conservative outcome this path already takes when the
+            // device is lost.
+            prosper::GpuSubmitRegion drain_gate;
+            if (!ctx.device_lost && drain_gate.admitted()) {
                 std::unique_lock<std::mutex> qlk(
                     prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
                 if (prosper::gpu::shared_present_active()) qlk.lock();
