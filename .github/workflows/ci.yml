@@ -140,6 +140,26 @@ jobs:
           # here so the protection does not depend on remembering which job carries which guard.
           ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
 
+      # A green run has to carry the NUMBERS, not just the verdict (#3067). The `timing-margin`
+      # ctest label marks the tests whose pass rests on a MEASURED wall-clock margin and which print
+      # that margin on stdout; `--output-on-failure` above discards it on exactly the runs where
+      # nothing is wrong, so the headroom on either side of a near-miss is unrecoverable and the only
+      # way to see the figure is to redden the job first. That is the #3208 defect -- a threshold
+      # whose margin nobody has measured recently -- sitting one flag away from being measured on
+      # every run. #3067 is what it cost: a red macOS job whose cause was printed in its own log
+      # (`(timeout took 13.58 ms via none)` against a 12 ms ceiling) was filed as "unresolved, two
+      # candidates" and stayed open for six days.
+      #
+      # Re-running the label is a few seconds -- the labelled tests are ~1.5 s each even under
+      # Rosetta 2. It is a SECOND sample of an assertion the step above already gated on, so it is
+      # left blocking on purpose: if a timing arm fails only on the re-run, that is a real second
+      # observation and worth a red job, and `-V` says which arm and at what measured value.
+      #
+      # `-L` together with `--no-tests=error` is the self-checking half: if the label is renamed or
+      # dropped, this step fails loudly instead of silently reporting nothing for ever after.
+      - name: Report the measured wait margins
+        run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
+
       # #1704: until this step existed, no Vulkan validation layer ran anywhere in the project.
       # #1690 was an invalid descriptor binding — a VK_IMAGE_VIEW_TYPE_3D view on a descriptor whose
       # module declared Dim 2D — which is undefined behaviour that three conformant drivers resolved
@@ -644,6 +664,11 @@ jobs:
         # See the linux job: plain ctest exits 0 on an empty suite (#2187).
         run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
 
+      # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
+      - name: Report the measured wait margins
+        shell: msys2 {0}
+        run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
+
   windows-app:
     name: Windows App
     runs-on: windows-latest
@@ -798,6 +823,10 @@ jobs:
         # non-GPU one -- which is exactly why a by-name Vulkan guard cannot be copied here and
         # why the empty case has to be caught by the flag instead.
         run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
+
+      # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
+      - name: Report the measured wait margins
+        run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
   macos-app:
     name: macOS App (SDL3 + MoltenVK)

@@ -744,6 +744,25 @@ if(TARGET prosper_core)
   # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
   set_tests_properties(kernel_nanosleep PROPERTIES TIMEOUT 60)
 
+  # LABEL: `timing-margin` -- the two tests above whose green verdict rests on a MEASURED wall-clock
+  # margin, and which print that margin on stdout so it can be quoted.
+  #
+  # #3067 is why this label exists. A red `macOS (x86_64 / Rosetta 2)` job was recorded as
+  # "unresolved, two candidates" while the failing job's own log already named the arm and the
+  # number -- `[FAIL] and returned inside one winpthreads tick of the request, not after it` /
+  # `(timeout took 13.58 ms via none)` against a 12 ms ceiling. The number was there because the
+  # test prints it; it was only in the log because that run was RED. `--output-on-failure` discards
+  # it from every green run, so the runs on either side of a near-miss carry no evidence at all and
+  # the headroom cannot be checked without reddening the job first -- the #3208 defect (a threshold
+  # whose margin nobody has measured recently) with the measurement one flag away.
+  #
+  # The CI jobs re-run this label with `-V` after the suite, so every green log carries the figures.
+  # `kernel_nanosleep` is deliberately NOT labelled: its wall-clock bounds are 500 ms order-of-
+  # magnitude guards against a ~292-year sleep and it prints no measured value, so a verbose re-run
+  # would report nothing. Add the label when a test both DEPENDS ON and PRINTS a margin.
+  set_tests_properties(kernel_sem_timedwait kernel_cond_timedwait_clock
+                       PROPERTIES LABELS "timing-margin")
+
   # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
   # code is Linux-only (guest %fs), so gate the test on it too.
   if(UNIX)

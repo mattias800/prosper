@@ -28,7 +28,16 @@
 //
 //                     defect, Windows, fix reverted:  14.69  12.06  17.75  10.00  15.32 ms
 //                     fix, Windows:                    5.49   5.47   5.39 ms
-//                     macOS/Rosetta, native path:     18.54  23.22  46.46 ms
+//                     macOS/Rosetta, native path:     13.58  18.54  23.22  46.46 ms
+//
+//                   The 13.58 ms is the run that actually reddened CI and became #3067 -- the
+//                   macOS job on PR #3063, whose log reads `(timeout took 13.58 ms via none)`
+//                   under `[FAIL] and returned inside one winpthreads tick`. It is BELOW the
+//                   18.54 ms this list already carried, which sharpens rather than repeats the
+//                   point: the 12 ms ceiling was not a bound that occasionally lost to an
+//                   outlier, it was a bound sitting inside the ordinary spread of a native
+//                   POSIX wait under binary translation. Nothing in this file changed to fix
+//                   it; #3066 was already merged 49 minutes after #3067 was filed.
 //
 //                   A 12 ms ceiling would have PASSED the defect (the 10.00 ms run), not
 //                   merely flaked -- silently, which is worse. And it cannot be repaired by
@@ -221,6 +230,14 @@ int main() {
         // per-test output, so a margin that is never printed cannot be quoted from a passing
         // log -- which is exactly how #3044 came to be merged on a green Rosetta job whose
         // numbers nobody had seen.
+        //
+        // Printing it was only half the fix and the other half was missing until #3067: CI ran
+        // `ctest --output-on-failure`, which shows a test's output ONLY when it fails, so these
+        // figures reached a log exclusively on runs that were already red. This test now carries
+        // the `timing-margin` ctest label and the Linux, Windows MinGW and macOS jobs re-run that
+        // label with `-V`, so every green run records what the margin actually was. To read the
+        // current headroom on any platform, open a recent CI log's "Report the measured wait
+        // margins" step rather than re-deriving it.
         printf("         (posted acquire took %.2f ms)\n", ms);
     }
 
