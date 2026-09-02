@@ -301,6 +301,15 @@ drops still discard the background.
 
 ## Ruled out
 
+- **"The surfaces prosper renders into read black because the live RTT cache does not treat them as
+  authoritative, so the sampler falls through to zeroed guest memory."** Falsified (#3140) — 58,569
+  sample HITs to 185 misses (an instrumented-run figure), and — the part that needs no run — the
+  graphics RTT sampler path is **on by default**, so a black default frame is not explained by that
+  path being off. The measurement, and why the original `PROSPER_RTT=1` arm did not mean what it was
+  captioned as meaning, are recorded above in the sub-bullet under the staging-buffer entry;
+  this row exists so the falsification is findable from the section people actually read before
+  forming a hypothesis. Do not restart from the RTT cache. #3140, #3126.
+
 - **"The title-screen vertex stages die because the recompiler cannot lower
   `buffer_load_format_* … idxen`, or because they arrive with no resource table."** Both falsified
   (#3137). The census line that raised them names an INSTRUCTION —
@@ -432,11 +441,38 @@ drops still discard the background.
     **And it is NOT why the background is black** — established after the above and worth stating
     here, because the reclassification reads like a lead and is not one. The graphics RTT sampler
     resolves these surfaces correctly: a landed title-screen run measures **58,569 sample HITs against
-    185 misses and 5 skips**, and all five skips are 32x32/64x64 3D textures. `PROSPER_RTT=1` renders
-    no additional pixel. So the composite reads black because its INPUTS are black at source (see the
+    185 misses and 5 skips**, and all five skips are 32x32/64x64 3D textures.
+
+    **And the evidence is stronger than the `PROSPER_RTT=1` arm it was first reported as.** That arm
+    was read as switching the sampler path on, and it does not: `pertarget` is
+    `getenv("PROSPER_RTT_PERTARGET") != nullptr || PROSPER_ENV_VALUE("PROSPER_RTT_SINGLE_TARGET") == nullptr`,
+    so with neither variable set it is **true**, and `rtt_on = getenv("PROSPER_RTT") != nullptr ||
+    pertarget` is true with it. The graphics RTT sampler path is therefore **ON BY DEFAULT**, and
+    that is a property of the code needing no run: a black default frame is not explained by the
+    path being off. That is what excludes the cache, and it is a stronger statement than "enabling
+    the path changes nothing".
+
+    `PROSPER_RTT` is read at **three** sites, though, and the other two are not `rtt_on`. Both
+    `agc_shader_layout.cpp` and `gpu_executor.cpp` declare
+    `rtt_bind = getenv("PROSPER_RTT") != nullptr || getenv("PROSPER_RTT_PERTARGET") != nullptr`
+    — **no `PROSPER_RTT_SINGLE_TARGET` disjunct**, so `rtt_bind` is false by default and true under
+    `PROSPER_RTT=1`, the opposite default from `rtt_on`. It decides whether an unmapped Gen5 image
+    format is dropped or bound as RGBA8. So `PROSPER_RTT=1` is a real change, and the "renders no
+    additional pixel" null spans a binding-policy difference rather than nothing at all — it
+    measured something, just not what its caption said. Read the identifier, not the variable name:
+    every error made on this question, this row's first version included, came from resolving the
+    line that was expected to matter and reading past the ones beside it.
+
+    So the composite reads black because its INPUTS are black at source (see the
     section of that name), not because a sample was served from cleared guest memory. The staging
     buffer being cleared is ordinary engine behaviour with no bearing on the picture. #3140 is
     falsified; do not restart from the RTT cache.
+
+    One caveat on the counted run, since the counts came from `PROSPER_RTTLOG`: that variable is the
+    final conjunct of **`live_gpu_targets`** (not of `timeline_capture_requested`, which is its own
+    one-line predicate above it), so setting it changes what the run RETAINS rather than only what
+    it prints. The HIT/miss ratio is therefore an instrumented-run figure. The default-configuration
+    claim above does not depend on it.
   - Four mechanisms measured and excluded, each in the same runs: **`dmem_zero`'s hole punch** (all 20
     calls occur at startup, before every one of these writes); **a re-map of the VA** (one `[physmap]`
     per VA, created ~2 ms *before* its write, none after); **a second VA aliasing the phys** (none —
