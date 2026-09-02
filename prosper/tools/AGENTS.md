@@ -1353,3 +1353,28 @@ cross-lane operation whether or not you meant it that way.
 
 Both fail closed where `/proc` is unreadable: without it, ownership cannot be established, and
 "I could not tell whose this is" must never render as "it is yours".
+
+- **`wt_stash.py`** — park uncommitted work in a ref that is really private to one worktree, plus
+  `check`, which asks whether the shared stash stack is currently holding somebody else's work.
+  A worktree isolates `HEAD`, the index and the working tree; it does **not** isolate `refs/stash`,
+  which is one ref in the common `.git` directory. Two lanes stashing in their own worktrees push
+  onto and pop from one LIFO stack, and on 2026-09-01 each popped the other's entry (#3174,
+  instrument trap 247). The park goes to `refs/worktree/prosper-stash/<slot>` instead — a namespace
+  `git-worktree(1)` documents as not shared — addressed by name rather than by top-of-stack, with
+  `push` refusing an occupied slot rather than stacking. Same fail-closed shape as the two above:
+  `check` reports an entry it cannot attribute to a branch as `UNATTRIBUTABLE`, never as yours.
+
+## Ruled out
+
+- **A `git` alias cannot guard `git stash`.** `git config alias.stash '!<guard>'` is silently
+  ignored — git does not let an alias shadow a builtin — so the guard never runs and the stash
+  lands as usual. Measured 2026-09-02 on git 2.55.0: with the alias configured, `git stash push`
+  saved an entry and the alias body printed nothing at all. A wrapper of that shape is worse than
+  no wrapper, because it reads as coverage and cannot fail. #3174.
+- **A `reference-transaction` hook does abort a stash cleanly — but it is not a guard anyone may
+  assume.** Measured 2026-09-02: exiting non-zero in the `prepared` phase for `refs/stash` refuses
+  the update, leaves the working tree untouched and creates no ref, so there is no half-stashed
+  state. It ships as `wt_stash.py install-hook` and is deliberately **off by default**: hooks live
+  in untracked `.git/hooks`, so every fresh clone fails open, and once installed it blocks
+  `git stash` repo-wide — every worktree, the human's interactive use, and `--autostash` with it.
+  So it is an opt-in convenience for one machine, never the reason the collision cannot recur.

@@ -203,6 +203,21 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_SOURCE_DIR}/tools/test_lanekill.py")
   endif()
+  # wt_stash parks uncommitted work in refs/worktree/, which git documents as per-worktree, because
+  # refs/stash is NOT: every worktree of this repo shares one stack, so two lanes each obeying the
+  # "work in your own worktree" rule still pop each other's entries (#3174, instrument trap 247).
+  #
+  # The first arm is a positive control built by hand from git primitives: two linked worktrees,
+  # plain `git stash` in each, and an assertion that lane A's pop really does hand it lane B's
+  # content. Every later arm claims the tool removes that failure, and none of them means anything
+  # if the fixture cannot produce it -- so a failure there reports VOID rather than a red arm.
+  #
+  # Platform-independent deliberately. Unlike worktree_reclaim and lanekill above, nothing here
+  # reads /proc: the whole subject is ref namespacing, which behaves the same everywhere git runs,
+  # and the collision this pins is likeliest on the Windows/PowerShell route the charter also
+  # prescribes.
+  add_test(NAME wt_stash_tool
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_wt_stash.py")
   add_test(NAME re_edis_mapping
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_edis.py")
   # nid_gate_scan answers "does this title BRANCH on an imported function's return value?", and a
