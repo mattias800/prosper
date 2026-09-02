@@ -422,7 +422,7 @@ jobs:
     # makes it stale at the moment of merging, which no pre-merge check can repair. Master therefore
     # regenerates it instead of failing -- for THAT cause. A generator or tracker error still fails
     # here, because it is author-fixable and leaves the file frozen if swallowed.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
       issues: read
@@ -436,7 +436,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Push contention is SOFT -- a derived file one commit behind is not worth a red master, and
+      # Push contention is SOFT -- a derived file one commit behind is not worth a red main, and
       # that is precisely the defect this job removes. A GENERATOR or TRACKER error is HARD, because
       # it writes no file and would otherwise freeze PROGRESS_TRACKER.md behind a permanently green
       # job; that one is author-fixable, which is the same criterion that keeps --selftest a gate.
@@ -465,7 +465,7 @@ jobs:
               echo "::error::not push contention, and it leaves PROGRESS_TRACKER.md frozen. Fix the"
               echo "::error::tracker it names, or the generator. Note the repair is usually an ISSUE"
               echo "::error::edit rather than a commit, so it may need no push from anyone at all --"
-              echo "::error::the next master push then regenerates cleanly."
+              echo "::error::the next main push then regenerates cleanly."
               exit 1
             }
             if git diff --quiet -- PROGRESS_TRACKER.md; then
@@ -479,22 +479,22 @@ jobs:
               echo "::error::commit failed with a staged change present"
               exit 1
             }
-            if git push origin HEAD:master; then
+            if git push origin HEAD:main; then
               echo "regenerated and pushed."
               exit 0
             fi
             # Another lane landed while we were generating. Rebuild on top of it and try again --
-            # regenerating rather than replaying our commit, so the result reflects the new master.
+            # regenerating rather than replaying our commit, so the result reflects the new main.
             #
             # The reset is LOAD-BEARING, not tidiness: without it `pull --rebase` carries the local
             # commit forward, the next regeneration then finds no diff, and the loop takes the
             # "already matches" exit 0 having committed locally and never pushed. Do not simplify.
-            echo "push rejected (attempt ${attempt}); rebasing onto the current master"
+            echo "push rejected (attempt ${attempt}); rebasing onto the current main"
             git reset --hard HEAD~1
-            git pull --rebase --quiet origin master || break
+            git pull --rebase --quiet origin main || break
           done
           echo "::warning::could not push the regenerated PROGRESS_TRACKER.md after 3 attempts;"
-          echo "::warning::the next push to master will regenerate it"
+          echo "::warning::the next push to main will regenerate it"
           exit 0
 
   linux-app:

@@ -313,7 +313,7 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
         repo = root / "repo"
         (repo / DOC_REL.parent).mkdir(parents=True)
         (repo / DOC_REL).write_text(SEED, encoding="utf-8")
-        for cmd in (["init", "-q", "-b", "master"],
+        for cmd in (["init", "-q", "-b", "main"],
                     ["config", "user.email", "t@example.invalid"],
                     # A developer with commit.gpgsign on globally would otherwise get a fixture
                     # whose commits fail, and every arm here reads a commit.
@@ -321,10 +321,10 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
                     ["config", "user.name", "t"], ["add", "-A"], ["commit", "-qm", "base"]):
             subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True)
 
-        # `--no-fetch --base master` unless an arm asks for a real remote, in which case it runs the
+        # `--no-fetch --base main` unless an arm asks for a real remote, in which case it runs the
         # DEFAULT path: fetch, then read origin/main. Every other arm skips the fetch, which is
         # how the fetch went unexercised (#2624).
-        base_args = ["--no-fetch", "--base", "master"]
+        base_args = ["--no-fetch", "--base", "main"]
         if origin_missing:
             base_args = ["--base", "origin/main"]
             git(repo, "remote", "add", "origin", str(root / "no-such-upstream"))
@@ -335,12 +335,12 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
                                   capture_output=True, text=True)
             assert init.returncode == 0, f"git init --bare failed: {init.stderr}"
             git(repo, "remote", "add", "origin", str(upstream))
-            git(repo, "push", "-q", "origin", "master")
+            git(repo, "push", "-q", "origin", "main")
             seeded = git(repo, "rev-parse", "HEAD")
             # Another lane's push, landing on the shared origin after this checkout was made.
             (repo / DOC_REL).write_text(doc_text(origin_rows), encoding="utf-8")
             git(repo, "commit", "-qam", "another lane's row")
-            git(repo, "push", "-q", "origin", "master")
+            git(repo, "push", "-q", "origin", "main")
             # Rewind the remote-tracking ref by hand rather than trusting push not to have moved it:
             # this is exactly the state of a checkout that has not fetched since that push, and it is
             # what makes the arm discriminate. Without a fetch the tool reads `seeded` and answers
@@ -442,7 +442,7 @@ run_main("a PR whose files array is at the 100 cap is scanned, not skipped",
 # This is the report that found the live #2602 collision, and disabling the branch changed nothing in
 # the suite. Master here holds rows 1 and 2; PR #44's patch adds a DIFFERENT row 2.
 run_main("a PR adding a number the base already holds is reported as a duplicate",
-         want_rc=0, expect="DUPLICATES 2 ALREADY ON master",
+         want_rc=0, expect="DUPLICATES 2 ALREADY ON main",
          stub_env={"STUB_MODE": "dupmaster"})
 
 # The wild-claim report, added two rounds ago as the allocator/gate divergence guard, also had no
