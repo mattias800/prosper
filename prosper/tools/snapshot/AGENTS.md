@@ -21,7 +21,8 @@ python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 
 A red guard is only evidence about your change if the guard itself is sound. Two are not, and a lane
 that treats either as a regression will spend a session chasing its own tools. **Selection is
-positional** — `snapshot.py check <name> [<name>...]`; there is no `--only` flag.
+positional** — `snapshot.py check <name> [<name>...]`; there is no `--only` flag, and an
+unrecognised option is now refused with exit 2 rather than read as a guard name.
 
 - **`gris-gameplay` — do not run it, and do not act on it.** Project-owner decision, 2026-09-02: its
   baseline has not been updated and *GRIS* is to be verified by hand instead. It fails on master
@@ -172,15 +173,65 @@ wrong scene.
 3. For content mode, choose a conservative `min_colors`, require at least two
    qualifying frames, and add `min_pixel_changes` for moving routes.
 4. Run `snapshot.py update NAME --reviewed` only after every image is accepted.
-   Content mode records reviewed luminance references for SSIM plus a
-   conservative non-black coverage floor; exact mode records the identical
-   pixel hash. Never use exact hashes for threaded gameplay merely because one
-   run happened to be stable.
+   Add `--verified-by=human` **only if a person looked at the images**; see
+   *Who verified it, and when* below. Content mode records reviewed luminance
+   references for SSIM plus a conservative non-black coverage floor; exact mode
+   records the identical pixel hash. Never use exact hashes for threaded
+   gameplay merely because one run happened to be stable.
 5. Replace the generic `review` string that `update` wrote with the factual note
    describing what was actually inspected.
 6. Run `snapshot.py check NAME` after approval.
 
 See `README.md` for every manifest field and the current title matrix.
+
+### Who verified it, and when
+
+Two structured fields record the *provenance* of a baseline, as data rather than as the English
+inside `review`:
+
+| field | shape | written by |
+| --- | --- | --- |
+| `verified_at` | ISO 8601 UTC instant, `2026-09-02T12:34:56Z` | `update NAME --reviewed` |
+| `verified_by` | `agent` or `human` | `update NAME --reviewed` |
+
+**`agent` is the default; `human` must be asserted.** The tool cannot observe who ran it, so it has
+to be told: `snapshot.py update NAME --reviewed --verified-by=human`. Nothing infers `human` from a
+TTY, from `$USER`, from an interactive terminal, or from the absence of an environment variable —
+every one of those is a proxy for "somebody was probably there", and a proxy is exactly what would
+make the field a lie. The asymmetry is deliberate and is the whole point: a `human` that never
+happened is far worse than an `agent` that understates a real review, because the only reason to
+record the actor at all is so a human-reviewed baseline can be trusted further than a
+machine-approved one. **So if you are an agent, do not pass the flag — not even when a person asked
+you to run the command.** They asked for the run; they did not look at the images.
+
+**Only `update --reviewed` stamps.** `check` never does, and must never be made to: checking a
+baseline is not verifying it, and a routine regression run that refreshed the date would launder a
+baseline nobody re-read into one that looks freshly reviewed. `verify` does not stamp either — it
+writes no manifest at all, and it runs *before* the images have been inspected, so a stamp there
+would record a review that has not happened yet.
+
+**Absence means "never recorded", and that is the useful signal.** The entries that predate the
+fields carry neither, and nothing backfills them — a date recovered from `review` prose or from git
+history would read as a recorded fact while being an inference, which is worse than no date at all.
+`snapshot.py list` prints the column, so a never-verified or long-stale baseline is visible without
+booting anything:
+
+```
+  guard                      last verified          configuration
+  gris-gameplay              NEVER VERIFIED         dump=PPSA09804-app0 min_colors=1200 ...
+  terminator-boot            2026-08-03 human  30d  dump=PPSA25872-app0 min_colors=300 ...
+
+  17 guards: 15 never verified, 1 agent-verified, 1 human-verified
+```
+
+`list` also takes guard names, so `snapshot.py list gris-gameplay` answers "when was this last
+looked at" for one entry.
+
+Two mechanical notes. Both fields are excluded from `entry_fingerprint`, like `review`, because
+`update` writes them — hashing them would make a second `update NAME --reviewed` refuse its own
+candidate with *"snapshot configuration changed after verify"*. And `update` now requires at least
+one guard name: an unnamed `update --reviewed` would sweep the whole manifest and stamp every entry
+with a verification nobody performed.
 
 ### Three ordering traps that silently produce a bad baseline
 
