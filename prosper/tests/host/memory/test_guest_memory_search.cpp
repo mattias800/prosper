@@ -118,8 +118,15 @@ int main() {
 
     // --- 2b. Every placement across the boundary, not just one --------------------------------
     // One placement can be right by luck; the whole crossing window cannot. Each offset is asserted
-    // to be found exactly once at the right address, which covers the de-duplication as well as the
-    // coverage: an overlap without de-duplication reports two hits somewhere in this sweep.
+    // to be found exactly once at the right address.
+    //
+    // It does NOT test the `accept_from` de-duplication, and saying it did was wrong: with the
+    // bounds as written the searched start windows of consecutive chunks are contiguous and
+    // disjoint, so no placement can be reported twice and removing the guard leaves this sweep
+    // green. Measured in review of #3243. The guard is an invariant against a future change to
+    // `limit` or `advance`, not a fix for a hazard this arithmetic can produce -- and it is
+    // deliberately unpinned, because a test that could redden without it would have to introduce
+    // the overlap the design excludes.
     {
         const size_t lo = kChunk - kNeedle - 2, hi = kChunk + 2;
         for (size_t at = lo; at <= hi; ++at) {
@@ -194,6 +201,23 @@ int main() {
                                  std::to_string(hits.size()));
                 break;
             }
+        }
+        // The `full` flag must require the needle to be PRESENT, not merely to compare equal
+        // against whatever the fetch buffer happens to hold beyond the range. This arm pins that:
+        // the needle's tail is all zeros and the fetch buffer is zero-initialised, so a full-needle
+        // memcmp that ran past `want` would SUCCEED and report full=true. Only the
+        // `off + needle_len <= want` guard makes the answer false here.
+        {
+            std::vector<uint8_t> zero_tail = needle;
+            for (size_t k = kPrefix; k < kNeedle; ++k) zero_tail[k] = 0;
+            FakeSpace z{0x600000000ull, filler(kChunk / 8)};
+            const size_t at = z.bytes.size() - kPrefix;      // only the prefix fits
+            memcpy(z.bytes.data() + at, zero_tail.data(), kPrefix);
+            std::vector<MemorySearchHit> zh;
+            memory_search_ranges(z.ranges(), z.fetch(), zero_tail.data(), kPrefix, kNeedle, 0, 64, zh);
+            check(zh.size() == 1 && zh[0].addr == z.base + at, "zero-tail: prefix hit found");
+            check(!zh.empty() && !zh[0].full,
+                  "zero-tail: full=false -- the needle does not FIT, whatever the buffer holds");
         }
         // ...and a range too short for the whole needle but long enough for the prefix is still
         // scanned rather than skipped.

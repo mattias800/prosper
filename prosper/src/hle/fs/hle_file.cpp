@@ -2737,10 +2737,11 @@ struct ZeroWatchEntry {
     uint64_t seed_off = 0;
     const char* path = "?";
     bool seen_nonzero = false, reported = false;
-    // #3142: a verbatim copy of the SOURCE bytes at seed_off, so that after the range goes quiet the
-    // guest's whole address space can be searched for them. Kept from the source rather than read
-    // back from the destination, for the same reason the seed scan uses the source: the payload is
-    // the oracle, and re-reading the destination would sample whatever is there now.
+    // #3142: a verbatim copy of the SOURCE bytes at `find_off` (NOT at seed_off -- see find_off
+    // below), so that after the range goes quiet the guest's whole address space can be searched for
+    // them. Kept from the source rather than read back from the destination, for the same reason the
+    // seed scan uses the source: the payload is the oracle, and re-reading the destination would
+    // sample whatever is there now.
     uint8_t seed[256] = {0};
     // A SECOND window, taken from the LAST non-zero place in the payload rather than the first.
     // Window 0 of a streamed UE4 chunk is its serialization header, and a header is exactly the part
@@ -2858,6 +2859,22 @@ size_t zerowatch_find_prefix() {
 
 void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, uint64_t needle_off,
              const char* window, bool* found_out) {
+    // A needle whose leading prefix_len bytes are all zero matches essentially everywhere, so both
+    // its hits and its misses are meaningless. The arming code below picks a non-zero start where
+    // one exists inside the window; this is the backstop for when none does, and it refuses rather
+    // than publishing a number.
+    bool degenerate = true;
+    for (size_t k = 0; k < zerowatch_find_prefix() && degenerate; ++k)
+        if (needle[k]) degenerate = false;
+    if (degenerate) {
+        if (found_out) *found_out = false;
+        fprintf(stderr, "[zerowatch-find] t=%llu %s dst=0x%llx window=%s seed-off=0x%llx "
+                        "DEGENERATE NEEDLE (first %zu bytes all zero) -- NOT scanned\n",
+                (unsigned long long)prosper::diagnostics::diag_now_us(), when,
+                (unsigned long long)e.dst, window, (unsigned long long)needle_off,
+                zerowatch_find_prefix());
+        return;
+    }
     std::vector<prosper::host::MemorySearchHit> hits;
     // The GUEST's address space only: [0x100000000, kGuestAutoMapLimit). prosper's own host
     // allocations sit at 0x7f... on this host and a wider scan does find the payload there -- in
@@ -2911,11 +2928,12 @@ void zw_find(const ZeroWatchEntry& e, const char* when, const uint8_t* needle, u
 // is not mistaken for one that lost its data.
 void zw_profile(const ZeroWatchEntry& e, const char* when) {
     char prof[640]; int used = 0;
-    uint32_t zero_windows = 0, live_windows = 0;
+    uint32_t zero_windows = 0, live_windows = 0, unreadable_windows = 0;
     for (uint32_t w = 0; w < 16; ++w) {
         const uint64_t off = (((e.size - 256ull) / 15ull) * w) & ~(uint64_t)3;
         uint32_t dw[64], nzw = 0;
         if (!zw_read256(e.dst + off, dw)) {
+            ++unreadable_windows;
             used += snprintf(prof + used, sizeof prof - (size_t)used, " w%u=??", w);
             continue;
         }
@@ -2924,11 +2942,23 @@ void zw_profile(const ZeroWatchEntry& e, const char* when) {
         used += snprintf(prof + used, sizeof prof - (size_t)used, " w%u=%u/%u", w, nzw,
                          e.src_profile[w]);
     }
+    // A range that has become UNREADABLE scores lost=0 kept=0 on the counters above, because neither
+    // branch runs -- which reads as "nothing happened" for the most complete kind of loss there is.
+    // Say `unreadable=N` in the line and, when the whole range is gone, replace the summary rather
+    // than printing a pair of zeros beside it.
+    if (unreadable_windows == 16) {
+        fprintf(stderr,
+                "[zerowatch] t=%llu dst=0x%llx zero-profile(%s) RANGE UNREADABLE -- all 16 windows "
+                "failed to read; this is a total loss, not `lost=0`\n",
+                (unsigned long long)prosper::diagnostics::diag_now_us(),
+                (unsigned long long)e.dst, when);
+        return;
+    }
     fprintf(stderr,
             "[zerowatch] t=%llu dst=0x%llx zero-profile(%s) payload-windows lost=%u kept=%u "
-            "(dst/src non-zero dwords per 256B window):%s\n",
+            "unreadable=%u (dst/src non-zero dwords per 256B window):%s\n",
             (unsigned long long)prosper::diagnostics::diag_now_us(),
-            (unsigned long long)e.dst, when, zero_windows, live_windows, prof);
+            (unsigned long long)e.dst, when, zero_windows, live_windows, unreadable_windows, prof);
 }
 
 // Runs until the process ends, and is never joined. That is safe here only because every exit path
@@ -3099,6 +3129,20 @@ void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* pat
     // WENT-ZERO probe keeps using seed_off, which stays comparable with the window formula the other
     // APR instruments use; only the FIND needle moves.
     e.find_off = e.seed_off & ~(uint64_t)15;
+    // ...and move forward, still 16-aligned, to a start whose first 16 bytes are not all zero. The
+    // window was chosen for holding data SOMEWHERE in its 256 bytes; a needle is only evidence if
+    // the bytes the search actually compares are distinctive, and an all-zero 16-byte lead matches
+    // everywhere. The shift is bounded by BOTH the window (240 = 256 - 16) and the payload: the
+    // last window starts at size-256, where no shift at all is possible without reading past the
+    // source buffer.
+    {
+        const uint64_t room = (size - 256ull) - e.find_off;   // find_off <= seed_off <= size-256
+        for (uint64_t d = 0; d <= 240 && d <= room; d += 16) {
+            bool nz = false;
+            for (uint32_t k = 0; k < 16 && !nz; ++k) if (p8[e.find_off + d + k]) nz = true;
+            if (nz) { e.find_off += d; break; }
+        }
+    }
     memcpy(e.seed, p8 + e.find_off, sizeof e.seed);
     for (uint32_t w = 0; w < 16; ++w) {
         const uint64_t off = (((size - 256ull) / 15ull) * w) & ~(uint64_t)3;
@@ -3113,12 +3157,17 @@ void zerowatch_arm(uint64_t dst, const void* src, uint64_t size, const char* pat
     for (int w = 7; w >= 0; --w) {
         const uint64_t off = ((((size - 256ull) / 7ull) * (uint32_t)w) & ~(uint64_t)3) & ~(uint64_t)15;
         if (off <= e.find_off) break;
-        bool nz = false;
-        for (uint32_t k = 0; k < 256 && !nz; ++k) if (p8[off + k]) nz = true;
+        // Same rule as find_off: the leading 16 bytes must be distinctive, not merely some byte in
+        // the window. A window whose first 16 bytes are zero is stepped forward inside itself.
+        uint64_t start = off; bool nz = false;
+        const uint64_t room = (size - 256ull) - off;          // off <= size-256 by construction
+        for (uint64_t d = 0; d <= 240 && d <= room && !nz; d += 16) {
+            for (uint32_t k = 0; k < 16 && !nz; ++k) if (p8[off + d + k]) { nz = true; start = off + d; }
+        }
         if (!nz) continue;
-        e.find_deep_off = off;
+        e.find_deep_off = start;
         e.has_seed_deep = true;
-        memcpy(e.seed_deep, p8 + off, sizeof e.seed_deep);
+        memcpy(e.seed_deep, p8 + start, sizeof e.seed_deep);
         break;
     }
     g_zw.push_back(e);
