@@ -462,6 +462,19 @@ struct ShaderResource {
     // later operation consumes the same version. Production tables leave both fields zero and use guest memory.
     uint8_t*       host_data        = nullptr;
     uint64_t       host_data_size   = 0;
+    // Bytes of the SAME allocation that lie immediately BELOW `host_data`: `host_data - k` is the
+    // guest byte at `gpu_addr - k` for every k in [1, host_data_prefix_bytes]. Zero means the
+    // backing starts exactly at `gpu_addr`, which is what every host-built fixture and every
+    // diagnostic replacement produces.
+    //
+    // It exists because a tiled GFX10 mip chain stores level zero LAST -- the shared tail block
+    // first, then the remaining levels smallest-to-largest -- so a descriptor selecting level zero
+    // names the HIGHEST address in its own allocation and every other level lives below it. Replay
+    // sets this from the resource's offset inside its capture blob, whose bytes are the guest bytes
+    // at those addresses by construction; production tables leave it zero and read guest memory by
+    // address instead (#3202). Anything that repoints `host_data` at a different buffer must reset
+    // it: a stale prefix would authorize a read before the start of the new allocation.
+    uint64_t       host_data_prefix_bytes = 0;
 
     // Instruction-scoped record-count proof for GTA V's exact linear stride-8 qword-atomic V#. Appended
     // after the historical aggregate-initialized fields so positional test fixtures remain stable.

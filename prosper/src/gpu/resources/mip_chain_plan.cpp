@@ -46,6 +46,25 @@ bool native_straight_copy_sampled_format(DataFormat format, uint32_t components)
     }
 }
 
+// Everything that decides whether the compute backend materializes a chain EXCEPT where the bytes
+// come from. Kept in one place so the level count, the allocation span the capture writer owns, and
+// the backend's own bounds check cannot drift apart.
+MipChainPlan compute_chain_plan(const ShaderResource& resource) {
+    // Cheapest possible rejection first. This runs per resource on the compile-key path, which runs
+    // for every dispatch, and almost every texture declares a single level -- so the common answer
+    // must not reach the plan's allocation arithmetic.
+    if (resource.declared_mip_levels < 2u || resource.cls != ResourceClass::Texture)
+        return {};
+    const uint32_t components = resource.num_components ? resource.num_components : 1u;
+    if (!native_straight_copy_sampled_format(resource.format, components)) return {};
+    if (resource.depth_compare) return {};
+    const uint32_t component_bytes = data_format_bytes(resource.format);
+    if (!component_bytes ||
+        component_bytes * components != resource.mip_chain_bytes_per_block)
+        return {};
+    return shader_resource_mip_chain_plan(resource);
+}
+
 } // namespace
 
 MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
@@ -125,25 +144,39 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
     return plan;
 }
 
+bool shader_resource_host_data_covers_mip_chain(const ShaderResource& resource,
+                                                const MipChainPlan& plan) {
+    if (!resource.host_data || !plan.valid || plan.levels.empty()) return false;
+    const uint64_t prefix = plan.levels[0].byte_offset;
+    // The selected level is the allocation's LAST stored level, so this cannot underflow for any
+    // plan this function accepts -- but the plan is an input, so prove it rather than assume it.
+    if (plan.allocation_bytes < prefix) return false;
+    return resource.host_data_prefix_bytes >= prefix &&
+           resource.host_data_size >= plan.allocation_bytes - prefix;
+}
+
+bool shader_resource_compute_mip_chain_allocation(const ShaderResource& resource,
+                                                  uint64_t& prefix_bytes, uint64_t& total_bytes) {
+    prefix_bytes = 0;
+    total_bytes = 0;
+    const MipChainPlan plan = compute_chain_plan(resource);
+    if (!plan.valid || plan.levels.empty()) return false;
+    prefix_bytes = plan.levels[0].byte_offset;
+    total_bytes = plan.allocation_bytes;
+    return true;
+}
+
 uint32_t shader_resource_compute_mip_chain_levels(const ShaderResource& resource) {
-    // Cheapest possible rejection first. This is called per resource on the compile-key path, which
-    // runs for every dispatch, and almost every texture declares a single level -- so the common
-    // answer must not reach the plan's allocation.
-    if (resource.declared_mip_levels < 2u ||
-        resource.cls != ResourceClass::Texture) return 1u;
-    const uint32_t components = resource.num_components ? resource.num_components : 1u;
-    if (!native_straight_copy_sampled_format(resource.format, components)) return 1u;
-    if (resource.depth_compare) return 1u;
-    // The allocation base sits BELOW gpu_addr, so the source must be ordinary guest memory. A
-    // host_data-backed resource (capture replay, synthetic fixtures) exposes only the selected
-    // level's span and cannot answer for the rest of the chain.
-    if (resource.host_data) return 1u;
-    const uint32_t component_bytes = data_format_bytes(resource.format);
-    if (!component_bytes ||
-        component_bytes * components != resource.mip_chain_bytes_per_block)
+    const MipChainPlan plan = compute_chain_plan(resource);
+    if (!plan.valid) return 1u;
+    // The allocation base sits BELOW gpu_addr, so a host-backed resource must own that prefix as
+    // well as the selected level. A capture that owned the whole allocation does (#3202); a
+    // synthetic fixture, a compute-internal snapshot and a `gpu_replay --override-resource`
+    // replacement do not, and they must keep declining -- the levels they do not own are not the
+    // guest's bytes, and synthesizing them is the failure mode this whole path exists to avoid.
+    if (resource.host_data && !shader_resource_host_data_covers_mip_chain(resource, plan))
         return 1u;
-    const MipChainPlan plan = shader_resource_mip_chain_plan(resource);
-    return plan.valid ? plan.level_count : 1u;
+    return plan.level_count;
 }
 
 } // namespace prosper::gpu

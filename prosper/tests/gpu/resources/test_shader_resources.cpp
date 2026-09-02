@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <vector>
 
 using namespace prosper::gpu;
 
@@ -1156,7 +1157,46 @@ int main() {
         host_backed.host_data = host_bytes;
         host_backed.host_data_size = sizeof host_bytes;
         CHECK(shader_resource_compute_mip_chain_levels(host_backed) == 1,
-              "a host_data-backed resource exposes only its selected level and is declined");
+              "a host_data-backed resource exposing only its selected level is declined");
+
+        // #3202: ...and one whose host span owns the WHOLE allocation is not. Built by hand here,
+        // outside the capture path that produces it in practice, so this arm cannot inherit that
+        // path's assumptions. The allocation base is BELOW gpu_addr (level zero is stored last),
+        // which is the whole reason a plain host_data pointer could not answer for the chain.
+        const uint64_t chain_prefix = plan.valid ? plan.levels[0].byte_offset : 0u;
+        const uint64_t chain_total = plan.allocation_bytes;
+        CHECK(plan.valid && chain_prefix > 0u && chain_total > chain_prefix,
+              "the hand-built host-backed fixture really has bytes below gpu_addr to own");
+        std::vector<uint8_t> whole_allocation(static_cast<size_t>(chain_total), 0u);
+        ShaderResource host_chain = chain;
+        host_chain.host_data = whole_allocation.data() + chain_prefix;
+        host_chain.host_data_size = chain_total - chain_prefix;
+        host_chain.host_data_prefix_bytes = chain_prefix;
+        CHECK(shader_resource_compute_mip_chain_levels(host_chain) == kMaxMip + 1,
+              "#3202: a host-backed resource whose span covers the whole allocation materializes "
+              "the declared chain");
+        // Both boundaries, because each is a separate half of the coverage rule and a fix that got
+        // only one of them right would still pass the arm above.
+        ShaderResource host_chain_short_prefix = host_chain;
+        host_chain_short_prefix.host_data_prefix_bytes = chain_prefix - 1u;
+        CHECK(shader_resource_compute_mip_chain_levels(host_chain_short_prefix) == 1,
+              "#3202: one byte short below gpu_addr declines");
+        ShaderResource host_chain_short_span = host_chain;
+        host_chain_short_span.host_data_size = chain_total - chain_prefix - 1u;
+        CHECK(shader_resource_compute_mip_chain_levels(host_chain_short_span) == 1,
+              "#3202: one byte short above gpu_addr declines");
+        uint64_t reported_prefix = 0, reported_total = 0;
+        CHECK(shader_resource_compute_mip_chain_allocation(chain, reported_prefix,
+                                                           reported_total) &&
+                  reported_prefix == chain_prefix && reported_total == chain_total,
+              "#3202: the allocation span the capture writer owns is the plan's own span");
+        uint64_t declined_prefix = 1, declined_total = 1;
+        ShaderResource declined = chain;
+        declined.tile_mode = 0;
+        CHECK(!shader_resource_compute_mip_chain_allocation(declined, declined_prefix,
+                                                            declined_total) &&
+                  !declined_prefix && !declined_total,
+              "#3202: a declined chain reports no allocation to own, and zeroes both outputs");
         // The chain is bounded by the extent as well as by the declaration: a T# may not name more
         // levels than 256x256 can have.
         ShaderResource over_declared = chain;

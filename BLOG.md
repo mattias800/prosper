@@ -36,6 +36,20 @@ does ([#3193][i3193]).
 
 [i3193]: https://github.com/mattias800/prosper/issues/3193
 
+### An F9 capture now owns the whole mip chain, so the fetch that stops Sonic Frontiers can be studied offline
+
+No picture — this one is a tool. Compute images carry the guest's declared mip chain since
+[#3048][i3048], but `gpu_replay` did not: a capture owned the *level* the descriptor named, and a
+tiled chain stores level zero last, so every other level sat below the captured range and replay
+fell back to a single-level image with `IMAGE_LOAD_MIP` still refused. Captures now own the whole
+allocation, and the offset that was already in the file turns out to say exactly how much of it
+lies below the descriptor's address — so no new format version was needed
+([#3202][i3202]). A bundle grabbed before this still declines, visibly, rather than fetching
+levels it does not have; re-grab the frame.
+
+[i3048]: https://github.com/mattias800/prosper/issues/3048
+[i3202]: https://github.com/mattias800/prosper/issues/3202
+
 ## 2026-09-01
 
 ### The shader that hangs Astro Bot's world map can now be pulled out of a run by name

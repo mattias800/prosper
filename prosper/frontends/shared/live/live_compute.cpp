@@ -5451,6 +5451,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ? reinterpret_cast<uint8_t*>(null_buffer_seed.data()) : entry.host_data;
             entry_resource.host_data_size = null_entry
                 ? null_buffer_seed.size() * sizeof(uint32_t) : entry.host_data_size;
+            // A table entry's backing is its own allocation, so the parent's prefix does not apply.
+            entry_resource.host_data_prefix_bytes = 0;
             buffer_resources.push_back(entry_resource);
             buffer_descriptor_indices.push_back(descriptor_index);
         }
@@ -6982,14 +6984,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         (r->host_data && r->host_data_size >= sampled_guest_need) ||
                         guest_readable(r->gpu_addr, static_cast<uint32_t>(sampled_guest_need));
                     if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
-                    // The chain's other levels live in the SAME allocation, below and above the
-                    // selected level. Bound the whole span before any of it is dereferenced.
+                    // The chain's other levels live in the SAME allocation, below the selected
+                    // level. Bound the whole span before any of it is dereferenced. A host-backed
+                    // resource is bounded by its own span -- a capsule that owns the allocation
+                    // qualifies (#3202), one that owns only the selected level does not -- and a
+                    // guest-backed one by `guest_readable` over the same range. The host arm is
+                    // the SAME predicate the level count used, not a second copy of it.
                     if (bi.mip_levels > 1u) {
                         const uint64_t level_zero_offset = mip_chain.levels[0].byte_offset;
-                        if (r->host_data || level_zero_offset > r->gpu_addr ||
-                            mip_chain.allocation_bytes > UINT32_MAX ||
-                            !guest_readable(r->gpu_addr - level_zero_offset,
-                                            static_cast<uint32_t>(mip_chain.allocation_bytes))) {
+                        const bool readable_chain = r->host_data
+                            ? prosper::gpu::shader_resource_host_data_covers_mip_chain(
+                                  *r, mip_chain)
+                            : (level_zero_offset <= r->gpu_addr &&
+                               mip_chain.allocation_bytes <= UINT32_MAX &&
+                               guest_readable(r->gpu_addr - level_zero_offset,
+                                              static_cast<uint32_t>(mip_chain.allocation_bytes)));
+                        if (!readable_chain) {
                             skip_image(r, "declared mip chain allocation unreadable");
                             break;
                         }

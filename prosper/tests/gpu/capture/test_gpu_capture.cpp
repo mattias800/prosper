@@ -6,6 +6,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "fixtures/gta5_cf9200_fixture.hpp"
 #include "fixtures/gta5_nullable_output_fixture.hpp"
@@ -4112,6 +4113,176 @@ int main(int argc, char** argv) {
         note.clear();
         CHECK(capture_blob_max_bytes_from_env_for_test("3072", &note) == kTotal && note.empty(),
               "exactly the total-blob budget is accepted as given (boundary, not clamped)");
+    }
+
+    // ---- #3202: a capture owns a materializable mip chain's whole ALLOCATION ------------------
+    // #3048 taught the live compute backend to build a T#-declared chain from the guest's own
+    // bytes; replay could not follow, for two reasons that both live here. A tiled GFX10 chain
+    // stores level zero LAST, so the descriptor's `gpu_addr` names the HIGHEST address in its own
+    // allocation and every other level sits below it -- outside a captured range anchored at
+    // `gpu_addr`, and unreachable through a `host_data` pointer anchored there. These arms pin the
+    // whole path: the writer owns the allocation, the reader publishes how much of it precedes
+    // `gpu_addr`, and the one derivation both the backend and the recompiler read accepts it.
+    {
+        constexpr uint32_t kChainWidth = 256, kChainHeight = 256, kChainBpb = 4;
+        constexpr uint32_t kChainTile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        constexpr uint32_t kChainMaxMip = 8;                 // 256 -> 1 is nine levels
+        constexpr uint32_t kChainLevels = kChainMaxMip + 1u;
+        const TiledMipLevelLayout chain_level0 = tiled_mip_level_layout(
+            kChainWidth, kChainHeight, kChainBpb, kChainTile, kChainMaxMip, 0);
+        const size_t chain_allocation_bytes = tiled_mip_chain_bytes(
+            kChainWidth, kChainHeight, kChainBpb, kChainTile, kChainMaxMip);
+        // Assert the fixture's geometry instead of assuming it: the whole point is that level zero
+        // is NOT at the allocation base, and an arrangement where it were would make every
+        // assertion below pass for the wrong reason.
+        CHECK(chain_level0.supported && !chain_level0.in_tail && chain_level0.byte_offset > 0 &&
+                  chain_allocation_bytes > chain_level0.byte_offset,
+              "#3202: the chain fixture's level zero really is stored ABOVE its allocation base");
+
+        const uint64_t chain_alloc_base = 0x30000000ull;
+        const uint64_t chain_gpu_addr = chain_alloc_base + chain_level0.byte_offset;
+        // Position-dependent bytes, so a right answer read from the wrong offset still fails.
+        std::vector<uint8_t> chain_memory(chain_allocation_bytes, 0u);
+        for (size_t i = 0; i < chain_memory.size(); ++i)
+            chain_memory[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xffu);
+        auto chain_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+            if (addr < chain_alloc_base || addr >= chain_alloc_base + chain_memory.size()) return 0;
+            const size_t offset = static_cast<size_t>(addr - chain_alloc_base);
+            const size_t take = std::min(n, chain_memory.size() - offset);
+            std::memcpy(dst, chain_memory.data() + offset, take);
+            return take;
+        };
+
+        ShaderResource chain_resource{};
+        chain_resource.cls = ResourceClass::Texture;
+        chain_resource.format = DataFormat::Uint32;
+        chain_resource.num_components = 1;
+        chain_resource.img_dim = 1;
+        chain_resource.binding = 0;
+        chain_resource.width = kChainWidth;
+        chain_resource.height = kChainHeight;
+        chain_resource.depth = 1;
+        chain_resource.tile_mode = kChainTile;
+        chain_resource.gpu_addr = chain_gpu_addr;
+        chain_resource.declared_mip_levels = kChainLevels;
+        chain_resource.mip_chain_element_width = kChainWidth;
+        chain_resource.mip_chain_element_height = kChainHeight;
+        chain_resource.mip_chain_bytes_per_block = kChainBpb;
+        chain_resource.mip_chain_max_level = kChainMaxMip;
+        chain_resource.mip_chain_base_level = 0;
+        CHECK(shader_resource_compute_mip_chain_levels(chain_resource) == kChainLevels,
+              "#3202: the live-side fixture declares a chain the compute backend materializes");
+
+        auto chain_table = std::make_shared<ShaderResourceTable>();
+        chain_table->resources = {chain_resource};
+        ComputeItem chain_compute;
+        chain_compute.spirv = {0x07230203u};
+        chain_compute.resources = chain_table;
+        chain_compute.dispatch_index = 3202;
+        chain_compute.command_order = 3202;
+        const std::vector<SubmitOperation> chain_operations = {
+            {SubmitOperationKind::Dispatch, 3202, 3202},
+        };
+
+        GpuCaptureFile chain_capture;
+        CHECK(capture_submit_items({}, {chain_compute}, chain_operations, meta, chain_reader,
+                                   chain_capture, error) &&
+                  chain_capture.blobs.size() == 1 &&
+                  chain_capture.blobs[0].guest_addr == chain_alloc_base &&
+                  chain_capture.blobs[0].bytes.size() == chain_allocation_bytes,
+              "#3202: the captured range starts at the ALLOCATION base, not at gpu_addr, and spans "
+              "the whole declared chain");
+        CHECK(!chain_capture.computes.empty() &&
+                  chain_capture.computes[0].resources.resources.size() == 1 &&
+                  chain_capture.computes[0].resources.resources[0].blob_offset ==
+                      chain_level0.byte_offset,
+              "#3202: the resource's blob offset is exactly the bytes of its allocation below "
+              "gpu_addr");
+
+        std::vector<uint8_t> chain_bytes;
+        GpuCaptureFile chain_loaded;
+        GpuReplayFrame chain_replay;
+        CHECK(serialize_gpu_capture(chain_capture, chain_bytes, error) &&
+                  deserialize_gpu_capture(chain_bytes, chain_loaded, error) &&
+                  materialize_gpu_replay(chain_loaded, chain_replay, error) &&
+                  chain_replay.computes.size() == 1 && chain_replay.computes[0].resources &&
+                  chain_replay.computes[0].resources->resources.size() == 1,
+              "#3202: the chain capsule round-trips and materializes one replayed compute binding");
+
+        if (chain_replay.computes.size() == 1 && chain_replay.computes[0].resources &&
+            chain_replay.computes[0].resources->resources.size() == 1) {
+            const ShaderResource& replayed = chain_replay.computes[0].resources->resources[0];
+            const size_t level_zero_bytes = tiled_surface_bytes(
+                kChainWidth, kChainHeight, kChainTile, 0, kChainBpb);
+            CHECK(replayed.host_data != nullptr &&
+                      replayed.host_data_prefix_bytes == chain_level0.byte_offset &&
+                      replayed.host_data_size == level_zero_bytes,
+                  "#3202: replay publishes the owned bytes BELOW gpu_addr as host_data_prefix_bytes");
+            // The bytes themselves, at the anchor the plan names. A blob that merely happened to be
+            // large enough would fail this: every byte is position-dependent.
+            CHECK(replayed.host_data &&
+                      replayed.host_data_prefix_bytes == chain_level0.byte_offset &&
+                      std::memcmp(replayed.host_data - chain_level0.byte_offset,
+                                  chain_memory.data(), chain_memory.size()) == 0,
+                  "#3202: the replayed allocation is byte-identical to the guest's, anchored below "
+                  "gpu_addr");
+            CHECK(shader_resource_compute_mip_chain_levels(replayed) == kChainLevels,
+                  "#3202: a replayed resource whose span covers the allocation materializes the "
+                  "whole declared chain (this is the decline #3048 could not lift)");
+
+            const MipChainPlan replayed_plan = shader_resource_mip_chain_plan(replayed);
+            bool every_level_present = replayed_plan.valid &&
+                replayed_plan.level_count == kChainLevels;
+            for (uint32_t level = 0; replayed_plan.valid && level < replayed_plan.level_count;
+                 ++level) {
+                const MipChainLevel& entry = replayed_plan.levels[level];
+                every_level_present &= entry.byte_offset + entry.byte_size <= chain_memory.size() &&
+                    std::memcmp(replayed.host_data - chain_level0.byte_offset + entry.byte_offset,
+                                chain_memory.data() + entry.byte_offset,
+                                static_cast<size_t>(entry.byte_size)) == 0;
+            }
+            CHECK(every_level_present,
+                  "#3202: every planned level's own bytes are present in the capsule at its own "
+                  "offset");
+
+            // The discriminator, both directions. One byte short of the allocation in either
+            // direction must decline -- these are the arms a capsule that owns only the selected
+            // level fails, and they cannot be satisfied by anything except real coverage.
+            ShaderResource short_prefix = replayed;
+            short_prefix.host_data_prefix_bytes -= 1u;
+            CHECK(shader_resource_compute_mip_chain_levels(short_prefix) == 1u,
+                  "#3202: one byte short BELOW gpu_addr declines, keeping the single-level image");
+            ShaderResource short_span = replayed;
+            short_span.host_data_size -= 1u;
+            CHECK(shader_resource_compute_mip_chain_levels(short_span) == 1u,
+                  "#3202: one byte short ABOVE gpu_addr declines, keeping the single-level image");
+            ShaderResource no_prefix = replayed;
+            no_prefix.host_data_prefix_bytes = 0;
+            CHECK(shader_resource_compute_mip_chain_levels(no_prefix) == 1u,
+                  "#3202: a pre-#3202 capsule -- selected level only, nothing below gpu_addr -- "
+                  "still declines IMAGE_LOAD_MIP rather than fetching levels it does not own");
+        }
+
+        // The writer extends the range only for a chain the backend would actually materialize. A
+        // converting format is declined by the same derivation, so its capsule must own exactly the
+        // selected level and replay must keep declining -- otherwise this change would grow every
+        // capture by a third for nothing.
+        ShaderResource converting = chain_resource;
+        converting.format = DataFormat::Float16;
+        converting.num_components = 2;
+        converting.mip_chain_bytes_per_block = 4;
+        CHECK(shader_resource_compute_mip_chain_levels(converting) == 1u,
+              "#3202: the converting-format control is declined by the derivation itself");
+        auto converting_table = std::make_shared<ShaderResourceTable>();
+        converting_table->resources = {converting};
+        ComputeItem converting_compute = chain_compute;
+        converting_compute.resources = converting_table;
+        GpuCaptureFile converting_capture;
+        CHECK(capture_submit_items({}, {converting_compute}, chain_operations, meta, chain_reader,
+                                   converting_capture, error) &&
+                  converting_capture.blobs.size() == 1 &&
+                  converting_capture.blobs[0].guest_addr == chain_gpu_addr,
+              "#3202: a resource whose chain is not materializable captures only its own level");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
