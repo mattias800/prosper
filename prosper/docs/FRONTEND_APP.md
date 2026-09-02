@@ -89,6 +89,19 @@ guest caused a reproducible Windows access violation when static teardown raced 
 The remaining lifecycle work is a guest flip-boundary check followed by a real join and normal
 teardown (#352).
 
+**A second, non-obvious cost of that missing join, and the partial answer to it (#3225).** `_Exit`
+becomes `exit_group()`, and a thread that is inside a syscall at that moment cannot be torn down
+until it returns from the kernel. When the syscall is an amdgpu command submission the task parks in
+`__drm_exec_lock_obj` on a GEM reservation nobody will now release: the process becomes an unreapable
+zombie (`SIGKILL` is a no-op) and the compositor's own DRM work queues behind it — a frozen desktop
+that only a root-forced GPU reset clears. Because there is no ordering on this path at all, that
+in-flight submission is abandoned on *every* close; that it usually costs nothing is luck about where
+the guest thread happened to be. `src/host/platform/gpu_submit_gate.hpp` bounds it: the frontend
+closes a gate that every guest-thread submission enters, so new submissions are refused
+(`VK_ERROR_DEVICE_LOST`) and a bounded drain can wait for the ones already inside. It is a
+mitigation, not the fix — a thread that never returns still expires the drain — and the fix remains
+the join above.
+
 ## Where the dump path comes from (#1469)
 
 `boot_program()` needs an app0 directory. Argv supplies it for every agent route, snapshot run, and CI
@@ -272,7 +285,12 @@ Handle swapchain resize (`present_width/height` change or window resize → recr
 
 Target shutdown ordering: `request_stop` → guest thread observes the flag at its loop boundary and
 returns → join → tear down GPU/window. Until that check exists, direct process exit deliberately
-skips frontend/HLE static teardown so it cannot race the detached guest.
+skips frontend/HLE static teardown so it cannot race the detached guest — preceded, since #3225, by
+`gpu_submit_gate_begin_shutdown()` → `gpu_submit_gate_drain()` → `vkDeviceWaitIdle`, which bounds the
+window in which that exit can kill a thread inside a GPU submission. The drain is also what makes the
+`vkDeviceWaitIdle` legal: it is the external synchronization of every `VkQueue` that call requires, so
+a drain that TIMES OUT deliberately skips the wait rather than racing a live submit. `tools/screenshot`
+runs the same two steps before its own `_exit` (`screenshot.cpp`), for the same reason.
 
 ## Target / build layout
 
@@ -739,6 +757,18 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
   at a flip boundary is a follow-up (today the
   guest thread is detached at window-close and reclaimed by process exit).
+
+## Ruled out
+
+- **"The headless path is safer by design."** The issue observed that `tools/screenshot` had never
+  taken the desktop down and read that as a property of the frontend. It is not: `screenshot.cpp`
+  detaches its guest thread and calls `_exit` in exactly the same shape `prosper-app` does, so it can
+  abandon an in-flight submission identically. What differs is the consequence — no compositor is
+  sharing the device with a headless run, so a stuck reservation has nothing to block. Both frontends
+  now take the gate (#3225).
+- **"A GPU hang / driver fault is involved."** No fault is logged at all: nothing in `journalctl -k`
+  for 30 minutes around the freeze, and the amdgpu hang detector never fires — there is no stuck job
+  to detect, only a held lock, which is why there is no self-recovery and no timeout (#3225).
 
 ## Risks & open questions
 

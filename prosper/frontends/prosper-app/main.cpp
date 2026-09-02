@@ -23,6 +23,7 @@
 #include "shared/present/present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
 #include "hle/sync/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
 #include "host/platform/lifecycle.hpp"          // frontend-owned stop/pause gates
+#include "host/platform/gpu_submit_gate.hpp"     // #3225: drain guest GPU submits before _Exit
 #include "host/image/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/image/exec_image.hpp"         // run_entry
 #include "host/memory/guest_write_watch.hpp"  // flush dmem writer diagnostic before deliberate _Exit
@@ -2957,6 +2958,46 @@ int main(int argc, char** argv) {
     // let the OS reclaim process state without running destructors under the live guest.
     if (g_guest_thread.joinable()) {
         g_guest_thread.detach();
+
+        // #3225: bound the window in which the detached guest thread can be inside a GPU submission
+        // when std::_Exit fires. _Exit becomes exit_group(), and a thread that is inside an amdgpu
+        // command submission at that moment cannot be torn down until it returns from the kernel —
+        // it parks in __drm_exec_lock_obj on a GEM reservation nobody will now release, the process
+        // becomes an unreapable zombie, and the compositor's own DRM work blocks behind it. That
+        // froze the developer's desktop twice in one day, recoverable only by a root-forced GPU
+        // reset.
+        //
+        // Closing the gate stops NEW guest submissions (they return VK_ERROR_DEVICE_LOST, which
+        // every submission site already handles as "not submitted"), which is what lets the drain
+        // reach zero instead of chasing a moving count. This BOUNDS the window; it does not close
+        // it. A thread already inside vkQueueSubmit is waited for, and if it never comes out the
+        // drain times out and we exit exactly as before. The real fix is the cooperative stop the
+        // comment above names as unimplemented — observe the flag, stop at a submission boundary,
+        // and JOIN.
+        prosper::gpu_submit_gate_begin_shutdown();
+        constexpr int kGuestSubmitDrainMs = 2000;
+        if (prosper::gpu_submit_gate_drain(kGuestSubmitDrainMs)) {
+            // Only after a SUCCESSFUL drain. vkDeviceWaitIdle requires host access to every VkQueue
+            // of the device to be externally synchronized, and the drain is what provides that here
+            // (the main loop uses the shared-present submit mutex for the same reason at the
+            // swapchain-resize wait above). A timed-out drain means a guest submit may still be
+            // live, so waiting would both violate that and be the very block we are avoiding.
+            //
+            // Note what this wait does and does not cost. It is UNBOUNDED — on a title that has
+            // hung a GPU job it returns only when the amdgpu watchdog resets the device, adding
+            // seconds to a close — and it is not protecting a teardown, because the _Exit below
+            // destroys no Vulkan object. What it buys is that already-submitted guest work is off
+            // the device before the process dies. That is a deliberate trade of a bounded, visible
+            // delay against the unbounded, invisible one this whole path exists to prevent; if it
+            // ever becomes the bigger nuisance, deleting it is safe and loses only that guarantee.
+            if (vk.device) vkDeviceWaitIdle(vk.device);
+        } else {
+            fprintf(stderr,
+                    "[app] guest GPU submissions did not drain within %d ms (%d still in flight); "
+                    "exiting anyway\n",
+                    kGuestSubmitDrainMs, prosper::gpu_submit_gate_in_flight());
+        }
+
 #ifdef PROSPER_HAVE_LIVE_RENDERER
         // _Exit skips RuntimeComputeTimingSelector's destructor. Publish its validity verdict here;
         // the report is idempotent so a future cooperative teardown cannot duplicate it.

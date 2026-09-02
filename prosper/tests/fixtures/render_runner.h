@@ -10,6 +10,7 @@
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/perf/performance_timing_gate.hpp"
@@ -1482,7 +1483,18 @@ inline const RenderVkCtx& render_vk_ctx() {
 // every non-shared device are unaffected. vkQueueSubmit returns without waiting for GPU work; the
 // wait-idle wrapper (used only on the batch fence-timeout and compute-drain ERROR paths) does drain the
 // queue under the lock, which briefly blocks the peer thread's submits -- acceptable on those rare paths.
+//
+// Both wrappers also take a GPU submit-gate region (#3225). Until the frontend begins shutting
+// down the gate always admits, so this is one uncontended CAS on a path that is about to enter the
+// driver; after shutdown begins it refuses, and the call returns VK_ERROR_DEVICE_LOST WITHOUT
+// entering the driver. That refusal is what lets prosper-app's drain reach zero before it _Exit()s
+// a process whose guest thread it cannot join — a thread caught inside an amdgpu submission at
+// exit_group() parks in __drm_exec_lock_obj and takes the host compositor down with it.
+// VK_ERROR_DEVICE_LOST is the honest result: the device really is going away, and every caller
+// here already treats a failed submit as "not submitted" and cleans up accordingly.
 inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    prosper::GpuSubmitRegion gate;
+    if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
         return vkQueueSubmit(q, n, s, f);
@@ -1490,6 +1502,8 @@ inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmit
     return vkQueueSubmit(q, n, s, f);
 }
 inline VkResult render_locked_queue_wait_idle(VkQueue q) {
+    prosper::GpuSubmitRegion gate;
+    if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
         return vkQueueWaitIdle(q);
