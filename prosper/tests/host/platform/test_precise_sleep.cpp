@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 
 using namespace prosper;
 
@@ -385,6 +386,188 @@ int main() {
         CHECK(ok, "every step through the last 8 ns before UINT64_MAX stays ordered and bounded");
         CHECK(host::sem_poll_step(start, deadline, kNsMax).expired,
               "and the maximum itself is the timeout, reached rather than overshot into a wrap");
+    }
+
+    // -----------------------------------------------------------------------
+    // ARMS 12-17 (#3056) — the RELATIVE-microsecond timed waits' deadline arithmetic:
+    // normalize_wait_deadline(), abs_deadline_from_rel_us() and wait_timeout_ms_ceil().
+    //
+    // wait_timeout_ms_ceil() is the conversion the WINDOWS condition wait feeds to WaitOnAddress,
+    // and before the extraction it lived inside `#ifdef _WIN32` — so on this host it could not be
+    // compiled at all, let alone driven through its rounding, its past-deadline case or its
+    // saturation. That is the same reason arms 5-11 exist, one platform further out: those needed a
+    // fake clock, these need a fake clock AND to escape the preprocessor.
+    //
+    // These are NOT accuracy tests. Nothing here asserts a duration; every arm is an identity of the
+    // pure function, so none of it can flake under host load (the #1770/#1793 rule this file's
+    // header already states).
+
+    // 12. NORMALIZATION, both directions and both saturating ends.
+    {
+        const host::WaitDeadline in_range = host::normalize_wait_deadline({5, 999999999});
+        CHECK(in_range.sec == 5 && in_range.nsec == 999999999,
+              "an already-normalized value is returned unchanged");
+
+        const host::WaitDeadline carry = host::normalize_wait_deadline({5, 2500000000ll});
+        CHECK(carry.sec == 7 && carry.nsec == 500000000ll,
+              "2.5e9 ns carries two whole seconds and leaves 0.5e9");
+
+        // A NEGATIVE nanosecond field borrows rather than truncating toward zero, which is what
+        // integer division alone would do: -1 ns must be {sec-1, 999999999}, never {sec, -1}.
+        const host::WaitDeadline borrow = host::normalize_wait_deadline({5, -1});
+        CHECK(borrow.sec == 4 && borrow.nsec == 999999999,
+              "a negative nanosecond field borrows a second instead of truncating toward zero");
+
+        const host::WaitDeadline big_borrow = host::normalize_wait_deadline({5, -2500000000ll});
+        CHECK(big_borrow.sec == 2 && big_borrow.nsec == 500000000ll,
+              "-2.5e9 ns borrows three seconds and leaves 0.5e9");
+
+        const host::WaitDeadline hi = host::normalize_wait_deadline({INT64_MAX, 2000000000ll});
+        CHECK(hi.sec == INT64_MAX && hi.nsec == 999999999,
+              "a carry past INT64_MAX seconds saturates instead of wrapping negative");
+
+        const host::WaitDeadline lo = host::normalize_wait_deadline({INT64_MIN, -2000000000ll});
+        CHECK(lo.sec == INT64_MIN && lo.nsec == 0,
+              "a borrow past INT64_MIN seconds saturates instead of wrapping positive");
+    }
+
+    // 13. RELATIVE MICROSECONDS -> ABSOLUTE DEADLINE, the conversion every Sony
+    //     scePthread*Timedwait/Timedlock entry point performs on a guest-supplied scalar.
+    {
+        // The exact interval #3056 was filed on: 818 us.
+        const host::WaitDeadline d = host::abs_deadline_from_rel_us({100, 0}, 818);
+        CHECK(d.sec == 100 && d.nsec == 818000,
+              "818 us lands 818,000 ns past a whole-second reading");
+
+        CHECK(host::abs_deadline_from_rel_us({100, 0}, 0).sec == 100 &&
+              host::abs_deadline_from_rel_us({100, 0}, 0).nsec == 0,
+              "a zero timeout is the reading itself, not one tick later");
+
+        const host::WaitDeadline whole = host::abs_deadline_from_rel_us({100, 0}, 2500000);
+        CHECK(whole.sec == 102 && whole.nsec == 500000000ll,
+              "2.5 s of microseconds splits into whole seconds plus a remainder");
+
+        // The CARRY, which the code this replaced did with a single subtraction: it is correct only
+        // because now.nsec < 1e9 and the added part is < 1e9, so at most one second is carried.
+        const host::WaitDeadline carry = host::abs_deadline_from_rel_us({100, 999999000}, 2);
+        CHECK(carry.sec == 101 && carry.nsec == 1000,
+              "a remainder that crosses a second boundary carries exactly once");
+        CHECK(carry.nsec >= 0 && carry.nsec < 1000000000ll,
+              "...and the result is normalized, so a 32-bit host tv_nsec cannot truncate it");
+
+        // Every returned nanosecond field is in range, for the widest inputs available. This is the
+        // property the host-`struct timespec` adapter in hle_kernel.cpp depends on: it casts nsec to
+        // a `long`, which is 32 bits on Windows x64 (#3038's truncation class).
+        bool normalized = true;
+        const uint64_t widths[] = {1ull, 999999ull, 1000000ull, 1000001ull,
+                                   1000000000ull, ~0ull / 2, ~0ull};
+        for (uint64_t us : widths) {
+            for (int64_t base_ns : {0ll, 1ll, 500000000ll, 999999999ll}) {
+                const host::WaitDeadline r = host::abs_deadline_from_rel_us({1700000000ll, base_ns}, us);
+                if (r.nsec < 0 || r.nsec >= 1000000000ll) { normalized = false; break; }
+            }
+        }
+        CHECK(normalized, "every result is normalized to [0, 1e9) across the whole input width");
+
+        // SATURATION. Unreachable from a real clock reading -- UINT64_MAX microseconds is 5.8e5
+        // years of seconds against int64's 2.9e11 -- and asserted anyway, because the arm is what
+        // makes "this cannot wrap" a checked statement rather than an assumption. Nothing else in
+        // the tree can reach it.
+        const host::WaitDeadline sat = host::abs_deadline_from_rel_us({INT64_MAX - 1, 0}, ~0ull);
+        CHECK(sat.sec == INT64_MAX && sat.nsec == 999999999,
+              "a maximal timeout from a near-maximal reading saturates instead of wrapping negative");
+        CHECK(sat.sec > 0, "...so the deadline stays in the FUTURE, which is the direction that matters");
+
+        const host::WaitDeadline sat_carry = host::abs_deadline_from_rel_us({INT64_MAX, 999999999}, 1);
+        CHECK(sat_carry.sec == INT64_MAX && sat_carry.nsec == 999999999,
+              "a carry off the top of the seconds field saturates too");
+    }
+
+    // 14. ABSOLUTE DEADLINE -> WHOLE MILLISECONDS, ROUNDED UP. This is the Windows conversion, and
+    //     the rounding direction is a CONTRACT: pthread_cond_timedwait must never report ETIMEDOUT
+    //     before its deadline, so a positive remainder may not become a zero-millisecond wait.
+    {
+        const uint64_t kMaxMs = 0xFFFFFFFEull;   // what the caller passes: INFINITE - 1
+
+        CHECK(host::wait_timeout_ms_ceil({100, 0}, {100, 818000}, kMaxMs) == 1,
+              "the 0.818 ms request from #3056's census rounds UP to a 1 ms wait, never down to 0");
+        CHECK(host::wait_timeout_ms_ceil({100, 0}, {100, 1}, kMaxMs) == 1,
+              "one nanosecond of remaining time is one millisecond of wait, not zero");
+        CHECK(host::wait_timeout_ms_ceil({100, 0}, {100, 1000000}, kMaxMs) == 1,
+              "an exact millisecond is not rounded up to two");
+        CHECK(host::wait_timeout_ms_ceil({100, 0}, {100, 1000001}, kMaxMs) == 2,
+              "a nanosecond past an exact millisecond is");
+        CHECK(host::wait_timeout_ms_ceil({100, 500000000ll}, {102, 250000000ll}, kMaxMs) == 1750,
+              "a span crossing whole seconds is converted across the boundary, not within it");
+    }
+
+    // 15. THE PAST-DEADLINE CASE, which is the loop's TERMINATION condition: zero means "the
+    //     deadline is reached", and the caller reports ETIMEDOUT on exactly that. Getting a
+    //     nonzero answer for a past deadline would park a guest past its own timeout; getting zero
+    //     for a future one is the early-ETIMEDOUT defect the re-arm loop exists to prevent.
+    {
+        const uint64_t kMaxMs = 0xFFFFFFFEull;
+        CHECK(host::wait_timeout_ms_ceil({100, 0}, {100, 0}, kMaxMs) == 0,
+              "a deadline exactly now has been reached");
+        CHECK(host::wait_timeout_ms_ceil({100, 1}, {100, 0}, kMaxMs) == 0,
+              "a deadline one nanosecond in the past has been reached");
+        CHECK(host::wait_timeout_ms_ceil({101, 0}, {100, 999999999}, kMaxMs) == 0,
+              "...including across a second boundary, where the nanosecond field alone reads FORWARD");
+        CHECK(host::wait_timeout_ms_ceil({1000, 0}, {100, 0}, kMaxMs) == 0,
+              "a deadline fifteen minutes in the past is still just zero, never a huge unsigned span");
+        // The sign-borrow the other way: now.nsec > deadline.nsec but the deadline is still ahead.
+        CHECK(host::wait_timeout_ms_ceil({100, 999000000ll}, {101, 1000000ll}, kMaxMs) == 2,
+              "a borrow across the second boundary yields the real 2 ms, not a wrapped span");
+    }
+
+    // 16. SATURATION AND THE ABSENCE OF OVERFLOW at the widest spans representable. `seconds * 1000`
+    //     would overflow for any span past ~2.9e8 years; the bound is applied BEFORE the multiply,
+    //     so no input can reach it.
+    {
+        const uint64_t kMaxMs = 0xFFFFFFFEull;
+        CHECK(host::wait_timeout_ms_ceil({0, 0}, {INT64_MAX, 999999999}, kMaxMs) == kMaxMs,
+              "the widest forward span saturates at max_ms instead of overflowing the multiply");
+        CHECK(host::wait_timeout_ms_ceil({INT64_MIN, 0}, {INT64_MAX, 0}, kMaxMs) == kMaxMs,
+              "...including a span wider than INT64_MAX, where a signed subtraction would overflow");
+        // Exactly at, and one below, the saturation boundary.
+        const uint64_t boundary_sec = kMaxMs / 1000ull;              // 4,294,967 s
+        CHECK(host::wait_timeout_ms_ceil({0, 0}, {(int64_t)boundary_sec, 0}, kMaxMs)
+                  == boundary_sec * 1000ull,
+              "a span exactly at the seconds bound is converted, not saturated");
+        CHECK(host::wait_timeout_ms_ceil({0, 0}, {(int64_t)boundary_sec + 1, 0}, kMaxMs) == kMaxMs,
+              "one second past it saturates");
+        CHECK(host::wait_timeout_ms_ceil({0, 0}, {(int64_t)boundary_sec, 999999999}, kMaxMs) == kMaxMs,
+              "...as does a remainder that would push the millisecond count past max_ms");
+        // max_ms is a parameter so the saturation is reachable without INFINITE; check it binds.
+        CHECK(host::wait_timeout_ms_ceil({0, 0}, {10, 0}, 5) == 5,
+              "max_ms binds wherever the caller sets it, not only at INFINITE - 1");
+    }
+
+    // 17. THE TWO FUNCTIONS COMPOSED, which is the real call sequence: a guest hands over a relative
+    //     microsecond count, hle_kernel.cpp turns it into an absolute deadline, and sync_futex.cpp's
+    //     Windows branch turns that back into a millisecond timeout. The property that must survive
+    //     the round trip is that the wait is never SHORTER than what the guest asked for.
+    {
+        const uint64_t kMaxMs = 0xFFFFFFFEull;
+        const host::WaitDeadline now{1700000000ll, 123456789ll};
+        bool never_short = true;
+        uint64_t worst_us = 0;
+        for (uint64_t us : {1ull, 499ull, 818ull, 1000ull, 1001ull, 5330ull, 16667ull,
+                            999999ull, 1000000ull, 1234567ull}) {
+            const host::WaitDeadline dl = host::abs_deadline_from_rel_us(now, us);
+            const uint64_t ms = host::wait_timeout_ms_ceil(now, dl, kMaxMs);
+            // Ceil of the request in milliseconds: the smallest wait that cannot be short.
+            const uint64_t want_ms = (us + 999ull) / 1000ull;
+            if (ms != want_ms) { never_short = false; worst_us = us; break; }
+        }
+        CHECK(never_short, "the round trip yields exactly ceil(request), so no wait is ever short");
+        if (!never_short) printf("       first divergence at %llu us\n", (unsigned long long)worst_us);
+
+        // And the one case where the guest asked for nothing: a zero timeout must reach the
+        // deadline immediately rather than becoming a one-millisecond park.
+        const host::WaitDeadline zero = host::abs_deadline_from_rel_us(now, 0);
+        CHECK(host::wait_timeout_ms_ceil(now, zero, kMaxMs) == 0,
+              "a zero-microsecond request is already expired, not rounded up to 1 ms");
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

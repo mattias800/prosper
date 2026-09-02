@@ -4,7 +4,9 @@
 #endif
 #include "hle/sync/sync_futex.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "host/platform/precise_sleep.hpp"   // #3056: the ms conversion, and a relock that is not on the tick
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,12 @@ namespace prosper {
 namespace {
 std::atomic<int> g_waiters{0};
 #ifdef _WIN32
+// Nanoseconds on std::chrono::steady_clock's epoch -- the same reading
+// prosper::host::sleep_until_steady_ns takes as its deadline (#3056).
+inline uint64_t steady_now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 struct WaitSlot {
     std::atomic<uint64_t> publication{0};
     uint64_t next_publication = 0; // written only while publication holds the exclusive sentinel
@@ -371,18 +379,40 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
 
-    timespec now{};
-    clock_gettime(CLOCK_REALTIME, &now);
-    int64_t sec = (int64_t)deadline->tv_sec - (int64_t)now.tv_sec;
-    int64_t nsec = (int64_t)deadline->tv_nsec - (int64_t)now.tv_nsec;
-    if (nsec < 0) { nsec += 1000000000; sec--; }
-    DWORD timeout = 0;
-    if (sec >= 0) {
-        uint64_t ms = (uint64_t)sec * 1000 + ((uint64_t)nsec + 999999) / 1000000;
-        timeout = ms >= (uint64_t)INFINITE ? INFINITE - 1 : (DWORD)ms;
+    // Wait to the ABSOLUTE deadline, re-reading the clock after a timeout instead of trusting one
+    // OS wait to land on it -- the post-condition sleep_until_steady_ns() composes for the same
+    // reason (#3074). It is reachable here without any OS misbehaviour: `deadline` is a
+    // CLOCK_REALTIME point while the kernel wait counts interrupt time, so a wall-clock step makes
+    // the two disagree, and the single-shot form then reported ETIMEDOUT before the guest's deadline
+    // had passed. pthread_cond_timedwait may not do that -- a guest reads ETIMEDOUT as "it did not
+    // happen", so an early one is a false negative rather than mere imprecision.
+    //
+    // A wake is still reported as a wake at once, spurious or not: the only thing re-armed is a
+    // TIMEOUT that arrived early. That leaves the guest-exception interruption path exactly as it
+    // was (interrupt_guest_wait wakes this address without changing its value, and the dispatch
+    // below still runs), and the loop cannot spin -- each iteration waits at least one millisecond,
+    // and a WaitOnAddress failure that is not ERROR_TIMEOUT leaves the loop instead of retrying it.
+    //
+    // The conversion itself is prosper::host::wait_timeout_ms_ceil, in precise_sleep.hpp beside the
+    // rest of this family's pure timing arithmetic, so a fake-clock test reaches it on every host
+    // rather than only where this branch compiles (#3056). Its rounding UP is what keeps a
+    // sub-millisecond remainder from becoming a zero-millisecond wait.
+    bool signaled = false;
+    for (;;) {
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        const uint64_t timeout_ms = host::wait_timeout_ms_ceil(
+            host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec},
+            host::WaitDeadline{(int64_t)deadline->tv_sec, (int64_t)deadline->tv_nsec},
+            (uint64_t)(INFINITE - 1));
+        if (timeout_ms == 0) break;   // the deadline really has passed -> ETIMEDOUT below
+        if (WaitOnAddress((volatile void*)&slot->sequence, &expected,
+                          sizeof(expected), (DWORD)timeout_ms) != FALSE) {
+            signaled = true;
+            break;
+        }
+        if (GetLastError() != ERROR_TIMEOUT) break;   // not a timeout; reported as it was before
     }
-    const bool signaled = WaitOnAddress((volatile void*)&slot->sequence, &expected,
-                                        sizeof(expected), timeout) != FALSE;
     dispatch_pending_guest_exception();
     if (const int injected = consume_cond_wait_failure(
             CondWaitFailurePointForTest::BeforeRelock)) {
@@ -535,11 +565,28 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex) {
     // Winpthreads' timed mutex wait has remained inside WaitForSingleObject after its absolute
     // deadline was already seconds in the past. Polling trylock keeps the wait cooperative: a GC
     // stop request is acknowledged even when the mutex owner is itself waiting for that thread.
+    // NOT ::Sleep(1) between polls, which Windows quantizes to the process timer period -- measured
+    // on this toolchain at 15.554 ms by default against 1.930 ms with the period raised (#3013,
+    // restated in precise_sleep.cpp's header). This loop runs inside EVERY guest condition wait's
+    // relock as well as every contended guest mutex acquisition, so that tick was charged to the
+    // interval the timed-wait census attributes to the wait itself (#3056). Same remedy #3022
+    // applied to the guest sleep family: an absolute deadline served by the high-resolution timer.
+    //
+    // The CADENCE is the semaphore poll loop's, reusing its function rather than picking a second
+    // set of numbers: 500 us while the wait is young, 2 ms after 8 ms have passed (#3044's measured
+    // floor table, beside poll_slice_ns in precise_sleep.hpp). A flat 500 us would poll 31x more
+    // often than the ::Sleep(1) it replaces for a lock held for seconds, which is the cost #3062
+    // quantifies and the reason the coarse regime exists; a flat 2 ms would blunt exactly the short
+    // contention this is trying to serve. There is no deadline here -- an untimed lock waits as long
+    // as it must -- so the "remaining" clamp is passed the maximum and never binds.
+    const uint64_t start_ns = steady_now_ns();
     for (;;) {
         const int result = pthread_mutex_trylock(mutex);
         if (result != EBUSY) return result;
         dispatch_pending_guest_exception();
-        Sleep(1);
+        const uint64_t now_ns = steady_now_ns();
+        const uint64_t slice = host::poll_slice_ns(now_ns - start_ns, ~0ull);
+        host::sleep_until_steady_ns(now_ns + slice);
     }
 #else
     return pthread_mutex_lock(mutex);

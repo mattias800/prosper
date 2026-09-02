@@ -612,6 +612,33 @@ edge cases are tracked separately in #697.
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
 
+### Ruled out — the Windows guest timed waits
+
+One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home for the
+`#3013`/`#3022`/`#3044`/`#3056` family; the *per-primitive* measurements live in those issues.
+
+- **"Every guest timed wait resolves on the winpthreads master tick."** True of the SLEEP family and
+  of `sem_timedwait`, which is what #3013 measured with a probe outside prosper — and NOT true of the
+  guest **condition** waits, which is where it kept being applied. `interruptible_cond_timedwait` and
+  `interruptible_cond_wait` have had a `#ifdef _WIN32` branch built on **`WaitOnAddress`** since the
+  #678/#690 cooperative-exception work described above; winpthreads' `pthread_cond_timedwait` is only
+  in the POSIX `#else`, which does not compile on Windows at all. So the ~15.6 ms winpthreads tick is
+  not what quantizes `scePthreadCondTimedwait`. #3056's own body says it "still delegates to
+  winpthreads' `pthread_cond_timedwait`"; it does not, and the correction is #3078.
+- **"...so #3056's 2.29x is an arithmetic defect."** It is not. `WaitOnAddress` takes a `DWORD`
+  **millisecond** timeout, and the conversion rounds UP because a condition wait may never report
+  `ETIMEDOUT` before its deadline. The censused 0.818 ms request therefore becomes a 1 ms wait by
+  design, and the remaining ~0.87 ms is the kernel wait's own tick quantization — the trap #3062
+  records, that a kernel wait *timeout* is quantized however precise the requested interval is. The
+  two terms account for the measured 1.870 ms without anything being wrong, so the residue is a
+  primitive choice (#3062) rather than a bug to find.
+- **A relative µs timeout is NOT clock-free.** `scePthreadCondTimedwait`'s interval is spent in the
+  condition variable's own registered clock — `SCE_KERNEL_CLOCK_VIRTUAL`/`_PROF` are process CPU time,
+  not wall time. The Sony spelling hardcoded `CLOCK_REALTIME` while its POSIX sibling resolved the
+  condvar's clock, so one object answered the same question two ways (#3056, fixed in #3078). Neither
+  a realtime nor a monotonic clock can discriminate that in a test, because the old path was
+  self-consistent for both; the virtual clock can, and does.
+
 **Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
 `cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
 -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DCMAKE_SYSTEM_NAME=Windows
