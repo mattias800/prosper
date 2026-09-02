@@ -1260,6 +1260,53 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   against 0.13) and the load rows explain the association at least as well as an amplifier does:
   prosper's reproduction generates its own GPU load. Do not spend anything more on it before the
   driver defect is reported. #2945.
+- **The GOOD hash is a property of the RENDERER and moves; the FAILURE hash is a property of the
+  CAPTURE and does not. Key any determinism harness on the failure.** BALAN's `s3537 --draw 42`
+  rendered `9068fcf09de07383` on 2026-08-23 and `ccc433ff6d980383` on 2026-09-02 — the renderer
+  legitimately changed what that draw produces, across 43 commits touching `src/render` and
+  `src/gpu`. The failure value `a5e7b61cbf984383` is unchanged and cannot move for a renderer
+  reason: it is literally the capsule's own seed for the target the draw writes, printed by
+  `gpu_replay <capsule> --inspect-only` as
+  `rtt-seed addr=0000009fc0000000 extent=3840x2160 format=rgba8 bytes=33177600 hash=a5e7b61cbf984383`.
+  A harness keyed the other way round reports every round of a perfectly healthy renderer as a
+  failure — `tools/vkprobe/correlate_with_replay.sh` shipped with exactly that keying and would
+  have scored 100% `other` on current `main`; it now keys on the failure and reads `bad`/`rendered`.
+  #2945.
+- **A hand-made positive instance of the failure costs one command, and no determinism null on this
+  issue should be believed without one.** The characterised mechanism is "every storage-buffer load
+  in the vertex shader returns 0", so supply that by hand rather than waiting for it:
+
+  ```bash
+  head -c 192 /dev/zero > zeros.bin        # binding 3 is 6 records x 32 bytes; --list-resources 42:vs
+  gpu_replay s3537.prgcap --draw 42 --override-resource 42:vs:3 zeros.bin out.bmp
+  #   [resource-override] draw=42 stage=vs binding=3 ... new-hash=fea2d2bd51234c83
+  #   output=3840x2160 target=0000009fc0000000 draw=42 hash=a5e7b61cbf984383   <- the failure value
+  ```
+
+  This is the same-source-control trap in reverse (instrument trap 122): a campaign that has never
+  shown its own apparatus reporting the class cannot distinguish a clean renderer from a blind
+  harness. #2945.
+- **The trigger row's "heavy GPU load" means concurrent SUBMISSION, not a busy GPU — the documented
+  recipe barely moves the utilisation.** Three concurrent full-submit `gpu_replay` replays of the
+  650 MB `s3537` capsule — the exact recipe recorded above as flipping a passing box within one
+  round — take amdgpu's `gpu_busy_percent` from an idle 0–2% to about **5–9%**, with the CPU load
+  average above 13. The replays are CPU-bound on capsule parsing and resource upload. So do not
+  read "the GPU was loaded" into that row, and do not treat a low utilisation figure as evidence
+  that a load arm failed to arm. `tools/determinism/replay_determinism.sh` records
+  `gpu_busy_percent` on every row so the load condition measures its own premise instead of
+  assuming it. #2945.
+- **The SAME binary and the SAME capsule render a different picture today than on 2026-08-23, so no
+  hash recorded in this section is a durable oracle.** `s3537.prgcap --draw 42` is written up above
+  as a binary outcome between `9068fcf09de07383` (rendered) and `a5e7b61cbf984383` (drew nothing).
+  Rebuilt from the exact commit the capsule carries (`rev=08c23efd`) and replayed on 2026-09-02,
+  that binary returns **`ccc433ff6d980383`** — 5 of 5 on the host (Mesa 26.2.1) and 3 of 3 inside
+  the build container (Mesa **26.1.4**, the version the original figure was taken on). Current
+  `main` returns the same value. So the moved value is not prosper's doing and not a Mesa
+  userspace-version difference; the other thing that moved on this box is the kernel, 7.1.5 →
+  7.2.1. `ccc433ff6d980383` is a real render rather than a new failure mode: it differs from the
+  untouched seed on 100% of sampled pixels, because that draw covers the whole 3840x2160 target.
+  Caveat stated plainly: the rebuild is the same source at the same commit, not provably the same
+  object bytes as the build that produced the 2026-08-23 figure. #2945.
 
 
 ## Recommended implementation order
