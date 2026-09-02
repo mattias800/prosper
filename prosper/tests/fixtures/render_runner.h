@@ -2753,6 +2753,179 @@ inline VkResult create_color_target_image(VkDevice dev, const VkImageCreateInfo&
     return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
 }
 
+// #3210: the NON-image object creates in this pass -- render pass, framebuffer, image view,
+// sampler, shader module. Three severities share one mechanism here, and the split matters:
+//
+//   * `rp` and `fb` were declared WITHOUT an initializer and used with no guard whatsoever. Vulkan
+//     writes an output handle only on success, so a failed create left them holding an
+//     INDETERMINATE value -- not the null the #3180/#3045 sites conventionally get, an arbitrary
+//     stack word. That word reached vkCreateFramebuffer, every pipeline's `renderPass`,
+//     vkCmdBeginRenderPass and, worst, vkDestroyRenderPass. Destroying a non-handle is undefined.
+//     Forcing the output null BEFORE the call (below) removes the indeterminate read at its source,
+//     whatever the driver leaves behind; the caller then drops the pass.
+//   * the image views and samplers behind a descriptor set ARE value-initialized (dview's
+//     declaration, SharedTextureBinding's members), so those were deterministic -- but unchecked,
+//     and a null view still reached VkDescriptorImageInfo and vkUpdateDescriptorSets. Two of them
+//     also CACHED the result, so one transient failure was retained in
+//     PersistentTextureImage::bindings and re-served to every later draw with the same key. The
+//     callers now break before the cache insert, which is the sole writer of that map, so no null
+//     can enter it and the hit path needs no guard of its own.
+//   * vkCreateShaderModule's result was discarded, but `m` is initialized and `!v.vs || !v.fs`
+//     already skips the draw. Folded in for the report only; the control flow is untouched.
+//
+// The report format matches #3180's: site name, the API, the real VkResult, and enough of the
+// request to tell an out-of-memory apart from a rejected description.
+enum class RenderVkObjectCreateSite : uint32_t {
+    None = 0,
+    RenderPass,               // the pass's own vkCreateRenderPass
+    Framebuffer,              // vkCreateFramebuffer over the attachment views
+    DepthStencilView,         // the depth/stencil attachment's view
+    TextureViewPersistent,    // a sampled-texture view created for the persistent binding cache
+    TextureSamplerPersistent, // ...and its sampler
+    TextureView,              // a sampled/storage view created for a transient binding
+    TextureSampler,           // ...and its sampler (never created for a storage image)
+    ShaderModule,             // any of a draw's VS/GS/FS modules
+};
+
+inline const char* render_vk_object_site_name(RenderVkObjectCreateSite site) {
+    switch (site) {
+        case RenderVkObjectCreateSite::RenderPass:               return "render-pass";
+        case RenderVkObjectCreateSite::Framebuffer:              return "framebuffer";
+        case RenderVkObjectCreateSite::DepthStencilView:         return "ds-view";
+        case RenderVkObjectCreateSite::TextureViewPersistent:    return "texture-view-persistent";
+        case RenderVkObjectCreateSite::TextureSamplerPersistent: return "texture-sampler-persistent";
+        case RenderVkObjectCreateSite::TextureView:              return "texture-view";
+        case RenderVkObjectCreateSite::TextureSampler:           return "texture-sampler";
+        case RenderVkObjectCreateSite::ShaderModule:             return "shader-module";
+        default:                                                 return "none";
+    }
+}
+
+// Deterministic one-shot injection, the same shape and the same reason as the color-target hook
+// above: these are ordinary render passes, framebuffers, 2D views, trilinear samplers and small
+// SPIR-V modules, so no real device can be made to refuse one on demand. Arming a site makes the
+// NEXT create at exactly that site report VK_ERROR_OUT_OF_DEVICE_MEMORY without calling the driver.
+// The production path never arms this state.
+inline RenderVkObjectCreateSite& render_vk_object_create_failure_storage() {
+    static thread_local RenderVkObjectCreateSite armed = RenderVkObjectCreateSite::None;
+    return armed;
+}
+
+inline void inject_render_vk_object_create_failure_once(RenderVkObjectCreateSite site) {
+    render_vk_object_create_failure_storage() = site;
+}
+
+inline bool consume_render_vk_object_create_failure(RenderVkObjectCreateSite site) {
+    RenderVkObjectCreateSite& armed = render_vk_object_create_failure_storage();
+    if (armed != site || site == RenderVkObjectCreateSite::None) return false;
+    armed = RenderVkObjectCreateSite::None;
+    return true;
+}
+
+// One counter for every site in this family, so a device refusing everything cannot flood a run
+// log. Deliberately separate from the color-target counter: exhausting one must not silence the
+// other, since they answer different questions about the same frame.
+inline bool render_vk_object_create_failure_should_log() {
+    static std::atomic<uint32_t> logs{0};
+    return logs.fetch_add(1, std::memory_order_relaxed) < 32;
+}
+
+// Every helper below forces its output handle to VK_NULL_HANDLE on entry and again on failure, and
+// returns a non-VK_SUCCESS code whenever the handle is not usable. VK_ERROR_INITIALIZATION_FAILED
+// stands in for the "driver returned success and left the handle null" case that no spec-conforming
+// implementation should produce but that the caller must not walk past either.
+inline VkResult create_render_pass_checked(VkDevice dev, const VkRenderPassCreateInfo& ci,
+                                           VkRenderPass* out_pass) {
+    *out_pass = VK_NULL_HANDLE;
+    const VkResult result = consume_render_vk_object_create_failure(
+                                RenderVkObjectCreateSite::RenderPass)
+        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+        : vkCreateRenderPass(dev, &ci, nullptr, out_pass);
+    if (result == VK_SUCCESS && *out_pass) return VK_SUCCESS;
+    *out_pass = VK_NULL_HANDLE;
+    if (render_vk_object_create_failure_should_log())
+        std::fprintf(stderr,
+                     "[render-object-create-failed] site=%s vkCreateRenderPass result=%d "
+                     "attachments=%u subpasses=%u deps=%u -- dropping the pass\n",
+                     render_vk_object_site_name(RenderVkObjectCreateSite::RenderPass), (int)result,
+                     ci.attachmentCount, ci.subpassCount, ci.dependencyCount);
+    return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+}
+
+inline VkResult create_framebuffer_checked(VkDevice dev, const VkFramebufferCreateInfo& ci,
+                                           VkFramebuffer* out_fb) {
+    *out_fb = VK_NULL_HANDLE;
+    const VkResult result = consume_render_vk_object_create_failure(
+                                RenderVkObjectCreateSite::Framebuffer)
+        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+        : vkCreateFramebuffer(dev, &ci, nullptr, out_fb);
+    if (result == VK_SUCCESS && *out_fb) return VK_SUCCESS;
+    *out_fb = VK_NULL_HANDLE;
+    if (render_vk_object_create_failure_should_log())
+        std::fprintf(stderr,
+                     "[render-object-create-failed] site=%s vkCreateFramebuffer result=%d "
+                     "extent=%ux%u attachments=%u -- dropping the pass\n",
+                     render_vk_object_site_name(RenderVkObjectCreateSite::Framebuffer), (int)result,
+                     ci.width, ci.height, ci.attachmentCount);
+    return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+}
+
+inline VkResult create_render_image_view_checked(VkDevice dev, const VkImageViewCreateInfo& ci,
+                                                 RenderVkObjectCreateSite site,
+                                                 VkImageView* out_view) {
+    *out_view = VK_NULL_HANDLE;
+    const VkResult result = consume_render_vk_object_create_failure(site)
+        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+        : vkCreateImageView(dev, &ci, nullptr, out_view);
+    if (result == VK_SUCCESS && *out_view) return VK_SUCCESS;
+    *out_view = VK_NULL_HANDLE;
+    if (render_vk_object_create_failure_should_log())
+        std::fprintf(stderr,
+                     "[render-object-create-failed] site=%s vkCreateImageView result=%d "
+                     "fmt=%d viewType=%d mips=%u layers=%u\n",
+                     render_vk_object_site_name(site), (int)result, (int)ci.format,
+                     (int)ci.viewType, ci.subresourceRange.levelCount,
+                     ci.subresourceRange.layerCount);
+    return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+}
+
+inline VkResult create_render_sampler_checked(VkDevice dev, const VkSamplerCreateInfo& ci,
+                                              RenderVkObjectCreateSite site,
+                                              VkSampler* out_sampler) {
+    *out_sampler = VK_NULL_HANDLE;
+    const VkResult result = consume_render_vk_object_create_failure(site)
+        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+        : vkCreateSampler(dev, &ci, nullptr, out_sampler);
+    if (result == VK_SUCCESS && *out_sampler) return VK_SUCCESS;
+    *out_sampler = VK_NULL_HANDLE;
+    if (render_vk_object_create_failure_should_log())
+        std::fprintf(stderr,
+                     "[render-object-create-failed] site=%s vkCreateSampler result=%d "
+                     "mag=%d min=%d aniso=%d\n",
+                     render_vk_object_site_name(site), (int)result, (int)ci.magFilter,
+                     (int)ci.minFilter, (int)ci.anisotropyEnable);
+    return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+}
+
+inline VkResult create_render_shader_module_checked(VkDevice dev,
+                                                    const VkShaderModuleCreateInfo& ci,
+                                                    VkShaderModule* out_module) {
+    *out_module = VK_NULL_HANDLE;
+    const VkResult result = consume_render_vk_object_create_failure(
+                                RenderVkObjectCreateSite::ShaderModule)
+        ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+        : vkCreateShaderModule(dev, &ci, nullptr, out_module);
+    if (result == VK_SUCCESS && *out_module) return VK_SUCCESS;
+    *out_module = VK_NULL_HANDLE;
+    if (render_vk_object_create_failure_should_log())
+        std::fprintf(stderr,
+                     "[render-object-create-failed] site=%s vkCreateShaderModule result=%d "
+                     "bytes=%zu -- skipping draw\n",
+                     render_vk_object_site_name(RenderVkObjectCreateSite::ShaderModule),
+                     (int)result, (size_t)ci.codeSize);
+    return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+}
+
 // Create, populate, and unmap one transient storage buffer. Every partial failure tears down in
 // Vulkan lifetime order (buffer before any bound memory) and leaves both outputs null. Returning the
 // exact failed step lets the caller report the binding before substituting a safe zero-word buffer.
@@ -5343,7 +5516,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
         dvci.subresourceRange = {DASPECT, 0, 1, 0, 1};
-        vkCreateImageView(dev, &dvci, nullptr, &dview);
+        // #3210: the result used to be discarded and `dview` used unchecked. It is
+        // value-initialized, so unlike the render pass below the failed value was at least
+        // deterministic -- but a null view still went into fbviews[ds_attachment] and from there
+        // into the framebuffer. Drop the pass the way the color-target sites do, and tear the
+        // half-created target down rather than caching it: a cached entry with a null view breaks
+        // every later LOAD of this identity, the same defect #1383 records for the color path.
+        if (create_render_image_view_checked(dev, dvci, RenderVkObjectCreateSite::DepthStencilView,
+                                             &dview) != VK_SUCCESS) {
+            vkDestroyImage(dev, dimg, nullptr);
+            dimg = VK_NULL_HANDLE;
+            if (cached_ds) {
+                if (dmem) vkFreeMemory(dev, dmem, nullptr);
+                persistent_ds_cache().erase(ds_key);
+            } else if (dmem) {
+                release_transient_render_memory(dev, dmem);
+            }
+            dmem = VK_NULL_HANDLE;
+            return out;
+        }
         if (cached_ds) { cached_ds->image = dimg; cached_ds->memory = dmem; cached_ds->view = dview; }
     }
 
@@ -5490,7 +5681,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         rpci.dependencyCount = static_cast<uint32_t>(deps.size());
         rpci.pDependencies = deps.data();
     }
-    VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
+    // #3210: both of these were declared WITHOUT an initializer and used with no guard at all --
+    // `rp` into fbci.renderPass, every VkGraphicsPipelineCreateInfo::renderPass, the render-pass
+    // begin info and vkDestroyRenderPass; `fb` straight into vkCmdBeginRenderPass. Vulkan writes an
+    // output handle only on success, so a failed create left an arbitrary stack word in them, and
+    // handing a non-handle to vkDestroyRenderPass is undefined. The helpers null the output before
+    // the call, so the indeterminate read is gone whatever the driver does; here we drop the pass,
+    // the same failure path the color-target creates above take.
+    VkRenderPass rp = VK_NULL_HANDLE;
+    if (create_render_pass_checked(dev, rpci, &rp) != VK_SUCCESS) return out;
     std::array<VkImageView, prosper::gpu::kColorTargetCount + 1> fbviews{};
     fbviews[0] = view;
     for (uint32_t slot = 1; slot < color_count; ++slot) fbviews[slot] = extra_views[slot];
@@ -5498,12 +5697,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbci.renderPass = rp; fbci.attachmentCount = color_count + (use_ds ? 1u : 0u);
     fbci.pAttachments = fbviews.data(); fbci.width = W; fbci.height = H; fbci.layers = 1;
-    VkFramebuffer fb; vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (create_framebuffer_checked(dev, fbci, &fb) != VK_SUCCESS) {
+        // `rp` is owned entirely by this scope and nothing references it yet, so unlike the wider
+        // transient state (which the deferred cleanup below would have taken) it can and must be
+        // destroyed here rather than leaked.
+        vkDestroyRenderPass(dev, rp, nullptr);
+        return out;
+    }
 
     auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
-        vkCreateShaderModule(dev, &s, nullptr, &m); return m; };
+        // #3210 case 3, the mild one: the result was discarded, but `m` is initialized above and
+        // the caller already skips the draw on `!v.vs || !v.fs`. Only the report is new -- the
+        // control flow is deliberately unchanged.
+        create_render_shader_module_checked(dev, s, &m);
+        return m; };
     // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     struct DV {
@@ -7380,8 +7590,34 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         ++resource_reuse_stats.persistent_texture_binding_evictions;
                                     }
                                 }
-                                vkCreateImageView(dev, &tvci, nullptr, &binding.view);
-                                vkCreateSampler(dev, &sci, nullptr, &binding.sampler);
+                                // #3210: both results used to be discarded, and a null
+                                // view/sampler went into VkDescriptorImageInfo and on to
+                                // vkUpdateDescriptorSets. Worse on THIS branch than on the
+                                // transient one below: the emplace a few lines down is the only
+                                // writer of PersistentTextureImage::bindings, so a null cached
+                                // here was retained and re-served to every later draw with the
+                                // same key. Skipping the draw before the emplace is what keeps
+                                // the map free of nulls, which is why the cache-hit path above
+                                // needs no guard of its own.
+                                const bool persistent_binding_ready =
+                                    create_render_image_view_checked(
+                                        dev, tvci, RenderVkObjectCreateSite::TextureViewPersistent,
+                                        &binding.view) == VK_SUCCESS &&
+                                    create_render_sampler_checked(
+                                        dev, sci,
+                                        RenderVkObjectCreateSite::TextureSamplerPersistent,
+                                        &binding.sampler) == VK_SUCCESS;
+                                if (!persistent_binding_ready) {
+                                    // Nothing has taken ownership yet -- the binding is not in
+                                    // shared_texture_bindings and not in the persistent map -- so
+                                    // whichever half succeeded is destroyed here.
+                                    if (binding.sampler)
+                                        vkDestroySampler(dev, binding.sampler, nullptr);
+                                    if (binding.view)
+                                        vkDestroyImageView(dev, binding.view, nullptr);
+                                    buffer_resources_ready = false;
+                                    break;
+                                }
                                 if (persistent_image->second.bindings.size() <
                                     max_bindings_per_texture) {
                                     persistent_image->second.bindings.emplace(
@@ -7391,9 +7627,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 }
                             }
                         } else {
-                            vkCreateImageView(dev, &tvci, nullptr, &binding.view);
-                            if (!r.is_storage_image)
-                                vkCreateSampler(dev, &sci, nullptr, &binding.sampler);
+                            // #3210: same unchecked pair on the transient branch. A storage image
+                            // legitimately gets NO sampler (VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                            // ignores it), so only the view is unconditionally required here --
+                            // treating a null sampler as a failure would drop every storage-image
+                            // draw. Skip the draw the way #3045's upload failure does.
+                            const bool binding_ready =
+                                create_render_image_view_checked(
+                                    dev, tvci, RenderVkObjectCreateSite::TextureView,
+                                    &binding.view) == VK_SUCCESS &&
+                                (r.is_storage_image ||
+                                 create_render_sampler_checked(
+                                     dev, sci, RenderVkObjectCreateSite::TextureSampler,
+                                     &binding.sampler) == VK_SUCCESS);
+                            if (!binding_ready) {
+                                if (binding.sampler)
+                                    vkDestroySampler(dev, binding.sampler, nullptr);
+                                if (binding.view)
+                                    vkDestroyImageView(dev, binding.view, nullptr);
+                                buffer_resources_ready = false;
+                                break;
+                            }
                         }
                         shared_texture_bindings.push_back(binding);
                         shared_texture_binding_indices.emplace(binding_key, binding_index);
