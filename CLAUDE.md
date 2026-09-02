@@ -868,6 +868,24 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
       reports rows, with a `commit_id` that is no longer on the branch. Compare each review's `commit_id`
       against the current head; if it is stale, establish by **content** (`git diff <reviewed-sha> <head>`)
       whether the approval still applies rather than assuming in either direction.
+    - **The same detachment applies to CI CHECKS**, which the bullet above does not cover: a branch
+      pushed after its checks started leaves `gh` reporting green for a commit that is no longer
+      what would merge, and every lane here pushes after CI starts. So compare `headRefOid` against
+      `git ls-remote origin refs/heads/<branch>` before merging, not only the reviews' `commit_id`.
+      One command, and the state is routine. (As of 2026-09-02 no merge here is known to have been
+      lost this way; #3259 first cited #3243 and that was wrong on the dates. The rule stands on the
+      hazard, not on a scar — full account in `prosper/tools/ci/AGENTS.md`.)
+    - **Never gate on the TEXT output of `gh pr checks`.** Its columns are tab-separated and this
+      repository's check names contain spaces — `Windows App`, `Linux App Package`,
+      `macOS (x86_64 / Rosetta 2)` — so splitting on whitespace puts the second *word of the name*
+      where the status belongs. A shell gate doing that merged #3234 with a red `Windows MinGW`;
+      an `awk '$2=="pass"'` written the same day counted 2 passing checks where 8 passed. Both
+      answers look plausible, which is the whole danger. Use `--json name,state,bucket`.
+    - Both rules, plus "an empty check list is VOID rather than green", are implemented in
+      `prosper/tools/ci/pr_merge_gate.py` — `python3 prosper/tools/ci/pr_merge_gate.py <PR>` exits 0
+      only when every check passed, none is pending, at least one passed, and the PR's recorded
+      head is still the branch tip. It exits **2** when it could not evaluate, so "the gate could not
+      run" is never confused with "the gate said no".
 - **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
   improvement may merge without matching work in every other frontend unless the issue explicitly promises
   parity or a shared public contract requires it. Unaffected platforms must still retain existing behavior and
