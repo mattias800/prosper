@@ -51,6 +51,7 @@ int main() {
     using prosper::frontend::mrt_draw_binds_target;
     using prosper::frontend::mrt_draw_binds_target_view;
     using prosper::frontend::mrt_same_color_pass;
+    using prosper::frontend::mrt_same_resolve_pass;
 
     constexpr uint64_t kMrt0 = 0x2050000000ull;
     constexpr uint64_t kMrt2 = 0x2083e00000ull;
@@ -271,6 +272,55 @@ int main() {
         array_other.color_targets[0].base = 0x600000ull;
         CHECK(!mrt_same_color_pass(array_only, array_other, format_defined, format_at));
         CHECK(mrt_same_color_pass(array_only, array_only, format_defined, format_at));
+    }
+
+    // #3025 -- the resolve DESTINATION is part of a resolve pass's identity.
+    //
+    // These arms establish the mechanism, not the outcome. The load-bearing assertion for this fix
+    // is in test_gpu_capture_render ("a second resolve into a different destination receives the
+    // resolved pixels"), which reads the destination surface's CONTENTS; a predicate that returns
+    // false proves only that two draws are not grouped, not that both destinations were written.
+    // What these arms add is the part that experiment cannot isolate: that the discriminating term
+    // is the destination and nothing else.
+    {
+        // The exact shape live_renderer sees. A fixed-function resolve exports nothing, so its
+        // color1_write_mask is 0 -- which is precisely why slot 1 could not discriminate.
+        auto resolve = make_draw();
+        resolve.ps.cb_resolve = true;
+        resolve.color0_base = 0x700000ull;             // the MSAA scene being resolved
+        resolve.color0_width = 32u; resolve.color0_height = 32u;
+        resolve.color1_base = 0x710000ull;             // the single-sample destination
+        resolve.color1_width = 32u; resolve.color1_height = 32u;
+        resolve.ps.color_write_mask = 0xfu;
+        resolve.ps.color1_write_mask = 0u;
+
+        auto second = resolve;
+        second.color1_base = 0x720000ull;              // a DIFFERENT destination
+
+        // The premise, asserted rather than assumed: slot 1 is inactive on a resolve, so the
+        // colour-identity predicate cannot tell these two apart. If this ever fails the fix below
+        // is keying on a term that was already discriminating, and these arms would pass for the
+        // wrong reason.
+        CHECK(mrt_active_color(resolve, 1, format_defined) == 0u);
+        CHECK(mrt_active_color_count(resolve, format_defined) == 1u);
+        CHECK(mrt_same_color_pass(resolve, second, format_defined, format_at));
+
+        CHECK(!mrt_same_resolve_pass(resolve, second));
+        CHECK(mrt_same_resolve_pass(resolve, resolve));
+
+        // A resolve never joins an ordinary draw's group: the copy ends the group, so an ordinary
+        // draw grouped after one would be dropped.
+        auto scene = resolve;
+        scene.ps.cb_resolve = false;
+        CHECK(!mrt_same_resolve_pass(resolve, scene));
+        CHECK(!mrt_same_resolve_pass(scene, resolve));
+
+        // Two ordinary draws are unaffected by the destination term, including when their stale
+        // named color1_base differs. This is what keeps the change scoped to resolves: keying every
+        // pass on a raw named field would split ordinary groups on stale register state.
+        auto scene_other_c1 = scene;
+        scene_other_c1.color1_base = 0x730000ull;
+        CHECK(mrt_same_resolve_pass(scene, scene_other_c1));
     }
 
     if (failures == 0) std::printf("mrt_binding: OK\n");
