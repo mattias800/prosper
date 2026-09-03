@@ -2389,14 +2389,39 @@ struct AprMeasuredRead {
     bool live = false;        // this slot has been written since the last reset
     bool suppressed = false;  // recorded AFTER the container paired, i.e. its read was skipped
     bool matched = false;     // a submit for exactly this tuple has since arrived
+    uint16_t idx_pos = 0;     // where the index below points at this slot (valid while `live`)
 };
 PROSPER_HEAP_MUTEX(g_apr_measure_mx);
 constexpr size_t kAprMeasureRingMax = 64;   // only the IMMEDIATE pairing matters; Stray's is adjacent
 std::array<AprMeasuredRead, kAprMeasureRingMax> g_apr_recent_measures{};
-size_t g_apr_recent_measures_used = 0;      // grows to kAprMeasureRingMax, then the ring wraps
 size_t g_apr_recent_measures_next = 0;
 std::map<uint32_t, bool> g_apr_measure_paired;   // file id -> a submit matched one of its measures
 bool g_apr_mixed_pattern_warned = false;         // the detector below fires at most once
+
+// --- The (id, dst, offset, size) -> ring-slot index ---------------------------------------------
+// apr_measure_note_submit runs on EVERY APR submit -- 14,255 of them in a 3-minute Stray boot -- and
+// it used to LINEAR-SCAN all 64 ring slots under the mutex, because keeping every entry marked (the
+// detector's requirement) removed the early-out that used to skip the scan once a container paired.
+// A 64-slot scan per submit is a plausible shape for a timing-sensitive failure on the submit path,
+// so the mechanism is removed rather than measured: this index restores O(1) expected lookup while
+// every entry still gets marked, which is what the detector needs. #3245.
+//
+// Open addressing with linear probing. Encoding avoids any dynamic initialisation, so the table is
+// correct from static zero-init: 0 = EMPTY, -1 = TOMBSTONE, n > 0 = ring slot n-1.
+// Sized at 4x the ring, so live load never exceeds 0.25 and probe chains stay short.
+constexpr size_t kAprMeasureIndexSlots = 256;   // power of two; mask-indexed
+constexpr int16_t kAprIndexEmpty = 0, kAprIndexTomb = -1;
+std::array<int16_t, kAprMeasureIndexSlots> g_apr_measure_index{};   // zero-init == all EMPTY
+size_t g_apr_measure_index_live = 0;    // occupied entries
+size_t g_apr_measure_index_tombs = 0;   // deleted entries still occupying a probe chain
+// Coverage counters, not diagnostics. An open-addressed lookup fails by finding NOTHING for a key
+// that is present, and the two ways that happens -- a probe chain terminated early at a tombstone,
+// and a stale slot pointer after a rebuild -- are both invisible to every return value the callers
+// check. A test that never drives a lookup across a tombstone, or never survives a rebuild, would
+// pass against a broken implementation of either. These let the test assert it REACHED the
+// mechanism rather than assuming it did.
+size_t g_apr_index_tomb_steps = 0;   // lookups that stepped OVER a tombstone to keep probing
+size_t g_apr_index_rebuilds = 0;     // full table rebuilds performed
 
 // auto (default) = the latch above; always = never suppress; never = never do the compatibility
 // read. Read once: an env lookup per streamed asset is itself a cost on this path.
@@ -2414,15 +2439,87 @@ AprMeasureMode apr_measure_mode() {
     }();
     return mode;
 }
+// One 64-bit mix over the whole key. All four fields participate: `dst` alone collides heavily
+// (titles reuse destinations), and `size` alone even more so.
+inline uint64_t apr_measure_hash(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (uint64_t v : { (uint64_t)id, dst, offset, size })
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33;   // finalizer
+    return h;
+}
+// Table position holding this key, or -1. Probing stops at EMPTY and steps over TOMBSTONEs, which
+// is what makes deletion-by-tombstone correct rather than merely usual.
+inline int apr_index_find_locked(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
+    constexpr size_t mask = kAprMeasureIndexSlots - 1;
+    size_t p = (size_t)apr_measure_hash(id, dst, offset, size) & mask;
+    for (size_t probes = 0; probes < kAprMeasureIndexSlots; probes++, p = (p + 1) & mask) {
+        const int16_t e = g_apr_measure_index[p];
+        if (e == kAprIndexEmpty) return -1;
+        if (e == kAprIndexTomb) { g_apr_index_tomb_steps++; continue; }
+        const AprMeasuredRead& m = g_apr_recent_measures[(size_t)(e - 1)];
+        if (m.live && m.id == id && m.dst == dst && m.offset == offset && m.size == size)
+            return (int)p;
+    }
+    return -1;   // table full of tombstones: cannot happen, the rebuild below keeps load <= 1/2
+}
+inline void apr_index_insert_locked(size_t slot) {
+    constexpr size_t mask = kAprMeasureIndexSlots - 1;
+    AprMeasuredRead& m = g_apr_recent_measures[slot];
+    size_t p = (size_t)apr_measure_hash(m.id, m.dst, m.offset, m.size) & mask;
+    while (g_apr_measure_index[p] > 0) p = (p + 1) & mask;   // first EMPTY or TOMBSTONE
+    if (g_apr_measure_index[p] == kAprIndexTomb) g_apr_measure_index_tombs--;
+    g_apr_measure_index[p] = (int16_t)(slot + 1);
+    g_apr_measure_index_live++;
+    m.idx_pos = (uint16_t)p;
+}
+// O(1) removal: the slot remembers where the index points at it, so no search is needed.
+inline void apr_index_erase_locked(size_t slot) {
+    const AprMeasuredRead& m = g_apr_recent_measures[slot];
+    if (!m.live || m.idx_pos >= kAprMeasureIndexSlots) return;
+    if (g_apr_measure_index[m.idx_pos] != (int16_t)(slot + 1)) return;
+    g_apr_measure_index[m.idx_pos] = kAprIndexTomb;
+    g_apr_measure_index_live--;
+    g_apr_measure_index_tombs++;
+}
+// Tombstones lengthen probe chains without ever being reclaimed by lookup, so the table is rebuilt
+// from the live ring whenever occupancy would exceed half. With a 64-entry ring in a 256-entry
+// table that is at least 64 inserts apart, so the O(256) rebuild is under 4 amortised steps per
+// insert -- against the 64 steps per SUBMIT that this whole index replaces.
+inline void apr_index_rebuild_locked() {
+    g_apr_index_rebuilds++;
+    g_apr_measure_index.fill(kAprIndexEmpty);
+    g_apr_measure_index_live = 0;
+    g_apr_measure_index_tombs = 0;
+    for (size_t s = 0; s < kAprMeasureRingMax; s++)
+        if (g_apr_recent_measures[s].live) apr_index_insert_locked(s);
+}
 }  // namespace
 
 static void apr_measure_reset_for_test() {
     std::lock_guard lk(g_apr_measure_mx);
     g_apr_recent_measures.fill(AprMeasuredRead{});
-    g_apr_recent_measures_used = 0;
     g_apr_recent_measures_next = 0;
+    g_apr_measure_index.fill(kAprIndexEmpty);
+    g_apr_measure_index_live = 0;
+    g_apr_measure_index_tombs = 0;
+    g_apr_index_tomb_steps = 0;
+    g_apr_index_rebuilds = 0;
     g_apr_measure_paired.clear();
     g_apr_mixed_pattern_warned = false;
+}
+// Test seam: which bucket does this key hash to? Needed so a test can CONSTRUCT a probe collision
+// by hand. Ordinary traffic almost never produces one -- 64 live keys in a 256-slot table means
+// nearly every lookup hits its home bucket -- so a test that only drives ordinary traffic reports a
+// clean zero for the tombstone path and proves nothing about it.
+size_t prosper_apr_index_bucket_for_test(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
+    return (size_t)apr_measure_hash(id, dst, offset, size) & (kAprMeasureIndexSlots - 1);
+}
+// Test seam: did a run actually exercise the index's two silent-failure paths?
+void prosper_apr_index_coverage_for_test(size_t* tomb_steps, size_t* rebuilds) {
+    std::lock_guard lk(g_apr_measure_mx);
+    if (tomb_steps) *tomb_steps = g_apr_index_tomb_steps;
+    if (rebuilds)   *rebuilds   = g_apr_index_rebuilds;
 }
 // Test seam for the detector below: has the mixed-pattern warning fired?
 bool prosper_apr_mixed_pattern_warned_for_test() {
@@ -2456,9 +2553,11 @@ static bool apr_measure_read_suppressed(uint32_t id) {
 // every entry carries whether a submit later claimed it, and an entry that leaves the ring having
 // been suppressed AND never matched is warned about, once, loudly. Nothing else produces that
 // signature: a pre-pairing entry ages out unmatched all the time and is not suppressed, and a
-// suppressed entry that a submit claimed is the designed case. Keeping the scan alive after pairing
-// costs a 64-entry compare per submit -- ~900k integer comparisons across a 3-minute Stray boot,
-// which is not measurable next to the 583 MB of file I/O this removes.
+// suppressed entry that a submit claimed is the designed case. Keeping every entry marked is what
+// costs: it removes note_submit's early-out, so that function scanned all 64 ring slots on every
+// submit until the (id, dst, offset, size) index above made the lookup O(1). Detection was kept and
+// the cost removed, rather than the cost bought back by sampling -- a detector that only sometimes
+// detects is the wrong trade when detection is the reason this design is acceptable at all.
 //
 // Known blind spot, stated rather than left to be discovered: up to kAprMeasureRingMax entries are
 // still in the ring when the process exits and are never adjudicated, so a title that mixes the two
@@ -2479,11 +2578,18 @@ static void apr_measure_warn_mixed_locked(const AprMeasuredRead& lost) {
 static void apr_measure_record(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size,
                                bool suppressed) {
     std::lock_guard lk(g_apr_measure_mx);
-    AprMeasuredRead& slot = g_apr_recent_measures[g_apr_recent_measures_next];
+    const size_t at = g_apr_recent_measures_next;
+    AprMeasuredRead& slot = g_apr_recent_measures[at];
     if (slot.live && slot.suppressed && !slot.matched) apr_measure_warn_mixed_locked(slot);
+    apr_index_erase_locked(at);   // must precede the overwrite: it reads the OLD key's idx_pos
     slot = AprMeasuredRead{ id, dst, offset, size, /*live=*/true, suppressed, /*matched=*/false };
+    // Rebuild INSTEAD of inserting when the table would pass half full: the rebuild walks the live
+    // ring, which already includes the entry just written, so inserting as well would double it.
+    if (g_apr_measure_index_live + g_apr_measure_index_tombs > kAprMeasureIndexSlots / 2)
+        apr_index_rebuild_locked();
+    else
+        apr_index_insert_locked(at);
     g_apr_recent_measures_next = (g_apr_recent_measures_next + 1) % kAprMeasureRingMax;
-    if (g_apr_recent_measures_used < kAprMeasureRingMax) g_apr_recent_measures_used++;
 }
 
 // A submit for a read the measure path already delivered: from here on this container does not need
@@ -2492,20 +2598,20 @@ static void apr_measure_record(uint32_t id, uint64_t dst, uint64_t offset, uint6
 static bool apr_measure_note_submit(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size) {
     if (apr_measure_mode() != AprMeasureMode::Auto) return false;
     std::lock_guard lk(g_apr_measure_mx);
-    // The scan deliberately continues after a container has paired: marking the entry is what lets
+    // Lookup deliberately continues after a container has paired: marking the entry is what lets
     // the detector in apr_measure_record tell "suppressed and never submitted" from "suppressed and
     // duly submitted". An early-out here would make the mixed pattern undetectable, which is the
-    // whole failure mode this heuristic has.
-    for (size_t i = 0; i < g_apr_recent_measures_used; i++) {
-        AprMeasuredRead& m = g_apr_recent_measures[i];
-        if (!m.live || m.id != id || m.dst != dst || m.offset != offset || m.size != size) continue;
-        m.matched = true;
-        bool& paired = g_apr_measure_paired[id];
-        const bool first = !paired;
-        paired = true;
-        return first;
-    }
-    return false;
+    // whole failure mode this heuristic has. Keeping that marking is why the O(1) index exists --
+    // it is what removed the 64-slot scan this used to do on every submit, rather than buying the
+    // speed back by giving up detection.
+    const int p = apr_index_find_locked(id, dst, offset, size);
+    if (p < 0) return false;
+    AprMeasuredRead& m = g_apr_recent_measures[(size_t)(g_apr_measure_index[(size_t)p] - 1)];
+    m.matched = true;
+    bool& paired = g_apr_measure_paired[id];
+    const bool first = !paired;
+    paired = true;
+    return first;
 }
 // "Which guest code asked for the file that is not there?" — the question every missing-asset
 // bring-up investigation reaches, and the one a path alone cannot answer. A resolve MISS names the

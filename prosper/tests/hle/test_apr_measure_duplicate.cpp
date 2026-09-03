@@ -14,6 +14,10 @@
 //   * consume-from-the-measure: measure -> guest reads dst -> no submit.  Must still deliver.
 //   * submit-what-it-measures:  measure -> submit of the IDENTICAL read.  Redundant from then on.
 //
+// The detector arms below double as the integrity check for the O(1) index that note_submit uses:
+// an index that silently finds nothing would disable detection without failing any return value,
+// and the "stays quiet" arm is what catches exactly that.
+//
 // The arms are named after the PATTERNS, not after titles, and deliberately so. An earlier version
 // called the first one "the DOLL arm" — but replaying the pairing predicate over four of DOLL's own
 // PROSPER_FILELOG boots shows DOLL pairs at submit #13 and has ZERO measured reads lacking an
@@ -46,6 +50,8 @@ namespace prosper {
 uint32_t prosper_apr_register(const std::string& path, uint64_t size);
 void prosper_apr_reset_for_test();
 bool prosper_apr_mixed_pattern_warned_for_test();
+void prosper_apr_index_coverage_for_test(size_t* tomb_steps, size_t* rebuilds);
+size_t prosper_apr_index_bucket_for_test(uint32_t id, uint64_t dst, uint64_t offset, uint64_t size);
 }
 using namespace prosper;
 
@@ -232,17 +238,49 @@ int main() {
     constexpr size_t kRing = 64, kEvict = kRing + 8;
     {
         // Arm A -- the DESIGNED case: suppressed measures that ARE each submitted. Must not warn.
+        //
+        // This arm is ALSO the (id, dst, offset, size) index's integrity oracle, and that is not a
+        // coincidence worth leaving implicit. The lookup is O(1) and open-addressed, so the way it
+        // fails is by finding NOTHING for a key that is present -- a bad hash, a probe chain
+        // terminated early by a mishandled tombstone, a stale idx_pos after a rebuild. None of those
+        // throws, and none of them changes a return value that anything else checks: pairing has
+        // already happened, so a missed lookup just silently stops marking entries. The detector is
+        // what turns that into a failure. An entry the index cannot find is never marked, ages out
+        // of the ring suppressed-and-unmatched, and warns -- so a silently-degraded index makes
+        // THIS arm go red.
+        //
+        // 600 iterations rather than 72 so the run spans many ring wraps and, at a 256-slot table
+        // rebuilt whenever it passes half full, several index rebuilds. A rebuild is where a stale
+        // idx_pos would bite, and 72 iterations would not have reached one.
+        constexpr size_t kIndexStress = 600;
         CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
               "detector: quiet before any suppressed measure goes unclaimed");
         Dest d;
-        for (size_t i = 0; i < kEvict; ++i) {
+        for (size_t i = 0; i < kIndexStress; ++i) {
             const size_t off = 2048 + i * 4, size = 32;
             d.poison();
             measure(id_a, d.addr(), size, off, 0, 0);
             read_file_guest(cb, 0, record, id_a, d.addr(), size, off, 0, 0);
         }
         CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
-              "detector: stays quiet when every suppressed measure is duly submitted");
+              "detector quiet + index found every key across many wraps and rebuilds");
+        // ...and PROVE the arm above reached the mechanism it claims to guard, rather than
+        // assuming it did. Both of the index's silent-failure modes need a specific condition to
+        // be reachable at all: a lookup must step OVER a tombstone (the classic open-addressing
+        // bug is to terminate the chain there instead), and the table must be REBUILT (which is
+        // where a stale slot pointer would bite). Neither is guaranteed by iteration count -- at a
+        // 256-slot table holding at most 64 live keys, most lookups hit their home slot and never
+        // touch either path. Without these two checks the arm above would pass against an index
+        // that mishandles both, which is precisely the "passes for the wrong reason" failure this
+        // file exists to avoid.
+        size_t tomb_steps = 0, rebuilds = 0;
+        prosper_apr_index_coverage_for_test(&tomb_steps, &rebuilds);
+        char cov[192];
+        std::snprintf(cov, sizeof cov,
+                      "index coverage: the stress arm survived %zu rebuild(s) (it stepped over %zu "
+                      "tombstone(s) -- ordinary traffic does not reach that path)",
+                      rebuilds, tomb_steps);
+        CHECK(rebuilds > 0, cov);   // holds in every mode: recording drives rebuilds, lookups do not
     }
     {
         // Arm B -- the MIXED pattern: suppressed measures that are never submitted. Must warn.
@@ -263,6 +301,111 @@ int main() {
         } else {
             CHECK(prosper_apr_mixed_pattern_warned_for_test(),
                   "detector: warns when a suppressed measure is never submitted (the mixed pattern)");
+        }
+    }
+
+    // ---- The probe chain, built BY HAND ---------------------------------------------------------
+    // The stress arm above reports 0 tombstone steps, and that zero is real rather than a
+    // measurement artefact: 64 live keys in a 256-slot table means almost every lookup resolves at
+    // its home bucket, so ordinary traffic never crosses a deleted entry. A clean zero on the very
+    // path most likely to be wrong is exactly the situation CLAUDE.md says to distrust -- construct
+    // one positive instance by hand, outside whatever produced the null, before believing it.
+    //
+    // So: force the one state that makes the tombstone path load-bearing -- a LIVE key whose probe
+    // chain passes through a DELETED entry -- and prove the lookup still finds it.
+    //
+    //   A and B are chosen to share a home bucket, so B is placed one past A.
+    //   A is submitted (marked), then aged out of the 64-entry ring, leaving a TOMBSTONE at the
+    //   shared home bucket while B is still live behind it.
+    //   Looking B up must now step OVER that tombstone. Terminating the chain there instead -- the
+    //   classic open-addressing bug -- loses B silently: no error, no wrong return value, just an
+    //   entry that never gets marked and later warns as a phantom mixed pattern.
+    {
+        prosper_apr_reset_for_test();
+        const uint32_t id = prosper_apr_register(path_a_storage, g_fixture.size());
+        Dest d;
+        constexpr uint64_t kSize = 32;
+        const uint64_t dst = d.addr();
+
+        // Pair the container first, so every later measure records without doing any file I/O.
+        d.poison();
+        measure(id, dst, kSize, 0, 0, 0);
+        read_file_guest(cb, 0, record, id, dst, kSize, 0, 0, 0);
+
+        // Search the key space for a colliding pair and for fillers that avoid their bucket.
+        const auto bucket = [&](uint64_t off) {
+            return prosper_apr_index_bucket_for_test(id, dst, off, kSize);
+        };
+        uint64_t off_a = 0, off_b = 0;
+        bool found = false;
+        for (uint64_t i = 1; i < 4000 && !found; ++i)
+            for (uint64_t j = i + 1; j < 4000 && !found; ++j)
+                if (bucket(i * 4) == bucket(j * 4)) { off_a = i * 4; off_b = j * 4; found = true; }
+        CHECK(found, "probe-collision arm: found two keys sharing a home bucket");
+        if (found) {
+            const size_t home = bucket(off_a);
+            std::vector<uint64_t> fillers;
+            for (uint64_t k = 1; fillers.size() < 63 && k < 200000; ++k) {
+                const uint64_t off = 8000 + k * 4;
+                if (off != off_a && off != off_b && bucket(off) != home) fillers.push_back(off);
+            }
+            CHECK(fillers.size() == 63, "probe-collision arm: found 63 non-colliding fillers");
+
+            size_t before = 0, dummy = 0;
+            prosper_apr_index_coverage_for_test(&before, &dummy);
+
+            // A: recorded and submitted, so its eviction cannot itself trip the detector.
+            measure(id, dst, kSize, off_a, 0, 0);
+            read_file_guest(cb, 0, record, id, dst, kSize, off_a, 0, 0);
+            // B: recorded only. It lands one past A, behind the bucket A will vacate.
+            measure(id, dst, kSize, off_b, 0, 0);
+            // 62 fillers fill the ring to 64; the 63rd evicts A and tombstones the shared bucket.
+            for (size_t i = 0; i < 63; ++i) {
+                measure(id, dst, kSize, fillers[i], 0, 0);
+                read_file_guest(cb, 0, record, id, dst, kSize, fillers[i], 0, 0);
+            }
+
+            size_t after = 0;
+            prosper_apr_index_coverage_for_test(&after, &dummy);
+            // Now the load-bearing lookup: B is live, its chain starts at the tombstoned bucket.
+            read_file_guest(cb, 0, record, id, dst, kSize, off_b, 0, 0);
+            size_t after_lookup = 0;
+            prosper_apr_index_coverage_for_test(&after_lookup, &dummy);
+
+            char msg[256];
+            if (forced_always) {
+                // Under =always, apr_measure_note_submit returns at its mode check BEFORE taking
+                // the lock, so no lookup happens at all and the counter cannot move. Asserting that
+                // is worth more than skipping: it is the same early return that makes the =always
+                // arm a valid control for this whole index -- if the index could cost anything in
+                // that mode, an A/B between the two arms would not isolate it.
+                std::snprintf(msg, sizeof msg,
+                              "probe-collision arm under =always: the index is never consulted, so "
+                              "it cannot cost anything in that mode (tomb steps %zu -> %zu -> %zu)",
+                              before, after, after_lookup);
+                CHECK(after_lookup == before, msg);
+            } else {
+                std::snprintf(msg, sizeof msg,
+                              "probe-collision arm: the lookup for B stepped over a tombstone "
+                              "(tomb steps %zu -> %zu -> %zu across the arm)",
+                              before, after, after_lookup);
+                CHECK(after_lookup > after, msg);
+            }
+
+            // And it must have FOUND B, not merely probed past the tombstone. Flush the ring: if B
+            // was marked, nothing warns; if the chain terminated early, B ages out suppressed and
+            // unmatched and the detector fires.
+            CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+                  "probe-collision arm: quiet before the flush");
+            for (size_t i = 0; i < 80; ++i) {
+                const uint64_t off = 300000 + i * 4;
+                measure(id, dst, kSize, off, 0, 0);
+                read_file_guest(cb, 0, record, id, dst, kSize, off, 0, 0);
+            }
+            CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+                  forced_always
+                      ? "probe-collision arm under =always: nothing is suppressed, so nothing warns"
+                      : "probe-collision arm: B was FOUND behind the tombstone, not lost silently");
         }
     }
 
