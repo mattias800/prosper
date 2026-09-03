@@ -8391,6 +8391,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         else if (storage_writeback_requested) flush_reason_storage = 1;
         else flush_reason_explicit = 1;
     }
+    // Sizing the readback buffer to the maximum extent over the selected slots captures the common
+    // case of unbound higher MRT slots without disturbing the absolute offsets (#3276).
+    readback_bytes = static_cast<VkDeviceSize>(
+        prosper::frontend::compute_active_readback_bytes<prosper::gpu::kColorTargetCount>(
+            color_count, color_offsets, color_bytes, [&](size_t slot) {
+                if (slot == 0) return readback_color0;
+                if (slot == 1) return readback_color1;
+                const bool persistent_slot = cached_extra[slot] != nullptr;
+                return want_color_readback &&
+                    prosper::frontend::is_color_target_readback_wanted(
+                        color_target != nullptr,
+                        color_target ? color_target->persistent_id_slots[slot] : 0,
+                        persistent_slot,
+                        color_target ? color_target->readback_slots[slot] : false);
+            }));
+
     VkBuffer rb = VK_NULL_HANDLE;
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     if (readback_requested) {

@@ -37,6 +37,31 @@ int main() {
     // When there is no color target struct at all, default readback behavior is preserved.
     CHECK(is_color_target_readback_wanted(false, 0, false, false));
 
+    // Active readback sizing (#3276): staging buffer is sized only to the maximum extent of
+    // selected slots, while preserving absolute offsets.
+    using prosper::frontend::compute_active_readback_bytes;
+    const uint64_t offsets[4] = {0, 33u << 20, 66u << 20, 99u << 20};
+    const uint64_t bytes[4] = {33u << 20, 33u << 20, 33u << 20, 33u << 20};
+
+    // Slot 0 only selected (common case: unbound higher MRT slots): only 33 MB, not 132 MB.
+    CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t s) { return s == 0; }) ==
+          (33u << 20));
+
+    // Slots 0 and 1 selected: 66 MB.
+    CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t s) { return s <= 1; }) ==
+          (66u << 20));
+
+    // Slot 2 selected (with holes at slots 0 and 1): covers up to end of slot 2 (99 MB).
+    CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t s) { return s == 2; }) ==
+          (99u << 20));
+
+    // All slots selected: full 132 MB.
+    CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t) { return true; }) ==
+          (132u << 20));
+
+    // No slots selected: 0 bytes.
+    CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t) { return false; }) == 0);
+
     if (!failures) std::printf("readback_policy: OK\n");
     return failures ? 1 : 0;
 }

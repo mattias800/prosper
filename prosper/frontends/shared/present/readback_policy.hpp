@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace prosper::frontend {
@@ -29,6 +30,26 @@ constexpr bool is_color_target_readback_wanted(bool has_color_target,
     if (!has_color_target) return true;
     if (target_readback) return true;
     return persistent_id != 0 && !persistent_color;
+}
+
+// Calculates the required staging buffer size covering only the active readback slots (#3276).
+// Sizing the allocation to max(offsets[slot] + bytes[slot]) over the selected slots captures
+// the common case of unbound higher MRT slots without disturbing the absolute offsets.
+template <size_t N, typename OffsetArray, typename BytesArray, typename WantedPred>
+constexpr uint64_t compute_active_readback_bytes(size_t count,
+                                                 const OffsetArray& offsets,
+                                                 const BytesArray& bytes,
+                                                 WantedPred&& is_wanted) {
+    uint64_t max_extent = 0;
+    const size_t limit = count < N ? count : N;
+    for (size_t slot = 0; slot < limit; ++slot) {
+        if (is_wanted(slot)) {
+            const uint64_t extent = static_cast<uint64_t>(offsets[slot]) +
+                                    static_cast<uint64_t>(bytes[slot]);
+            if (extent > max_extent) max_extent = extent;
+        }
+    }
+    return max_extent;
 }
 
 } // namespace prosper::frontend
