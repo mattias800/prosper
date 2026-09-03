@@ -113,6 +113,36 @@ int main() {
           std::strcmp(built.data(), "http://alice:secret@2001:db8::1:8080/x#frag") == 0,
           "userinfo, explicit port, path and fragment are assembled in the library's order");
 
+    // A guest-supplied element need not have come from our own parser, so build one BY HAND to
+    // reach the library's PREFIX-compare default-port lookup: "httpx" takes HTTP's 80 and the
+    // port is therefore suppressed. An exact-match lookup would emit ":80" here.
+    char hand_scheme[] = "httpx";
+    char hand_host[] = "example.test";
+    char hand_empty[] = "";
+    http::SceHttpUriElement hand{};
+    hand.opaque = false;
+    hand.scheme = hand_scheme;
+    hand.username = hand_empty;
+    hand.password = hand_empty;
+    hand.hostname = hand_host;
+    hand.path = hand_empty;
+    hand.query = hand_empty;
+    hand.fragment = hand_empty;
+    hand.port = 80;
+    std::memset(built.data(), 0, built.size());
+    CHECK(build((uint64_t)built.data(), (uint64_t)&build_need, built.size(), (uint64_t)&hand,
+                http::kUriBuildAll, 0) == 0 &&
+          std::strcmp(built.data(), "httpx://example.test") == 0,
+          "a prefix-matching scheme takes HTTP's default port, so \":80\" is suppressed");
+    // The contrasting arm: without this a lookup that suppressed every port would also pass above.
+    char hand_ftp[] = "ftp";
+    hand.scheme = hand_ftp;
+    std::memset(built.data(), 0, built.size());
+    build((uint64_t)built.data(), (uint64_t)&build_need, built.size(), (uint64_t)&hand,
+          http::kUriBuildAll, 0);
+    CHECK(std::strcmp(built.data(), "ftp://example.test:80") == 0,
+          "a scheme with no default port emits \":80\" rather than suppressing it");
+
     // Error paths. None of these values can come from the dispatcher default.
     CHECK(build((uint64_t)built.data(), (uint64_t)&build_need, built.size(), 0,
                 http::kUriBuildAll, 0) == http::kErrorInvalidUrl,
@@ -152,14 +182,34 @@ int main() {
               "a terminated context no longer creates templates");
         CHECK(term(ctx, 0, 0, 0, 0, 0) == http::kErrorInvalidId,
               "terminating an already-released context returns INVALID_ID");
-        // ...and the slot really is reusable, so a title that init/terms repeatedly cannot
-        // exhaust the four-slot table.
-        for (int i = 0; i < 16; i++) {
+        // Kills a Term that releases the context slot but leaves its templates allocated. Fill
+        // the template table from one context, terminate it, and a fresh context must be able to
+        // fill it to the same depth -- which it cannot if the templates outlived their owner.
+        //
+        // The arm this replaces ran 16 init/term cycles that created NO templates, so it could
+        // not express the case it claimed to guard: a template leak was structurally invisible
+        // to it. Same vacuity class as #3288.
+        uint64_t owner_ctx = init(0, 0, 0, 0, 0, 0);
+        int first_fill = 0;
+        while ((int64_t)create_tmpl(owner_ctx, 0, 0, 0, 0, 0) > 0) first_fill++;
+        CHECK(first_fill > 0, "the template table fills from a live context");
+        CHECK(term(owner_ctx, 0, 0, 0, 0, 0) == 0,
+              "sceHttpTerm releases a context that still owns templates");
+        uint64_t next_ctx = init(0, 0, 0, 0, 0, 0);
+        int second_fill = 0;
+        while ((int64_t)create_tmpl(next_ctx, 0, 0, 0, 0, 0) > 0) second_fill++;
+        CHECK(second_fill == first_fill,
+              "sceHttpTerm reclaims the templates its context owned");
+        CHECK(term(next_ctx, 0, 0, 0, 0, 0) == 0, "the second context releases cleanly");
+
+        // Context slots are reusable too: more init/term cycles than the table is deep. One
+        // CHECK site, evaluated once, so the executed count and the source count agree.
+        bool ctx_cycles_ok = true;
+        for (int i = 0; i < 16 && ctx_cycles_ok; i++) {
             uint64_t again = init(0, 0, 0, 0, 0, 0);
-            if ((int64_t)again <= 0) { CHECK(false, "init/term cycles do not leak context slots"); break; }
-            term(again, 0, 0, 0, 0, 0);
-            if (i == 15) CHECK(true, "init/term cycles do not leak context slots");
+            ctx_cycles_ok = (int64_t)again > 0 && term(again, 0, 0, 0, 0, 0) == 0;
         }
+        CHECK(ctx_cycles_ok, "16 init/term cycles do not leak context slots");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

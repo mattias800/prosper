@@ -204,16 +204,29 @@ constexpr size_t kUriTextMax = 0x3fff;
 
 size_t capped_len(const char* text, size_t cap) { return text ? strnlen(text, cap) : 0; }
 
-// The library upper-cases the scheme and matches "HTTPS" then "HTTP"; anything else has no
-// default port. It then compares a third literal that string-merging left as "TTP", which no
-// real scheme can reach -- deliberately not reproduced. Matching is exact here rather than the
-// library's prefix compare, which is unreachable for a scheme that parsed.
+// The library upper-cases the scheme into a stack buffer and then runs three PREFIX compares --
+// strncmp(upper, LIT, strlen(LIT)) -- against "HTTPS" (443, +0x21aa2), "HTTP" (80, +0x21aab) and
+// a third literal that string merging left as "TTP" (+0x326ac). That third arm ends in
+// `mov eax,0x50 / cmovne eax,ecx` with ecx zeroed, and cmovne fires on MISMATCH: a "TTP" prefix
+// yields 80, and only a non-match yields "no default port".
+//
+// Reproduced rather than narrowed to exact equality, which is what this comment used to claim was
+// safe. element->scheme is GUEST-supplied and need not have come from our own parser, so "httpx"
+// prefix-matches "HTTP" and takes 80 on hardware; under exact matching prosper would answer 0 and
+// then emit a ":80" that the library suppresses. Divergence for a scheme nobody uses, but the
+// contract this file claims is fidelity to the shipped library, so match it.
 uint16_t default_port_for_scheme(const char* scheme) {
     const size_t length = capped_len(scheme, kUriSchemeMax);
     if (length == 0) return 0;
     const std::string_view value(scheme, length);
-    if (ascii_ieq(value, "https")) return 443;
-    if (ascii_ieq(value, "http")) return 80;
+    // strncmp against a shorter buffer stops at its NUL, so a prefix match needs the whole literal.
+    const auto prefixed = [value](std::string_view literal) {
+        return value.size() >= literal.size() &&
+               ascii_ieq(value.substr(0, literal.size()), literal);
+    };
+    if (prefixed("https")) return 443;
+    if (prefixed("http")) return 80;
+    if (prefixed("ttp")) return 80;
     return 0;
 }
 
@@ -328,9 +341,15 @@ HLE(h_http_uri_build) { // (out, required, pool_size, element, flags)
 // census noise without fabricating an SDK error encoding.
 //
 // CreateTemplate now VALIDATES its library context id rather than accepting whatever it is
-// given. The encoding is not invented: the shipped PS5 3.20 libSceHttp contains the id
-// validator itself, which range-checks (1..0x80) and cross-checks the table slot and answers
-// 0x80431100 on either failure. CONFIDENCE: HIGH.
+// given. The encoding is not invented: sceHttpCreateTemplate (+0x107f0) calls the validator at
+// +0xb070, which range-checks the id (1..0x80), cross-checks the slot in the 0xd0-stride context
+// table, and answers 0x80431100 on either failure. That is the validator on this call path, not
+// a same-shaped neighbour. CONFIDENCE: HIGH.
+//
+// Known fidelity gap, seen and not missed: the library answers 0x80431001 (BEFORE_INIT) when
+// sceHttpInit was never called and only reaches the id validator once the library is up, while
+// prosper answers 0x80431100 for both. Derivable locally -- no live context means never inited --
+// but the guest classifies the two identically, so it is not worth a second code path yet.
 //
 // This comment used to say "PS5 3.20 libSceHttp exports no sceHttpTerminate: contexts live for
 // the process". The name is wrong, and so was the conclusion drawn from it - the export is
@@ -339,7 +358,7 @@ HLE(h_http_uri_build) { // (out, required, pool_size, element, flags)
 // dry by a title that inits and terminates repeatedly.
 
 struct HttpLibCtx   { bool in_use = false; };
-struct HttpTemplate { bool in_use = false; };
+struct HttpTemplate { bool in_use = false; int owner = 0; };
 constexpr int kMaxHttpLibs      = 4;
 constexpr int kMaxHttpTemplates = 16;
 
@@ -366,10 +385,19 @@ bool http_ctx_is_live(uint64_t raw) {
     return id >= 1 && id <= kMaxHttpLibs && g_http_libs[id - 1].in_use;
 }
 
-HLE(h_http_term) { // sceHttpTerm(libCtxId) -> SCE_OK, releasing the context
+HLE(h_http_term) { // sceHttpTerm(libCtxId) -> SCE_OK, releasing the context AND what it owns
     std::lock_guard<std::mutex> lk(g_http_mx);
     if (!http_ctx_is_live(a0)) return http::kErrorInvalidId;
-    g_http_libs[(int32_t)a0 - 1].in_use = false;
+    const int id = (int32_t)a0;
+    // Term does not merely drop the context. After the refcount decrement at +0x1068b the shipped
+    // sceHttpTerm runs four per-context teardown helpers (+0x83f0, +0x1c8e0, +0x35b0, +0xaf90),
+    // each taking the ctx id in edi; +0xaf90 re-validates the id against the same slot table the
+    // create path uses. Releasing only the slot would leak every template created under it, and
+    // the template table is 16 deep -- so a title that inits, creates one template and terms in a
+    // loop would exhaust it and start getting -1 from a table that is really empty.
+    for (auto& tmpl : g_http_templates)
+        if (tmpl.in_use && tmpl.owner == id) tmpl = {};
+    g_http_libs[id - 1].in_use = false;
     return 0;
 }
 
@@ -380,6 +408,7 @@ HLE(h_http_create_template) { // sceHttpCreateTemplate(libCtxId, ...) -> templat
     for (int i = 0; i < kMaxHttpTemplates; i++) {
         if (g_http_templates[i].in_use) continue;
         g_http_templates[i].in_use = true;
+        g_http_templates[i].owner = (int32_t)a0;  // so sceHttpTerm can reclaim it
         return (uint64_t)(i + 1);
     }
     return (uint64_t)(int64_t)-1;
@@ -388,7 +417,7 @@ HLE(h_http_create_template) { // sceHttpCreateTemplate(libCtxId, ...) -> templat
 HLE(h_http_delete_template) { // sceHttpDeleteTemplate(templateId) -> SCE_OK offline
     std::lock_guard<std::mutex> lk(g_http_mx);
     if (int id = (int32_t)a0; id >= 1 && id <= kMaxHttpTemplates)
-        g_http_templates[id - 1].in_use = false;
+        g_http_templates[id - 1] = {};
     return 0;
 }
 } // namespace
