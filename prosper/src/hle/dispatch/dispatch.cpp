@@ -157,9 +157,42 @@ std::vector<RegisteredFn> Hle::registrations() {
                         kv.second.signature, kv.second.guest_abi });
     return out;
 }
+bool Hle::registered(const std::string& nid) {
+    return registry().find(nid) != registry().end();
+}
+const void* Hle::lookup_address(const std::string& nid) {
+    auto it = registry().find(nid);
+    return it == registry().end() ? nullptr : reinterpret_cast<const void*>(it->second.fn);
+}
 HleFn Hle::lookup(const std::string& nid) {
     auto it = registry().find(nid);
-    return it == registry().end() ? nullptr : it->second.fn;
+    if (it == registry().end()) return nullptr;
+    if (it->second.guest_abi) {
+        // A programming error, not a runtime condition (#3272). Handing the address back would give
+        // the caller a pointer whose type describes the wrong calling convention, and on every
+        // platform but Windows that compiles and behaves correctly -- so the mistake stays invisible
+        // until the MinGW job dereferences a wild pointer. Refuse, loudly, and name the way out.
+        //
+        // Loud ONCE per NID: this can be reached from a per-import-slot loop, and a message per call
+        // would bury the first one. `nullptr` is deliberately NOT the same answer as "unimplemented"
+        // in the log, because a caller that only checks for null would otherwise report a registered
+        // handler as missing.
+        static std::mutex mx;
+        static std::unordered_map<std::string, bool> warned;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            first = warned.emplace(nid, true).second;
+        }
+        if (first)
+            fprintf(stderr,
+                    "[prosper] Hle::lookup refused %s (%s): it is a guest-ABI handler and HleFn is "
+                    "the wrong type for one. Call it with Hle::lookup_guest_abi<R, Args...>(nid), or "
+                    "use Hle::lookup_address(nid) if you only need the address.\n",
+                    it->second.name.c_str(), nid.c_str());
+        return nullptr;
+    }
+    return it->second.fn;
 }
 HleReturnHook Hle::return_hook_of(const std::string& nid) {
     auto it = registry().find(nid);

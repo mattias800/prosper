@@ -17,7 +17,7 @@
 //     exact NID set the loader will try to bind;
 //   * cross-module exports come from `module_export_nids`, the loader's own definition of what a
 //     module contributes to the global export table;
-//   * registration comes from `Hle::lookup` after `register_builtin_hle()` — the real runtime
+//   * registration comes from `Hle::registered` after `register_builtin_hle()` — the real runtime
 //     registry, so a NID registered from a table, a loop, or a raw literal is seen identically.
 // A grep over `register_fn(...)` call sites would miss every non-literal registration and would
 // report those as false-success candidates. Asking the registry cannot.
@@ -276,7 +276,7 @@ int main(int argc, char** argv) {
     size_t total = 0, unregistered = 0;
     for (auto& [nid, r] : rows) {
         total++;
-        const bool registered = Hle::lookup(nid) != nullptr;
+        const bool registered = Hle::registered(nid);
         if (!registered) unregistered++;
         if (registered && !show_registered) continue;
         if (auto it = names.by_nid.find(nid); it != names.by_nid.end()) r.name = it->second;
@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
             for (const auto& t : r->titles) { if (!tl.empty()) tl += ","; tl += t; }
             printf("%s\t%s\t%d\t%zu\t%zu\t%s\t%s\n", r->nid.c_str(),
                    r->name.empty() ? "?" : r->name.c_str(),
-                   Hle::lookup(r->nid) != nullptr ? 1 : 0,
+                   Hle::registered(r->nid) ? 1 : 0,
                    r->titles.size(), r->modules, libs.c_str(), tl.c_str());
         }
         print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),

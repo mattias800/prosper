@@ -143,7 +143,51 @@ public:
     // tracing thunk that a real handler is expected to replace later). A subsequent register_fn that
     // overwrites a placeholder is NOT flagged as a shadow — that override is the intent.
     static void  register_placeholder(const std::string& nid, HleFn fn, const char* name);
-    static HleFn lookup(const std::string& nid);          // nullptr if unimplemented
+    // An ordinary HOST-ABI handler for a NID; nullptr if unimplemented.
+    //
+    // REFUSES a guest-ABI handler, returning nullptr and complaining once per NID (#3272). Those are
+    // compiled in the guest's convention, and invoking one through `HleFn` places the arguments by
+    // one convention and reads them by the other -- on Windows a printf-family handler's first `%s`
+    // then dereferences whatever landed in rdi. That is not hypothetical: `test_printf` and
+    // `test_guest_log_capture` both did it and SEGFAULTed on the Windows MinGW job the moment these
+    // handlers were tagged, while passing everywhere else, because PROSPER_GUEST_ABI is empty on
+    // every other platform and the two types are then identical.
+    //
+    // So `lookup` now means exactly "a handler I may call through HleFn", and the two other needs
+    // have their own accessors: `lookup_guest_abi` to CALL a guest-ABI handler with a pointer type
+    // this header constructs, and `lookup_address` when the address is all you want.
+    static HleFn lookup(const std::string& nid);
+    // The handler ADDRESS for a NID, with no calling convention attached; nullptr if unimplemented.
+    // This is what the import-stub emitters want -- they only ever patch the value into a jump, and
+    // never call it -- so they are unaffected by the refusal above. Prefer it over `lookup` wherever
+    // the value is an address rather than something you intend to invoke.
+    static const void* lookup_address(const std::string& nid);
+    // "Is there a handler for this NID at all?" -- a THIRD question, and the one that made the
+    // split necessary rather than merely tidy. It is not "give me something callable" (`lookup`)
+    // and not "give me the address" (`lookup_address`), and before #3272 all three were spelled
+    // `lookup(nid) != nullptr`. Two callers asking it that way broke the moment `lookup` learned to
+    // refuse -- `test_hle_registered` and `nid_census`, the latter with no ctest case, so nothing
+    // would have gone red. Spell the question so a fourth caller does not have to improvise it.
+    static bool registered(const std::string& nid);
+    // A pointer type in the GUEST's calling convention. Spelled once, here, so no caller has to.
+    template <class R, class... A>
+    using GuestAbiFn = PROSPER_GUEST_ABI R (*)(A..., ...);
+    // Look up a handler registered with `register_guest_abi`, as a pointer type THIS ACCESSOR
+    // constructs (#3272). The caller names the return type and the fixed prefix and never names the
+    // calling convention, so an untagged pointer cannot come out of here -- which is the whole
+    // point, since on every platform but Windows an untagged one compiles and behaves identically
+    // and the mistake is invisible until the MinGW job runs.
+    //
+    //     auto guest_printf = Hle::lookup_guest_abi<int, const char*>(nid_hash("printf"));
+    //
+    // nullptr if the NID is unimplemented OR is not a guest-ABI handler -- asking for the guest
+    // convention on an ordinary host handler is the same category error in the other direction, and
+    // silently handing back a mis-typed pointer is exactly what this accessor exists to stop.
+    template <class R, class... A>
+    static GuestAbiFn<R, A...> lookup_guest_abi(const std::string& nid) {
+        if (!guest_abi_nid(nid)) return nullptr;
+        return reinterpret_cast<GuestAbiFn<R, A...>>(const_cast<void*>(lookup_address(nid)));
+    }
     static HleReturnHook return_hook_of(const std::string& nid); // called by the import return trampoline
     static const char* name_of(const std::string& nid);   // registered display name or ""
     // Every NID that was registered 2+ times with DIFFERING handlers, in registration order. Empty

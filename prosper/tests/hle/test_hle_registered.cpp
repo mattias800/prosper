@@ -13,8 +13,15 @@
 using namespace prosper;
 
 static int fails = 0;
+// "Is this NID registered?" is a THIRD question, distinct from both "give me a handler I may call
+// through HleFn" and "give me a guest-ABI handler" -- and `lookup` used to answer all three. It no
+// longer answers this one for the printf family, which are guest-ABI (#3272): `lookup` refuses
+// those, so asking it about `snprintf` here reported a registered handler as missing. That is the
+// whole reason the accessor was split; `Hle::registered` is the one that means existence.
 static void must(const char* name) {
-    if (Hle::lookup(nid_hash(name)) == nullptr) { printf("  [FAIL] not registered: %s\n", name); fails++; }
+    if (!Hle::registered(nid_hash(name))) {
+        printf("  [FAIL] not registered: %s\n", name); fails++;
+    }
 }
 
 int main() {
@@ -52,7 +59,7 @@ int main() {
     };
     for (const char* n : names) must(n);
     // sync_on_address futex is registered by raw NID (no symbol name) — check it directly.
-    if (Hle::lookup("Hc4CaR6JBL0") == nullptr) { printf("  [FAIL] sceKernelWaitOnAddress raw NID\n"); fails++; }
+    if (!Hle::registered("Hc4CaR6JBL0")) { printf("  [FAIL] sceKernelWaitOnAddress raw NID\n"); fails++; }
 
     // __ctype_get_mb_cur_max returns the VALUE of MB_CUR_MAX (1 in the "C" locale we
     // present), not a pointer to it — guest code sizes buffers as MB_CUR_MAX*n (#141).

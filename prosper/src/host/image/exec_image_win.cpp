@@ -1194,14 +1194,19 @@ bool map_image(const LoadedImage& img, std::string* err) {
 // byte-identical stubs for the same slot, or a runtime-loaded module's imports would take a
 // different path into the HLE than the pre-linked ones.
 static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx, size_t capacity) {
-    HleFn fn = Hle::lookup(s.nid);
+    // lookup_ADDRESS, not lookup (#3272): this value is only ever patched into the emitted stub as a
+    // jump target, never invoked from here, so the calling convention of the handler behind it is
+    // none of this function's business -- and `lookup` now refuses the guest-ABI handlers precisely
+    // because it hands back a type that claims one. `guest_abi_nid` below is what actually decides
+    // the stub's shape for those.
+    const void* fn = Hle::lookup_address(s.nid);
     const uint64_t return_hook = (uint64_t)(uintptr_t)Hle::return_hook_of(s.nid);
     // Stage, then copy. The bridge's length depends on the handler's declared signature, and a stub
     // that does not fit its slot must be REPORTED rather than written: emitting straight into the
     // table would already have overrun the next slot by the time the caller compared the length.
     uint8_t staged[abi::kMaxBridgeBytes];
     const size_t emitted =
-        fn ? emit_impl(staged, (uint64_t)fn, return_hook, Hle::signature_of_nid(s.nid),
+        fn ? emit_impl(staged, (uint64_t)(uintptr_t)fn, return_hook, Hle::signature_of_nid(s.nid),
                        Hle::guest_abi_nid(s.nid))
            : emit_unimpl(staged, idx, (uint64_t)&prosper_on_unimpl);
     if (emitted <= capacity) memcpy(slot, staged, emitted);

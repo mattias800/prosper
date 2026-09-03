@@ -68,10 +68,10 @@ int main() {
     // must carry PROSPER_GUEST_ABI -- on Windows that is `sysv_abi`, and calling it through an
     // untagged type places the arguments by the wrong convention. The integer handlers below are
     // ordinary host functions and need no tag.
-    using PrintfFn = PROSPER_GUEST_ABI int (*)(const char*, ...);
+    // `lookup_guest_abi` constructs the tagged pointer type (#3272); the integer handlers below stay
+    // on plain `lookup`, which now means exactly "a handler HleFn describes correctly".
     using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-    auto guest_printf = reinterpret_cast<PrintfFn>(
-        reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("printf"))));
+    auto guest_printf = prosper::Hle::lookup_guest_abi<int, const char*>(prosper::nid_hash("printf"));
     auto guest_fputs = reinterpret_cast<HleFn>(
         reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("fputs"))));
     auto guest_fwrite = reinterpret_cast<HleFn>(
