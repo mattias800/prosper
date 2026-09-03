@@ -35,6 +35,33 @@ namespace prosper {
 // marker of the boundary in case a future toolchain makes the attribute viable.
 #define PROSPER_SYSV_ABI
 
+// A handler compiled in the GUEST's convention rather than the host's. On Windows that really is
+// `__attribute__((sysv_abi))`; everywhere else the host ABI already is the guest's and it expands to
+// nothing. The import stub for such a handler is the same bare tail-jump Linux uses, so the guest's
+// frame arrives intact.
+//
+// This is NOT a reversal of the note above. Tagging the ~537 STL-using handlers was tried and
+// abandoned, and the reason is a hard constraint that still applies: **MinGW cannot emit SEH unwind
+// data for a sysv_abi function**, so a frame that needs an unwind cleanup fails to assemble with
+// `.seh_handlerdata used outside of .seh_proc block`. Reproduced 2026-09-02 on MinGW GCC 16.1.1, and
+// it is optimization-dependent — the same source assembles at `-O0`/`-O2` and fails at `-O1`, where
+// a throwing callee gets inlined into the tagged frame.
+//
+// So the tag is for handlers that can be kept trivially cleanup-free, and the rule is mechanical:
+// **a PROSPER_GUEST_ABI function must own no object with a destructor and must call nothing that can
+// be inlined into it carrying one.** Capture what the guest passed, hand it to an ordinary
+// `noinline` host function, return. Everything interesting happens in that callee, in the host ABI,
+// where the compiler is free again.
+//
+// What it buys, and why the escape hatch exists at all: a REAL C VARIADIC cannot be described by a
+// `CallSignature`, because its argument list is whatever the format string says at run time (#3246).
+// The only thing that can capture it is the compiler's own System V variadic prologue.
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+#define PROSPER_GUEST_ABI __attribute__((sysv_abi))
+#else
+#define PROSPER_GUEST_ABI
+#endif
+
 // Cached diagnostic-flag reads for HOT paths (PROSPER_ENV_ON / PROSPER_ENV_VALUE) moved to
 // diagnostics/env_cache.hpp: the renderer backend and the draw executor need them too, and
 // should not have to include the HLE dispatch registry to ask whether a switch is on. Included
@@ -66,6 +93,7 @@ struct RegisteredFn {
     const void* fn = nullptr; // handler address; equal addresses = Sony entry points that collapse
     bool placeholder = false; // registered as a deliberately-overridable tracing thunk
     abi::CallSignature signature{};  // #2955: declared only where a float/double is involved
+    bool guest_abi = false;   // #3246: PROSPER_GUEST_ABI handler; the Windows stub converts nothing
 };
 
 // Registry of implemented functions, keyed by NID.
@@ -88,6 +116,26 @@ public:
     static void  register_fn_with_signature(const std::string& nid, HleFn fn, const char* name,
                                             const abi::CallSignature& signature,
                                             HleReturnHook return_hook = nullptr);
+    // Register a REAL C VARIADIC (or any other handler compiled in the guest's own convention). The
+    // parameter type carries PROSPER_GUEST_ABI, so on Windows an untagged handler is a compile
+    // error rather than a stub that silently reads the wrong registers — the tag and the
+    // registration cannot drift apart. `A...` is the fixed prefix; the `...` is the real ellipsis.
+    //
+    // ANY DIRECT CALLER MUST USE A PROSPER_GUEST_ABI POINTER TYPE. `Hle::lookup` hands back a bare
+    // address, and calling one of these through an ordinary host-ABI function pointer places the
+    // arguments by the wrong convention — on Windows the first `%s` then dereferences whatever
+    // landed in rdi. Not hypothetical: `test_printf` and `test_guest_log_capture` did exactly that
+    // and SEGFAULTed on the Windows MinGW job the moment these handlers were tagged, and passed
+    // everywhere else. `HleFn` is the wrong type for one of these too.
+    template <class R, class... A>
+    static void register_guest_abi(const std::string& nid, PROSPER_GUEST_ABI R (*fn)(A..., ...),
+                                   const char* name) {
+        register_guest_abi_fn(nid, reinterpret_cast<HleFn>(fn), name);
+    }
+    static void  register_guest_abi_fn(const std::string& nid, HleFn fn, const char* name);
+    // Whether the handler for a NID is compiled in the guest's convention. The Windows import stub
+    // consults this and emits a bare tail-jump; every other platform emits one regardless.
+    static bool  guest_abi_nid(const std::string& nid);
     // The declared signature for a NID, or a default-constructed (undeclared) one. The Windows
     // import stub consults this; every other platform's host ABI already matches the guest's.
     static abi::CallSignature signature_of_nid(const std::string& nid);

@@ -50,10 +50,18 @@ ArgLocation ms_arg_location(const CallSignature& sig, unsigned arg);
 
 // Everything one import stub needs. `checkpoint` and `return_hook` are host-ABI functions taking no
 // arguments; `return_hook` is optional.
+//
+// `guest_abi` says the handler is compiled in the GUEST's own convention (PROSPER_GUEST_ABI in
+// hle/dispatch/dispatch.hpp), so there is nothing to convert and the stub is the same bare tail-jump
+// Linux uses. It is how a REAL C VARIADIC is reached (#3246): a `CallSignature` describes a list the
+// type system knows, and a variadic handler's list is whatever its format string says at run time —
+// so the only way to hand it an intact System V frame is to let the compiler's own System V variadic
+// prologue capture it. See emit_guest_abi_tailjump for what it costs.
 struct BridgeParams {
     uint64_t      handler     = 0;
     uint64_t      checkpoint  = 0;
     uint64_t      return_hook = 0;
+    bool          guest_abi   = false;
     CallSignature signature{};
 };
 
@@ -82,5 +90,19 @@ size_t emit_sysv_to_ms_bridge(uint8_t* out, const BridgeParams& params);
 // stack into the Microsoft integer registers and outgoing stack. Exposed so a test can pin the
 // no-op property by byte comparison rather than by inspection.
 size_t emit_legacy_integer_prologue(uint8_t* out);
+
+// The number of guest arguments the fixed integer prologue forwards. A handler declaring more than
+// this and registered by `(HleFn)` cast would silently lose the rest on Windows — audited for #3246
+// and clear today: the widest HLE macro in the tree is `HLE10`, which is exactly this many.
+inline constexpr unsigned kLegacyForwardedArgs = 10;
+
+// `movabs rax, handler ; jmp rax` — the bare tail-jump, byte-identical to the LINUX import stub
+// (host/image/exec_image_linux.cpp's emit_impl). Emitted on Windows only for a handler compiled in
+// the guest's own convention, where there is nothing to convert.
+//
+// The cost is the return checkpoint: a tail-jump returns straight to the guest, so a guest-ABI
+// handler that wants the pending-guest-exception poll must call
+// `dispatch_pending_guest_exception()` itself before returning. That is what the libc variadics do.
+size_t emit_guest_abi_tailjump(uint8_t* out, uint64_t handler);
 
 } // namespace prosper::abi

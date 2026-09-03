@@ -323,11 +323,12 @@ namespace {
     // registry supplies the handler's declared signature, without which a floating-point argument —
     // and every argument after it — cannot be placed at all.
     size_t emit_impl(uint8_t* p, uint64_t fn, uint64_t return_hook,
-                     const abi::CallSignature& signature) {
+                     const abi::CallSignature& signature, bool guest_abi) {
         abi::BridgeParams params;
         params.handler     = fn;
         params.checkpoint  = (uint64_t)(uintptr_t)&dispatch_pending_guest_exception;
         params.return_hook = return_hook;
+        params.guest_abi   = guest_abi;
         params.signature   = signature;
         return abi::emit_sysv_to_ms_bridge(p, params);
     }
@@ -1200,7 +1201,8 @@ static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx, si
     // table would already have overrun the next slot by the time the caller compared the length.
     uint8_t staged[abi::kMaxBridgeBytes];
     const size_t emitted =
-        fn ? emit_impl(staged, (uint64_t)fn, return_hook, Hle::signature_of_nid(s.nid))
+        fn ? emit_impl(staged, (uint64_t)fn, return_hook, Hle::signature_of_nid(s.nid),
+                       Hle::guest_abi_nid(s.nid))
            : emit_unimpl(staged, idx, (uint64_t)&prosper_on_unimpl);
     if (emitted <= capacity) memcpy(slot, staged, emitted);
     return emitted;

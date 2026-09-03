@@ -64,7 +64,11 @@ int main() {
     CHECK(guest_log_capture_bundle_enabled(), "exact-line gate enables only with marker and bundle path");
 
     prosper::register_builtin_hle();
-    using PrintfFn = int (*)(const char*, ...);
+    // `printf` is a real C variadic compiled in the GUEST's convention (#3246), so its pointer type
+    // must carry PROSPER_GUEST_ABI -- on Windows that is `sysv_abi`, and calling it through an
+    // untagged type places the arguments by the wrong convention. The integer handlers below are
+    // ordinary host functions and need no tag.
+    using PrintfFn = PROSPER_GUEST_ABI int (*)(const char*, ...);
     using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
     auto guest_printf = reinterpret_cast<PrintfFn>(
         reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("printf"))));

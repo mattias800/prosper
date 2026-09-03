@@ -5,6 +5,7 @@
 // prosper_core stays dependency-free; a concrete output frontend (SDL3, ...) installs itself via
 // audio_set_sink() from outside the core.
 #include "hle/dispatch/dispatch.hpp"
+#include "host/abi/sysv_ms_bridge.hpp"   // #3246: kLegacyForwardedArgs, the fixed prologue's capacity
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle/dispatch/nid.hpp"
 #include "hle/audio/audio.hpp"
@@ -50,6 +51,13 @@ namespace prosper {
 #define HLE10(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
                                        uint64_t a7, uint64_t a8, uint64_t a9)
+// HLE10 is the WIDEST handler shape in the tree, and that is a fact the Windows import stub depends
+// on: its fixed integer prologue forwards exactly `kLegacyForwardedArgs` guest arguments and would
+// silently drop anything beyond them (#3246, where the census was taken). Widening this macro — or
+// adding an HLE11 anywhere — needs the prologue widened first, so the coupling is asserted here
+// rather than left to be rediscovered on a platform nobody develops on.
+static_assert(10 <= prosper::abi::kLegacyForwardedArgs,
+              "HLE10 declares more arguments than the Windows import stub forwards");
 #define P(x) ((void*)(uintptr_t)(x))
 
 namespace {

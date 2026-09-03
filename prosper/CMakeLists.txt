@@ -2214,6 +2214,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_sysv_ms_bridge PRIVATE prosper_core)
   add_test(NAME sysv_ms_bridge COMMAND test_sysv_ms_bridge)
 
+  # #3246: the one argument list #2955's CallSignature cannot describe — a real C variadic, whose
+  # shape the format string decides at run time. CROSS-PLATFORM for the same reason as the bridge
+  # above, and then some: reading a guest System V va_list and writing a Microsoft one are pure
+  # functions, and BOTH conventions' va_arg are available on any x86-64 host through
+  # __builtin_sysv_va_list / __builtin_ms_va_list — so the round trip is executed against the
+  # compiler's own readers here, and against the real CRT on Windows.
+  add_executable(test_guest_varargs tests/host/abi/test_guest_varargs.cpp)
+  target_link_libraries(test_guest_varargs PRIVATE prosper_core)
+  add_test(NAME guest_varargs COMMAND test_guest_varargs)
+
   # sceImeUpdate must invoke the guest key handler on the CALLER's guest %fs, not the host %fs the
   # import stub swapped in (#1286: Evergate SIGSEGV at eboot+0xaf8431 on a key press). Drives the real
   # import path on an activated guest TCB; a no-op pass off Linux.

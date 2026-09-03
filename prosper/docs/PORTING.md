@@ -605,11 +605,18 @@ edge cases are tracked separately in #697.
 3. ~~**Validate/repair the guest→HLE ABI trampoline for XMM/float args.**~~ Done (#2955). The bridge
    is signature-driven: `src/host/abi/` carries the two placement tables and emits the trampoline
    from the handler's own C++ declaration, which `Hle::register_typed` preserves. A handler with no
-   float still gets the historical fixed integer shuffle, byte for byte. `printf`-family handlers are
-   deliberately NOT converted — they are real host variadics, reached by the same fixed path as
-   before, and a variadic Microsoft x64 call additionally wants each FP argument duplicated into the
-   integer register. That is #3246, open and unmeasured; a `CallSignature` cannot describe it at all,
-   because the argument list is whatever the format string says at run time.
+   float still gets the historical fixed integer shuffle, byte for byte.
+   ~~The `printf` family is deliberately NOT converted.~~ Done too (#3246), by a different route,
+   because a `CallSignature` genuinely cannot describe a list the format string decides at run time.
+   Those handlers are now tagged `PROSPER_GUEST_ABI` — really `__attribute__((sysv_abi))` on Windows
+   — and their import stub is the same bare tail-jump Linux uses, so the compiler's own System V
+   variadic prologue captures the guest's frame. `src/host/abi/guest_varargs.cpp` then reads that
+   list by the System V rules and writes the flat 8-byte-slot array that IS a Microsoft `va_list`,
+   which sidesteps the FP-duplication rule rather than trying to satisfy it in registers.
+   The attribute route being "abandoned" (above) still holds for the 537 STL-using handlers: MinGW
+   cannot emit SEH unwind data for a `sysv_abi` frame, so it only works where the frame can be kept
+   free of unwind cleanups. Three tiny capture-and-delegate shims can be; a library of handlers
+   cannot.
 4. **VEH recovery hardening for genuine stack-overflow faults.** #633 added a tested assembly recovery
    entry with valid Microsoft-x64 shadow space/alignment, but a truly exhausted guest stack still needs
    a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
@@ -618,12 +625,46 @@ edge cases are tracked separately in #697.
    NIDs — the `libSceFont` scale/slant/weight/render group and the whole libm bank plus
    `strtod`/`strtof` in `hle_libc.cpp` — and those now register through `Hle::register_typed`. The
    remaining cast targets pass and return integers and pointers, which both conventions place
-   identically. What is still unaudited is the *other* half of the original question: whether a cast
-   target's argument COUNT exceeds ten, which the fixed path silently truncates. #3246 carries it.
+   identically.
+   ~~What is still unaudited is the *other* half of the original question: whether a cast target's
+   argument COUNT exceeds ten, which the fixed path silently truncates.~~ Audited for #3246, and the
+   answer is negative: no registered handler declares more than ten arguments. Handlers are written
+   through per-file `HLE`/`HLE7`/`HLE8`/`HLE9`/`HLE10` macros whose widest member is exactly ten (12
+   uses of `HLE10`; there is no `HLE11`), and the only hand-written wide declarations reach nine.
+   `abi::kLegacyForwardedArgs` records the prologue's capacity beside the emitter that implements it.
+   The audit is a source census, so it goes stale the day someone writes an `HLE11` — the surviving
+   truncation risk is that edit, not anything in the tree today.
 
 ### Ruled out — the Windows import trampoline's floating-point arguments
 
-One line per falsified hypothesis, per `CLAUDE.md`. The mechanism and the fix are #2955.
+One line per falsified hypothesis, per `CLAUDE.md`. The mechanism and the fix are #2955, with the
+variadic half in #3246.
+
+- **"The `v*` forms take a `va_list` POINTER and are not affected — they copy the guest's list
+  wholesale."** False on Windows, and it was #3246's own opening claim. A Windows `va_list` is a bare
+  `char*`, so `memcpy(&ap, guest_ptr, sizeof(va_list))` copies **eight** bytes of a **twenty-four**
+  byte System V structure and then reads its `{gp_offset, fp_offset}` pair as a pointer. That is not
+  a wholesale copy, it is a type confusion, and it applied to `vsnprintf`, `vsprintf` and `vsscanf`
+  on every Windows boot. Fixed by the same repacking path as the real variadics; the Linux arms are
+  untouched, where the copy really is wholesale and correct.
+- **"`sscanf` is affected."** False, and it is the one row of #3246's affected table that does not
+  hold. Every variadic argument a scanf-family call passes is a POINTER, so the list is all-integer,
+  no floating-point duplication is required, and System V's integer registers map one-for-one onto
+  Microsoft's first ten argument positions — which is exactly what the historical shuffle already
+  delivers. `h_sscanf` is deliberately left on that path rather than converted for symmetry. The cap
+  that remains is the shuffle's ten arguments, recorded rather than fixed.
+- **"A variadic Microsoft x64 call needs each FP argument duplicated into the integer register, so
+  the fix must emit that duplication."** True of the rule and false of the fix. The duplication only
+  matters to code that FORWARDS a variadic call in registers; prosper does not have to. Reading the
+  guest's System V list and writing a Microsoft `va_list` image directly means no register ever
+  carries a variadic floating-point argument on the host side, and the rule never applies.
+- **"`__attribute__((sysv_abi))` cannot be used on a Windows handler at all."** Too strong, though
+  the shape it came from is real. Measured on MinGW GCC 16.1.1 (2026-09-02): a `sysv_abi` variadic
+  function assembles and runs correctly under wine — *unless* its frame needs an unwind cleanup, in
+  which case the assembler rejects `.seh_handlerdata used outside of .seh_proc block`. And that is an
+  **inlining** decision, so the same source compiled at `-O0` and `-O2` and failed at `-O1`, where a
+  throwing callee was inlined into the tagged frame. So the attribute is usable exactly where the
+  frame can be kept cleanup-free, which is why the variadic shims capture and delegate immediately.
 
 - **"Only four handlers are affected, all in `src/hle/util/hle_font.cpp`; nothing else in 700+
   registered NIDs declares a float parameter."** False — that was #2955's own opening census, and it
