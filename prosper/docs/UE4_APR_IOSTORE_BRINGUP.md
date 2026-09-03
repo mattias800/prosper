@@ -231,6 +231,30 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   neither NID string occurs anywhere in DOLL's 91 MB or Stray's 33 MB `PROSPER_FILELOG` boot logs.
   So the refusal's blast radius is 22 linked titles rather than none.
   [#2926](https://github.com/mattias800/prosper/issues/2926).
+- **"The measure-size call's compatibility read is DOLL-specific in effect, because only DOLL needs
+  it" — false, measured 2026-09-02.** `f_apr_measure_read_file` gated the read on nothing but "does
+  the file id resolve", so it ran for every APR title. *Stray* (`PPSA02101`), 180 s, `PROSPER_FILELOG=1`:
+  **13,925** compatibility reads delivering **582,619,946 bytes**, against 14,255 submits delivering
+  603,329,577 — roughly **97% of the measure-path bytes re-delivered** by the submit path from an
+  identical `(dst, offset, size)` moments later, plus an extra `mmap`/`munmap` per read. The
+  correctness half matters more than the cost: a *sizing* call filling the destination puts bytes
+  there before the guest has recorded the read command, so a title that measures a batch and
+  prepares its destinations afterwards would have prosper's bytes land first and then be overwritten.
+  Also **do not "fix" this by suppressing the second delivery of an identical pair**: the measure
+  comes FIRST and the submit is the authoritative one, so an order-agnostic duplicate filter
+  suppresses the wrong half. The pairing is used only as evidence that the container submits what it
+  measures, and the suppression is keyed per container.
+
+  **A second claim in this area was falsified before it could become load-bearing, and is recorded
+  so it is not re-derived:** *"the suppression cannot fire for DOLL, whose measured reads are never
+  submitted through the ReadFile NID"* — false. Replaying the predicate over four DOLL
+  `PROSPER_FILELOG` boots, container id=6 pairs at **submit #13** every time. What makes DOLL safe is
+  the opposite fact, from the same replay: **0 of 1,254 / 1,255 / 1,725 / 1,732 measured reads lack
+  an identical submit**, so DOLL is a submits-everything-it-measures title — exactly the case the
+  suppression is designed for — not the consume-from-the-measure title the older note describes.
+  *Stray* replays the same way (id=1 pairs at submit #4, 0 unmatched over three logs, 13,923 measures
+  against 14,253 submits — which also reproduces this issue's headline figure independently).
+  [#3245](https://github.com/mattias800/prosper/issues/3245).
 
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
 
@@ -1459,7 +1483,21 @@ The shared contract is now explicit:
   query; DOLL's non-null queue/id pair also registers the APR completion source.
 - `vWU-odnS+fU` always returns 20 or 24 according to the file-offset width. An unregistered id is a
   pure Sonic sizing query; a valid registered APR file id also performs DOLL's range-checked eager
-  read on both Linux and Windows.
+  read on both Linux and Windows. **Narrowed 2026-09-02 (#3245):** that eager read is now retired
+  per APR container once a submit is seen re-delivering a read the measure already served, because
+  it fired for every APR title and duplicated 582 MB in a 3-minute *Stray* boot. The sizing answer
+  is unchanged in every case, and `PROSPER_APR_MEASURE_READ=always|never|auto` is the A/B lever.
+
+  **DOLL is not exempt, and the paragraph above this one is now partly historical.** Replaying the
+  pairing predicate over four of DOLL's own `PROSPER_FILELOG` boots: container id=6 pairs at submit
+  **#13** in every run, and 1,253 / 1,254 / 1,724 / 1,731 compatibility reads are suppressed from
+  there. It is safe anyway, for the *opposite* reason to the one first written down — **every**
+  measured read has an identical submit (1,254/1,254, 1,255/1,255, 1,725/1,725, 1,732/1,732; **0
+  unmatched**), so DOLL submits everything it measures and the submit path delivers the same bytes.
+  The consequence deserves stating: **the reason this read is documented to exist is no longer
+  visible in DOLL's traffic** — prosper serves the ReadFile submit eagerly now, and DOLL does
+  submit. Whether the read is needed at all is what `PROSPER_APR_MEASURE_READ=never` tests; that is
+  a separate question from narrowing it.
 - `4fgtGfXDrFc` retains the independent 32-byte conservative size used by Sonic; A/B testing proved
   it is not part of DOLL's regression.
 

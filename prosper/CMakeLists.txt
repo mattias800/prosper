@@ -1595,6 +1595,23 @@ if(TARGET prosper_core)
   target_include_directories(test_apr_gather_scatter PRIVATE tests)
   target_link_libraries(test_apr_gather_scatter PRIVATE prosper_core)
   add_test(NAME apr_gather_scatter COMMAND test_apr_gather_scatter)
+  # #3245: sceAmprMeasureCommandSizeReadFile's compatibility read fired for every title, so a title
+  # that also submits its measured reads paid for the same bytes twice (13,925 duplicate reads /
+  # 582 MB in a 3-minute Stray boot) and had them written before it recorded the command. Registered
+  # twice on purpose -- the PROSPER_APR_MEASURE_READ=always run asserts the opposite outcome, which
+  # is what shows the suppression actually suppressed. Pure: scratch files and generated import
+  # stubs, no game dump.
+  add_executable(test_apr_measure_duplicate tests/hle/test_apr_measure_duplicate.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_apr_measure_duplicate PRIVATE tests)
+  target_link_libraries(test_apr_measure_duplicate PRIVATE prosper_core)
+  add_test(NAME apr_measure_duplicate COMMAND test_apr_measure_duplicate)
+  add_test(NAME apr_measure_duplicate_forced COMMAND test_apr_measure_duplicate)
+  set_tests_properties(apr_measure_duplicate_forced PROPERTIES
+                       ENVIRONMENT "PROSPER_APR_MEASURE_READ=always")
+  add_test(NAME apr_measure_duplicate_never COMMAND test_apr_measure_duplicate)
+  set_tests_properties(apr_measure_duplicate_never PROPERTIES
+                       ENVIRONMENT "PROSPER_APR_MEASURE_READ=never")
 
   add_executable(test_ampr_measure tests/hle/test_ampr_measure.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
