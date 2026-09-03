@@ -142,6 +142,16 @@ int main() {
           http::kUriBuildAll, 0);
     CHECK(std::strcmp(built.data(), "ftp://example.test:80") == 0,
           "a scheme with no default port emits \":80\" rather than suppressing it");
+    // The third literal the library compares is a string-merge artifact, "TTP", and it maps to 80
+    // like "HTTP". Without this arm that branch is dead under test -- deleting it from the source
+    // would leave every other check green, which is a poor outcome for the one line N1 was about.
+    char hand_ttp[] = "ttp";
+    hand.scheme = hand_ttp;
+    std::memset(built.data(), 0, built.size());
+    build((uint64_t)built.data(), (uint64_t)&build_need, built.size(), (uint64_t)&hand,
+          http::kUriBuildAll, 0);
+    CHECK(std::strcmp(built.data(), "ttp://example.test") == 0,
+          "the library's \"TTP\" literal also defaults to 80, so its \":80\" is suppressed too");
 
     // Error paths. None of these values can come from the dispatcher default.
     CHECK(build((uint64_t)built.data(), (uint64_t)&build_need, built.size(), 0,
@@ -210,6 +220,28 @@ int main() {
             ctx_cycles_ok = (int64_t)again > 0 && term(again, 0, 0, 0, 0, 0) == 0;
         }
         CHECK(ctx_cycles_ok, "16 init/term cycles do not leak context slots");
+
+        // The arm above proves templates die with a Term; it does NOT prove they die SELECTIVELY.
+        // A Term that cleared every slot regardless of owner satisfies it completely, which would
+        // make the owner field itself untested -- the same vacuity one level in. So: two live
+        // contexts, terminate one, and require the other's template to survive.
+        //
+        // Counted rather than probed, because there is no getter for a template. Exactly one slot
+        // must come back: the depth left for ctx_b is first_fill - 1 if only ctx_a's template was
+        // reclaimed, and first_fill if Term cleared the table indiscriminately.
+        uint64_t ctx_a = init(0, 0, 0, 0, 0, 0);
+        uint64_t ctx_b = init(0, 0, 0, 0, 0, 0);
+        uint64_t tmpl_a = create_tmpl(ctx_a, 0, 0, 0, 0, 0);
+        uint64_t tmpl_b = create_tmpl(ctx_b, 0, 0, 0, 0, 0);
+        CHECK((int64_t)ctx_a > 0 && (int64_t)ctx_b > 0 && ctx_a != ctx_b &&
+              (int64_t)tmpl_a > 0 && (int64_t)tmpl_b > 0 && tmpl_a != tmpl_b,
+              "two live contexts hold distinct templates");
+        CHECK(term(ctx_a, 0, 0, 0, 0, 0) == 0, "one of two live contexts terminates");
+        int remaining = 0;
+        while ((int64_t)create_tmpl(ctx_b, 0, 0, 0, 0, 0) > 0) remaining++;
+        CHECK(remaining == first_fill - 1,
+              "sceHttpTerm reclaims ONLY the terminated context's templates");
+        term(ctx_b, 0, 0, 0, 0, 0);
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
