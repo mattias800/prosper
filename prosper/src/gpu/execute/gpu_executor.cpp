@@ -39,6 +39,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <tuple>
 #include <thread>
@@ -874,15 +875,32 @@ struct ShaderCompileKeyHash {
 struct CachedShader {
     SharedShaderWords spirv;
     uint64_t identity = 0;
-    uint64_t last_use = 0;
+    mutable std::atomic<uint64_t> last_use{0};
     uint64_t bytes = 0;
+
+    CachedShader() = default;
+    CachedShader(const CachedShader& other)
+        : spirv(other.spirv), identity(other.identity),
+          last_use(other.last_use.load(std::memory_order_relaxed)),
+          bytes(other.bytes) {}
+    CachedShader& operator=(const CachedShader& other) {
+        if (this != &other) {
+            spirv = other.spirv;
+            identity = other.identity;
+            last_use.store(other.last_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytes = other.bytes;
+        }
+        return *this;
+    }
 };
 
 struct ShaderCache {
-    std::mutex mutex;
+    std::shared_mutex mutex;
     std::unordered_map<ShaderCompileKey, CachedShader, ShaderCompileKeyHash> entries;
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> bypasses{0};
+    std::atomic<uint64_t> use_counter{0};
     ShaderRecompileCacheStats stats;
-    uint64_t use_counter = 0;
     uint64_t next_identity = 1;
 };
 
@@ -1849,10 +1867,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     if (cache_identity) *cache_identity = 0;
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
-        {
-            std::lock_guard lock(cache.mutex);
-            ++cache.stats.bypasses;
-        }
+        cache.bypasses.fetch_add(1, std::memory_order_relaxed);
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
             compile_graphics_shader(stage, key, resources, program_address));
         maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
@@ -1860,15 +1875,30 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     }
 
     auto& cache = shader_cache();
-    std::lock_guard lock(cache.mutex);
-    auto found = cache.entries.find(key);
-    if (found != cache.entries.end()) {
-        ++cache.stats.hits;
-        found->second.last_use = ++cache.use_counter;
-        if (cache_identity) *cache_identity = found->second.identity;
-        maybe_dump_successful_shader(stage, key, *found->second.spirv, program_address,
+    {
+        std::shared_lock lock(cache.mutex);
+        auto found = cache.entries.find(key);
+        if (found != cache.entries.end()) {
+            cache.hits.fetch_add(1, std::memory_order_relaxed);
+            found->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
+                                         std::memory_order_relaxed);
+            if (cache_identity) *cache_identity = found->second.identity;
+            maybe_dump_successful_shader(stage, key, *found->second.spirv, program_address,
+                                        chain_address);
+            return found->second.spirv;
+        }
+    }
+
+    std::unique_lock lock(cache.mutex);
+    auto double_check = cache.entries.find(key);
+    if (double_check != cache.entries.end()) {
+        cache.hits.fetch_add(1, std::memory_order_relaxed);
+        double_check->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+        if (cache_identity) *cache_identity = double_check->second.identity;
+        maybe_dump_successful_shader(stage, key, *double_check->second.spirv, program_address,
                                     chain_address);
-        return found->second.spirv;
+        return double_check->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -1886,7 +1916,9 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
            (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
         auto oldest = cache.entries.begin();
         for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
-            if (it->second.last_use < oldest->second.last_use) oldest = it;
+            if (it->second.last_use.load(std::memory_order_relaxed) <
+                oldest->second.last_use.load(std::memory_order_relaxed))
+                oldest = it;
         cache.stats.bytes -= oldest->second.bytes;
         cache.entries.erase(oldest);
         ++cache.stats.evictions;
@@ -1895,7 +1927,8 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         CachedShader value;
         value.spirv = spirv;
         value.identity = cache.next_identity++;
-        value.last_use = ++cache.use_counter;
+        value.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
+                             std::memory_order_relaxed);
         value.bytes = bytes;
         if (cache_identity) *cache_identity = value.identity;
         cache.stats.bytes += bytes;
@@ -2156,10 +2189,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     };
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
-        {
-            std::lock_guard lock(cache.mutex);
-            ++cache.stats.bypasses;
-        }
+        cache.bypasses.fetch_add(1, std::memory_order_relaxed);
         std::vector<uint32_t> spirv = compile();
         maybe_dump_successful_shader(ShaderProgramStage::Compute, key, spirv,
                                      diagnostic.program_address, 0);
@@ -2167,15 +2197,30 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     }
 
     auto& cache = shader_cache();
-    std::lock_guard lock(cache.mutex);
-    auto found = cache.entries.find(key);
-    if (found != cache.entries.end()) {
-        ++cache.stats.hits;
-        found->second.last_use = ++cache.use_counter;
-        if (cache_identity) *cache_identity = found->second.identity;
-        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv,
+    {
+        std::shared_lock lock(cache.mutex);
+        auto found = cache.entries.find(key);
+        if (found != cache.entries.end()) {
+            cache.hits.fetch_add(1, std::memory_order_relaxed);
+            found->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
+                                         std::memory_order_relaxed);
+            if (cache_identity) *cache_identity = found->second.identity;
+            maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv,
+                                        diagnostic.program_address, 0);
+            return *found->second.spirv;
+        }
+    }
+
+    std::unique_lock lock(cache.mutex);
+    auto double_check = cache.entries.find(key);
+    if (double_check != cache.entries.end()) {
+        cache.hits.fetch_add(1, std::memory_order_relaxed);
+        double_check->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+        if (cache_identity) *cache_identity = double_check->second.identity;
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *double_check->second.spirv,
                                     diagnostic.program_address, 0);
-        return *found->second.spirv;
+        return *double_check->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -2193,7 +2238,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
            (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
         auto oldest = cache.entries.begin();
         for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
-            if (it->second.last_use < oldest->second.last_use) oldest = it;
+            if (it->second.last_use.load(std::memory_order_relaxed) <
+                oldest->second.last_use.load(std::memory_order_relaxed))
+                oldest = it;
         cache.stats.bytes -= oldest->second.bytes;
         cache.entries.erase(oldest);
         ++cache.stats.evictions;
@@ -2202,7 +2249,8 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         CachedShader value;
         value.spirv = spirv;
         value.identity = cache.next_identity++;
-        value.last_use = ++cache.use_counter;
+        value.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
+                             std::memory_order_relaxed);
         value.bytes = bytes;
         if (cache_identity) *cache_identity = value.identity;
         cache.stats.bytes += bytes;
@@ -2375,18 +2423,22 @@ bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
 
 ShaderRecompileCacheStats shader_recompile_cache_stats() {
     auto& cache = shader_cache();
-    std::lock_guard lock(cache.mutex);
+    std::shared_lock lock(cache.mutex);
     ShaderRecompileCacheStats result = cache.stats;
+    result.hits = cache.hits.load(std::memory_order_relaxed);
+    result.bypasses = cache.bypasses.load(std::memory_order_relaxed);
     result.entries = cache.entries.size();
     return result;
 }
 
 void clear_shader_recompile_cache() {
     auto& cache = shader_cache();
-    std::lock_guard lock(cache.mutex);
+    std::unique_lock lock(cache.mutex);
     cache.entries.clear();
     cache.stats = {};
-    cache.use_counter = 0;
+    cache.hits.store(0, std::memory_order_relaxed);
+    cache.bypasses.store(0, std::memory_order_relaxed);
+    cache.use_counter.store(0, std::memory_order_relaxed);
 }
 
 thread_local DrawRealizationPhaseStats g_draw_realization_phases;

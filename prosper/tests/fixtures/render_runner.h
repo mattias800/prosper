@@ -1581,6 +1581,9 @@ inline const RenderVkCtx& render_vk_ctx() {
                 prosper::gpu::DataFormat::Uint8, 4, VK_FORMAT_R8G8B8A8_UINT);
             add_native_storage_format(
                 prosper::gpu::DataFormat::Uint16, 1, VK_FORMAT_R16_UINT);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Unorm2_10_10_10, 4,
+                VK_FORMAT_A2B10G10R10_UNORM_PACK32);
             // Present unification (#1270): advertise present adoption only when the instance is
             // surface-capable AND the device enabled VK_KHR_swapchain AND a present queue was resolved.
             shared.present_capable = r.present_surface_capable && r.present_swapchain_capable &&
@@ -8325,26 +8328,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // `synchronous_results_requested` and therefore `flush_now`, which gates persistent attachment
     // publication. Removing a flush is a real win (each is a queue submit plus a full CPU-GPU fence
     // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
-    const bool readback_color0_wanted = !persistent_color || color_target->readback;
+    const bool readback_color0_wanted = !color_target
+        ? true
+        : ((!persistent_color && color_target->persistent_id != 0) || color_target->readback);
     const bool readback_color1_wanted = use_color1 &&
-        (!persistent_color1 || color_target->readback1);
-    const bool readback_requested_for_flush =
-        readback_color0_wanted || readback_color1_wanted || color_count > 2;
-
-    // ...and will one actually be PERFORMED. Blue Prince renders 457 depth-only passes with no
-    // colour base per route; every one reads back a fully black surface that the frontend then
-    // never looks at (`live_renderer.cpp:6082`/`:6118` consume the pixels only under `if (base ...)`,
-    // and there is no else). That is up to 8 MB copied and discarded per pass.
-    const bool readback_color0 = want_color_readback && readback_color0_wanted;
-    const bool readback_color1 = want_color_readback && readback_color1_wanted;
+        (!color_target
+             ? true
+             : ((!persistent_color1 && color_target->persistent_id1 != 0) || color_target->readback1));
     // Slots 2+ ask per slot, exactly as slots 0 and 1 do. `color_count > 2` alone would force a
     // readback of every higher slot on every segment of a split pass, including the ones whose
     // pixels are thrown away.
     const bool readback_extra_wanted = [&] {
         for (uint32_t slot = 2; slot < color_count; ++slot)
-            if (!color_target || color_target->readback_slots[slot]) return true;
+            if (!color_target || (color_target->persistent_id_slots[slot] != 0 && color_target->readback_slots[slot])) return true;
         return false;
     }();
+    const bool readback_requested_for_flush =
+        readback_color0_wanted || readback_color1_wanted || readback_extra_wanted;
+    const bool readback_color0 = want_color_readback && readback_color0_wanted;
+    const bool readback_color1 = want_color_readback && readback_color1_wanted;
     const bool readback_requested = readback_color0 || readback_color1 ||
                                     (want_color_readback && readback_extra_wanted);
     const bool storage_writeback_requested = std::any_of(
@@ -9880,7 +9882,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 readback + static_cast<size_t>(color_offsets[1] + color_bytes[1]));
         if (mrt_outputs)
             for (uint32_t slot = 2; slot < color_count; ++slot) {
-                if (color_target && !color_target->readback_slots[slot]) continue;
+                if (color_target && (!color_target->persistent_id_slots[slot] || !color_target->readback_slots[slot])) continue;
                 mrt_outputs->colors[slot].assign(
                     readback + static_cast<size_t>(color_offsets[slot]),
                     readback + static_cast<size_t>(color_offsets[slot] + color_bytes[slot]));

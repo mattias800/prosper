@@ -1602,6 +1602,15 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
             testPattern ? "test-pattern" : "waiting for guest frames");
+#ifdef _WIN32
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (hwnd) {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        UpdateWindow(hwnd);
+        SetForegroundWindow(hwnd);
+    }
+#endif
 
     // Keyboard controls augment SDL pad 0; the fallback keeps physical pads and their analog state.
     prosper::input::pad_set_backend(&g_keyboard_pad);

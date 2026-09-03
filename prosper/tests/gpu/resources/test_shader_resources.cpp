@@ -557,12 +557,16 @@ int main() {
     CHECK(native_float_storage_image_supported(DataFormat::Unorm8, 1, false, true) &&
               native_float_storage_image_supported(DataFormat::Unorm8, 2, false, true) &&
               native_float_storage_image_supported(
-                  DataFormat::Float10_11_11, 3, false, true),
-          "native typed storage accepts supported R8, RG8, and packed R11G11B10 formats");
+                  DataFormat::Float10_11_11, 3, false, true) &&
+              native_float_storage_image_supported(
+                  DataFormat::Unorm2_10_10_10, 4, false, true),
+          "native typed storage accepts supported R8, RG8, packed R11G11B10, and packed R10G10B10A2 formats");
     CHECK(!native_float_storage_image_supported(DataFormat::Unorm8, 1, false, false) &&
               !native_float_storage_image_supported(DataFormat::Unorm8, 2, false, false) &&
               !native_float_storage_image_supported(
-                  DataFormat::Float10_11_11, 3, false, false),
+                  DataFormat::Float10_11_11, 3, false, false) &&
+              !native_float_storage_image_supported(
+                  DataFormat::Unorm2_10_10_10, 4, false, false),
           "missing Vulkan storage-image support forces optional typed formats to the raw fallback");
     CHECK(!native_float_storage_image_supported(DataFormat::Unorm8, 4, true, true) &&
               !native_float_storage_image_supported(DataFormat::Float16, 3, false, true),
@@ -590,17 +594,22 @@ int main() {
         native_storage_format_support_bit(DataFormat::Uint16, 1);
     const uint32_t rgba8ui_storage =
         native_storage_format_support_bit(DataFormat::Uint8, 4);
+    const uint32_t unorm2_10_storage =
+        native_storage_format_support_bit(DataFormat::Unorm2_10_10_10, 4);
     CHECK(r8_storage && rg8_storage && packed_storage && fp16_3d_storage &&
               r32ui_storage && r16ui_storage && r8ui_storage && rgba8ui_storage &&
+              unorm2_10_storage &&
               r8_storage != rg8_storage &&
               rg8_storage != packed_storage &&
               r32ui_storage != r16ui_storage && r16ui_storage != r8ui_storage &&
               r8ui_storage != rgba8ui_storage &&
+              unorm2_10_storage != rgba8ui_storage &&
               !(fp16_3d_storage & ((1u << 10) - 1u)) &&
               !(fp16_3d_storage & ~kNativeStorageFormatSupportMask) &&
               !(r32ui_storage & ~kNativeStorageFormatSupportMask) &&
               !(r16ui_storage & ~kNativeStorageFormatSupportMask) &&
               !(rgba8ui_storage & ~kNativeStorageFormatSupportMask) &&
+              !(unorm2_10_storage & ~kNativeStorageFormatSupportMask) &&
               native_storage_3d_format_support_bit(DataFormat::Uint32, 1) == 0 &&
               native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
           "native storage capability bits distinguish exact typed VkFormat and dimension candidates");
