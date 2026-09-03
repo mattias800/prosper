@@ -33,53 +33,25 @@
 # rendering series moved gameplay from ~0.3-2.2 to ~22, overlapping the menu range.
 
 # --- Boot -> title card -> main menu -------------------------------------------------------------
-f600-620:cross
-f800-820:cross
-f1000-1020:cross
-f1200-1220:cross
-f1400-1420:cross
-f1600-1620:cross
-f1800-1820:cross
-f2000-2020:cross
-f2200-2220:cross
-f2400-2420:cross
+f1121-1148:cross
+f1210-1212:cross
 
-# --- Settle on STORY (rightmost tab; extra R1 clamps rather than overshoots) ----------------------
-60-60.15:r1
-66-66.15:r1
-72-72.15:r1
-78-78.15:r1
+# --- Settle on STORY tab (rightmost tab) ---------------------------------------------------------
+f1633-1651:r1
+f1782-1804:r1
 
 # --- Settings -> Display -------------------------------------------------------------------------
-90-90.15:options
-104-104.15:down
-112-112.15:down
-120-120.15:down
+f2109-2124:options
+f2272-2284:down
+f2407-2411:down
+f2518-2527:down
 
-# --- Into the pane, onto Graphics Mode, and change it --------------------------------------------
-# CROSS moves focus into the option column, not Right. Measured both ways: with Right the Graphics
-# Mode row stayed unhighlighted and its value stayed `Fidelity`, while the earlier Notifications
-# capture -- taken from a run that pressed Cross -- showed the pane's first row highlighted with
-# `< On >` chevrons. Chevrons appear only on a FOCUSED row, so they are the tell that focus arrived.
-#
-# Graphics Mode is Display's first row, so no Down is needed once focus is in the pane. The value is
-# a left/right enum, and its ORDER was measured rather than assumed:
-#
-#     Performance RT  <  Fidelity  >  Performance
-#
-# Fidelity is the default and sits in the MIDDLE. Left therefore moves AWAY from what we want: one
-# Left lands on `Performance RT` (a different mode -- it keeps ray tracing) and further Lefts clamp
-# there, which is exactly what three of them did when this was first written. Plain `Performance` is
-# a single Right.
-132-132.15:cross
-144-144.15:right
+# --- Into the pane, onto Graphics Mode, and switch to Performance (left) -------------------------
+f2675-2691:cross
+f2826-2830:left
 
-# --- Back out and start Story --------------------------------------------------------------------
-182-182.15:circle
-194-194.15:circle
-208-208.15:cross
+# --- Back out to main menu and start Story Mode --------------------------------------------------
+f3102-3117:circle
+f3266-3284:circle
+f3606-3625:cross
 
-# Past Story entry: the save-slot / Resume prompts.
-227-227.15:cross
-242-242.15:cross
-257-257.15:cross
