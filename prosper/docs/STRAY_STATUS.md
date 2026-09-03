@@ -83,6 +83,68 @@ the real guest program address, which turns this from an inference into a lookup
 above predate the fix and were never re-attributed, so they remain unassigned to a stage — re-running
 the census is what would assign them.
 
+**Re-run 2026-09-03, on the TITLE SCREEN, and now attributed** (`origin/main` `fc21d46ca`,
+`tools/screenshot`, `reach-title-hold.pad`, `PROSPER_NULL_PAGE=1`, 30 frames). Five sites again, and
+`program=` is real this time:
+
+| program | pc | op | srsrc | `written` | resource AT that key |
+|---|---|---|---|---|---|
+| `0x3013540000` (VS) | 32 | `0x00` IMAGE_LOAD | s8 | 0 | **`cbuf`** — plus two `vbuf`, all three at `sgpr_base 8` |
+| `0x3013c60000` (PS) | 69 | `0x20` IMAGE_SAMPLE | s8 | 0 | none (its textures are at s0 and s16) |
+| `0x30be9c0000` (PS) | 47 | `0x20` IMAGE_SAMPLE | s0 | 0 | **`cbuf`** |
+| `0x30131d0000` (CS) | 77 | `0x08` IMAGE_STORE | s0 | **1** | none at `srt=0x20` (the tag it carries) |
+| `0x30131d0000` (CS) | 50 | `0x47` | s0 | 0 | **`cbuf`** |
+
+Stage attribution: `0x30131d0000` is named by its own `[compute]` / `[compute-table]` lines; the other
+three are read off the binding base, which `assign_convention_bindings` sets to 32 for a pixel stage and
+2 otherwise (`kPsBindingBase`), with the two `VertexBuffer`s separating the vertex stage from compute.
+
+Two things follow, and neither needs another run.
+
+**`written=0` makes four of the five sites' printed fields vacuous.** `srt_tag`, `key_res`, `pc_res`
+and `alias_res` describe the `s_load`-tag, SRT-key, per-pc and copy-alias routes. `written=0` says the
+shader never wrote the SRSRC range — the descriptor is entry user data by the shader's own
+construction — so none of those routes can fire and the whole quadruple is a restatement of
+`written=0`, not evidence of absence. The route that *did* run is `by_sgpr_base(SRSRC)`, whose outcome
+the line did not print. The pc=77 row is the internal control: it reports `written=1` and its
+`srt_tag=0x20` field populates, because there its route ran.
+
+**Three of those four had a resource at exactly the requested SGPR, of the wrong class, discarded in
+silence.** `by_sgpr_base` is first-match-wins and class-blind, and the resolver took that hit and
+nulled it on class afterwards. So "nothing is bound here" and "a ConstantBuffer is bound here" printed the same
+line. The vertex row also settles that key collisions are ordinary rather than hypothetical on this
+title: one `ConstantBuffer` and two `VertexBuffer`s share `sgpr_base 8`. Both the lookup and the
+diagnostic are fixed in #3126's PR; the lookup fix **does not by itself resolve any of these five**,
+because none of these tables holds an image-class resource at the requested key at all.
+
+**One dispatch pair shows the classification itself is unstable.** Compute `0x30131d0000` publishes the
+descriptor at `s0` as `class=2` (Texture, `[compute-table] … addr=0x30c5150000 size=16588800 sgpr=0
+pc=50`) on one dispatch — where pc=50 resolves through `by_fetch_pc` — and as a `ConstantBuffer` on
+another, where it does not. Every other producer of a compute resource sets `sgpr_base = 0xFFFFFFFF`,
+and `build_shader_resources`' `sharp[3]` loop is class-static, so this came from one of the two loops
+that classify a user-data slot by a four-dword V#-shape test on bytes that differ per dispatch — which
+is consistent with this title's own `PROSPER_SHARPLOG` figure of **16 textures dropped "claimed by the
+V# path"** (#3126, 2026-08-30). CONFIDENCE: MED on that attribution, HIGH that the class of one slot
+changes within a single run.
+
+This is deliberately **not** a re-assertion of the "present at the right SGPR and mis-classified as a
+buffer" claim that #3126's 2026-08-30 thread retracted: that retraction was scoped to the three big
+compute stages, whose tables were shown complete, and it stands. What is added here is a different
+stage and a different kind of evidence — a class that changes between two dispatches of one program.
+An earlier usage-driven fix attempt is also already recorded there as not firing; do not restart from
+it without reading why.
+
+**The next run, and it is one run.** `PROSPER_DYNTRACE_FAIL=1` (plus `PROSPER_SHARPLOG=1`) on this same
+route. `resolve_dynamic_fetch` already handles the direct case — `untouched_seed_range(tbase, 8)`
+publishes a `SrtUse` with the live eight dwords and `use_pc`, which becomes `fetch_pc` provenance, the
+resolver's *first* lookup — so `pc_res=null` at all five sites means either the fold declined
+(`plausible_seed` false: the user-data dwords are not an image) or materialization dropped it.
+`[dyntrace] MIMG pc=… have_t8=… seed_t8=… t8=<8 dwords> -> base=… type=… fmt=…` separates those in one
+line. Expectation, stated to be falsifiable: for the graphics sites the fold had all 32 user SGPRs, so
+the discriminator should be `plausible_seed` — i.e. the #305/#3137 window family, not a recompiler gap.
+The vertex row is consistent with that already: its cbufs sit at `s16`/`s20`, VS user dwords 8 and 12,
+outside an 8-dword window.
+
 Separately, four stages declare a *writable* 8-dword T# that reaches no resource table at all
 ([#3128](https://github.com/mattias800/prosper/issues/3128)); one of them has four image ops against a
 completely empty table. Whether that is what its image ops want is untested — see Ruled out.
