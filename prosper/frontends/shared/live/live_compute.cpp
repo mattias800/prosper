@@ -426,6 +426,9 @@ VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t comp
     case DataFormat::Float10_11_11:
         if (components == 3) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
         break;
+    case DataFormat::Unorm2_10_10_10:
+        if (components == 4) return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        break;
     case DataFormat::Uint32:
         if (components == 1) return VK_FORMAT_R32_UINT;
         break;
@@ -1205,6 +1208,19 @@ size_t cold_storage_result_snapshot_defer_min_bytes() {
             "PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB", value, 16ull,
             SIZE_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<size_t>(mib * (1024ull * 1024ull));
+    }();
+    return bytes;
+}
+
+size_t max_gpu_compare_image_bytes() {
+    static const size_t bytes = [] {
+        const char* value = std::getenv("PROSPER_MAX_GPU_COMPARE_IMAGE_MB");
+        char* end = nullptr;
+        const uint64_t parsed = value ? std::strtoull(value, &end, 10) : 2ull;
+        const uint64_t mib = value && (!end || *end) ? 2ull : parsed;
+        return static_cast<size_t>(
+            std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
+            (1024ull * 1024ull));
     }();
     return bytes;
 }
@@ -6429,7 +6445,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // proving frame establishes actual full coverage for this shader/binding/extent.
             const bool enough_threads = dispatch_has_enough_threads_for_texels(
                 item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
-                r->width, r->height, r->depth);
+                r->width, r->height, r->depth, 16);
             // Diagnostic: force the proving (poison) path on every eligible dispatch, never fast-skip.
             static const bool force_verify = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
             if (bi.storage && seed_skip_enabled && !image_descriptors[i].readable &&
@@ -6775,7 +6791,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                (sampled_components == 1 || sampled_components == 2 ||
                                                 sampled_components == 4);
             const uint32_t native_storage_bytes = bi.exact_storage_bytes()
-                ? (r->format == DataFormat::Float10_11_11
+                ? (r->format == DataFormat::Float10_11_11 ||
+                   r->format == DataFormat::Unorm2_10_10_10
                        ? 4u : data_format_bytes(r->format) * sampled_components)
                 : 0u;
             // The one bytes call site where 0 does NOT mean decline: zero is already this
@@ -6828,6 +6845,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                      : VK_FORMAT_R16G16B16A16_SFLOAT)
                    : r->format == DataFormat::Float10_11_11
                        ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
+                   : r->format == DataFormat::Unorm2_10_10_10
+                       ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
                        : (sampled_components == 1 ? VK_FORMAT_R32_SFLOAT
                           : sampled_components == 2 ? VK_FORMAT_R32G32_SFLOAT
                                                      : VK_FORMAT_R32G32B32A32_SFLOAT))
@@ -7533,7 +7552,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped,
                         !bi.seed_skip || !adaptive_storage_result_validation_enabled());
-                    if (bi.persistent)
+                    if (bi.persistent && bi.exact_result_bytes <= max_gpu_compare_image_bytes())
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
                     if (trace && bi.persistent)
@@ -7555,7 +7574,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         ctx.acquire_cached_image_allocation_for_forced_seed(
                             bi.cache_key, bi.image, bi.memory, bi.allocation_bytes);
                     bi.persistent = bi.forced_seed_allocation_reused;
-                    if (bi.persistent)
+                    if (bi.persistent && bi.exact_result_bytes <= max_gpu_compare_image_bytes())
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
                     if (trace && bi.persistent)
@@ -8608,6 +8627,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 (image.upload_skipped ||
                  (image.seed_skip && adaptive_storage_result_validation_enabled())) &&
                 image.result_baseline && image.exact_result_bytes &&
+                image.exact_result_bytes <= max_gpu_compare_image_bytes() &&
                 !(image.exact_result_bytes & 15u) && staging[i])
                 compare_targets.push_back({
                     staging[i], image.result_baseline, image.exact_result_bytes,
@@ -10145,9 +10165,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     g_force_next_image_result_host_fallback_for_test.exchange(
                         false, std::memory_order_acq_rel);
                 retain_gpu_result_baseline = bi.persistent && !bi.result_baseline &&
-                    bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
+                    bi.exact_result_bytes &&
+                    bi.exact_result_bytes <= max_gpu_compare_image_bytes() &&
+                    !(bi.exact_result_bytes & 15u) &&
                     !force_host_result_fallback && ctx.prepare_compare_pipeline();
-                if (bi.persistent && !retain_gpu_result_baseline)
+                if (bi.persistent && !retain_gpu_result_baseline &&
+                    (force_host_result_fallback || bi.exact_result_bytes <= max_gpu_compare_image_bytes()))
                     ctx.remember_cached_image_result(
                         bi.cache_key, native_texels,
                         static_cast<size_t>(bi.exact_result_bytes));
@@ -10501,8 +10524,10 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
     using prosper::gpu::DataFormat;
     const bool packed_r11 =
         format == DataFormat::Float10_11_11 && components == 3;
+    const bool unorm2_10 =
+        format == DataFormat::Unorm2_10_10_10 && components == 4;
     const bool float_or_unorm = format == DataFormat::Float32 ||
-        format == DataFormat::Unorm8 || packed_r11;
+        format == DataFormat::Unorm8 || packed_r11 || unorm2_10;
     const bool exact_uint = native_uint_storage_image(format, components, false);
     if (!float_or_unorm && !exact_uint) return false;
     if (!packed_r11 && !exact_uint &&
@@ -10520,6 +10545,7 @@ uint32_t live_compute_graphics_import_native_format(
         (format == DataFormat::Float16 &&
          (components == 1 || components == 2 || components == 4)) ||
         (format == DataFormat::Float10_11_11 && components == 3) ||
+        (format == DataFormat::Unorm2_10_10_10 && components == 4) ||
         (format == DataFormat::Unorm16 && components == 1) ||
         (format == DataFormat::Unorm8 && (components == 1 || components == 4)) ||
         (format == DataFormat::Uint32 && components == 1) ||
@@ -10567,7 +10593,8 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     import = {};
     VulkanComputeContext* context = g_live_compute_context;
     const bool ordinary_shape =
-        (sampled_resource.img_dim == 1 && sampled_resource.depth == 1) ||
+        ((sampled_resource.img_dim == 1 || sampled_resource.img_dim == 5) &&
+         sampled_resource.depth == 1) ||
         (sampled_resource.img_dim == 2 && sampled_resource.depth != 0);
     // A compute U# writes GTA V's six R16_UINT shadow faces through DIM=2D_ARRAY, while the later
     // graphics T# names the byte-identical allocation as DIM=CUBE. Graphics lowers cube sampling to
@@ -10613,19 +10640,23 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         sampled_resource.format == prosper::gpu::DataFormat::Float32 && components == 1;
     const bool packed_r11_uint32_alias =
         sampled_resource.format == prosper::gpu::DataFormat::Float10_11_11 && components == 3;
+    const bool packed_r10_uint32_alias =
+        sampled_resource.format == prosper::gpu::DataFormat::Unorm2_10_10_10 && components == 4;
     if (!borrowed && (normalized_uint8_alias || normalized_uint16_alias ||
-                      float32_uint32_alias || packed_r11_uint32_alias)) {
+                      float32_uint32_alias || packed_r11_uint32_alias ||
+                      packed_r10_uint32_alias)) {
         if (normalized_uint8_alias)
             storage_identity.format = prosper::gpu::DataFormat::Uint8;
         else if (normalized_uint16_alias)
             storage_identity.format = prosper::gpu::DataFormat::Uint16;
-        else if (float32_uint32_alias)
+        else if (float32_uint32_alias || packed_r10_uint32_alias)
             storage_identity.format = prosper::gpu::DataFormat::Uint32;
-        // Packed R11 retains its guest format identity: only its exact storage VkFormat is R32_UINT.
+        // Packed R11/R10 retain guest format identity or alias to exact storage VkFormat R32_UINT.
         const VkFormat producer_format = native_storage_vk_format(
-            float32_uint32_alias || packed_r11_uint32_alias
+            float32_uint32_alias || packed_r11_uint32_alias || packed_r10_uint32_alias
                 ? prosper::gpu::DataFormat::Uint32 : storage_identity.format,
-            float32_uint32_alias || packed_r11_uint32_alias ? 1u : components);
+            float32_uint32_alias || packed_r11_uint32_alias || packed_r10_uint32_alias
+                ? 1u : components);
         key = storage_image_cache_key(
             storage_identity, static_cast<uint32_t>(guest_bytes), producer_format);
         borrowed = context->borrow_cached_image_for_graphics(

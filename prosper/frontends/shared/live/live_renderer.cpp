@@ -8564,10 +8564,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                        phase.allows_deferred_scanout_readback(),
                                        final_gpu_present,
                                        defer_intermediate_scanout, cpu_needed_same_batch)) ||
-                         (!is_vo && base != front_va && rtt_defer_ok));
+                         (!is_vo && (base != front_va || final_gpu_present) && rtt_defer_ok));
                     const bool defer_readback1 = live_gpu_targets && vo_n > 0 && use_color1 &&
                         base1 && base1 != base && !phase.authoritative_readback &&
-                        base1 != front_va && rtt_defer_ok1;
+                        (base1 != front_va || final_gpu_present) && rtt_defer_ok1;
                     std::array<bool, prosper::gpu::kColorTargetCount> defer_readback_slots{};
                     for (uint32_t slot = 2; slot < mrt_count; ++slot) {
                         const LaterTargetConsumers& consumers = consumers_slots[slot];
@@ -8577,7 +8577,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint64_t slot_base = pass_bases[slot];
                         defer_readback_slots[slot] = live_gpu_targets && vo_n > 0 &&
                             slot_base && !phase.authoritative_readback &&
-                            slot_base != front_va && rtt_defer_ok_slot;
+                            (slot_base != front_va || final_gpu_present) && rtt_defer_ok_slot;
                     }
                     // PROSPER_READBACK_WHY (#1284): classify WHY each non-deferred pass takes the
                     // synchronous CPU readback (75-79 ms/window on Blue Prince's Day One frame).
@@ -8686,10 +8686,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const auto build_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     prosper::test::BackendColorTarget backend_target{
-                        base, seed_rtt0, !defer_readback, pass_format};
+                        base, seed_rtt0, base != 0 && !defer_readback, pass_format};
                     backend_target.persistent_id1 = use_color1 ? base1 : 0;
                     backend_target.load_existing1 = seed_rtt1;
-                    backend_target.readback1 = !defer_readback1;
+                    backend_target.readback1 = use_color1 && base1 != 0 && !defer_readback1;
                     backend_target.format1 = pass_format1;
                     // Slots 2..7 retain across render groups on the same terms as slots 0 and 1.
                     // A G-buffer built by several groups against one set of allocations otherwise
@@ -8698,7 +8698,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     for (uint32_t slot = 2; slot < mrt_count; ++slot) {
                         backend_target.persistent_id_slots[slot] = pass_bases[slot];
                         backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
-                        backend_target.readback_slots[slot] = !defer_readback_slots[slot];
+                        backend_target.readback_slots[slot] = pass_bases[slot] != 0 && !defer_readback_slots[slot];
                     }
                     auto backend_draws = build_bds(render_pass);
                     const auto build_done = timing_enabled

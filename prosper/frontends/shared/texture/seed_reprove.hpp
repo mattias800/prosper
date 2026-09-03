@@ -10,9 +10,10 @@ namespace prosper::frontend {
 // pass below establishes actual coverage before any seed is skipped.
 constexpr bool dispatch_has_enough_threads_for_texels(uint32_t threads_x, uint32_t threads_y,
                                                        uint32_t threads_z, uint32_t width,
-                                                       uint32_t height, uint32_t depth) {
-    if (!threads_x || !threads_y || !threads_z || !width || !height || !depth) return false;
-    return static_cast<uint64_t>(threads_x) * threads_y * threads_z >=
+                                                       uint32_t height, uint32_t depth,
+                                                       uint32_t max_texels_per_thread = 1) {
+    if (!threads_x || !threads_y || !threads_z || !width || !height || !depth || !max_texels_per_thread) return false;
+    return static_cast<uint64_t>(threads_x) * threads_y * threads_z * max_texels_per_thread >=
            static_cast<uint64_t>(width) * height * depth;
 }
 

@@ -17,6 +17,7 @@
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/perf/performance_timing_gate.hpp"
 #include "shared/perf/performance_timing_policy.hpp"
+#include "shared/present/readback_policy.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1581,6 +1582,9 @@ inline const RenderVkCtx& render_vk_ctx() {
                 prosper::gpu::DataFormat::Uint8, 4, VK_FORMAT_R8G8B8A8_UINT);
             add_native_storage_format(
                 prosper::gpu::DataFormat::Uint16, 1, VK_FORMAT_R16_UINT);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Unorm2_10_10_10, 4,
+                VK_FORMAT_A2B10G10R10_UNORM_PACK32);
             // Present unification (#1270): advertise present adoption only when the instance is
             // surface-capable AND the device enabled VK_KHR_swapchain AND a present queue was resolved.
             shared.present_capable = r.present_surface_capable && r.present_swapchain_capable &&
@@ -8325,11 +8329,34 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // `synchronous_results_requested` and therefore `flush_now`, which gates persistent attachment
     // publication. Removing a flush is a real win (each is a queue submit plus a full CPU-GPU fence
     // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
-    const bool readback_color0_wanted = !persistent_color || color_target->readback;
+    const bool readback_color0_wanted = prosper::frontend::is_color_target_readback_wanted(
+        color_target != nullptr,
+        color_target ? color_target->persistent_id : 0,
+        persistent_color,
+        color_target ? color_target->readback : false);
     const bool readback_color1_wanted = use_color1 &&
-        (!persistent_color1 || color_target->readback1);
+        prosper::frontend::is_color_target_readback_wanted(
+            color_target != nullptr,
+            color_target ? color_target->persistent_id1 : 0,
+            persistent_color1,
+            color_target ? color_target->readback1 : false);
+    // Slots 2+ ask per slot, exactly as slots 0 and 1 do. `color_count > 2` alone would force a
+    // readback of every higher slot on every segment of a split pass, including the ones whose
+    // pixels are thrown away.
+    const bool readback_extra_wanted = [&] {
+        for (uint32_t slot = 2; slot < color_count; ++slot) {
+            const bool persistent_slot = cached_extra[slot] != nullptr;
+            if (prosper::frontend::is_color_target_readback_wanted(
+                    color_target != nullptr,
+                    color_target ? color_target->persistent_id_slots[slot] : 0,
+                    persistent_slot,
+                    color_target ? color_target->readback_slots[slot] : false))
+                return true;
+        }
+        return false;
+    }();
     const bool readback_requested_for_flush =
-        readback_color0_wanted || readback_color1_wanted || color_count > 2;
+        readback_color0_wanted || readback_color1_wanted || readback_extra_wanted;
 
     // ...and will one actually be PERFORMED. Blue Prince renders 457 depth-only passes with no
     // colour base per route; every one reads back a fully black surface that the frontend then
@@ -8337,14 +8364,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // and there is no else). That is up to 8 MB copied and discarded per pass.
     const bool readback_color0 = want_color_readback && readback_color0_wanted;
     const bool readback_color1 = want_color_readback && readback_color1_wanted;
-    // Slots 2+ ask per slot, exactly as slots 0 and 1 do. `color_count > 2` alone would force a
-    // readback of every higher slot on every segment of a split pass, including the ones whose
-    // pixels are thrown away.
-    const bool readback_extra_wanted = [&] {
-        for (uint32_t slot = 2; slot < color_count; ++slot)
-            if (!color_target || color_target->readback_slots[slot]) return true;
-        return false;
-    }();
     const bool readback_requested = readback_color0 || readback_color1 ||
                                     (want_color_readback && readback_extra_wanted);
     const bool storage_writeback_requested = std::any_of(
@@ -9417,10 +9436,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         };
         transition_color_to_readback(persistent_color, readback_color0, img);
         transition_color_to_readback(persistent_color1, readback_color1, img1);
-        for (uint32_t slot = 2; slot < color_count; ++slot)
+        for (uint32_t slot = 2; slot < color_count; ++slot) {
+            const bool persistent_slot = cached_extra[slot] != nullptr;
+            const bool slot_readback = want_color_readback &&
+                prosper::frontend::is_color_target_readback_wanted(
+                    color_target != nullptr,
+                    color_target ? color_target->persistent_id_slots[slot] : 0,
+                    persistent_slot,
+                    color_target ? color_target->readback_slots[slot] : false);
             transition_color_to_readback(
-                cached_extra[slot] != nullptr,
-                !color_target || color_target->readback_slots[slot], extra_images[slot]);
+                persistent_slot, slot_readback, extra_images[slot]);
+        }
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         cp.imageExtent = {W, H, 1};
@@ -9433,7 +9459,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cmd, img1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp1);
         }
         for (uint32_t slot = 2; slot < color_count; ++slot) {
-            if (color_target && !color_target->readback_slots[slot]) continue;
+            const bool persistent_slot = cached_extra[slot] != nullptr;
+            const bool slot_readback = want_color_readback &&
+                prosper::frontend::is_color_target_readback_wanted(
+                    color_target != nullptr,
+                    color_target ? color_target->persistent_id_slots[slot] : 0,
+                    persistent_slot,
+                    color_target ? color_target->readback_slots[slot] : false);
+            if (!slot_readback) continue;
             VkBufferImageCopy extra_copy = cp;
             extra_copy.bufferOffset = color_offsets[slot];
             vkCmdCopyImageToBuffer(cmd, extra_images[slot],
@@ -9880,7 +9913,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 readback + static_cast<size_t>(color_offsets[1] + color_bytes[1]));
         if (mrt_outputs)
             for (uint32_t slot = 2; slot < color_count; ++slot) {
-                if (color_target && !color_target->readback_slots[slot]) continue;
+                const bool persistent_slot = cached_extra[slot] != nullptr;
+                const bool slot_readback = want_color_readback &&
+                    prosper::frontend::is_color_target_readback_wanted(
+                        color_target != nullptr,
+                        color_target ? color_target->persistent_id_slots[slot] : 0,
+                        persistent_slot,
+                        color_target ? color_target->readback_slots[slot] : false);
+                if (!slot_readback) continue;
                 mrt_outputs->colors[slot].assign(
                     readback + static_cast<size_t>(color_offsets[slot]),
                     readback + static_cast<size_t>(color_offsets[slot] + color_bytes[slot]));
@@ -10474,6 +10514,13 @@ inline SplitSegmentContract split_segment_contract(
         for (uint32_t slot = 2; slot < out.color_count; ++slot)
             out.target.readback_slots[slot] = true;
         if (out.color_count > 1) out.target.readback1 = true;
+    } else if (!whole) {
+        // A synthesised carrier target on the final segment represents a caller with whole == nullptr.
+        // It must read back the requested outputs just as a whole == nullptr non-split pass does.
+        out.target.readback = true;
+        out.target.readback1 = out.color_count > 1;
+        for (uint32_t slot = 2; slot < out.color_count; ++slot)
+            out.target.readback_slots[slot] = true;
     }
     return out;
 }

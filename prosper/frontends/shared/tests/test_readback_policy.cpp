@@ -3,6 +3,7 @@
 #include <cstdio>
 
 using prosper::frontend::can_defer_scanout_readback;
+using prosper::frontend::is_color_target_readback_wanted;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -17,6 +18,24 @@ int main() {
     CHECK(!can_defer_scanout_readback(true, false, true, true));
     CHECK(!can_defer_scanout_readback(false, false, true, false));
     CHECK(!can_defer_scanout_readback(true, false, false, false));
+
+    // Unbound color targets (persistent_id == 0) do not trigger CPU readbacks when unflagged,
+    // avoiding reading back unallocated host memory when persistent_color is false.
+    CHECK(!is_color_target_readback_wanted(true, 0, false, false));
+    CHECK(!is_color_target_readback_wanted(true, 0, true, false));
+
+    // Explicitly requested readbacks (e.g. split pass carry or caller request) are always honored.
+    CHECK(is_color_target_readback_wanted(true, 0, false, true));
+    CHECK(is_color_target_readback_wanted(true, 0, true, true));
+    CHECK(is_color_target_readback_wanted(true, 0x1234, true, true));
+
+    // Bound color targets (persistent_id != 0) trigger readback when non-persistent, and stay
+    // GPU-resident when persistent.
+    CHECK(is_color_target_readback_wanted(true, 0x1234, false, false));
+    CHECK(!is_color_target_readback_wanted(true, 0x1234, true, false));
+
+    // When there is no color target struct at all, default readback behavior is preserved.
+    CHECK(is_color_target_readback_wanted(false, 0, false, false));
 
     if (!failures) std::printf("readback_policy: OK\n");
     return failures ? 1 : 0;

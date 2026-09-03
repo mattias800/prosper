@@ -111,7 +111,8 @@ constexpr bool native_float_storage_image(DataFormat format, uint32_t components
            (((components == 1 || components == 2 || components == 4) &&
              (format == DataFormat::Unorm8 || format == DataFormat::Float16 ||
               format == DataFormat::Float32)) ||
-            (components == 3 && format == DataFormat::Float10_11_11));
+            (components == 3 && format == DataFormat::Float10_11_11) ||
+            (components == 4 && format == DataFormat::Unorm2_10_10_10));
 }
 
 // Native typed storage is only valid when the physical device advertises storage-image support
@@ -162,6 +163,7 @@ constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t
     if (format == DataFormat::Uint8 && components == 1) return 1u << 21;
     if (format == DataFormat::Uint16 && components == 1) return 1u << 22;
     if (format == DataFormat::Uint8 && components == 4) return 1u << 23;
+    if (format == DataFormat::Unorm2_10_10_10 && components == 4) return 1u << 24;
     return 0;
 }
 
@@ -174,7 +176,7 @@ constexpr uint32_t native_storage_3d_format_support_bit(DataFormat format,
     return (format_bit & ((1u << 10) - 1u)) ? format_bit << 10 : 0u;
 }
 
-constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 24) - 1u;
+constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 25) - 1u;
 
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.

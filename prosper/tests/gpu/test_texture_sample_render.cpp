@@ -608,6 +608,15 @@ int main() {
             {producer}, W, H, nullptr, nullptr, false, &forced_sync_target,
             nullptr, nullptr, nullptr, &forced_sync_batch, false);
         const auto forced_sync_timing = prosper::test::backend_render_timing_stats();
+
+        // An unbound color target (persistent_id == 0) must not request or execute readback even
+        // when persistence is inactive, while setting persistent_id non-zero requests it.
+        prosper::test::BackendColorTarget unbound_target{0, false, false};
+        prosper::test::BackendSubmissionBatch unbound_batch;
+        const std::vector<uint8_t> unbound_pixels = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &unbound_target,
+            nullptr, nullptr, nullptr, &unbound_batch, false);
+        const auto unbound_timing = prosper::test::backend_render_timing_stats();
 #ifdef _WIN32
         _putenv_s("PROSPER_RENDER_TIMING", "");
 #else
@@ -634,6 +643,8 @@ int main() {
                     forced_sync_timing.gpu_device_ms > 0.0 &&
                     forced_sync_timing.gpu_device_ms <= forced_sync_timing.gpu_wait_ms)),
               "synchronous readback closes its device envelope despite a deferred-flush hint");
+        CHECK(unbound_pixels.empty() && unbound_timing.queue_submits == 0,
+              "unbound target with persistent_id=0 does not trigger readback or flush");
         prosper::test::invalidate_persistent_color_target(forced_sync_target_id);
 
         prosper::test::BackendDraw add_green;
