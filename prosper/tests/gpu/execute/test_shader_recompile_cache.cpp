@@ -2109,7 +2109,7 @@ int main() {
         const auto after_concurrent = shader_recompile_cache_stats();
         CHECK(success_count.load() == kWorkerThreads * kLookupsPerWorker &&
                   after_concurrent.hits >= before_concurrent.hits + kWorkerThreads * kLookupsPerWorker,
-              "concurrent reader threads hit shader cache without races under shared_lock");
+              "concurrent reader lookups are race-free and hit the shader cache");
     }
 
     // #3130, and deliberately LAST. The arm above cannot show that the program address actually

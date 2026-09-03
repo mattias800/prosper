@@ -8344,8 +8344,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // readback of every higher slot on every segment of a split pass, including the ones whose
     // pixels are thrown away.
     const bool readback_extra_wanted = [&] {
-        for (uint32_t slot = 2; slot < color_count; ++slot)
-            if (!color_target || (color_target->persistent_id_slots[slot] != 0 && color_target->readback_slots[slot])) return true;
+        for (uint32_t slot = 2; slot < color_count; ++slot) {
+            const bool persistent_slot = cached_extra[slot] != nullptr;
+            if (prosper::frontend::is_color_target_readback_wanted(
+                    color_target != nullptr,
+                    color_target ? color_target->persistent_id_slots[slot] : 0,
+                    persistent_slot,
+                    color_target ? color_target->readback_slots[slot] : false))
+                return true;
+        }
         return false;
     }();
     const bool readback_requested_for_flush =
@@ -9430,10 +9437,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         transition_color_to_readback(persistent_color, readback_color0, img);
         transition_color_to_readback(persistent_color1, readback_color1, img1);
         for (uint32_t slot = 2; slot < color_count; ++slot) {
-            const bool slot_readback = !color_target ||
-                (color_target->persistent_id_slots[slot] != 0 && color_target->readback_slots[slot]);
+            const bool persistent_slot = cached_extra[slot] != nullptr;
+            const bool slot_readback = want_color_readback &&
+                prosper::frontend::is_color_target_readback_wanted(
+                    color_target != nullptr,
+                    color_target ? color_target->persistent_id_slots[slot] : 0,
+                    persistent_slot,
+                    color_target ? color_target->readback_slots[slot] : false);
             transition_color_to_readback(
-                cached_extra[slot] != nullptr, slot_readback, extra_images[slot]);
+                persistent_slot, slot_readback, extra_images[slot]);
         }
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -9447,7 +9459,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cmd, img1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp1);
         }
         for (uint32_t slot = 2; slot < color_count; ++slot) {
-            if (color_target && !color_target->readback_slots[slot]) continue;
+            const bool persistent_slot = cached_extra[slot] != nullptr;
+            const bool slot_readback = want_color_readback &&
+                prosper::frontend::is_color_target_readback_wanted(
+                    color_target != nullptr,
+                    color_target ? color_target->persistent_id_slots[slot] : 0,
+                    persistent_slot,
+                    color_target ? color_target->readback_slots[slot] : false);
+            if (!slot_readback) continue;
             VkBufferImageCopy extra_copy = cp;
             extra_copy.bufferOffset = color_offsets[slot];
             vkCmdCopyImageToBuffer(cmd, extra_images[slot],
@@ -9894,7 +9913,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 readback + static_cast<size_t>(color_offsets[1] + color_bytes[1]));
         if (mrt_outputs)
             for (uint32_t slot = 2; slot < color_count; ++slot) {
-                if (color_target && (!color_target->persistent_id_slots[slot] || !color_target->readback_slots[slot])) continue;
+                const bool persistent_slot = cached_extra[slot] != nullptr;
+                const bool slot_readback = want_color_readback &&
+                    prosper::frontend::is_color_target_readback_wanted(
+                        color_target != nullptr,
+                        color_target ? color_target->persistent_id_slots[slot] : 0,
+                        persistent_slot,
+                        color_target ? color_target->readback_slots[slot] : false);
+                if (!slot_readback) continue;
                 mrt_outputs->colors[slot].assign(
                     readback + static_cast<size_t>(color_offsets[slot]),
                     readback + static_cast<size_t>(color_offsets[slot] + color_bytes[slot]));

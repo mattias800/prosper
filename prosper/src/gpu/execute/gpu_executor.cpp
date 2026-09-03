@@ -904,6 +904,9 @@ struct ShaderCache {
     uint64_t next_identity = 1;
 };
 
+static_assert(std::is_same_v<decltype(ShaderCache::mutex), std::shared_mutex>,
+              "ShaderCache::mutex must be std::shared_mutex for concurrent read scaling");
+
 ShaderCache& shader_cache() {
     static ShaderCache cache;
     return cache;
