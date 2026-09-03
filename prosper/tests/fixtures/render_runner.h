@@ -4363,8 +4363,9 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
 // source — after a #780 guest-write CPU-copy discard, consumers (Blue Prince's compute tonemap)
 // imported the stale image and read black, cascading the #1287 display-chain collapse. Copy the
 // device-local pixels so the destination image is genuinely valid. Creates the destination if
-// absent (same shape/usage as the render path; budget-checked WITHOUT eviction — an allocation
-// failure returns false and the caller keeps the CPU pixels as the only truth, fail-visibly).
+// absent (same shape/usage as the render path; budget-checked with LRU eviction of unpinned older
+// targets — an allocation failure returns false and the caller keeps the CPU pixels as the only truth,
+// fail-visibly).
 inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint32_t width,
                                          uint32_t height, VkFormat format, std::string& error) {
     error.clear();
@@ -4405,12 +4406,20 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         }
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(ctx.dev, img, &ir);
         const VkDeviceSize limit = persistent_color_target_limit();
+        const size_t count_limit = persistent_color_target_count_limit();
+        if (ir.size <= limit) {
+            ++src->pin_count;
+            while ((persistent_color_target_cache().size() > count_limit ||
+                    persistent_color_target_bytes() > limit - ir.size) &&
+                   evict_persistent_color_target(ctx, persistent_color_target_generation())) {}
+            --src->pin_count;
+        }
         VkDeviceMemory imem = VK_NULL_HANDLE;
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         iai.allocationSize = ir.size;
         iai.memoryTypeIndex = render_memory_type(ctx.phys, ir.memoryTypeBits, 0);
         if (ir.size > limit || persistent_color_target_bytes() > limit - ir.size ||
-            persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
+            persistent_color_target_cache().size() > count_limit ||
             vkAllocateMemory(ctx.dev, &iai, nullptr, &imem) != VK_SUCCESS || !imem) {
             vkDestroyImage(ctx.dev, img, nullptr);
             persistent_color_target_cache().erase(dst_key);

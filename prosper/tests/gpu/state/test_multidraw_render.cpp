@@ -919,6 +919,24 @@ int main() {
                   0x1334000000000003ull, 0x1334000000000004ull, W, H,
                   VK_FORMAT_R8G8B8A8_UNORM, missing_err),
               "a missing source declines the copy");
+
+        // Verify that copy_persistent_color_target evicts older entries when the target cache
+        // reaches capacity, rather than failing and dropping the destination to CPU-only pixels.
+        const size_t count_limit = prosper::test::persistent_color_target_count_limit();
+        const uint64_t evict_dummy_base = 0x1334000000001000ull;
+        size_t dummy_count = 0;
+        while (prosper::test::persistent_color_target_cache().size() < count_limit) {
+            const uint64_t id = evict_dummy_base + dummy_count++;
+            prosper::test::PersistentColorTargetKey key{id, W, H, VK_FORMAT_R8G8B8A8_UNORM};
+            auto& entry = prosper::test::persistent_color_target_cache()[key];
+            entry.last_use = 1; // old generation eligible for eviction
+            entry.valid = false;
+        }
+        std::string evict_copy_err;
+        CHECK(prosper::test::copy_persistent_color_target(
+                  0x1334000000000001ull, 0x1334000000000005ull, W, H,
+                  VK_FORMAT_R8G8B8A8_UNORM, evict_copy_err),
+              "GPU-side persistent color copy succeeds at capacity limit by evicting older target");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
