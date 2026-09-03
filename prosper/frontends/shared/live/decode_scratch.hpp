@@ -138,6 +138,13 @@ public:
         }
         // Never shrink: a smaller later request reuses the mapped pages instead of returning them
         // to the kernel and faulting a fresh set in on the next big one.
+        //
+        // `clear()` first when the buffer must REALLOCATE, and only then. `resize` past capacity
+        // copies the existing elements into the new allocation -- 66 MiB of copy to preserve
+        // contents this class explicitly does not promise. Clearing makes that copy zero elements.
+        // Within capacity the opposite holds: `resize` value-initialises only the delta, where
+        // clearing first would memset the whole extent.
+        if (buffer.capacity() < bytes) buffer.clear();
         if (buffer.size() < bytes) buffer.resize(bytes);
         return Lease(this, std::move(buffer), bytes);
     }
