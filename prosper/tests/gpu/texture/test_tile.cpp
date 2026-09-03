@@ -15,6 +15,15 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+static void set_env_var(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else       unsetenv(name);
+#endif
+}
+
 // A linear image where each texel encodes its (x,y) so any misplacement is detectable.
 static std::vector<uint8_t> make_ref(uint32_t w, uint32_t h) {
     std::vector<uint8_t> v((size_t)w * h * 4);
@@ -1254,9 +1263,9 @@ int main() {
                 std::vector<uint8_t> tiled_avx2(tb, 0);
                 std::vector<uint8_t> tiled_scalar(tb, 0);
                 tile_surface(tiled_avx2.data(), lin.data(), W, H, M, 0, bpe);
-                setenv("PROSPER_NO_AVX2_TILE", "1", 1);
+                set_env_var("PROSPER_NO_AVX2_TILE", "1");
                 tile_surface(tiled_scalar.data(), lin.data(), W, H, M, 0, bpe);
-                unsetenv("PROSPER_NO_AVX2_TILE");
+                set_env_var("PROSPER_NO_AVX2_TILE", nullptr);
                 CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) == 0,
                       "AVX2 tile_surface matches scalar tile_surface byte-for-byte");
             }

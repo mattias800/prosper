@@ -794,12 +794,11 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
     static const bool row_major_tile = std::getenv("PROSPER_TILE_ROW_MAJOR") != nullptr;
     if ((!ToTiled && !row_major_detile) || (ToTiled && !row_major_tile)) {
 #if defined(PROSPER_HAVE_TARGET_AVX2)
-        static const bool use_avx2_gather =
-            std::getenv("PROSPER_NO_AVX2_DETILE") == nullptr &&
-            __builtin_cpu_supports("avx2");
-        static const bool use_avx2_tile =
-            std::getenv("PROSPER_NO_AVX2_TILE") == nullptr &&
-            __builtin_cpu_supports("avx2");
+        static const bool cpu_has_avx2 = __builtin_cpu_supports("avx2");
+        const bool use_avx2_gather = cpu_has_avx2 &&
+            std::getenv("PROSPER_NO_AVX2_DETILE") == nullptr;
+        const bool use_avx2_tile = cpu_has_avx2 &&
+            std::getenv("PROSPER_NO_AVX2_TILE") == nullptr;
 #endif
             const uint32_t surface_block_rows = (eh + bh - 1) / bh;
             const uint32_t surface_block_cols = (ew + bw - 1) / bw;
