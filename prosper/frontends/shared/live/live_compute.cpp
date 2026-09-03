@@ -10536,6 +10536,11 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
     return native_storage_vk_format(format, components) != VK_FORMAT_UNDEFINED;
 }
 
+// Import-eligibility table naming which format/component combinations the graphics backend
+// can preserve when leasing an existing compute-produced image. This list governs import
+// admission into graphics views (where formats are reinterpreted, e.g. Float16 <-> Uint16),
+// not image creation: the underlying VkImage was already successfully created and validated
+// by the compute pipeline against the device's confirmed capabilities (via add_native_storage_format).
 uint32_t live_compute_graphics_import_native_format(
     prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
