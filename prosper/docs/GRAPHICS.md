@@ -1347,6 +1347,26 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   untouched seed on 100% of sampled pixels, because that draw covers the whole 3840x2160 target.
   Caveat stated plainly: the rebuild is the same source at the same commit, not provably the same
   object bytes as the build that produced the 2026-08-23 figure. #2945.
+- **RE-MEASURED 2026-09-03: 3,875 replays, one output hash per arm, and the verdict is still
+  UNDECIDED rather than "fixed".** Four campaigns run through
+  `tools/determinism/replay_determinism.sh`, unloaded and self-loaded blocks alternating, peers
+  recorded per row:
+
+  | campaign | binary / driver | subject | replays | distinct hashes | span |
+  | --- | --- | --- | --- | --- | --- |
+  | `new` | current `main`, host Mesa 26.2.1 | `s3537` whole submit / `--draw 42` | 707 / 706 | **1 / 1** | 1.75 h |
+  | `old` | rebuilt `08c23efd`, host Mesa 26.2.1 | same | 701 / 701 | **1 / 1** | 1.75 h |
+  | `container` | current `main`, container Mesa **26.1.4** | same | 296 / 295 | **1 / 1** | 1.13 h |
+  | `stray` | current `main`, host | a seven-submit *Stray* `.prgbundle` | 469 | **1** | 1.73 h |
+
+  Against the 2026-08-23 figure of **5 distinct hashes over 15 replays** of the same submit, i.e. a
+  53% per-replay non-modal rate. With 0 deviations the 95% upper bound is 0.42% on the largest arm.
+  GPU utilisation over the campaign was 0-37% (mean ~11%), and six full `ctest --no-tests=error -j4`
+  runs taken during it were 345/345 six times over — the `-j4` load regime #2937 was found in.
+  **The bare-Vulkan control fired in 0 of 2,172 rounds**, so by the drift row at the top of this
+  section the campaign has NOT shown that it met a window in which this class is expressible. That
+  is what `replay_determinism_report.py` prints, and the sentence to quote is "no instance observed
+  in 3,875 replays over 1.75 h", never "the renderer is deterministic". #2945.
 
 
 ## Recommended implementation order
