@@ -132,6 +132,9 @@ int main() {
         record.total_ms = 20 + i;
         record.pass_loop_ms = 7 + i;
         record.frontend_tex_persist_miss_ms = 2 + i;
+        record.frontend_tex_persist_invalid_ms = 4 + i;
+        record.frontend_tex_persist_invalid_n = 5 + i;
+        record.frontend_tex_other_n = 6 + i;
         record.frontend_tex_other_slowest_ms = 1.5 + i;
         record.frontend_tex_other_addr = 0x2046960000ull + i * 0x1000;
         record.frontend_tex_other_width = 2560;
@@ -199,6 +202,12 @@ int main() {
           "renderer records serialize the GPU timestamp availability discriminator");
     check(text.find("\"pass_loop_ms\":7") != std::string::npos &&
           text.find("\"frontend_tex_persist_miss_ms\":2") != std::string::npos &&
+          // The invalidation class and the unclassified COUNT. Without both in the artifact the
+          // offline report cannot separate "the cache is missing" from "the content really changed",
+          // and cannot say whether a millisecond residual has references behind it.
+          text.find("\"frontend_tex_persist_invalid_ms\":4") != std::string::npos &&
+          text.find("\"frontend_tex_persist_invalid_n\":5") != std::string::npos &&
+          text.find("\"frontend_tex_other_n\":6") != std::string::npos &&
           text.find("\"frontend_tex_other_addr\":138623188992") != std::string::npos &&
           text.find("\"frontend_tex_other_compute_candidate\":true") != std::string::npos &&
           text.find("\"resolve_read_count\":3") != std::string::npos,

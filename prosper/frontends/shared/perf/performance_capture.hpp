@@ -86,6 +86,16 @@ struct RendererTimingRecord {
     double frontend_tex_persist_hit_ms = 0;
     double frontend_tex_persist_reuse_ms = 0;
     double frontend_tex_persist_miss_ms = 0;
+    // The persistent entry was found and its guest bytes had CHANGED, so the surface was decoded
+    // again. Split out of the unnamed residual because "the cache is missing" and "the cache is
+    // working and the content really is new" call for opposite work, and a single `other` bucket
+    // cannot tell them apart -- which is exactly how Stray's title screen hid 930 of 1110 ms.
+    double frontend_tex_persist_invalid_ms = 0;
+    uint64_t frontend_tex_persist_invalid_n = 0;
+    // References that reached NONE of the named classes. A count, not a duration: paired with the
+    // signed millisecond residual the report derives, the two disagree only if the classification
+    // itself is wrong.
+    uint64_t frontend_tex_other_n = 0;
     // Slowest texture reference that reached none of the named outcome classes in this semantic
     // submit. One fixed-size witness keeps F8 non-perturbing while still giving an offline report
     // the exact resource identity needed to explain the residual.
