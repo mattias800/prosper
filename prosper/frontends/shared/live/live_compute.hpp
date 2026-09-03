@@ -7,6 +7,10 @@
 #include <memory>
 #include <vector>
 
+namespace prosper::gpu {
+struct MipChainPlan;
+}
+
 namespace prosper::frontend {
 
 enum class ComputeImageCacheClass : uint8_t { sampled, storage };
@@ -29,15 +33,12 @@ compute_buffer_materialization_discriminator(
     return {plan.logical_bytes, plan.binding_bytes, plan.semantic};
 }
 
-// Read-only sampled inputs are often tiny, numerous, and cheap to upload; retaining all of them
-// wastes cache identities and device memory. A storage target has a different cost model: even a
-// small repeated output otherwise incurs staging readback, guest-format packing, and layout work.
-// One 4 KiB host page is the measured storage crossover and avoids retaining sub-page Vulkan
-// objects. Keep the default crossover policy explicit and independently testable.
+// One 4 KiB host page is the measured crossover for both storage and sampled images, avoiding
+// retaining sub-page Vulkan objects while eliminating repetitive CPU staging allocation, CPU
+// detiling, and Vulkan image creation for sub-1MB textures (#3291).
 constexpr uint64_t compute_image_cache_default_minimum_bytes(
     ComputeImageCacheClass image_class) {
-    return image_class == ComputeImageCacheClass::storage ? 4ull * 1024ull
-                                                          : 1024ull * 1024ull;
+    return 4ull * 1024ull;
 }
 
 constexpr bool compute_image_cache_default_eligible(
@@ -289,6 +290,18 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
 // by the compute backend (excluding live renderer targets and unsupported dimensions).
 bool compute_binding_mip_chain_materializable(const prosper::gpu::ShaderResource& r,
                                               bool renderer_owned);
+struct ComputeSampledCacheSpan {
+    uint64_t gpu_addr = 0;
+    uint32_t guest_bytes = 0;
+    bool eligible = false;
+};
+// Returns the validated allocation span and cache candidate eligibility for a sampled image resource,
+// taking into account single-level and multi-level mip chains (#3291).
+ComputeSampledCacheSpan compute_sampled_cache_span(
+    const prosper::gpu::ShaderResource& r,
+    uint32_t mip_levels,
+    uint64_t sampled_guest_need,
+    const prosper::gpu::MipChainPlan& mip_chain);
 // Monotonic count of sampled 2D/3D images seeded from an exact retained native storage result with a
 // device-local image copy instead of a guest-memory conversion/upload.
 uint64_t live_compute_storage_transfer_seeds();

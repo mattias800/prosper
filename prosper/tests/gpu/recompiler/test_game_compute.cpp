@@ -248,14 +248,14 @@ int main() {
         adaptive_storage_result_validation_enabled;
     using prosper::frontend::ComputeImageCacheClass;
     CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
-              ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
+              ComputeImageCacheClass::sampled) == 4ull * 1024ull &&
           prosper::frontend::compute_image_cache_default_minimum_bytes(
               ComputeImageCacheClass::storage) == 4ull * 1024ull,
-          "sampled and storage images retain independent default cache crossovers");
+          "sampled and storage images share 4 KiB host-page default cache crossover");
     CHECK(!prosper::frontend::compute_image_cache_default_eligible(
-              1024ull * 1024ull - 1, ComputeImageCacheClass::sampled) &&
+              4ull * 1024ull - 1, ComputeImageCacheClass::sampled) &&
           prosper::frontend::compute_image_cache_default_eligible(
-              1024ull * 1024ull, ComputeImageCacheClass::sampled) &&
+              4ull * 1024ull, ComputeImageCacheClass::sampled) &&
           !prosper::frontend::compute_image_cache_default_eligible(
               4ull * 1024ull - 1, ComputeImageCacheClass::storage) &&
           prosper::frontend::compute_image_cache_default_eligible(
@@ -5293,6 +5293,27 @@ int main() {
                 // Live render target with multi-level chain cannot be materialized by compute backend (#3290)
                 CHECK(!prosper::frontend::compute_binding_mip_chain_materializable(chain, true),
                       "multi-level compute image binding is declined when aliasing a live render target");
+
+                // Caching multi-level sampled textures with allocation-spanning validation (#3291)
+                const auto chain_plan = prosper::gpu::shader_resource_mip_chain_plan(chain);
+                const auto single_span = prosper::frontend::compute_sampled_cache_span(
+                    single_level, 1, 65536, {});
+                CHECK(single_span.eligible && single_span.gpu_addr == single_level.gpu_addr &&
+                      single_span.guest_bytes == 65536,
+                      "single-level sampled texture uses descriptor address and exact need");
+
+                const auto invalid_chain_span = prosper::frontend::compute_sampled_cache_span(
+                    chain, kMaxMip + 1, 65536, {});
+                CHECK(!invalid_chain_span.eligible,
+                      "multi-level sampled texture declines caching without a valid mip chain plan");
+
+                const auto valid_chain_span = prosper::frontend::compute_sampled_cache_span(
+                    chain, kMaxMip + 1, 65536, chain_plan);
+                CHECK(valid_chain_span.eligible &&
+                      valid_chain_span.gpu_addr == 0x2026900000ull &&
+                      valid_chain_span.guest_bytes == chain_plan.allocation_bytes &&
+                      valid_chain_span.guest_bytes > 65536,
+                      "multi-level sampled texture spans complete allocation from level zero offset");
             }
             CHECK(prosper::frontend::live_compute_graphics_import_native_format(
                       DataFormat::Float32, 1) == 100u && // VK_FORMAT_R32_SFLOAT
