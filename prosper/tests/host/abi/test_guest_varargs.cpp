@@ -283,11 +283,15 @@ void check_lookup_accessors() {
            "lookup_guest_abi returned an address the registry does not hold");
 
     // (4b) `registered` answers the THIRD question, and must answer it for a guest-ABI handler --
-    //      `lookup` returning nullptr for one must not read as "no handler exists". This is the arm
-    //      that would have caught the `nid_census` miss found in review: that tool reports a NID
-    //      with no registered handler as a return-0 false-success candidate (#2081), so a wrong
-    //      answer here puts five real handlers into a table that is acted on. It has no ctest case
-    //      of its own, so nothing else in the suite can see it.
+    //      `lookup` returning nullptr for one must not read as "no handler exists". Why it matters:
+    //      `nid_census` reports a NID with no registered handler as a return-0 false-success
+    //      candidate (#2081), so a wrong answer here puts five real handlers into a table that is
+    //      acted on, and that tool has no ctest case of its own.
+    //
+    //      This arm does NOT close that hole, and saying so is the point. It is a property of
+    //      `Hle::registered`; the miss was `nid_census` calling `lookup`. Had this predicate existed
+    //      then, with nid_census unchanged, this arm would still be green. Nothing here couples a
+    //      CALLER to the accessor it ought to use -- #3297.
     unsigned known = 0;
     for (const char* name : kGuestAbi) {
         if (Hle::registered(nid_hash(name))) { ++known; continue; }
