@@ -11,6 +11,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <thread>
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -2076,6 +2077,39 @@ int main() {
         set_test_env("PROSPER_SHADER_DUMP_PROGRAM", nullptr);
         set_test_env("PROSPER_SHADER_DUMP_SUCCESS", nullptr);
         std::filesystem::remove_all(address_dir, address_ec);
+    }
+
+    // Concurrent cache scaling: multiple threads querying the cache concurrently under shared_lock
+    {
+        // Prime the cache with one entry so all worker lookups are warm hits under shared_lock
+        uint64_t prime_id = 0;
+        recompile_graphics_shader_cached(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+            &prime_id);
+        const auto before_concurrent = shader_recompile_cache_stats();
+        constexpr int kWorkerThreads = 8;
+        constexpr int kLookupsPerWorker = 50;
+        std::vector<std::thread> workers;
+        workers.reserve(kWorkerThreads);
+        std::atomic<int> success_count{0};
+        for (int i = 0; i < kWorkerThreads; ++i) {
+            workers.emplace_back([&] {
+                for (int j = 0; j < kLookupsPerWorker; ++j) {
+                    uint64_t worker_id = 0;
+                    const auto hit = recompile_graphics_shader_cached(
+                        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+                        &worker_id);
+                    if (!hit.empty() && worker_id != 0) {
+                        success_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        const auto after_concurrent = shader_recompile_cache_stats();
+        CHECK(success_count.load() == kWorkerThreads * kLookupsPerWorker &&
+                  after_concurrent.hits >= before_concurrent.hits + kWorkerThreads * kLookupsPerWorker,
+              "concurrent reader threads hit shader cache without races under shared_lock");
     }
 
     // #3130, and deliberately LAST. The arm above cannot show that the program address actually

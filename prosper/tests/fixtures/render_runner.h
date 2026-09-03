@@ -17,6 +17,7 @@
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/perf/performance_timing_gate.hpp"
 #include "shared/perf/performance_timing_policy.hpp"
+#include "shared/present/readback_policy.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8328,13 +8329,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // `synchronous_results_requested` and therefore `flush_now`, which gates persistent attachment
     // publication. Removing a flush is a real win (each is a queue submit plus a full CPU-GPU fence
     // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
-    const bool readback_color0_wanted = !color_target
-        ? true
-        : (color_target->persistent_id != 0 && (!persistent_color || color_target->readback));
+    const bool readback_color0_wanted = prosper::frontend::is_color_target_readback_wanted(
+        color_target != nullptr,
+        color_target ? color_target->persistent_id : 0,
+        persistent_color,
+        color_target ? color_target->readback : false);
     const bool readback_color1_wanted = use_color1 &&
-        (!color_target
-             ? true
-             : (color_target->persistent_id1 != 0 && (!persistent_color1 || color_target->readback1)));
+        prosper::frontend::is_color_target_readback_wanted(
+            color_target != nullptr,
+            color_target ? color_target->persistent_id1 : 0,
+            persistent_color1,
+            color_target ? color_target->readback1 : false);
     // Slots 2+ ask per slot, exactly as slots 0 and 1 do. `color_count > 2` alone would force a
     // readback of every higher slot on every segment of a split pass, including the ones whose
     // pixels are thrown away.
@@ -8345,6 +8350,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }();
     const bool readback_requested_for_flush =
         readback_color0_wanted || readback_color1_wanted || readback_extra_wanted;
+
+    // ...and will one actually be PERFORMED. Blue Prince renders 457 depth-only passes with no
+    // colour base per route; every one reads back a fully black surface that the frontend then
+    // never looks at (`live_renderer.cpp:6082`/`:6118` consume the pixels only under `if (base ...)`,
+    // and there is no else). That is up to 8 MB copied and discarded per pass.
     const bool readback_color0 = want_color_readback && readback_color0_wanted;
     const bool readback_color1 = want_color_readback && readback_color1_wanted;
     const bool readback_requested = readback_color0 || readback_color1 ||
