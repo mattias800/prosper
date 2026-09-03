@@ -373,6 +373,15 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME cached_env_arming_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_cached_env.py"
                    "${CMAKE_SOURCE_DIR}")
+  # The coverage half of test_env_numeric_sites (#3267). That test MIRRORS each converted site
+  # rather than calling it -- the sites cache their reads in function-local statics, so a runtime
+  # arm would go vacuous exactly as cached_env_arming_logic above describes -- and a mirror drifts
+  # silently: convert a site, forget the arm, suite stays green. This refuses that by comparing the
+  # set of knobs parsed through diagnostics/env_numeric.hpp against the set the test arms. It is a
+  # text scan, so it needs nothing built.
+  add_test(NAME env_numeric_arms
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_env_numeric_arms.py"
+                   "${CMAKE_SOURCE_DIR}")
   # stdout carries BYTES, and Windows decodes them as cp1252/cp437. One em dash in a printf literal
   # therefore reaches a Windows user as three mojibake characters, so a grep for the line the tool
   # itself printed does not match it -- and a test asserting on the rendered string fails on
@@ -1474,6 +1483,16 @@ if(TARGET prosper_core)
   add_executable(test_env_cache tests/diagnostics/test_env_cache.cpp)
   target_include_directories(test_env_cache PRIVATE src)
   add_test(NAME diagnostics_env_cache COMMAND test_env_cache)
+
+  # One arm per PROSPER_* knob #3267 converted to diagnostics/env_numeric.hpp. Header-only and
+  # environment-free by construction: nearly every converted site caches its read in a
+  # function-local static, so an arm that armed the variable at runtime would go VACUOUS rather
+  # than red (#2214). Each arm therefore calls the same helper the site calls, and also computes
+  # what the site's OLD spelling answered -- so an arm on a knob that never needed converting
+  # fails instead of passing quietly.
+  add_executable(test_env_numeric_sites tests/diagnostics/test_env_numeric_sites.cpp)
+  target_include_directories(test_env_numeric_sites PRIVATE src)
+  add_test(NAME diagnostics_env_numeric_sites COMMAND test_env_numeric_sites)
 
   # Diagnostics: enabled-path and JSON tests (only when feature is built).
   if(PROSPER_DIAGNOSTICS)

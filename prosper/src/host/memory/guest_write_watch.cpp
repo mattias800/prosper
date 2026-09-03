@@ -1,5 +1,6 @@
 #include "host/memory/guest_write_watch.hpp"
 #include "host/memory/guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
+#include "diagnostics/env_numeric.hpp"        // #3267: a typo must not silently unbound this limit
 
 #include <algorithm>
 #include <atomic>
@@ -1159,10 +1160,16 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     // exact byte-comparison fallback (and can register millions of pages while a level loads). Keep
     // dirty tracking for ranges where it amortizes; zero makes the diagnostic limit unbounded.
     static const uint64_t max_watch_bytes = [] {
+        // 0 is not "off" here -- it is the MOST permissive setting, so a bare strtoull would turn
+        // `=8mb` or `=eight` into "no limit at all" while the operator believed they had capped the
+        // watch. That is #3253's shape exactly, in the write-watch implementation the issue was
+        // filed about (#3267).
         const char* value = std::getenv("PROSPER_WRITE_WATCH_MAX_KB");
-        const uint64_t kib = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        const uint64_t kib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_WRITE_WATCH_MAX_KB", value, 0ull, UINT64_MAX / 1024ull, "KiB",
+            "unbounded: no range is too large to watch");
         if (!kib) return uint64_t{UINT64_MAX};
-        return kib > UINT64_MAX / 1024ull ? uint64_t{UINT64_MAX} : uint64_t{kib * 1024ull};
+        return uint64_t{kib * 1024ull};
     }();
     if (watch_bytes > max_watch_bytes) {
         bump(stats().create_oversized);

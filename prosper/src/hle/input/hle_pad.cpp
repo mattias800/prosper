@@ -15,6 +15,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "input/pad.hpp"
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not make every scripted press zero-length
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -273,7 +274,13 @@ extern "C" uint64_t prosper_vo_flip_count();
 std::atomic<uint64_t> g_pad_flip0{std::numeric_limits<uint64_t>::max()};
 
 int64_t pad_frame_hold() {   // how many flips to hold a frame-anchored press (default 8)
-    static const int64_t h = [] { const char* e = getenv("PROSPER_PAD_FRAME_HOLD"); return e ? (int64_t)atoll(e) : 8; }();
+    // A hold of 0 flips is a press the guest can miss entirely, and a route that delivers nothing
+    // looks exactly like a render or progression wall rather than like a mistyped variable (#3267).
+    static const int64_t h = [] {
+        const char* e = getenv("PROSPER_PAD_FRAME_HOLD");
+        return (int64_t)prosper::diag::env_u64_or_default_capped(
+            "PROSPER_PAD_FRAME_HOLD", e, 8ull, INT64_MAX, "flips");
+    }();
     return h;
 }
 
@@ -309,8 +316,10 @@ std::atomic<uint64_t> g_pad_read_count{0};
 
 int64_t pad_read_hold() {
     static const int64_t h = [] {
+        // Same as PROSPER_PAD_FRAME_HOLD: 0 reads is a press nothing observes (#3267).
         const char* e = getenv("PROSPER_PAD_READ_HOLD");
-        return e ? (int64_t)atoll(e) : 8;
+        return (int64_t)prosper::diag::env_u64_or_default_capped(
+            "PROSPER_PAD_READ_HOLD", e, 8ull, INT64_MAX, "reads");
     }();
     return h;
 }

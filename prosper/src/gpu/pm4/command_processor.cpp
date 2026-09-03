@@ -3,6 +3,7 @@
 #include "hle/memory/guest_memory_topology.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/execute/mb3_freelist.hpp"
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "hle/sync/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
@@ -1411,8 +1412,11 @@ static bool declines_nonheap_ptr(const char* kind, uint64_t dst, uint64_t pre, u
 // write that would forge a freelist next-pointer (see forges_freelist_ptr), gated to the consumed-
 // marker label population so plain fence labels (Messenger) are untouched.
 static bool forge_guard() {
+    // DEFAULT ON, and it is the #312 ROOT fix -- so `strtol` answering 0 for `=yes`/`=true`/`=on`
+    // silently REMOVED the fix while the operator believed they had pinned it on (#3267).
     static const bool v = [] { const char* e = getenv("PROSPER_REL1_FORGE_GUARD");
-                               return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
+                               return prosper::diag::env_u64_or_default_auto(
+                                   "PROSPER_REL1_FORGE_GUARD", e, 1ull) != 0; }();   // default ON
     return v;
 }
 // #1226 decisive A/B arm: suppress EVERY REL1 write matching forges_freelist_ptr(), including the
@@ -2125,8 +2129,10 @@ bool declines_drifted_pair_release(uint64_t addr, uint64_t value, const char* ki
 // guest already freed the recycled label back to the allocator. Writing our 4-byte 1 over +0 forges
 // 0x10000000_00000001 (or a 0x2001... pool pointer) — the exact #312 fatal family. Suppress it.
 static bool rel1_stomp_guard() {
+    // DEFAULT ON -- same inversion as PROSPER_REL1_FORGE_GUARD, same #312 fatal family (#3267).
     static const bool v = [] { const char* e = getenv("PROSPER_REL1_STOMP_GUARD");
-                               return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
+                               return prosper::diag::env_u64_or_default_auto(
+                                   "PROSPER_REL1_STOMP_GUARD", e, 1ull) != 0; }();   // default ON
     return v;
 }
 // --- #1226 clock-fence provenance: persistent per-address record of 64-bit GPU-clock writes. -----

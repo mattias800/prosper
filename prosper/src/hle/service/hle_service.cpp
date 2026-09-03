@@ -9,6 +9,7 @@
 #include "hle/util/hle_json2.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not unregister a default-ON NID family
 #include "hle/dispatch/callback_fs.hpp"
 #include "hle/input/ime_input.hpp"
 #include "hle/service/platform_ui.hpp"
@@ -487,7 +488,11 @@ VdecDump& vdec_dump() {
         const char* dir = getenv("PROSPER_VDEC2_DUMP_DIR");
         if (!dir || !*dir) return;
         if (const char* n = getenv("PROSPER_VDEC2_DUMP_FRAMES")) {
-            const unsigned long parsed = strtoul(n, nullptr, 0);
+            // `if (parsed)` refuses only a value that parses to 0. `=-1` saturated to ULONG_MAX and
+            // lifted the 16-frame cap this block's own comment describes as the difference between
+            // 50 MB and 5 GB on disk. Base 0 was the pre-existing grammar, so keep `0x` (#3267 B1).
+            const uint64_t parsed = prosper::diag::env_u64_or_default_auto_capped(
+                "PROSPER_VDEC2_DUMP_FRAMES", n, 16ull, UINT32_MAX, "frames");
             if (parsed) d.limit = (unsigned)parsed;
         }
         const std::string base(dir);
@@ -5286,8 +5291,13 @@ void register_service_hle() {
     // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
     // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.
     {
+        // DEFAULT ON since #306. `strtol` answered 0 for `=yes`/`=true`/`=on`, and the consequence
+        // is not a lost diagnostic: the three callback NIDs guarded here (RegisterCallback,
+        // CheckCallback, GetState) go UNREGISTERED, so the guest gets the pre-#306 unimplemented
+        // behaviour from what the operator read as "enable it". GetInfo and GetResult below are
+        // registered unconditionally and are unaffected (#3267).
         const char* e = getenv("PROSPER_NETCTL_CB");
-        if (!e || strtol(e, nullptr, 0) != 0) {
+        if (prosper::diag::env_u64_or_default_auto("PROSPER_NETCTL_CB", e, 1ull) != 0) {
             R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
             R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
             R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI

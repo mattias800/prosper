@@ -1,6 +1,7 @@
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "host/image/boot_program.hpp"   // #1659: BOOT_EBOOT (the real mapped base)
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
 
 #include <atomic>
 #include <cstdlib>
@@ -75,8 +76,11 @@ bool scan_chain(uint64_t head, uint64_t block, uint8_t list, uint64_t pool_base,
 
 bool central_scan_enabled() {
     static const bool enabled = [] {
+        // DEFAULT ON. `strtol` answered 0 for `=yes`, `=true` and `=on`, so an operator making the
+        // default explicit switched the scan OFF instead (#3267). A refusal keeps ON; `=0` still
+        // means off.
         const char* e = getenv("PROSPER_MB3_CENTRAL_SCAN");
-        return !e || strtol(e, nullptr, 0) != 0;
+        return prosper::diag::env_u64_or_default_auto("PROSPER_MB3_CENTRAL_SCAN", e, 1ull) != 0;
     }();
     return enabled;
 }
@@ -197,8 +201,9 @@ bool scan_once(uint64_t block, Mb3FreelistMatch* match) {
 
 bool mb3_tls_tracking_enabled() {
     static const bool enabled = [] {
+        // DEFAULT ON -- same inversion as PROSPER_MB3_CENTRAL_SCAN above (#3267).
         const char* e = getenv("PROSPER_MB3_TRACK_TLS");
-        return !e || strtol(e, nullptr, 0) != 0;
+        return prosper::diag::env_u64_or_default_auto("PROSPER_MB3_TRACK_TLS", e, 1ull) != 0;
     }();
     return enabled;
 }

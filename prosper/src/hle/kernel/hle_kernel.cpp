@@ -15,6 +15,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not remove the fairness yield
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/image/exec_image.hpp"      // describe_code_address (host frame naming)
 #include "host/platform/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
@@ -950,8 +951,10 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
         // earlier, but below ~300 us the render pump (5.33 ms period) starts winning the re-lock
         // race again and the commit re-starves.
         if (had_waiters) {
-            static const int fair_us = getenv("PROSPER_MUTEX_FAIR_US")
-                                           ? atoi(getenv("PROSPER_MUTEX_FAIR_US")) : 3000;
+            // 0 is not "off" -- sleep_for(0us) returns immediately, so a typo removes the yield
+            // entirely and GRIS's bank commit re-starves against the render pump (#2981, #3267).
+            static const int fair_us = static_cast<int>(prosper::diag::env_u64_or_default_capped(
+                "PROSPER_MUTEX_FAIR_US", getenv("PROSPER_MUTEX_FAIR_US"), 3000ull, INT32_MAX, "us"));
             std::this_thread::sleep_for(std::chrono::microseconds(fair_us));
         }
     }
