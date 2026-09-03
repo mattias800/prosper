@@ -7279,12 +7279,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     .persistent_enabled = persistent_compute_image_enabled(
                         sbytes, ComputeImageCacheClass::sampled),
                 });
-                // #3048: a cached sampled image is revalidated against the SELECTED level's guest
-                // bytes only. A multi-level image's higher levels live elsewhere in the same
-                // allocation, so an unchanged level zero would wrongly certify a stale level three.
-                // Fail closed and re-upload every dispatch until the validated span covers the whole
-                // chain; this costs upload time, never correctness.
-                if (bi.mip_levels > 1u) bi.cache_candidate = false;
+                // #3048, #3291: a multi-level image's levels live throughout the same allocation.
+                // When a valid, bounded mip chain plan covers the whole allocation, cache and validate
+                // against the complete allocation footprint rather than level zero alone.
+                const auto cache_span = compute_sampled_cache_span(
+                    *r, bi.mip_levels, sampled_guest_need, mip_chain);
+                if (!cache_span.eligible) bi.cache_candidate = false;
                 const VkFormat transfer_native_format =
                     compute_transfer_storage_vk_format(r->format, sampled_components);
                 const bool float32_uint32_transfer_alias =
@@ -7326,9 +7326,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ComputeTransferBorrowResult::NotAttempted;
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
+                    const uint64_t level_zero_offset =
+                        (bi.mip_levels > 1u && mip_chain.valid) ? mip_chain.levels[0].byte_offset : 0u;
+                    const uint8_t* cache_guest_source = sampled_guest_source - level_zero_offset;
                     bi.cache_key = {
-                        r->gpu_addr, reinterpret_cast<uintptr_t>(r->host_data),
-                        static_cast<uint32_t>(sampled_guest_need), r->size,
+                        cache_span.gpu_addr, reinterpret_cast<uintptr_t>(r->host_data),
+                        cache_span.guest_bytes, r->size,
                         r->width, r->height, r->depth,
                         static_cast<uint32_t>(r->format), sampled_components,
                         r->tile_mode, r->img_dim, r->linear_row_pitch_bytes,
@@ -7393,7 +7396,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key,
-                        bi.compute_transfer_seed_borrowed ? nullptr : sampled_guest_source,
+                        bi.compute_transfer_seed_borrowed ? nullptr : cache_guest_source,
                         image_validation_epoch, bi.image, bi.memory, bi.upload_skipped,
                         !bi.compute_transfer_seed_borrowed);
                     if (bi.persistent && bi.upload_skipped)
@@ -7405,15 +7408,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (trace && bi.persistent)
                         std::fprintf(stderr,
                                      "[compute]   persistent sampled image binding=%u "
-                                     "addr=0x%llx guest=%zu upload-skipped=%u compressed=%u "
+                                     "addr=0x%llx guest=%u upload-skipped=%u compressed=%u "
                                      "dcc-safe=%u\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr,
-                                     sampled_guest_need, bi.upload_skipped ? 1u : 0u,
+                                     bi.binding, (unsigned long long)cache_span.gpu_addr,
+                                     cache_span.guest_bytes, bi.upload_skipped ? 1u : 0u,
                                      r->compression_enabled ? 1u : 0u, dcc_cache_safe ? 1u : 0u);
                     if (!bi.persistent && !bi.compute_transfer_seed_borrowed)
                         bi.cache_source_snapshot.assign(
-                            sampled_guest_source,
-                            sampled_guest_source + sampled_guest_need);
+                            cache_guest_source,
+                            cache_guest_source + cache_span.guest_bytes);
                     cache_lookup_ms = std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
@@ -10476,6 +10479,30 @@ bool compute_binding_mip_chain_materializable(const prosper::gpu::ShaderResource
     if (!mip_chain.valid || mip_chain.level_count != declared_chain_levels) return false;
     if (r.img_dim != 1 /* 2D */ || r.depth_compare) return false;
     return true;
+}
+
+ComputeSampledCacheSpan compute_sampled_cache_span(
+    const prosper::gpu::ShaderResource& r,
+    uint32_t mip_levels,
+    uint64_t sampled_guest_need,
+    const prosper::gpu::MipChainPlan& mip_chain) {
+    if (mip_levels > 1u) {
+        const bool chain_cache_valid =
+            mip_chain.valid && mip_chain.allocation_bytes > 0 &&
+            mip_chain.allocation_bytes <= UINT32_MAX &&
+            mip_chain.levels[0].byte_offset <= r.gpu_addr;
+        if (!chain_cache_valid) return {};
+        return {
+            .gpu_addr = r.gpu_addr - mip_chain.levels[0].byte_offset,
+            .guest_bytes = static_cast<uint32_t>(mip_chain.allocation_bytes),
+            .eligible = true,
+        };
+    }
+    return {
+        .gpu_addr = r.gpu_addr,
+        .guest_bytes = static_cast<uint32_t>(sampled_guest_need),
+        .eligible = true,
+    };
 }
 
 uint32_t storage_image_guest_texel_bytes(prosper::gpu::DataFormat format,
