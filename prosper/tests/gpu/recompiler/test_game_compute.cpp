@@ -673,6 +673,29 @@ int main() {
         CHECK(seed_reprove_interval_from_env("0", 256) == 0, "explicit 0 honored (intentionally disables re-proving)");
         CHECK(seed_reprove_interval_from_env("64", 256) == 64, "exact in-range value overrides default");
         CHECK(seed_reprove_interval_from_env("4294967295", 256) == 4294967295u, "max uint32 accepted");
+
+        // #3285: untouched storage coverage classification. When 100% of poison survived (survived == texels),
+        // zero texels were stored by the shader; it is classified as SeedCoverage::None to avoid redundant
+        // seeding and writeback on every dispatch.
+        using prosper::frontend::SeedCoverage;
+        using prosper::frontend::classify_seed_coverage;
+        using prosper::frontend::seed_coverage_name;
+        CHECK(classify_seed_coverage(0, 8294400) == SeedCoverage::Full,
+              "zero survivors proves Full coverage");
+        CHECK(classify_seed_coverage(8294400, 8294400) == SeedCoverage::None,
+              "100% survivors proves None (untouched) coverage (#3285)");
+        CHECK(classify_seed_coverage(8294401, 8294400) == SeedCoverage::None,
+              "clamped/overflow survivors classifies as None coverage");
+        CHECK(classify_seed_coverage(1, 8294400) == SeedCoverage::Partial,
+              "one survivor classifies as Partial coverage");
+        CHECK(classify_seed_coverage(8294399, 8294400) == SeedCoverage::Partial,
+              "all but one survivor classifies as Partial coverage");
+        CHECK(std::string(seed_coverage_name(SeedCoverage::Full)).find("full-coverage") != std::string::npos,
+              "Full coverage name contains full-coverage");
+        CHECK(std::string(seed_coverage_name(SeedCoverage::None)).find("NONE-COVERAGE") != std::string::npos,
+              "None coverage name contains NONE-COVERAGE");
+        CHECK(std::string(seed_coverage_name(SeedCoverage::Partial)).find("PARTIAL-COVERAGE") != std::string::npos,
+              "Partial coverage name contains PARTIAL-COVERAGE");
     }
 
     // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is
@@ -6524,6 +6547,63 @@ int main() {
                 const bool row0_written = std::memcmp(part_guest.data(),
                                                       part_original.data(), row_bytes) != 0;
                 CHECK(row0_written, "partial store did write the covered row (kernel ran)");
+            }
+        }
+    }
+
+    // #3285: untouched write-only storage image test. A compute dispatch binds a write-only
+    // storage image, but the shader writes 0 texels into the image bounds. 100% of the proving
+    // poison survives. Verify it is classified as SeedCoverage::None, writeback is skipped on the
+    // proving run (preserving guest memory without spurious host write notifications), and future
+    // dispatches fast-skip both seeding and writeback entirely.
+    {
+        static const uint32_t store_untouched_2d[] = {
+            0x7E0802FFu, 0x0000270Fu,// v4 = 9999 (x, well out-of-bounds)
+            0x7E0A02FFu, 0x0000270Fu,// v5 = 9999 (y, well out-of-bounds)
+            0xF0200F08u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5) to binding 5 -- write-only
+            0xBF810000u,             // s_endpgm
+        };
+        const uint32_t H2 = 2;
+        std::vector<uint32_t> p_index(W);
+        for (uint32_t i = 0; i < W; ++i) p_index[i] = i;
+        std::vector<uint32_t> pdummy(4, 0);
+        std::vector<uint8_t> untouched_guest(W * H2 * 4);
+        for (size_t i = 0; i < untouched_guest.size(); ++i)
+            untouched_guest[i] = (uint8_t)(i * 31 + 17);
+        const std::vector<uint8_t> untouched_original = untouched_guest;
+        ShaderResourceTable untouched_rt;
+        auto add_buf = [&](uint32_t b, void* d, uint32_t s) {
+            ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer; r.binding = b;
+            r.gpu_addr = (uint64_t)(uintptr_t)d; r.size = s; untouched_rt.resources.push_back(r); };
+        add_buf(0, p_index.data(), W * sizeof(uint32_t));
+        add_buf(1, pdummy.data(), 16); add_buf(2, pdummy.data(), 16); add_buf(3, pdummy.data(), 16);
+        ShaderResource udst{};
+        udst.cls = ResourceClass::StorageImage; udst.img_dim = 1; udst.binding = 5; udst.sgpr_base = 8;
+        udst.format = DataFormat::Unorm8; udst.num_components = 4; udst.width = W; udst.height = H2;
+        udst.depth = 1; udst.gpu_addr = (uint64_t)(uintptr_t)untouched_guest.data(); udst.size = W * H2 * 4;
+        untouched_rt.resources.push_back(udst);
+        std::vector<uint32_t> untouched_spirv = recompile_valu(
+            store_untouched_2d, sizeof(store_untouched_2d) / sizeof(store_untouched_2d[0]), 1, 0, &untouched_rt);
+        CHECK(!untouched_spirv.empty(), "write-only 2D out-of-bounds store kernel recompiles");
+        if (!untouched_spirv.empty()) {
+            ComputeItem it; it.spirv = untouched_spirv;
+            it.resources = std::make_shared<ShaderResourceTable>(untouched_rt);
+            it.launch.threads_x = W; it.launch.local_x = 64; it.launch.groups_x = 1;
+            it.launch.threads_y = H2; it.launch.local_y = 1; it.launch.groups_y = H2;
+            it.launch.threads_z = 1; it.launch.local_z = 1; it.launch.groups_z = 1;
+            it.code_addr = 0x32850001u;
+            // Run 0: proves (100% poison survived -> SeedCoverage::None), skips writeback.
+            // Run 1: fast-skip cached None verdict, skips seeding and writeback.
+            for (int run = 0; run < 2; ++run) {
+                CHECK(prosper::frontend::execute_live_compute_items({it}),
+                      run == 0 ? "untouched-store proving run executes"
+                               : "untouched-store fast-skip run executes");
+                const bool preserved = std::memcmp(untouched_guest.data(),
+                                                   untouched_original.data(),
+                                                   untouched_original.size()) == 0;
+                CHECK(preserved,
+                      run == 0 ? "untouched-store proving run leaves guest memory unmodified"
+                               : "untouched-store fast-skip run leaves guest memory unmodified");
             }
         }
     }

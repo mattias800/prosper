@@ -3192,6 +3192,7 @@ struct BoundImage {
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
     bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
+    bool write_skip = false;            // untouched storage image: unwritten and unread; skip staging, readback, and writeback
     size_t seed_from_imported = SIZE_MAX; // renderer image copied on-device into this partial-write target
     bool mirror_result_to_imported = false;
     std::vector<uint8_t> seed_linear;   // #1122: detiled guest seed, kept on a proving frame so any
@@ -5333,12 +5334,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // store`) that is full on the proving frame but partial later; that residual soundness gap is
     // tracked in #1127 -- no exercised title shader triggers it, and a shader first seen partial is
     // cached Partial and always seeds (safe).
-    enum class SeedCoverage : uint8_t { Full, Partial };
+    using prosper::frontend::SeedCoverage;
+    using prosper::frontend::classify_seed_coverage;
+    using prosper::frontend::seed_coverage_name;
     // #1127: 'prove once, trust forever' is unsound for a DATA-DEPENDENT store (full on the proving
-    // frame, partial later). Re-prove a Full verdict every kSeedReproveInterval fast-skips: a shader
+    // frame, partial later). Re-prove a Full or None verdict every kSeedReproveInterval fast-skips: a shader
     // that ever covers partially is then re-cached Partial and always seeds, bounding the corruption
-    // window from unbounded to <= interval fast-skips. A genuinely data-independent full-writer (the
-    // exercised full-screen composites) re-proves to Full each time -- no rendered-output change, ~1
+    // window from unbounded to <= interval fast-skips. A genuinely data-independent writer (the
+    // exercised full-screen composites or untouched bindings) re-proves each time -- no rendered-output change, ~1
     // extra poison frame per interval. skips counts fast-skips taken since the last (re-)proof.
     struct SeedVerdict { SeedCoverage cov = SeedCoverage::Partial; uint32_t skips = 0; };
     // key = (shader code_addr, output binding, width, height, depth) -- collision-free by construction.
@@ -6450,18 +6453,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 image_descriptors[i].writable && enough_threads) {
                 const SeedCoverageKey proof_key{item.code_addr, bi.binding,
                                                 r->width, r->height, r->depth};
-                bool proven_full = false, known = false, reprove_due = false;
+                bool proven_full = false, proven_none = false, known = false, reprove_due = false;
                 {
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     auto it = seed_coverage_proof.find(proof_key);
                     if (it != seed_coverage_proof.end()) {
                         known = true;
                         proven_full = it->second.cov == SeedCoverage::Full;
-                        // #1127: periodically re-prove a Full verdict so a data-dependent store that
-                        // later under-covers is caught (re-cached Partial, then always seeds). The
+                        proven_none = it->second.cov == SeedCoverage::None;
+                        // #1127: periodically re-prove a Full or None verdict so a data-dependent store that
+                        // later changes coverage is caught (re-cached Partial, then always seeds). The
                         // helper resets the counter, so concurrent dispatches on this key don't all
                         // re-prove at once.
-                        if (proven_full && seed_reprove_due(it->second.skips, kSeedReproveInterval))
+                        if ((proven_full || proven_none) &&
+                            seed_reprove_due(it->second.skips, kSeedReproveInterval))
                             reprove_due = true;
                     }
                 }
@@ -6476,6 +6481,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
                                      item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
                                      renderer_owned ? 1 : 0);
+                } else if (proven_none) {
+                    bi.seed_skip = true;        // proven unwritten and unread: skip seeding
+                    bi.write_skip = true;       // proven unwritten: skip GPU readback and guest writeback
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   seed-and-write-skip untouched storage binding=%u addr=0x%llx "
+                                     "extent=%ux%u threads=%ux%ux%u\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
+                                     item.launch.threads_x, item.launch.threads_y, item.launch.threads_z);
                 } else if (!known) {
                     bi.poison_verify = true;    // unknown: prove coverage this frame (still correct)
                     if (trace)
@@ -7372,8 +7386,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // transfer. Only a read-only sampled cache hit can omit staging altogether.
             const auto staging_start = ComputeClock::now();
             if (!bi.imported &&
-                (bi.storage || (!bi.compute_transfer_seed_borrowed &&
-                                !(bi.persistent && bi.upload_skipped)))) {
+                ((bi.storage && !bi.write_skip) || (!bi.compute_transfer_seed_borrowed &&
+                                                    !(bi.persistent && bi.upload_skipped)))) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 sci.size = sbytes;
                 sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -9103,7 +9117,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // detile those identical bytes again on the next pass.
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
-            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
+            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip) continue;
             const ShaderResource* r = bi.resource;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -9769,6 +9783,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size() && readback_ok; i++) {
             BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
+            if (bi.write_skip) {
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   skipped untouched storage writeback binding=%u "
+                                 "addr=0x%llx\n",
+                                 bi.binding, (unsigned long long)bi.resource->gpu_addr);
+                continue;
+            }
             const auto image_writeback_start = ComputeClock::now();
             const bool image_cache_hit = bi.persistent;
             const ShaderResource* r = bi.resource;
@@ -9845,16 +9867,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
                 continue;
             }
-            // Notify page-based dirty trackers only when bytes will actually be written. Doing this
-            // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
-            // even on the no-write path, defeating the validation that made that path safe.
-            if (!r->host_data && r->gpu_addr)
-                prosper::host::guest_write_watch_notify_host_write(
-                    r->gpu_addr, bi.guest_bytes);
-            const auto watch_done = ComputeClock::now();
             // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
             // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
-            // any survivor == partial coverage (must always seed). Cache the verdict per (code,binding)
+            // all survivors == the shader wrote zero texels (safe to fast-skip seed and writeback);
+            // intermediate survivors == partial coverage (must always seed). Cache the verdict per (code,binding)
             // and, for a partial write, restore the un-stored texels from the clean seed after packing.
             std::vector<uint8_t> poison_texel;   // 1 == this texel survived as poison (untouched)
             if (bi.poison_verify) {
@@ -9878,19 +9894,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                     if (all) { ++survived; poison_texel[t] = 1; }
                 }
+                const SeedCoverage cov = classify_seed_coverage(survived, texels);
                 {
                     const SeedCoverageKey proof_key{item.code_addr, bi.binding,
                                                     r->width, r->height, r->depth};
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
-                    seed_coverage_proof[proof_key] =
-                        SeedVerdict{ survived ? SeedCoverage::Partial : SeedCoverage::Full, 0 };
+                    seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0 };
                 }
                 std::fprintf(stderr,
                              "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
                              (unsigned long long)item.code_addr, bi.binding, texels, survived,
-                             survived ? "PARTIAL-COVERAGE (will always seed)" : "full-coverage (seed-skip proven)");
+                             seed_coverage_name(cov));
+                if (cov == SeedCoverage::None) {
+                    // Untouched storage target: the shader stored zero texels. Guest memory retains its
+                    // clean original contents. Skip guest memory write-watch notification, unpack/pack,
+                    // and CPU tiling writeback entirely.
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   proving frame confirmed untouched storage binding=%u "
+                                     "addr=0x%llx: skipping guest writeback\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr);
+                    ctx.unmap_memory(staging_memory[i]);
+                    continue;
+                }
             }
+            // Notify page-based dirty trackers only when bytes will actually be written. Doing this
+            // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
+            // even on the no-write path, defeating the validation that made that path safe.
+            if (!r->host_data && r->gpu_addr)
+                prosper::host::guest_write_watch_notify_host_write(
+                    r->gpu_addr, bi.guest_bytes);
+            const auto watch_done = ComputeClock::now();
             if (trace) {
                 if (bi.exact_storage_bytes()) {
                     for (size_t t = 0; t < texels; ++t) {
