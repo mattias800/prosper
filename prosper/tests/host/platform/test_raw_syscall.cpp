@@ -27,6 +27,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "support/death_test.hpp"
 
 static int failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; \
@@ -124,6 +125,8 @@ static int signal_from_child(int (*fn)(char*, size_t), size_t cap) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        // This child is EXPECTED to fault; its dump would be noise that stalls other suites (#3269).
+        prosper::test::suppress_coredump();
         void* region = nullptr;
         char* buf = guard_backed(cap, &region);
         if (!buf) _exit(70);
