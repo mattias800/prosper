@@ -6513,6 +6513,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_source_size);
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
+                            // The entry this decode replaces holds a source_prefix buffer of the
+                            // same shape. Taking its allocation instead of letting `assign` build a
+                            // new one is worth naming on a surface the guest rewrites every frame:
+                            // for Stray's 63.75 MiB HDR intermediate that pair -- free 63.75 MiB,
+                            // then mmap and fault 63.75 MiB back in for the same bytes -- measured
+                            // 13.00 ms per invalidation on this host, against 3.5 ms for the copy
+                            // it exists to hold. The bytes stored are identical either way; only
+                            // the mapping's lifetime changes.
+                            std::vector<uint8_t> inherited_source_prefix;
                             uint32_t inherited_watch_dirty_count = 0;
                             uint32_t inherited_watch_stable_validations = 0;
                             bool inherited_watch_disabled = false;
@@ -6545,6 +6554,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     retired_submit_pixels.push_back(old->second.pixels);
                                 }
                                 persistent_decoded_texture_bytes -= old->second.bytes();
+                                // Taken AFTER the ledger has been debited by the old entry's
+                                // `bytes()`, which reads `source_prefix.size()`: moving first would
+                                // debit zero and leak the entry's bytes from the budget forever.
+                                inherited_source_prefix = std::move(old->second.source_prefix);
                                 persistent_decoded_textures.erase(old);
                             }
                             const size_t required =
@@ -6572,10 +6585,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_size = persistent_source_size;
                                 cached.source_prefix_size = source_prefix_size;
                                 cached.source_matches_pixels = persistent_source_matches_pixels;
-                                if (!persistent_source_matches_pixels)
-                                    cached.source_prefix.assign(
-                                        persistent_validation_scratch.begin(),
-                                        persistent_validation_scratch.begin() + source_prefix_size);
+                                if (!persistent_source_matches_pixels) {
+                                    // Byte-for-byte what `assign(scratch.begin(),
+                                    // scratch.begin() + source_prefix_size)` produced. `resize`
+                                    // before the copy so a SHORT read stores exactly the prefix it
+                                    // read -- `source_prefix.size()` is compared against
+                                    // `persistent_source_size` on the validation path, so growing
+                                    // it to the inherited buffer's extent would silently change
+                                    // which entries revalidate. Shrinking keeps the capacity, which
+                                    // is the whole point.
+                                    cached.source_prefix = std::move(inherited_source_prefix);
+                                    cached.source_prefix.resize(source_prefix_size);
+                                    if (source_prefix_size)
+                                        std::memcpy(cached.source_prefix.data(),
+                                                    persistent_validation_scratch.data(),
+                                                    source_prefix_size);
+                                }
                                 cached.pixels = std::make_shared<const std::vector<uint8_t>>(
                                     std::move(texture_pixels));
                                 cached.output_height = fr.th;
