@@ -10,6 +10,7 @@
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/texture/write_watch_census.hpp"
 #include "shared/texture/write_watch_policy.hpp"
+#include "diagnostics/env_numeric.hpp"   // #3253: a typo must not select a different setting
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger compute timing
 #include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
 
@@ -1105,9 +1106,13 @@ VkDeviceSize persistent_compute_image_limit(
 
 uint32_t compute_write_watch_promotion_validations() {
     static const uint32_t value = [] {
+        // 0 here is not "off": `stable >= 0` is always true, so every source arms on first
+        // acquisition. A malformed value must therefore keep the default rather than becoming it
+        // (#3253).
         const char* text = std::getenv("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS");
-        const uint64_t parsed = text ? std::strtoull(text, nullptr, 10) : 3ull;
-        return static_cast<uint32_t>(std::min<uint64_t>(parsed, UINT32_MAX));
+        return static_cast<uint32_t>(prosper::diag::env_u64_or_default_capped(
+            "PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS", text, 3ull, UINT32_MAX,
+            "unchanged validations"));
     }();
     return value;
 }
@@ -1133,20 +1138,20 @@ uint32_t compute_write_watch_promotion_validations() {
 // Pair it with PROSPER_WATCH_PROMOTE_CENSUS, which reports what each setting actually bought.
 size_t compute_write_watch_defer_min_bytes() {
     static const size_t value = [] {
+        // The historical default is 1 BYTE, not 1 KiB, so it cannot be expressed in this knob's own
+        // units -- hence the explicit unset case rather than a KiB default handed to the helper.
         constexpr size_t historical_default = 1;
         const char* text = std::getenv("PROSPER_COMPUTE_WATCH_DEFER_MIN_KB");
         if (!text || !*text) return historical_default;
-        // Refuse a malformed value LOUDLY and keep the default. A bare `strtoull` answers 0 for
-        // anything non-numeric, and 0 here means "defer nothing" -- the most aggressive setting on
-        // the knob. A typo must cost you the experiment, never hand you a different one you did not
-        // ask for and cannot see in the run's own output.
-        char* end = nullptr;
-        const uint64_t kib = std::strtoull(text, &end, 10);
-        if (end == text || (end && *end)) {
+        // #3251 gave this knob a strict parse; #3253 moved that parse into diagnostics/env_numeric
+        // so the whole write-watch family shares one, rather than this one being the exception. The
+        // sentinel it protects: 0 means "defer nothing", i.e. arm every source on first acquisition.
+        uint64_t kib = 0;
+        if (!prosper::diag::parse_u64_strict(text, &kib)) {
             std::fprintf(stderr,
-                         "[watch-policy] PROSPER_COMPUTE_WATCH_DEFER_MIN_KB='%s' is not a number "
-                         "-- the compute defer minimum stays at its default and NOTHING is being "
-                         "A/B'd\n",
+                         "[env] PROSPER_COMPUTE_WATCH_DEFER_MIN_KB='%s' is not a plain "
+                         "non-negative integer of KiB -- keeping the default (1 byte) and NOTHING "
+                         "is being A/B'd\n",
                          text);
             return historical_default;
         }
@@ -1158,11 +1163,13 @@ size_t compute_write_watch_defer_min_bytes() {
 
 size_t compute_write_watch_promotion_budget_bytes() {
     static const size_t value = [] {
+        // 0 here is not "off" either: WriteWatchPromotionBudget::try_consume returns true
+        // unconditionally when the byte limit is 0, i.e. UNBOUNDED arming per submit (#3253).
         const char* text = std::getenv("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB");
-        const uint64_t mib = text ? std::strtoull(text, nullptr, 10) : 8ull;
-        return static_cast<size_t>(
-            std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
-            (1024ull * 1024ull));
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB", text, 8ull,
+            SIZE_MAX / (1024ull * 1024ull), "MiB");
+        return static_cast<size_t>(mib * (1024ull * 1024ull));
     }();
     return value;
 }
@@ -1190,13 +1197,14 @@ size_t cold_storage_result_snapshot_defer_min_bytes() {
             false, std::memory_order_acq_rel))
         return 0;
     static const size_t bytes = [] {
+        // This one already validated its end pointer but fell back in SILENCE, which fails the
+        // other way from the rest of the family: a typo left you measuring the default while
+        // believing you had moved it (#3253). Same helper, so the refusal is now audible.
         const char* value = std::getenv("PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB");
-        char* end = nullptr;
-        const uint64_t parsed = value ? std::strtoull(value, &end, 10) : 16ull;
-        const uint64_t mib = value && (!end || *end) ? 16ull : parsed;
-        return static_cast<size_t>(
-            std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
-            (1024ull * 1024ull));
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB", value, 16ull,
+            SIZE_MAX / (1024ull * 1024ull), "MiB");
+        return static_cast<size_t>(mib * (1024ull * 1024ull));
     }();
     return bytes;
 }

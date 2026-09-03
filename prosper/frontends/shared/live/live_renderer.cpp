@@ -2,6 +2,7 @@
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "shared/live/live_renderer.hpp"
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
+#include "diagnostics/env_numeric.hpp" // #3253: a typo must not select a different setting
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "gpu/diagnostics/draw_program_skip.hpp"          // PROSPER_SKIP_DRAW_PROGRAM / census
@@ -1709,11 +1710,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             static const size_t write_watch_promotion_budget_bytes = [] {
+                // 0 is not "off": an empty budget makes WriteWatchPromotionBudget::try_consume
+                // return true unconditionally, i.e. unbounded arming per submit. A typo must keep
+                // the default rather than select that (#3253).
                 const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB");
-                const uint64_t mib = value ? strtoull(value, nullptr, 10) : 8ull;
-                return static_cast<size_t>(
-                    std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
-                    (1024ull * 1024ull));
+                const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+                    "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB", value, 8ull,
+                    SIZE_MAX / (1024ull * 1024ull), "MiB");
+                return static_cast<size_t>(mib * (1024ull * 1024ull));
             }();
             static thread_local prosper::frontend::WriteWatchPromotionBudget
                 write_watch_promotion_budget;
@@ -3844,23 +3848,35 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // sources large enough for it to amortize.  Keep the cutoff tunable for
                         // host/platform profiling without changing the cache's correctness policy.
                         static const size_t cross_submit_watch_min_bytes = [] {
+                            // Same family, same sentinel: 0 makes every source large enough, so a
+                            // typo would widen eligibility rather than disable the knob (#3253).
                             const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB");
-                            const uint64_t kib = value ? strtoull(value, nullptr, 10) : 1024ull;
-                            return static_cast<size_t>(
-                                std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
+                            const uint64_t kib = prosper::diag::env_u64_or_default_capped(
+                                "PROSPER_TEXTURE_WRITE_WATCH_MIN_KB", value, 1024ull,
+                                SIZE_MAX / 1024ull, "KiB");
+                            return static_cast<size_t>(kib * 1024ull);
                         }();
                         const bool cross_submit_watch_eligible = cross_submit_watch_enabled &&
                             persistent_source_size >= cross_submit_watch_min_bytes;
                         static const size_t cross_submit_watch_defer_min_bytes = [] {
+                            // 0 means "defer nothing": should_promote_write_watch returns true
+                            // immediately, arming every source on first sight. This is the knob
+                            // #3253 names first, because it is the one an A/B is most likely to
+                            // mistype (`=8mb`, `=8 KB`, a stray quote) -- and a bare strtoull would
+                            // hand back the MOST aggressive arm instead of the one asked for.
                             const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB");
-                            const uint64_t kib = value ? strtoull(value, nullptr, 10) : 8192ull;
-                            return static_cast<size_t>(
-                                std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
+                            const uint64_t kib = prosper::diag::env_u64_or_default_capped(
+                                "PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB", value, 8192ull,
+                                SIZE_MAX / 1024ull, "KiB");
+                            return static_cast<size_t>(kib * 1024ull);
                         }();
                         static const uint32_t cross_submit_watch_promotion_validations = [] {
+                            // 0 makes `stable >= 0` always true, so every deferred source promotes
+                            // on its first acquisition -- the aggressive end, not the off end.
                             const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS");
-                            const uint64_t hits = value ? strtoull(value, nullptr, 10) : 3ull;
-                            return static_cast<uint32_t>(std::min<uint64_t>(hits, UINT32_MAX));
+                            return static_cast<uint32_t>(prosper::diag::env_u64_or_default_capped(
+                                "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS", value, 3ull, UINT32_MAX,
+                                "unchanged validations"));
                         }();
                         static const bool audit_cross_submit_watch =
                             PROSPER_ENV_VALUE("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
