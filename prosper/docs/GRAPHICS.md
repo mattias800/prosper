@@ -1300,18 +1300,25 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   against 0.13) and the load rows explain the association at least as well as an amplifier does:
   prosper's reproduction generates its own GPU load. Do not spend anything more on it before the
   driver defect is reported. #2945.
-- **The GOOD hash is a property of the RENDERER and moves; the FAILURE hash is a property of the
-  CAPTURE and does not. Key any determinism harness on the failure.** BALAN's `s3537 --draw 42`
-  rendered `9068fcf09de07383` on 2026-08-23 and `ccc433ff6d980383` on 2026-09-02 — the renderer
-  legitimately changed what that draw produces, across 43 commits touching `src/render` and
-  `src/gpu`. The failure value `a5e7b61cbf984383` is unchanged and cannot move for a renderer
-  reason: it is literally the capsule's own seed for the target the draw writes, printed by
-  `gpu_replay <capsule> --inspect-only` as
+- **The GOOD hash moves; the FAILURE hash cannot move for a RASTERIZATION reason. Key any
+  determinism harness on the failure.** BALAN's `s3537 --draw 42` rendered `9068fcf09de07383` on
+  2026-08-23 and `ccc433ff6d980383` on 2026-09-02. The failure value `a5e7b61cbf984383` did not
+  move, and the reason is structural rather than empirical: "the draw drew nothing" leaves the
+  scanout exactly as the capsule seeded it, so the output hash is the SEED's hash — which the
+  capsule carries and `gpu_replay <capsule> --inspect-only` prints, four lines above where this
+  section quotes it:
   `rtt-seed addr=0000009fc0000000 extent=3840x2160 format=rgba8 bytes=33177600 hash=a5e7b61cbf984383`.
-  A harness keyed the other way round reports every round of a perfectly healthy renderer as a
-  failure — `tools/vkprobe/correlate_with_replay.sh` shipped with exactly that keying and would
-  have scored 100% `other` on current `main`; it now keys on the failure and reads `bad`/`rendered`.
-  #2945.
+  Both values come from the same `gpu_capture_hash` over a byte vector, so the identity is exact,
+  not an observed coincidence. What is NOT claimed here is why the good value moved: the row four
+  below shows the *rebuilt 2026-08-23 binary* returning the same new value, which rules out the
+  obvious explanation that the renderer changed the picture. An earlier version of this row asserted
+  that explanation and cited "43 commits touching `src/render` and `src/gpu`" — wrong three ways:
+  the causal claim is falsified by that row, `prosper/src/render` exists at neither endpoint (the
+  path matched nothing), and the count over `prosper/src/gpu` is 657 first-parent commits. The
+  operative half is untouched by any of it: **a harness keyed on the good hash reports every round
+  of a perfectly healthy renderer as a failure.** `tools/vkprobe/correlate_with_replay.sh` shipped
+  with exactly that keying and would score 100% `other` on current `main`; it now derives the
+  failure key from the capsule and reads `bad`/`rendered`. #2945.
 - **A hand-made positive instance of the failure costs one command, and no determinism null on this
   issue should be believed without one.** The characterised mechanism is "every storage-buffer load
   in the vertex shader returns 0", so supply that by hand rather than waiting for it:
@@ -1363,10 +1370,25 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   53% per-replay non-modal rate. With 0 deviations the 95% upper bound is 0.42% on the largest arm.
   GPU utilisation over the campaign was 0-37% (mean ~11%), and six full `ctest --no-tests=error -j4`
   runs taken during it were 345/345 six times over — the `-j4` load regime #2937 was found in.
-  **The bare-Vulkan control fired in 0 of 2,172 rounds**, so by the drift row at the top of this
-  section the campaign has NOT shown that it met a window in which this class is expressible. That
-  is what `replay_determinism_report.py` prints, and the sentence to quote is "no instance observed
-  in 3,875 replays over 1.75 h", never "the renderer is deterministic". #2945.
+
+  **Three qualifications, all of which narrow the claim rather than the verdict.** (1) The four
+  campaigns ran CONCURRENTLY: their spans sum to 6.37 h inside a **1.75 h** wall-clock window, so
+  the dataset samples 1.75 h four times over, not seven hours — and each campaign was load for the
+  others, which means **no row labelled `no-selfload` was taken on an idle GPU**. Read the
+  `gpu_pct` column, not the condition label. (2) The control figure was taken by a parse that read
+  only the first of `vkprobe`'s per-pattern readback lines, and the correct pattern sorts before the
+  common wrong ones, so the honest statement of it is **"no round's lexicographically-smallest
+  indexed readback pattern was other than the correct one in 2,172 rounds"** — weaker than "the
+  control fired 0 times", and conservative in the direction that matters (a missed fire pushes the
+  verdict toward UNDECIDED, never toward DETERMINISTIC). The parse now aggregates every line; the
+  corrected re-run is the row below. (3) Every subject row carried a real hash — 0 of 3,875 recorded
+  `none` — which had to be checked rather than assumed, because the runner recorded exactly that for
+  every bundle replay until #3270 taught it that `--bundle` prints no `output=` line.
+
+  None of that moves the verdict, which is **UNDECIDED** either way: by the drift row at the top of
+  this section the campaign has not shown that it met a window in which this class is expressible.
+  That is what `replay_determinism_report.py` prints, and the sentence to quote is "no instance
+  observed in 3,875 replays over a 1.75 h window", never "the renderer is deterministic". #2945.
 
 
 ## Recommended implementation order

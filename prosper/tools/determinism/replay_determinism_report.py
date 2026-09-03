@@ -118,6 +118,27 @@ def control_broken(row: Row) -> bool:
     return row.role == "control" and row.rc != 0
 
 
+NON_ANSWERS = ("", "none")
+
+
+def subject_answered(row: Row) -> bool:
+    """Did this replay actually produce a hash?
+
+    The runner writes `none` when it found no hash line in the replay's output, and it writes that
+    with the replay's own exit status -- which is frequently 0, because a tool can exit cleanly
+    having printed something the parser did not recognise. That is not a hypothetical: the runner
+    recorded `none` for EVERY bundle replay until it learned that `--bundle` prints per-submit lines
+    and no `output=` line at all.
+
+    Counting `none` as a hash is the exact failure this whole file exists to prevent, one level in.
+    A campaign of 469 rows of `none` has one distinct value per arm and no varying arm, so a reader
+    that filters only on `rc` calls it DETERMINISTIC -- reporting a campaign that measured NOTHING
+    as the strongest possible result. The producer bug is fixable and was fixed; the reader is the
+    durable artefact, and it has to refuse.
+    """
+    return row.role == "subject" and row.rc == 0 and row.value not in NON_ANSWERS
+
+
 def evaluate(rows: list) -> Report:
     report = Report(rows=rows)
     if not rows:
@@ -131,12 +152,17 @@ def evaluate(rows: list) -> Report:
         report.reasons.append("no subject rows: nothing was replayed")
         return report
 
-    # A replay that did not finish has no output to compare, so it is not a sample -- and counting
-    # its empty `value` as a distinct hash would report NONDETERMINISTIC for a timeout.
-    finished = [r for r in subjects if r.rc == 0]
+    # Three kinds of subject row, and only the first is a sample. A replay that did not finish has
+    # no output to compare; a replay that finished without producing a hash measured nothing at all.
+    # Counting either as a value would turn a timeout into NONDETERMINISTIC and a campaign of
+    # non-answers into DETERMINISTIC.
+    answered = [r for r in subjects if subject_answered(r)]
     failed_replays = [r for r in subjects if r.rc != 0]
+    # Derived from the SAME predicate as `answered`, not from an independent re-test of the
+    # value: two spellings of one rule can disagree, and the disagreement would be silent.
+    non_answers = [r for r in subjects if r.rc == 0 and not subject_answered(r)]
     per_arm = collections.defaultdict(collections.Counter)
-    for row in finished:
+    for row in answered:
         per_arm[row.arm][row.value] += 1
 
     varying = {arm: c for arm, c in per_arm.items() if len(c) > 1}
@@ -148,11 +174,26 @@ def evaluate(rows: list) -> Report:
                 f"arm {arm}: {len(counter)} distinct hashes over {sum(counter.values())} replays")
         return report
 
+    if non_answers:
+        report.verdict = UNDECIDED
+        report.reasons.append(
+            f"{len(non_answers)} of {len(subjects)} replays exited 0 but recorded no hash "
+            f"({'/'.join(sorted({r.value or '<empty>' for r in non_answers}))}); a campaign that "
+            "recorded nothing has one value per arm and no varying arm, which is not a result")
+        return report
+
     if failed_replays:
         report.verdict = UNDECIDED
         report.reasons.append(
             f"{len(failed_replays)} of {len(subjects)} replays exited non-zero; a run that did not "
             "finish is not a sample of what the finished ones measured")
+        return report
+
+    silent_arms = sorted({r.arm for r in subjects} - set(per_arm))
+    if silent_arms:
+        report.verdict = UNDECIDED
+        report.reasons.append(
+            f"arm(s) {', '.join(silent_arms)} produced no usable replay at all")
         return report
 
     controls = [r for r in rows if r.role == "control"]
@@ -204,13 +245,20 @@ def format_report(report: Report) -> str:
             out.append(f"  [{cond}] GPU busy: not sampled on this platform")
 
     per_arm = collections.defaultdict(collections.Counter)
+    unusable = collections.defaultdict(collections.Counter)
     for row in report.subjects:
-        per_arm[row.arm][row.value] += 1
-    for arm in sorted(per_arm):
+        if subject_answered(row):
+            per_arm[row.arm][row.value] += 1
+        else:
+            unusable[row.arm][row.value if row.rc == 0 else f"rc={row.rc}"] += 1
+    for arm in sorted(set(per_arm) | set(unusable)):
         counter = per_arm[arm]
-        out.append(f"\nsubject {arm}: {len(counter)} distinct over {sum(counter.values())} replays")
+        out.append(f"\nsubject {arm}: {len(counter)} distinct over {sum(counter.values())} "
+                   f"USABLE replays")
         for value, n in counter.most_common():
             out.append(f"    {value} x{n}")
+        for value, n in unusable[arm].most_common():
+            out.append(f"    [not a sample] {value} x{n}")
 
     controls = report.controls
     if controls:

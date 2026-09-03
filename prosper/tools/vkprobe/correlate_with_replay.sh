@@ -32,14 +32,40 @@
 # of a perfectly healthy campaign reads as `other` and the correlation silently becomes a
 # correlation with nothing.
 #
-# Pass the untouched-scanout hash for your own capsule if it is not BALAN's s3537. Read it off the
-# capsule rather than guessing -- it is the `rtt-seed` line for the draw's target:
-#   gpu_replay <capsule> --inspect-only /dev/null | grep '^rtt-seed addr=<TARGET>'
+# The key is DERIVED FROM THE CAPSULE at startup rather than hardcoded, because this script is
+# itself the proof that a hardcoded hash rots. "The draw drew nothing" leaves the scanout exactly as
+# the capsule seeded it, so the failure hash is the seed's hash -- and the capsule carries both the
+# draw's target address and that seed's hash:
+#   draw[42] ... target=0000009fc0000000 ...
+#   rtt-seed addr=0000009fc0000000 ... hash=a5e7b61cbf984383
+# Pass an explicit value as $8 to override the derivation; a derivation that fails says so loudly
+# and falls back to the recorded BALAN s3537 value rather than to silence.
 set -u
 probe=${1:?vkprobe}; replay=${2:?gpu_replay}; capsule=${3:?capsule}; draw=${4:?draw}
 work=${5:?workdir}; rounds=${6:?rounds}; gap=${7:?gap}
-BAD=${8:-a5e7b61cbf984383}   # BALAN s3537: the scanout untouched, i.e. the draw drew nothing
+BAD=${8:-}
 cd "$work" || exit 2
+
+if [ -z "$BAD" ]; then
+    inspect=$("$replay" "$capsule" --inspect-only /dev/null 2>/dev/null)
+    target=$(printf '%s\n' "$inspect" | grep -oE "^draw\[$draw\] .* target=[0-9a-f]+" \
+             | grep -oE 'target=[0-9a-f]+' | head -1)
+    target=${target#target=}
+    if [ -n "$target" ]; then
+        BAD=$(printf '%s\n' "$inspect" | grep -oE "^rtt-seed addr=$target .* hash=[0-9a-f]+" \
+              | grep -oE 'hash=[0-9a-f]+' | head -1)
+        BAD=${BAD#hash=}
+    fi
+    if [ -n "$BAD" ]; then
+        echo "correlate: draw $draw writes target $target, whose capsule seed hashes to $BAD;" \
+             "that is the 'drew nothing' value for this capsule" >&2
+    else
+        BAD=a5e7b61cbf984383
+        echo "correlate: could NOT derive the failure hash from this capsule (no draw[$draw] target" \
+             "or no matching rtt-seed line); falling back to BALAN s3537's $BAD, which is almost" \
+             "certainly wrong for any other capture -- pass the right one as argument 8" >&2
+    fi
+fi
 
 for round in $(seq 1 "$rounds"); do
     timeout 120 "$probe" --vs prosper_vs.spv --fs prosper_fs.spv \

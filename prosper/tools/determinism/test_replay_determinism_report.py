@@ -124,6 +124,52 @@ def main():
     check(r.verdict == RPT.DETERMINISTIC,
           "distinct arms are counted separately, not pooled into one census")
 
+    # --- A campaign that RECORDED NOTHING is not a clean campaign -------------------------------
+    # The runner writes `none` when it found no hash line, and it writes that with the replay's own
+    # exit status, which is routinely 0. This is the reviewer's counter-example on #3270: 49 subject
+    # rows of `none` at rc 0 beside one control fire has one distinct value per arm and no varying
+    # arm, so a reader filtering only on rc calls it DETERMINISTIC -- the strongest possible verdict
+    # for a campaign that measured nothing. It is also not hypothetical: the runner recorded exactly
+    # this for every bundle replay until it learned that `--bundle` prints no `output=` line.
+    nothing_recorded = csv([control(1, "fail:2/20")]
+                           + [subject(i, "none") for i in range(1, 50)])
+    r = verdict(nothing_recorded)
+    check(r.verdict == RPT.UNDECIDED,
+          "49 subject rows of `none` at rc 0, beside a control fire -> UNDECIDED, not DETERMINISTIC")
+    check(any("recorded no hash" in reason for reason in r.reasons),
+          "...and the reason says the replays recorded no hash")
+    check("[not a sample] none x49" in RPT.format_report(nothing_recorded and r),
+          "...and the census prints them as not-a-sample rather than as one distinct hash")
+
+    # The empty string is the same non-answer by another route.
+    r = verdict(csv([control(1, "fail:2/20"), subject(1, ""), subject(2, "")]))
+    check(r.verdict == RPT.UNDECIDED, "an EMPTY subject value is a non-answer too")
+
+    # ...and a campaign mixing real hashes with non-answers is undecided on the non-answers, not
+    # cleared by the hashes that happened to land.
+    r = verdict(csv([control(1, "fail:2/20"), subject(1, "aaaa"), subject(2, "none"),
+                     subject(3, "aaaa")]))
+    check(r.verdict == RPT.UNDECIDED,
+          "one non-answer among real hashes still blocks a DETERMINISTIC verdict")
+
+    # A varying arm stays decisive even when another row recorded nothing: the variation is real
+    # evidence and outranks a missing sample.
+    r = verdict(csv([subject(1, "aaaa"), subject(2, "bbbb"), subject(3, "none")]))
+    check(r.verdict == RPT.NONDETERMINISTIC,
+          "a genuinely varying arm outranks a non-answer elsewhere in the campaign")
+
+    # MUTATION for the same rule: count `none` as a hash and the reviewer's campaign flips.
+    original_answered = RPT.subject_answered
+    try:
+        RPT.subject_answered = lambda row: row.role == "subject" and row.rc == 0
+        mutant_none = verdict(nothing_recorded)
+    finally:
+        RPT.subject_answered = original_answered
+    check(mutant_none.verdict == RPT.DETERMINISTIC,
+          "MUTATION: counting `none` as a hash reports the empty campaign as DETERMINISTIC")
+    check(verdict(nothing_recorded).verdict == RPT.UNDECIDED,
+          "...and the unmutated evaluator still reports UNDECIDED, so the arm is not vacuous")
+
     # --- The mutation arm: remove the control check and this test must go red -------------------
     original = RPT.control_failed
     try:

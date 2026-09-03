@@ -117,10 +117,28 @@ gpu_pct() {
     echo -1
 }
 
-peers() {   # peer GPU consumers, EXCLUDING this campaign's own gpu_replay/vkprobe
-    local t=0 c
+# Peer GPU consumers, deliberately EXCLUDING `gpu_replay` and `vkprobe` -- this campaign's own
+# tools, which `tools/gpu_busy.sh` counts and which would therefore make the campaign see itself as
+# a peer and wait forever. That exclusion is the whole reason this is not a call to gpu_busy.sh, and
+# it has a consequence the reader must be told: **another lane's gpu_replay, vkprobe or ctest is
+# invisible here**, and so is a sibling campaign of this very script. The `gpu_pct` column is the
+# ground truth about load; this count is only about the frontends whose captures must not be
+# contaminated.
+#
+# A pgrep that ERRORS is not an answer, and reporting it as "no peers" is the trap-222 shape
+# gpu_busy.sh exists to prevent -- a guard whose failure looks like its success. Fail closed: an
+# unusable count reports a peer, so the campaign waits rather than trampling one.
+peers() {
+    local t=0 c rc
     for n in prosper-app boot_trace screenshot screenshot_snap; do
-        c=$(pgrep -c -x "$n" 2>/dev/null) || c=0
+        c=$(pgrep -c -x "$n" 2>/dev/null); rc=$?
+        if [ "$rc" -eq 1 ]; then
+            c=0                                  # no match is an answer
+        elif [ "$rc" -ne 0 ]; then
+            echo "replay_determinism.sh: pgrep failed on '$n' (rc=$rc); assuming a peer is up" >&2
+            echo 1
+            return 0
+        fi
         t=$((t + c))
     done
     echo "$t"
@@ -197,7 +215,15 @@ run_control() {   # <round> <cond> <peers>
         --indices 3,4,5 --readback-dwords 16:8 --iterations "$control_iterations" > "$log" 2>&1
     rc=$?
     t1=$(date +%s%N)
-    line=$(grep -E '^\[vkprobe\] b: indexed +vertex-index readback' "$log" | head -1)
+    # ALL of them, not `head -1`. vkprobe prints one readback line PER PATTERN (vkprobe.cpp, the
+    # `for (const auto& [pattern, count] : tally.indexed_words)` loop), from a map, so the lines
+    # arrive in lexicographic pattern order. Reading the first line alone makes `total` the count
+    # for one pattern instead of the iteration count, and -- because the correct pattern
+    # `[--,--,--,4,5,6,--,--]` sorts BEFORE a wrong one such as `[1,2,3,--,...]` -- a round whose
+    # only failures sort after it scores `pass`. That error is conservative (a missed fire pushes
+    # the verdict toward UNDECIDED, never toward DETERMINISTIC), which is exactly why it survived a
+    # whole campaign unnoticed: it can only ever weaken a result, so nothing ever looks wrong.
+    line=$(grep -E '^\[vkprobe\] b: indexed +vertex-index readback' "$log")
     # `rc` in the CSV means "could this control run at all", NOT vkprobe's own exit status.
     # vkprobe exits 1 whenever any iteration covered no pixels, and with the diagnostic indices
     # 3,4,5 the indexed arm reads outside the record buffer and covers nothing BY DESIGN -- so its
@@ -209,12 +235,13 @@ run_control() {   # <round> <cond> <peers>
              "$(( (t1 - t0) / 1000000 ))"
         return 0
     fi
-    ok=$(printf '%s' "$line" | grep -oE '\[--,--,--,4,5,6,--,--\] x[0-9]+' | grep -oE '[0-9]+$')
+    ok=$(printf '%s\n' "$line" | grep -oE '\[--,--,--,4,5,6,--,--\] x[0-9]+' | grep -oE '[0-9]+$' \
+         | awk '{ n += $1 } END { if (NR > 0) print n }')
     # Sum the per-pattern counts with awk rather than `paste | bc`: bc is not always installed, and
     # an empty total would compare unequal to ok and report a control FAILURE on every round --
     # turning "the control never fired" into "the control always fired", which is exactly the
     # inversion this campaign exists to prevent. A total that does not parse is did-not-run.
-    total=$(printf '%s' "$line" | grep -oE 'x[0-9]+' | sed 's/x//' \
+    total=$(printf '%s\n' "$line" | grep -oE 'x[0-9]+' | sed 's/x//' \
             | awk '{ n += $1 } END { if (NR > 0) print n }')
     ok=${ok:-0}
     if [ -z "$total" ] || [ "$total" -le 0 ] 2>/dev/null; then
@@ -233,8 +260,12 @@ run_control() {   # <round> <cond> <peers>
 [ -s "$out" ] || printf 'epoch,round,cond,peers,gpu_pct,role,arm,value,rc,ms\n' > "$out"
 
 for round in $(seq 1 "$rounds"); do
+    # `no-selfload` means exactly what it says: THIS campaign started no loader of its own for this
+    # block. It does NOT mean the GPU was idle -- a sibling campaign, another lane's ctest, or any
+    # gpu_replay on the box is invisible to `peers()` above. Read `gpu_pct`, never the label, when
+    # you want to know what the load actually was.
     blk=$(( (round - 1) / block ))
-    cond=unloaded
+    cond=no-selfload
     if [ "$load" -gt 0 ] && [ $(( blk % 2 )) -eq 1 ]; then cond=selfload; fi
 
     # Wait a peer out, bounded, so another lane's capture is not contaminated -- then proceed and
@@ -247,7 +278,7 @@ for round in $(seq 1 "$rounds"); do
     if [ "$cond" = selfload ]; then
         if [ "$p" -gt 0 ]; then cond=peerload; else start_load; fi
     fi
-    [ "$p" -gt 0 ] && [ "$cond" = unloaded ] && cond=unloaded-peer
+    [ "$p" -gt 0 ] && [ "$cond" = no-selfload ] && cond=no-selfload-peer
 
     if [ $(( round % 2 )) -eq 1 ]; then
         run_control "$round" "$cond" "$p"

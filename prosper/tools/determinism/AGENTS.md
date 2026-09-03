@@ -62,8 +62,15 @@ they are 24 MB apiece at 4K and the hash is what the campaign compares.
 
 Two things the numbers do not say on their own, so say them yourself:
 
-- **Quote the wall-clock span beside the n.** 400 runs inside 173 s are one drift period, not 400
-  samples of what varies. The report prints the span for this reason.
+- **Quote the wall-clock span beside the n — and if you ran several campaigns at once, quote the
+  WINDOW, not the sum of their spans.** 400 runs inside 173 s are one drift period, not 400 samples
+  of what varies. The report prints each campaign's own span; four concurrent campaigns reporting
+  1.75 h each did not sample 7 h, they sampled 1.75 h four times over.
+- **`cond` describes this campaign's own loader, not the box.** A row saying `no-selfload` means
+  only that this invocation started no loader for that block. `peers()` cannot see another lane's
+  `gpu_replay`, `vkprobe` or `ctest`, nor a sibling campaign of this same script, so concurrent
+  campaigns are load for each other and *none* of their `no-selfload` rows was taken on an idle GPU.
+  The `gpu_pct` column is the ground truth; the label is a record of intent.
 - **Quote the driver and the frontend.** Runs made through a container and on the host can be
   different Mesa builds on the same box; `--label` is there to keep two such arms apart in one CSV,
   and interleaving them round by round is the only shape of that comparison that survives the drift.
