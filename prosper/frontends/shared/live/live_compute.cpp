@@ -5393,9 +5393,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      [](const ShaderResource& resource) {
                          return is_gta5_cf9200_no_backing_marker_candidate(resource) &&
                                 !is_proven_gta5_cf9200_no_backing(resource);
-                     }))) return decline("cf9200-no-backing-unproven");
-    double setup_validate_ms = std::chrono::duration<double, std::milli>(
-        ComputeClock::now() - setup_validate_start).count();
+                      }))) return decline("cf9200-no-backing-unproven");
     double setup_buffers_ms = 0.0;
 
     std::vector<SpirvDescriptorBinding> descriptors;       // storage buffers
@@ -5416,6 +5414,46 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 return decline("unsupported-descriptor-kind");
         }
     }
+
+    // Fast pre-validation of image bindings: decline immediately if any image descriptor is
+    // degenerate, has an unsupported storage numeric class, or declares an unmaterializable
+    // mip chain (e.g. aliasing a live render target). This avoids burning dozens of milliseconds
+    // allocating staging buffers, mapping host memory, and running CPU de-tiling for doomed dispatches.
+    for (const auto& descriptor : image_descriptors) {
+        const ShaderResource* r = item.resources ? item.resources->by_binding(descriptor.binding) : nullptr;
+        if (!r || !r->width || !r->height) {
+            return decline("no/degenerate resource");
+        }
+        if (descriptor.kind == SpirvDescriptorKind::StorageImage) {
+            if (descriptor.image_numeric_class != SpirvImageNumericClass::Float &&
+                descriptor.image_numeric_class != SpirvImageNumericClass::Uint) {
+                return decline("storage image has unknown or unsupported signed numeric class");
+            }
+        } else {
+            const uint32_t declared_chain_levels =
+                prosper::gpu::shader_resource_compute_mip_chain_levels(*r);
+            if (declared_chain_levels > 1u) {
+                const bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
+                if (!compute_binding_mip_chain_materializable(*r, renderer_owned)) {
+                    static std::atomic<uint64_t> chain_shape_declines{0};
+                    const uint64_t occurrence =
+                        chain_shape_declines.fetch_add(1, std::memory_order_relaxed) + 1u;
+                    if ((occurrence & (occurrence - 1u)) == 0u) {
+                        std::fprintf(stderr,
+                                     "[compute-mip-chain] declined binding=%u addr=0x%llx "
+                                     "levels=%u imported=0 rtt=%u (occurrence %llu; this "
+                                     "dispatch is dropped every frame)\n",
+                                     descriptor.binding, (unsigned long long)r->gpu_addr,
+                                     declared_chain_levels, renderer_owned ? 1u : 0u,
+                                     (unsigned long long)occurrence);
+                    }
+                    return decline("declared mip chain not materializable for this binding shape");
+                }
+            }
+        }
+    }
+    double setup_validate_ms = std::chrono::duration<double, std::milli>(
+        ComputeClock::now() - setup_validate_start).count();
     // A compute program whose every external RAW access either has NUM_RECORDS=0 or is a proven
     // unreachable store contains no storage/image operation after recompilation. Treat only those
     // exact runtime contracts as a successful no-op: reporting failure here would publish an unknown
@@ -10415,6 +10453,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 }
 
 } // namespace
+
+bool compute_binding_mip_chain_materializable(const prosper::gpu::ShaderResource& r,
+                                              bool renderer_owned) {
+    const uint32_t declared_chain_levels =
+        prosper::gpu::shader_resource_compute_mip_chain_levels(r);
+    if (declared_chain_levels <= 1u) return true;
+    if (renderer_owned) return false;
+    const auto mip_chain = prosper::gpu::shader_resource_mip_chain_plan(r);
+    if (!mip_chain.valid || mip_chain.level_count != declared_chain_levels) return false;
+    if (r.img_dim != 1 /* 2D */ || r.depth_compare) return false;
+    return true;
+}
 
 uint32_t storage_image_guest_texel_bytes(prosper::gpu::DataFormat format,
                                          uint32_t components) {

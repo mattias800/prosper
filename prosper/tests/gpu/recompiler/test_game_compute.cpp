@@ -5,6 +5,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "shared/live/live_compute.hpp"
@@ -5251,6 +5252,48 @@ int main() {
                       !prosper::frontend::compute_native_2d_transfer_format_compatible(
                           DataFormat::Float16, 1),
                   "native 2D transfer admits exact formats and packed R11 bit-copy compatibility");
+            {
+                prosper::gpu::ShaderResource single_level{};
+                single_level.cls = prosper::gpu::ResourceClass::Texture;
+                single_level.width = 256;
+                single_level.height = 256;
+                single_level.img_dim = 1;
+                single_level.declared_mip_levels = 1;
+                CHECK(prosper::frontend::compute_binding_mip_chain_materializable(single_level, false) &&
+                      prosper::frontend::compute_binding_mip_chain_materializable(single_level, true),
+                      "single-level compute image binding is viable regardless of render target ownership");
+
+                constexpr uint32_t kWidth = 256, kHeight = 256, kBytesPerBlock = 4;
+                constexpr uint32_t kTile = static_cast<uint32_t>(prosper::gpu::TileMode::Sw64KbRX);
+                constexpr uint32_t kMaxMip = 8;
+                const auto level0 = prosper::gpu::tiled_mip_level_layout(
+                    kWidth, kHeight, kBytesPerBlock, kTile, kMaxMip, 0);
+
+                prosper::gpu::ShaderResource chain{};
+                chain.cls = prosper::gpu::ResourceClass::Texture;
+                chain.format = prosper::gpu::DataFormat::Uint32;
+                chain.num_components = 1;
+                chain.img_dim = 1;
+                chain.width = kWidth;
+                chain.height = kHeight;
+                chain.depth = 1;
+                chain.tile_mode = kTile;
+                chain.declared_mip_levels = kMaxMip + 1;
+                chain.mip_chain_element_width = kWidth;
+                chain.mip_chain_element_height = kHeight;
+                chain.mip_chain_bytes_per_block = kBytesPerBlock;
+                chain.mip_chain_max_level = kMaxMip;
+                chain.mip_chain_base_level = 0;
+                chain.gpu_addr = 0x2026900000ull + level0.byte_offset;
+
+                CHECK(prosper::gpu::shader_resource_compute_mip_chain_levels(chain) == kMaxMip + 1,
+                      "tiled 2D chain declares nine levels");
+                CHECK(prosper::frontend::compute_binding_mip_chain_materializable(chain, false),
+                      "valid non-renderer-owned tiled 2D chain is materializable");
+                // Live render target with multi-level chain cannot be materialized by compute backend (#3290)
+                CHECK(!prosper::frontend::compute_binding_mip_chain_materializable(chain, true),
+                      "multi-level compute image binding is declined when aliasing a live render target");
+            }
             CHECK(prosper::frontend::live_compute_graphics_import_native_format(
                       DataFormat::Float32, 1) == 100u && // VK_FORMAT_R32_SFLOAT
                       prosper::frontend::live_compute_graphics_import_native_format(

@@ -285,6 +285,10 @@ uint64_t live_compute_sampled_image_upload_skips();
 // transfer contract; resource identity and write authority are checked separately at runtime.
 bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat format,
                                                   uint32_t components);
+// True only when an image resource declaring a compute mip chain can be materialized
+// by the compute backend (excluding live renderer targets and unsupported dimensions).
+bool compute_binding_mip_chain_materializable(const prosper::gpu::ShaderResource& r,
+                                              bool renderer_owned);
 // Monotonic count of sampled 2D/3D images seeded from an exact retained native storage result with a
 // device-local image copy instead of a guest-memory conversion/upload.
 uint64_t live_compute_storage_transfer_seeds();
