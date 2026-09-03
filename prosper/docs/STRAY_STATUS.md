@@ -99,10 +99,22 @@ This is the same cost [#3149](https://github.com/mattias800/prosper/issues/3149)
 `zap_present_ptes` / `__free_one_page` under a 22.2% `do_syscall_64` — and attributed to the compute
 path, because that is where it looked. It is the graphics frontend materializer.
 
-Two more allocations of the same family sit on the same reference and are **not** addressed yet:
-the persistent cache re-stores a fresh 63.8 MiB `source_prefix` on every invalidation (13.00 ms at
-this shape), and `cached.pixels = std::move(texture_pixels)` steals the pooled `texstore` slot, so
-the next decode allocates its 33 MiB output buffer fresh as well (~4.4 ms).
+Two more allocations of the same family sit on the same reference. The persistent cache re-stored a
+fresh 63.8 MiB `source_prefix` on every invalidation (13.00 ms at this shape) — it now inherits the
+allocation from the entry it replaces. The remaining one is **not** addressed:
+`cached.pixels = std::move(texture_pixels)` steals the pooled `texstore` slot, so the next decode
+allocates its 33 MiB output buffer fresh (~4.4 ms). Fixing it needs a decision about buffer ownership
+between `texstore` and the persistent cache, which hands its buffer out as a
+`shared_ptr<const std::vector>` that never comes back.
+
+### The lever that is worth more than all of this
+
+The witness says `compute_cand=1`: the surface is a **compute image candidate whose import misses
+every frame**. `import_live_compute_storage_image` finds nothing under its key, so graphics falls
+through to the guest-byte decode. If that import hit, the 63.8 MiB writeback → detile → convert
+disappears **on both sides of the boundary** — the graphics decode and the compute writeback that
+feeds it. That is a bigger lever than every allocation above put together, and it lives in the
+compute cache's admission, not in the materializer.
 
 ## The unresolved image ops — established on CALIBRATION
 
