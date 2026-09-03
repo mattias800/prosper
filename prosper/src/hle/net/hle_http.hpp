@@ -28,4 +28,21 @@ constexpr uint32_t kErrorOutOfMemory = 0x80431022u;
 constexpr uint32_t kErrorInvalidValue = 0x804311feu;
 constexpr uint32_t kErrorInvalidUrl = 0x80433060u;
 
+// The library's own id validator answers exactly this for an out-of-range or unallocated
+// library context id. CONFIDENCE: HIGH -- read off the validator itself rather than inferred
+// from an error-name table (see hle_http.cpp's note on where these came from).
+constexpr uint32_t kErrorInvalidId = 0x80431100u;
+
+// sceHttpUriBuild component selectors. Each bit gates one SceHttpUriElement field; the caller
+// passes the union of the parts it wants emitted.
+constexpr uint32_t kUriBuildScheme = 0x01u;
+constexpr uint32_t kUriBuildHostname = 0x02u;
+constexpr uint32_t kUriBuildPort = 0x04u;
+constexpr uint32_t kUriBuildPath = 0x08u;
+constexpr uint32_t kUriBuildUsername = 0x10u;
+constexpr uint32_t kUriBuildPassword = 0x20u;
+constexpr uint32_t kUriBuildQuery = 0x40u;
+constexpr uint32_t kUriBuildFragment = 0x80u;
+constexpr uint32_t kUriBuildAll = 0xffu;
+
 } // namespace prosper::http

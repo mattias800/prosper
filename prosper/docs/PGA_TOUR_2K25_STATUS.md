@@ -118,11 +118,32 @@ dereference stale pointer fields."*
 
 The fix is to implement libSceHttp2's lifecycle honestly — local resource creation genuinely
 succeeds, setters genuinely record state, and anything that would need a network answer **reports
-failure instead of `SCE_OK`**, leaving out-parameters untouched. That was deliberately **not** done
-in this session: the correct Sony error values for the libSceHttp2 facility are not derivable from
-the dump, from `../PS5-3.20_Libs/` (which gives names and NIDs only, no values), or from prosper's
-existing `0x8043xxxx` libSceHttp constants, and inventing one would be fabrication rather than
-reimplementation. Tracked separately.
+failure instead of `SCE_OK`**, leaving out-parameters untouched. Tracked as #2894.
+
+**The reason this was deferred no longer holds — see `## Ruled out`.** This paragraph used to say
+the v2 error encodings were not derivable from anything on hand. They are, and the answer changes
+what an implementer must do: **libSceHttp2's facility is `0x817b____`, not v1's `0x8043____`**, so
+prosper's existing libSceHttp constants are *not* reusable across the two even though the low code
+bytes are shared. `<DUMP_ROOT>/sprx/` ships `libSceHttp.sprx` and `libSceHttp2.sprx` as plain ELF
+(entropy 5.417 / 5.403 bits/byte), and this title's own error classifier at `eboot+0x142ddf0`
+confirms the facility independently.
+
+The behavioural finding matters more than the constant. **Any non-zero return is handled
+gracefully; only `0` crashes this title.** The classifier's sole zero-returning path is a literal
+`test eax,eax`, all 33 targets of its `0x817b1064..0x817b1084` jump table return non-zero, and at
+the send site a non-zero classification makes the caller store the error and *return* without ever
+reaching the response parser above. So the fault at `eboot+0x142d5e0` is caused specifically by the
+false `SCE_OK` — the title was always prepared to be told the request failed. Picking the exact
+constant is a correctness question, not a safety one.
+
+For the send path specifically, the real library does not return an HTTP error at all: on a connect
+failure it propagates the **raw libSceNet error**, pinned by `0x80410124` being special-cased as
+*not* a failure at libSceHttp2's `sceNetConnect` site (`0x24` = 36 = `EINPROGRESS`), which fixes the
+encoding as `0x80410100 | BSD errno`. That makes `ENETUNREACH` the honest offline answer, and it is
+consistent with what prosper already tells this guest through NetCtl: `sceNetCtlGetState` writes
+`SCE_NET_CTL_STATE_DISCONNECTED` and `sceNetCtlGetInfo` returns `SCE_NET_CTL_ERROR_NOT_CONNECTED`
+(`hle_service.cpp:4795`, `:4830`). Full derivation, per-NID export map and argument shapes are on
+#2894; start there rather than re-deriving.
 
 Other unimplemented NIDs seen on the same boot, none of which is implicated in the fault:
 `sceNpAuthCreateAsyncRequest`, `sceNpAuthGetAuthorizationCodeV3`, `sceNpAuthWaitAsync`,
@@ -150,6 +171,26 @@ HTTP fault, so no hypothesis is recorded here yet.
 
 ## Ruled out
 
+- **"The correct Sony error values for the libSceHttp2 facility are not derivable from the dump,
+  from `../PS5-3.20_Libs/`, or from prosper's existing `0x8043xxxx` constants, so implementing the
+  lifecycle honestly would require fabricating one."** Falsified 2026-09-03 (#2894, PR #3295 for
+  the v1 sibling). They are derivable, from two independent primary sources that agree. The dump's
+  own `sprx/` directory ships `libSceHttp2.sprx` as a **plain ELF** — entropy 5.403 bits/byte, so
+  nothing is decrypted to read it — and every export's shared stack-guard prologue returns
+  `0x817b1076`, dating the facility as **`0x817b____`**, *not* v1's `0x8043____`. This title's own
+  error classifier at `eboot+0x142ddf0` compares against `0x817b1220` and dispatches
+  `0x817b1064..0x817b1084` through a 33-entry jump table, confirming the facility from the guest
+  side. The claim was not merely incomplete but load-bearing in the wrong direction: it said the
+  work could not be started, when in fact the send path does not use an HTTP error at all — the
+  library propagates the raw libSceNet error, whose encoding (`0x80410100 | BSD errno`) is pinned by
+  `0x80410124` = `EINPROGRESS` being treated as a non-failure at the connect site. Independently
+  re-derived from the bytes by a second reader before this row was written.
+- **"Any error prosper invents here risks being read as data, so returning one is hazardous."**
+  Falsified 2026-09-03 by enumerating all 33 jump-table targets: they return five distinct non-zero
+  categories and **none** reaches the classifier's zero-return `ret`, which is reachable only for an
+  input of exactly `0`. So every non-zero value is classified as a failure and handled the same way,
+  and the caller returns before touching the response parser. A wrong constant here is wrong, not
+  dangerous — which removes the safety argument for deferring the whole lifecycle.
 - **"The `only_if_imported` filter (#2870/#2890) drops `sce_module/libSceNpCppWebApi.prx` for this
   title, and that is what makes the PSN handshake fail."** Falsified 2026-08-22 on `af481db2`:
   `PROSPER_INITLOG=1` lists it as **module 8, base `0x4d0000000`** — it is linked, mapped and
