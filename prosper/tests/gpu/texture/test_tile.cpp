@@ -15,6 +15,7 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+
 // A linear image where each texel encodes its (x,y) so any misplacement is detectable.
 static std::vector<uint8_t> make_ref(uint32_t w, uint32_t h) {
     std::vector<uint8_t> v((size_t)w * h * 4);
@@ -1235,6 +1236,35 @@ int main() {
               "4K block-aligned-width / unaligned-height tile+detile round-trips exactly");
         CHECK(residual == 0,
               "every tiled byte is written by the copy or zeroed -- no stale padding survives");
+        }
+    }
+
+    // #3284 AVX2 vectorized tile_surface: verify that tile_full_block_row_avx2 produces byte-for-byte
+    // identical tiled outputs to the unvectorized scalar path across element sizes (2, 4, 8, 16 BPE)
+    // on 1080p surfaces.
+    {
+        const uint32_t modes[] = {(uint32_t)TileMode::Sw64KbS, (uint32_t)TileMode::Sw64KbZX,
+                                  (uint32_t)TileMode::Sw64KbRX};
+        for (const uint32_t M : modes) {
+            for (const uint32_t bpe : {2u, 4u, 8u, 16u}) {
+                const uint32_t W = 1920, H = 1080;
+                std::vector<uint8_t> lin((size_t)W * H * bpe);
+                for (size_t i = 0; i < lin.size(); i++)
+                    lin[i] = static_cast<uint8_t>((i * 13u + 7u) ^ (i >> 8));
+                const size_t tb = tiled_surface_bytes(W, H, M, 0, bpe);
+                std::vector<uint8_t> tiled_avx2(tb, 0);
+                std::vector<uint8_t> tiled_scalar(tb, 0);
+                tile_surface(tiled_avx2.data(), lin.data(), W, H, M, 0, bpe, /*allow_avx2=*/true);
+                tile_surface(tiled_scalar.data(), lin.data(), W, H, M, 0, bpe, /*allow_avx2=*/false);
+                CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) == 0,
+                      "AVX2 tile_surface matches scalar tile_surface byte-for-byte");
+
+                // Mutation arm: verify the comparison is strictly discriminating by mutating
+                // a byte in the tiled buffer and asserting a mismatch against the scalar baseline.
+                tiled_avx2[tb / 2 + 13] ^= 0xa5;
+                CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) != 0,
+                      "mutation arm: corrupted tile buffer fails equality against scalar baseline");
+            }
         }
     }
 

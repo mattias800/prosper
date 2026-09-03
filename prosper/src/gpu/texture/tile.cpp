@@ -677,6 +677,80 @@ void detile_full_block_row_avx2(uint8_t* dst, const uint8_t* tiled_block,
                               tiled_block + (x_offsets[x] ^ y_offset), bpe);
 }
 
+__attribute__((target("avx2")))
+void tile_full_block_row_avx2(uint8_t* tiled_block, const uint8_t* linear_src,
+                              const uint16_t* x_offsets, uint16_t y_offset,
+                              uint32_t columns, uint32_t bpe) {
+    uint32_t x = 0;
+    const __m128i y = _mm_set1_epi16(static_cast<int16_t>(y_offset));
+    static const bool paired_tiles =
+        std::getenv("PROSPER_NO_PAIRED_AVX2_TILE") == nullptr;
+    const __m128i even_offsets = _mm_setr_epi8(
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
+    if (bpe == 2 && paired_tiles) {
+        for (; x + 8 <= columns; x += 8) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const __m128i pair_offsets16 = _mm_shuffle_epi8(offsets16, even_offsets);
+            const uint16_t off0 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 0));
+            const uint16_t off1 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 1));
+            const uint16_t off2 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 2));
+            const uint16_t off3 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 3));
+            const uint32_t* src32 =
+                reinterpret_cast<const uint32_t*>(linear_src + static_cast<size_t>(x) * 2);
+            *reinterpret_cast<uint32_t*>(tiled_block + off0) = src32[0];
+            *reinterpret_cast<uint32_t*>(tiled_block + off1) = src32[1];
+            *reinterpret_cast<uint32_t*>(tiled_block + off2) = src32[2];
+            *reinterpret_cast<uint32_t*>(tiled_block + off3) = src32[3];
+        }
+    } else if (bpe == 4 && paired_tiles) {
+        for (; x + 8 <= columns; x += 8) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const __m128i pair_offsets16 = _mm_shuffle_epi8(offsets16, even_offsets);
+            const uint16_t off0 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 0));
+            const uint16_t off1 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 1));
+            const uint16_t off2 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 2));
+            const uint16_t off3 = static_cast<uint16_t>(_mm_extract_epi16(pair_offsets16, 3));
+            const uint64_t* src64 =
+                reinterpret_cast<const uint64_t*>(linear_src + static_cast<size_t>(x) * 4);
+            *reinterpret_cast<uint64_t*>(tiled_block + off0) = src64[0];
+            *reinterpret_cast<uint64_t*>(tiled_block + off1) = src64[1];
+            *reinterpret_cast<uint64_t*>(tiled_block + off2) = src64[2];
+            *reinterpret_cast<uint64_t*>(tiled_block + off3) = src64[3];
+        }
+    } else if (bpe == 8) {
+        for (; x + 4 <= columns; x += 4) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const uint16_t off0 = static_cast<uint16_t>(_mm_extract_epi16(offsets16, 0));
+            const uint16_t off1 = static_cast<uint16_t>(_mm_extract_epi16(offsets16, 2));
+            const __m128i val0 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(linear_src + static_cast<size_t>(x) * 8));
+            const __m128i val1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(linear_src + static_cast<size_t>(x) * 8 + 16));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(tiled_block + off0), val0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(tiled_block + off1), val1);
+        }
+    } else if (bpe == 16) {
+        for (; x + 2 <= columns; x += 2) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_cvtsi32_si128(*reinterpret_cast<const int32_t*>(x_offsets + x)), y);
+            const uint16_t off0 = static_cast<uint16_t>(_mm_extract_epi16(offsets16, 0));
+            const uint16_t off1 = static_cast<uint16_t>(_mm_extract_epi16(offsets16, 1));
+            const __m128i val0 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(linear_src + static_cast<size_t>(x) * 16));
+            const __m128i val1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(linear_src + static_cast<size_t>(x) * 16 + 16));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(tiled_block + off0), val0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(tiled_block + off1), val1);
+        }
+    }
+    for (; x < columns; ++x)
+        copy_swizzled_element(tiled_block + (x_offsets[x] ^ y_offset),
+                              linear_src + static_cast<size_t>(x) * bpe, bpe);
+}
+
 #endif
 
 // The 64KB tiled<->linear walk. The pattern offset is XOR-separable in x and y (each offset bit is
@@ -687,7 +761,7 @@ void detile_full_block_row_avx2(uint8_t* dst, const uint8_t* tiled_block,
 template <bool ToTiled>
 void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uint32_t pitch,
                  uint32_t bpe, size_t tiled_bytes, uint32_t tile_mode,
-                 size_t tiled_origin = 0) {
+                 size_t tiled_origin = 0, bool allow_avx2 = true) {
     uint32_t el = sw64kb_elem_log2(bpe);
     if (el == UINT32_MAX) {
         const size_t n = (size_t)ew * eh * bpe;
@@ -720,9 +794,11 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
     static const bool row_major_tile = std::getenv("PROSPER_TILE_ROW_MAJOR") != nullptr;
     if ((!ToTiled && !row_major_detile) || (ToTiled && !row_major_tile)) {
 #if defined(PROSPER_HAVE_TARGET_AVX2)
-        static const bool use_avx2_gather =
-            std::getenv("PROSPER_NO_AVX2_DETILE") == nullptr &&
-            __builtin_cpu_supports("avx2");
+        static const bool cpu_has_avx2 = __builtin_cpu_supports("avx2");
+        const bool use_avx2_gather = allow_avx2 && cpu_has_avx2 &&
+            std::getenv("PROSPER_NO_AVX2_DETILE") == nullptr;
+        const bool use_avx2_tile = allow_avx2 && cpu_has_avx2 &&
+            std::getenv("PROSPER_NO_AVX2_TILE") == nullptr;
 #endif
             const uint32_t surface_block_rows = (eh + bh - 1) / bh;
             const uint32_t surface_block_cols = (ew + bw - 1) / bw;
@@ -743,16 +819,28 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
                         for (uint32_t iy = 0; iy < rows; ++iy) {
                             const uint32_t y = y0 + iy;
                             const uint16_t y_offset = fy[y];
-                            uint8_t* linear = nullptr;
+                            uint8_t* linear_dst = nullptr;
+                            const uint8_t* linear_src = nullptr;
                             if constexpr (!ToTiled)
-                                linear = dst + (static_cast<size_t>(y) * ew + x0) * bpe;
+                                linear_dst = dst + (static_cast<size_t>(y) * ew + x0) * bpe;
+                            else
+                                linear_src = src + (static_cast<size_t>(y) * ew + x0) * bpe;
 #if defined(PROSPER_HAVE_TARGET_AVX2)
                             if constexpr (!ToTiled) {
                                 if (full_block && (bpe == 2 || bpe == 4 || bpe == 8)) {
                                     if (use_avx2_gather) {
-                                        detile_full_block_row_avx2(linear, src + block_base,
+                                        detile_full_block_row_avx2(linear_dst, src + block_base,
                                                                   fx.data() + x0, y_offset,
                                                                   columns, bpe);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                if (full_block && (bpe == 2 || bpe == 4 || bpe == 8 || bpe == 16)) {
+                                    if (use_avx2_tile) {
+                                        tile_full_block_row_avx2(dst + block_base, linear_src,
+                                                                fx.data() + x0, y_offset,
+                                                                columns, bpe);
                                         continue;
                                     }
                                 }
@@ -778,18 +866,17 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
                                     if (full_block ||
                                         (tiled <= tiled_bytes && bytes <= tiled_bytes - tiled))
                                         copy_swizzled_element(dst + tiled,
-                                                              src + (static_cast<size_t>(y) * ew +
-                                                                     x0 + ix) * bpe,
+                                                              linear_src + static_cast<size_t>(ix) * bpe,
                                                               bytes);
                                 } else {
                                     if (full_block ||
                                         (tiled <= tiled_bytes && bytes <= tiled_bytes - tiled))
                                         copy_swizzled_element(
-                                            linear + static_cast<size_t>(ix) * bpe,
+                                            linear_dst + static_cast<size_t>(ix) * bpe,
                                             src + tiled, bytes);
                                     else
                                         zero_swizzled_element(
-                                            linear + static_cast<size_t>(ix) * bpe, bytes);
+                                            linear_dst + static_cast<size_t>(ix) * bpe, bytes);
                                 }
                                 ix += run;
                             }
@@ -1310,7 +1397,8 @@ std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t wi
 }
 
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
-                  uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
+                  uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel,
+                  bool allow_avx2) {
     tile_census_note("tile_surface", width, height, bytes_per_texel, tile_mode);
     if (!tile_mode_is_tiled(tile_mode)) { std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     const size_t dst_bytes = tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel);
@@ -1344,7 +1432,8 @@ void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t hei
         return;
     }
     if (is_64kb_mode(tile_mode)) {
-        sw64kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes, tile_mode);
+        sw64kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes, tile_mode,
+                          0, allow_avx2);
         return;
     }
     sw4kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes);
