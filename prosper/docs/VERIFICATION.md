@@ -176,10 +176,23 @@ cases carry assertions that only run with a dump — `module_loads_eboot`, `nid_
 so a regression in the paths they cover is caught only by an agent who happens to run the suite
 locally with that title installed, which is not a gate. #2567 carries the measured per-case census.
 
-**Five of the six cannot be synthesized and should not be.** They are pinned to one real title's
+**Four of the six cannot be synthesized and should not be.** They are pinned to one real title's
 bytes — `PPSA24651`'s import counts, its IL2CPP module layout, the RDNA2 blobs embedded in its
 eboot. A synthetic fixture would be a *different* test wearing the same name, which is worse than an
 honest skip.
+
+**Ruled out: `trap_identifies_imports` was never one of them (#2997).** It was counted here because
+it asserted `prog.slots.size() > 500` — PPSA24651's slot count — but that assertion was incidental
+to what the case tests, which is the title-agnostic link → map → stub → dispatch chain. Measured
+across all 55 local dumps: slot counts run from 179 (`PPSA16901`) to over 500, and **all 55 dispatch
+all four probed libraries correctly**. The count made it *fail* — not skip — on four titles,
+including `PPSA15552` (*Dead Cells*, rung 6, guarded) and `PPSA03839` (*Tactics Ogre*, rung 3). With
+the assertion made title-agnostic it passes on 55 of 55, so it is dump-*requiring* but not
+title-pinned, and it needs neither a gate nor a synthetic fixture.
+
+The distinction is the one worth carrying forward: a case that *needs a dump* is not the same as a
+case *pinned to one title's bytes*, and reaching for `prosper_add_title_gated_test` on the first kind
+trades a false red for lost coverage on every other dump.
 
 **`plugin_autolink`'s dump-gated block was the exception, and is now covered without a dump.** What it
 guards — `link_program`'s export table, the duplicate-export collision guard (#1609) and the alias

@@ -23,19 +23,29 @@ int main(int argc, char** argv) {
     if (!link_program({ { dump + "/eboot.bin", 0x400000000ull } }, 0x600000000ull, prog, &err)) {
         printf("  [FAIL] link: %s\n", err.c_str()); return 1;
     }
-    // > 0, not > 500 (#2997). The old threshold was PPSA24651's import count, and this test is not
-    // about how many imports a title has -- it is about the link -> map -> stub -> dispatch chain,
-    // which is title-agnostic. Measured across all 55 local dumps: import tables run from 179 slots
-    // (PPSA16901) to well over 500, so the threshold failed FOUR titles on a property none of them
-    // was doing anything wrong about -- including PPSA15552 (Dead Cells, rung 6) and PPSA03839
-    // (Tactics Ogre, rung 3), so this was not confined to new bring-ups.
+    // NOT `> 500` (#2997). That threshold was PPSA24651's slot count, and this test is not about how
+    // many imports a title has -- it is about the link -> map -> stub -> dispatch chain, which is
+    // title-agnostic. Measured across all 55 local dumps: slot counts run from 179 (PPSA16901) to
+    // over 500, so the threshold FAILED four titles on a property none of them was doing anything
+    // wrong about -- including PPSA15552 (Dead Cells, rung 6) and PPSA03839 (Tactics Ogre, rung 3).
+    // A red case is worse than a skip: it forces a bring-up agent to prove a failure is pre-existing
+    // before trusting anything else in the run.
     //
-    // A red case is materially worse than a skip here: an agent bringing up a title has to prove a
-    // failure is pre-existing before it can trust anything else in the run. Skipping on a
-    // non-Messenger dump was the other option and is what #1573 did for its three siblings, but it
-    // would drop this chain's coverage on the other 54 dumps -- and the chain working is exactly
-    // what a bring-up agent wants to know first.
-    CHECK(!prog.slots.empty(), "link produced no import stub slots at all");
+    // What replaces it is NOT `!slots.empty()`. Review showed that would be strictly SUBSUMED by the
+    // four `slot >= 0` probes below -- no state fails it while those pass -- so it would read as an
+    // assertion while carrying no weight. These are the linker's own accounting invariants instead,
+    // and they are title-agnostic in the way the count only pretended to be:
+    //   * the module imports something at all;
+    //   * every import is accounted for as either cross-module-resolved or stubbed -- this is what
+    //     catches a linker that silently DROPS imports (e.g. deduplicating on the wrong key), which
+    //     a slot-count floor cannot distinguish from a title that simply imports less;
+    //   * every stubbed import actually got a slot, which is the precondition for everything below.
+    CHECK(prog.total_imports > 0, "link produced no imports at all");
+    CHECK(prog.total_imports == prog.resolved_cross_module + prog.stubbed,
+          "import accounting does not close: %zu total != %zu cross-module + %zu stubbed",
+          prog.total_imports, prog.resolved_cross_module, prog.stubbed);
+    CHECK(prog.stubbed == prog.slots.size(),
+          "%zu imports stubbed but %zu slots emitted", prog.stubbed, prog.slots.size());
     for (auto& img : prog.imgs) CHECK(map_image(img, &err), "map: %s", err.c_str());
     CHECK(install_stubs(prog.slots, prog.stub_base, prog.stub_size, &err), "install_stubs: %s", err.c_str());
     install_trap_handler();
