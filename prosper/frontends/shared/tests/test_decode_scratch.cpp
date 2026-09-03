@@ -111,23 +111,37 @@ int main() {
     }
 
     // --- the budget bounds retention, and drops the SMALLEST buffers first -----------------------
+    //
+    // The leases are held SIMULTANEOUSLY on purpose. Taken one at a time the pool would hand the
+    // same buffer back each time and never hold more than one, so the eviction path this asserts
+    // would never run and the test would pass without exercising anything.
     {
-        DecodeScratchPool pool(6u << 20, /*max_retained=*/8);
-        { auto a = pool.take(4u << 20); (void)a.size(); }
-        { auto b = pool.take(1u << 20); (void)b.size(); }
-        { auto c = pool.take(1u << 20); (void)c.size(); }
-        CHECK(pool.retained_bytes() <= (6u << 20));
-        // The big one survives: re-taking it must not have to allocate beyond what is retained.
-        CHECK(pool.retained_bytes() >= (4u << 20));
+        DecodeScratchPool pool(5u << 20, /*max_retained=*/8);
+        {
+            auto a = pool.take(4u << 20);
+            auto b = pool.take(1u << 20);
+            auto c = pool.take(1u << 20);
+            CHECK(a.data() != b.data() && b.data() != c.data() && a.data() != c.data());
+        }
+        // 6 MiB returned against a 5 MiB budget: one 1 MiB buffer goes, the 4 MiB one stays.
+        CHECK(pool.retained_buffers() == 2);
+        CHECK(pool.retained_bytes() == (5u << 20));
+        auto big = pool.take(4u << 20);
+        CHECK(big.size() == (4u << 20));
+        CHECK(pool.retained_bytes() == (1u << 20));   // the survivor really was the big one
     }
 
     // --- max_retained bounds the COUNT independently of the byte budget --------------------------
     {
         DecodeScratchPool pool(1024u << 20, /*max_retained=*/2);
-        { auto a = pool.take(1024); (void)a.size(); }
-        { auto b = pool.take(2048); (void)b.size(); }
-        { auto c = pool.take(4096); (void)c.size(); }
+        {
+            auto a = pool.take(1024);
+            auto b = pool.take(2048);
+            auto c = pool.take(4096);
+            (void)a.size(); (void)b.size(); (void)c.size();
+        }
         CHECK(pool.retained_buffers() == 2);
+        CHECK(pool.retained_bytes() == 2048 + 4096);   // the smallest was the one dropped
     }
 
     // --- retention disabled: every lease is a fresh allocation, i.e. the pre-pool behaviour ------
