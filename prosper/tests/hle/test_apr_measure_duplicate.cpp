@@ -387,15 +387,38 @@ int main() {
             }
             CHECK(fillers.size() == 63, "probe-collision arm: found 63 non-colliding fillers");
 
-            // LOAD-BEARING PRECONDITION: no rebuild may intervene between B's insert and B's
-            // lookup. A rebuild re-inserts only the live entries, which clears every tombstone --
-            // including the one this arm exists to probe past -- and would silently turn the whole
-            // arm into a passing no-op. The threshold is `live + tombs > 128`; this arm reaches
-            // 64 live + 2 tombs = 66, so there are ~62 records of headroom. That is comfortable
-            // today and invisible if someone later shrinks the table, grows the ring, or lowers the
-            // threshold, so the rebuild counter is asserted unchanged across the window rather than
-            // left to a comment. This is the same class the arm itself guards: a silent degradation
-            // that changes no return value.
+            // PRECONDITION -- asserted for DIAGNOSIS, not for detection. Read that distinction
+            // before trusting the assertion below, because the obvious justification for it is
+            // wrong and an earlier version of this comment made it.
+            //
+            // No rebuild may intervene between B's insert and B's lookup: a rebuild re-inserts only
+            // the LIVE entries, which clears the tombstone at H that this arm exists to probe past.
+            // The tempting claim is that this would "silently turn the arm into a passing no-op".
+            // It would not. B's home bucket IS H -- that is how the collision was constructed -- so
+            // after a rebuild B lands at H, `find` resolves it immediately, and the tomb-step
+            // assertion below sees 0 steps and goes RED on its own. Measured, not reasoned: forcing
+            // a rebuild into this window (threshold temporarily 128 -> 32) fails the tomb-step
+            // assertion with `tomb steps 0 -> 0 -> 0`.
+            //
+            // So the arm is already immune to the hazard, and what this CHECK buys is the reason
+            // WHY, at the moment of failure. A future constants change -- a smaller table, a bigger
+            // ring, a lower threshold -- would otherwise present as "a tombstone arm stopped seeing
+            // tombstones", leaving the next person to re-derive the cause. With it, the two
+            // assertions fail together and the second one names it. Headroom today: the threshold
+            // is `live + tombs > 128` and this arm reaches 64 live + 2 tombs = 66.
+            //
+            // WINDOW WIDTH. The load-bearing window is [the evicting record, the lookup], and it
+            // has to START INSIDE that record rather than after it: apr_measure_record creates the
+            // tombstone and then may rebuild in the same call, so a sample taken once the loop
+            // finishes is already past the only rebuild that can hurt. A window from there to the
+            // lookup is vacuously true -- lookups never rebuild -- and would read as meaningful
+            // while asserting nothing. Measured: under a forced rebuild it passed while the arm was
+            // broken, which is why the sample point moved.
+            //
+            // The wider `rebuilds_before == after` is kept as well. It is strictly stronger on a
+            // monotonic counter, and the extra width is wanted rather than tolerated: a rebuild
+            // ANYWHERE in this arm means the constants moved and the slot arithmetic above needs
+            // re-deriving, whether or not this particular run happened to survive it.
             size_t before = 0, rebuilds_before = 0;
             prosper_apr_index_coverage_for_test(&before, &rebuilds_before);
 
@@ -404,21 +427,35 @@ int main() {
             read_file_guest(cb, 0, record, id, dst, kSize, off_a, 0, 0);
             // B: recorded only. It lands one past A, behind the bucket A will vacate.
             measure(id, dst, kSize, off_b, 0, 0);
-            // 62 fillers fill the ring to 64; the 63rd evicts A and tombstones the shared bucket.
-            for (size_t i = 0; i < 63; ++i) {
+            // 62 fillers fill the ring to 64; the 63rd (last) evicts A and tombstones bucket H.
+            for (size_t i = 0; i < 62; ++i) {
                 measure(id, dst, kSize, fillers[i], 0, 0);
                 read_file_guest(cb, 0, record, id, dst, kSize, fillers[i], 0, 0);
             }
+            // Sample BEFORE the evicting record, not after it. apr_measure_record erases the old
+            // entry -- creating the tombstone -- and then, IN THE SAME CALL, may rebuild and destroy
+            // it. A sample taken after the loop therefore sits on the far side of the only rebuild
+            // that can hurt, and comparing it against the post-lookup value is vacuously true: a
+            // lookup never rebuilds, so nothing can happen in between. This split makes the window
+            // contain the one call that matters.
+            size_t rebuilds_pre_evict = 0, dummy2 = 0;
+            prosper_apr_index_coverage_for_test(&dummy2, &rebuilds_pre_evict);
+            measure(id, dst, kSize, fillers[62], 0, 0);
+            read_file_guest(cb, 0, record, id, dst, kSize, fillers[62], 0, 0);
 
             size_t after = 0, rebuilds_mid = 0;
             prosper_apr_index_coverage_for_test(&after, &rebuilds_mid);
+            (void)rebuilds_mid;
             // Now the load-bearing lookup: B is live, its chain starts at the tombstoned bucket.
             read_file_guest(cb, 0, record, id, dst, kSize, off_b, 0, 0);
             size_t after_lookup = 0, rebuilds_after = 0;
             prosper_apr_index_coverage_for_test(&after_lookup, &rebuilds_after);
+            CHECK(rebuilds_pre_evict == rebuilds_after,
+                  "probe-collision arm: no rebuild from the evicting record through the lookup "
+                  "-- the load-bearing window, and the tombstone survived to be probed past");
             CHECK(rebuilds_before == rebuilds_after,
-                  "probe-collision arm: no rebuild intervened, so the tombstone it probes past "
-                  "really was still there (the arm is not a no-op)");
+                  "probe-collision arm: no rebuild anywhere in the arm, so its slot arithmetic "
+                  "still holds (deliberately wider than the load-bearing window)");
 
             char msg[256];
             if (forced_always) {
