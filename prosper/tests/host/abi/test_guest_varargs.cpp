@@ -282,6 +282,26 @@ void check_lookup_accessors() {
            reinterpret_cast<const void*>(printf_fn) == Hle::lookup_address(nid_hash("printf")),
            "lookup_guest_abi returned an address the registry does not hold");
 
+    // (4b) `registered` answers the THIRD question, and must answer it for a guest-ABI handler --
+    //      `lookup` returning nullptr for one must not read as "no handler exists". This is the arm
+    //      that would have caught the `nid_census` miss found in review: that tool reports a NID
+    //      with no registered handler as a return-0 false-success candidate (#2081), so a wrong
+    //      answer here puts five real handlers into a table that is acted on. It has no ctest case
+    //      of its own, so nothing else in the suite can see it.
+    unsigned known = 0;
+    for (const char* name : kGuestAbi) {
+        if (Hle::registered(nid_hash(name))) { ++known; continue; }
+        fail("guest-ABI handlers report as registered",
+             std::string(name) + ": Hle::registered said no handler exists for a registered NID");
+    }
+    expect("registered-arm is not vacuous", known == 5,
+           "expected all five printf-family NIDs to report registered, got " + std::to_string(known));
+    expect("registered agrees with lookup for an ordinary handler",
+           Hle::registered(nid_hash("memcpy")) && Hle::lookup(nid_hash("memcpy")) != nullptr,
+           "registered and lookup disagree about an ordinary host-ABI handler");
+    expect("registered says no for an unregistered NID", !Hle::registered("no-such-nid-xyz"),
+           "Hle::registered claimed a NID that was never registered");
+
     // (5) The category error in the OTHER direction. Asking for the guest convention on an ordinary
     //     host handler must not quietly succeed either -- that mis-types the pointer just as badly,
     //     and it is the mistake a caller makes when they copy the line above to a different NID.
@@ -291,8 +311,10 @@ void check_lookup_accessors() {
 
     // (6) The pointer is USABLE, not merely non-null -- an address that resolves but cannot be
     //     called through would satisfy every arm above. snprintf is the one whose result can be
-    //     asserted without writing to stdout, and the arguments deliberately spill past both
-    //     register files so the call exercises the overflow area rather than registers alone.
+    //     asserted without writing to stdout. Seven integer-class arguments means one spills to the
+    //     overflow area, so the call is not register-only; the single `4.5` uses 1 of the 8 SSE
+    //     slots and does NOT spill, which is fine here -- the FP overflow path is check_executed's
+    //     job, not this arm's.
     auto snprintf_fn =
         Hle::lookup_guest_abi<int, char*, size_t, const char*>(nid_hash("snprintf"));
     expect("lookup_guest_abi resolves snprintf", snprintf_fn != nullptr,

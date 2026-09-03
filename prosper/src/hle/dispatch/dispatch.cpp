@@ -157,6 +157,9 @@ std::vector<RegisteredFn> Hle::registrations() {
                         kv.second.signature, kv.second.guest_abi });
     return out;
 }
+bool Hle::registered(const std::string& nid) {
+    return registry().find(nid) != registry().end();
+}
 const void* Hle::lookup_address(const std::string& nid) {
     auto it = registry().find(nid);
     return it == registry().end() ? nullptr : reinterpret_cast<const void*>(it->second.fn);

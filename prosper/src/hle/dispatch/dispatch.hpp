@@ -162,6 +162,13 @@ public:
     // never call it -- so they are unaffected by the refusal above. Prefer it over `lookup` wherever
     // the value is an address rather than something you intend to invoke.
     static const void* lookup_address(const std::string& nid);
+    // "Is there a handler for this NID at all?" -- a THIRD question, and the one that made the
+    // split necessary rather than merely tidy. It is not "give me something callable" (`lookup`)
+    // and not "give me the address" (`lookup_address`), and before #3272 all three were spelled
+    // `lookup(nid) != nullptr`. Two callers asking it that way broke the moment `lookup` learned to
+    // refuse -- `test_hle_registered` and `nid_census`, the latter with no ctest case, so nothing
+    // would have gone red. Spell the question so a fourth caller does not have to improvise it.
+    static bool registered(const std::string& nid);
     // A pointer type in the GUEST's calling convention. Spelled once, here, so no caller has to.
     template <class R, class... A>
     using GuestAbiFn = PROSPER_GUEST_ABI R (*)(A..., ...);
