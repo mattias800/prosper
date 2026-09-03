@@ -3905,12 +3905,30 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // 62,000/62,000, first word 0x00000000 in both, differing only in plane size (73,728 vs
         // 49,152 words, i.e. resolution). A "uniform plane means a fast clear" discriminator was
         // hypothesised and MEASURED FALSE before it was written; PROSPER_HTILE_UNIFORMLOG below is
-        // the instrument that killed it. So this restores behaviour known to be correct for both
-        // titles without knowing why the same event needs opposite handling, and the actual fix the
-        // comment above still names -- decoding HTILE to tell a clear from a refresh -- remains open.
-        const bool byte_preserving =
-            std::strcmp(prosper::gpu::guest_gpu_write_origin(), "gpu-preserving") == 0;
-        const bool htile_kill = htile_overlap && htile_invalidates && !byte_preserving;
+        // the instrument that killed it.
+        // #3264: the `!byte_preserving` term is REMOVED, not weakened. It suppressed the
+        // invalidation whenever the write carried the `gpu-preserving` origin, and that is unsound
+        // for the reason GTA5_STATUS.md's own Ruled out section recorded on 2026-08-28 (#3089), one
+        // day before it was reinstated: prosper never writes rendered HiZ back into the guest HTILE
+        // plane, so the guest copy is a constant the guest's own writes keep reproducing, and the
+        // byte comparator reports `changed=0` for a fast CLEAR exactly as readily as for the
+        // decompress the rule was written for.
+        //
+        // There was never a trade-off between the two titles. Suppressing the invalidation leaves
+        // STALE DEPTH, and the two titles present the same defect differently -- Blue Prince fails
+        // the depth test against it and draws nothing, GTA V samples it and hangs the GPU. Measured
+        // on one binary pair, same session, same routes:
+        //
+        //   Blue Prince title    4/5 frames render (256 distinct)  vs  0/5 (2 distinct)
+        //   GTA V routed world   8/8 render, 0 device losses       vs  3/8 then black, 122 losses
+        //
+        // Dead Cells #611 is the prior counterexample where sparing the invalidation makes gameplay
+        // geometry disappear, so this rule has now cost three titles. Restoring it again needs the
+        // discriminator its own author named and did not build: decode HTILE to tell a clear from a
+        // refresh. A byte comparison cannot, and the `gpu-preserving` origin is a process-global set
+        // by whichever write ran last (gpu_executor.cpp, `g_guest_write_origin`), so keying on it is
+        // order-dependent by construction.
+        const bool htile_kill = htile_overlap && htile_invalidates;
         if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
         if (depth_overlap || htile_kill) image.depth_valid = false;
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
