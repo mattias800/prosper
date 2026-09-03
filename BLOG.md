@@ -26,7 +26,8 @@ from the tracker issues, and still gated, because it is a projection of state ra
 No picture, and the number is the point. #2945 is the smallest reproduction we have of the
 renderer's nondeterminism — one captured frame, replayed offline, coming back different every few
 runs. Re-measured overnight it did not vary once: 3,875 replays across two captures, two builds and
-two Vulkan drivers, over 1.75 hours, against a recorded 5-distinct-hashes-in-15 a fortnight ago.
+two Vulkan drivers, over a 1.75-hour window, against a recorded 5-distinct-hashes-in-15 a
+fortnight ago.
 The verdict is still not "fixed", because the bare-Vulkan control that reproduces the same defect
 with no prosper code in the process stayed quiet too — and a quiet window looks exactly like a
 repaired renderer, so the new campaign tool reports UNDECIDED and names the two things it cannot

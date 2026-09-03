@@ -1389,6 +1389,17 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   this section the campaign has not shown that it met a window in which this class is expressible.
   That is what `replay_determinism_report.py` prints, and the sentence to quote is "no instance
   observed in 3,875 replays over a 1.75 h window", never "the renderer is deterministic". #2945.
+- **The corrected control parse, re-run: still 0 fires, now properly counted.** The parse above read
+  only the first of `vkprobe`'s per-pattern readback lines; aggregated across all of them and re-run
+  on the same box under alternating self-load, **600 rounds, 0 failing, 600 usable replays and 1
+  distinct hash** over a 0.48 h window (GPU busy 0-16%, mean ~7%). So the weaker claim and the
+  strong one now agree, and "the control did not fire" is a properly counted statement rather than
+  a statement about lexicographic order. It does not change the verdict: a control that does not
+  fire leaves the campaign UNDECIDED however carefully it is counted, and **that is now the finding
+  worth acting on — the failing regime cannot be reproduced on this box at all.** Until someone can
+  make `vkprobe` fail here again, every determinism campaign on this issue returns UNDECIDED by
+  construction, and the open question is what stopped the box entering that regime rather than
+  whether prosper is clean. #2945.
 
 
 ## Recommended implementation order
