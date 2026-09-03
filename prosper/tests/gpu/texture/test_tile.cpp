@@ -1268,6 +1268,64 @@ int main() {
         }
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // DESTINATION COVERAGE. The frontend materializer hands detile_surface a POOLED buffer that
+    // still holds the previous surface's bytes (frontends/shared/live/decode_scratch.hpp), so it
+    // relies on `detile_writes_whole_destination` to say when it may skip pre-zeroing.
+    // A false positive there is a silent wrong picture, so assert it by filling the destination
+    // with poison and requiring that none of it survives.
+    {
+        const uint32_t modes[] = {
+            (uint32_t)TileMode::Linear,  (uint32_t)TileMode::Sw256BS, (uint32_t)TileMode::Sw4KbS,
+            (uint32_t)TileMode::Sw64KbS, (uint32_t)TileMode::Sw64KbZX, (uint32_t)TileMode::Sw64KbRX,
+        };
+        // Block-aligned and deliberately ragged extents: partial blocks are where a copier that
+        // bounds itself by the tiled source would leave a hole.
+        const uint32_t sizes[][2] = {{256, 128}, {129, 67}, {1920, 1080}, {3840, 2176}, {7, 3}};
+        bool any_true = false, any_false = false;
+        for (const uint32_t M : modes) {
+            for (const uint32_t bpe : {1u, 2u, 4u, 8u, 16u}) {
+                for (const auto& wh : sizes) {
+                    const uint32_t W = wh[0], H = wh[1];
+                    const size_t dst_bytes = (size_t)W * H * bpe;
+                    if (dst_bytes > (96u << 20)) continue;   // keep the sweep's wall time bounded
+                    // Only the coverage claim is under test, so give the detiler a COMPLETE source:
+                    // a short one legitimately zero-fills, which is a different contract.
+                    const size_t tb = std::max<size_t>(
+                        tiled_surface_bytes(W, H, M, 0, bpe), dst_bytes);
+                    // The poison byte is excluded from the source, so a surviving one is
+                    // unambiguous -- it can only be a destination byte nothing wrote.
+                    std::vector<uint8_t> src(tb);
+                    for (size_t i = 0; i < tb; i++) {
+                        uint8_t v = (uint8_t)((i * 31u + 5u) ^ (i >> 7));
+                        src[i] = (v == 0xDB) ? 0x00 : v;
+                    }
+                    std::vector<uint8_t> dst(dst_bytes, 0xDB);   // poison
+                    detile_surface(dst.data(), src.data(), W, H, M, 0, bpe);
+                    const bool claims_full = detile_writes_whole_destination(M, bpe);
+                    (claims_full ? any_true : any_false) = true;
+                    if (!claims_full) continue;
+                    size_t survivors = 0;
+                    for (size_t i = 0; i < dst_bytes; i++) survivors += (dst[i] == 0xDB);
+                    if (survivors) {
+                        printf("  [FAIL] detile_surface left %zu poison bytes for mode=%u bpe=%u "
+                               "%ux%u while claiming whole-destination coverage\n",
+                               survivors, M, bpe, W, H);
+                        fails++;
+                    }
+                }
+            }
+        }
+        CHECK(any_true, "coverage predicate accepts the shapes the materializer actually uses");
+        // Mutation arm by construction, not by exit code alone: the predicate must be able to say
+        // NO, or "claims_full" above is vacuous and the poison sweep tested nothing.
+        CHECK(!detile_writes_whole_destination((uint32_t)TileMode::Sw64KbRX, 6u),
+              "coverage predicate refuses a 64KB element size its pattern tables do not cover");
+        CHECK(detile_writes_whole_destination((uint32_t)TileMode::Sw64KbRX, 8u),
+              "coverage predicate accepts a 64KB element size the tables do cover");
+        (void)any_false;
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

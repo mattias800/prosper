@@ -105,6 +105,21 @@ struct TileCensusScope {
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
+// Do `detile_surface` and `detile_elements` write EVERY byte of their width*height*bytes_per_element
+// destination for this shape? True means a caller may hand them an uninitialised buffer; false means
+// the caller must zero the destination first, because one copier below stops at the TILED source
+// size and would leave the remainder holding whatever was there. Both entry points route to the same
+// three copiers with the same guard, so they share one answer. It does NOT extend to
+// `detile_volume` or the mip-tail `*_level` variants, whose destinations are not covered here.
+//
+// This exists so the answer lives beside the implementation it describes rather than in a caller's
+// comment. The frontend materializer hands `detile_surface` a POOLED buffer that still holds the
+// previous surface (`frontends/shared/live/decode_scratch.hpp`), so "the destination is zero unless
+// something writes it" stopped being true there, and a wrong answer here is a silent wrong picture
+// rather than a crash. `tests/gpu/texture/test_tile.cpp` fills the destination with poison and
+// asserts none survives, for every shape this returns true for.
+bool detile_writes_whole_destination(uint32_t tile_mode, uint32_t bytes_per_texel);
+
 // Convenience wrapper: detile `src` (tiled) into a returned linear vector. Returns a copy of `src` for
 // linear/unknown modes.
 std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t width, uint32_t height,

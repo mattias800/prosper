@@ -1377,6 +1377,18 @@ void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t h
                       sw4kb_tiled_bytes(width, height, pitch, bytes_per_texel));
 }
 
+bool detile_writes_whole_destination(uint32_t tile_mode, uint32_t bytes_per_texel) {
+    // Untiled: a straight memcpy of exactly width*height*bytes_per_texel.
+    if (!tile_mode_is_tiled(tile_mode)) return true;
+    // sw256_copy and sw4kb_copy iterate every (x, y) in the surface and either copy the element or
+    // memset it to zero, for any bpe their lookup accepts -- there is no early-out that writes less.
+    if (tile_mode == (uint32_t)TileMode::Sw256BS) return true;
+    // sw64kb_copy has one: an element size its pattern tables do not cover falls back to
+    // `memcpy(dst, src, min(n, tiled_bytes))`, which can stop short of the destination.
+    if (is_64kb_mode(tile_mode)) return sw64kb_elem_log2(bytes_per_texel) != UINT32_MAX;
+    return true;
+}
+
 std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t width, uint32_t height,
                                     uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
     std::vector<uint8_t> out((size_t)width * height * bytes_per_texel, 0);
