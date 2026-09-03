@@ -266,13 +266,30 @@ int main() {
         auto& image = prosper::test::persistent_ds_cache()[key];
         image.depth_valid = true;
         image.stencil_valid = true;
+        image.last_depth_write = 1;
+        image.last_depth_present = prosper::gpu::present_count();
 
         prosper::gpu::set_guest_gpu_write_origin("gpu-preserving");
         const size_t preserved =
             prosper::test::invalidate_persistent_ds_guest_write(kHtile, 4096);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
         check(preserved == 0 && image.depth_valid && image.stencil_valid,
-              "a byte-preserving HTILE rewrite preserves both retained aspects (#3121)");
+              "a byte-preserving HTILE rewrite on current-frame depth preserves both retained aspects (#3121)");
+
+        // If the depth was rendered in a prior frame (present_count advanced),
+        // a byte-preserving HTILE clear must discard the stale prior-frame depth
+        // so the new frame starts fresh (Blue Prince #3264).
+        image.depth_valid = true;
+        image.stencil_valid = true;
+        image.last_depth_write = 1;
+        image.last_depth_present = prosper::gpu::present_count() - 1;
+
+        prosper::gpu::set_guest_gpu_write_origin("gpu-preserving");
+        const size_t prior_frame_cleared =
+            prosper::test::invalidate_persistent_ds_guest_write(kHtile, 4096);
+        prosper::gpu::set_guest_gpu_write_origin(nullptr);
+        check(prior_frame_cleared == 1 && !image.depth_valid && !image.stencil_valid,
+              "a byte-preserving HTILE rewrite on prior-frame depth invalidates stale depth (#3264)");
 
         // The changed-origin arm is kept beside it so the assertion above cannot pass merely
         // because HTILE invalidation stopped firing at all -- which is the mutation that would
