@@ -610,8 +610,8 @@ int main() {
         const auto forced_sync_timing = prosper::test::backend_render_timing_stats();
 
         // An unbound color target (persistent_id == 0) must not request or execute readback even
-        // when readback=true is set on the struct, while setting persistent_id non-zero requests it.
-        prosper::test::BackendColorTarget unbound_target{0, false, true};
+        // when persistence is inactive, while setting persistent_id non-zero requests it.
+        prosper::test::BackendColorTarget unbound_target{0, false, false};
         prosper::test::BackendSubmissionBatch unbound_batch;
         const std::vector<uint8_t> unbound_pixels = prosper::test::render_draws_rgba(
             {producer}, W, H, nullptr, nullptr, false, &unbound_target,

@@ -10170,9 +10170,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !(bi.exact_result_bytes & 15u) &&
                     !force_host_result_fallback && ctx.prepare_compare_pipeline();
                 if (bi.persistent && !retain_gpu_result_baseline &&
-                    !cold_storage_result_snapshot_can_defer(
-                        r->host_data != nullptr, bi.seed_skip, bi.guest_bytes,
-                        cold_storage_result_snapshot_defer_min_bytes()))
+                    (force_host_result_fallback || bi.exact_result_bytes <= max_gpu_compare_image_bytes()))
                     ctx.remember_cached_image_result(
                         bi.cache_key, native_texels,
                         static_cast<size_t>(bi.exact_result_bytes));
