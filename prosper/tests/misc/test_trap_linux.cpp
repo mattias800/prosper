@@ -36,10 +36,17 @@ int main(int argc, char** argv) {
     // assertion while carrying no weight. These are the linker's own accounting invariants instead,
     // and they are title-agnostic in the way the count only pretended to be:
     //   * the module imports something at all;
-    //   * every import is accounted for as either cross-module-resolved or stubbed -- this is what
-    //     catches a linker that silently DROPS imports (e.g. deduplicating on the wrong key), which
-    //     a slot-count floor cannot distinguish from a title that simply imports less;
-    //   * every stubbed import actually got a slot, which is the precondition for everything below.
+    //   * every import is accounted for as either cross-module-resolved or stubbed. This cannot fail
+    //     on any input: pass 2's body increments total_imports and then exactly one of the other two
+    //     (linker.cpp:115 / :119 / :131), with no third path. It is an EDIT guard, not a detector --
+    //     it fires if a future filter or early-out counts an import without accounting for it.
+    //   * every stubbed import got its OWN slot. This is the one that carries weight: deduplicating
+    //     on the wrong key (lib instead of NID) leaves the accounting identity intact -- 612 == 0 +
+    //     612 on PPSA24651 -- while collapsing 612 slots to 35, which is what a slot-count floor
+    //     could not tell apart from a title that simply imports less. It is an equality only because
+    //     no eboot imports the same NID twice: MEASURED at 0 duplicates across all 55 dumps, not
+    //     derived (module.cpp:221 does not dedupe imports, and linker.cpp:122 keys the slot table on
+    //     the NID alone).
     CHECK(prog.total_imports > 0, "link produced no imports at all");
     CHECK(prog.total_imports == prog.resolved_cross_module + prog.stubbed,
           "import accounting does not close: %zu total != %zu cross-module + %zu stubbed",
