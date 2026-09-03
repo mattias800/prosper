@@ -44,8 +44,10 @@ elsewhere, and looking for them here is the mistake to avoid:
 - **`sceHttp2Init`, `sceNetCtlGetState` and the NetCtl/NP service surface live in
   `../service/hle_service.cpp`**, not here. That is why `libSceHttp2` looks absent from this folder
   while one of its entry points is already registered.
-- Answers must not contradict each other across that boundary. `sceNetCtlGetState` already reports
-  `SCE_NET_CTL_ERROR_NOT_CONNECTED`, so an HTTP layer that reported a successful request would be
-  telling the same guest two incompatible things.
+- Answers must not contradict each other across that boundary. prosper already tells the guest it
+  is offline there — `sceNetCtlGetState` writes `SCE_NET_CTL_STATE_DISCONNECTED` and
+  `sceNetCtlGetInfo` returns `SCE_NET_CTL_ERROR_NOT_CONNECTED` (`hle_service.cpp:4795`, `:4830`) —
+  so an HTTP layer that reported a successful request would be telling the same guest two
+  incompatible things.
 
 New Sony networking libraries that prosper answers itself belong here, one file per library.

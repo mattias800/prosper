@@ -140,8 +140,9 @@ For the send path specifically, the real library does not return an HTTP error a
 failure it propagates the **raw libSceNet error**, pinned by `0x80410124` being special-cased as
 *not* a failure at libSceHttp2's `sceNetConnect` site (`0x24` = 36 = `EINPROGRESS`), which fixes the
 encoding as `0x80410100 | BSD errno`. That makes `ENETUNREACH` the honest offline answer, and it is
-consistent with what prosper already tells this guest through `sceNetCtlGetState`
-(`SCE_NET_CTL_ERROR_NOT_CONNECTED`). Full derivation, per-NID export map and argument shapes are on
+consistent with what prosper already tells this guest through NetCtl: `sceNetCtlGetState` writes
+`SCE_NET_CTL_STATE_DISCONNECTED` and `sceNetCtlGetInfo` returns `SCE_NET_CTL_ERROR_NOT_CONNECTED`
+(`hle_service.cpp:4795`, `:4830`). Full derivation, per-NID export map and argument shapes are on
 #2894; start there rather than re-deriving.
 
 Other unimplemented NIDs seen on the same boot, none of which is implicated in the fault:
