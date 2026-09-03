@@ -1300,6 +1300,106 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   against 0.13) and the load rows explain the association at least as well as an amplifier does:
   prosper's reproduction generates its own GPU load. Do not spend anything more on it before the
   driver defect is reported. #2945.
+- **The GOOD hash moves; the FAILURE hash cannot move for a RASTERIZATION reason. Key any
+  determinism harness on the failure.** BALAN's `s3537 --draw 42` rendered `9068fcf09de07383` on
+  2026-08-23 and `ccc433ff6d980383` on 2026-09-02. The failure value `a5e7b61cbf984383` did not
+  move, and the reason is structural rather than empirical: "the draw drew nothing" leaves the
+  scanout exactly as the capsule seeded it, so the output hash is the SEED's hash — which the
+  capsule carries and `gpu_replay <capsule> --inspect-only` prints, four lines above where this
+  section quotes it:
+  `rtt-seed addr=0000009fc0000000 extent=3840x2160 format=rgba8 bytes=33177600 hash=a5e7b61cbf984383`.
+  Both values come from the same `gpu_capture_hash` over a byte vector, so the identity is exact,
+  not an observed coincidence. What is NOT claimed here is why the good value moved: the row four
+  below shows the *rebuilt 2026-08-23 binary* returning the same new value, which rules out the
+  obvious explanation that the renderer changed the picture. An earlier version of this row asserted
+  that explanation and cited "43 commits touching `src/render` and `src/gpu`" — wrong three ways:
+  the causal claim is falsified by that row, `prosper/src/render` exists at neither endpoint (the
+  path matched nothing), and the count over `prosper/src/gpu` is 657 first-parent commits. The
+  operative half is untouched by any of it: **a harness keyed on the good hash reports every round
+  of a perfectly healthy renderer as a failure.** `tools/vkprobe/correlate_with_replay.sh` shipped
+  with exactly that keying and would score 100% `other` on current `main`; it now derives the
+  failure key from the capsule and reads `bad`/`rendered`. #2945.
+- **A hand-made positive instance of the failure costs one command, and no determinism null on this
+  issue should be believed without one.** The characterised mechanism is "every storage-buffer load
+  in the vertex shader returns 0", so supply that by hand rather than waiting for it:
+
+  ```bash
+  head -c 192 /dev/zero > zeros.bin        # binding 3 is 6 records x 32 bytes; --list-resources 42:vs
+  gpu_replay s3537.prgcap --draw 42 --override-resource 42:vs:3 zeros.bin out.bmp
+  #   [resource-override] draw=42 stage=vs binding=3 ... new-hash=fea2d2bd51234c83
+  #   output=3840x2160 target=0000009fc0000000 draw=42 hash=a5e7b61cbf984383   <- the failure value
+  ```
+
+  This is the same-source-control trap in reverse (instrument trap 122): a campaign that has never
+  shown its own apparatus reporting the class cannot distinguish a clean renderer from a blind
+  harness. #2945.
+- **The trigger row's "heavy GPU load" means concurrent SUBMISSION, not a busy GPU — the documented
+  recipe barely moves the utilisation.** Three concurrent full-submit `gpu_replay` replays of the
+  650 MB `s3537` capsule — the exact recipe recorded above as flipping a passing box within one
+  round — take amdgpu's `gpu_busy_percent` from an idle 0–2% to about **5–9%**, with the CPU load
+  average above 13. The replays are CPU-bound on capsule parsing and resource upload. So do not
+  read "the GPU was loaded" into that row, and do not treat a low utilisation figure as evidence
+  that a load arm failed to arm. `tools/determinism/replay_determinism.sh` records
+  `gpu_busy_percent` on every row so the load condition measures its own premise instead of
+  assuming it. #2945.
+- **The SAME binary and the SAME capsule render a different picture today than on 2026-08-23, so no
+  hash recorded in this section is a durable oracle.** `s3537.prgcap --draw 42` is written up above
+  as a binary outcome between `9068fcf09de07383` (rendered) and `a5e7b61cbf984383` (drew nothing).
+  Rebuilt from the exact commit the capsule carries (`rev=08c23efd`) and replayed on 2026-09-02,
+  that binary returns **`ccc433ff6d980383`** — 5 of 5 on the host (Mesa 26.2.1) and 3 of 3 inside
+  the build container (Mesa **26.1.4**, the version the original figure was taken on). Current
+  `main` returns the same value. So the moved value is not prosper's doing and not a Mesa
+  userspace-version difference; the other thing that moved on this box is the kernel, 7.1.5 →
+  7.2.1. `ccc433ff6d980383` is a real render rather than a new failure mode: it differs from the
+  untouched seed on 100% of sampled pixels, because that draw covers the whole 3840x2160 target.
+  Caveat stated plainly: the rebuild is the same source at the same commit, not provably the same
+  object bytes as the build that produced the 2026-08-23 figure. #2945.
+- **RE-MEASURED 2026-09-03: 3,875 replays, one output hash per arm, and the verdict is still
+  UNDECIDED rather than "fixed".** Four campaigns run through
+  `tools/determinism/replay_determinism.sh`, unloaded and self-loaded blocks alternating, peers
+  recorded per row:
+
+  | campaign | binary / driver | subject | replays | distinct hashes | span |
+  | --- | --- | --- | --- | --- | --- |
+  | `new` | current `main`, host Mesa 26.2.1 | `s3537` whole submit / `--draw 42` | 707 / 706 | **1 / 1** | 1.75 h |
+  | `old` | rebuilt `08c23efd`, host Mesa 26.2.1 | same | 701 / 701 | **1 / 1** | 1.75 h |
+  | `container` | current `main`, container Mesa **26.1.4** | same | 296 / 295 | **1 / 1** | 1.13 h |
+  | `stray` | current `main`, host | a seven-submit *Stray* `.prgbundle` | 469 | **1** | 1.73 h |
+
+  Against the 2026-08-23 figure of **5 distinct hashes over 15 replays** of the same submit, i.e. a
+  53% per-replay non-modal rate. With 0 deviations the 95% upper bound is 0.42% on the largest arm.
+  GPU utilisation over the campaign was 0-37% (mean ~11%), and six full `ctest --no-tests=error -j4`
+  runs taken during it were 345/345 six times over — the `-j4` load regime #2937 was found in.
+
+  **Three qualifications, all of which narrow the claim rather than the verdict.** (1) The four
+  campaigns ran CONCURRENTLY: their spans sum to 6.37 h inside a **1.75 h** wall-clock window, so
+  the dataset samples 1.75 h four times over, not seven hours — and each campaign was load for the
+  others, which means **no row labelled `no-selfload` was taken on an idle GPU**. Read the
+  `gpu_pct` column, not the condition label. (2) The control figure was taken by a parse that read
+  only the first of `vkprobe`'s per-pattern readback lines, and the correct pattern sorts before the
+  common wrong ones, so the honest statement of it is **"no round's lexicographically-smallest
+  indexed readback pattern was other than the correct one in 2,172 rounds"** — weaker than "the
+  control fired 0 times", and conservative in the direction that matters (a missed fire pushes the
+  verdict toward UNDECIDED, never toward DETERMINISTIC). The parse now aggregates every line; the
+  corrected re-run is the row below. (3) Every subject row carried a real hash — 0 of 3,875 recorded
+  `none` — which had to be checked rather than assumed, because the runner recorded exactly that for
+  every bundle replay until #3270 taught it that `--bundle` prints no `output=` line.
+
+  None of that moves the verdict, which is **UNDECIDED** either way: by the drift row at the top of
+  this section the campaign has not shown that it met a window in which this class is expressible.
+  That is what `replay_determinism_report.py` prints, and the sentence to quote is "no instance
+  observed in 3,875 replays over a 1.75 h window", never "the renderer is deterministic". #2945.
+- **The corrected control parse, re-run: still 0 fires, now properly counted.** The parse above read
+  only the first of `vkprobe`'s per-pattern readback lines; aggregated across all of them and re-run
+  on the same box under alternating self-load, **600 rounds, 0 failing, 600 usable replays and 1
+  distinct hash** over a 0.48 h window (GPU busy 0-16%, mean ~7%). So the weaker claim and the
+  strong one now agree, and "the control did not fire" is a properly counted statement rather than
+  a statement about lexicographic order. It does not change the verdict: a control that does not
+  fire leaves the campaign UNDECIDED however carefully it is counted, and **that is now the finding
+  worth acting on — the failing regime cannot be reproduced on this box at all.** Until someone can
+  make `vkprobe` fail here again, every determinism campaign on this issue returns UNDECIDED by
+  construction, and the open question is what stopped the box entering that regime rather than
+  whether prosper is clean. #2945.
 
 
 ## Recommended implementation order
