@@ -28,15 +28,27 @@
 // looks like one and is 11x faster than doing nothing.
 //
 // `PR_SET_DUMPABLE` is decided in the kernel before the handler is reached, so nothing is spawned:
-// 87x faster again, and the only arm that leaves no journal entry.
+// faster again by roughly two orders of magnitude, and the only arm that leaves no `coredumpctl`
+// entry. NOT "no journal entry" -- an earlier draft said that and it is false: every crash still
+// writes an `audit ANOM_ABEND` and a `kernel: ... segfault at ...` line whatever the arm, which one
+// `journalctl | grep` falsifies. Treat the multipliers as approximate; the unlimited arm alone
+// ranges from about 4 s to 58 s for 20 crashes depending on machine load.
 //
 // (Checking this the cheap way — crash under `ulimit -c 0` and look in /var/lib/systemd/coredump —
 // finds no file and reads as though the flag worked. `coredumpctl list`'s COREFILE column shows
 // `none` for those entries, which is the distinction the earlier draft missed.)
 //
-// Call it in the CHILD, as early as possible and always before the deliberate death. It is
-// deliberately not called for the parent: a test process that crashes UNEXPECTEDLY should still
-// leave a dump, because that one is worth opening.
+// Call it in the CHILD, as early as possible -- and before the deliberate death where there is one.
+// Children that are expected to LIVE may call it too; they simply have nothing to suppress, and a
+// conditional would be more code for no behaviour. It is deliberately not called for the parent: a
+// test process that crashes UNEXPECTEDLY should still leave a dump, because that one is worth
+// opening.
+//
+// One cost this accepts, invisible at the call site: with no dump stored, a SIGSEGV inside prosper's
+// allocator and `test_libc_alloc`'s expected SIGABRT look identical to anyone debugging a red
+// `libc_alloc` -- both merely satisfy its `!= 0`, and `coredumpctl`'s signal column can no longer
+// tell them apart. If that test goes red for a reason you cannot explain, re-run the one child
+// without the suppression.
 #pragma once
 
 #if defined(__linux__)
