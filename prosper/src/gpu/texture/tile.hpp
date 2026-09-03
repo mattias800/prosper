@@ -113,7 +113,8 @@ std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t wi
 // Inverse of detile_surface (linear -> tiled). Provided for testing the round-trip; the runtime only
 // detiles. Same parameters.
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
-                  uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
+                  uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4,
+                  bool allow_avx2 = true);
 
 // Exact GFX10 2D-MSAA materialization. The guest swizzle includes sample-coordinate bits in every
 // 64 KiB block; treating it as an ordinary surface both under-reads the allocation and scrambles

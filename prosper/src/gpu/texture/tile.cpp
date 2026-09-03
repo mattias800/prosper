@@ -761,7 +761,7 @@ void tile_full_block_row_avx2(uint8_t* tiled_block, const uint8_t* linear_src,
 template <bool ToTiled>
 void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uint32_t pitch,
                  uint32_t bpe, size_t tiled_bytes, uint32_t tile_mode,
-                 size_t tiled_origin = 0) {
+                 size_t tiled_origin = 0, bool allow_avx2 = true) {
     uint32_t el = sw64kb_elem_log2(bpe);
     if (el == UINT32_MAX) {
         const size_t n = (size_t)ew * eh * bpe;
@@ -795,9 +795,9 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
     if ((!ToTiled && !row_major_detile) || (ToTiled && !row_major_tile)) {
 #if defined(PROSPER_HAVE_TARGET_AVX2)
         static const bool cpu_has_avx2 = __builtin_cpu_supports("avx2");
-        const bool use_avx2_gather = cpu_has_avx2 &&
+        const bool use_avx2_gather = allow_avx2 && cpu_has_avx2 &&
             std::getenv("PROSPER_NO_AVX2_DETILE") == nullptr;
-        const bool use_avx2_tile = cpu_has_avx2 &&
+        const bool use_avx2_tile = allow_avx2 && cpu_has_avx2 &&
             std::getenv("PROSPER_NO_AVX2_TILE") == nullptr;
 #endif
             const uint32_t surface_block_rows = (eh + bh - 1) / bh;
@@ -1397,7 +1397,8 @@ std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t wi
 }
 
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
-                  uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
+                  uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel,
+                  bool allow_avx2) {
     tile_census_note("tile_surface", width, height, bytes_per_texel, tile_mode);
     if (!tile_mode_is_tiled(tile_mode)) { std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     const size_t dst_bytes = tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel);
@@ -1431,7 +1432,8 @@ void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t hei
         return;
     }
     if (is_64kb_mode(tile_mode)) {
-        sw64kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes, tile_mode);
+        sw64kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes, tile_mode,
+                          0, allow_avx2);
         return;
     }
     sw4kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes);

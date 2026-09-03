@@ -15,14 +15,6 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
-static void set_env_var(const char* name, const char* value) {
-#if defined(_WIN32)
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1);
-    else       unsetenv(name);
-#endif
-}
 
 // A linear image where each texel encodes its (x,y) so any misplacement is detectable.
 static std::vector<uint8_t> make_ref(uint32_t w, uint32_t h) {
@@ -1262,12 +1254,16 @@ int main() {
                 const size_t tb = tiled_surface_bytes(W, H, M, 0, bpe);
                 std::vector<uint8_t> tiled_avx2(tb, 0);
                 std::vector<uint8_t> tiled_scalar(tb, 0);
-                tile_surface(tiled_avx2.data(), lin.data(), W, H, M, 0, bpe);
-                set_env_var("PROSPER_NO_AVX2_TILE", "1");
-                tile_surface(tiled_scalar.data(), lin.data(), W, H, M, 0, bpe);
-                set_env_var("PROSPER_NO_AVX2_TILE", nullptr);
+                tile_surface(tiled_avx2.data(), lin.data(), W, H, M, 0, bpe, /*allow_avx2=*/true);
+                tile_surface(tiled_scalar.data(), lin.data(), W, H, M, 0, bpe, /*allow_avx2=*/false);
                 CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) == 0,
                       "AVX2 tile_surface matches scalar tile_surface byte-for-byte");
+
+                // Mutation arm: verify the comparison is strictly discriminating by mutating
+                // a byte in the tiled buffer and asserting a mismatch against the scalar baseline.
+                tiled_avx2[tb / 2 + 13] ^= 0xa5;
+                CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) != 0,
+                      "mutation arm: corrupted tile buffer fails equality against scalar baseline");
             }
         }
     }
