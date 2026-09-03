@@ -2497,10 +2497,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const uint64_t decode_generation = persistent_decode_generation;
             static thread_local std::vector<std::shared_ptr<const std::vector<uint8_t>>>
                 retired_submit_pixels;
+            static size_t retired_submit_bytes = 0;
             if (rebuild_decode_scope) {
                 decoded_textures.clear();
                 texstore_pinned.assign(texstore.size(), false);
                 retired_submit_pixels.clear();
+                retired_submit_bytes = 0;
             }
             static uint64_t persistent_texture_id = 0;
             static std::vector<uint8_t> persistent_validation_scratch;
@@ -6376,13 +6378,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 inherited_persistent_version = old->second.persistent_version;
                             }
                             // An identity already established earlier in this submit may be re-decoded
-                            // if an interleaved guest GPU write mutated its backing. Retired pixels are
-                            // retained in `retired_submit_pixels` so prior draws in this submit that hold
-                            // pointers to those bytes remain safe, while the persistent entry is
-                            // replaced with the newly de-tiled pixels and updated validation baseline (#3283).
+                            // if an interleaved guest GPU write mutated its backing. Only if it was used in
+                            // the current submit (last_use == decode_generation) might earlier draws hold
+                            // raw pointers to those bytes, so those allocations are retained in submit-scoped
+                            // `retired_submit_pixels` until the submit scope completes (#3283).
+                            // Retired bytes are tracked separately in `retired_submit_bytes` and deliberately
+                            // held resident off-ledger for the submit's duration to ensure pointer safety.
                             if (old != persistent_decoded_textures.end()) {
-                                if (old->second.pixels)
+                                if (old->second.pixels && old->second.last_use == decode_generation) {
+                                    retired_submit_bytes += old->second.bytes();
                                     retired_submit_pixels.push_back(old->second.pixels);
+                                }
                                 persistent_decoded_texture_bytes -= old->second.bytes();
                                 persistent_decoded_textures.erase(old);
                             }
@@ -6399,8 +6405,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         it->second.last_use < victim->second.last_use) victim = it;
                                 }
                                 if (victim == persistent_decoded_textures.end()) break;
-                                if (victim->second.pixels)
-                                    retired_submit_pixels.push_back(victim->second.pixels);
+                                // Victims are from prior submits (last_use < decode_generation) with no live
+                                // references in the current submit, so erasing them releases their memory immediately.
                                 persistent_decoded_texture_bytes -= victim->second.bytes();
                                 persistent_decoded_textures.erase(victim);
                             }
