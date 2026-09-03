@@ -2151,6 +2151,14 @@ int main() {
               "typed R16_UINT storage remains byte-exact for an R16_UNORM graphics consumer");
         CHECK(alias_imported && alias_format == 70u, // VK_FORMAT_R16_UNORM
               "same-submit R16_UNORM consumer leases a mutable view of the exact R16_UINT result");
+        const auto [fp16_executed, fp16_destination, fp16_imported, fp16_format] =
+            run_native_typed_copy(DataFormat::Uint16, kSpirvImageFormatR16ui,
+                                  SpirvImageNumericClass::Uint, 1,
+                                  sizeof(uint16_t), source, DataFormat::Float16);
+        CHECK(fp16_executed && fp16_destination == source,
+              "typed R16_UINT storage remains byte-exact for an R16_SFLOAT graphics consumer");
+        CHECK(fp16_imported && fp16_format == 76u, // VK_FORMAT_R16_SFLOAT
+              "same-submit R16_SFLOAT consumer leases a mutable view of the exact R16_UINT result");
     }
     {
         // GTA V writes a six-layer R16_UINT DIM=2D_ARRAY shadow allocation, then samples the same
@@ -2249,6 +2257,15 @@ int main() {
                         normalized_import.valid() && normalized_import.native_format == 70u &&
                         normalized_import.vertical_stack_layers == layers &&
                         normalized_import.producer_command_order == item.command_order;
+                    ShaderResource float16_cube = cube;
+                    float16_cube.format = DataFormat::Float16;
+                    prosper::frontend::LiveComputeImageImport float16_import;
+                    const bool float16_imported =
+                        prosper::frontend::import_live_compute_storage_image(
+                            float16_cube, float16_cube.size, float16_import) &&
+                        float16_import.valid() && float16_import.native_format == 76u &&
+                        float16_import.vertical_stack_layers == layers &&
+                        float16_import.producer_command_order == item.command_order;
                     ShaderResource mismatch = cube;
                     --mismatch.depth;
                     prosper::frontend::LiveComputeImageImport rejected;
@@ -2260,7 +2277,7 @@ int main() {
                     const bool stride_rejected =
                         !prosper::frontend::import_live_compute_storage_image(
                             mismatch, cube.size, rejected);
-                    mismatches_rejected = depth_rejected && stride_rejected;
+                    mismatches_rejected = depth_rejected && stride_rejected && float16_imported;
                     return RenderedFrame{};
                 },
                 [&](const std::vector<ComputeItem>& items) {
