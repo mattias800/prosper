@@ -80,7 +80,7 @@ bool central_scan_enabled() {
         // default explicit switched the scan OFF instead (#3267). A refusal keeps ON; `=0` still
         // means off.
         const char* e = getenv("PROSPER_MB3_CENTRAL_SCAN");
-        return prosper::diag::env_u64_or_default("PROSPER_MB3_CENTRAL_SCAN", e, 1ull) != 0;
+        return prosper::diag::env_u64_or_default_auto("PROSPER_MB3_CENTRAL_SCAN", e, 1ull) != 0;
     }();
     return enabled;
 }
@@ -203,7 +203,7 @@ bool mb3_tls_tracking_enabled() {
     static const bool enabled = [] {
         // DEFAULT ON -- same inversion as PROSPER_MB3_CENTRAL_SCAN above (#3267).
         const char* e = getenv("PROSPER_MB3_TRACK_TLS");
-        return prosper::diag::env_u64_or_default("PROSPER_MB3_TRACK_TLS", e, 1ull) != 0;
+        return prosper::diag::env_u64_or_default_auto("PROSPER_MB3_TRACK_TLS", e, 1ull) != 0;
     }();
     return enabled;
 }

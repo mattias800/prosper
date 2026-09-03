@@ -1415,7 +1415,7 @@ static bool forge_guard() {
     // DEFAULT ON, and it is the #312 ROOT fix -- so `strtol` answering 0 for `=yes`/`=true`/`=on`
     // silently REMOVED the fix while the operator believed they had pinned it on (#3267).
     static const bool v = [] { const char* e = getenv("PROSPER_REL1_FORGE_GUARD");
-                               return prosper::diag::env_u64_or_default(
+                               return prosper::diag::env_u64_or_default_auto(
                                    "PROSPER_REL1_FORGE_GUARD", e, 1ull) != 0; }();   // default ON
     return v;
 }
@@ -2131,7 +2131,7 @@ bool declines_drifted_pair_release(uint64_t addr, uint64_t value, const char* ki
 static bool rel1_stomp_guard() {
     // DEFAULT ON -- same inversion as PROSPER_REL1_FORGE_GUARD, same #312 fatal family (#3267).
     static const bool v = [] { const char* e = getenv("PROSPER_REL1_STOMP_GUARD");
-                               return prosper::diag::env_u64_or_default(
+                               return prosper::diag::env_u64_or_default_auto(
                                    "PROSPER_REL1_STOMP_GUARD", e, 1ull) != 0; }();   // default ON
     return v;
 }

@@ -29,7 +29,13 @@ import re
 import sys
 from pathlib import Path
 
-CALL_RE = re.compile(r'env_u64_or_default(?:_capped)?\s*\(\s*\n?\s*"(PROSPER_[A-Z_0-9]+)"')
+# EVERY name-taking entry point in diagnostics/env_numeric.hpp, not just the two the first revision
+# knew about. That omission was not theoretical: env_u64_or_report's call site was the one site with
+# bespoke arithmetic and a non-numeric fallback -- the site most likely to drift -- and it was the
+# one site this gate could not see, while the success line below asserted full coverage (#3267 N2).
+# Adding a helper to that header without adding it here re-opens exactly that hole.
+CALL_RE = re.compile(
+    r'env_u64_or_(?:default(?:_auto)?(?:_capped)?|report)\s*\(\s*\n?\s*"(PROSPER_[A-Z_0-9]+)"')
 ARM_RE = re.compile(r'"(PROSPER_[A-Z_0-9]+)"')
 SKIP_DIRS = {"build-linux", "build-windows", "third_party", ".git", "tmpdir"}
 TEST = Path("tests/diagnostics/test_env_numeric_sites.cpp")
@@ -71,7 +77,12 @@ def main() -> int:
               f"any more -- the arm asserts about code that is gone")
     if missing or stale:
         return 1
-    print(f"[env-arms] ok: {len(armed)} knob(s) parsed by env_numeric, every one armed")
+    # Print the PARSED count, not the armed one. They are equal here by construction -- both
+    # differences were just checked -- but the claim being made is about coverage of the call sites,
+    # and a success line should be phrased in the quantity it is asserting about. The first revision
+    # printed the armed count and so read "27 ... every one armed" while 28 were parsed.
+    print(f"[env-arms] ok: {len(parsed)} knob(s) parsed by env_numeric, every one armed "
+          f"({len(armed)} arm name(s) in the table)")
     return 0
 
 

@@ -1166,7 +1166,8 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
         // filed about (#3267).
         const char* value = std::getenv("PROSPER_WRITE_WATCH_MAX_KB");
         const uint64_t kib = prosper::diag::env_u64_or_default_capped(
-            "PROSPER_WRITE_WATCH_MAX_KB", value, 0ull, UINT64_MAX / 1024ull, "KiB");
+            "PROSPER_WRITE_WATCH_MAX_KB", value, 0ull, UINT64_MAX / 1024ull, "KiB",
+            "unbounded: no range is too large to watch");
         if (!kib) return uint64_t{UINT64_MAX};
         return uint64_t{kib * 1024ull};
     }();

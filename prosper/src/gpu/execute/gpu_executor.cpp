@@ -7735,8 +7735,9 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
         // mistyped as `=750,000` unbounded the very thing being bounded (#3267).
         const char* value = std::getenv("PROSPER_MAX_DISPATCH_GROUPS");
         if (!value || !*value) return 0u;
-        return static_cast<uint32_t>(prosper::diag::env_u64_or_default_capped(
-            "PROSPER_MAX_DISPATCH_GROUPS", value, 0ull, UINT32_MAX, "workgroups"));
+        return static_cast<uint32_t>(prosper::diag::env_u64_or_default_auto_capped(
+            "PROSPER_MAX_DISPATCH_GROUPS", value, 0ull, UINT32_MAX, "workgroups",
+            "no cap: nothing is bounded"));
     }();
     if (group_cap) {
         auto clamp_groups = [&](uint32_t& groups, uint32_t& threads, uint32_t local) {

@@ -67,7 +67,8 @@ struct Site {
 // --- src/host/memory/guest_write_watch.cpp : PROSPER_WRITE_WATCH_MAX_KB ------------------------
 // 0 means UNBOUNDED here, so a malformed value used to remove the cap entirely.
 static uint64_t ww_max_new(const char* n, const char* t) {
-    const uint64_t kib = env_u64_or_default_capped(n, t, 0ull, UINT64_MAX / 1024ull, "KiB");
+    const uint64_t kib = env_u64_or_default_capped(n, t, 0ull, UINT64_MAX / 1024ull, "KiB",
+                                                   "unbounded: no range is too large to watch");
     return kib ? kib * 1024ull : UINT64_MAX;
 }
 static uint64_t ww_max_old(const char* t) {
@@ -114,7 +115,7 @@ static uint64_t arena_old(const char* t) {
 
 // --- tests/fixtures/render_runner.h : PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES --------------------
 static uint64_t layout_entries_new(const char* n, const char* t) {
-    return env_u64_or_default_capped(n, t, 256ull, UINT64_MAX, "entries");
+    return env_u64_or_default_capped(n, t, 256ull, SIZE_MAX, "entries");
 }
 static uint64_t layout_entries_old(const char* t) {
     return t ? std::strtoull(t, nullptr, 10) : 256ull;
@@ -140,7 +141,8 @@ static uint64_t dmem_old(const char* t) {
 // only ever set in order to impose a cap.
 static uint64_t dispatch_cap_new(const char* n, const char* t) {
     if (!t || !*t) return 0;
-    return env_u64_or_default_capped(n, t, 0ull, UINT32_MAX, "workgroups");
+    return prosper::diag::env_u64_or_default_auto_capped(n, t, 0ull, UINT32_MAX, "workgroups",
+                                                         "no cap: nothing is bounded");
 }
 static uint64_t dispatch_cap_old(const char* t) {
     return t && *t ? static_cast<uint32_t>(std::strtoul(t, nullptr, 0)) : 0u;
@@ -152,7 +154,7 @@ static uint64_t dispatch_cap_old(const char* t) {
 // inversion is the whole finding: `=yes`, `=true` and `=on` are what a person types to make a
 // default-ON switch explicit, and strtol answers 0 for every one of them -- i.e. OFF.
 static uint64_t default_on_new(const char* n, const char* t) {
-    return env_u64_or_default(n, t, 1ull) != 0 ? 1 : 0;
+    return prosper::diag::env_u64_or_default_auto(n, t, 1ull) != 0 ? 1 : 0;
 }
 static uint64_t default_on_old(const char* t) {
     return (!t || std::strtol(t, nullptr, 0) != 0) ? 1 : 0;
@@ -165,8 +167,11 @@ static uint64_t fair_us_new(const char* n, const char* t) {
 static uint64_t fair_us_old(const char* t) { return t ? (uint64_t)(unsigned)std::atoi(t) : 3000ull; }
 
 // --- src/hle/input/hle_pad.cpp : PROSPER_PAD_FRAME_HOLD / PROSPER_PAD_READ_HOLD ----------------
-static uint64_t pad_hold_new(const char* n, const char* t) {
-    return env_u64_or_default_capped(n, t, 8ull, INT64_MAX, "presses");
+static uint64_t pad_frame_hold_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 8ull, INT64_MAX, "flips");
+}
+static uint64_t pad_read_hold_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 8ull, INT64_MAX, "reads");
 }
 static uint64_t pad_hold_old(const char* t) { return t ? (uint64_t)std::atoll(t) : 8ull; }
 
@@ -188,11 +193,62 @@ static uint64_t kib_cap_old(uint64_t dflt, const char* t) {
 static uint64_t kib_1024_old(const char* t) { return kib_cap_old(1024ull, t); }
 static uint64_t kib_8192_old(const char* t) { return kib_cap_old(8192ull, t); }
 template <uint64_t Default>
+static uint64_t mib_cap_size_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, Default, SIZE_MAX / (1024ull * 1024ull), "MiB")
+           * 1024ull * 1024ull;
+}
+template <uint64_t Default>
 static uint64_t hits_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, Default, UINT32_MAX, "unchanged validations");
 }
 template <uint64_t Default>
 static uint64_t hits_old(const char* t) { return t ? std::strtoull(t, nullptr, 10) : Default; }
+
+// --- tests/fixtures/render_runner.h : PROSPER_BACKEND_TARGET_CACHE_COUNT (#3267 B1) -------------
+// `n ? n : 256` refused a value parsing to 0 and nothing else, so `=-1` saturated, stayed non-zero,
+// and removed the resident-target count bound outright.
+static uint64_t target_count_new(const char* n, const char* t) {
+    const uint64_t v = env_u64_or_default_capped(n, t, 256ull, SIZE_MAX, "targets");
+    return v ? v : 256ull;
+}
+static uint64_t target_count_old(const char* t) {
+    const uint64_t v = t ? std::strtoull(t, nullptr, 10) : 256ull;
+    return v ? v : 256ull;
+}
+
+// --- src/hle/service/hle_service.cpp : PROSPER_VDEC2_DUMP_FRAMES (#3267 B1) ---------------------
+// Same shape, and the bound it lost is a DISK bound: the site's own comment puts the 16-frame cap
+// at 50 MB against 5 GB uncapped.
+static uint64_t vdec_frames_new(const char* n, const char* t) {
+    const uint64_t v = prosper::diag::env_u64_or_default_auto_capped(n, t, 16ull, UINT32_MAX,
+                                                                     "frames");
+    return v ? v : 16ull;
+}
+static uint64_t vdec_frames_old(const char* t) {
+    const uint64_t v = t ? std::strtoul(t, nullptr, 0) : 0ull;
+    return v ? v : 16ull;
+}
+
+// --- frontends/shared/live/live_compute.cpp : PROSPER_COMPUTE_IMAGE_CACHE_MB (#3267 N2) ---------
+// The one converted site whose refusal falls back to a CODE PATH rather than a number: unset means
+// "derive the budget from device memory". kSentinelDerived stands for that path so the arm can be
+// expressed in the same uint64_t table as the rest.
+static const uint64_t kSentinelDerived = ~0ull - 1ull;
+static uint64_t image_cache_new(const char* n, const char* t) {
+    uint64_t mib = 0;
+    if (!prosper::diag::env_u64_or_report(n, t, &mib, "MiB", "the device-derived budget"))
+        return kSentinelDerived;
+    if (mib > UINT64_MAX / (1024ull * 1024ull)) return UINT64_MAX;
+    return mib * 1024ull * 1024ull;
+}
+static uint64_t image_cache_old(const char* t) {
+    // The pre-image had no empty-string check either, so `=""` reached strtoull and selected a
+    // ZERO-byte image cache. That half is a fix too, and this mirror keeps it visible.
+    if (!t) return kSentinelDerived;
+    const uint64_t mib = std::strtoull(t, nullptr, 10);
+    if (mib > UINT64_MAX / (1024ull * 1024ull)) return UINT64_MAX;
+    return mib * 1024ull * 1024ull;
+}
 
 static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
@@ -200,9 +256,12 @@ static const uint64_t kGiB = 1024ull * kMiB;
 static const Site kSites[] = {
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob
     // means "watch essentially nothing", since every range above 8 KiB is then refused a watch.
-    // NOTE the `-1` case is deliberately absent: strtoull saturates it and the saturation is then
-    // clamped back to UINT64_MAX, which is also what the refusal keeps, so an arm on it would be
-    // void rather than green (this file's own rule, applied to itself).
+    // TWO malformed inputs are deliberately absent, for the same reason: `-1` saturates and is then
+    // clamped back to UINT64_MAX, and `eight` parses to 0 which IS this knob's default -- in both
+    // cases the old spelling already answered what the refusal keeps, so an arm would be void
+    // rather than green (this file's own rule, applied to itself). On those inputs the change here
+    // is the MESSAGE alone, and the same is true of PROSPER_MAX_DISPATCH_GROUPS below; both say so
+    // in their refusal, which is why both pass a gloss naming what their 0 means.
     {"guest_write_watch.cpp PROSPER_WRITE_WATCH_MAX_KB", "PROSPER_WRITE_WATCH_MAX_KB",
      ww_max_new, ww_max_old,
      "8mb", UINT64_MAX /* the documented 0 == unbounded default */, "65536", 65536ull * 1024ull},
@@ -259,9 +318,29 @@ static const Site kSites[] = {
      fair_us_new, fair_us_old, "3ms", 3000ull, "500", 500ull},
 
     {"hle_pad.cpp PROSPER_PAD_FRAME_HOLD", "PROSPER_PAD_FRAME_HOLD",
-     pad_hold_new, pad_hold_old, "16 flips", 8ull, "16", 16ull},
+     pad_frame_hold_new, pad_hold_old, "16 flips", 8ull, "16", 16ull},
     {"hle_pad.cpp PROSPER_PAD_READ_HOLD", "PROSPER_PAD_READ_HOLD",
-     pad_hold_new, pad_hold_old, "-1", 8ull, "4", 4ull},
+     pad_read_hold_new, pad_hold_old, "-1", 8ull, "4", 4ull},
+
+    {"render_runner.h PROSPER_BACKEND_TARGET_CACHE_COUNT", "PROSPER_BACKEND_TARGET_CACHE_COUNT",
+     target_count_new, target_count_old, "-1", 256ull, "512", 512ull},
+    {"hle_service.cpp PROSPER_VDEC2_DUMP_FRAMES", "PROSPER_VDEC2_DUMP_FRAMES",
+     vdec_frames_new, vdec_frames_old, "-1", 16ull, "0x40", 64ull},
+    {"live_compute.cpp PROSPER_COMPUTE_IMAGE_CACHE_MB", "PROSPER_COMPUTE_IMAGE_CACHE_MB",
+     image_cache_new, image_cache_old, "512mb", kSentinelDerived, "512", 512ull * kMiB},
+    {"live_compute.cpp PROSPER_COMPUTE_IMAGE_CACHE_MB (empty string)",
+     "PROSPER_COMPUTE_IMAGE_CACHE_MB", image_cache_new, image_cache_old,
+     "", kSentinelDerived, "1", 1ull * kMiB},
+
+    // N1: `0x…` was well-formed at these six before the conversion, because they read base 0. The
+    // `good` column is the regression: if the _auto family is ever narrowed back to decimal, these
+    // fail. On PROSPER_MAX_DISPATCH_GROUPS refusing `0x2000` would mean NO CAP, i.e. this PR's own
+    // hazard class introduced by the fix for it.
+    {"gpu_executor.cpp PROSPER_MAX_DISPATCH_GROUPS (base-0 spelling kept)",
+     "PROSPER_MAX_DISPATCH_GROUPS", dispatch_cap_new, dispatch_cap_old,
+     "0x2000 groups", 0ull, "0x2000", 8192ull},
+    {"command_processor.cpp PROSPER_REL1_FORGE_GUARD (base-0 off kept)",
+     "PROSPER_REL1_FORGE_GUARD", default_on_new, default_on_old, "0xzz", 1, "0x0", 0},
 
     // #3253's own six, plus the two the same PR added. Every fallback below is that site's
     // documented default; every legacy answer below is the aggressive end of its own policy.
@@ -274,19 +353,19 @@ static const Site kSites[] = {
      "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS", hits_new<3>, hits_old<3>,
      "three", 3ull, "5", 5ull},
     {"live_renderer.cpp PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB",
-     "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB", mib_cap_new<8>, mib_cap_old<8>,
+     "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB", mib_cap_size_new<8>, mib_cap_old<8>,
      "64mb", 8ull * kMiB, "16", 16ull * kMiB},
     {"live_compute.cpp PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS",
      "PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS", hits_new<3>, hits_old<3>,
      "-1", 3ull, "7", 7ull},
     {"live_compute.cpp PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB",
-     "PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB", mib_cap_new<8>, mib_cap_old<8>,
+     "PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB", mib_cap_size_new<8>, mib_cap_old<8>,
      "eight", 8ull * kMiB, "32", 32ull * kMiB},
     {"live_compute.cpp PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB",
-     "PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB", mib_cap_new<16>, mib_cap_old<16>,
+     "PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB", mib_cap_size_new<16>, mib_cap_old<16>,
      "64 MB", 16ull * kMiB, "64", 64ull * kMiB},
     {"live_compute.cpp PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "PROSPER_MAX_GPU_COMPARE_IMAGE_MB",
-     mib_cap_new<2>, mib_cap_old<2>, "32mb", 2ull * kMiB, "8", 8ull * kMiB},
+     mib_cap_size_new<2>, mib_cap_old<2>, "32mb", 2ull * kMiB, "8", 8ull * kMiB},
 };
 int main() {
     char msg[512];

@@ -2227,7 +2227,12 @@ inline size_t persistent_color_target_count_limit() {
         const char* value = getenv("PROSPER_BACKEND_TARGET_CACHE_COUNT");
         // Raised from the historical 64 so a 4K deferred renderer's targets are bounded by the memory
         // budget (persistent_color_target_limit) rather than an arbitrarily small count (#1177).
-        const uint64_t n = value ? strtoull(value, nullptr, 10) : 256ull;
+        // `n ? n : 256` refuses a value that parses to 0 and NOTHING else: this is an unsigned
+        // parse, so `=-1` saturated to UINT64_MAX, stayed non-zero, and removed the count bound
+        // entirely (SIZE_MAX resident targets). The byte twin of this knob two functions up was
+        // converted while this one was published as "already refuses" -- it was not (#3267 B1).
+        const uint64_t n = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_BACKEND_TARGET_CACHE_COUNT", value, 256ull, SIZE_MAX, "targets");
         return n ? static_cast<size_t>(n) : size_t{256};
     }();
     return count;

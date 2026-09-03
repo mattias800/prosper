@@ -1097,17 +1097,15 @@ VkDeviceSize persistent_compute_image_limit(
         -> std::optional<VkDeviceSize> {
         const char* value = std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MB");
         if (!value || !*value) return std::nullopt;
-        // There is no numeric default to fall back to -- unset means "derive from device memory" --
-        // so a refusal must fall back to THAT, not to a number. Hence parse_u64_strict plus an
-        // explicit nullopt rather than the or_default helper (#3267).
+        // There is no numeric default to fall back to -- unset means "derive from device memory"
+        // -- so a refusal must fall back to that CODE PATH, not to a number. env_u64_or_report is
+        // the named helper for that shape; a hand-written fprintf here would be invisible to
+        // tools/env/check_env_numeric_arms.py, which is how the one site with bespoke arithmetic
+        // became the one site the anti-drift gate could not see (#3267 N2).
         uint64_t mib = 0;
-        if (!prosper::diag::parse_u64_strict(value, &mib)) {
-            std::fprintf(stderr,
-                         "[env] PROSPER_COMPUTE_IMAGE_CACHE_MB='%s' is not a plain non-negative "
-                         "count of MiB -- keeping the device-derived budget and changing NOTHING\n",
-                         value);
+        if (!prosper::diag::env_u64_or_report("PROSPER_COMPUTE_IMAGE_CACHE_MB", value, &mib, "MiB",
+                                              "the device-derived budget"))
             return std::nullopt;
-        }
         if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
