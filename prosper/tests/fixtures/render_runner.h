@@ -10473,7 +10473,7 @@ inline SplitSegmentContract split_segment_contract(
     // > 1, not > 2: slot 1 needs carrying too when the caller takes it through BackendMrtOutputs.
     // The threshold was 2 and a two-attachment split therefore synthesised no carrier at all, so
     // MRT1 was cleared by the next segment even with every other part of the carry correct.
-    const bool carries_slots = !final && out.color_count > 1u;
+    const bool carries_slots = out.color_count > 1u;
     if (!whole && !carries_slots) return out;
     if (whole) out.target = *whole;
     out.has_target = true;
@@ -10514,6 +10514,13 @@ inline SplitSegmentContract split_segment_contract(
         for (uint32_t slot = 2; slot < out.color_count; ++slot)
             out.target.readback_slots[slot] = true;
         if (out.color_count > 1) out.target.readback1 = true;
+    } else if (!whole) {
+        // A synthesised carrier target on the final segment represents a caller with whole == nullptr.
+        // It must read back the requested outputs just as a whole == nullptr non-split pass does.
+        out.target.readback = true;
+        out.target.readback1 = out.color_count > 1;
+        for (uint32_t slot = 2; slot < out.color_count; ++slot)
+            out.target.readback_slots[slot] = true;
     }
     return out;
 }
