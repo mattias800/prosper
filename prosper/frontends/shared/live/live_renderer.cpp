@@ -793,7 +793,7 @@ struct PersistentDecodedTexture {
     size_t source_prefix_size = 0;
     bool source_matches_pixels = false;
     std::vector<uint8_t> source_prefix;
-    std::vector<uint8_t> pixels;
+    std::shared_ptr<const std::vector<uint8_t>> pixels;
     uint32_t output_height = 0;
     bool narrow = false;
     uint64_t last_use = 0;
@@ -808,7 +808,7 @@ struct PersistentDecodedTexture {
     bool source_watch_only = false;
     bool source_watch_disabled = false;
 
-    size_t bytes() const { return source_prefix.size() + pixels.size(); }
+    size_t bytes() const { return source_prefix.size() + (pixels ? pixels->size() : 0); }
 };
 
 uint64_t host_physical_memory_bytes() {
@@ -2495,9 +2495,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // retained pointer refers to cannot be freed under it later in the same submit.
             if (rebuild_decode_scope) ++persistent_decode_generation;
             const uint64_t decode_generation = persistent_decode_generation;
+            static thread_local std::vector<std::shared_ptr<const std::vector<uint8_t>>>
+                retired_submit_pixels;
             if (rebuild_decode_scope) {
                 decoded_textures.clear();
                 texstore_pinned.assign(texstore.size(), false);
+                retired_submit_pixels.clear();
             }
             static uint64_t persistent_texture_id = 0;
             static std::vector<uint8_t> persistent_validation_scratch;
@@ -3963,7 +3966,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     size_t validated_bytes = 0;
                                     if (cached->second.source_matches_pixels) {
                                         matches = safe_equal(
-                                            cached->second.pixels.data(), persistent_source_addr,
+                                            cached->second.pixels ? cached->second.pixels->data() : nullptr,
+                                            persistent_source_addr,
                                             persistent_source_size, validated_bytes) &&
                                             validated_bytes == cached->second.source_prefix_size;
                                     } else if (!PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") &&
@@ -4135,17 +4139,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         cached->second.source_watch_only = true;
                                         persistent_decoded_texture_bytes -= released;
                                     }
-                                    persistent_reuse = {cached->second.pixels.data(),
+                                    persistent_reuse = {cached->second.pixels ? cached->second.pixels->data() : nullptr,
                                                         cached->second.output_height,
                                                         cached->second.narrow,
                                                         cached->second.persistent_id,
-                                                        cached->second.persistent_version};
+                                                        cached->second.persistent_version,
+                                                        decode_span_ordinal,
+                                                        cached->second.validation_snapshot,
+                                                        cached->second.source_addr,
+                                                        cross_span_source_size,
+                                                        SIZE_MAX,
+                                                        cached->second.pixels};
                                     persistent_reuse.texture_format =
                                         cached->second.texture_format;
                                     persistent_reuse.storage_image_contract_valid =
                                         cached->second.storage_image_contract_valid;
                                     persistent_reuse.layers = cached->second.layers;
-                                    persistent_reuse.pixels_bytes = cached->second.pixels.size();
+                                    persistent_reuse.pixels_bytes = cached->second.pixels ? cached->second.pixels->size() : 0;
                                     decoded_reuse = &persistent_reuse;
                                     resource_persistent_hit = true;
                                     if (timing_enabled) pending_timing.persistent_hits++;
@@ -4353,6 +4363,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         } else if (decoded_reuse) {
                             fr.tex_rgba = decoded_reuse->pixels;
+                            fr.tex_rgba_owner = decoded_reuse->pixels_owner;
                             fr.tw = tw;
                             fr.th = decoded_reuse->output_height;
                             // #325: the layer count travels with the decoded pixels. Without this
@@ -4590,7 +4601,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // the scratch allocator never recycles and no pin is needed; the retained
                             // range is the one that cache itself validates for this identity.
                             if (!resource_local_reuse)
-                                decoded_textures.emplace(
+                                decoded_textures.insert_or_assign(
                                     decode_key,
                                     DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                    fr.persistent_texture_id,
@@ -4598,7 +4609,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                    decode_span_ordinal,
                                     prosper::gpu::guest_gpu_write_snapshot(),
                                     persistent_source_addr,
-                                    cross_span_source_size, SIZE_MAX, nullptr,
+                                    cross_span_source_size, SIZE_MAX,
+                                    fr.tex_rgba_owner,
                                                    fr.texture_format,
                                                    fr.storage_image_contract_valid,
                                                    fr.sample_count, fr.tex_byte_size});
@@ -6363,18 +6375,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 inherited_persistent_id = old->second.persistent_id;
                                 inherited_persistent_version = old->second.persistent_version;
                             }
-                            // `decode_generation` is per SUBMIT since #1691, so an identity already
-                            // established earlier in this submit is not replaced by a later re-decode
-                            // of the same key. That protection is what makes retained pointers into
-                            // this cache safe. The re-decode itself still renders from its own
-                            // scratch bytes and still populates the submit-scoped map, so the only
-                            // cost is that the persistent copy stays stale until the next submit
-                            // re-validates it and misses. This is reachable only when a guest GPU
-                            // write invalidated the identity mid-submit, which is already the
-                            // expensive path.
-                            const bool can_replace = old == persistent_decoded_textures.end() ||
-                                old->second.last_use != decode_generation;
-                            if (old != persistent_decoded_textures.end() && can_replace) {
+                            // An identity already established earlier in this submit may be re-decoded
+                            // if an interleaved guest GPU write mutated its backing. Retired pixels are
+                            // retained in `retired_submit_pixels` so prior draws in this submit that hold
+                            // pointers to those bytes remain safe, while the persistent entry is
+                            // replaced with the newly de-tiled pixels and updated validation baseline (#3283).
+                            if (old != persistent_decoded_textures.end()) {
+                                if (old->second.pixels)
+                                    retired_submit_pixels.push_back(old->second.pixels);
                                 persistent_decoded_texture_bytes -= old->second.bytes();
                                 persistent_decoded_textures.erase(old);
                             }
@@ -6391,11 +6399,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         it->second.last_use < victim->second.last_use) victim = it;
                                 }
                                 if (victim == persistent_decoded_textures.end()) break;
+                                if (victim->second.pixels)
+                                    retired_submit_pixels.push_back(victim->second.pixels);
                                 persistent_decoded_texture_bytes -= victim->second.bytes();
                                 persistent_decoded_textures.erase(victim);
                             }
-                            if (can_replace &&
-                                required <= persistent_decode_limit &&
+                            if (required <= persistent_decode_limit &&
                                 persistent_decoded_texture_bytes <= persistent_decode_limit - required) {
                                 PersistentDecodedTexture cached;
                                 cached.source_addr = persistent_source_addr;
@@ -6406,14 +6415,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     cached.source_prefix.assign(
                                         persistent_validation_scratch.begin(),
                                         persistent_validation_scratch.begin() + source_prefix_size);
-                                // A successful persistent insertion owns the decoded allocation from
-                                // now on. Moving it avoids retaining the same large atlas in both the
-                                // process-wide cache and a reusable scratch slot.
-                                cached.pixels = std::move(texture_pixels);
+                                cached.pixels = std::make_shared<const std::vector<uint8_t>>(
+                                    std::move(texture_pixels));
                                 cached.output_height = fr.th;
-                                // Set from fr.sample_count, which the publish seam above has
-                                // already given the decoded layer count. Reading it any earlier
-                                // captures 1 and the layers die here.
                                 cached.layers = fr.sample_count;
                                 cached.narrow = narrow_done;
                                 cached.last_use = decode_generation;
@@ -6437,31 +6441,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_watch = std::move(inherited_source_watch);
                                 auto [inserted, ok] = persistent_decoded_textures.emplace(
                                     decode_key, std::move(cached));
-                                // `ok == false` is unreachable: the erase above leaves this key
-                                // absent, so the insert cannot collide. It matters anyway, because
-                                // the move has already emptied `texture_pixels` by this point — so
-                                // bind the map's pixels either way (a collision is the same key,
-                                // hence the same decode) and let only the byte accounting depend on
-                                // whether an insertion actually happened. The scratch slot no longer
-                                // owns these bytes in either case.
                                 if (ok)
                                     persistent_decoded_texture_bytes += inserted->second.bytes();
-                                fr.tex_rgba = inserted->second.pixels.data();
+                                fr.tex_rgba = inserted->second.pixels ? inserted->second.pixels->data() : nullptr;
+                                fr.tex_rgba_owner = inserted->second.pixels;
                                 fr.persistent_texture_id = inserted->second.persistent_id;
                                 fr.persistent_texture_version = inserted->second.persistent_version;
                                 decoded_pixels_in_texstore = false;
                             }
                         }
                         if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
-                            // Pin the scratch slot only for an entry that can actually outlive this
-                            // span AND whose pixels the persistent cache did not take: then the slot
-                            // IS the storage and a later span reusing it would rewrite what the entry
-                            // points at. An entry with no validated range is refused at its first
-                            // cross-span lookup, and within one span the cursor never hands the same
-                            // slot out twice — pinning those would strand one scratch allocation per
-                            // decode, which on a replay submit (every resource carries captured
-                            // backing, so none is retainable) is the whole submit's texture working
-                            // set instead of one span's.
                             const bool pin_scratch =
                                 decoded_pixels_in_texstore && cross_span_source_size != 0;
                             const size_t pinned_slot = pin_scratch ? texture_slot : SIZE_MAX;
@@ -6469,7 +6458,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 texstore_pinned[texture_slot] = true;
                                 ++g_texture_decode_scope.scratch_pins;
                             }
-                            decoded_textures.emplace(
+                            decoded_textures.insert_or_assign(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id,
                                                           fr.persistent_texture_version,
@@ -6477,7 +6466,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                           prosper::gpu::guest_gpu_write_snapshot(),
                                                           persistent_source_addr,
                                                           cross_span_source_size, pinned_slot,
-                                                          nullptr, fr.texture_format,
+                                                          fr.tex_rgba_owner, fr.texture_format,
                                                           fr.storage_image_contract_valid,
                                                           fr.sample_count, fr.tex_byte_size});
                         }
@@ -10630,7 +10619,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     for (const auto& [key, texture] : persistent_decoded_textures) {
                         (void)key;
                         persistent_source_bytes += texture.source_prefix.size();
-                        persistent_pixel_bytes += texture.pixels.size();
+                        persistent_pixel_bytes += texture.pixels ? texture.pixels->size() : 0;
                         if (texture.source_watch_only) {
                             ++persistent_watch_only_entries;
                             persistent_watch_only_saved_bytes += texture.source_prefix_size;

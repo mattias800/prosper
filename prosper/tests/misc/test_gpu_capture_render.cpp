@@ -2253,20 +2253,16 @@ int main() {
             std::vector<uint8_t> pin_second, pin_last;
             const uint8_t* pin_span2 = target_center(pin_targets[1], pin_second);
             const uint8_t* pin_span3 = target_center(pin_targets[3], pin_last);
-            // `scratch_pins == 1` is what makes this case self-validating rather than merely true.
-            // The pin is only reached because `decode_generation` is per SUBMIT, which is what makes
-            // `can_replace` false for span 2's re-decode. Revert that to a per-span bump and the
-            // pixels move into the persistent cache instead, no pin is taken, and both green
-            // assertions below still pass while covering nothing — so assert the mechanism, not only
-            // its consequence. It doubles as the guard on the per-submit generation, which is
-            // otherwise untestable without provoking a use-after-free.
-            CHECK(pinned.scratch_pins == 1 && pinned.cross_span_reuses == 1 &&
+            // `scratch_pins == 0` because mid-submit re-decodes now safely update the persistent entry
+            // (retiring prior pixels into `retired_submit_pixels` to prevent UAF) instead of being stranded
+            // in a scratch slot (#3283).
+            CHECK(pinned.scratch_pins == 0 && pinned.cross_span_reuses == 1 &&
                       pinned.invalidations == 1 && pinned.decodes == 3,
-                  "the twice-decoded identity is pinned in scratch and served across the next span");
+                  "the twice-decoded identity updates persistent cache with safe retirement and is served across the next span");
             CHECK(pin_span2 && pin_span3 &&
                       pin_span2[1] > 0xC0 && pin_span2[0] < 0x40 &&
                       pin_span3[1] > 0xC0 && pin_span3[0] < 0x40,
-                  "a scratch-backed retained entry survives a later span decoding another texture");
+                  "a re-decoded persistent entry survives a later span decoding another texture");
 
             // (5) The identity map does not outlive its submit: an entry established in one submit
             // must never serve the next, whose indirect descriptor memory may have moved on. The
@@ -2290,6 +2286,59 @@ int main() {
                       second_submit.invalidations == 0 &&
                       second_submit.cross_span_reuses == 0,
                   "a new submit rebuilds the identity map instead of inheriting the previous one");
+
+            // (6) MULTI-SPAN RE-DECODE REUSE (#3283) — An identity re-decoded mid-submit due to
+            // an intervening GPU write updates the persistent cache entry and is memoized so that
+            // multiple subsequent draw passes/spans in the same submit reuse the freshly de-tiled
+            // pixels instead of repeatedly de-tiling on every span.
+            const uint64_t multispan_texture = guest_base + 0x7000;
+            std::memcpy(guest + 0x7000, red_2x2.data(), red_2x2.size());
+            std::vector<ComputeItem> three_dispatches(3);
+            for (size_t i = 0; i < 3; ++i) three_dispatches[i].dispatch_index = static_cast<uint32_t>(i);
+            int dispatch_count = 0;
+            LiveComputeFn write_once_then_unrelated = [&](const std::vector<ComputeItem>&) {
+                if (dispatch_count++ == 0) {
+                    std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(multispan_texture)),
+                                green_2x2.data(), green_2x2.size());
+                    notify_guest_gpu_write(multispan_texture, green_2x2.size());
+                } else {
+                    notify_guest_gpu_write(unrelated, 4);
+                }
+                return true;
+            };
+            uint64_t multi_targets[5] = {0};
+            auto multi_draw = [&](uint64_t draw_index, uint64_t order) {
+                DrawItem draw = texture_draw(multispan_texture, 2, 2, 8, draw_index, order);
+                draw.color0_base = pin_next_target;
+                if (draw_index < 5) multi_targets[draw_index] = pin_next_target;
+                pin_next_target += 0x100000ull;
+                return draw;
+            };
+            dispatch_count = 0;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(
+                {{SubmitOperationKind::Draw, 0, 100},
+                 {SubmitOperationKind::Dispatch, 0, 150},
+                 {SubmitOperationKind::Draw, 1, 200},
+                 {SubmitOperationKind::Dispatch, 1, 250},
+                 {SubmitOperationKind::Draw, 2, 300},
+                 {SubmitOperationKind::Dispatch, 2, 350},
+                 {SubmitOperationKind::Draw, 3, 400}},
+                {multi_draw(0, 100), multi_draw(1, 200), multi_draw(2, 300), multi_draw(3, 400)},
+                three_dispatches, counting_render, write_once_then_unrelated, W, H);
+            const auto multispan_stats = texture_decode_scope_stats();
+            std::vector<uint8_t> multi_span2, multi_span3, multi_span4;
+            const uint8_t* p2 = target_center(multi_targets[1], multi_span2);
+            const uint8_t* p3 = target_center(multi_targets[2], multi_span3);
+            const uint8_t* p4 = target_center(multi_targets[3], multi_span4);
+            CHECK(multispan_stats.decodes == 2 && multispan_stats.invalidations == 1 &&
+                      multispan_stats.cross_span_reuses == 2,
+                  "mid-submit re-decode is reused across subsequent spans without re-decoding");
+            CHECK(p2 && p3 && p4 &&
+                      p2[1] > 0xC0 && p2[0] < 0x40 &&
+                      p3[1] > 0xC0 && p3[0] < 0x40 &&
+                      p4[1] > 0xC0 && p4[0] < 0x40,
+                  "all spans after the re-decode sample the updated green texture");
         }
     }
 
