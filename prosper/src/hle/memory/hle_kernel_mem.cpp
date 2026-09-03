@@ -200,10 +200,16 @@ void ampr_cb_reset(uint64_t cb) {
     if (!cb) return;
     // Rewinding a command buffer also closes the APR read chain recorded against it: the file a
     // …ReadFileGatherScatter segment reads from is the one the plain ReadFile named, and that
-    // record dies with the commands it belonged to. The guest's own reader relies on exactly this
-    // ordering -- Yakuza Kiwami's dispatcher at eboot+0xdb5fb0 calls Reset immediately before the
-    // ReadFile that opens each chain (see the block beside prosper_apr_chain_reset in
-    // src/hle/fs/hle_file.cpp, which owns APR file identity).
+    // record dies with the commands it belonged to. Yakuza Kiwami's dispatcher at eboot+0xdb5fb0
+    // calls Reset immediately before the ReadFile that opens each chain, which is consistent with
+    // this -- but note it does NOT establish it, since the ReadFile that follows re-opens the chain
+    // either way.
+    //
+    // This helper has more callers than the public Reset NID -- SUBMIT is one of them, because it
+    // rewinds the same command cursor -- so closing here closes on all of them. That width is
+    // deliberate and its justification (which way the undecided lifetime should fail) is written
+    // out once, on f_apr_read_gather_scatter in src/hle/fs/hle_file.cpp, which owns APR file
+    // identity. Read it before narrowing this; tests/hle/test_apr_gather_scatter.cpp pins the set.
     prosper_apr_chain_reset(cb);
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
@@ -2152,10 +2158,16 @@ HLE(k_ampr_init) {
     return 0;
 }
 // DIAGNOSTIC (PROSPER_AMPRLOG=1): arg capture for the four other libSceAmpr NIDs the APR read flow
-// touches (baQO9ez2gL4 / ULvXMDz56po / Qs1xtplKo0U / GuchCTefuZw, previously anonymous unimpl
-// stubs). One of these likely carries the READ RANGE: the pak reads want the FPakInfo footer at
-// filesize-0xdd (a5 of the submit = 0xdd = footer size, 0x90 = utoc header size), so a per-read
-// {offset,size} must flow through some pre-submit call. CONFIDENCE: LOW until captured.
+// touches. All four are NAMED in the PS5 3.20 firmware library database, so the "previously
+// anonymous unimpl stubs" this comment used to describe are anonymous no longer:
+//   baQO9ez2gL4 sceAmprCommandBufferReset      ULvXMDz56po sceAmprCommandBufferClearBuffer
+//   Qs1xtplKo0U sceAmprAprCommandBufferDestructor  GuchCTefuZw sceAmprCommandBufferDestructor
+// The hypothesis this comment carried -- that one of them "likely carries the READ RANGE", so that
+// the pak reads' FPakInfo footer offset could arrive through a pre-submit call -- is FALSIFIED by
+// those names: a reset, a clear and two destructors are buffer-lifetime operations and none of them
+// can name a file range. The real range travels in the read builder's own arguments
+// (sceAmprAprCommandBufferReadFile / …GatherScatter, src/hle/fs/hle_file.cpp). Do not restart it
+// (#2928). CONFIDENCE: HIGH on the names (firmware NID database).
 HLE(k_ampr_x1) {
     ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5);
     ampr_cb_reset(a0);
