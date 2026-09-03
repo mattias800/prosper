@@ -8330,11 +8330,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
     const bool readback_color0_wanted = !color_target
         ? true
-        : ((!persistent_color && color_target->persistent_id != 0) || color_target->readback);
+        : (color_target->persistent_id != 0 && (!persistent_color || color_target->readback));
     const bool readback_color1_wanted = use_color1 &&
         (!color_target
              ? true
-             : ((!persistent_color1 && color_target->persistent_id1 != 0) || color_target->readback1));
+             : (color_target->persistent_id1 != 0 && (!persistent_color1 || color_target->readback1)));
     // Slots 2+ ask per slot, exactly as slots 0 and 1 do. `color_count > 2` alone would force a
     // readback of every higher slot on every segment of a split pass, including the ones whose
     // pixels are thrown away.
@@ -9419,10 +9419,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         };
         transition_color_to_readback(persistent_color, readback_color0, img);
         transition_color_to_readback(persistent_color1, readback_color1, img1);
-        for (uint32_t slot = 2; slot < color_count; ++slot)
+        for (uint32_t slot = 2; slot < color_count; ++slot) {
+            const bool slot_readback = !color_target ||
+                (color_target->persistent_id_slots[slot] != 0 && color_target->readback_slots[slot]);
             transition_color_to_readback(
-                cached_extra[slot] != nullptr,
-                !color_target || color_target->readback_slots[slot], extra_images[slot]);
+                cached_extra[slot] != nullptr, slot_readback, extra_images[slot]);
+        }
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         cp.imageExtent = {W, H, 1};
