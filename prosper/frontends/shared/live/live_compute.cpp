@@ -1215,12 +1215,10 @@ size_t cold_storage_result_snapshot_defer_min_bytes() {
 size_t max_gpu_compare_image_bytes() {
     static const size_t bytes = [] {
         const char* value = std::getenv("PROSPER_MAX_GPU_COMPARE_IMAGE_MB");
-        char* end = nullptr;
-        const uint64_t parsed = value ? std::strtoull(value, &end, 10) : 2ull;
-        const uint64_t mib = value && (!end || *end) ? 2ull : parsed;
-        return static_cast<size_t>(
-            std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
-            (1024ull * 1024ull));
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", value, 2ull,
+            SIZE_MAX / (1024ull * 1024ull), "MiB");
+        return static_cast<size_t>(mib * (1024ull * 1024ull));
     }();
     return bytes;
 }

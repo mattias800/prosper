@@ -227,6 +227,18 @@ int main() {
             "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB", "eight", 8)) * (1u << 20));
         CHECK(kept_budget.try_consume(64u << 20));
         CHECK(!kept_budget.try_consume(64u << 20));  // bounded, which is what was asked for
+
+        // PROSPER_MAX_GPU_COMPARE_IMAGE_MB (#3276): negative or unit typo keeps default 2 MiB rather
+        // than wrapping to UINT64_MAX or zero.
+        using prosper::diag::env_u64_or_default_capped;
+        CHECK(env_u64_or_default_capped(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "-1", 2ull, 1024ull, "MiB") == 2ull);
+        CHECK(env_u64_or_default_capped(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "2mb", 2ull, 1024ull, "MiB") == 2ull);
+        CHECK(env_u64_or_default_capped(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "8", 2ull, 1024ull, "MiB") == 8ull);
+        CHECK(env_u64_or_default_capped(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "2048", 2ull, 1024ull, "MiB") == 1024ull);
     }
 
     if (!failures) std::printf("write_watch_policy: OK\n");
