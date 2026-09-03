@@ -20,6 +20,23 @@
 //
 // Vary -O0/-O1/-O2/-O3/-Og/-Os: the guest-ABI shim shape has to ASSEMBLE at all of them, because
 // MinGW cannot emit SEH unwind data for a sysv_abi frame and inlining decides whether one is needed.
+//
+// READ THIS BEFORE TRUSTING A RESULT FROM HERE. This probe's CRT is NOT the shipped CRT, and the
+// difference is invisible in its output:
+//
+//                     toolchain                 __USE_MINGW_ANSI_STDIO   vsnprintf resolves to
+//   this probe        a cross mingw, msvcrt     1                        __mingw_vsnprintf
+//   CI and shipping   MSYS2 UCRT64 (ci.yml)     0                        UCRT's own
+//
+// `_mingw.h:442-454` auto-enables ANSI stdio only while `__MSVCRT_VERSION__ < 0xE00`, and `:229-236`
+// pins exactly 0xE00 on the UCRT branch, so the clause that enables it here cannot fire there.
+// The two implementations agree about the ABI, the register files, the overflow area and the va_list
+// layout — everything this probe exists to check — and DISAGREE about format-string extensions:
+// __mingw_vsnprintf consumes an argument for `%'d`, UCRT does not. A green "4/4 at six optimisation
+// levels" from here is therefore strong evidence about ABI and translation and NO evidence at all
+// about which specifiers may be accepted. That question belongs to the CRT that ships, and
+// `tests/host/abi/test_guest_varargs.cpp` asks it there, in the Windows job, on every run.
+// A `%'d` here would pass and ship a defect; that is not hypothetical, it happened (#3266 review).
 #include "host/abi/guest_varargs.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
 

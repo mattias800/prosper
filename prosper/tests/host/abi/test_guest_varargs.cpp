@@ -124,10 +124,11 @@ void check_plans() {
     // argument behind it. It must refuse, not classify.
     check_plan("%d %qd", "i!");
     check_plan("%qu", "!");
-    // `'` is on the other side of the same measurement -- the CRT does consume an argument for it --
-    // so it stays accepted. Pinned so that dropping it is a deliberate act with a measurement behind
-    // it, not a tidy-up.
-    check_plan("%'d %'f", "if");
+    // `'` is the SUSv2 thousands-grouping flag, and it goes the same way for the same reason: real
+    // ucrtbase.dll prints "'d" and consumes nothing. It was KEPT at first on a measurement taken
+    // against a DIFFERENT CRT than the one that ships -- see guest_varargs.cpp's subset rule.
+    check_plan("%d %'d", "i!");
+    check_plan("%'f", "!");
     check_plan("%.2f %10.4e %+g %#a", "ffff");
     // A `*` width or precision consumes an int of its own, ahead of the conversion's own argument.
     check_plan("%*d", "ii");
@@ -441,6 +442,74 @@ void check_executed() {
     }
 
 #if defined(_WIN32)
+    // --- the subset rule, asked of the CRT THIS BUILD ACTUALLY LINKS -------------------------------
+    // The rule guest_varargs.cpp obeys is that plan_format must never consume an argument the CRT
+    // does not. That was a judgment call backed by a measurement on one toolchain, and the toolchain
+    // was the wrong one: the first version of this change accepted `%'d` because a Fedora cross-mingw
+    // probe (ANSI stdio, __mingw_vsnprintf) consumed it, while CI and the shipped build are MSYS2
+    // UCRT64 (no ANSI stdio, UCRT's own vsnprintf) where it consumes nothing.
+    //
+    // So stop asserting it and ASK. For each specifier, hand the CRT a call with a trailing sentinel:
+    // if the spec consumed its own argument the sentinel prints, and if it consumed nothing the spec
+    // ate the sentinel instead. Then require the implication that actually matters —
+    //
+    //     we consume  =>  the CRT consumes
+    //
+    // — rather than equality, because refusing something the CRT does support is merely a truncated
+    // line, while accepting something it does not is the argument-shifting corruption this file
+    // exists to prevent. Whichever CRT a future build resolves to, this arm answers for it.
+    {
+        static const struct { const char* spec; const char* fmt; bool fp; } kSpecs[] = {
+            { "%'d",  "%'d|%d",  false },   // the one that was got wrong
+            { "%qd",  "%qd|%d",  false },
+            { "%zu",  "%zu|%d",  false },
+            { "%jd",  "%jd|%d",  false },
+            { "%td",  "%td|%d",  false },
+            { "%hhd", "%hhd|%d", false },
+            { "%lld", "%lld|%d", false },
+            { "%d",   "%d|%d",   false },
+            { "%a",   "%a|%d",   true  },
+            { "%.2f", "%.2f|%d", true  },
+            { "%s",   "%s|%d",   false },
+        };
+        unsigned probed = 0, crt_rejects = 0;
+        for (const auto& c : kSpecs) {
+            // Ask the CRT. The sentinel is 77; the leading argument is distinctive either way.
+            char rendered[160];
+            if (c.fp)                       snprintf(rendered, sizeof rendered, c.fmt, 1.5, 77);
+            else if (strcmp(c.spec, "%s") == 0)
+                                            snprintf(rendered, sizeof rendered, c.fmt, "str", 77);
+            else                            snprintf(rendered, sizeof rendered, c.fmt,
+                                                     (long long)1234, 77);
+            const bool crt_consumes = strstr(rendered, "|77") != nullptr;
+
+            // Ask the walker.
+            char just_spec[16];
+            snprintf(just_spec, sizeof just_spec, "%s", c.spec);
+            const FormatPlan plan = plan_format(just_spec, FormatGrammar::Printf);
+            const bool we_consume = plan.complete && plan.count == 1;
+
+            ++probed;
+            if (!crt_consumes) ++crt_rejects;
+            char d[220];
+            snprintf(d, sizeof d,
+                     "%s: the walker consumes an argument but this CRT does not (it rendered "
+                     "\"%s\"), so every argument behind it would shift", c.spec, rendered);
+            expect("accepted set is a subset of the CRT's", !we_consume || crt_consumes, d);
+        }
+        // Vacuity guards, and the second one is the load-bearing half. The implication passes trivially
+        // for any specifier the CRT consumes, so if the sentinel technique could not DETECT a
+        // non-consuming specifier -- if it silently reported "consumes" for everything -- the whole
+        // loop would be green and would be measuring nothing. The table therefore has to contain at
+        // least one specifier this CRT rejects, and `%qd` is rejected by both the UCRT and the ANSI
+        // stdio implementations, so the guard holds whichever one a build resolves to.
+        expect("CRT subset probe ran", probed == sizeof kSpecs / sizeof *kSpecs,
+               "the specifier table changed but the count did not");
+        expect("CRT subset probe can see a refusal", crt_rejects > 0,
+               "this CRT reports that it consumes an argument for EVERY specifier probed, including "
+               "%qd -- the sentinel detector is broken, so the subset rule was never tested");
+    }
+
     // --- the host CRT, on the platform this exists for ---------------------------------------------
     // The layout is checked above against the compiler's own reader; here the real vsnprintf reads
     // the same bytes and the formatted text itself is asserted.
@@ -454,6 +523,24 @@ void check_executed() {
         if (n < 0 || strcmp(buf, want) != 0)
             fail("Windows CRT round trip",
                  std::string("formatted \"") + buf + "\", expected \"" + want + "\"");
+    }
+
+    // ...and the same round trip for a format carrying `%'d`, driven through the REAL CRT. This is
+    // the case the first version of this change got wrong, so it is pinned end to end rather than
+    // only in the plan table: the walker must refuse at the `%'d`, and what the CRT is then handed
+    // must be the safe prefix with its own arguments intact — never the full format against a slot
+    // array the CRT will read differently.
+    {
+        const char* fmt = "n=%d t=%'d";
+        prepare(fmt);
+        guest_call(fmt, (uint64_t)42, (uint64_t)1234567);
+        char buf[128];
+        const int n = vsnprintf(buf, sizeof buf, g_fallback_format, (va_list)(char*)g_slots);
+        if (n < 0 || strcmp(buf, "n=42 t=") != 0)
+            fail("Windows CRT round trip with %'d",
+                 std::string("formatted \"") + buf + "\", expected \"n=42 t=\"");
+        if (g_fallback_complete)
+            fail("Windows CRT round trip with %'d", "the walker accepted %'d");
     }
 #endif
 }

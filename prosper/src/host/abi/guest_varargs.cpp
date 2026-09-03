@@ -6,9 +6,9 @@ namespace prosper::abi {
 namespace {
 
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
-// ' is the SUSv2 thousands-grouping flag; the rest are C's.
+// C's five. NOT the SUSv2 thousands-grouping `'` -- see the subset rule below.
 bool is_printf_flag(char c) {
-    return c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' || c == '\'';
+    return c == '-' || c == '+' || c == ' ' || c == '#' || c == '0';
 }
 bool is_float_conversion(char c) {
     return c == 'e' || c == 'E' || c == 'f' || c == 'F' ||
@@ -26,21 +26,36 @@ bool is_integer_conversion(char c) {
 // would get on hardware, and that is its business — but if THIS walker and the CRT disagree about
 // the same string, the CRT reads a slot the walker never wrote or skips one it did, and every
 // argument behind that point is wrong. That is precisely the failure this file exists to remove,
-// reintroduced one level up. So an extension is accepted only once it has been MEASURED, and
-// anything unmeasured falls through to the refusal path, which truncates rather than desynchronises.
+// reintroduced one level up.
 //
-// Measured 2026-09-03 against the MinGW CRT under wine (tools/probe_win_varargs.cpp's toolchain), by
-// asking whether a trailing sentinel argument still lands where the caller put it:
+// Measured 2026-09-03 against the REAL ucrtbase.dll — loaded directly and called through its
+// exported `__stdio_common_vsprintf`, since UCRT keeps `snprintf` inline in its headers — by asking
+// whether a trailing sentinel argument still lands where the caller put it:
 //
-//   %zu %jd %td %hhd %a %S %C   consume one argument  -> safe to accept
-//   %'d                         consumes one argument -> accepted, but it is the one entry resting
-//                                                        on MinGW's ANSI stdio rather than on
-//                                                        standard C; re-measure if the CRT changes
-//   %qd                         prints "%qd" LITERALLY and consumes NOTHING -> must be refused
+//   %zu %jd %td %hhd %lld %a %.2f    consume one argument   -> accepted
+//   %'d                              prints "'d" and consumes NOTHING  -> REFUSED
+//   %qd                              prints "qd" and consumes NOTHING  -> REFUSED
 //
-// `q` is therefore absent from the switch below on purpose: a BSD long-long modifier the guest may
-// well emit (332 occurrences across 50 dumps) that the host CRT does not implement. Refusing it
-// costs the tail of one line; accepting it would shift every argument behind it.
+// `q` is a BSD long-long modifier and `'` the SUSv2 thousands-grouping flag; the guest may well emit
+// either (332 and 971 occurrences across the dump corpus). Refusing them costs the tail of one line.
+// Accepting them shifts every argument behind, and a `%s` behind one dereferences a non-pointer.
+//
+// HOW THIS WAS GOT WRONG THE FIRST TIME, because the trap is subtler than the character:
+// `'` was originally KEPT, on a measurement that ran a MinGW probe under wine and saw the argument
+// consumed. That measurement was real and its conclusion was false, because the probe and the
+// shipped build do not resolve `printf` to the same implementation:
+//
+//                        toolchain                __USE_MINGW_ANSI_STDIO   vsnprintf is
+//   the probe            Fedora cross, msvcrt     1                        __mingw_vsnprintf  ('  ok)
+//   CI and shipping      MSYS2 UCRT64             0                        UCRT's own         ('  NOT ok)
+//
+// `_mingw.h:442-454` auto-enables ANSI stdio only while `__MSVCRT_VERSION__ < 0xE00`, and `:229-236`
+// sets exactly 0xE00 on the UCRT branch — so the C++11 clause that rescues the msvcrt build cannot
+// fire on the shipped one, and nothing in CMakeLists.txt or ci.yml defines the escape hatches.
+// THE LESSON IS ABOUT EVIDENCE, NOT ABOUT `'`: "executed on a real Microsoft x64 host" is a strong
+// claim that silently says nothing about anything the two CRTs disagree on. A specifier is accepted
+// here only against the CRT THAT SHIPS, and `test_guest_varargs.cpp` now asks whichever CRT it was
+// built against and fails if this list is not a subset of it.
 
 // Skip a length modifier, reporting whether it was the x87 `L`. `L` matters because a System V
 // `long double` is an 80-bit x87 value passed in MEMORY with 16-byte alignment — neither an integer
