@@ -11,12 +11,28 @@
 // whichever lane happens to be running a THIRD suite — as an unexplained hang in an unrelated test,
 // which reads as "my change deadlocks something" (#3269).
 //
-// `ulimit -c 0` DOES NOT FIX THIS, which is the whole reason this header exists rather than a line
-// in the charter. Measured 2026-09-03 on this box: with `ulimit -c` verified at 0, a crashing
-// process still produced a dump — one, exactly as with `ulimit -c unlimited`. When `core_pattern`
-// begins with `|`, the kernel invokes the handler and leaves the limit for the handler to
-// interpret. `PR_SET_DUMPABLE` is decided in the kernel before that, so it is the one that holds:
-// same experiment, 0 dumps with it against 1 for the control.
+// `ulimit -c 0` DOES NOT FIX THIS, and the reason is narrower than "it does nothing" — that phrasing
+// was in an earlier draft of this comment and is wrong. Measured 2026-09-03 on this box, 20 SIGSEGVs
+// per arm:
+//
+//     arm                        handler invoked   core files stored   wall
+//     ulimit -c 0                     20 / 20              0           0.78 s
+//     ulimit -c unlimited             20 / 20             20           8.53 s
+//     prctl(PR_SET_DUMPABLE, 0)        0 / 20              0           0.009 s
+//
+// So `ulimit -c 0` really does stop the core file being written — systemd-coredump logs "Resource
+// limits disable core dumping" and declines to save. What it does NOT stop is the handler being
+// invoked at all: when `core_pattern` begins with `|`, the kernel spawns the handler regardless and
+// leaves RLIMIT_CORE for it to interpret, so the process spawn and the journal commit are still paid
+// for every crash. THAT is the #3269 stall, which is why the flag is not the fix even though it
+// looks like one and is 11x faster than doing nothing.
+//
+// `PR_SET_DUMPABLE` is decided in the kernel before the handler is reached, so nothing is spawned:
+// 87x faster again, and the only arm that leaves no journal entry.
+//
+// (Checking this the cheap way — crash under `ulimit -c 0` and look in /var/lib/systemd/coredump —
+// finds no file and reads as though the flag worked. `coredumpctl list`'s COREFILE column shows
+// `none` for those entries, which is the distinction the earlier draft missed.)
 //
 // Call it in the CHILD, as early as possible and always before the deliberate death. It is
 // deliberately not called for the parent: a test process that crashes UNEXPECTEDLY should still
