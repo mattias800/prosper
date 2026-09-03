@@ -42,6 +42,17 @@
 // terminal reason must carry the `cfg-recompile-reject` tag, which only `emit_cfg_state_machine`
 // writes.
 //
+// #3308 EXTENDS this file with the other half of the same contract. #3203 pinned that the token
+// must SURVIVE a dispatcher edge; it said nothing about where the token may first appear, and
+// `load_state` re-armed the whole-stream MAY set at EVERY block entry -- the program's own ENTRY
+// block included, where no instruction has run and no save can have executed. Stray's compute
+// program `0x300e390000` saves M0 into s14 at pc157, and s14 is also the compute stage's
+// workgroup-id X, so `v_lshl_add_u32 v11, s14, 3, v0` at pc4 -- the shader's global-thread-index
+// computation, four dwords in -- read a token for a save 153 dwords AHEAD of it and the dispatch
+// was skipped (#3126). The re-arm is now an entry-rooted forward MAY dataflow, and arms D and E
+// below pin both directions of it: an entry-block read compiles, and a read past the save still
+// rejects at that read.
+//
 // Every arm reports independently instead of returning at the first failure. The ctest binary the
 // other #3133 arms live in returns at its first `[FAIL]`, so a mutation run there cannot tell which
 // arms moved; #3136's author had to build a throwaway probe harness for exactly that. This one is
@@ -162,6 +173,37 @@ int main() {
         0xbf810000u,                            // pc8: s_endpgm
     };
 
+    // ARM D (#3308) — THE ENTRY BLOCK. Same region shape and same dispatcher route as the arm
+    // above, with the read moved to pc0, AHEAD of the save at pc3 in both program order and every
+    // control-flow path. s0 gets no prior write on purpose: that is the Stray shape, where the
+    // token-bearing register is an inbound launch word (workgroup-id X) the shader reads before it
+    // ever reuses it. No save has executed at pc0 on any path, so the token cannot be live there and
+    // the read must resolve. With the whole-stream re-arm it did not: `entry_m0_may_hold` is {s0}
+    // and the entry block's own `load_state` stamped it, so the program was refused at pc=0.
+    const uint32_t entry_read_before_any_save[] = {
+        0x4A020000u,                            // pc0: v_add_nc_u32 v1, s0, v0   (ENTRY-block read)
+        0xbf068004u,                            // pc1: s_cmp_eq_u32 s4, 0
+        0xbf840001u,                            // pc2: s_cbranch_scc0 -> pc4
+        0xBE80037Cu,                            // pc3: s_mov_b32 s0, m0          (the save, LATER)
+        0xd7600002u, 0x00010100u,               // pc4: v_readlane_b32 s2, v0, 0
+        0xbf810000u,                            // pc6: s_endpgm
+    };
+    // ARM E (#3308) — the direction that keeps arm D from being a licence to delete the token. The
+    // same program with one extra read of s0 AFTER the save's block. The entry read at pc0 must
+    // still resolve and the post-save read at pc6 must still reject, so the program is refused and
+    // the refusal names pc=6. Asserting only `empty()` here would pass for a fix that reverted to
+    // rejecting at pc=0, which is the defect; asserting only arm D would pass for a fix that deleted
+    // the re-arm outright, which is #3203's silent-zero regression. Neither arm is sufficient alone.
+    const uint32_t entry_read_then_post_save_read[] = {
+        0x4A020000u,                            // pc0: v_add_nc_u32 v1, s0, v0   (ENTRY-block read)
+        0xbf068004u,                            // pc1: s_cmp_eq_u32 s4, 0
+        0xbf840001u,                            // pc2: s_cbranch_scc0 -> pc4
+        0xBE80037Cu,                            // pc3: s_mov_b32 s0, m0          (the save)
+        0xd7600002u, 0x00010100u,               // pc4: v_readlane_b32 s2, v0, 0
+        0x4A060000u,                            // pc6: v_add_nc_u32 v3, s0, v0   (past the edge)
+        0xbf810000u,                            // pc7: s_endpgm
+    };
+
     const auto arm = compile(save_then_read_across_edge,
                              std::size(save_then_read_across_edge), 0x32030001ull);
     const auto control_a = compile(ordinary_write_across_edge,
@@ -170,6 +212,10 @@ int main() {
                                    std::size(save_elsewhere_read_across_edge), 0x32030003ull);
     const auto control_c = compile(save_and_restore_in_one_block,
                                    std::size(save_and_restore_in_one_block), 0x32030004ull);
+    const auto arm_d = compile(entry_read_before_any_save,
+                               std::size(entry_read_before_any_save), 0x32030005ull);
+    const auto arm_e = compile(entry_read_then_post_save_read,
+                               std::size(entry_read_then_post_save_read), 0x32030006ull);
 
     // The controls first: an arm whose controls have not been read is a reject with no denominator.
     CHECK(!control_a.empty(),
@@ -199,6 +245,22 @@ int main() {
           "missing lowering");
     if (fails) printf("  [info] arm reject reason: '%s'\n", reason.c_str());
 
+    // Arms D and E (#3308).
+    CHECK(!arm_d.empty(),
+          "#3308: a read at the ENTRY block of a register saved LATER compiles -- no save has "
+          "executed there on any path, so no token can be live");
+    CHECK(has_opcode(arm_d, kOpSwitch),
+          "#3308: arm D lowered through the CFG DISPATCHER (the module contains an OpSwitch)");
+    CHECK(arm_e.empty(),
+          "#3308: the token still rejects a read past the save's block -- the entry-block fix is a "
+          "narrowing, not a deletion");
+    const std::string reason_e = last_terminal_reject_reason(0x32030006ull);
+    CHECK(has(reason_e, "cfg-recompile-reject"),
+          "#3308: arm E's refusal came from the CFG dispatcher itself");
+    CHECK(has(reason_e, "pc=6"),
+          "#3308: arm E refused at the READ PAST THE SAVE, not at the entry-block read at pc=0");
+    if (fails) printf("  [info] arm E reject reason: '%s'\n", reason_e.c_str());
+
     // Measured mutation signatures, so a future reader can tell a real regression from a fixture
     // that drifted. Every one built cleanly (rc=0) before being believed.
     //
@@ -207,6 +269,18 @@ int main() {
     //                                          the other 335 registered tests still pass.
     //   `state.sreg.erase(reg)` with no      -> identical signature. "Untracked" is not a safe
     //   `sreg_entry_m0.insert(reg)`             middle ground: it fabricates the same zero silently.
+    //   re-arm the whole-stream MAY set at    -> 3 fails (rc=1): arm D's two lines, and arm E's
+    //   every block entry (the pre-#3308          `pc=` line, whose reason reads
+    //   behaviour)                                `pc=0 words=4a020000 fmt=6 op=0x25` -- the
+    //                                             ENTRY-block read refused for a save three dwords
+    //                                             ahead of it. The four #3203 arms and all five
+    //                                             controls stay green, which is why #3203 alone
+    //                                             could not see this.
+    //   stamp NO tokens at any block entry    -> 7 fails (rc=1): every #3203 arm plus arm E. Arm D
+    //                                             passes, correctly -- nothing rejects when the
+    //                                             token is gone. The two signatures are disjoint in
+    //                                             both directions, so neither arm is vacuous and
+    //                                             neither substitutes for the other.
     //   re-arm EVERY scalar, not the MAY set -> the OPPOSITE signature. Controls B and C redden, the
     //                                          arm still rejects -- but at `pc=1`, the `s_cmp` that
     //                                          reads s4, not the read the contract is about. That is

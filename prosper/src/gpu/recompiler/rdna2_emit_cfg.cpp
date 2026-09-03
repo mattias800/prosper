@@ -1923,6 +1923,66 @@ bool emit_cfg_state_machine(
         if (reads_dynamic_vector_range) vector_reads[block] = vregs;
     }
 
+    // #3133's `entry_m0_may_hold` is a WHOLE-STREAM MAY set, and `load_state` stamps it at EVERY
+    // dispatcher block entry -- the program's own ENTRY block included. Its comment predicted the
+    // cost as "over-rejects a register that the shader reuses for real data in a LATER block"; the
+    // entry block is the case where that is not a judgement call but provably wrong. No instruction
+    // has run there, so no save can have executed, and every scalar still holds the inbound word the
+    // hardware placed in it.
+    //
+    // Stray's compute program `0x300e390000` is the worked example (#3308; the title-screen
+    // background it belongs to is #3126). It saves M0 into s14 at pc157 and pc274 -- and s14 is ALSO
+    // the compute stage's workgroup-id X, so `v_lshl_add_u32 v11, s14, 3, v0` at pc4, the shader's
+    // own global-thread-index computation four dwords into the program, read a token for a save 153
+    // dwords AHEAD of it and the whole dispatch was skipped.
+    //
+    // Narrow it to an entry-rooted forward MAY dataflow over the same CFG the mask analyses below
+    // walk. GEN is #3133's own save shape; KILL is any other scalar write to the word, applied in
+    // instruction order so a save and a later overwrite inside one block end the lifetime the save
+    // started. The join is a UNION and deliberately not the MUST/equality join the mask analyses
+    // use: the token is a MAY property whose whole purpose is to reject, so a register holding it on
+    // one edge and data on another must keep rejecting.
+    std::vector<std::set<int>> entry_m0_in(starts.size());
+    std::vector<bool> entry_m0_reachable(starts.size(), false);
+    if (!entry_m0_may_hold.empty() && !starts.empty()) {
+        entry_m0_reachable.front() = true;   // the entry block's in-set stays EMPTY by construction
+        std::vector<uint32_t> pending{0};
+        while (!pending.empty()) {
+            const uint32_t block = pending.back();
+            pending.pop_back();
+            std::set<int> tokens = entry_m0_in[block];
+            const uint32_t lo = starts[block];
+            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+            for (const auto& in : ins) {
+                if (in.pc < lo || in.pc >= hi || in.is_end) continue;
+                // Kill before gen, so the save's own destination write does not erase the token it
+                // is about to create.
+                for_each_scalar_write(in, [&](int base, uint32_t width) {
+                    for (uint32_t word = 0; word < width; ++word)
+                        tokens.erase(base + static_cast<int>(word));
+                }, proven_wave32_masks);
+                if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                    in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
+                    in.dst.value <= 105)
+                    tokens.insert(in.dst.value);
+            }
+            for (const uint32_t successor : successors[block]) {
+                if (!entry_m0_reachable[successor]) {
+                    entry_m0_reachable[successor] = true;
+                    entry_m0_in[successor] = tokens;
+                    pending.push_back(successor);
+                    continue;
+                }
+                std::set<int> joined = entry_m0_in[successor];
+                joined.insert(tokens.begin(), tokens.end());
+                if (joined != entry_m0_in[successor]) {
+                    entry_m0_in[successor] = std::move(joined);
+                    pending.push_back(successor);
+                }
+            }
+        }
+    }
+
     // Wave32 saved masks can be replaced by ordinary scalar-data lifetimes. The dispatcher reloads
     // a statically-shaped register file at every case, so carry both the one-word B32 mask domain
     // and B64 saved-mask domain as compile-time properties of each basic-block entry. This is exact
@@ -3637,10 +3697,6 @@ bool emit_cfg_state_machine(
             state.vreg[kv.first] = b.load_function(b.t_u32, kv.second);
         }
         for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
-        for (int reg : entry_m0_may_hold) {                        // #3133 (see the MAY set above)
-            state.sreg.erase(reg);
-            state.sreg_entry_m0.insert(reg);
-        }
         const std::set<int>* entry_b32 = nullptr;
         const std::set<int>* entry_b64 = nullptr;
         const std::set<int>* entry_wave64_b64 = nullptr;
@@ -3652,6 +3708,18 @@ bool emit_cfg_state_machine(
         else if (const auto terminal = block_for_pc.find(end_pc);
                  terminal != block_for_pc.end())
             entry_block = terminal->second;
+        // #3133's token, narrowed to the saves that can actually REACH this block entry. A block the
+        // walk never reached -- and the terminal call when `end_pc` maps to no block -- falls back
+        // to the whole-stream set, so the unknown case keeps #3133's conservative behaviour instead
+        // of silently dropping the token.
+        const std::set<int>& entry_m0_here =
+            (entry_block != UINT32_MAX && entry_m0_reachable[entry_block])
+                ? entry_m0_in[entry_block]
+                : entry_m0_may_hold;
+        for (int reg : entry_m0_here) {
+            state.sreg.erase(reg);
+            state.sreg_entry_m0.insert(reg);
+        }
         if (b.allow_b32_masks) {
             if (entry_block != UINT32_MAX && b32_mask_reachable[entry_block]) {
                 entry_b32 = &b32_mask_in[entry_block];

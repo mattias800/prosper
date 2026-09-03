@@ -435,7 +435,7 @@ investigation down the `no-effect` path.
 | 1, 2 | vertex `0x300f190000` | `v_mbcnt_lo/hi_u32_b32` cross-lane, rejected at **pc=4** -- see the correction below |
 | 3 | fragment `0x30be800000` | MIMG `op=0x1`, `recompile-reject-mimg-address extra=1` at pc=134 |
 | 6-9 | fragment `0x300c010000` | `s_mov_b32 s0, m0` — `scalar-data-reject pc=37 special=s124 tracked=0` |
-| 10 | compute `0x300e390000` | the same `s_mov_b32 sX, m0` at pc=157, behind a `nested-backedge-in-body` loop reject at pc=688 |
+| 10 | compute `0x300e390000` | **superseded — see the subsection below.** Recorded here as the same `s_mov_b32 sX, m0` at pc=157, behind a `nested-backedge-in-body` loop reject at pc=688. The live reject is at **pc=4**, and the pc157 save is its cause only at one remove (#3308) |
 
 Two more fragment programs fail in other draws of the same frame: `0x300e500000` (`unsupported=29`,
 first reject pc=20) and `0x3011560000` (`unsupported=1`, first reject pc=383).
@@ -471,6 +471,50 @@ gpu_replay <capsule>.prgcap --inspect-only                     # the failure/ope
 PROSPER_DBG=1 gpu_replay <capsule>.prgcap --retry-failed-stage 6:1
 gpu_replay <capsule>.prgcap --dump-failed-shader 1:1 vs.bin    # the raw guest program
 ```
+
+### The compute program `0x300e390000`, decoded — and why its reject PC misleads twice
+
+```
+[compute] skip unsupported program 0x300e390000 reason=cfg-recompile-reject mode=unresolved-operand
+          pc=4 words=d746000b,0401060e len=2 fmt=9 op=0x346
+```
+
+`d746000b 0401060e` is **`v_lshl_add_u32 v11, s14, 3, v0`** (llvm-mc; `gfx1010` and `gfx1030` agree —
+VOP3A `VDST=11`, `SRC0=14` = s14, `SRC1=131` = inline constant 3, `SRC2=256` = v0, no
+abs/neg/omod/clamp/op_sel). It is the kernel's own global-thread-index computation: workgroup-id X
+times the workgroup width, plus the local invocation id, four dwords into the program.
+
+**`op=0x346` is not a missing instruction.** prosper has lowered `v_lshl_add_u32` since long before
+this title was tracked (`rdna2_emit_alu.cpp:4844`), and it is already on the B32 VOP3 source-width
+allowlist (`rdna2_cfg_support.hpp:1304`). The line says so itself: `mode=unresolved-operand`, not
+`unknown-encoding` — the field #2412 added precisely so a census can tell "implement this" from "the
+operand did not resolve".
+
+**The register is the whole story.** `s14` is both the compute stage's workgroup-id X *and* the
+register this shader saves M0 into, at pc157 (`be8e037c`) and again at pc274. #3133's CFG-dispatcher
+re-arm stamped its entry-M0 token on a **whole-stream** MAY set at **every** block entry — the
+program's own entry block included, where nothing has executed and no save can have run. The read at
+pc4 was therefore refused for a save 153 dwords *ahead* of it. #3308 replaces that with an
+entry-rooted forward MAY dataflow; the reject then moves to pc145 and the emitted-word count from
+3220 to 8931.
+
+**It still does not compile, and the remaining blockers are unrelated to either.** pc145 is
+`v_writelane_b32 v20, s15, 2`, a spill of the *high half* of the Wave64 mask `s[14:15]`; with a
+native 64-wide subgroup adopted the next stop is pc412, `s_mov_b64 exec, s[74:75]`. This program is a
+chain, and clearing its first link is not evidence about the background.
+
+**The whole chain is reproducible offline, CPU-only — no boot, no GPU, seconds per iteration.** The
+program's bytes sit in every checked-in Stray F9 bundle, and `tools/shader_inspect` runs the entire
+compute translator on a raw dump:
+
+```bash
+PROSPER_DBG=1 ./build-linux/shader_inspect <prog>.bin --stage compute
+```
+
+Its default launch shape is deliberately empty, which moves the decline to sites the live
+translation never reaches. Pass `PROSPER_SHADER_INSPECT_WAVE_SIZE=64`,
+`PROSPER_SHADER_INSPECT_NATIVE_SUBGROUP=64`, `PROSPER_SHADER_INSPECT_USER_SGPRS=14` and
+`PROSPER_SHADER_INSPECT_TGID=xyz` to model this dispatch.
 
 ## The scene targets are black AT SOURCE
 
@@ -620,6 +664,16 @@ drops still discard the background.
   V# (`base=0x2120e82400 stride=32 size=192`). An eight-dword shift would have to put a cbuf V#'s
   leading dwords precisely where two dereferenceable pointers are. Slot 0 is the only place declaration
   and memory disagree. #3126.
+- **"Compute `0x300e390000` is skipped because the recompiler lacks `op=0x346`."** Falsified by
+  reading the words the diagnostic prints: `d746000b,0401060e` is `v_lshl_add_u32`, whose emitter is
+  `rdna2_emit_alu.cpp:4844` and has been there all along. The line already said `unresolved-operand`
+  rather than `unknown-encoding`. The actual cause was an entry-M0 token stamped on an inbound launch
+  register. **The transferable lesson is the one #2481/#2801 already record — a reject PC names where
+  a fact was CONSUMED, not where it was lost** — and here the two are 153 dwords apart *in the wrong
+  order*, the consumer coming first, which is why nobody looked past it. #3308.
+- **"Clearing that program's reject renders the title-screen background."** Not established, and do
+  not assume it: the fix moves the reject from pc4 to pc145 (a Wave64 mask-half spill), with pc412
+  (`s_mov_b64 exec, s[74:75]`) behind that. The dispatch is still skipped. #3308.
 
 - **"The surfaces prosper renders into read black because the live RTT cache does not treat them as
   authoritative, so the sampler falls through to zeroed guest memory."** Falsified (#3140) — 58,569
