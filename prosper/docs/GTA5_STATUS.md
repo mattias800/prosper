@@ -24,18 +24,22 @@ pointer here and in `CLAUDE.md` said #2481 long after it closed). Route: `script
 presses for a reason).
 
 **Framerate optimization (2026-09-03)**: Gameplay in the prologue bank heist advanced from the
-initial ~0.6–0.8 FPS slide-show baseline to **15.2–15.4 FPS** in native 4K Performance mode,
-crossing the interactive threshold (measured average frame time 64.8 ms; see detailed breakdown
-below).
+initial ~0.6–0.8 FPS slide-show baseline to **21.0–21.3 FPS (46.99 ms average frame interval)** in native 4K Performance mode,
+an overall **~34x speedup** (measured across 106 rendered frames in 4.90 s; Run 6 milestone reached 15.2–15.4 FPS; Run 7 reached 21.0–21.3 FPS; see breakdown below).
 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
-## Gameplay framerate optimization: reaching 15+ FPS (2026-09-03)
+## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
 
-Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist) raised gameplay throughput from **0.6–0.8 FPS (1,600+ ms/frame) to 15.2–15.4 FPS (64.8 ms/frame)** on host hardware (Intel Core i9 24-core, NVIDIA GeForce RTX 4090 24GB).
+**Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.
 
-This represents a **~22x speedup**. The primary bottlenecks identified and resolved are detailed below.
+> [!NOTE]
+> Several transfer-reduction mechanisms below (§2, §3, §4) explicitly address host staging bloat and discrete PCIe bus transfers between system RAM and dedicated VRAM. On unified-memory APU/iGPU architectures (such as Linux / Radeon 8060S), host memory and device memory share the same physical address space, so PCIe-specific bus bottlenecks do not exist there in the same form.
+
+Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist) raised gameplay throughput from **0.6–0.8 FPS (1,600+ ms/frame) to 21.0–21.3 FPS (46.99 ms/frame)** on host hardware.
+
+This represents a **~34x speedup**. The primary bottlenecks identified and resolved are detailed below.
 
 ### 1. MRT Flush Breaking Backend Submission Batching (~560 ms/frame reduction)
 
@@ -71,11 +75,12 @@ This represents a **~22x speedup**. The primary bottlenecks identified and resol
 
 - **Problem Description**:
   - In `live_renderer.cpp`, `base != front_va` forced synchronous CPU readback of the 4K scanout buffer ($3840 \times 2160 \times 4 = 33.2\text{ MB}$, taking ~9.3 ms/frame). However, under active GPU presentation (`final_gpu_present`), `present_blit_publish` samples directly from Vulkan GPU images (`tgt->image`), so the CPU-copied pixels were immediately discarded.
-  - In `render_runner.h`, when slot 0 was not bound (`color_target->persistent_id == 0`), `persistent_color` evaluated to `false`, causing `!persistent_color` to evaluate to `true` in `readback_color0_wanted`. This erroneously triggered 33.2 MB readbacks on passes that never even bound slot 0.
+  - In `render_runner.h`, when slot 0 or extra slots were not bound (`persistent_id == 0`), empty slots evaluated `!persistent_color` or uninitialized readback flags to true, triggering multi-megabyte `vkCmdCopyImageToBuffer` calls into staging buffers and subsequent host CPU memcpy loops for unused memory.
 - **Solution Description**:
   - Defer scanout readbacks when `final_gpu_present` is active (`(base != front_va || final_gpu_present)`).
-  - Gate `readback_color0_wanted` and `readback_extra_wanted` on `color_target->persistent_id != 0`, preventing multi-megabyte host readback allocations on unbound slots.
-  **Impact**: Saved ~9.3 ms of CPU readback and memcpy latency per frame.
+  - Gate `readback_color0_wanted`, `readback_color1_wanted`, and `readback_extra_wanted` on `color_target->persistent_id != 0`, preventing multi-megabyte host readback allocations on unbound slots.
+  - In `live_renderer.cpp`, only set `backend_target.readback*` flags when the corresponding slot base address is non-zero.
+  **Impact**: Saved ~17.6 ms of CPU readback and PCIe memcpy latency per frame.
 
 ### 5. Concurrent Shader Cache Scaling (`std::shared_mutex`)
 
@@ -83,24 +88,52 @@ This represents a **~22x speedup**. The primary bottlenecks identified and resol
   Drawing 442 items per frame across 16 parallel draw realization workers (`PROSPER_DRAW_REALIZE_THREADS=16`) generated 884 shader lookups per frame. In `src/gpu/execute/gpu_executor.cpp`, `ShaderCache` was guarded by a standard `std::mutex`. Even though the cache experienced 100% hits in steady state, all 16 worker threads serialized on this single mutex, accumulating **228.6 ms of contention across threads (14.3 ms wall time)**.
 - **Solution Description**:
   Upgraded `ShaderCache::mutex` to `std::shared_mutex`. Cache hits now acquire `std::shared_lock`, allowing all 16 worker threads to query and resolve cached SPIR-V simultaneously. Thread-safe atomic counters (`atomic<uint64_t> hits`, `atomic<uint64_t> last_use`) eliminate data races without locking.
-  **Impact**: Eliminated thread serialization; wall time between submissions dropped from 43.9 ms to 26.6 ms.
+  **Impact**: Eliminated thread serialization; wall time between submissions dropped from 43.9 ms to 12.3 ms.
 
 ### 6. Summary of Progression & Verification
 
 | Milestone | Configuration / Fixes | Frame Time (avg) | FPS | Key Gain |
 | :--- | :--- | :--- | :--- | :--- |
-| **Baseline** | Default master launch | ~1,600 ms | ~0.6–0.8 FPS | Initial state |
+| **Baseline** | Default launch | ~1,600 ms | ~0.6–0.8 FPS | Initial state |
 | **Run 2** | Native `Unorm2_10_10_10` + Bounded GPU compare | ~693 ms | ~1.5–2.0 FPS | Bounded PCIe compare (1138ms -> 30ms) |
 | **Run 3** | MRT batching fix (`readback_extra_wanted`) | 84.9 ms | 11.8 FPS | Reduced submits from 28 to 2 (saved 598ms) |
 | **Run 5** | 16 realization threads + Mailbox present + 8GB caches | 77.0 ms | 13.0 FPS | Triple-buffering, expanded target budgets |
-| **Run 6** | Unbound readback bypass + `shared_mutex` shader cache | **64.8 ms** | **15.2–15.4 FPS** | Zero thread contention, 0ms spurious readback |
+| **Run 6** | Readback bypass + `shared_mutex` shader cache | 64.8 ms | 15.2–15.4 FPS | Zero thread contention across 16 workers |
+| **Run 7 (Final)** | Full unbound slot readback elimination (`live_renderer` + `render_runner`) | **46.99 ms** | **21.0–21.3 FPS** | 0ms spurious readback across all MRT slots (~34x speedup) |
 
-- **Final Performance Capture**: `perf_capture_PPSA04263_20260903-073935-834.prperf`
-  - Sample Window: 5.14 s, 79 rendered frames.
-  - Guest Flips Rate: **15.17 flips/s**.
-  - Effective Renderer Rate: **15.43 FPS** (average dt: 64.82 ms).
-  - Measured Graphics Time: **38.21 ms/frame** (26.2 FPS GPU capacity).
+- **Final Performance Capture**: `perf_capture_PPSA04263_20260903-075401-494.prperf`
+  - Sample Window: 4.90 s, 106 rendered frames.
+  - Guest Flips Rate: **21.00 flips/s**.
+  - Effective Renderer Rate: **21.28 FPS** (average dt: 46.99 ms).
+  - Measured Graphics Time: **34.65 ms/frame** (28.8 FPS GPU capacity).
+  - Inter-frame gap: **12.34 ms**.
   - Test Suite: **267 / 268 passed** (1 skipped, 0 failed).
+
+### 7. Reproduction Recipe
+
+To reproduce the benchmark capture on Windows:
+```powershell
+$env:PROSPER_PAD_SCRIPT = "@C:/Users/matti/repos/ps5ys/prosper/scripts/gta5/reach-performance-story.pad"
+$env:PROSPER_PAD_SCRIPT_LOG = "1"
+$env:PROSPER_CAPTURE_DIR = "C:/Users/matti/repos/ps5ys/tmp/captures"
+$env:PROSPER_PERF_CAPTURE_AFTER_MS = "270000"
+$env:PROSPER_RENDER = "1"
+$env:PROSPER_MAX_GPU_COMPARE_IMAGE_MB = "2"
+$env:PROSPER_BACKEND_TARGET_CACHE_COUNT = "4096"
+$env:PROSPER_BACKEND_TARGET_CACHE_MB = "8192"
+$env:PROSPER_BACKEND_TEXTURE_CACHE_MB = "8192"
+$env:PROSPER_COMPUTE_IMAGE_CACHE_MB = "4096"
+$env:PROSPER_TEXTURE_DECODE_CACHE_MB = "4096"
+$env:PROSPER_DETILE_THREADS = "4"
+$env:PROSPER_COMPUTE_CONVERSION_THREADS = "4"
+$env:PROSPER_DRAW_REALIZE_THREADS = "16"
+
+.\build-mingw-app\prosper-app.exe --dump "C:\Users\matti\repos\ps5ys\testdata\PPSA04263-app0" --volume 0 --present-mode mailbox
+```
+Inspect the resulting `.prperf` capture file with:
+```bash
+python tools/perf/performance_capture_report.py <capture>.prperf
+```
 
 ## What the rendering series changed, and what it teaches (2026-08-26)
 
