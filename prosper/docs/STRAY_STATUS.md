@@ -103,9 +103,9 @@ Two more allocations of the same family sit on the same reference. The persisten
 fresh 63.8 MiB `source_prefix` on every invalidation (13.00 ms at this shape) — it now inherits the
 allocation from the entry it replaces. The remaining one is **not** addressed:
 `cached.pixels = std::move(texture_pixels)` steals the pooled `texstore` slot, so the next decode
-allocates its 33 MiB output buffer fresh (~4.4 ms). Fixing it needs a decision about buffer ownership
-between `texstore` and the persistent cache, which hands its buffer out as a
-`shared_ptr<const std::vector>` that never comes back.
+allocates its 33 MiB output buffer fresh (~4.4 ms) — [#3310](https://github.com/mattias800/prosper/issues/3310).
+Fixing it needs a decision about buffer ownership between `texstore` and the persistent cache, which
+hands its buffer out as a `shared_ptr<const std::vector>` that never comes back.
 
 ### The lever that is worth more than all of this
 
@@ -114,7 +114,9 @@ every frame**. `import_live_compute_storage_image` finds nothing under its key, 
 through to the guest-byte decode. If that import hit, the 63.8 MiB writeback → detile → convert
 disappears **on both sides of the boundary** — the graphics decode and the compute writeback that
 feeds it. That is a bigger lever than every allocation above put together, and it lives in the
-compute cache's admission, not in the materializer.
+compute cache's admission, not in the materializer. Both halves of that round trip are read
+together in [#3307](https://github.com/mattias800/prosper/issues/3307): the compute side's re-tile
+into guest memory, and the graphics side's read of those same bytes back out.
 
 ## The unresolved image ops — established on CALIBRATION
 
