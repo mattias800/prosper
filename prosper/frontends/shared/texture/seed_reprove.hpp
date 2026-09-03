@@ -47,4 +47,25 @@ inline uint32_t seed_reprove_interval_from_env(const char* env, uint32_t dflt) {
     return (uint32_t)v;
 }
 
+// Coverage classification for storage image writes proven by poison pattern verification.
+// Full: every texel is overwritten by the shader (survived == 0).
+// Partial: some texels are overwritten and some remain untouched (0 < survived < texels).
+// None: zero texels are overwritten by the shader (survived == texels).
+enum class SeedCoverage : uint8_t { Full, Partial, None };
+
+constexpr SeedCoverage classify_seed_coverage(size_t survived, size_t texels) {
+    if (survived == 0) return SeedCoverage::Full;
+    if (survived >= texels) return SeedCoverage::None;
+    return SeedCoverage::Partial;
+}
+
+constexpr const char* seed_coverage_name(SeedCoverage cov) {
+    switch (cov) {
+        case SeedCoverage::Full: return "full-coverage (seed-skip proven)";
+        case SeedCoverage::None: return "NONE-COVERAGE (untouched, setup/writeback skip proven)";
+        case SeedCoverage::Partial: return "PARTIAL-COVERAGE (will always seed)";
+    }
+    return "unknown";
+}
+
 }  // namespace prosper::frontend
