@@ -18,6 +18,7 @@
 #include "shared/perf/performance_timing_gate.hpp"
 #include "shared/perf/performance_timing_policy.hpp"
 #include "shared/present/readback_policy.hpp"
+#include "gpu/present/videoout_present.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3351,6 +3352,7 @@ struct PersistentDsImage {
     bool stencil_valid = false;
     uint64_t last_depth_write = 0;   // sampled-bridge recency (#1275)
     uint64_t last_depth_command_order = 0;
+    uint64_t last_depth_present = UINT64_MAX;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -3395,6 +3397,7 @@ inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_de
     if (use_depth && depth_may_be_written) {
         image.last_depth_write = ++persistent_ds_write_generation();
         image.last_depth_command_order = command_order;
+        image.last_depth_present = prosper::gpu::present_count();
     }
 }
 
@@ -3928,7 +3931,15 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // refresh. A byte comparison cannot, and the `gpu-preserving` origin is a process-global set
         // by whichever write ran last (gpu_executor.cpp, `g_guest_write_origin`), so keying on it is
         // order-dependent by construction.
-        const bool htile_kill = htile_overlap && htile_invalidates;
+        const bool byte_preserving =
+            std::strcmp(prosper::gpu::guest_gpu_write_origin(), "gpu-preserving") == 0;
+        const uint64_t current_present = prosper::gpu::present_count();
+        const bool current_frame_depth =
+            image.depth_valid && image.last_depth_write > 0 &&
+            image.last_depth_present != UINT64_MAX &&
+            image.last_depth_present == current_present;
+        const bool htile_kill = htile_overlap && htile_invalidates &&
+                                (!byte_preserving || !current_frame_depth);
         if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
         if (depth_overlap || htile_kill) image.depth_valid = false;
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
