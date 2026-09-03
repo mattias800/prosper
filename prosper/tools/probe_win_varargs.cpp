@@ -2,9 +2,15 @@
 //
 // NOT part of the build and NOT a ctest case: it is the reproduction recipe for the one claim the
 // Linux suite cannot make, kept beside the change so the next person does not have to rebuild it.
-// `tests/host/abi/test_guest_varargs.cpp` checks the same logic on any x86-64 host; this compiles the
-// PRODUCTION sources for Windows and executes them, so the CRT, the ABI and the emitted stub bytes
-// are the real ones rather than modelled ones.
+//
+// BE PRECISE ABOUT WHAT THIS SHARES WITH PRODUCTION, because "it runs the production code" would be
+// an overclaim. It compiles the production TRANSLATION sources — `guest_varargs.cpp` and
+// `sysv_ms_bridge.cpp`, the two files that decide argument classes, read the guest's System V list,
+// write the Microsoft one and emit the stub bytes — and it exercises them through the real MinGW CRT
+// on a real Microsoft x64 ABI. What it does NOT link is `hle_libc.cpp`: `guest_snprintf` below
+// RE-SPELLS the guest-ABI shim's shape rather than being it, because linking the HLE would drag in
+// the whole emulator. So the ABI, the CRT and the translation are the real ones; the four-line shim
+// around them is a copy, and a change to the real shim's shape has to be mirrored here by hand.
 //
 //   distrobox enter ps5ys -- bash -lc '
 //     x86_64-w64-mingw32-g++ -std=c++20 -O2 -static -I prosper/src \
@@ -100,8 +106,13 @@ int main() {
     // defect, and it is also why the control here avoids reproducing it: a probe that crashes cannot
     // report its own result.
     ((LegacyGuest)code)(g_legacy_buf, sizeof g_legacy_buf, "%d|%.2f|%d", 1, 1.5, 2);
+    // Assert the SHAPE of the corruption, not merely that it differs. `!=` would also be satisfied by
+    // a truncated buffer or an empty one, i.e. by the probe being broken. What actually happens is
+    // deterministic for the first two fields: the first integer still arrives (both conventions place
+    // it identically), and the float is read from the integer register holding the NEXT argument, a
+    // tiny denormal that prints as 0.00. Only the third field is stack-dependent.
     check("signature-blind stub does NOT deliver the float",
-          strcmp(g_legacy_buf, "1|1.50|2") != 0, g_legacy_buf);
+          strncmp(g_legacy_buf, "1|0.00|", 7) == 0, g_legacy_buf);
 
     printf(g_fail ? "\nprobe_win_varargs: %d failure(s)\n" : "\nprobe_win_varargs: all cases passed\n",
            g_fail);

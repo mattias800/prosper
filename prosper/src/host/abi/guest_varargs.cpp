@@ -21,6 +21,27 @@ bool is_integer_conversion(char c) {
            c == 'c' || c == 'C' || c == 's' || c == 'S' || c == 'p' || c == 'n';
 }
 
+// THE RULE THIS WHOLE FILE OBEYS: what is accepted here must be a SUBSET of what the host CRT
+// consumes an argument for. A guest that lies about its own format string gets the same garbage it
+// would get on hardware, and that is its business — but if THIS walker and the CRT disagree about
+// the same string, the CRT reads a slot the walker never wrote or skips one it did, and every
+// argument behind that point is wrong. That is precisely the failure this file exists to remove,
+// reintroduced one level up. So an extension is accepted only once it has been MEASURED, and
+// anything unmeasured falls through to the refusal path, which truncates rather than desynchronises.
+//
+// Measured 2026-09-03 against the MinGW CRT under wine (tools/probe_win_varargs.cpp's toolchain), by
+// asking whether a trailing sentinel argument still lands where the caller put it:
+//
+//   %zu %jd %td %hhd %a %S %C   consume one argument  -> safe to accept
+//   %'d                         consumes one argument -> accepted, but it is the one entry resting
+//                                                        on MinGW's ANSI stdio rather than on
+//                                                        standard C; re-measure if the CRT changes
+//   %qd                         prints "%qd" LITERALLY and consumes NOTHING -> must be refused
+//
+// `q` is therefore absent from the switch below on purpose: a BSD long-long modifier the guest may
+// well emit (332 occurrences across 50 dumps) that the host CRT does not implement. Refusing it
+// costs the tail of one line; accepting it would shift every argument behind it.
+
 // Skip a length modifier, reporting whether it was the x87 `L`. `L` matters because a System V
 // `long double` is an 80-bit x87 value passed in MEMORY with 16-byte alignment — neither an integer
 // slot nor an SSE one — so a format carrying it is refused rather than mis-read as a double.
@@ -30,7 +51,7 @@ const char* skip_length(const char* p, bool* long_double) {
     case 'h': ++p; if (*p == 'h') ++p; break;
     case 'l': ++p; if (*p == 'l') ++p; break;
     case 'L': *long_double = true; ++p; break;
-    case 'q': case 'j': case 'z': case 't': ++p; break;
+    case 'j': case 'z': case 't': ++p; break;   // NOT 'q' — see the subset rule above
     default: break;
     }
     return p;
@@ -176,12 +197,30 @@ void pack_ms_va_slots(const FormatPlan& plan, SysvVaList ap, uint64_t* slots) {
 
 MsVarargCall::MsVarargCall(const char* fmt, const SysvVaList& ap, FormatGrammar grammar)
     : plan_(plan_format(fmt, grammar)) {
-    pack_ms_va_slots(plan_, ap, slots_);
-    if (plan_.complete) { format_ = fmt; return; }
+    complete_ = plan_.complete;
+    reject_   = plan_.reject;
+    if (plan_.complete) {
+        pack_ms_va_slots(plan_, ap, slots_);
+        format_ = fmt;
+        return;
+    }
+
     size_t keep = plan_.modelled_bytes;
     if (keep >= kMaxPrefixBytes) keep = kMaxPrefixBytes - 1;
     if (keep && fmt) std::memcpy(prefix_, fmt, keep);
     prefix_[keep] = '\0';
+
+    // Re-plan the PREFIX rather than trusting the cap. `modelled_bytes` is always a conversion
+    // boundary, but kMaxPrefixBytes is not, so a long format can be cut in the middle of a `%...`
+    // spec — and the slot count planned for the whole format would then no longer describe the
+    // string actually handed to the CRT. Planning what will really be formatted keeps the two
+    // definitionally in step, and shortens the prefix again when the cut landed inside a conversion.
+    // The prefix's own plan may come back `complete`, since the cut can have removed the very thing
+    // that was refused; the CALLER's verdict stays the original one, which is why it is captured
+    // above rather than read back from here.
+    plan_ = plan_format(prefix_, grammar);
+    prefix_[plan_.modelled_bytes] = '\0';
+    pack_ms_va_slots(plan_, ap, slots_);
     format_ = prefix_;
 }
 

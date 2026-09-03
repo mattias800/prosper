@@ -98,19 +98,24 @@ public:
     const char* format() const { return format_; }
     // The Microsoft x64 va_list image. On Windows this is castable to `va_list` directly.
     void*       va_list_image() { return slots_; }
+    // Slots actually packed, which always describes `format()` rather than the original string.
     unsigned    count() const { return plan_.count; }
-    bool        complete() const { return plan_.complete; }
-    const char* reject() const { return plan_.reject; }
+    // The verdict on the ORIGINAL format. Deliberately not read back from `plan_`, which after a
+    // refusal describes the truncated prefix and can itself be complete.
+    bool        complete() const { return complete_; }
+    const char* reject() const { return reject_; }
 
 private:
     // Longest format prefix retained when the tail cannot be modelled. A format longer than this that
     // also carries an unmodellable conversion loses more of its tail, which is the safe direction.
     static constexpr size_t kMaxPrefixBytes = 512;
 
-    FormatPlan plan_{};
+    FormatPlan plan_{};                  // the plan for `format_`, i.e. what was actually packed
     uint64_t   slots_[kMaxFormatArgs]{};
     char       prefix_[kMaxPrefixBytes]{};
     const char* format_ = nullptr;
+    bool        complete_ = true;        // the verdict on the format as GIVEN
+    const char* reject_ = nullptr;
 };
 
 } // namespace prosper::abi

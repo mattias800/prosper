@@ -694,11 +694,28 @@ void observe_guest_c_string(const char* text, bool known_newline,
 // nothing that could be inlined into it carrying one (PROSPER_GUEST_ABI in dispatch.hpp). Capture,
 // delegate, return.
 //
-// CONFIDENCE: HIGH on Linux/macOS, where this is the long-standing behaviour and the tag is empty.
-// HIGH on the Windows mechanism as well — the shape below was assembled by MinGW GCC 16.1.1 at every
-// optimization level and executed under wine, delivering a twelve-argument mixed call including
-// System V overflow-area integers and five xmm doubles (#3246). What is NOT verified is a live guest
-// calling it on a Windows host; nobody here has one.
+// THE ONE CAVEAT, and it is on LINUX rather than on the new path. When guest %fs TLS is on — which is
+// the DEFAULT (`guest_tls.cpp` opts out only through PROSPER_NO_GUEST_FS) — the import stub is not a
+// tail-jump at all but the swap stub, which interposes a CALL so it can restore the guest's %fs
+// afterwards. To keep the callee's stack arguments where SysV puts them it re-pushes the guest's
+// spilled words... and it re-pushes exactly FOUR of them (`emit_swap_stub`, exec_image_linux.cpp:
+// "push original arg10/9/8/7"). Immediately behind those sits the stub's saved r11, then the guest's
+// return address, then a shifted duplicate of the same four words.
+//
+// So a variadic call whose overflow area holds a FIFTH word reads the stub's saved r11 as that
+// argument, and everything after it is wrong too. Reaching it needs more than six integer-class or
+// more than eight floating-point variadic arguments — rare for a format call, and unchanged by this
+// commit, which is why it is recorded rather than fixed here (#3271). It is NOT a Windows problem: there the
+// guest-ABI stub really is a bare tail-jump with no interposed frame, so the overflow area arrives
+// whole. macOS never emits the swap stub either (`stub_swap_mode()` returns false there).
+//
+// CONFIDENCE: HIGH on Linux/macOS for register and xmm arguments, which is the overwhelmingly common
+// case and the long-standing behaviour with the tag empty; MED for Linux stack-spilled arguments past
+// the fourth, per the paragraph above. HIGH on the Windows mechanism — the shape below was assembled
+// by MinGW GCC 16.1.1 at every optimization level and executed under wine, delivering a
+// twelve-argument mixed call including System V overflow-area integers and five xmm doubles, and the
+// whole suite runs on the Windows MinGW CI host (#3246). What is NOT verified is a live guest calling
+// it on a Windows host; nobody here has one.
 static PROSPER_GUEST_ABI uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
 #if defined(_WIN32)
     __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);

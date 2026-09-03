@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 using namespace prosper;
 using namespace prosper::abi;
@@ -57,6 +58,23 @@ using namespace prosper::abi;
 #endif
 
 namespace {
+// PROSPER_GUEST_ABI's whole value is that it is part of the FUNCTION TYPE: that is what makes
+// `Hle::register_guest_abi` reject an untagged handler at compile time on Windows, and what makes
+// the tag a no-op everywhere else. Both halves are checked by the compiler, here, rather than
+// asserted in a PR body — and the Windows half is only ever evaluated by the Windows MinGW job,
+// which is the point. If the tag ever silently stopped changing the type, the registration guard
+// would still compile and would be closing nothing.
+using GuestAbiVariadic = PROSPER_GUEST_ABI int (*)(const char*, ...);
+using HostAbiVariadic  = int (*)(const char*, ...);
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+static_assert(!std::is_same_v<GuestAbiVariadic, HostAbiVariadic>,
+              "PROSPER_GUEST_ABI does not change the function type on Windows, so "
+              "register_guest_abi's compile-time guard cannot refuse an untagged handler");
+#else
+static_assert(std::is_same_v<GuestAbiVariadic, HostAbiVariadic>,
+              "PROSPER_GUEST_ABI is not empty off Windows, so the change is not the no-op it claims");
+#endif
+
 int g_fail = 0;
 void fail(const char* what, const std::string& detail) {
     fprintf(stderr, "FAIL %-44s: %s\n", what, detail.c_str());
@@ -100,6 +118,16 @@ void check_plans() {
     // conventions, and Microsoft's `long double` is a double.
     check_plan("%lld %zu %ju %td %hhd %hd %ld %p %c %s", "iiiiiiiiii");
     check_plan("%lf %le %Lg", "ff!");             // ...except x87 long double, which is refused
+    // The accepted set is a SUBSET of what the host CRT consumes an argument for (guest_varargs.cpp,
+    // "THE RULE THIS WHOLE FILE OBEYS"). `q` is the BSD long-long modifier: measured under wine, the
+    // MinGW CRT prints "%qd" literally and consumes NOTHING, so accepting it would shift every
+    // argument behind it. It must refuse, not classify.
+    check_plan("%d %qd", "i!");
+    check_plan("%qu", "!");
+    // `'` is on the other side of the same measurement -- the CRT does consume an argument for it --
+    // so it stays accepted. Pinned so that dropping it is a deliberate act with a measurement behind
+    // it, not a tidy-up.
+    check_plan("%'d %'f", "if");
     check_plan("%.2f %10.4e %+g %#a", "ffff");
     // A `*` width or precision consumes an int of its own, ahead of the conversion's own argument.
     check_plan("%*d", "ii");
@@ -154,8 +182,25 @@ void check_stub_and_registry() {
     expect("guest-abi flag moves the emitter", emit_sysv_to_ms_bridge(bytes, converting) != n,
            "the converting bridge emitted the same length as the tail-jump");
 
+    // A tail-jump returns straight to the guest, so it cannot run a return hook afterwards. The
+    // combination is unreachable through the registry today, and the emitter must REFUSE it rather
+    // than emit a stub that silently drops the hook -- the one outcome nothing downstream notices.
+    BridgeParams hooked = params;
+    hooked.return_hook = 0x0102030405060708ull;
+    expect("guest-abi + return hook is refused",
+           emit_sysv_to_ms_bridge(bytes, hooked) > kMaxBridgeBytes,
+           "a guest-ABI stub with a return hook was emitted, dropping the hook");
+
     // The registry really carries the flag for the printf family, and only where it is meant to.
     register_builtin_hle();
+    // ...and the registry keeps the flag and a return hook apart, which is what makes the emitter
+    // case above a guard against a future edit rather than a live path. NOTE THE PLACEMENT: read
+    // before register_builtin_hle() this loop passes vacuously against an empty registry, which is
+    // exactly how it was first written here.
+    for (const char* name : { "printf", "sprintf", "snprintf", "sprintf_s", "snprintf_s" })
+        expect("guest-abi NIDs carry no return hook",
+               Hle::return_hook_of(nid_hash(name)) == nullptr,
+               std::string(name) + " has a return hook a tail-jump stub could not run");
     unsigned marked = 0;
     for (const char* name : { "printf", "sprintf", "snprintf", "sprintf_s", "snprintf_s" }) {
         if (Hle::guest_abi_nid(nid_hash(name))) { ++marked; continue; }
@@ -190,6 +235,7 @@ FormatPlan  g_plan{};
 uint64_t    g_slots[kMaxFormatArgs]{};
 uint64_t    g_blind_slots[kMaxFormatArgs]{};
 bool        g_fallback_complete = true;
+const char* g_fallback_reject = nullptr;
 char        g_fallback_format[512]{};
 
 // Everything the capture is used for happens HERE, while the guest frame is still live — which is
@@ -210,6 +256,7 @@ void capture_and_pack(const char* fmt, const SysvVaList& ap) {
     // ...and the truncating fallback, from the same frame.
     MsVarargCall call(fmt, ap, FormatGrammar::Printf);
     g_fallback_complete = call.complete();
+    g_fallback_reject = call.reject();
     snprintf(g_fallback_format, sizeof g_fallback_format, "%s", call.format());
 }
 
@@ -346,11 +393,51 @@ void check_executed() {
         prepare(fmt);
         guest_call(fmt, (uint64_t)7, 6.5, s1);
         expect("truncating fallback refuses", !g_fallback_complete, "a positional format was accepted");
+        expect("truncating fallback names a reason", g_fallback_reject != nullptr,
+               "a refusal carried no reason");
         // The prefix must be exactly the conversions the packed slots match — two of them here, so
         // the guest sees less than it asked for and never sees a value read from the wrong file.
         expect("truncating fallback keeps a safe prefix",
                strcmp(g_fallback_format, "a=%d b=%f c=") == 0,
                std::string("kept \"") + g_fallback_format + "\"");
+    }
+
+    // --- the prefix cap must not slice a conversion in half -----------------------------------------
+    // MsVarargCall retains at most 511 bytes of a refused format, and that limit is NOT a conversion
+    // boundary. Build one where the cut lands inside a `%...` spec and require the retained string to
+    // end on a boundary anyway -- otherwise the CRT is handed a dangling conversion and the packed
+    // slot count no longer describes what is being formatted.
+    {
+        // Getting the cap to bite at all took two tries, and both failures were the arm proving
+        // nothing rather than the code being wrong:
+        //   * 504 bytes of "ab%d" never reached the 511-byte limit, and the arm passed against a
+        //     build with the fix REMOVED;
+        //   * 600 bytes of "ab%d" reached the ARGUMENT limit first (kMaxFormatArgs = 64 conversions,
+        //     i.e. 258 bytes in), so the byte cap was still never exercised.
+        // Hence mostly literal filler with ONE conversion, positioned so the 511-byte cut falls
+        // inside it: 510 bytes of 'x', then "%d" occupying offsets 510-511. Cutting at 511 leaves a
+        // dangling '%', which is exactly the slice this fix exists to prevent.
+        std::string long_fmt(510, 'x');
+        long_fmt += "%d";        // straddles the cut
+        long_fmt += "z";
+        long_fmt += "%1$s";      // ...and something the model must refuse, so the prefix path runs
+        prepare(long_fmt.c_str());
+        guest_call(long_fmt.c_str(), (uint64_t)1);
+        const size_t kept = strlen(g_fallback_format);
+        expect("the prefix cap actually bit", kept == 510,
+               "kept " + std::to_string(kept) + " bytes; 510 means the cut landed inside the `%d` and "
+               "was walked back, anything else means this arm is vacuous");
+        expect("prefix cap stays under the limit", kept < 512,
+               "kept " + std::to_string(kept) + " bytes");
+        expect("prefix cap does not end inside a conversion",
+               kept == 0 || g_fallback_format[kept - 1] != '%',
+               std::string("prefix ends with a dangling '%'"));
+        // The decisive check: re-planning what was kept must agree with it exactly, which is what
+        // "the packed count describes the formatted string" means.
+        const FormatPlan of_kept = plan_format(g_fallback_format, FormatGrammar::Printf);
+        expect("prefix is fully modelled by its own plan",
+               of_kept.complete && of_kept.modelled_bytes == kept,
+               "the retained prefix does not re-plan cleanly");
     }
 
 #if defined(_WIN32)

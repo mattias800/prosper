@@ -144,7 +144,17 @@ size_t emit_sysv_to_ms_bridge(uint8_t* out, const BridgeParams& params) {
     // is already the one it reads, including a variadic frame no CallSignature could have described
     // (#3246). Checked before the signature, because the two are mutually exclusive: a guest-ABI
     // handler's arguments are not the bridge's business, and a declared signature would only mislead.
-    if (params.guest_abi) return emit_guest_abi_tailjump(out, params.handler);
+    if (params.guest_abi) {
+        // ...but a tail-jump returns straight to the guest, so there is NOWHERE to run a return hook
+        // afterwards. The combination is unreachable today by construction — register_guest_abi_fn
+        // takes no hook, and a later register_fn that supplied one would drop the guest_abi flag
+        // along with the handler it described — so this is a guard against a future edit, not a live
+        // case. Refuse it the way an over-wide signature is refused: an impossible length, which
+        // install_stubs reports before writing anything. Silently dropping the hook is the one
+        // outcome that must not happen, because nothing downstream would ever notice.
+        if (params.return_hook) return kMaxBridgeBytes + 1;
+        return emit_guest_abi_tailjump(out, params.handler);
+    }
 
     if (!sig.needs_conversion()) {
         // Historical path, byte for byte. The pad + four copied guest stack words + the 0x30 outgoing
