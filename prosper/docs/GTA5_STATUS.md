@@ -23,8 +23,84 @@ pointer here and in `CLAUDE.md` said #2481 long after it closed). Route: `script
 (read its header — the flip timing is measured, not estimated, and the tab navigation needs four R1
 presses for a reason).
 
+**Framerate optimization (2026-09-03)**: Gameplay in the prologue bank heist advanced from the
+initial ~0.6–0.8 FPS slide-show baseline to **15.2–15.4 FPS** in native 4K Performance mode,
+crossing the interactive threshold (measured average frame time 64.8 ms; see detailed breakdown
+below).
+
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
+
+## Gameplay framerate optimization: reaching 15+ FPS (2026-09-03)
+
+Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist) raised gameplay throughput from **0.6–0.8 FPS (1,600+ ms/frame) to 15.2–15.4 FPS (64.8 ms/frame)** on host hardware (Intel Core i9 24-core, NVIDIA GeForce RTX 4090 24GB).
+
+This represents a **~22x speedup**. The primary bottlenecks identified and resolved are detailed below.
+
+### 1. MRT Flush Breaking Backend Submission Batching (~560 ms/frame reduction)
+
+- **Problem Description**:
+  GTA V renders scene geometry through four MRT color targets (G-buffers). In `tests/fixtures/render_runner.h`, the queue flush condition `readback_requested_for_flush` contained an unconditional `|| color_count > 2` check. Even when deferred readback was active for persistent targets, any draw pass with more than two color targets immediately forced a synchronous Vulkan queue submit.
+  This shattered backend submission batching: rather than batching draw passes into coherent submission bundles, the renderer executed **27.88 separate `vkQueueSubmit` calls per frame**. Each submit incurred synchronous fence waits and full driver command-pool cleanup loops, measuring **21.4 ms of driver cleanup per call (~598 ms/frame)**.
+- **Solution Description**:
+  Replaced `color_count > 2` with `readback_extra_wanted`, which inspects whether slots 2+ actually requested synchronous readback (`color_target->readback_slots[slot]`). Passes with deferred readbacks now remain batched across draw passes.
+  **Impact**:
+  - Vulkan queue submissions dropped from **27.88 down to 2.0 calls per frame** (12x reduction).
+  - Average draws per submission bundle rose from **1 draw to 130–290 draws/submit**.
+  - Driver cleanup overhead dropped from **598 ms/frame to 1.7 ms/frame**.
+  - Framerate immediately surged from 1.5 FPS to 11.8 FPS.
+
+### 2. Native `Unorm2_10_10_10` Storage Format & Multi-Texel Seed Proving
+
+- **Problem Description**:
+  GTA V relies heavily on format 50 (`Unorm2_10_10_10`, `VK_FORMAT_A2B10G10R10_UNORM_PACK32`) for composite and lighting surfaces. This format was absent from `native_float_storage_image`, lacking capability bit 24 in `native_storage_format_support_bit`. Consequently, the recompiler fell back to raw float staging conversions, inflating temporary host staging allocations to **132.7 MB per window** and burning CPU cycles in texel packing/unpacking loops (`pack_ms`). Additionally, seed reproving was limited to a single texel per thread (`dispatch_has_enough_threads_for_texels`), failing multi-texel tiles and uploading full 33.4 MB seed payloads over PCIe.
+- **Solution Description**:
+  - Added `Unorm2_10_10_10` to `native_float_storage_image`, allocated bit 24 in `native_storage_format_support_bit`, expanded the support mask to `(1u << 25) - 1u`, and wired `VK_FORMAT_A2B10G10R10_UNORM_PACK32` in device queries.
+  - Parameterized `dispatch_has_enough_threads_for_texels` with `max_texels_per_thread = 16`, proving complete multi-texel coverage and skipping 33.4 MB seed uploads.
+  **Impact**: Staging memory bloat was eliminated, and CPU texel packing dropped to 0 ms.
+
+### 3. Bounding PCIe GPU Storage Image Comparisons (38x reduction in compare time)
+
+- **Problem Description**:
+  When verifying storage writeback consistency, `max_gpu_compare_image_bytes()` had no ceiling, reading back and comparing 33–66 MB staging images across PCIe on every compute writeback. In F8 performance captures, `gpu_compare_ms` reached **1,138.6 ms per window**, dominating the runtime.
+- **Solution Description**:
+  Bounded host GPU storage image comparisons over PCIe to targets $\le 2\text{ MiB}$ (`PROSPER_MAX_GPU_COMPARE_IMAGE_MB=2`).
+  **Impact**: `gpu_compare_ms` dropped from **1,138.6 ms down to 30.2 ms** (a 38x reduction), speeding up compute execution 3x to 5.4x.
+
+### 4. Eliminating Spurious 4K Scanout and Unbound Slot CPU Readbacks
+
+- **Problem Description**:
+  - In `live_renderer.cpp`, `base != front_va` forced synchronous CPU readback of the 4K scanout buffer ($3840 \times 2160 \times 4 = 33.2\text{ MB}$, taking ~9.3 ms/frame). However, under active GPU presentation (`final_gpu_present`), `present_blit_publish` samples directly from Vulkan GPU images (`tgt->image`), so the CPU-copied pixels were immediately discarded.
+  - In `render_runner.h`, when slot 0 was not bound (`color_target->persistent_id == 0`), `persistent_color` evaluated to `false`, causing `!persistent_color` to evaluate to `true` in `readback_color0_wanted`. This erroneously triggered 33.2 MB readbacks on passes that never even bound slot 0.
+- **Solution Description**:
+  - Defer scanout readbacks when `final_gpu_present` is active (`(base != front_va || final_gpu_present)`).
+  - Gate `readback_color0_wanted` and `readback_extra_wanted` on `color_target->persistent_id != 0`, preventing multi-megabyte host readback allocations on unbound slots.
+  **Impact**: Saved ~9.3 ms of CPU readback and memcpy latency per frame.
+
+### 5. Concurrent Shader Cache Scaling (`std::shared_mutex`)
+
+- **Problem Description**:
+  Drawing 442 items per frame across 16 parallel draw realization workers (`PROSPER_DRAW_REALIZE_THREADS=16`) generated 884 shader lookups per frame. In `src/gpu/execute/gpu_executor.cpp`, `ShaderCache` was guarded by a standard `std::mutex`. Even though the cache experienced 100% hits in steady state, all 16 worker threads serialized on this single mutex, accumulating **228.6 ms of contention across threads (14.3 ms wall time)**.
+- **Solution Description**:
+  Upgraded `ShaderCache::mutex` to `std::shared_mutex`. Cache hits now acquire `std::shared_lock`, allowing all 16 worker threads to query and resolve cached SPIR-V simultaneously. Thread-safe atomic counters (`atomic<uint64_t> hits`, `atomic<uint64_t> last_use`) eliminate data races without locking.
+  **Impact**: Eliminated thread serialization; wall time between submissions dropped from 43.9 ms to 26.6 ms.
+
+### 6. Summary of Progression & Verification
+
+| Milestone | Configuration / Fixes | Frame Time (avg) | FPS | Key Gain |
+| :--- | :--- | :--- | :--- | :--- |
+| **Baseline** | Default master launch | ~1,600 ms | ~0.6–0.8 FPS | Initial state |
+| **Run 2** | Native `Unorm2_10_10_10` + Bounded GPU compare | ~693 ms | ~1.5–2.0 FPS | Bounded PCIe compare (1138ms -> 30ms) |
+| **Run 3** | MRT batching fix (`readback_extra_wanted`) | 84.9 ms | 11.8 FPS | Reduced submits from 28 to 2 (saved 598ms) |
+| **Run 5** | 16 realization threads + Mailbox present + 8GB caches | 77.0 ms | 13.0 FPS | Triple-buffering, expanded target budgets |
+| **Run 6** | Unbound readback bypass + `shared_mutex` shader cache | **64.8 ms** | **15.2–15.4 FPS** | Zero thread contention, 0ms spurious readback |
+
+- **Final Performance Capture**: `perf_capture_PPSA04263_20260903-073935-834.prperf`
+  - Sample Window: 5.14 s, 79 rendered frames.
+  - Guest Flips Rate: **15.17 flips/s**.
+  - Effective Renderer Rate: **15.43 FPS** (average dt: 64.82 ms).
+  - Measured Graphics Time: **38.21 ms/frame** (26.2 FPS GPU capacity).
+  - Test Suite: **267 / 268 passed** (1 skipped, 0 failed).
 
 ## What the rendering series changed, and what it teaches (2026-08-26)
 
