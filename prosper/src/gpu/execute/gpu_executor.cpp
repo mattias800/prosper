@@ -6,6 +6,8 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
+#include <cstdint>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "gpu/capture/capture_compute_policy.hpp"
@@ -7728,8 +7730,13 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     // reaches 752,646 workgroups in one dispatch and the device is lost permanently a few submits
     // later; with it, the same route can be run to the same point with the size bounded.
     static const uint32_t group_cap = [] {
+        // 0 disables the cap. That is the right DEFAULT and the wrong answer to a typo: this knob
+        // is only ever set to bound a dispatch that loses the device (#1742/#1743), so `=750000`
+        // mistyped as `=750,000` unbounded the very thing being bounded (#3267).
         const char* value = std::getenv("PROSPER_MAX_DISPATCH_GROUPS");
-        return value && *value ? static_cast<uint32_t>(strtoul(value, nullptr, 0)) : 0u;
+        if (!value || !*value) return 0u;
+        return static_cast<uint32_t>(prosper::diag::env_u64_or_default_capped(
+            "PROSPER_MAX_DISPATCH_GROUPS", value, 0ull, UINT32_MAX, "workgroups"));
     }();
     if (group_cap) {
         auto clamp_groups = [&](uint32_t& groups, uint32_t& threads, uint32_t local) {

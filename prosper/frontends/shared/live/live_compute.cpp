@@ -1045,9 +1045,12 @@ bool persistent_compute_buffer_result_enabled(uint32_t bytes) {
 
 VkDeviceSize persistent_compute_buffer_limit() {
     static const VkDeviceSize limit = []() -> VkDeviceSize {
+        // A cache CAP: `-1` saturated this to UINT64_MAX, i.e. unbounded, and `1gb` to 1 MiB.
+        // Both look deliberate afterwards; neither is (#3267).
         const char* value = std::getenv("PROSPER_COMPUTE_BUFFER_CACHE_MB");
-        const uint64_t mib = value ? std::strtoull(value, nullptr, 10) : 256ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_COMPUTE_BUFFER_CACHE_MB", value, 256ull,
+            UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
     return limit;
@@ -1093,8 +1096,18 @@ VkDeviceSize persistent_compute_image_limit(
     static const std::optional<VkDeviceSize> override_limit = []()
         -> std::optional<VkDeviceSize> {
         const char* value = std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MB");
-        if (!value) return std::nullopt;
-        const uint64_t mib = std::strtoull(value, nullptr, 10);
+        if (!value || !*value) return std::nullopt;
+        // There is no numeric default to fall back to -- unset means "derive from device memory" --
+        // so a refusal must fall back to THAT, not to a number. Hence parse_u64_strict plus an
+        // explicit nullopt rather than the or_default helper (#3267).
+        uint64_t mib = 0;
+        if (!prosper::diag::parse_u64_strict(value, &mib)) {
+            std::fprintf(stderr,
+                         "[env] PROSPER_COMPUTE_IMAGE_CACHE_MB='%s' is not a plain non-negative "
+                         "count of MiB -- keeping the device-derived budget and changing NOTHING\n",
+                         value);
+            return std::nullopt;
+        }
         if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
@@ -1244,8 +1257,9 @@ VkDeviceSize compute_memory_pool_limit() {
         // staging allocations. A 256 MiB cache discarded about 200 allocations and repeatedly paid
         // AMD BO page initialization; 640 MiB holds that measured working set with zero discards,
         // while remaining a bounded fraction of the renderer's persistent-target budget.
-        const uint64_t mib = value ? std::strtoull(value, nullptr, 10) : 640ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_COMPUTE_MEMORY_POOL_MB", value, 640ull,
+            UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
     return limit;

@@ -777,8 +777,13 @@ thread_local TextureDecodeScopeStats g_texture_decode_scope{};
 // that report depend on two switches, which check_diag_gates.py rightly rejects (TWO-GATE).
 inline uint64_t array_decode_budget_bytes() {
     static const uint64_t bytes = [] {
+        // atoll turned `-1` into a budget of 0xFFFFFFFFFFF00000 -- i.e. UNBOUNDED, the one setting
+        // this knob exists to prevent -- and `1gib` into 1 MiB, which reads in the log as a
+        // deliberate choice. Refuse both and keep 1 GiB (#3267).
         const char* e = getenv("PROSPER_ARRAY_DECODE_BUDGET_MIB");
-        return static_cast<uint64_t>(e ? atoll(e) : 1024) << 20;
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_ARRAY_DECODE_BUDGET_MIB", e, 1024ull, UINT64_MAX >> 20, "MiB");
+        return mib << 20;
     }();
     return bytes;
 }

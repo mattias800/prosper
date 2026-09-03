@@ -14,6 +14,7 @@
 #endif
 #include "hle/dispatch/dispatch.hpp"
 #include "diagnostics/diag_clock.hpp"
+#include "diagnostics/env_numeric.hpp"   // #3267: -1 here overflowed the MiB multiply
 #include "hle/memory/dmem_caller_chain.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/dispatch/nid.hpp"
@@ -953,7 +954,12 @@ namespace {
     // cross-title verification of a hardware-truthful default.
     const uint64_t kDmemTotal = [] {
         if (const char* v = getenv("PROSPER_DMEM_BUDGET_MB")) {
-            const uint64_t mib = strtoull(v, nullptr, 10);
+            // `-1` reached UINT64_MAX, and `mib * 1024 * 1024` then WRAPPED -- the guest was handed
+            // a budget nobody chose, on the very path #2934 was about (#3267). Refusing keeps the
+            // 16 GiB default, which is also what a sub-1024 value has always done.
+            const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+                "PROSPER_DMEM_BUDGET_MB", v, 16ull * 1024ull,
+                UINT64_MAX / (1024ull * 1024ull), "MiB");
             if (mib >= 1024) return mib * 1024ull * 1024ull;
         }
         return 16ull * 1024 * 1024 * 1024;
@@ -3968,7 +3974,12 @@ namespace {
     // cross-title verification of a hardware-truthful default.
     const uint64_t kDmemTotal = [] {
         if (const char* v = getenv("PROSPER_DMEM_BUDGET_MB")) {
-            const uint64_t mib = strtoull(v, nullptr, 10);
+            // `-1` reached UINT64_MAX, and `mib * 1024 * 1024` then WRAPPED -- the guest was handed
+            // a budget nobody chose, on the very path #2934 was about (#3267). Refusing keeps the
+            // 16 GiB default, which is also what a sub-1024 value has always done.
+            const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+                "PROSPER_DMEM_BUDGET_MB", v, 16ull * 1024ull,
+                UINT64_MAX / (1024ull * 1024ull), "MiB");
             if (mib >= 1024) return mib * 1024ull * 1024ull;
         }
         return 16ull * 1024 * 1024 * 1024;

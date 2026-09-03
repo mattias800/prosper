@@ -10,6 +10,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
+#include "diagnostics/env_numeric.hpp"     // #3267: a typo must not silently re-size a cache
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
@@ -881,8 +882,11 @@ inline bool persistent_pipeline_layout_cache_enabled() {
 
 inline size_t persistent_pipeline_layout_cache_limit() {
     static const size_t limit = [] {
+        // 0 entries is not "off" -- it evicts on every miss, so a typo turns the cache into a
+        // per-draw create/destroy loop that looks like a renderer regression (#3267).
         const char* value = getenv("PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES");
-        return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{256};
+        return static_cast<size_t>(prosper::diag::env_u64_or_default_capped(
+            "PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES", value, 256ull, SIZE_MAX, "entries"));
     }();
     return limit;
 }
@@ -2136,8 +2140,9 @@ inline VkDeviceSize persistent_color_target_limit() {
     static const bool have_env = getenv("PROSPER_BACKEND_TARGET_CACHE_MB") != nullptr;
     static const VkDeviceSize env_limit = []() -> VkDeviceSize {
         const char* value = getenv("PROSPER_BACKEND_TARGET_CACHE_MB");
-        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_BACKEND_TARGET_CACHE_MB", value, 256ull,
+            UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
     if (have_env) return env_limit;
@@ -2203,8 +2208,9 @@ inline VkDeviceSize persistent_texture_cache_limit() {
     static const bool have_env = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") != nullptr;
     static const VkDeviceSize env_limit = []() -> VkDeviceSize {
         const char* value = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB");
-        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_BACKEND_TEXTURE_CACHE_MB", value, 1024ull,
+            UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
     if (have_env) return env_limit;
@@ -2407,8 +2413,9 @@ inline bool render_memory_pool_enabled() {
 inline VkDeviceSize render_memory_pool_limit() {
     static const VkDeviceSize limit = []() -> VkDeviceSize {
         const char* value = getenv("PROSPER_MEMORY_POOL_MB");
-        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 512ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_MEMORY_POOL_MB", value, 512ull,
+            UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
     return limit;
@@ -2629,9 +2636,11 @@ inline VkDeviceSize render_host_buffer_pool_limit() {
 
 inline VkDeviceSize render_host_buffer_arena_size() {
     static const VkDeviceSize bytes = []() -> VkDeviceSize {
+        // The max(4, ...) floor means a typo does not crash -- it silently builds a FOUR-BYTE
+        // arena, which is the worst kind of wrong setting: plausible, survivable, and slow (#3267).
         const char* value = getenv("PROSPER_BACKEND_BUFFER_ARENA_KB");
-        const uint64_t kib = value ? strtoull(value, nullptr, 10) : 1024ull;
-        if (kib > UINT64_MAX / 1024ull) return VkDeviceSize{UINT64_MAX};
+        const uint64_t kib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_BACKEND_BUFFER_ARENA_KB", value, 1024ull, UINT64_MAX / 1024ull, "KiB");
         return std::max<VkDeviceSize>(4, static_cast<VkDeviceSize>(kib) * 1024ull);
     }();
     return bytes;

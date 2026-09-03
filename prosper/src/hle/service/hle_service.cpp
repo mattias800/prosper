@@ -9,6 +9,7 @@
 #include "hle/util/hle_json2.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
+#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not unregister a default-ON NID family
 #include "hle/dispatch/callback_fs.hpp"
 #include "hle/input/ime_input.hpp"
 #include "hle/service/platform_ui.hpp"
@@ -5286,8 +5287,11 @@ void register_service_hle() {
     // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
     // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.
     {
+        // DEFAULT ON since #306. `strtol` answered 0 for `=yes`/`=true`/`=on`, and the consequence
+        // is not a lost diagnostic: the whole NetCtl NID family goes UNREGISTERED, so the guest gets
+        // the pre-#306 unimplemented behaviour from what the operator read as "enable it" (#3267).
         const char* e = getenv("PROSPER_NETCTL_CB");
-        if (!e || strtol(e, nullptr, 0) != 0) {
+        if (prosper::diag::env_u64_or_default("PROSPER_NETCTL_CB", e, 1ull) != 0) {
             R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
             R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
             R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI
