@@ -1238,6 +1238,31 @@ int main() {
         }
     }
 
+    // #3284 AVX2 vectorized tile_surface: verify that tile_full_block_row_avx2 produces byte-for-byte
+    // identical tiled outputs to the unvectorized scalar path across element sizes (2, 4, 8, 16 BPE)
+    // on 1080p surfaces.
+    {
+        const uint32_t modes[] = {(uint32_t)TileMode::Sw64KbS, (uint32_t)TileMode::Sw64KbZX,
+                                  (uint32_t)TileMode::Sw64KbRX};
+        for (const uint32_t M : modes) {
+            for (const uint32_t bpe : {2u, 4u, 8u, 16u}) {
+                const uint32_t W = 1920, H = 1080;
+                std::vector<uint8_t> lin((size_t)W * H * bpe);
+                for (size_t i = 0; i < lin.size(); i++)
+                    lin[i] = static_cast<uint8_t>((i * 13u + 7u) ^ (i >> 8));
+                const size_t tb = tiled_surface_bytes(W, H, M, 0, bpe);
+                std::vector<uint8_t> tiled_avx2(tb, 0);
+                std::vector<uint8_t> tiled_scalar(tb, 0);
+                tile_surface(tiled_avx2.data(), lin.data(), W, H, M, 0, bpe);
+                setenv("PROSPER_NO_AVX2_TILE", "1", 1);
+                tile_surface(tiled_scalar.data(), lin.data(), W, H, M, 0, bpe);
+                unsetenv("PROSPER_NO_AVX2_TILE");
+                CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) == 0,
+                      "AVX2 tile_surface matches scalar tile_surface byte-for-byte");
+            }
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
