@@ -434,6 +434,8 @@ VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t comp
         break;
     case DataFormat::Uint16:
         if (components == 1) return VK_FORMAT_R16_UINT;
+        if (components == 2) return VK_FORMAT_R16G16_UINT;
+        if (components == 4) return VK_FORMAT_R16G16B16A16_UINT;
         break;
     case DataFormat::Uint8:
         if (components == 1) return VK_FORMAT_R8_UINT;
@@ -10534,6 +10536,11 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
     return native_storage_vk_format(format, components) != VK_FORMAT_UNDEFINED;
 }
 
+// Import-eligibility table naming which format/component combinations the graphics backend
+// can preserve when leasing an existing compute-produced image. This list governs import
+// admission into graphics views (where formats are reinterpreted, e.g. Float16 <-> Uint16),
+// not image creation: the underlying VkImage was already successfully created and validated
+// by the compute pipeline against the device's confirmed capabilities (via add_native_storage_format).
 uint32_t live_compute_graphics_import_native_format(
     prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
@@ -10547,7 +10554,7 @@ uint32_t live_compute_graphics_import_native_format(
         (format == DataFormat::Unorm16 && components == 1) ||
         (format == DataFormat::Unorm8 && (components == 1 || components == 4)) ||
         (format == DataFormat::Uint32 && components == 1) ||
-        (format == DataFormat::Uint16 && components == 1) ||
+        (format == DataFormat::Uint16 && (components == 1 || components == 2 || components == 4)) ||
         (format == DataFormat::Uint8 && (components == 1 || components == 4));
     return admitted
         ? static_cast<uint32_t>(native_storage_vk_format(format, components))
@@ -10563,13 +10570,15 @@ uint64_t live_compute_graphics_import_guest_bytes(
     const bool r16_cube_array_alias = sampled_resource.img_dim == 3u &&
         sampled_resource.depth == 6u && components == 1u &&
         (sampled_resource.format == DataFormat::Uint16 ||
-         sampled_resource.format == DataFormat::Unorm16);
+         sampled_resource.format == DataFormat::Unorm16 ||
+         sampled_resource.format == DataFormat::Float16);
     if (r16_cube_array_alias)
         return prosper::gpu::gpu_capture_resource_footprint(sampled_resource);
     if (decoded_source_bytes) return decoded_source_bytes;
-    if (components == 1u &&
+    if ((components == 1u || components == 2u || components == 4u) &&
         (sampled_resource.format == DataFormat::Uint16 ||
-         sampled_resource.format == DataFormat::Unorm16))
+         sampled_resource.format == DataFormat::Unorm16 ||
+         sampled_resource.format == DataFormat::Float16))
         return prosper::gpu::gpu_capture_resource_footprint(sampled_resource);
     return 0;
 }
@@ -10600,7 +10609,8 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     const bool cube_array_alias = sampled_resource.img_dim == 3 &&
         sampled_resource.depth == 6 &&
         (sampled_resource.format == prosper::gpu::DataFormat::Uint16 ||
-         sampled_resource.format == prosper::gpu::DataFormat::Unorm16) &&
+         sampled_resource.format == prosper::gpu::DataFormat::Unorm16 ||
+         sampled_resource.format == prosper::gpu::DataFormat::Float16) &&
         (sampled_resource.num_components ? sampled_resource.num_components : 1u) == 1u &&
         sampled_resource.layer_stride_bytes != 0;
     if (!context || !context->device || !sampled_resource.gpu_addr ||
@@ -10634,6 +10644,9 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         (components == 1 || components == 4);
     const bool normalized_uint16_alias =
         sampled_resource.format == prosper::gpu::DataFormat::Unorm16 && components == 1;
+    const bool float16_uint16_alias =
+        sampled_resource.format == prosper::gpu::DataFormat::Float16 &&
+        (components == 1 || components == 2 || components == 4);
     const bool float32_uint32_alias =
         sampled_resource.format == prosper::gpu::DataFormat::Float32 && components == 1;
     const bool packed_r11_uint32_alias =
@@ -10641,11 +10654,12 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     const bool packed_r10_uint32_alias =
         sampled_resource.format == prosper::gpu::DataFormat::Unorm2_10_10_10 && components == 4;
     if (!borrowed && (normalized_uint8_alias || normalized_uint16_alias ||
+                      float16_uint16_alias ||
                       float32_uint32_alias || packed_r11_uint32_alias ||
                       packed_r10_uint32_alias)) {
         if (normalized_uint8_alias)
             storage_identity.format = prosper::gpu::DataFormat::Uint8;
-        else if (normalized_uint16_alias)
+        else if (normalized_uint16_alias || float16_uint16_alias)
             storage_identity.format = prosper::gpu::DataFormat::Uint16;
         else if (float32_uint32_alias || packed_r10_uint32_alias)
             storage_identity.format = prosper::gpu::DataFormat::Uint32;
