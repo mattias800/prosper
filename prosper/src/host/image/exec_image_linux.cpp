@@ -3057,11 +3057,16 @@ bool map_image(const LoadedImage& img, std::string* err) {
 // byte-identical stubs for the same slot, or a runtime-loaded module's imports would take a
 // different path into the HLE than the pre-linked ones.
 static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx, bool swap) {
-    HleFn fn = Hle::lookup(s.nid);
+    // lookup_ADDRESS, not lookup (#3272): this value is only ever patched into the emitted stub as a
+    // jump target, never invoked from here, so the calling convention of the handler behind it is
+    // none of this function's business -- and `lookup` now refuses the guest-ABI handlers precisely
+    // because it hands back a type that claims one.
+    const void* fn = Hle::lookup_address(s.nid);
     HleReturnHook return_hook = Hle::return_hook_of(s.nid);
     if (fn) {
-        if (return_hook) return emit_impl_hook(slot, (uint64_t)fn, (uint64_t)return_hook, swap);
-        return swap ? emit_impl_swap(slot, (uint64_t)fn) : emit_impl(slot, (uint64_t)fn);
+        const uint64_t target = (uint64_t)(uintptr_t)fn;
+        if (return_hook) return emit_impl_hook(slot, target, (uint64_t)return_hook, swap);
+        return swap ? emit_impl_swap(slot, target) : emit_impl(slot, target);
     }
     return swap ? emit_unimpl_swap(slot, idx, (uint64_t)&prosper_on_unimpl)
                 : emit_unimpl(slot, idx, (uint64_t)&prosper_on_unimpl);

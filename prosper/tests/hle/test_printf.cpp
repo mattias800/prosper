@@ -17,19 +17,24 @@ static int fails = 0;
 
 // PROSPER_GUEST_ABI is what makes the comment above TRUE rather than aspirational. These handlers
 // are compiled in the GUEST's convention (#3246), which on Windows is not the host's -- so an
-// untagged pointer type here would place the arguments by Microsoft x64 rules for a callee reading
-// them by System V, and the first `%s` would dereference whatever landed in `rdi`. It did: this test
-// SEGFAULTed on the Windows MinGW job the moment the handlers were tagged. Empty on Linux/macOS.
-using SnprintfFn = PROSPER_GUEST_ABI int (*)(char*, size_t, const char*, ...);
-using SprintfFn  = PROSPER_GUEST_ABI int (*)(char*, const char*, ...);
+// untagged pointer type would place the arguments by Microsoft x64 rules for a callee reading them
+// by System V, and the first `%s` would dereference whatever landed in `rdi`. It did: this test
+// SEGFAULTed on the Windows MinGW job the moment the handlers were tagged.
+//
+// This file used to spell those tagged types itself. It no longer does: `Hle::lookup_guest_abi`
+// constructs them (#3272), so the convention is spelled in one place instead of at every call site
+// that wants one of these handlers.
 
 int main() {
     printf("== test_printf ==\n");
     register_builtin_hle();
 
-    auto snf = (SnprintfFn)(void*)Hle::lookup(nid_hash("snprintf"));
-    auto spf = (SprintfFn)(void*)Hle::lookup(nid_hash("sprintf"));
-    auto snfs = (SnprintfFn)(void*)Hle::lookup(nid_hash("snprintf_s"));
+    // `lookup_guest_abi` builds the PROSPER_GUEST_ABI pointer type itself (#3272), so this file no
+    // longer spells the calling convention and cannot get it wrong -- which matters because an
+    // untagged type compiles and behaves identically everywhere except the MinGW job.
+    auto snf  = Hle::lookup_guest_abi<int, char*, size_t, const char*>(nid_hash("snprintf"));
+    auto spf  = Hle::lookup_guest_abi<int, char*, const char*>(nid_hash("sprintf"));
+    auto snfs = Hle::lookup_guest_abi<int, char*, size_t, const char*>(nid_hash("snprintf_s"));
     CHECK(snf && spf && snfs, "printf-family fns registered");
     if (!(snf && spf && snfs)) { printf("== FAIL ==\n"); return 1; }
 

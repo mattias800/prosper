@@ -218,6 +218,95 @@ void check_stub_and_registry() {
            "sscanf was routed through the guest-ABI path; #3246 records why it should not be");
 }
 
+// #3272 -- the CALL side of the guest-ABI boundary. #3246 closed registration at compile time; the
+// three accessors below are what close retrieval, and each of these arms is a property of the
+// accessor rather than of the registry it reads.
+//
+// The reason this needs asserting at all is that the failure is INVISIBLE on the platform it is
+// written on: PROSPER_GUEST_ABI expands to nothing outside Windows, so a mis-typed pointer compiles
+// and behaves identically here, and only the MinGW job dereferences the wild pointer. So these arms
+// check the shape of the API surface -- what each accessor refuses -- not the eventual crash.
+void check_lookup_accessors() {
+    // EXPECTED STDERR: arm (1) deliberately drives the refusal path, so this test prints five
+    // "[prosper] Hle::lookup refused ..." lines. They are the fix working, not a failure -- and
+    // their absence would mean the refusal went quiet, which is the outcome the loud path exists to
+    // prevent. Only the "test_guest_varargs: ..." lines report the verdict.
+    register_builtin_hle();
+    static const char* const kGuestAbi[] = { "printf", "sprintf", "snprintf",
+                                             "sprintf_s", "snprintf_s" };
+
+    // (1) `lookup` refuses every guest-ABI handler. This is the defect: it used to hand back a bare
+    //     HleFn, and nothing stopped a caller invoking a System V variadic through it.
+    unsigned refused = 0;
+    for (const char* name : kGuestAbi) {
+        if (Hle::lookup(nid_hash(name)) == nullptr) { ++refused; continue; }
+        fail("lookup refuses guest-ABI handlers",
+             std::string(name) + ": Hle::lookup returned a bare HleFn for a guest-ABI handler");
+    }
+    expect("lookup-refusal arm is not vacuous", refused == 5,
+           "expected all five printf-family NIDs to be refused, got " + std::to_string(refused));
+
+    // (2) DISCRIMINATOR for (1). Refusing everything would satisfy (1) just as well, and would be a
+    //     far worse bug than the one being fixed -- every import in the tree resolves through here.
+    expect("lookup still returns ordinary handlers", Hle::lookup(nid_hash("memcpy")) != nullptr,
+           "Hle::lookup refused an ordinary host-ABI handler; the refusal is not selective");
+
+    // (3) THE REGRESSION GUARD THAT MATTERS. Both import-stub emitters resolve every slot through
+    //     an accessor, and if the guest-ABI NIDs stopped resolving there, `printf` would be emitted
+    //     as an UNIMPLEMENTED stub for every title on both platforms -- a silent, total loss of
+    //     guest stdout that no other arm here would notice. `lookup_address` is the accessor they
+    //     use, and it must answer for a guest-ABI handler exactly as it does for any other.
+    unsigned addressable = 0;
+    for (const char* name : kGuestAbi) {
+        if (Hle::lookup_address(nid_hash(name)) != nullptr) { ++addressable; continue; }
+        fail("guest-ABI handlers remain addressable",
+             std::string(name) + ": lookup_address returned nullptr, so the import stub for it "
+             "would be emitted as unimplemented");
+    }
+    expect("addressability arm is not vacuous", addressable == 5,
+           "expected all five printf-family NIDs to be addressable, got "
+           + std::to_string(addressable));
+    expect("lookup_address agrees with lookup for ordinary handlers",
+           Hle::lookup_address(nid_hash("memcpy"))
+               == reinterpret_cast<const void*>(Hle::lookup(nid_hash("memcpy"))),
+           "the two accessors disagree about an ordinary handler's address");
+    expect("lookup_address reports an unregistered NID as missing",
+           Hle::lookup_address("no-such-nid-xyz") == nullptr,
+           "lookup_address invented an address for a NID that was never registered");
+
+    // (4) `lookup_guest_abi` hands back the SAME handler, through a type it constructs itself.
+    auto printf_fn = Hle::lookup_guest_abi<int, const char*>(nid_hash("printf"));
+    expect("lookup_guest_abi resolves a guest-ABI handler", printf_fn != nullptr,
+           "lookup_guest_abi returned nullptr for printf");
+    expect("lookup_guest_abi returns the registered address",
+           reinterpret_cast<const void*>(printf_fn) == Hle::lookup_address(nid_hash("printf")),
+           "lookup_guest_abi returned an address the registry does not hold");
+
+    // (5) The category error in the OTHER direction. Asking for the guest convention on an ordinary
+    //     host handler must not quietly succeed either -- that mis-types the pointer just as badly,
+    //     and it is the mistake a caller makes when they copy the line above to a different NID.
+    expect("lookup_guest_abi refuses an ordinary handler",
+           Hle::lookup_guest_abi<int, const char*>(nid_hash("memcpy")) == nullptr,
+           "lookup_guest_abi handed back a guest-convention pointer to a host-ABI handler");
+
+    // (6) The pointer is USABLE, not merely non-null -- an address that resolves but cannot be
+    //     called through would satisfy every arm above. snprintf is the one whose result can be
+    //     asserted without writing to stdout, and the arguments deliberately spill past both
+    //     register files so the call exercises the overflow area rather than registers alone.
+    auto snprintf_fn =
+        Hle::lookup_guest_abi<int, char*, size_t, const char*>(nid_hash("snprintf"));
+    expect("lookup_guest_abi resolves snprintf", snprintf_fn != nullptr,
+           "lookup_guest_abi returned nullptr for snprintf");
+    if (snprintf_fn) {
+        char buf[128] = {};
+        const int n = snprintf_fn(buf, sizeof buf, "%s|%d|%d|%d|%.2f", "s", 1, 2, 3, 4.5);
+        expect("a handler called through lookup_guest_abi formats correctly",
+               n == 12 && strcmp(buf, "s|1|2|3|4.50") == 0,
+               std::string("formatted \"") + buf + "\" (n=" + std::to_string(n)
+                   + "), expected \"s|1|2|3|4.50\" (n=12)");
+    }
+}
+
 #if PROSPER_TEST_X86_64
 // ---------------------------------------------------------------------------------------------
 // (1) + (3) Executed: a real System V variadic frame, read, packed, and consumed as Microsoft x64.
@@ -503,8 +592,13 @@ void check_executed() {
         // loop would be green and would be measuring nothing. The table therefore has to contain at
         // least one specifier this CRT rejects, and `%qd` is rejected by both the UCRT and the ANSI
         // stdio implementations, so the guard holds whichever one a build resolves to.
-        expect("CRT subset probe ran", probed == sizeof kSpecs / sizeof *kSpecs,
-               "the specifier table changed but the count did not");
+        // The literal, NOT `sizeof kSpecs / sizeof *kSpecs` (#3273): comparing the count against the
+        // array it was counted from is a tautology, and one in the very file whose subject is arms
+        // that cannot fail. Pinned, an edit to kSpecs reddens this instead of silently changing what
+        // the arm claims to have probed.
+        expect("CRT subset probe ran", probed == 11,
+               "the specifier table changed but the pinned count did not -- update both, and check "
+               "the table still contains a specifier this CRT REJECTS (the guard below)");
         expect("CRT subset probe can see a refusal", crt_rejects > 0,
                "this CRT reports that it consumes an argument for EVERY specifier probed, including "
                "%qd -- the sentinel detector is broken, so the subset rule was never tested");
@@ -551,6 +645,7 @@ void check_executed() {
 int main() {
     check_plans();
     check_stub_and_registry();
+    check_lookup_accessors();
 #if PROSPER_TEST_X86_64
     check_executed();
 #else
