@@ -224,6 +224,16 @@ and `gpu_device` is 4.31 ms, so **no single term reaches 30 fps on this title.**
   call before removing it, not after.
 - **The #1268 small-buffer content hash is not the term.** Live `hash-stats`: 414,633 hash calls over
   168.1 MiB against 3.5 M references — ~1 % of the buffer term.
+- **"Texture handling is not the term live" is true of *The Messenger*'s shapes and NOT of a title
+  that binds a large mutable surface.** Same instrument, Stray at its title screen (2026-09-04,
+  `fc21d46ca`): the frontend texture leaf is **1110.1 ms of a 5020 ms window**, the largest single
+  leaf in the capture, against `gpu-device` at 232.5 ms. The row above is not withdrawn — `res.texture`
+  is the BACKEND's bucket and it is still small (206.7 ms here) — but it has been read as "textures
+  are solved", and the frontend materializer is a different layer with a different answer. What
+  separated them was printing the frontend's own cache-outcome classes, which the renderer had
+  recorded since #2250 and the report never printed: 930.8 of the 1110.1 ms was in a single unnamed
+  residual. **Before concluding a leaf is small, check which layer's leaf you are reading, and check
+  the report is printing the sub-classes that exist.**
 
 ## Plucky Squire maximum-size atlas retention (2026-07-29)
 

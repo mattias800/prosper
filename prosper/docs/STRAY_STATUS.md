@@ -63,6 +63,47 @@ One compute program, `0x3011300000`, accounts for ~605 ms of that at roughly 32 
 3840×2160. So the cost is on the host side of the boundary, and pointing a GPU profiler at this title
 answers a question it does not have. Detail on [#3126](https://github.com/mattias800/prosper/issues/3126).
 
+### Inside the texture leaf (2026-09-04, `fc21d46ca`, 5.02 s at the title screen)
+
+The 1110 ms above is **one class of reference and two surfaces**. Read from the same `.prperf` with
+the frontend cache-outcome classes the report now prints:
+
+| class | ms | note |
+| --- | --- | --- |
+| rtt | 77.3 | |
+| compute | 59.9 | |
+| persist_hit | 25.0 | |
+| local | 17.1 | |
+| persist_reuse / persist_miss | 0.0 / 0.0 | |
+| **unclassified** | **930.8** | **84% of the leaf** |
+
+The slowest single unclassified reference is 59.6 ms, and its identity is the whole story:
+**3840×2160 RGBA16F, 63.8 MiB of tiled source, DCC on, a compute *and* a persistent candidate**, at
+one of exactly **two alternating addresses** (`0x30784e0000` / `0x30d10f0000`) — a double-buffered 4K
+HDR intermediate, re-decoded on every callback that samples it.
+
+**Two thirds of that decode was the allocator and the kernel, not the decode.** Each reference built
+two fresh value-initialised `std::vector<uint8_t>` intermediates — 66,846,720 tiled bytes and
+66,355,200 linear — both past glibc's 32 MiB mmap threshold, so each was an `mmap`, 16,000 page
+faults, a memset and a `munmap`, per reference. Measured standalone at this exact shape:
+
+| | ms |
+| --- | --- |
+| fresh `traw`+`hlin`, copy + detile-equivalent traffic | 26.00 |
+| **the two fresh zero-initialised allocations alone** | **17.84** |
+| pooled `traw`+`hlin`, same copy and traffic | 6.00 |
+| pooled linear only, tiled source read in place | 2.83 |
+
+This is the same cost [#3149](https://github.com/mattias800/prosper/issues/3149) saw from outside as
+`__memmove_avx512` at 14.5% self and `clear_highpages_kasan_tagged` / `map_anon_folio_pte_nopf` /
+`zap_present_ptes` / `__free_one_page` under a 22.2% `do_syscall_64` — and attributed to the compute
+path, because that is where it looked. It is the graphics frontend materializer.
+
+Two more allocations of the same family sit on the same reference and are **not** addressed yet:
+the persistent cache re-stores a fresh 63.8 MiB `source_prefix` on every invalidation (13.00 ms at
+this shape), and `cached.pixels = std::move(texture_pixels)` steals the pooled `texstore` slot, so
+the next decode allocates its 33 MiB output buffer fresh as well (~4.4 ms).
+
 ## The unresolved image ops — established on CALIBRATION
 
 > **The five-op census below was read on the calibration screen**, like every other live census above
