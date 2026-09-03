@@ -2411,6 +2411,14 @@ bool g_apr_mixed_pattern_warned = false;         // the detector below fires at 
 // Sized at 4x the ring, so live load never exceeds 0.25 and probe chains stay short.
 constexpr size_t kAprMeasureIndexSlots = 256;   // power of two; mask-indexed
 constexpr int16_t kAprIndexEmpty = 0, kAprIndexTomb = -1;
+// The table stores slot+1 in an int16_t, and probing masks with slots-1. Both encodings are silent
+// if violated -- a truncated slot index would point at the wrong ring entry rather than fault, and a
+// non-power-of-two size would make the mask skip buckets -- so pin them where a change would land.
+static_assert(kAprMeasureRingMax + 1 <= INT16_MAX, "ring slot+1 must fit the index's int16_t");
+static_assert((kAprMeasureIndexSlots & (kAprMeasureIndexSlots - 1)) == 0,
+              "index size must be a power of two: probing masks rather than divides");
+static_assert(kAprMeasureIndexSlots >= 2 * kAprMeasureRingMax,
+              "index must stay under half full from live entries alone, or probe chains grow");
 std::array<int16_t, kAprMeasureIndexSlots> g_apr_measure_index{};   // zero-init == all EMPTY
 size_t g_apr_measure_index_live = 0;    // occupied entries
 size_t g_apr_measure_index_tombs = 0;   // deleted entries still occupying a probe chain
@@ -2559,10 +2567,34 @@ static bool apr_measure_read_suppressed(uint32_t id) {
 // the cost removed, rather than the cost bought back by sampling -- a detector that only sometimes
 // detects is the wrong trade when detection is the reason this design is acceptable at all.
 //
+// Second known blind spot: duplicate keys are not deduplicated. Two LIVE ring slots holding the same
+// (id, dst, offset, size) would be matched one-at-a-time -- the index finds one, the other stays
+// unmatched and warns on eviction as a phantom mixed pattern. Latent rather than live: across four
+// DOLL PROSPER_FILELOG boots, 5,966 measured reads produced 5,966 distinct tuples and 0 duplicates,
+// so no observed title re-measures an identical read while the first is still in the ring. Left as a
+// note rather than code because deduplicating would mean deciding WHICH of two identical pending
+// reads a single submit satisfies, and nothing observed poses that question.
+//
 // Known blind spot, stated rather than left to be discovered: up to kAprMeasureRingMax entries are
 // still in the ring when the process exits and are never adjudicated, so a title that mixes the two
 // patterns FEWER than 64 measures before quitting would not warn.
 static void apr_measure_warn_mixed_locked(const AprMeasuredRead& lost) {
+    // ONLY in Auto. The detector's premise is "a submit should have claimed this entry", and that
+    // premise is a property of Auto alone -- apr_measure_note_submit returns at its own mode check
+    // before it looks at anything, so in the other two modes nothing is EVER marked.
+    //
+    // Never is the mode this bites, and it bit: apr_measure_read_suppressed returns true for Never,
+    // so every measure records suppressed=true, nothing marks it, and the eviction check fired on
+    // the 65th measure of EVERY run of EVERY title -- printing a message blaming a title-specific
+    // mixed pattern and asking the user to report the title, when the cause was their own flag.
+    // A guaranteed false positive, and worse than an ordinary one: `never` is the lever for the open
+    // question this whole design raises (is the compatibility read needed at all?), so a warning on
+    // every title made the one experiment the feature exists to enable uninterpretable.
+    //
+    // This is the same argument as the =always arm in the test, one mode over. Always happens to be
+    // safe for a second reason -- it never sets suppressed=true at all -- but relying on that
+    // coincidence is how Never got missed, so gate on the premise itself rather than on the symptom.
+    if (apr_measure_mode() != AprMeasureMode::Auto) return;
     if (g_apr_mixed_pattern_warned) return;
     g_apr_mixed_pattern_warned = true;
     fprintf(stderr,

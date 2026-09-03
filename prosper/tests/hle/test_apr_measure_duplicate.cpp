@@ -56,6 +56,10 @@ size_t prosper_apr_index_bucket_for_test(uint32_t id, uint64_t dst, uint64_t off
 using namespace prosper;
 
 static int fails = 0;
+// Collapse a loop's worth of identical assertions into one reported line: a per-iteration CHECK
+// would print 200 rows and bury everything else.
+static bool quiet_ok = true;
+#define CHECK_QUIET(cond) do { if (!(cond)) quiet_ok = false; } while (0)
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
                               else        { std::printf("  [ok]   %s\n", msg); } } while (0)
 
@@ -160,6 +164,29 @@ int main() {
         // contract -- the read never happens, the sizing answer is still right -- is asserted above.
         CHECK(measure(0, 0, 0, 0xffffffffffull, 0, 0) == 24,
               "PROSPER_APR_MEASURE_READ=never: the sizing answer is still the contract");
+
+        // ...and the detector must stay SILENT, which is the arm this file was missing. In `never`
+        // every measure records suppressed=true (the read really is skipped) while note_submit
+        // returns at its mode check without marking anything, so the eviction check would fire on
+        // the 65th measure of every run of every title -- blaming a title-specific mixed pattern for
+        // the user's own flag. This arm previously returned after TWO measures, far short of the
+        // 64-entry ring, which is exactly why it did not see that.
+        //
+        // It matters more than an ordinary false positive: `never` is the lever for the open
+        // question this design raises -- whether the compatibility read is needed at all -- so a
+        // warning on every title would make the one experiment the feature exists to enable
+        // uninterpretable. This is the =always "cannot cry wolf" arm, one mode over.
+        constexpr size_t kPastRingWrap = 200;   // >> the 64-entry ring, so many entries are evicted
+        Dest nd;
+        for (size_t i = 0; i < kPastRingWrap; ++i) {
+            nd.poison();
+            measure(id_a, nd.addr(), 32, 1024 + i * 4, 0, 0);
+            CHECK_QUIET(nd.untouched(32));
+        }
+        CHECK(quiet_ok, "PROSPER_APR_MEASURE_READ=never: no measure ever writes its destination");
+        CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
+              "PROSPER_APR_MEASURE_READ=never: the detector cannot cry wolf past the ring wrap");
+
         prosper_apr_reset_for_test();
         std::remove(path_a_storage.c_str());
         std::remove(path_b_storage.c_str());
@@ -252,6 +279,15 @@ int main() {
         // 600 iterations rather than 72 so the run spans many ring wraps and, at a 256-slot table
         // rebuilt whenever it passes half full, several index rebuilds. A rebuild is where a stale
         // idx_pos would bite, and 72 iterations would not have reached one.
+        //
+        // What this arm CANNOT reach, and why that is structural rather than a sampling accident:
+        // it never steps over a tombstone, and no iteration count would change that. Each loop pass
+        // records a key and then immediately looks up the SAME key. Insert places at the first
+        // EMPTY-or-TOMBSTONE from the home bucket while find stops only at EMPTY, so find always
+        // reaches the entry at or before the position insert chose -- a tombstone can never sit
+        // between them. **Zero is the only value this workload can produce**, not a small number
+        // that more iterations would grow. That is why the tombstone path needs the hand-built
+        // collision below: measuring this zero harder would only have confirmed it.
         constexpr size_t kIndexStress = 600;
         CHECK(!prosper_apr_mixed_pattern_warned_for_test(),
               "detector: quiet before any suppressed measure goes unclaimed");
@@ -351,8 +387,17 @@ int main() {
             }
             CHECK(fillers.size() == 63, "probe-collision arm: found 63 non-colliding fillers");
 
-            size_t before = 0, dummy = 0;
-            prosper_apr_index_coverage_for_test(&before, &dummy);
+            // LOAD-BEARING PRECONDITION: no rebuild may intervene between B's insert and B's
+            // lookup. A rebuild re-inserts only the live entries, which clears every tombstone --
+            // including the one this arm exists to probe past -- and would silently turn the whole
+            // arm into a passing no-op. The threshold is `live + tombs > 128`; this arm reaches
+            // 64 live + 2 tombs = 66, so there are ~62 records of headroom. That is comfortable
+            // today and invisible if someone later shrinks the table, grows the ring, or lowers the
+            // threshold, so the rebuild counter is asserted unchanged across the window rather than
+            // left to a comment. This is the same class the arm itself guards: a silent degradation
+            // that changes no return value.
+            size_t before = 0, rebuilds_before = 0;
+            prosper_apr_index_coverage_for_test(&before, &rebuilds_before);
 
             // A: recorded and submitted, so its eviction cannot itself trip the detector.
             measure(id, dst, kSize, off_a, 0, 0);
@@ -365,12 +410,15 @@ int main() {
                 read_file_guest(cb, 0, record, id, dst, kSize, fillers[i], 0, 0);
             }
 
-            size_t after = 0;
-            prosper_apr_index_coverage_for_test(&after, &dummy);
+            size_t after = 0, rebuilds_mid = 0;
+            prosper_apr_index_coverage_for_test(&after, &rebuilds_mid);
             // Now the load-bearing lookup: B is live, its chain starts at the tombstoned bucket.
             read_file_guest(cb, 0, record, id, dst, kSize, off_b, 0, 0);
-            size_t after_lookup = 0;
-            prosper_apr_index_coverage_for_test(&after_lookup, &dummy);
+            size_t after_lookup = 0, rebuilds_after = 0;
+            prosper_apr_index_coverage_for_test(&after_lookup, &rebuilds_after);
+            CHECK(rebuilds_before == rebuilds_after,
+                  "probe-collision arm: no rebuild intervened, so the tombstone it probes past "
+                  "really was still there (the arm is not a no-op)");
 
             char msg[256];
             if (forced_always) {
