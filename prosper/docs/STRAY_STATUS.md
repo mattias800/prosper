@@ -82,6 +82,26 @@ The slowest single unclassified reference is 59.6 ms, and its identity is the wh
 one of exactly **two alternating addresses** (`0x30784e0000` / `0x30d10f0000`) — a double-buffered 4K
 HDR intermediate, re-decoded on every callback that samples it.
 
+**Which cache state that is, derived rather than guessed.** The capture predates the
+`persist_invalid` bucket, so the class is established by elimination from the witness's own fields
+plus the code — and the next capture will confirm or refute it directly, which is why the bucket
+exists:
+
+| step | from | conclusion |
+| --- | --- | --- |
+| `persist_cand=1` | `texture_decode_cache_candidate` | no live colour or depth target, no captured host data, `cls == Texture`, format supported |
+| `class=2` | the witness | `fr.is_storage_image` is `cls == StorageImage`, so false |
+| `compute_cand=1` with `dcc=1` | `compute_image_candidate` requires `!compression_enabled \|\| persistent_dcc_uncompressed` | the DCC plane is all-`0xff`, so `compression_supported` holds |
+| default launch | — | the cache is not disabled and its budget is non-zero |
+| ⟹ | `persistent_texture_decode_cache_eligible` | **eligible** — the lookup really does run |
+| `persist_miss = 0.00` over the whole window | the capture | not a miss, so the entry was FOUND |
+| `persist_hit = 25.0` total, and this reference is unclassified | the capture | not a hit |
+
+Eligible, found, and neither hit nor miss leaves exactly one state: **`resource_persistent_invalidation`**
+— the entry exists and its guest bytes changed. The cache is not broken; the content genuinely is
+new every frame, because a compute dispatch rewrites the surface. So no amount of cache tuning
+removes this decode. Only not making the round trip does.
+
 **Two thirds of that decode was the allocator and the kernel, not the decode.** Each reference built
 two fresh value-initialised `std::vector<uint8_t>` intermediates — 66,846,720 tiled bytes and
 66,355,200 linear — both past glibc's 32 MiB mmap threshold, so each was an `mmap`, 16,000 page
