@@ -50,22 +50,26 @@ inline bool parse_u64_strict(const char* text, uint64_t* out) {
 // alone so the caller keeps its own choice of cached (`PROSPER_ENV_VALUE`) or live (`std::getenv`)
 // read; `name` is for the message.
 //
-// `unit` is an optional trailing note for the message ("KiB", "MiB", ...), because a knob's units
-// live at its call site and a reader who mistyped one wants to be told which was expected.
+// `unit` is an optional trailing note for the message ("KiB", "MiB", "validations", ...), because a
+// knob's units live at its call site and a reader who mistyped one wants to be told which was
+// expected. It is rendered as "... is not a plain non-negative count of KiB", so pass a bare noun.
 inline uint64_t env_u64_or_default(const char* name, const char* text, uint64_t fallback,
                                    const char* unit = nullptr) {
     uint64_t value = 0;
     if (parse_u64_strict(text, &value)) return value;
     if (!text || !*text) return fallback;   // unset or empty: not a typo, and not worth a line
     std::fprintf(stderr,
-                 "[env] %s='%s' is not a plain non-negative integer%s%s -- keeping the default "
-                 "(%llu) and changing NOTHING\n",
-                 name, text, unit ? " of " : "", unit ? unit : "",
+                 "[env] %s='%s' is not a plain non-negative %s%s -- keeping the default (%llu) and "
+                 "changing NOTHING\n",
+                 name, text, unit ? "count of " : "integer", unit ? unit : "",
                  static_cast<unsigned long long>(fallback));
     return fallback;
 }
 
-// The same, saturating at `cap` instead of overflowing a later multiply. Every byte-valued knob in
+// The same, saturating at `cap` instead of overflowing a later multiply. NOTE that the saturation
+// itself is SILENT -- only a malformed value is reported. A well-formed but absurd number is a
+// deliberate act ("as large as possible"), where clamping is the expected answer rather than a
+// surprise; a typo cannot reach here, because it was already refused above. Every byte-valued knob in
 // the tree scales its number by 1024 or 1024*1024, and a value near UINT64_MAX would wrap that
 // product to something small — the same class of silent wrong setting this header exists to remove.
 inline uint64_t env_u64_or_default_capped(const char* name, const char* text, uint64_t fallback,

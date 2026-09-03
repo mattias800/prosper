@@ -173,6 +173,15 @@ int main() {
         CHECK(std::strtoull("\"8192\"", nullptr, 10) == 0);
         CHECK(std::strtoull("8mb", nullptr, 10) == 8);
         CHECK(std::strtoull("-1", nullptr, 10) == UINT64_MAX);
+        // Two more the reviewer of #3253 added, both worth keeping. A hex-looking value is the
+        // sharpest of the lot: someone reaching for `0x2000` on a byte-valued knob is thinking in
+        // hex, and base 10 stops at the '0' -- landing on the aggressive sentinel, not on 8192.
+        CHECK(std::strtoull("0x10", nullptr, 10) == 0);
+        CHECK(!parse_u64_strict("0x10", &parsed));
+        // And a trailing newline, which a heredoc or a `$(cat file)` puts there without anyone
+        // typing it. strtoull takes it; this does not.
+        CHECK(std::strtoull("8192\n", nullptr, 10) == 8192);
+        CHECK(!parse_u64_strict("8192\n", &parsed));
 
         // THE LOAD-BEARING ARM. Each of those keeps the DEFAULT instead.
         CHECK(env_u64_or_default("PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB", "eight", 8192) == 8192);

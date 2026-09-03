@@ -45,8 +45,8 @@ is process-wide, so independently taken values in unrelated translation units co
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
 
-`env_cache.hpp` is the third always-reachable file, and it is here for the same reason as
-`diag_clock.hpp`: it is shared, and it belongs to no one subsystem. It holds `PROSPER_ENV_ON` /
+`env_cache.hpp` and `env_numeric.hpp` are the remaining always-reachable files, and they are here for
+the same reason as `diag_clock.hpp`: it is shared, and it belongs to no one subsystem. It holds `PROSPER_ENV_ON` /
 `PROSPER_ENV_VALUE`, the one-shot reads of a `PROSPER_*` switch. They lived in
 `hle/dispatch/dispatch.hpp` until #3094, which is where they were first needed and not where they
 belong — the renderer backend, the draw executor and the live frontend all evaluate diagnostic
@@ -63,3 +63,18 @@ runtime, and separately pins the hot sites #3094 converted so they cannot regrow
 Run it before caching a new name. Note it can only see arming through a *literal* name —
 `tools/gpu_replay` re-applies `render_env[]` (`gpu/capture/gpu_capture.cpp`) per bundle submit
 through a variable, which is invisible to it; that comment lives in `env_cache.hpp` itself.
+
+`env_numeric.hpp` answers the neighbouring question — not "was this set?" but "what NUMBER is that
+text?" — and exists because the obvious spelling is quietly wrong. `strtoull(value, nullptr, 10)`
+discards the end pointer, so the parse cannot fail; it just answers something, and measured on glibc
+it answers **three** different wrong things: `0` for text it cannot start on, the leading digits for
+`8mb`, and `UINT64_MAX` for `-1`. On a knob where 0 means "off" that is a lost experiment. On the
+write-watch family it is worse, because 0 there is a *meaningful and maximally aggressive* setting, so
+a typo silently ran a different experiment than the one asked for (#3253, after #3155's retracted
+measurement). `env_u64_or_default*` refuses loudly and keeps the default; the accepted grammar is
+exactly `[0-9]+`.
+
+Both headers take the variable's NAME as a literal argument, and `check_cached_env.py` treats any
+callee containing `env` as an environment WRITE — so a new reader here has to be added to that
+script's `ENV_READERS` set or it reads as an arming. That coupling is the one non-obvious thing about
+adding a function to this pair.
