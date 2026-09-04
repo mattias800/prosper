@@ -42,13 +42,15 @@ constexpr uint32_t kImageLoadDmask1    = 0xF0000108u;   // op 0x00, DMASK=0x1 ->
 constexpr uint32_t kImageStoreDmask1   = 0xF0200108u;   // op 0x08, DMASK=0x1 -> needs a StorageImage
 constexpr uint32_t kEndpgm             = 0xBF810000u;
 
-// MIMG word0 field check, so the three constants above are not three independent guesses. OP sits at
-// [24:18]: 0xF0000108 (op 0x00) and 0xF0200108 (op 0x08) differ by exactly 8<<18, and both are words
-// the guest itself submits -- they are copied from Stray's and The Oregon Trail's rejects, not
-// synthesized. If a future edit mistypes one, this fires before any resolver arm runs.
-static_assert(((kImageLoadDmask1    >> 18) & 0x7Fu) == 0x00u, "IMAGE_LOAD word0 encodes op 0x00");
-static_assert(((kImageStoreDmask1   >> 18) & 0x7Fu) == 0x08u, "IMAGE_STORE word0 encodes op 0x08");
-static_assert(((kImageSampleDmask15 >> 18) & 0x7Fu) == 0x20u, "IMAGE_SAMPLE word0 encodes op 0x20");
+// MIMG word0 field check, so the three constants above are not three independent guesses. The decoder
+// builds the opcode from EIGHT bits, `((w & 1) << 7) | ((w >> 18) & 0x7F)` (`rdna2_decode.cpp`), so
+// reconstruct it the same way: masking only the low seven would leave bit 7 unchecked and a constant
+// with word0 bit 0 set would decode as opcode+0x80 while still passing. All three are words the guest
+// itself submits -- copied from Stray's and The Oregon Trail's rejects, not synthesized.
+constexpr uint32_t mimg_opcode(uint32_t word0) { return ((word0 & 1u) << 7) | ((word0 >> 18) & 0x7Fu); }
+static_assert(mimg_opcode(kImageLoadDmask1)    == 0x00u, "IMAGE_LOAD word0 encodes op 0x00");
+static_assert(mimg_opcode(kImageStoreDmask1)   == 0x08u, "IMAGE_STORE word0 encodes op 0x08");
+static_assert(mimg_opcode(kImageSampleDmask15) == 0x20u, "IMAGE_SAMPLE word0 encodes op 0x20");
 
 ShaderResource make_texture(uint32_t sgpr_base) {
     ShaderResource texture{};

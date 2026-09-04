@@ -7074,8 +7074,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // intended contract -- exact per-use provenance outranks a table key, because a sample
             // and a store may share one key while needing different Vulkan classes -- but it means
             // the outcome can be a DIFFERENT, still class-valid resource, not only a rejection turned
-            // into a resolution. Reachability needs the BVH piggyback (`gpu_executor.cpp`) to land on
-            // a texture-publishing pc. #3126/#1634.
+            // into a resolution.
+            //
+            // NO REACHABLE INSTANCE IS KNOWN, and the first version of this comment claimed one that
+            // cannot exist: "reachability needs the BVH piggyback to land on a texture-publishing pc".
+            // It cannot -- that piggyback keys a ConstantBuffer by an IMAGE_BVH_INTERSECT_RAY pc, and
+            // opcode 0xe6 returns from its own block above, before this lookup ever runs. The sentence
+            // arrived verbatim from a review comment, carrying a file:line, and was promoted into
+            // shipped code without anyone opening the cited path -- the #2049 -> #2052 shape CLAUDE.md
+            // records, repeated. State the precedence change, which is real and provable from the
+            // diff; do not attach a reachability story to it that has not been traced. #3126/#1634.
             const ShaderResource* res = rt->image_by_fetch_pc(in.pc, image_requirement);
             if (!res) {
                 uint32_t srt_tag = 0;
