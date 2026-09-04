@@ -12,8 +12,11 @@ both to report failure takes the guest from **dying at 8.6 s in every run** to *
 200 s window and 39,920 frames** with no `PS5 Out of Memory`, no `Fatal error!` and no `SIGSEGV`.
 See *Blocker 2, re-framed* for the mechanism and the disassembly.
 
-The rung is still 0 until a **rendered frame** is captured: a guest that reaches its frame loop is
-not a picture, and this fix makes no claim about the renderer.
+The rung is still 0. A rendered run on the fixed build holds the guest alive for the full 120 s
+(`guest=running status=ok`) and composites nine distinct pictures — a yellow quadrant, a brown
+gradient, and the old flat white — **none of which is content**. The blocker has changed identity
+rather than gone: it was a memory-shaped guest abort, and it is now a rendering question with a live
+guest underneath it. See *After the fix* below.
 
 First brought up 2026-08-22 from nothing: no tracker, no `COMPATIBILITY.md` row, no route, no prior
 work of any kind. Everything below is from that session unless a link says otherwise.
@@ -493,6 +496,63 @@ Two things fall out that are **not** Khazan's to fix:
 
 **Sifu (`PPSA03001`) is NOT fixed by this.** It calls `libScePsml` zero times and its identical
 banner has a different cause; see the corrected `## Ruled out` row.
+
+### After the fix: the guest survives under the RENDERER, and still draws nothing recognisable
+
+Measured 2026-09-05 on the fixed build, `tools/screenshot`, default route, live renderer
+(`PROSPER_RENDER=1`), 12 samples over 120 s:
+
+```text
+[shot] done: 12/12 screenshot(s); stop=request-satisfied source-distinct=9 pixel-distinct=4
+             max-source-stale=30.0s max-pixel-stale=80.0s guest=running status=ok
+[shot] fps: 1.2 fps while producing frames, 14% of the 119.7 s run active
+```
+
+`guest=running status=ok` is the half that matters: every earlier arm on this title reported
+`guest=faulted status=GUEST-FAULT` at 8.6 s. So the fix holds under the **rendering** frontend and
+not only under `boot_trace` — worth stating explicitly, because on `PPSA21406` the frontend was the
+variable that decided a claim (instrument trap 127).
+
+**All 12 manifest entries read `"source": "composited"`**, 3840x2160. Nothing here is the guest's own
+display buffer echoed back, so the pictures below are prosper's own composites.
+
+**And none of them is content, so this is still rung 0:**
+
+| frame | picture |
+| --- | --- |
+| 00 | a solid **yellow (255,255,0)** rectangle filling the top-left quadrant on black; 9 distinct colours |
+| 01-09, 11 | a **brown/orange vertical gradient** over black; 132 distinct colours, 50.1% non-black |
+| 10 | **flat white**, 1 distinct colour — the old picture, now one state among several rather than the only one |
+
+The metrics are the trap here and are recorded so nobody re-reads them upward: 132 distinct colours
+and 50% non-black is what a **gradient** scores, and prosper's own seed-miss gradient is documented
+as outscoring real content. The frames were opened and looked at; they are a gradient.
+
+**An observation, offered as an observation and not a claim: three UE4 titles have now been seen
+with red and green forced to maximum and blue at zero.** Khazan's frame 00 here, *Little Nightmares
+III* (`PPSA05143`, #2014, "most title frames arrive with red and green forced to maximum, reading as
+a yellow background"), and a frame another lane matched by CRC to *Unbound: Worlds Apart*. One
+engine, three independent sightings, no mechanism proposed — written down so whoever finds the
+mechanism can find the sightings.
+
+**Where to go next — and which colour-block lever, because the two are not interchangeable.** Across
+every Khazan run the only colour-block diagnostic is `CB_COLOR_CONTROL.MODE=2 is an unmodeled
+color-block operation -> still executed as an ordinary color draw` — **24 occurrences, `MODE=2`
+exclusively, never `MODE=0`**. `MODE=2` is `ELIMINATE_FAST_CLEAR`, and a fast-clear-eliminate pass
+executed as an ordinary colour draw is exactly the shape that lays a flat fill or a gradient over a
+real image.
+
+So the arm to run here is **`PROSPER_CB_EFC_NO_COLOR=1`**, not `PROSPER_LEGACY_CB_DISABLE_MASK`:
+
+- `PROSPER_LEGACY_CB_DISABLE_MASK` targets `MODE=0` (`DISABLE`). This title never emits it, so that
+  arm has **nothing to act on** and would return a clean null — which reads, six weeks later, as
+  "tried it, no effect" rather than "the lever was aimed at an empty population". Do not run it for
+  completeness; the census above is the answer.
+- `PROSPER_CB_EFC_NO_COLOR=1` targets `MODE=2`, which is **100% of this title's population**. Note
+  that this lever measured as a null on `PPSA05143` (17.84% against an 18.08% control) — but that
+  title emits *both* modes, so its EFC arm acted on a small share. That null does not transfer to a
+  title where EFC is the entire population, for the same reason a `MODE=0` result does not transfer
+  here.
 
 ## Ruled out
 
