@@ -939,6 +939,56 @@ drops still discard the background.
 
 ## Ruled out
 
+### The title screen's black composite — five falsified explanations, 2026-09-04
+
+All five were formed against the evidence available at the time and all five died to a measurement
+built to contradict them. Two were filed as issues and retracted (#3327, #3329). The instrument
+throughout was RenderDoc's replay bindings (#3321), which read render-target *contents* headless.
+
+- **"Five composite descriptors were collapsed onto a shared dedup key."** Predicted five null
+  images; `PROSPER_TEXBIND=1` measured **0 nulls in 139,288** 4K bindings, with `borrowed_target=1`
+  on the composite's inputs. Falsified.
+- **"Five slots sharing one image view is anomalous."** It is ordinary **bindless filler**: draws
+  with 32, 21 and 13 fragment inputs also resolve to one distinct view, **including bloom passes that
+  render correctly**. #3327 retracted and closed as invalid. *"No engine would do that" is an
+  argument from expectation* — the check that kills it is one script that scans the frame for the
+  same shape on passes known to work.
+- **"The tonemap's 1x1 exposure input being zero blacks the frame."** Two other draws (EID 2432,
+  2460) sample **that same zero 1x1** and produce peak 0.0236. A zero there is not fatal. Falsified.
+- **"A skipped compute program starves the scene."** `PROSPER_TABLESIZE=1` measured **5,102 compile
+  attempts and 1 failure** for `0x300ba70000`. The claim of "7,839 skipped" came from joining two
+  correct numbers — a dispatch count and a **deduplicated** skip line (`gpu_executor.cpp:2262`) —
+  into an invented conclusion. #3329 retracted and closed as invalid.
+- **"#3311 (`0x300e390000`, EXEC from a spilled wave mask) is the blocker."** That program is
+  dispatched **zero times** on this route. Excluded — work on its mask model will not move the title
+  screen.
+
+### What the same series established (measured, not inferred)
+
+`PixelHistory` at the frame's **brightest** pixel (1120,1912) — the centre pixel is legitimately dark
+and misleads:
+
+| stage | EID | `shaderOut` | stored |
+| --- | ---: | --- | --- |
+| scene | 3069 | `0.01101, 0.007385, 0.005688` | `0.01099` |
+| tonemap | 3752 | **`0.001099`** | **`0`** |
+| composite | 3788 | `0,0,0,1` | `0` |
+
+**The shader is not producing black; the store is** — `0.001099 x 255 = 0.28` rounds to zero in
+`R8G8B8A8_UNORM`. Two contributions, separated: a scene arriving ~40-100x low, and a tonemap removing
+a further ~10x.
+
+**A fix to the tonemap alone cannot work.** At 1:1 the brightest pixel reaches `0.011 x 255 = 2.8`,
+i.e. 2/255. The scene's shortfall is the dominant term. Note also that the tonemap's 10x may be
+correct behaviour: a scene at 1.0 through a 10x exposure reduction yields 0.1, a normal tonemapped
+value.
+
+**Instrument caveats that cost time here:** the skip line is deduplicated per program;
+`PROSPER_COMPUTELOG_CODE` does not filter the `[compute] submit=` lines; `PROSPER_COMPUTELOG_RAW`
+takes a **file** path and dumps a readable window, not the shader's span; `sh=<code[0]>/<dwords>` is
+first-dword and span, not a hash; `PROSPER_RENDERDOC_AFTER_MS` is app-loop time and does not land on
+the same guest state across runs.
+
 - **"`import_live_compute_storage_image` finds nothing under its key, so the compute-image borrow
   fails in the cache's ADMISSION."** Not falsified — **withdrawn as unmeasured**, 2026-09-04. It was
   written into § *The lever that is worth more than all of this* as a statement of fact, and it is
