@@ -2,7 +2,16 @@
 //
 // Reuses the shared boot path (boot_program) and the shared live renderer (frontends/shared), so the
 // game boots and composites exactly as boot_trace / prosper-app do; this tool just samples the
-// present layer (present_readback) periodically and writes PNGs. Frames are counted as rendered frames
+// present layer (present_snapshot) periodically and writes PNGs.
+//
+// THE IMAGE IS NOT THE PROVENANCE, and this comment is where two readers went wrong before it said
+// so. `present_snapshot` FALLS BACK to the guest's own display buffer when the renderer published
+// nothing (videoout_present.cpp, returning RawScanout), and this tool saves that by default. So a
+// correct-looking PNG does not mean prosper composited anything: a title that draws its own menu
+// into its own scanout buffer produces a byte-identical picture whether we rendered it or not.
+// Which one it was lives in the manifest's `source` field -- `capture_source_name()`:
+// composited / guest_scanout / raw_scanout -- and nowhere in the pixels.
+// `--require-composited-frame` asserts Rendered specifically. Frames are counted as rendered frames
 // (present_frame_seq). Files are named <titleCode>_<runTimestamp>_<index>.png so every screenshot from
 // one run shares a prefix and sorts together in a folder of many runs.
 //
@@ -51,7 +60,7 @@
 #include "host/image/boot_program.hpp"       // boot_program
 #include "host/image/exec_image.hpp"         // run_entry
 #include "host/platform/gpu_submit_gate.hpp" // #3225: drain guest GPU submits before _exit
-#include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
+#include "gpu/present/videoout_present.hpp"    // present_count / present_snapshot / present_width/height
 #include "gpu/present/present_frame_rate.hpp" // distinct-guest-frame framerate (NOT a present rate)
 #include "overlay_text.hpp"                   // --fps-overlay: burn the rate into the image
 #include "build_revision.hpp"                // the revision the overlay reports for this binary
