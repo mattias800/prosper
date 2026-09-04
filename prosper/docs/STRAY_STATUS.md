@@ -150,12 +150,16 @@ change that gave the residual a name also removed most of the cost the name was 
 prediction whose own fix invalidates its arithmetic is confirmed about *which* state, not about
 *how much*.
 
-**The lever arm's gap is explained, not noise.** It returns the leaf to 918.2 rather than 1110.1
-because at the time it was run **one of the four changes had no off-switch** — the `source_prefix`
-inheritance — so it was still active in the "off" arm. The missing 191.9 ms is that, and it is
-consistent with the 13.00 ms per-invalidation figure above over ~14 references.
-`PROSPER_NO_TEXTURE_PREFIX_INHERIT` closes that gap; the arm above therefore **under-reports** what
-#3309 is worth, and a re-run with all three levers is the one to quote.
+**The lever arm's gap has a known cause, and how much of it that cause accounts for is NOT
+established.** The arm returns the leaf to 918.2 rather than 1110.1. What is established, by reading
+the code rather than by inference, is that at the time it ran **one of the four changes had no
+off-switch** — the `source_prefix` inheritance — so it was necessarily still active in the "off"
+arm, and *some* of the 191.9 ms gap is therefore it. What is **not** established is that all of it
+is: the standalone figure predicts ~133 ms (13.00 ms per invalidation over ~14 references), the two
+captures are separate runs, and `setup_resources` buffer copy also moved between them (512.6 → 596),
+so run-to-run variance here is not zero. `PROSPER_NO_TEXTURE_PREFIX_INHERIT` exists to settle it in
+one arm. Until that arm is run, the 918.2 is known to under-report #3309 by an unquantified amount —
+which is a weaker and more useful statement than a number.
 
 **Compute rose 1981.5 → 2351.4 ms in the same window, and that is not a regression** — the window
 is fixed at 5.02 s, so a pipeline that renders 18% more frames also issues more dispatches into it.
