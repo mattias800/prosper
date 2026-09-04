@@ -232,14 +232,15 @@ void guest_write_watch_invalidate_all();
 //   * It returns the FIRST range containing `addr` and does NOT check that the range extends far
 //     enough for the intended access. Fine for a probe; a production caller needs the size check.
 //   * `false` means "no alias covers this VA" OR "the alias table holds nothing to search", which
-//     are very different facts. Always report guest_write_watch_alias_count() beside a false, or the
-//     reader will take an unarmed instrument for a negative result.
-bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys);
-
-// How many direct-mapping alias ranges are currently known -- the SEARCHED DOMAIN of the resolver
-// above, so a caller can tell an empty table from a genuine miss. Zero on Windows (page-protection
-// watches never arm there) and on any run that never reached guest_write_watch_set_fault_onstack.
-size_t guest_write_watch_alias_count();
+//     are very different facts. Pass `alias_count` and report it beside a false, or the reader will
+//     take an unarmed instrument for a negative result.
+//
+// `alias_count` (optional) receives the SEARCHED DOMAIN -- how many direct-mapping alias ranges were
+// available to match against -- read under the SAME lock acquisition as the lookup, so the pair is
+// mutually consistent rather than two samples of a table that can change between them. Zero on
+// Windows (page-protection watches never arm there) and on any run that never reached
+// guest_write_watch_set_fault_onstack.
+bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys, size_t* alias_count = nullptr);
 
 // Called by the HLE, by guest VA range, immediately BEFORE a host/kernel store into guest memory (e.g. a
 // read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages

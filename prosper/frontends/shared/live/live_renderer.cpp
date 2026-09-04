@@ -9967,9 +9967,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // domain is how an unarmed instrument gets recorded as a negative result.
                         if (read.metadata.address && prosper::diag_should_print(ord)) {
                             uint64_t flip_phys = 0;
+                            size_t alias_n = 0;
                             const bool ok = prosper::host::guest_write_watch_va_to_phys(
-                                read.metadata.address, flip_phys);
-                            const size_t alias_n = prosper::host::guest_write_watch_alias_count();
+                                read.metadata.address, flip_phys, &alias_n);
                             if (ok)
                                 fprintf(stderr,
                                         "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> phys=0x%llx "

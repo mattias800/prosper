@@ -21,15 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-04
 
-### Stray's missing world is not an address-matching bug, and now we can prove it
+### Stray renders its title screen straight into the display buffer, and the world still is not there
 
-No picture with this one — it is a dead end worth recording. Stray's main menu draws a full 3D scene
-into prosper's own render targets and then presents only the UI bar over black, and the tempting
-explanation was that the buffer the game flips to the screen and the buffers we render into are two
-names for the same memory, which we were simply failing to connect. They are not: measured directly,
-the two sit half a gigabyte apart in physical memory. So the game really is copying its finished
-frame somewhere else, by a route we do not yet follow — which is a narrower question than the one we
-started with.
+No picture worth showing — the frame is the menu over black, which is what it has been. The finding
+is what sits behind it. We had assumed the game composed its picture in one place and copied it to
+the buffer the screen reads, and that prosper was losing the copy. Measuring every render target this
+time, rather than only the first one, says otherwise: the two display buffers *are* render targets,
+and prosper draws into them nearly a thousand times in a run that still shows an empty screen. So
+nothing is being lost in transit. Either only the menu is ever drawn there, or the world is drawn and
+then wiped — and those two are quick to tell apart.
 
 ### RenderDoc works on prosper now, and the first capture was a beautiful picture of the wrong thing
 

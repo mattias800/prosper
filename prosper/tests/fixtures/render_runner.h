@@ -5442,24 +5442,35 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // VA-keyed match is the whole defect; if none does, the guest copies between distinct
         // allocations and the question moves to which packet performs it.
         //
-        // SCOPE, and it is a real limit on what the census can conclude: this prints colour SLOT 0
-        // only. `persistent_id1` and `persistent_id_slots[2..7]` are separate guest VAs that are
-        // never censused here, so "no target aliases the scanout page" is a statement about slot 0
-        // and not about every surface the frame renders into.
+        // EVERY colour slot is censused, not just slot 0, and that scope is the whole point rather
+        // than thoroughness for its own sake. `is_live_render_target` consults `g_rtt`, and `g_rtt`
+        // is populated for every slot (`live_renderer.cpp` keys it by `pass_bases[slot]`), so a
+        // slot-1..7 target aliasing the scanout page would be a live render target the present path
+        // ALREADY knows by VA -- exactly the link the alias hypothesis proposes. A slot-0-only
+        // census would leave that case unobserved while reading like a general answer, which is the
+        // charter's "positive control tests the discriminator, never the domain" in miniature.
         static const bool target_phys_census = std::getenv("PROSPER_TARGET_PHYS") != nullptr;
-        if (target_phys_census && color_target->persistent_id) {
-            uint64_t tphys = 0;
-            const bool ok = prosper::host::guest_write_watch_va_to_phys(
-                color_target->persistent_id, tphys);
-            if (ok)
-                std::fprintf(stderr, "[target-phys] slot0 va=0x%llx %ux%u -> phys=0x%llx\n",
-                             (unsigned long long)color_target->persistent_id, W, H,
-                             (unsigned long long)tphys);
-            else
-                std::fprintf(stderr, "[target-phys] slot0 va=0x%llx %ux%u -> UNRESOLVED "
-                                     "(aliases=%zu)\n",
-                             (unsigned long long)color_target->persistent_id, W, H,
-                             prosper::host::guest_write_watch_alias_count());
+        if (target_phys_census) {
+            const auto census_slot = [&](unsigned slot, uint64_t va) {
+                if (!va) return;
+                uint64_t tphys = 0;
+                size_t alias_n = 0;
+                if (prosper::host::guest_write_watch_va_to_phys(va, tphys, &alias_n))
+                    std::fprintf(stderr, "[target-phys] slot%u va=0x%llx %ux%u -> phys=0x%llx\n",
+                                 slot, (unsigned long long)va, W, H, (unsigned long long)tphys);
+                else
+                    std::fprintf(stderr, "[target-phys] slot%u va=0x%llx %ux%u -> UNRESOLVED "
+                                         "(aliases=%zu)\n",
+                                 slot, (unsigned long long)va, W, H, alias_n);
+            };
+            census_slot(0, color_target->persistent_id);
+            // Slot 1 lives in its own field; only report it when it is a DISTINCT surface, matching
+            // the test the MRT path itself applies, so a single-target pass does not print twice.
+            if (color_target->persistent_id1 &&
+                color_target->persistent_id1 != color_target->persistent_id)
+                census_slot(1, color_target->persistent_id1);
+            for (size_t sl = 2; sl < color_target->persistent_id_slots.size(); ++sl)
+                census_slot((unsigned)sl, color_target->persistent_id_slots[sl]);
         }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
