@@ -231,7 +231,7 @@ The standing warnings that are **not** title-specific:
 
 `docs/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
 `docs/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
-both shader stages recompile and dynamic V#/T#/S# resources resolve on current master, and the
+both shader stages recompile and dynamic V#/T#/S# resources resolve on current `main`, and the
 render-loop frontier is complete. Each carries its own superseded banner — do not start work from
 either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
 
@@ -786,8 +786,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     served only to serialize independent lanes; the flag now errors and names its replacement. So if you
     lose a collision, renumber to any number above the current highest and merge — you no longer have to
     wait for the number below yours. Before writing a row, allocate with
-    `python3 prosper/tools/docs/trap_number.py`, which scans master **and every open PR** (#1729);
-    reading master alone is what produced the #2574/#2581 collision.
+    `python3 prosper/tools/docs/trap_number.py`, which scans `main` **and every open PR** (#1729);
+    reading the base branch alone is what produced the #2574/#2581 collision.
     **On a PR that touches a numbered table, run the gate against the MERGE RESULT immediately before
     merging** — `python3 prosper/tools/docs/check_merge_result.py` fetches, merges into
     `origin/main` in the object database (no checkout, no index), and runs the gate on the result.
@@ -1018,7 +1018,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     doc, or your head is a bug that gets rediscovered the hard way.
   - **Before starting non-trivial work, check the tracker** (`gh issue list --label bug-hunt`,
     or by area) — the fix may already be specified, or an issue may conflict with what you're
-    about to change. Before fixing an issue, **re-verify it still exists on current master**
+    about to change. Before fixing an issue, **re-verify it still exists on current `main`**
     (another PR may have fixed it independently).
   - **One issue → one focused PR** where feasible; reference the issue in the PR body
     (`Fixes #NN`) so the merge closes it. When a fix lands that partially addresses an issue,

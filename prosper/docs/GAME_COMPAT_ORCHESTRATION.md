@@ -17,7 +17,7 @@ this document is the map that helps the next orchestrator find and interpret tha
 ## Current checkpoint
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
-- Remote branch: `master`.
+- Remote branch: `main`.
 - Documentation refresh base: `5e7ff0ab` (2026-08-10).
 - **Game dumps live at `<DUMP_ROOT>/<TITLE_ID>-app0`, and `<DUMP_ROOT>` is whatever
   `$PROSPER_GAME_ROOT` points at** (gitignored, and deliberately not written down here — the
@@ -805,7 +805,7 @@ The orchestrator owns integration and scheduling, not every line of investigatio
    an ordinary PR, then merge when authorized.
 9. Keep issues and PR descriptions self-contained. Post exact commands, hashes, conclusions, and falsified hypotheses.
 10. Update compatibility docs and representative screenshots when a title reaches a new visible checkpoint.
-11. Rebase or restart long-lived investigation branches from current master before they drift.
+11. Rebase or restart long-lived investigation branches from current `main` before they drift.
 12. Stop stale processes and keep evidence off the repository and off RAM-backed `/tmp`.
 
 The current user explicitly authorized the orchestrator/subagent arrangement as pair programming and allowed the
@@ -818,7 +818,7 @@ authorization: if a future user has not granted it, follow the independent-revie
 Every game subagent should receive and follow this contract:
 
 - Work only in the assigned private worktree and worktree-local build directory.
-- Start from the exact remote master SHA supplied by the orchestrator; report branch, head, merge-base, and status.
+- Start from the exact remote `main` SHA supplied by the orchestrator; report branch, head, merge-base, and status.
 - Read the title issue and status docs before running a new experiment.
 - State one falsifiable question before each run and the outcome that would distinguish the competing explanations.
 - Prefer immutable F9/timeline/capsule evidence and offline `gpu_replay` over repeated game boots.
@@ -857,7 +857,7 @@ TMPDIR="$PWD/prosper/build-linux/tmpdir" \
   cmake --build prosper/build-linux -j6
 ```
 
-Before publishing, fetch master, inspect divergence, synchronize when needed, rerun the relevant checks on the exact
+Before publishing, fetch `main`, inspect divergence, synchronize when needed, rerun the relevant checks on the exact
 head, and report:
 
 ```text
@@ -1155,7 +1155,7 @@ Practical consequences for any routed run on a developer's desktop:
 
 ## Recently merged foundation
 
-These changes are already on current master and should not be reimplemented:
+These changes are already on current `main` and should not be reimplemented:
 
 | PR | Merge commit | Result |
 |---|---|---|
@@ -2054,7 +2054,7 @@ A useful cadence is:
 3. Keep one integration step active at a time: inspect diff, verify exact head, publish PR, watch CI, merge.
 4. Let the other agents continue evidence gathering while CI runs, provided they are not modifying the same files or
    depending on the unmerged result.
-5. After every merge, fetch master and restart dependent branches from the new exact head.
+5. After every merge, fetch `main` and restart dependent branches from the new exact head.
 6. Report to the user in plain language: what became visible/correct, what was ruled out, what is running, and whether
    the GPU is shared or exclusive. Performance numbers are ballpark unless the GPU was isolated.
 
@@ -2065,7 +2065,7 @@ When an agent appears frozen, distinguish a real long computation from a helper 
 
 After a material event:
 
-- replace the exact master SHA;
+- replace the exact `main` SHA;
 - move merged work into the foundation table;
 - update the lane's “proven,” “falsified,” and “next” sections;
 - link the new issue comment/PR;

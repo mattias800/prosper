@@ -236,8 +236,8 @@ rather than decoration:**
 PR (`gen_progress_tracker.py --check`), and **that gate was removed on 2026-08-27** because one of
 its two triggers was unfixable by the person it failed.
 
-**You no longer have to do anything.** A `progress-tracker` job regenerates the file on every master
-push and commits it if it changed. If your PR closes a cited blocker, master repairs itself.
+**You no longer have to do anything.** A `progress-tracker` job regenerates the file on every `main`
+push and commits it if it changed. If your PR closes a cited blocker, `main` repairs itself.
 
 The reasoning is kept because it is the useful part:
 
