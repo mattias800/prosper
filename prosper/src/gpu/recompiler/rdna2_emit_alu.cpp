@@ -7060,9 +7060,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // at sgpr_base 8, so the collision is real, not hypothetical -- and (b) a wrong-class hit on
             // the SRT route left `res` non-null, which SUPPRESSED the `!res` guard on the SGPR fallback,
             // so a route that could have resolved was never tried. Filtering inside the lookup makes the
-            // search continue past a wrong-class entry instead of stopping on it. The accepted set is
-            // unchanged (`image_resource_class_satisfies` is exactly the old post-check), so this can
-            // only turn a rejection into a resolution, never bind a class the op cannot use. #3126/#1634.
+            // search continue past a wrong-class entry instead of stopping on it.
+            //
+            // The ACCEPTED SET is unchanged -- `image_resource_class_satisfies` is exactly the old
+            // post-check, verified by enumerating all 256x5 (opcode, class) pairs: 258 accepted, zero
+            // disagreements, with a deliberately mis-mapped 0x0e control showing the comparison can
+            // detect one. So this can never bind a class the op cannot use.
+            //
+            // What it CAN change, and the first version of this comment wrongly denied: ROUTE
+            // PRECEDENCE. Where the first entry at a `fetch_pc` is buffer-class and a later one at
+            // the same pc is image-class, the old code took the buffer hit, failed the class test and
+            // fell through to the SRT/SGPR routes; this one lets the pc route win. That is the
+            // intended contract -- exact per-use provenance outranks a table key, because a sample
+            // and a store may share one key while needing different Vulkan classes -- but it means
+            // the outcome can be a DIFFERENT, still class-valid resource, not only a rejection turned
+            // into a resolution.
+            //
+            // NO REACHABLE INSTANCE IS KNOWN, and the first version of this comment claimed one that
+            // cannot exist: "reachability needs the BVH piggyback to land on a texture-publishing pc".
+            // It cannot -- that piggyback keys a ConstantBuffer by an IMAGE_BVH_INTERSECT_RAY pc, and
+            // opcode 0xe6 returns from its own block above, before this lookup ever runs. The sentence
+            // arrived verbatim from a review comment, carrying a file:line, and was promoted into
+            // shipped code without anyone opening the cited path -- the #2049 -> #2052 shape CLAUDE.md
+            // records, repeated. State the precedence change, which is real and provable from the
+            // diff; do not attach a reachability story to it that has not been traced. #3126/#1634.
             const ShaderResource* res = rt->image_by_fetch_pc(in.pc, image_requirement);
             if (!res) {
                 uint32_t srt_tag = 0;
@@ -7123,6 +7144,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // had a resource sitting at the requested SGPR the whole time -- of the wrong
                     // class, discarded in silence. Print the class-BLIND hit so "nothing is here"
                     // and "something is here and it is a cbuf" stop looking identical. #3126/#1634.
+                    //
+                    // ...and say whether that route was CONSULTED, which is the same trap inverted
+                    // (trap 254). The SGPR route is guarded by `!sreg_range_written` above, so on a
+                    // `written=1` site it never runs -- and printing a bare `sgpr_res=tex` there
+                    // tells the reader a Texture was found at the requested SGPR and rejected, when
+                    // in fact nothing consulted it and the descriptor is not the entry user data at
+                    // all. That is live on this title: `0x30131d0000` pc=77 is `written=1`. Print the
+                    // status and the contents, never the contents alone.
+                    const bool srsrc_written = sreg_range_written(rs, in.src[1].value, 8);
                     const ShaderResource* ps_direct = rt->by_sgpr_base(in.src[1].value);
                     auto cls_name = [](const ShaderResource* r) {
                         if (!r) return "null";
@@ -7139,6 +7169,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         image_requirement == ImageResourceRequirement::StorageOnly ? "storage"
                       : image_requirement == ImageResourceRequirement::SampledOnly ? "sampled"
                                                                                    : "either";
+                    // `not-consulted(<cls>)` keeps BOTH facts on the line: that the route did not
+                    // run, and what happens to sit at that SGPR anyway. Dropping the second half
+                    // would trade one misreading for a different one.
+                    const std::string sgpr_res =
+                        srsrc_written ? std::string("not-consulted(") + cls_name(ps_direct) + ")"
+                                      : std::string(cls_name(ps_direct));
                     fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u op=0x%02x storage=%d need=%s srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s sgpr_res=%s written=%d (%zu res)\n",
                             (unsigned long long)b.diagnostic.program_address,
                             in.pc, in.opcode, (int)storage_only_op, need,
@@ -7146,8 +7182,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             has_srt_tag ? srt_tag : 0u,
                             cls_name(pk), cls_name(pp),
                             has_ud_alias ? "s" : "NONE ", has_ud_alias ? ud_origin : 0,
-                            cls_name(pa), cls_name(ps_direct),
-                            sreg_range_written(rs, in.src[1].value, 8) ? 1 : 0,
+                            cls_name(pa), sgpr_res.c_str(),
+                            srsrc_written ? 1 : 0,
                             rt->resources.size());
                     // #3126: say what WAS available, not only what failed. "key_res=null pc_res=null"
                     // tells you the lookups missed; it does not tell you whether the table holds the

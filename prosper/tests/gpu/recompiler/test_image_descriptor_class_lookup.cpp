@@ -39,7 +39,18 @@ constexpr uint32_t mimg_word1(uint32_t vaddr, uint32_t vdata, uint32_t srsrc, ui
 // the exact IMAGE_LOAD word The Oregon Trail's rejected pixel shader submits at pc=34 (#1634).
 constexpr uint32_t kImageSampleDmask15 = 0xF0800F08u;   // op 0x20, DMASK=0xf -> needs a Texture
 constexpr uint32_t kImageLoadDmask1    = 0xF0000108u;   // op 0x00, DMASK=0x1 -> Texture OR StorageImage
+constexpr uint32_t kImageStoreDmask1   = 0xF0200108u;   // op 0x08, DMASK=0x1 -> needs a StorageImage
 constexpr uint32_t kEndpgm             = 0xBF810000u;
+
+// MIMG word0 field check, so the three constants above are not three independent guesses. The decoder
+// builds the opcode from EIGHT bits, `((w & 1) << 7) | ((w >> 18) & 0x7F)` (`rdna2_decode.cpp`), so
+// reconstruct it the same way: masking only the low seven would leave bit 7 unchecked and a constant
+// with word0 bit 0 set would decode as opcode+0x80 while still passing. All three are words the guest
+// itself submits -- copied from Stray's and The Oregon Trail's rejects, not synthesized.
+constexpr uint32_t mimg_opcode(uint32_t word0) { return ((word0 & 1u) << 7) | ((word0 >> 18) & 0x7Fu); }
+static_assert(mimg_opcode(kImageLoadDmask1)    == 0x00u, "IMAGE_LOAD word0 encodes op 0x00");
+static_assert(mimg_opcode(kImageStoreDmask1)   == 0x08u, "IMAGE_STORE word0 encodes op 0x08");
+static_assert(mimg_opcode(kImageSampleDmask15) == 0x20u, "IMAGE_SAMPLE word0 encodes op 0x20");
 
 ShaderResource make_texture(uint32_t sgpr_base) {
     ShaderResource texture{};
@@ -170,6 +181,75 @@ int main() {
               "IMAGE_LOAD's Either requirement reaches a StorageImage behind a buffer");
         CHECK(recompiles(load_s8, rt),
               "image_load resolves a StorageImage that shares sgpr_base 8 with a ConstantBuffer");
+    }
+
+    // --- The requirement MAPPING, driven end to end, not just asserted --------------------------
+    // Every arm above drives op 0x20 or op 0x00. That leaves the opcode -> requirement mapping in the
+    // resolver untested through the resolver itself: verified by reading, which is exactly the
+    // evidence class this project treats as weakest. A storage-only op is the case that matters most,
+    // because it is the one where a mapping error binds a WRONG resource rather than failing to bind
+    // one -- an image_store lowered against a sampled Texture is a write to a descriptor that cannot
+    // accept it.
+    const std::vector<uint32_t> store_s8 = {
+        kImageStoreDmask1, mimg_word1(0, /*vdata=*/1, /*srsrc=*/8, /*ssamp=*/0), kEndpgm,
+    };
+    {
+        ShaderResourceTable rt;
+        rt.resources.push_back(make_storage_image(8));
+        CHECK(recompiles(store_s8, rt),
+              "image_store resolves a StorageImage at its SRSRC (control for the arms below)");
+    }
+    {
+        // Same op, same SGPR, only the resource CLASS differs.
+        //
+        // This arm does NOT isolate the requirement mapping, and saying so is the point: collapsing
+        // `image_requirement` to `Either` leaves it green, because the emitter dispatches on class a
+        // SECOND time further down (`if (res->cls == ResourceClass::StorageImage)`), and an
+        // image_store bound to a Texture falls out of that branch anyway. It is a defence-in-depth
+        // arm -- it pins that SOME layer refuses the pairing -- and it was measured to be
+        // mapping-insensitive rather than assumed to be sensitive. The arm below is the one with
+        // teeth.
+        ShaderResourceTable rt;
+        rt.resources.push_back(make_texture(8));
+        CHECK(!recompiles(store_s8, rt),
+              "image_store REFUSES a Texture at its SRSRC (some layer; see the mapping arms below)");
+    }
+    {
+        // MAPPING-SENSITIVE, and built so that only the requirement can decide it. Both classes sit
+        // at sgpr_base 8 with the Texture FIRST, so a first-match-wins lookup returns the Texture.
+        // Under the correct StorageOnly mapping the search skips it and binds the StorageImage, and
+        // the stage compiles; under any mapping that admits a Texture the lookup stops on it, the
+        // storage branch is not taken, and the stage fails. Verified by mutation: collapsing
+        // `image_requirement` to `Either` reddens exactly this arm and its sampled twin.
+        ShaderResourceTable rt;
+        rt.resources.push_back(make_texture(8));
+        rt.resources.push_back(make_storage_image(8));
+        CHECK(recompiles(store_s8, rt),
+              "image_store binds the StorageImage past a Texture at the same SGPR (StorageOnly mapping)");
+    }
+    {
+        // The sampled twin, with the classes the other way round.
+        ShaderResourceTable rt;
+        rt.resources.push_back(make_storage_image(8));
+        rt.resources.push_back(make_texture(8));
+        CHECK(recompiles(sample_s8, rt),
+              "image_sample binds the Texture past a StorageImage at the same SGPR (SampledOnly mapping)");
+    }
+    {
+        // ...and the collision form of the same thing: the StorageImage is reachable behind a buffer.
+        ShaderResourceTable rt;
+        rt.resources.push_back(make_shadowing_buffer(8));
+        rt.resources.push_back(make_storage_image(8));
+        CHECK(recompiles(store_s8, rt),
+              "image_store reaches a StorageImage behind a ConstantBuffer at sgpr_base 8");
+    }
+    {
+        // Either, the third arm of the mapping: IMAGE_LOAD must accept a Texture as well as the
+        // StorageImage the arm further up already covers.
+        ShaderResourceTable rt;
+        rt.resources.push_back(make_texture(8));
+        CHECK(recompiles(load_s8, rt),
+              "image_load accepts a Texture too (Either, the other half of the mapping)");
     }
 
     // --- The same collision on the other two provenance routes --------------------------------
