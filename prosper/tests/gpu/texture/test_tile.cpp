@@ -1300,23 +1300,36 @@ int main() {
                         uint8_t v = (uint8_t)((i * 31u + 5u) ^ (i >> 7));
                         src[i] = (v == 0xDB) ? 0x00 : v;
                     }
-                    std::vector<uint8_t> dst(dst_bytes, 0xDB);   // poison
-                    detile_surface(dst.data(), src.data(), W, H, M, 0, bpe);
                     const bool claims_full = detile_writes_whole_destination(M, bpe);
                     (claims_full ? any_true : any_false) = true;
                     if (!claims_full) continue;
-                    size_t survivors = 0;
-                    for (size_t i = 0; i < dst_bytes; i++) survivors += (dst[i] == 0xDB);
-                    if (survivors) {
-                        printf("  [FAIL] detile_surface left %zu poison bytes for mode=%u bpe=%u "
-                               "%ux%u while claiming whole-destination coverage\n",
-                               survivors, M, bpe, W, H);
-                        fails++;
+                    // BOTH entry points, because the predicate in tile.hpp answers for both and the
+                    // materializer uses both -- the BC branch of live_renderer.cpp calls
+                    // `detile_elements`, every other converted branch calls `detile_surface`. They
+                    // route to the same three copiers today, so testing one appeared to cover the
+                    // other; a fast path added to either would falsify the predicate for the call
+                    // sites that use it with nothing turning red.
+                    for (int entry = 0; entry < 2; entry++) {
+                        std::vector<uint8_t> dst(dst_bytes, 0xDB);   // poison
+                        const char* who = entry ? "detile_elements" : "detile_surface";
+                        if (entry)
+                            detile_elements(dst.data(), src.data(), tb, W, H, bpe, M);
+                        else
+                            detile_surface(dst.data(), src.data(), W, H, M, 0, bpe);
+                        size_t survivors = 0;
+                        for (size_t i = 0; i < dst_bytes; i++) survivors += (dst[i] == 0xDB);
+                        if (survivors) {
+                            printf("  [FAIL] %s left %zu poison bytes for mode=%u bpe=%u "
+                                   "%ux%u while claiming whole-destination coverage\n",
+                                   who, survivors, M, bpe, W, H);
+                            fails++;
+                        }
                     }
                 }
             }
         }
-        CHECK(any_true, "coverage predicate accepts the shapes the materializer actually uses");
+        CHECK(any_true, "coverage predicate accepts the shapes the materializer actually uses "
+                        "(swept through detile_surface AND detile_elements)");
         // Mutation arm by construction, not by exit code alone: the predicate must be able to say
         // NO, or "claims_full" above is vacuous and the poison sweep tested nothing.
         CHECK(!detile_writes_whole_destination((uint32_t)TileMode::Sw64KbRX, 6u),

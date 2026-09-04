@@ -10884,10 +10884,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // The decode INTERMEDIATE pool is retained memory too, and a census that omits
                     // it under-reports the frontend's footprint by exactly the amount this change
                     // stopped churning -- which is the number a reader would want to see.
+                    //
+                    // It is THIS THREAD's pool, and the label says so. The pool is thread_local, so
+                    // a process running N decoding threads retains up to N times this; printing a
+                    // per-thread figure under a heading that reads as a process total is the kind
+                    // of number that gets quoted as the whole footprint.
                     const auto& intermediates = prosper::frontend::decode_scratch_pool();
                     fprintf(stderr,
                             "[render-timing] host_cache rtt=%zu %.1f MiB decode_scratch=%zu %.1f MiB "
-                            "intermediates=%zu %.1f MiB validation=%.1f MiB\n",
+                            "intermediates(this thread)=%zu %.1f MiB validation=%.1f MiB\n",
                             g_rtt.size(), rtt_bytes / (1024.0 * 1024.0),
                             texstore.size(), scratch_bytes / (1024.0 * 1024.0),
                             intermediates.retained_buffers(),

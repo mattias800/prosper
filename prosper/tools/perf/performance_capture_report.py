@@ -140,6 +140,13 @@ def _resource_breakdown(renderer):
         breakdown["tex_persist_invalid"] = (
             _total(renderer, "frontend_tex_persist_invalid_ms")
             if breakdown["tex_invalid_available"] else 0.0)
+        # The COUNT of references nothing claimed, paired with the signed millisecond residual
+        # below. `performance_capture.hpp` says these two disagree only if the classification is
+        # wrong -- which is a cross-check nobody could run while the report printed one of them.
+        breakdown["tex_other_n_available"] = all("frontend_tex_other_n" in r for r in renderer)
+        breakdown["tex_other_n"] = (
+            sum(r.get("frontend_tex_other_n", 0) for r in renderer)
+            if breakdown["tex_other_n_available"] else None)
         breakdown["tex_other"] = breakdown["frontend_texture"] - sum(
             breakdown["tex_" + key] for key in
             ("rtt", "compute", "local", "persist_hit", "persist_reuse", "persist_miss",
@@ -586,7 +593,17 @@ def print_summary(summary):
                   f" persist_reuse={breakdown['tex_persist_reuse']:.1f}"
                   f" persist_miss={breakdown['tex_persist_miss']:.1f}"
                   f" {invalid}"
-                  f" other={breakdown['tex_other']:+.1f}")
+                  f" other={breakdown['tex_other']:+.1f}"
+                  + ("" if breakdown["tex_other_n"] is None
+                     else f"/{breakdown['tex_other_n']}refs"))
+            # Loud, and only when the two residuals disagree. A signed millisecond remainder with
+            # NO unclassified references means the classification is losing time a named class
+            # should hold -- a defect in this instrument, not in the renderer, and the breakdown
+            # above is not trustworthy while it holds.
+            if (breakdown["tex_other_n"] == 0 and abs(breakdown["tex_other"]) > 1.0):
+                print(f"    *** {breakdown['tex_other']:+.1f}ms is unattributed with ZERO "
+                      "unclassified references — the texture classification is losing time, "
+                      "which is an instrument defect rather than a renderer one")
             witness = breakdown.get("tex_other_witness")
             if witness:
                 # The identity of the slowest unclassified reference. Without it `other` is a number
