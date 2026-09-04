@@ -28,6 +28,18 @@ unusable, because it only starts a capture on a *keypress* and every agent here 
 prosper now drives its in-application API itself, so a capture aims at a frame ordinal like F8 and F9
 do. The first working one held zero draws: prosper runs two Vulkan devices, and asked to pick,
 RenderDoc took the one that only presents. Details in [#3321](https://github.com/mattias800/prosper/issues/3321).
+### The compute half of that same round trip was doing it too
+
+No picture. #3309 pooled the *graphics* side's 63 MiB scratch buffers; the compute side was still
+allocating one per dispatch, for the same surfaces, at the same size — the linear buffer a tiled
+storage image is detiled into before the GPU is seeded with it. Measured here: 14.4 ms to allocate
+and fill 64 MiB against 3.1 ms into a buffer that is already mapped.
+Two of Stray's named costs also turned out not to be what their names said. The CPU re-tile that is
+61% of compute-image writeback is already running faster than one core can `memcpy` the same bytes,
+so it can only be reduced by re-tiling fewer surfaces, never by re-tiling faster. And the 31%
+attributed to "write-watch registration" is not the page-index walk at all — that costs 0.05 ms per
+64 MiB — it is one `mprotect` over the whole surface, at 0.39 ms.
+[#3307](https://github.com/mattias800/prosper/issues/3307)
 
 ### Two thirds of Stray's biggest render cost was the allocator, not the work
 

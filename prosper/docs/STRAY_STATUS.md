@@ -197,6 +197,43 @@ those used to be the same bare `return false`.
 for a same-address entry that names the key field it disagreed on. **Read that before proposing a
 fix here**; the branch it reports selects between fixes that have nothing to do with one another.
 
+### The compute side of the same round trip (2026-09-04, `df1bbae32`)
+
+#3309 found that two thirds of the *graphics* materializer's cost was the allocator rather than the
+decode. **The compute half was still doing it**, at the same sizes and on the same surfaces.
+`live_compute.cpp` gave every dispatch a fresh `make_unique_for_overwrite<uint8_t[]>` for its
+full-surface intermediates — the linear buffer a tiled storage image is detiled into before it is
+seeded, and the one a non-exact writeback is packed through. Stray's dominant storage geometry is
+3840×2160 at 8 bytes per texel, so that is **63.3 MiB per allocation**, past glibc's 32 MiB mmap
+threshold and therefore an `mmap`, 16,384 page faults as the detile touches it, and a `munmap`.
+
+Measured on this machine, allocate-and-fill against fill-into-a-retained-buffer:
+
+| extent | fresh alloc + fill | reused + fill | penalty |
+| --- | --- | --- | --- |
+| 4 MiB | 0.107 ms | 0.077 ms | 0.031 ms |
+| 16 MiB | 0.644 ms | 0.459 ms | 0.185 ms |
+| **33 MiB** | **7.371 ms** | **1.413 ms** | **5.958 ms** |
+| **64 MiB** | **14.396 ms** | **3.117 ms** | **11.279 ms** |
+
+The cliff between 16 and 33 MiB is glibc's dynamic `M_MMAP_THRESHOLD`, whose cap is 32 MiB: below it
+the heap recycles the block, above it every allocation is a fresh mapping.
+
+**This lands in `setup`, not in writeback**, which is why #3307's stage table does not show it: the
+seed detile runs in the image-setup loop. On the dominant geometry the storage-gate census reports
+`seed_skip=2469` of `evaluated=4879`, so roughly **half** of those bindings seed — and each seed is
+one of these allocations. The fix is #3309's, reused: `DecodeScratchPool` from
+`frontends/shared/live/decode_scratch.hpp`.
+
+### What `layout_ms` and `watch_ms` actually are
+
+Both of #3307's two named stages were re-measured against standalone micro-benchmarks of the exact
+code they run, and **neither is what its name suggests**; see `## Ruled out`. The short form:
+`layout_ms` is the CPU re-tile running at memory-bandwidth speed, so it can only be reduced by
+re-tiling **fewer** surfaces; `watch_ms` is an `mprotect` over the whole surface, not the page-index
+walk, so its lever is whether a page-protection watch over a surface prosper itself overwrites every
+dispatch should exist at all.
+
 ## The unresolved image ops — established on CALIBRATION
 
 > **The five-op census below was read on the calibration screen**, like every other live census above
@@ -818,6 +855,30 @@ drops still discard the background.
   the admission gate would report "no change" for a reason unrelated to the change if the miss is
   really the export-authority or the write-proof branch. The instrument that decides it is
   `PROSPER_COMPUTE_BORROW_CENSUS=1`. #3307.
+- **"`layout_ms` — 61% of compute-image writeback — can be cut by making the CPU re-tile faster."**
+  Falsified by micro-benchmark on this machine, 2026-09-04. At Stray's dominant geometry
+  (3840×2160, 8 bytes per texel, tile mode 27 = `SW_64KB_R_X`) `tile_surface` runs at **1.83 ms best
+  / 2.21 ms mean**, while a single-threaded `memcpy` of the same 63.3 MiB is **2.75 ms** — i.e. the
+  re-tile already moves 127 MiB of traffic (63.3 read + 63.8 written) faster than one core copies
+  63. It is already threaded over block rows (7.77 ms at one thread, 1.69 ms at eight, so the
+  parallelism is real and thread spawn is not the cost), and its bpe=8 AVX2 inner loop already
+  stores the **longest contiguous run the swizzle permits**: in the 16-pipe R_X pattern for 8-byte
+  elements, consecutive `x` differ only in address bit 3, so two texels are adjacent and `x+2` jumps
+  to bit 5 — 16 bytes is the maximum, and the code stores 16. **`layout_ms` can only be reduced by
+  re-tiling fewer surfaces, never by re-tiling faster.** #3307.
+- **"`watch_ms` — 31% of compute-image writeback — is per-writeback write-watch *registration*, i.e.
+  the per-page index walk."** Falsified, 2026-09-04. The span `prepare_done → watch_done` contains
+  only the (rare) poison-coverage scan and one `guest_write_watch_notify_host_write`, and that
+  function's page loop — one `pages_by_addr.find` per 4 KiB, plus the hit vector and the generation
+  bumps — was modelled exactly and costs **0.05 ms per 64 MiB when every page in the range is
+  watched** and 0.0035 ms when none is. What costs what `watch_ms` reports is the `mprotect` that
+  `set_pages_armed` issues when pages **are** armed: measured **0.39 ms per 64 MiB idle and 0.63 ms
+  with twelve busy threads**, against a measured `watch_ms` mean of 0.33 ms over 4,291 records. So
+  the stage is the arm/disarm of a page-protection watch over the surface, and the lever is not the
+  loop but whether a watch over a surface prosper's own writeback dirties every dispatch should
+  exist. `PROSPER_RENDER_TIMING`'s `write_watch … host_write=…/… pages_hit=… mprotect=… calls/… MiB`
+  fields (added with this row) decide it in one run: `pages_hit=0` would mean the notifications are
+  walking the index and finding nothing, and the attribution is wrong again. #3307.
 
 - **"A recompile fix — resolving the unresolved image ops — restores the title-screen background."**
   **Falsified on the title screen, and this row exists because the measurement was recorded NOWHERE a

@@ -10907,7 +10907,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             "[render-timing] write_watch create=%llu ok=%llu pages=%llu no_map=%llu "
                             "alias=%llu oversized=%llu sizes=%llu/%llu/%llu/%llu protect=%llu "
                             "query=%llu unchanged=%llu dirty=%llu "
-                            "unknown=%llu faults=%llu stale=%llu physical=%llu rearms=%llu\n",
+                            "unknown=%llu faults=%llu stale=%llu physical=%llu rearms=%llu "
+                            "host_write=%llu/%llu no_alias pages_hit=%llu "
+                            "mprotect=%llu calls/%.1f MiB\n",
                             (unsigned long long)write_watch.create_attempts,
                             (unsigned long long)write_watch.registrations,
                             (unsigned long long)write_watch.registered_pages,
@@ -10926,7 +10928,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (unsigned long long)write_watch.faults,
                             (unsigned long long)write_watch.stale_faults,
                             (unsigned long long)write_watch.physical_writes,
-                            (unsigned long long)write_watch.rearms);
+                            (unsigned long long)write_watch.rearms,
+                            (unsigned long long)write_watch.host_write_notifies,
+                            (unsigned long long)write_watch.host_write_no_alias,
+                            (unsigned long long)write_watch.host_write_pages_hit,
+                            (unsigned long long)write_watch.protect_calls,
+                            write_watch.protect_bytes / (1024.0 * 1024.0));
                     const double wn = static_cast<double>(window.submits);
                     const double window_pass_control = window.pass_ms -
                         window.build_resources_ms - window.backend_ms;

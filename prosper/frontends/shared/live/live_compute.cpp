@@ -4,6 +4,7 @@
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
+#include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/live_target_format.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
@@ -7816,10 +7817,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!(bi.persistent && bi.upload_skipped)) {
                 const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
-                std::unique_ptr<uint8_t[]> linear;
+                // Pooled, not freshly allocated: a 4K RGBA16F seed is 63.3 MiB, which is past
+                // glibc's 32 MiB mmap threshold, so a per-dispatch allocation is an mmap, a page
+                // fault per 4 KiB as the detile touches it, and a munmap on the way out. Measured
+                // on this machine at 64 MiB: 14.4 ms fresh-allocate-and-fill against 3.1 ms into a
+                // retained buffer. Stray seeds this every dispatch for the bindings the coverage
+                // proof classified PARTIAL. Same reasoning and the same pool as #3309's texture
+                // materializer; see decode_scratch.hpp for the zero contract.
+                prosper::frontend::ScratchBuffer linear;
                 if (linear_size && !renderer_owned &&
-                    (r->tile_mode || (dim_2d_array && r->depth > 1)))
-                    linear = std::make_unique_for_overwrite<uint8_t[]>(linear_size);
+                    (r->tile_mode || (dim_2d_array && r->depth > 1))) {
+                    // Two ways the branch chain below can leave part of `linear_size` unwritten,
+                    // and both must take the zero because a fresh mapping used to supply it. First,
+                    // a 64 KiB detile whose element size the pattern tables do not cover falls back
+                    // to a bounded memcpy that can stop short. Second, `linear_size` is
+                    // `volume_texels`, which counts SIX slices for a stacked-cube shape while the
+                    // only branch that shape reaches fills one.
+                    const bool one_branch_fills_the_extent =
+                        dim_3d || dim_2d_array || sampled_layers == 1u;
+                    linear.reset(linear_size,
+                                 !one_branch_fills_the_extent ||
+                                 !prosper::gpu::detile_writes_whole_destination(
+                                     r->tile_mode, static_cast<uint32_t>(guest_texel)));
+                }
                 const uint8_t* unpack_source = nullptr;
                 if (bi.seed_skip) {
                     // #1122: write-only full-coverage target -- the shader overwrites every texel, so
@@ -8234,7 +8254,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
                         const size_t linear_slice = static_cast<size_t>(bw) * bh * bpb;
                         const uint32_t layers = sampled_layers;
-                        std::unique_ptr<uint8_t[]> linear;
+                        prosper::frontend::ScratchBuffer linear;
                         const bool layered = layers > 1;
                         const size_t selected_slice = r->in_mip_tail
                             ? r->mip_tail_bytes
@@ -8251,7 +8271,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             (layered && layer_stride != linear_slice);
                         const uint8_t* decode_source = src;
                         if (remap) {
-                            linear = std::make_unique_for_overwrite<uint8_t[]>(linear_slice * layers);
+                            linear.reset(linear_slice * layers,
+                                         !prosper::gpu::detile_writes_whole_destination(
+                                             r->tile_mode, bpb));
                             decode_source = linear.get();
                         }
                         if (remap) {
@@ -8288,13 +8310,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     } else if (needs_sampled_upload) {
                         const uint32_t bpt = (r11g11b10 || unorm2_10_10_10) ? 4u : cb * nc;
                         const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
-                        std::unique_ptr<uint8_t[]> linear;
+                        prosper::frontend::ScratchBuffer linear;
                         const uint8_t* sampled_source = src;
                         const bool remap = r->tile_mode ||
                             (cube_face_as_2d && r->layer_stride_bytes) ||
                             (dim_2d_array && r->depth > 1);
                         if (remap) {
-                            linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
+                            // This one always takes the zero: the branches below fill a
+                            // `sampled_layers`-slice prefix, which is not always the whole
+                            // `volume_texels` extent, and one of them (cube stacked, untiled) can be
+                            // reached without `remap` having selected any fill at all.
+                            linear.reset(linear_bytes, /*zero_fill=*/true);
                             sampled_source = linear.get();
                         }
                         if (cube_face_as_2d && r->layer_stride_bytes) {
@@ -10053,11 +10079,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool tile_mapped_bytes = storage_writeback_can_tile_mapped_bytes(
                 bi.exact_storage_bytes(), r->tile_mode, bi.poison_verify,
                 direct_tiled_writeback_disabled);
-            std::unique_ptr<uint8_t[]> linear;
+            // Pooled for the same reason as the seed above: this is a full-surface intermediate
+            // allocated per writeback. Every fill below covers the whole extent (the pack loops run
+            // over all `texels`), so no zero is needed.
+            prosper::frontend::ScratchBuffer linear;
             uint8_t* packed = destination;
             if ((r->tile_mode && !tile_mapped_bytes) ||
                 (!r->tile_mode && array_image && r->depth > 1)) {
-                linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
+                linear.reset(linear_bytes, /*zero_fill=*/false);
                 packed = linear.get();
             }
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);

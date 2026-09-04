@@ -60,6 +60,21 @@
 
 namespace prosper::frontend {
 
+// Fail-visible arm for this file's one real hazard. The allocations these leases replace were
+// either `std::vector<uint8_t>(n, 0)` (explicitly zero) or `make_unique_for_overwrite` (nominally
+// indeterminate) -- but past glibc's 32 MiB mmap threshold the second kind is FRESH KERNEL PAGES,
+// which read as zero. So a call site can depend on zeroing it never asked for, and a pooled buffer
+// holding the previous tenant would silently produce wrong pixels there.
+//
+// `PROSPER_DECODE_SCRATCH_POISON=1` fills every lease with 0xCD before handing it out, so such a
+// call site fails loudly instead. Off by default; it exists so "the pooled buffer is equivalent"
+// is a claim a test run can falsify rather than one the reader has to accept.
+inline bool decode_scratch_poison_enabled() {
+    static const bool on = std::getenv("PROSPER_DECODE_SCRATCH_POISON") != nullptr;
+    return on;
+}
+
+
 class DecodeScratchPool {
 public:
     // A borrowed buffer. Move-only; returns itself to the pool on destruction, so an early `break`
@@ -158,6 +173,7 @@ public:
         // clearing first would memset the whole extent.
         if (buffer.capacity() < bytes) buffer.clear();
         if (buffer.size() < bytes) buffer.resize(bytes);
+        if (decode_scratch_poison_enabled()) std::memset(buffer.data(), 0xCD, bytes);
         return Lease(this, std::move(buffer), bytes);
     }
 
@@ -195,12 +211,52 @@ inline size_t decode_scratch_budget_bytes(const char* text) {
     return static_cast<size_t>(mib * 1024ull * 1024ull);
 }
 
+// A pooled stand-in for a `std::unique_ptr<uint8_t[]>` full-surface intermediate, with the same
+// shape: default-constructed `get()` is null, and one `reset()` makes it a buffer of `bytes`. It
+// exists so the compute path's per-dispatch intermediates (`live_compute.cpp` seeds a storage image
+// by detiling the whole guest surface into one, and packs a writeback through another) can stop
+// mmap'ing and munmap'ing tens of MiB per dispatch without rewriting every `.get()` at the call
+// site.
+//
+// `zero_fill` is the contract switch and it is not optional thinking. `make_unique_for_overwrite`
+// leaves the bytes indeterminate, but for anything past glibc's 32 MiB mmap threshold those bytes
+// are FRESH KERNEL PAGES and therefore read as zero in practice. A pooled buffer holds the previous
+// tenant instead, so a call site whose fill does not provably cover the whole extent must ask for
+// the zero — `prosper::gpu::detile_writes_whole_destination` answers that for the detile fills.
+class ScratchBuffer {
+public:
+    ScratchBuffer() = default;
+    // Neither copyable nor movable: it exists to be a function-local intermediate, and a moved-from
+    // copy would keep a raw `data_` pointing into the lease that moved away.
+    ScratchBuffer(const ScratchBuffer&) = delete;
+    ScratchBuffer& operator=(const ScratchBuffer&) = delete;
+
+    // Lease `bytes` from this thread's pool. `zero_fill` restores the value-initialised contract for
+    // a caller that may leave part of the extent unwritten. A zero-byte request leases nothing and
+    // leaves `get()` null, so it cannot claim (and immediately return) a retained buffer.
+    void reset(size_t bytes, bool zero_fill);
+
+    uint8_t* get() const { return data_; }
+    explicit operator bool() const { return data_ != nullptr; }
+
+private:
+    DecodeScratchPool::Lease lease_;
+    uint8_t* data_ = nullptr;
+};
+
 // Per-thread pool. The decode paths run on the render thread(s) and never hand a lease to another
 // thread, so a thread-local pool needs no lock on the hottest allocation path in the frontend.
 inline DecodeScratchPool& decode_scratch_pool() {
     static const size_t budget = decode_scratch_budget_bytes(std::getenv("PROSPER_DECODE_SCRATCH_MB"));
     static thread_local DecodeScratchPool pool(budget);
     return pool;
+}
+
+inline void ScratchBuffer::reset(size_t bytes, bool zero_fill) {
+    if (!bytes) { lease_ = DecodeScratchPool::Lease(); data_ = nullptr; return; }
+    lease_ = decode_scratch_pool().take(bytes);
+    if (zero_fill) lease_.zero_all();
+    data_ = lease_.data();
 }
 
 }  // namespace prosper::frontend
