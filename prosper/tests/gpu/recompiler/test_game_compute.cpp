@@ -806,6 +806,15 @@ int main() {
                   "per-layer mask is exact below 64 layers");
             CHECK(!array_all_layers_written(4, part.written_layers, part.exact),
                   "partially written array is not promoted");
+
+            // The ONE input where `exact` decides the answer. Below 64 the comparison is against
+            // (1<<depth)-1, which ~0ULL fails anyway; above 64 the depth guard returns first. So
+            // depth==64 with no per-layer counts is the only case that can catch a future edit
+            // deleting the `!exact ||` guard -- and without this arm, deleting it passes everything.
+            const auto d64_nocounts = classify_array_layer_coverage(64, nullptr, 0,
+                                                                    /*survived=*/10, /*texels=*/1024);
+            CHECK(!array_all_layers_written(64, d64_nocounts.written_layers, d64_nocounts.exact),
+                  "a depth-64 sentinel mask must not promote an unmeasured surface to Full");
         }
     }
 
