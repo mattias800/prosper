@@ -161,6 +161,13 @@ so run-to-run variance here is not zero. `PROSPER_NO_TEXTURE_PREFIX_INHERIT` exi
 one arm. Until that arm is run, the 918.2 is known to under-report #3309 by an unquantified amount —
 which is a weaker and more useful statement than a number.
 
+The disarmed arm, to be pasted rather than typed — `PROSPER_DECODE_SCRATCH_MB` is a budget, so a
+malformed value keeps its 512 MiB default and leaves the pool **armed** while the run looks disarmed:
+
+```
+PROSPER_NO_DIRECT_TEXTURE_SOURCE=1 PROSPER_DECODE_SCRATCH_MB=0 PROSPER_NO_TEXTURE_PREFIX_INHERIT=1
+```
+
 **Compute rose 1981.5 → 2351.4 ms in the same window, and that is not a regression** — the window
 is fixed at 5.02 s, so a pipeline that renders 18% more frames also issues more dispatches into it.
 The bucket total is throughput, not cost. The discriminating pair is mean-ms-per-dispatch and
