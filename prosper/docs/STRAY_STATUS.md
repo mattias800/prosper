@@ -1458,18 +1458,38 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   | lowest render target | `0x30…` | `0x1e980000` (511 MB) |
   | highest render target | `0x30…` | `0x79f20000` (2.0 GB) |
 
-  80,511 target resolutions, **0 unresolved** — so the census saw the whole population rather than a
-  sample that happened to miss the alias. The scanout sits ~509 MB *below* every render target. They
-  are separate physical allocations and nothing is aliased.
+  80,511 target resolutions, **0 unresolved** — every VA the census was shown did resolve, so the
+  answers above are real rather than a resolver failing quietly. The scanout sits ~509 MB *below*
+  every render target: separate physical allocations, nothing aliased.
+
+  **What that number does NOT say is "the whole population".** The census reads
+  `color_target->persistent_id` — colour **slot 0 only**. `persistent_id1` and
+  `persistent_id_slots[2..7]` are separate guest VAs and are never censused, and 80,511 counts
+  invocations rather than distinct addresses. An alias hiding in an un-censused MRT slot is exactly
+  what the hypothesis predicts and exactly what this instrument cannot see, so the falsification is
+  **scoped to slot 0** — which is the slot the composite is built in, and enough to stop the
+  VA-keyed-match story, but not a proof about every surface the frame renders into.
 
   **What this leaves is narrower and better posed.** The guest composites into its own allocation and
   moves it to scanout by a route prosper does not model, so the open question is *which packet does
   that*, not how the present path matches addresses. Two further facts bound it: `select_present_source`
   returns `None` (`px_front=none px_vo=none px_last=none`, `fresh=0 retained=0`), and
-  `videoout_buffer_authored_locked` reports `authored=0` for the flipped buffer — its bytes are
-  unchanged since registration. That second one is the load-bearing constraint, because the digest test
-  reads guest memory directly: **a GPU copy landing in guest memory would flip `authored` on its own.**
-  So the copy is not happening, not landing there, or not being executed by prosper at all.
+  `videoout_buffer_authored_locked` reports `authored=0` for the flipped buffer.
+
+  **Read that second one carefully — it is weaker than it first looks, and an earlier draft of this
+  row overstated it.** The tempting reading is "the bytes are unchanged since registration, and since
+  the digest test reads guest memory directly, a GPU copy landing there would have flipped `authored`
+  by itself". The predicate has **four** ways to return false (`hle_graphics.cpp`), and one of them
+  breaks that inference: `!buffer_digest_valid[slot]`, i.e. **no baseline was ever seeded** — which is
+  what happens when the buffer was not readable at registration time, and the seeding path documents
+  the resulting state as *deliberately indistinguishable from "not written"*. With no baseline, a copy
+  of any size leaves `authored` at 0.
+
+  So the honest disjunction has a fourth branch: the copy is **not happening**, **not landing there**,
+  **not executed by prosper at all**, or **it happened and prosper cannot tell**. Separating the last
+  one from the first three is cheap — check `buffer_digest_valid` for the slot — and should be the
+  first step for whoever picks this up, because three of the four branches are a missing packet and
+  the fourth is a blind instrument.
 
   **Two cautions for whoever picks this up.** Stray registers **two** scanout buffers,
   `0x9fc0000000` and `0x9fc2000000` — a rotating set, which is the shape behind *Bendy and the Ink

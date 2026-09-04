@@ -536,6 +536,14 @@ void guest_dmem_write_trace_unlock_state_for_test() {}
 
 void guest_write_watch_set_fault_onstack(bool) {}   // Windows never arms page-protection watches
 
+// #2932 VA->phys probe. Stubbed on the same grounds as everything above it: the alias table is
+// populated only while page-protection watches are armed, and Windows' create() always refuses, so
+// there is never anything here to search. Returning false with a count of 0 is the honest answer --
+// and it is why the count is part of the contract, so a caller cannot read this platform's
+// structural "nothing to search" as a measured "no alias covers that VA".
+bool guest_write_watch_va_to_phys(uint64_t, uint64_t&) { return false; }
+size_t guest_write_watch_alias_count() { return 0; }
+
 } // namespace prosper::host
 
 #else   // ---- Linux / macOS: real page-protection dirty-tracking (mprotect + SIGSEGV) --------------
@@ -1137,10 +1145,10 @@ bool trace_va_to_phys_locked(const DmemTraceState& trace, uint64_t addr, uint64_
 
 } // namespace
 
-// Diagnostic resolution of a guest VA to its physical address (#2932). Reuses the trace's own alias
-// table rather than adding a second notion of "which VAs map this page": a duplicated resolver that
-// could disagree with the write-watch would be worse than none, because two subsystems would then
-// answer the same question differently.
+// Diagnostic resolution of a guest VA to its physical address (#2932). Resolves over the LIVE
+// DIRECT-MAPPING ALIAS TABLE rather than adding a second notion of "which VAs map this page": a
+// duplicated resolver that could disagree with the write-watch would be worse than none, because
+// two subsystems would then answer the same question differently.
 bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys) {
     if (!addr) return false;
     WatchState& w = state();
@@ -1157,6 +1165,17 @@ bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys) {
         return true;
     }
     return false;
+}
+
+// The searched domain, so a `false` above can be told apart from an unarmed instrument. `w.aliases`
+// is populated only while fault_onstack is set -- guest_write_watch_notify_direct_mapping_added
+// returns early otherwise -- so a run that never armed watches reports 0 here and every VA resolves
+// as a miss. That is exactly the shape of the trap this probe's first revision fell into against
+// `trace.pages`, one level up, so the count is published rather than left for the caller to assume.
+size_t guest_write_watch_alias_count() {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    return w.aliases.size();
 }
 
 GuestWriteWatch::~GuestWriteWatch() { reset(); }

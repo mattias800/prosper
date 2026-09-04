@@ -9960,18 +9960,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // and the fix reuses resolution prosper already performs. Printed beside the
                         // decision so the answer arrives with the failure rather than in a separate
                         // run whose guest state may differ.
-                        if (prosper::diag_should_print(ord)) {
+                        //
+                        // `aliases=N` is part of the reading, not decoration: the table is populated
+                        // only while page-protection watches are armed, so N=0 means "nothing was
+                        // searched" and says NOTHING about this VA. Reporting the miss without the
+                        // domain is how an unarmed instrument gets recorded as a negative result.
+                        if (read.metadata.address && prosper::diag_should_print(ord)) {
                             uint64_t flip_phys = 0;
                             const bool ok = prosper::host::guest_write_watch_va_to_phys(
                                 read.metadata.address, flip_phys);
-                            fprintf(stderr,
-                                    "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> %s\n",
-                                    (unsigned long long)ord,
-                                    (unsigned long long)read.metadata.address,
-                                    ok ? "" : "UNRESOLVED (no direct mapping covers this VA)");
+                            const size_t alias_n = prosper::host::guest_write_watch_alias_count();
                             if (ok)
-                                fprintf(stderr, "[rtt]   flip phys=0x%llx\n",
-                                        (unsigned long long)flip_phys);
+                                fprintf(stderr,
+                                        "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> phys=0x%llx "
+                                        "(aliases=%zu)\n",
+                                        (unsigned long long)ord,
+                                        (unsigned long long)read.metadata.address,
+                                        (unsigned long long)flip_phys, alias_n);
+                            else
+                                fprintf(stderr,
+                                        "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> UNRESOLVED "
+                                        "(aliases=%zu; %s)\n",
+                                        (unsigned long long)ord,
+                                        (unsigned long long)read.metadata.address, alias_n,
+                                        alias_n ? "no alias range covers this VA"
+                                                : "alias table EMPTY -- nothing was searched");
                         }
                     }
                     // Re-check the size on the cached path too: a two-set geometry switch can change

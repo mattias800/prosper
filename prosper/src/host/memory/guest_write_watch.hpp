@@ -213,22 +213,33 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
 void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t size);
 void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t size,
                                                         uint32_t protection);
-// PROSPER_SCANOUT_PHYS (#2932): resolve a guest VA to its physical address through the dmem trace.
+void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size);
+void guest_write_watch_invalidate_all();
+
+// PROSPER_TARGET_PHYS (#2932): resolve a guest VA to its physical address through the DIRECT-MAPPING
+// ALIAS TABLE -- the ranges recorded by guest_write_watch_notify_direct_mapping_added above, not the
+// dmem write-trace, which is a narrower thing armed for one investigation at a time.
 //
 // The present path matches a flipped scanout buffer against render targets by VIRTUAL address only
 // (`is_live_render_target`), and `hle_graphics.cpp`'s scanout registry has no aliasing concept at
 // all. Stray renders into 0x30... and flips 0x9fc0000000 -- ~450 GiB apart -- so no VA-keyed lookup
-// can connect them, and BOTH publish paths fail: no pass "targets" the flip, and the scanout bytes
-// are unchanged since registration so the guest-authored fallback declines too.
+// can connect them, and neither publish path produces a picture. If those were two mappings of one
+// set of physical pages, that would follow with no further defect. This exposes the resolution the
+// write-watch already performs -- it models exactly this aliasing in `WatchedPage { phys; aliases; }`
+// -- so the hypothesis can be TESTED before anything is built on it.
 //
-// If those are two mappings of one set of physical pages, every one of those observations follows
-// with no further defect. This exposes the resolution the write-watch already performs -- it models
-// exactly this aliasing in `WatchedPage { phys; aliases; }` -- so the hypothesis can be TESTED
-// before anything is built on it. Diagnostic only; no production path calls it.
+// Diagnostic only; no production path calls it. Two limits a caller MUST respect:
+//   * It returns the FIRST range containing `addr` and does NOT check that the range extends far
+//     enough for the intended access. Fine for a probe; a production caller needs the size check.
+//   * `false` means "no alias covers this VA" OR "the alias table holds nothing to search", which
+//     are very different facts. Always report guest_write_watch_alias_count() beside a false, or the
+//     reader will take an unarmed instrument for a negative result.
 bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys);
 
-void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size);
-void guest_write_watch_invalidate_all();
+// How many direct-mapping alias ranges are currently known -- the SEARCHED DOMAIN of the resolver
+// above, so a caller can tell an empty table from a genuine miss. Zero on Windows (page-protection
+// watches never arm there) and on any run that never reached guest_write_watch_set_fault_onstack.
+size_t guest_write_watch_alias_count();
 
 // Called by the HLE, by guest VA range, immediately BEFORE a host/kernel store into guest memory (e.g. a
 // read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages

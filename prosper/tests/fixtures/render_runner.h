@@ -5441,14 +5441,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // target's physical range covers that page, the two are aliases of one allocation and the
         // VA-keyed match is the whole defect; if none does, the guest copies between distinct
         // allocations and the question moves to which packet performs it.
+        //
+        // SCOPE, and it is a real limit on what the census can conclude: this prints colour SLOT 0
+        // only. `persistent_id1` and `persistent_id_slots[2..7]` are separate guest VAs that are
+        // never censused here, so "no target aliases the scanout page" is a statement about slot 0
+        // and not about every surface the frame renders into.
         static const bool target_phys_census = std::getenv("PROSPER_TARGET_PHYS") != nullptr;
         if (target_phys_census && color_target->persistent_id) {
             uint64_t tphys = 0;
             const bool ok = prosper::host::guest_write_watch_va_to_phys(
                 color_target->persistent_id, tphys);
-            std::fprintf(stderr, "[target-phys] va=0x%llx %ux%u -> %s0x%llx\n",
-                         (unsigned long long)color_target->persistent_id, W, H,
-                         ok ? "phys=" : "UNRESOLVED ", (unsigned long long)tphys);
+            if (ok)
+                std::fprintf(stderr, "[target-phys] slot0 va=0x%llx %ux%u -> phys=0x%llx\n",
+                             (unsigned long long)color_target->persistent_id, W, H,
+                             (unsigned long long)tphys);
+            else
+                std::fprintf(stderr, "[target-phys] slot0 va=0x%llx %ux%u -> UNRESOLVED "
+                                     "(aliases=%zu)\n",
+                             (unsigned long long)color_target->persistent_id, W, H,
+                             prosper::host::guest_write_watch_alias_count());
         }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
