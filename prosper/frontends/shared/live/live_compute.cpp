@@ -3371,6 +3371,8 @@ struct BoundImage {
     bool compute_transfer_seed_borrowed = false;
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
+    bool near_full_coverage = false;    // >= 99.8% written post-processing target (cutouts like minimap)
+    uint64_t written_layers_mask = ~0ULL; // bitmask of touched array layers (depth <= 64)
     bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
     bool write_skip = false;            // untouched storage image: unwritten and unread; skip staging, readback, and writeback
     size_t seed_from_imported = SIZE_MAX; // renderer image copied on-device into this partial-write target
@@ -5535,7 +5537,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // window from unbounded to <= interval fast-skips. A genuinely data-independent writer (the
     // exercised full-screen composites or untouched bindings) re-proves each time -- no rendered-output change, ~1
     // extra poison frame per interval. skips counts fast-skips taken since the last (re-)proof.
-    struct SeedVerdict { SeedCoverage cov = SeedCoverage::Partial; uint32_t skips = 0; };
+    struct SeedVerdict {
+        SeedCoverage cov = SeedCoverage::Partial;
+        uint32_t skips = 0;
+        uint64_t written_layers = ~0ULL;
+        bool near_full = false;
+    };
     // key = (shader code_addr, output binding, width, height, depth) -- collision-free by construction.
     using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
     static std::mutex seed_coverage_mu;
@@ -6691,6 +6698,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         known = true;
                         proven_full = it->second.cov == SeedCoverage::Full;
                         proven_none = it->second.cov == SeedCoverage::None;
+                        bi.written_layers_mask = it->second.written_layers;
+                        bi.near_full_coverage = it->second.near_full;
                         // #1127: periodically re-prove a Full or None verdict so a data-dependent store that
                         // later changes coverage is caught (re-cached Partial, then always seeds). The
                         // helper resets the counter, so concurrent dispatches on this key don't all
@@ -9388,11 +9397,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip) continue;
-            static const bool no_skip_export_writeback =
-                std::getenv("PROSPER_NO_EXPORTED_STORAGE_WRITEBACK_SKIP") != nullptr;
-            const bool skip_exported_writeback = !no_skip_export_writeback &&
+            static const bool skip_export_writeback_enabled =
+                std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
+            const bool skip_exported_writeback = skip_export_writeback_enabled &&
                 bi.graphics_sampled_usage && bi.cache_candidate && bi.persistent &&
-                bi.seed_skip && !bi.poison_verify && !bi.mirror_result_to_imported;
+                (bi.seed_skip || bi.near_full_coverage) &&
+                !bi.poison_verify && !bi.mirror_result_to_imported;
             if (skip_exported_writeback) continue;
             const ShaderResource* r = bi.resource;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -10067,11 +10077,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)bi.resource->gpu_addr);
                 continue;
             }
-            static const bool no_skip_export_writeback =
-                std::getenv("PROSPER_NO_EXPORTED_STORAGE_WRITEBACK_SKIP") != nullptr;
-            const bool skip_exported_writeback = !no_skip_export_writeback &&
+            static const bool skip_export_writeback_enabled =
+                std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
+            const bool skip_exported_writeback = skip_export_writeback_enabled &&
                 bi.graphics_sampled_usage && bi.cache_candidate && bi.persistent &&
-                bi.seed_skip && !bi.poison_verify && !bi.mirror_result_to_imported;
+                (bi.seed_skip || bi.near_full_coverage) &&
+                !bi.poison_verify && !bi.mirror_result_to_imported;
             if (skip_exported_writeback) {
                 if (trace || (bi.resource && bi.resource->gpu_addr == 0x204aee0000)) {
                     std::fprintf(stderr,
@@ -10171,12 +10182,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (bi.poison_verify) {
                 size_t survived = 0;
                 poison_texel.assign(texels, 0);
+                const size_t layer_texels = (r->depth > 1) ? (size_t)r->width * r->height : texels;
+                std::vector<size_t> layer_survived(r->depth > 1 ? r->depth : 1, 0);
                 // Stop at the first non-poison unit. The verdict is "every unit is still
                 // poison", so one mismatch settles the texel -- and that is the overwhelmingly
                 // common case: a covering shader writes every texel, so `poison_survived` is 0 and
                 // the mismatch is usually at the first byte. Without the early exit each texel paid
                 // the full guest_texel (or 4-channel) scan to reach a conclusion it already had.
                 // Measured on Astro Bot: 108.4 M texels scanned across one 70 s run.
+                uint32_t s_min_x = UINT32_MAX, s_max_x = 0, s_min_y = UINT32_MAX, s_max_y = 0;
+                uint32_t w_min_x = UINT32_MAX, w_max_x = 0, w_min_y = UINT32_MAX, w_max_y = 0;
                 for (size_t t = 0; t < texels; ++t) {
                     bool all = true;
                     if (bi.exact_storage_bytes()) {
@@ -10187,20 +10202,78 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         for (uint32_t c = 0; c < 4; ++c)
                             if (channels[t * 4 + c] != 0xDEADBEEFu) { all = false; break; }
                     }
-                    if (all) { ++survived; poison_texel[t] = 1; }
+                    const uint32_t px = r->width ? static_cast<uint32_t>(t % r->width) : 0;
+                    const uint32_t py = r->width ? static_cast<uint32_t>(t / r->width) : 0;
+                    const uint32_t l = (r->depth > 1 && layer_texels > 0) ? static_cast<uint32_t>(t / layer_texels) : 0u;
+                    if (all) {
+                        ++survived;
+                        poison_texel[t] = 1;
+                        if (l < layer_survived.size()) ++layer_survived[l];
+                        s_min_x = std::min(s_min_x, px);
+                        s_max_x = std::max(s_max_x, px);
+                        s_min_y = std::min(s_min_y, py);
+                        s_max_y = std::max(s_max_y, py);
+                    } else {
+                        w_min_x = std::min(w_min_x, px);
+                        w_max_x = std::max(w_max_x, px);
+                        w_min_y = std::min(w_min_y, py);
+                        w_max_y = std::max(w_max_y, py);
+                    }
                 }
-                const SeedCoverage cov = classify_seed_coverage(survived, texels);
+                uint64_t written_layers = 0;
+                bool any_written_partial = false;
+                if (r->depth > 1 && layer_texels > 0 && r->depth <= 64) {
+                    for (uint32_t l = 0; l < r->depth; ++l) {
+                        if (layer_survived[l] < layer_texels) {
+                            written_layers |= (1ULL << l);
+                            if (layer_survived[l] > 0) {
+                                any_written_partial = true;
+                            }
+                        }
+                    }
+                } else {
+                    written_layers = (survived < texels) ? 1ULL : 0ULL;
+                    any_written_partial = (survived > 0 && survived < texels);
+                }
+                SeedCoverage cov = classify_seed_coverage(survived, texels);
+                if (r->depth > 1 && written_layers != 0 && !any_written_partial) {
+                    cov = SeedCoverage::Full;
+                }
+                const bool near_full = (survived == 0) || (texels >= 1000 && survived * 500 <= texels);
+                bi.written_layers_mask = written_layers;
+                bi.near_full_coverage = near_full;
                 {
                     const SeedCoverageKey proof_key{item.code_addr, bi.binding,
                                                     r->width, r->height, r->depth};
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
-                    seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0 };
+                    seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0, written_layers, near_full };
                 }
-                std::fprintf(stderr,
-                             "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
-                             (unsigned long long)item.code_addr, bi.binding, texels, survived,
-                             seed_coverage_name(cov));
+                if (survived == 0) {
+                    std::fprintf(stderr,
+                                 "[seed-skip-verify] code=0x%llx binding=%u addr=0x%llx extent=%ux%ux%u fmt=%u tile=%u "
+                                 "texels=%zu poison_survived=0 %s\n",
+                                 (unsigned long long)item.code_addr, bi.binding,
+                                 (unsigned long long)r->gpu_addr, r->width, r->height, r->depth,
+                                 (unsigned)r->format, r->tile_mode, texels, seed_coverage_name(cov));
+                } else if (survived >= texels) {
+                    std::fprintf(stderr,
+                                 "[seed-skip-verify] code=0x%llx binding=%u addr=0x%llx extent=%ux%ux%u fmt=%u tile=%u "
+                                 "texels=%zu poison_survived=%zu (all) %s\n",
+                                 (unsigned long long)item.code_addr, bi.binding,
+                                 (unsigned long long)r->gpu_addr, r->width, r->height, r->depth,
+                                 (unsigned)r->format, r->tile_mode, texels, survived, seed_coverage_name(cov));
+                } else {
+                    std::fprintf(stderr,
+                                 "[seed-skip-verify] code=0x%llx binding=%u addr=0x%llx extent=%ux%ux%u fmt=%u tile=%u "
+                                 "texels=%zu poison_survived=%zu survived_box=[%u,%u..%u,%u] written_box=[%u,%u..%u,%u] %s\n",
+                                 (unsigned long long)item.code_addr, bi.binding,
+                                 (unsigned long long)r->gpu_addr, r->width, r->height, r->depth,
+                                 (unsigned)r->format, r->tile_mode, texels, survived,
+                                 s_min_x, s_min_y, s_max_x, s_max_y,
+                                 w_min_x, w_min_y, w_max_x, w_max_y,
+                                 seed_coverage_name(cov));
+                }
                 if (cov == SeedCoverage::None) {
                     // Untouched storage target: the shader stored zero texels. Guest memory retains its
                     // clean original contents. Skip guest memory write-watch notification, unpack/pack,
@@ -10249,11 +10322,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         (end - begin) * guest_texel);
                         });
             } else if (pack_range_enabled) {
-                storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
+                if (array_image && r->depth > 1 && bi.written_layers_mask != ~0ULL) {
+                    const size_t layer_texels = (size_t)r->width * r->height;
+                    for (uint32_t layer = 0; layer < r->depth && layer < 64; ++layer) {
+                        if (bi.written_layers_mask & (1ULL << layer)) {
+                            storage_pack_range(channels + layer * layer_texels * 4,
+                                               r->format, nc, layer_texels,
+                                               packed + layer * layer_texels * guest_texel,
+                                               guest_texel);
+                        }
+                    }
+                } else {
+                    storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
+                }
             } else {
-                for (size_t t = 0; t < texels; t++)
+                for (size_t t = 0; t < texels; t++) {
+                    const uint32_t layer = (array_image && r->depth > 1 && r->width && r->height)
+                        ? static_cast<uint32_t>(t / ((size_t)r->width * r->height)) : 0u;
+                    if (layer < 64 && !(bi.written_layers_mask & (1ULL << layer))) continue;
                     storage_pack_texel(channels + t * 4, r->format, nc,
                                        packed + t * guest_texel);
+                }
             }
             // #1122: a proving frame that turned out partial-coverage packed poison garbage into the
             // un-stored texels. Restore each from the clean seed so the guest keeps its real prior
@@ -10315,6 +10404,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const size_t layer_stride = r->layer_stride_bytes
                     ? r->layer_stride_bytes : selected_slice;
                 for (uint32_t layer = 0; layer < r->depth; ++layer) {
+                    if (layer < 64 && !(bi.written_layers_mask & (1ULL << layer))) {
+                        continue;
+                    }
                     uint8_t* layer_base = destination + layer_stride * layer;
                     if (!r->tile_mode) {
                         const size_t row_pitch = r->layer_stride_bytes
@@ -10360,7 +10452,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // emulator is invalidating its own caches. Everything reaching the DS invalidation path
             // used to report the default `gpu`, which cannot distinguish them.
             set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
-            notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
+            if (array_image && r->depth > 1 && bi.written_layers_mask != ~0ULL) {
+                uint32_t max_written_layer = 0;
+                for (uint32_t layer = 0; layer < r->depth && layer < 64; ++layer) {
+                    if (bi.written_layers_mask & (1ULL << layer)) max_written_layer = layer;
+                }
+                const size_t linear_slice = static_cast<size_t>(r->width) * r->height * guest_texel;
+                const size_t selected_slice = r->in_mip_tail
+                    ? r->mip_tail_bytes
+                    : (r->tile_mode
+                           ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                 static_cast<uint32_t>(guest_texel))
+                           : (r->layer_stride_bytes
+                                  ? linear_array_surface_bytes(
+                                        *r, static_cast<uint32_t>(guest_texel))
+                                  : linear_slice));
+                const size_t layer_stride = r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice;
+                const uint64_t written_range = std::min((uint64_t)(max_written_layer + 1) * layer_stride, bi.guest_bytes);
+                notify_guest_gpu_write(r->gpu_addr, written_range);
+            } else {
+                notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
+            }
             set_guest_gpu_write_origin(nullptr);
             if (!r->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
