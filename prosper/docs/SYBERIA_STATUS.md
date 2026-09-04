@@ -40,6 +40,10 @@ re-derive these without contradictory new evidence.
 | The gameplay frame's unrealized operations are all **compute** dispatches, so the composite defect must be on the compute/exposure side | **Falsified by counting the draws.** `--inspect-only` on the gameplay submit reports 23 unrealized operations, of which only **three** are dispatches; **sixteen are draws**, and fifteen of those carry `reason=shader-recompile`. Every earlier Syberia investigation enumerated dispatch rejects (#1628 lists ten for the menu frame, whose capture genuinely has zero failed draws) and none enumerated draw rejects, so the draw side went unexamined for two months. Fifteen 1920x1080 `R11G11B10F` forward-pass draws — including a 38,994-vertex opaque depth-writing one — were being dropped. | #1627 |
 | The fifteen dropped gameplay draws fail for fifteen different reasons, so recovering them is open-ended | **Falsified.** `--retry-failed-stage F:1` under `PROSPER_DBG=1` reports the *identical* first reject in all fifteen: a fragment `v_min_u32_dpp vN,vN,vN row_shr:N`, i.e. one admission test, not fifteen gaps. Fourteen recompile after that single test is generalized. | #1627 |
 | A black routed Syberia run is evidence about the renderer | **Not necessarily — check the load first.** Under heavy concurrent-lane load the intro logo videos alone reach t≈185 s and the time-based pad route desynchronizes; two arms differing only in the patch under test were identically black. See the route-timing warning above. | #1627 |
+| The ~1.5 fps is #2215's `res_buffer_copy_ms` — the backend buffer memcpy that dominates *Blue Prince* | **Falsified.** `PROSPER_RENDER_TIMING` measures that leaf at **0.01 ms/submit** here (`backend-submit resources ... buffer=0.07 (acquire=0.01 copy=0.01 create=0.00 ...)`) against an 89.19 ms submit. The dominant `__memmove` — 21.4% / 21.9% / 17.6% of self time across three `perf` windows — is a different subsystem entirely: `std::vector::assign` inside `remember_image_source_snapshot` (`live_compute.cpp:1996`), reached from `validate_cached_image_source` and `acquire_cached_image` in `execute_live_compute_items`. Same symbol, different mechanism; do not re-derive the buffer path from the symbol name. | #1811 |
+| Syberia is GPU-bound | **Falsified four independent ways.** `radeontop` gpu **7.8-9.8%** against a `vblank_mode=0 glxgears` control at **40.8-48.8%**; `top -H` shows **one thread at 89.5%** with 92 threads at 0.0%; `PROSPER_RENDER_TIMING` puts `gpu_wait device` at **2.78 ms of 89.19** (3.1%); the F8 `.prperf` puts `gpu-device` at **88.1 ms of ~4,600** (1.9%). Note `vkcube` is **not** a usable control on this chip — vsync-limited it reads 0.42-1.25%, which would make the title look GPU-busy. | #1811 |
+| The backend's 21.94 ms/submit readback is a title cost | **Withdrawn as apparatus.** Every arm ran headless, and neither `SDL_VIDEODRIVER=offscreen` `prosper-app` nor `tools/screenshot` adopts GPU present, so the frontend copied every scanout frame to the CPU. `tools/perf/performance_capture_report.py` says so unprompted; `PROSPER_RENDER_TIMING` reports the same cost as an ordinary backend leaf with nothing marking it apparatus. Re-measure through a real window before quoting any readback figure for this title. | #1811 |
+| The renderer's sampled-Float32 narrowing is an irreducible per-texel cost | **Falsified.** It was a scalar loop around `float_to_half` (8.3 M conversions and 16.6 M small `memcpy`s per 1920x1080 reference, single-threaded) sitting beside `storage_pack_float16x4_range`, which is F16C-vectorised, thread-split, and already bit-identity-tested against `float_to_half` over a million patterns. Now routed through it for every component count and stride. | #1811 |
 
 **Still open:** what causes the restored menu layer's substantial overexposure (#1790). Recompiling
 source 101 restores the visible 3D layer on the **default** path, but does not make it visually
@@ -518,6 +522,64 @@ that every consumed recompiler gap is the visible composite cause.
   diagnostic is **capped at 40 lines** (`command_processor.cpp:2450`) — the count is a log cap, not a
   measurement. An unsatisfied wait is documented as normal handled state; do not treat these as a
   finding without an A/B against `PROSPER_WAIT_DEFER=1`.
+
+## Where the CPU goes — 2026-09-05
+
+The title renders at **1.5 distinct fps** while producing frames (`tools/screenshot`'s own summary:
+`152 distinct of 2108 published; 26% of the 382.1 s run active`). Quote `distinct`; the 5.5 fps both
+frontends print is a **publication** count and several of this title's earlier performance figures were
+that number misread as a rate.
+
+**It is CPU-bound on one thread, and the GPU is idle** — see the four independent measurements in
+`## Ruled out`. Full profile, byte figures, F8 decomposition and every apparatus caveat are in
+[#1811](https://github.com/mattias800/prosper/issues/1811); this is the map, not the record.
+
+The frame budget, from `PROSPER_RENDER_TIMING` (400 submits at 46.3 draws/submit — a renderer share
+without its draw count is unusable):
+
+```
+total          89.19 ms/submit  (11.2 submits/s)
+ build_resources 46.36  -> texture 46.20  [persist_invalid 26.34 on ONE ref/submit,
+                                           unclassified 12.84, rtt 6.43 on 107.7 refs]
+ backend         42.08  -> readback 21.94 (APPARATUS -- headless present, see Ruled out),
+                           draw_setup 11.29, gpu_wait 6.06 (device 2.78)
+ pass_control     0.80, prelude 0.02, output_copy 0.01, other 0.00
+```
+
+The bounded F8 capture ranks the components differently and more usefully: **compute is the largest
+measured component at 2,277.8 ms (48%)**, and **one program is 71% of it** —
+`0xce1c621c779851b1` at `0x20fbeab900`, 315 dispatches, 1,614.2 ms, mean 5.12 ms, against 138.8 ms for
+the next largest. That reconciles with the profile rather than competing with it: the image-source
+snapshot `assign()` (**123.5 GiB**) and the validation `memcmp` (**222.4 GiB in 215.8 s**, over a
+stretch that produced *zero* distinct frames) happen inside those dispatches.
+
+Two open frontiers, both with the instrument already built:
+
+- **The dominant compute program.** `PROSPER_COMPUTE_PHASE_TIMING=1 PROSPER_COMPUTE_IMAGE_TIMING=1`
+  plus `tools/perf/compute_phase_report.py --program 0x20fbeab900` decomposes the 5.12 ms and prints
+  unattributed parent time as its own row.
+- **`persist_invalid`.** One texture reference costs 26.34 ms every submit because its persistent-cache
+  entry is found and then declared content-changed (`resource_persistent_invalidation`,
+  `live_renderer.cpp:4249`); overall texture reuse is **9.4%** across 292 GiB of material. The
+  per-texture detail line at `live_renderer.cpp:7200` names the address and the validation verdict —
+  but it needs `PROSPER_RENDER_TIMING=detail`, **not `=1`** (instrument trap 259), and it is capped at
+  250 lines, so aim it with `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT`.
+
+**Route timing is not a constant on this title and the cache decides which states you can even see.**
+Two runs the same night: first full-frame content at **t=155 s** in one and still black at **t=190 s**
+in the other. The warmer run (973.8 MB of the dump resident) shows a small corner loading indicator at
+t=25-35 s — ~2,800 non-black pixels, 253 colours — that the colder run (214.2 MB resident of 22,170.3
+MB) **never produced at all**. Record residency with `tools/dropcache.py --report-only` alongside any
+boot timing here rather than assuming it.
+
+There is also a long second black region — `distinct_frames` frozen for the last 127 s of a 382 s run.
+The run ended there, so **non-recovery was not observed**; the documented timetable does expect a black
+transition at this point, just a much shorter one. Untangling that needs a run long enough to contain
+the region's end.
+
+**PS5 speed for this title could not be established.** `sceVideoOutSetFlipRate` is not called once in
+382 s of boot, so the guest states no cadence target and none is assumed here. The handler now logs
+every change under `PROSPER_EVLOG`. Note it would report the requested **cap**, not what a PS5 achieves.
 
 ## Reproducing the evidence
 
