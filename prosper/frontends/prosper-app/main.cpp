@@ -2294,18 +2294,19 @@ int main(int argc, char** argv) {
                                  "%s) -- RenderDoc recorded no API work in the span\n",
                                  (unsigned long long)renderdocOpenIterations, closedBy);
                 else {
+                    // Warning first, for the same reason as the shutdown note below.
                     char note[512];
                     std::snprintf(note, sizeof note,
-                                  "prosper capture. Closed by %s after %llu app-loop iteration(s) "
-                                  "and %llu guest present(s). Aimed at %s.%s",
+                                  "%sprosper capture. Closed by %s after %llu app-loop iteration(s) "
+                                  "and %llu guest present(s). Aimed at %s.",
+                                  guestPresented ? ""
+                                                 : "TRUNCATED -- closed by the iteration cap, not "
+                                                   "by a guest present: this may hold only part of "
+                                                   "a frame, or no guest frame at all. ",
                                   closedBy, (unsigned long long)renderdocOpenIterations,
                                   (unsigned long long)(guestNow - renderdocOpenedAtGuestPresent),
                                   renderdocDevicePointer ? "the live renderer's Vulkan device"
-                                                         : "whichever device RenderDoc chose",
-                                  guestPresented ? ""
-                                                 : "  WARNING: closed by the iteration cap, not by "
-                                                   "a guest present -- this may hold only part of "
-                                                   "a frame, or no guest frame at all.");
+                                                         : "whichever device RenderDoc chose");
                     prosper::frontend::RenderDocCapture::instance().set_comments(rdocPath, note);
                     std::fprintf(stderr,
                                  "[renderdoc] capture written: %s (spanned %llu app-loop iterations "
@@ -3131,13 +3132,18 @@ int main(int argc, char** argv) {
             // capture opens perfectly and reads as a whole frame with draws missing -- the same
             // shape as the wrong-device capture this trigger exists to prevent -- and the stderr
             // line does not travel with the artifact.
+            // The warning leads. If these strings ever grow past the buffer, snprintf truncates
+            // the TAIL -- so the safety-critical clause must not sit there, or a future edit
+            // silently produces a confident-looking stamp with the caveat cut off.
             char note[512];
             std::snprintf(note, sizeof note,
-                          "prosper capture -- TRUNCATED. Closed by application SHUTDOWN after %llu "
-                          "app-loop iteration(s), NOT by a guest present. It may hold only part of "
-                          "a frame, so missing draws are expected and are NOT evidence that the "
-                          "guest failed to submit them.",
-                          (unsigned long long)renderdocOpenIterations);
+                          "TRUNCATED -- missing draws are expected here and are NOT evidence that "
+                          "the guest failed to submit them. prosper capture, closed by application "
+                          "SHUTDOWN after %llu app-loop iteration(s), NOT by a guest present, so it "
+                          "may hold only part of a frame. Aimed at %s.",
+                          (unsigned long long)renderdocOpenIterations,
+                          renderdocDevicePointer ? "the live renderer's Vulkan device"
+                                                 : "whichever device RenderDoc chose");
             prosper::frontend::RenderDocCapture::instance().set_comments(rdocPath, note);
             std::fprintf(stderr, "[renderdoc] capture written: %s (closed by SHUTDOWN after %llu "
                                  "app-loop iteration(s), NOT by a guest present -- it may hold only "
