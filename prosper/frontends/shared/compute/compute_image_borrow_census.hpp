@@ -321,8 +321,20 @@ struct ComputeImageBorrowCensusSnapshot {
     // guest address under a different key. `no_entry_same_addr == 0` means the producer is absent,
     // not that the key disagrees -- which is the whole distinction `STRAY_STATUS.md` guessed at.
     //
-    // `exact_key_scans` counts scans actually performed. `key_field_diffs` is read against
-    // `exact_key_scans - exact_key_scans_rescued`, never against `outcomes[NoCacheEntry]`.
+    // `exact_key_scans` counts scans actually performed. These four numbers nest, each a proper
+    // subset of the one before, and reading a field against the wrong level is how a percentage
+    // acquires a meaning nobody intended:
+    //
+    //     exact_key_scans  >=  (exact_key_scans - exact_key_scans_rescued)
+    //                      >=  no_entry_same_addr  >=  key_field_diffs[f]
+    //
+    // **`key_field_diffs` is read against `no_entry_same_addr`, and against nothing else.** A field
+    // bit and `no_entry_same_addr` are bumped under one and the same condition below, so that is
+    // the field list's exact denominator. Dividing by `exact_key_scans - rescued` instead dilutes
+    // it with the scans that found NOTHING at the address -- which is a different row of the
+    // decision table (the producer is absent, not keyed differently), folded in as if it were
+    // evidence about key fields. Worked: `exact_key_scans=12 (rescued=9) same_addr=2 tile_mode=2`
+    // is tile_mode on 100% of near-misses, not 67% (#3307 review, round 3).
     //
     // The subtraction is the part that is easy to get wrong, and it is the second half of the
     // finding that produced this whole section. An exact-key miss that the format-alias retry then

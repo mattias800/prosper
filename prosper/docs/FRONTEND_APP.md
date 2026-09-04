@@ -498,10 +498,16 @@ and `vk_format` by construction — so scanning it would report those two as dif
 whether or not they were the reason, and would point a reader at exactly the normalisation the alias
 arm forbids. The retry is therefore not scanned, which is also why `exact_key_scans` (scans
 performed) and `no_cache_entry` (final outcomes) are different numbers. Read the field list against
-`exact_key_scans` **minus** its `rescued=` term: an exact-key miss the alias retry then rescues is a
-successful import whose mask names `format`/`vk_format` by construction, so those scans are counted
-and their fields deliberately excluded — otherwise a title whose alias path routinely succeeds
-reports a field list dominated by the alias working as designed. And the `Unknown` that `guest_gpu_writes_since` returns —
+**`same_addr=`, and against nothing else** — a field bit and `same_addr` are incremented under one
+and the same condition, so that is the list's exact denominator. The three numbers on that line nest
+(`exact_key_scans` ⊇ non-`rescued` ⊇ `same_addr`), and dividing by either wider one dilutes the field
+list with lookups that found nothing at the address at all — which is the *other* decision-table row,
+the one where the producer is absent rather than keyed differently.
+
+`rescued=` counts the exact-key misses the format-alias retry then saved. Those are successful
+imports whose mask names `format`/`vk_format` by construction, so they are counted and their fields
+deliberately excluded — otherwise a title whose alias path routinely succeeds reports a field list
+dominated by the alias working as designed. And the `Unknown` that `guest_gpu_writes_since` returns —
 which its own header warns a caller cannot decompose — is split into the three parts that ARE
 separable from the borrow site: `journal_unarmed` (not armed on the consuming thread),
 `journal_unjournaled` (the producer's publish carried no submit serial, so it was stamped while the

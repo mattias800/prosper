@@ -247,6 +247,17 @@ int main() {
     {
         ComputeImageBorrowCensus census;
         census.record_no_entry_scan(false, 0, false); // scanned; nothing at this address at all
+        // The same, but carrying a non-empty mask. Production never builds one -- the scan leaves
+        // the mask at zero when it finds no same-address entry -- and that is exactly why the arm
+        // is here: with a zero mask, "fields are gated on same_addr" and "fields happen to be empty"
+        // are the same observation, and a mutation that drops the gate passes unnoticed. It did,
+        // when this block first tried to pin the nesting. The gate is a contract of the public
+        // recorder, so it is tested at the boundary the contract names rather than at the one the
+        // current caller happens to produce.
+        const uint32_t width_and_height =
+            (1u << static_cast<uint32_t>(ComputeImageKeyField::Width)) |
+            (1u << static_cast<uint32_t>(ComputeImageKeyField::Height));
+        census.record_no_entry_scan(false, width_and_height, /*rescued_by_alias=*/false);
         const uint32_t tile_and_pitch =
             (1u << static_cast<uint32_t>(ComputeImageKeyField::TileMode)) |
             (1u << static_cast<uint32_t>(ComputeImageKeyField::LinearRowPitch));
@@ -260,14 +271,33 @@ int main() {
             (1u << static_cast<uint32_t>(ComputeImageKeyField::VkFormat));
         census.record_no_entry_scan(true, format_fields, /*rescued_by_alias=*/true);
         const auto snapshot = census.snapshot();
-        CHECK(snapshot.exact_key_scans == 3);
+        CHECK(snapshot.exact_key_scans == 4);
         CHECK(snapshot.exact_key_scans_rescued == 1);
         CHECK(snapshot.no_entry_same_addr == 1);
+        // The discriminating pair: a mask offered without a same-address entry contributes nothing.
+        CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::Width)] == 0);
+        CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::Height)] == 0);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::Format)] == 0);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::VkFormat)] == 0);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::TileMode)] == 1);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::LinearRowPitch)] == 1);
-        CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::VkFormat)] == 0);
+
+        // The four numbers NEST, each a proper subset of the one before, and the nesting is the
+        // whole reason the field list has an unambiguous denominator:
+        //
+        //     exact_key_scans >= (exact_key_scans - rescued) >= no_entry_same_addr >= diffs[f]
+        //
+        // This arm exists because that chain was documented as a comment and read against the
+        // WRONG level -- against `exact_key_scans - rescued` rather than `no_entry_same_addr`,
+        // which dilutes the field list with lookups that found nothing at the address at all
+        // (#3307 review, round 3). The four inputs above are chosen so every inequality is
+        // STRICT: 4 > 3 > 1 >= 1. An arm whose levels were all equal would hold for an
+        // implementation that collapsed them and would prove nothing.
+        CHECK(snapshot.exact_key_scans > snapshot.exact_key_scans - snapshot.exact_key_scans_rescued);
+        CHECK(snapshot.exact_key_scans - snapshot.exact_key_scans_rescued >
+              snapshot.no_entry_same_addr);
+        for (size_t i = 0; i < static_cast<size_t>(ComputeImageKeyField::Count); ++i)
+            CHECK(snapshot.key_field_diffs[i] <= snapshot.no_entry_same_addr);
     }
 
     // ---- 7. The report carries its denominators and every outcome bucket -------------------
