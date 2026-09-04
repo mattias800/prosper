@@ -498,10 +498,13 @@ pc4 was therefore refused for a save 153 dwords *ahead* of it. #3308 replaces th
 entry-rooted forward MAY dataflow; the reject then moves to pc145 and the emitted-word count from
 3220 to 8931.
 
-**It still does not compile, and the remaining blockers are unrelated to either.** pc145 is
-`v_writelane_b32 v20, s15, 2`, a spill of the *high half* of the Wave64 mask `s[14:15]`; with a
-native 64-wide subgroup adopted the next stop is pc412, `s_mov_b64 exec, s[74:75]`. This program is a
-chain, and clearing its first link is not evidence about the background.
+**It still does not compile, and the remaining blocker is unrelated to either.** Live, with a native
+64-wide subgroup adopted, the reject moves to **pc412** — `s_mov_b64 exec, s[74:75]`, where the pair
+is a wave mask the guest spilled through a scalar copy and a `v_writelane`/`v_readlane` lane slot and
+reassembled. That is the wave-model frontier, tracked as **#3311**, and it is the last recorded
+blocker for this program. Title-screen visuals with #3308 are **unchanged at `max_nonblack` 0.0052**
+against a 0.2824 oracle, so clearing this program's first link is not evidence about the background —
+and clearing its second is not known to be either.
 
 **The whole chain is reproducible offline, CPU-only — no boot, no GPU, seconds per iteration.** The
 program's bytes sit in every checked-in Stray F9 bundle, and `tools/shader_inspect` runs the entire
@@ -511,10 +514,13 @@ compute translator on a raw dump:
 PROSPER_DBG=1 ./build-linux/shader_inspect <prog>.bin --stage compute
 ```
 
-Its default launch shape is deliberately empty, which moves the decline to sites the live
-translation never reaches. Pass `PROSPER_SHADER_INSPECT_WAVE_SIZE=64`,
-`PROSPER_SHADER_INSPECT_NATIVE_SUBGROUP=64`, `PROSPER_SHADER_INSPECT_USER_SGPRS=14` and
-`PROSPER_SHADER_INSPECT_TGID=xyz` to model this dispatch.
+Its default launch shape is deliberately empty, which moves the decline to sites the live translation
+never reaches — on this program, to pc145 rather than pc412. Pass
+`PROSPER_SHADER_INSPECT_WAVE_SIZE=64`, `PROSPER_SHADER_INSPECT_NATIVE_SUBGROUP=64`,
+`PROSPER_SHADER_INSPECT_USER_SGPRS=14` and `PROSPER_SHADER_INSPECT_TGID=xyz`, and the tool then
+reports `[subgroup-width] device=64 ... native_subgroup_size=64` and the **same reject PC and words as
+the live boot**. Verified against a live run on 2026-09-04: with those four supplied it is a faithful
+offline oracle for this dispatch; without them it names the wrong instruction.
 
 ## The scene targets are black AT SOURCE
 

@@ -42,7 +42,9 @@ for months. The problem was `s14`, which this shader uses as the workgroup id *a
 later, as somewhere to park M0 while it does something else. Our containment for that parking spot
 was marking the register unreadable at every block in the shader, including the first one — so the
 kernel was refused at instruction four for something it does at instruction 157. It now reasons about
-which saves can actually reach a given block. [#3308](https://github.com/mattias800/prosper/issues/3308)
+which saves can actually reach a given block — and The Plucky Squire turned out to have a kernel
+failing on the byte-identical instruction at the byte-identical address, which also advances.
+[#3308](https://github.com/mattias800/prosper/issues/3308)
 
 ## 2026-09-03
 
