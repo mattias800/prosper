@@ -536,6 +536,81 @@ int main() {
     CHECK(storage_half_range_matches,
           "packed RGBA32F storage range matches scalar Float16 rounding and NaN payloads");
 
+    // pack_float32_to_rgba16f_range replaced a per-texel/per-channel scalar loop in the renderer's
+    // sampled-Float32 path. The contract it has to keep is not "close enough": it is the EXACT
+    // output of that loop, including the (0,0,0,1) synthesis for channels the source does not carry,
+    // for every component count and for a padded source stride. The reference below is that original
+    // loop, written out here rather than described, so the assertion compares implementations rather
+    // than comparing the new code against a restatement of what it was meant to do.
+    //
+    // The value population deliberately reuses `pack_channels` above -- a million patterns seeded
+    // with explicit NaN-payload, signaling-NaN, infinity, subnormal, negative-zero and
+    // rounding-boundary edges. A fresh random population would be a weaker input, not a stronger
+    // one, because those edges are exactly where a vector converter and a scalar one diverge.
+    {
+        auto scalar_reference = [](const uint8_t* source, uint32_t components,
+                                   size_t source_texel_bytes, size_t texels,
+                                   std::vector<uint8_t>& out) {
+            out.assign(texels * 8, 0u);
+            for (size_t t = 0; t < texels; ++t)
+                for (uint32_t c = 0; c < 4; ++c) {
+                    float value = c == 3 ? 1.0f : 0.0f;
+                    if (c < components)
+                        std::memcpy(&value, source + t * source_texel_bytes + c * 4, 4);
+                    const uint16_t half = prosper::gpu::float_to_half(value);
+                    std::memcpy(out.data() + t * 8 + c * 2, &half, 2);
+                }
+        };
+
+        bool narrowing_matches = true;
+        size_t narrowing_cases = 0;
+        // components/stride pairs: the three the renderer actually produces (bpt = nc * 4 for
+        // nc = 1, 2, 4), the awkward three-channel case, and a PADDED stride where the source texel
+        // is wider than the channels it carries -- the one shape a "stride == components * 4"
+        // assumption would silently read wrong.
+        const struct { uint32_t components; size_t stride; } narrowing_shapes[] = {
+            {1u, 4u}, {2u, 8u}, {3u, 12u}, {4u, 16u}, {2u, 16u}, {1u, 16u},
+        };
+        for (const auto& shape : narrowing_shapes) {
+            const size_t texels = pack_channels_count / 4u;   // enough source words for stride 16
+            const auto* const source = reinterpret_cast<const uint8_t*>(pack_channels.data());
+            std::vector<uint8_t> expected;
+            scalar_reference(source, shape.components, shape.stride, texels, expected);
+            std::vector<uint8_t> actual(texels * 8, 0xccu);
+            prosper::frontend::pack_float32_to_rgba16f_range(
+                source, shape.components, shape.stride, texels, actual.data());
+            ++narrowing_cases;
+            if (actual != expected) {
+                size_t first = 0;
+                while (first < expected.size() && expected[first] == actual[first]) ++first;
+                std::printf("Float32->RGBA16F narrowing mismatch components=%u stride=%zu "
+                            "byte=%zu expected=%02x actual=%02x\n",
+                            shape.components, shape.stride, first,
+                            first < expected.size() ? expected[first] : 0u,
+                            first < actual.size() ? actual[first] : 0u);
+                narrowing_matches = false;
+                break;
+            }
+        }
+        CHECK(narrowing_matches && narrowing_cases == 6,
+              "Float32->RGBA16F narrowing is byte-identical to the scalar loop it replaced, for "
+              "every component count and for a padded source stride");
+
+        // Refusals, so a malformed call cannot half-fill a destination: the guard has to reject
+        // BEFORE writing anything, which a caller can only observe by the buffer staying untouched.
+        std::vector<uint8_t> untouched(64u, 0x5au);
+        const std::vector<uint8_t> untouched_before = untouched;
+        const auto* const source = reinterpret_cast<const uint8_t*>(pack_channels.data());
+        prosper::frontend::pack_float32_to_rgba16f_range(source, 0u, 4u, 8u, untouched.data());
+        prosper::frontend::pack_float32_to_rgba16f_range(source, 2u, 0u, 8u, untouched.data());
+        // stride narrower than the channels it claims to carry: reading it would run off the texel
+        prosper::frontend::pack_float32_to_rgba16f_range(source, 4u, 8u, 8u, untouched.data());
+        prosper::frontend::pack_float32_to_rgba16f_range(nullptr, 4u, 16u, 8u, untouched.data());
+        prosper::frontend::pack_float32_to_rgba16f_range(source, 4u, 16u, 0u, untouched.data());
+        CHECK(untouched == untouched_before,
+              "Float32->RGBA16F narrowing writes nothing for a zero, null, or short-stride call");
+    }
+
     using prosper::frontend::direct_sampled_rtt_compatible;
     CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
                                         LiveTargetPixelFormat::Rgba8Unorm, false) &&

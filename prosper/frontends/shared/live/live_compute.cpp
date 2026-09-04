@@ -11395,6 +11395,42 @@ void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8
         });
 }
 
+void pack_float32_to_rgba16f_range(const uint8_t* source, uint32_t components,
+                                   size_t source_texel_bytes, size_t texels,
+                                   uint8_t* rgba16f) {
+    if (!source || !rgba16f || !texels || !components || !source_texel_bytes) return;
+    const uint32_t carried = std::min(components, 4u);
+    const size_t copy_bytes = static_cast<size_t>(carried) * sizeof(float);
+    if (copy_bytes > source_texel_bytes) return;   // caller contract; nothing safe to read
+
+    // Four carried channels at the packer's own stride is its input shape already, so hand the
+    // surface over whole. The alignment test is not pedantry: `source` is a byte pointer from the
+    // decode scratch pool, and the packer indexes it as uint32_t.
+    if (carried == 4 && source_texel_bytes == 4 * sizeof(float) &&
+        (reinterpret_cast<uintptr_t>(source) % alignof(uint32_t)) == 0) {
+        storage_pack_float16x4_range(reinterpret_cast<const uint32_t*>(source), texels, rgba16f);
+        return;
+    }
+
+    // Fewer carried channels, a padded stride, or an under-aligned source: widen a bounded block to
+    // the packer's shape and reuse the same vector path, rather than dropping to a per-value scalar
+    // conversion. The block is small enough to stay resident and large enough that the packer's own
+    // work-based thread split still sees a worthwhile range.
+    constexpr size_t kBlockTexels = 8192;
+    static constexpr uint32_t kFloatOneBits = 0x3f800000u;   // 1.0f
+    std::vector<uint32_t> block(kBlockTexels * 4);
+    for (size_t base = 0; base < texels; base += kBlockTexels) {
+        const size_t count = std::min(kBlockTexels, texels - base);
+        for (size_t texel = 0; texel < count; ++texel) {
+            uint32_t* const widened = block.data() + texel * 4;
+            widened[0] = widened[1] = widened[2] = 0u;
+            widened[3] = kFloatOneBits;
+            std::memcpy(widened, source + (base + texel) * source_texel_bytes, copy_bytes);
+        }
+        storage_pack_float16x4_range(block.data(), count, rgba16f + base * 8);
+    }
+}
+
 void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
                                      size_t texels, uint8_t* rgba) {
     if (!source || !rgba || !components || components > 4) return;
