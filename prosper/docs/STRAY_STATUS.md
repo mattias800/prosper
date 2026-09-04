@@ -231,7 +231,8 @@ to null whatever is wrong, and that quadruple restates `written=0` rather than m
 instruction, with no register-state guard at all — it is also the resolver's *first* route. Reading its
 null as vacuous would be this section's own trap with the sign flipped, and § *MEASURED* below depends
 on `pc_res=null` being real: that is precisely the ambiguity `PROSPER_DYNTRACE_FAIL=1` was run to
-resolve. The route that *did* run and went unreported is `by_sgpr_base(SRSRC)`. The pc=77 row is the internal control: it reports `written=1` and its
+resolve. The route that *did* run and went unreported is
+`by_sgpr_base(SRSRC)`. The pc=77 row is the internal control: it reports `written=1` and its
 `srt_tag=0x20` field populates, because there its route ran.
 
 **Three of those four had a resource at exactly the requested SGPR, of the wrong class, discarded in
@@ -344,12 +345,28 @@ exactly as derived above. The prediction is measured.
 | `2f70fbb8 00000030 2f70fdcc 00000030 …` | stride 0 → rejected | `0x302f70fbb8`, `0x302f70fdcc` (Δ `0x214`) |
 
 Both `bad-image-type` samples are two clean, adjacent guest pointers plus a constant `0x00700000` at
-dword 5. **Both of those lines carry the same `ud=0x21e0e55590`** — one block, two different payloads —
-so what they show is variation *between draws of one block*, which is the stronger reading and the one
-the section needs. That is derivable precisely because the dedupe key embeds the payload: the same
-property that makes the count useless makes the variation visible. The third payload, from `[resdump]`
-on the same stage, is a third draw. In none of them did the declared image slot hold an image
-descriptor.
+dword 5, and **both lines carry the same `ud=`** — one block, two different payloads. That is the
+load-bearing claim in this paragraph, so here are the two lines rather than a description of them:
+
+```
+[sharp]   ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: degenerate T# (bad-image-type)
+          base=0x300ae8fb5400 13713x11172x1 type=0 base_array=0 fmt=0
+          raw 0ae8fb54 00000030 0ae8fd64 00000030 00000000 00700000 00000000 00000000
+[sharp]   ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: degenerate T# (bad-image-type)
+          base=0x302f70fbb800 14129x15812x1 type=0 base_array=0 fmt=0
+          raw 2f70fbb8 00000030 2f70fdcc 00000030 00000000 00700000 00000000 00000000
+```
+
+`grep 'degenerate T#' | grep -oE 'ud=0x[0-9a-f]+' | sort | uniq -c` over that run returns
+`2  ud=0x21e0e55590` — the whole bucket, one block. So what these show is variation *between draws of
+one block*, and it is derivable precisely because the dedupe key embeds the payload: the property that
+makes the count useless is what makes the variation visible.
+
+The **first** row of the table above is a different instrument — the `[resdump]` block quoted earlier
+in this section, not a `tex_drop` line — so "a third draw" is an inference from two sources rather than
+a reading of one, and it is not needed: the two lines above already establish per-draw variation on
+their own. What is directly observed is that in none of the three payloads did the declared image slot
+hold an image descriptor.
 
 **Settled: the guest declares an eight-dword T# there.** `PROSPER_SHARPLOG=1` together with
 `PROSPER_DYNTRACE_FAIL=1` — both are needed, because `[sharp]` keys on `ud=` and only `[resdump]` ties a
