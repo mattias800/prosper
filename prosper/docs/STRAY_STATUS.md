@@ -1509,8 +1509,18 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   the failing steady state — and that is honestly reported as **never reached**, not as evidence of
   what published. A draft of this row inferred "the menu therefore publishes" from the zero count;
   that inference is withdrawn, having violated a precedent written into the header it reasoned about.
-  **The publishing claim rests on the frame instead**: a captured title-screen frame exists and shows
-  the menu, which is direct evidence something published.
+  **The publishing claim rests on the frame instead** — and the artifact has to be named, because
+  which buffer was dumped is the whole strength of it. These are `tools/screenshot` PNGs, which come
+  from `present_readback`, which returns what `present_write_frame` wrote
+  (`gpu_executor.cpp:11780`/`:11927`). So a menu-bearing PNG is direct evidence that **a frame was
+  published to the present layer** — the publication itself, not an inference from a decline that
+  never printed.
+
+  Do not substitute the renderer's own `frame_%04d.bmp` for this without collecting it: that dump is
+  fed by `selected_pixels` (`live_renderer.cpp:10160` → `:10184`), so it would prove
+  `have_selected_pixels` — stage 1's second input — which is a *stronger* statement about the gate but
+  a different artifact, and it was not produced by these runs. An RTT dump would be weaker than
+  either: it would show only that the menu was drawn somewhere.
 
   Two things survive this correction intact. `rtt_owns=` **cannot be collected on the title route**
   (the report sits inside the stage-1 `Publish` branch). And the forward direction holds: any
@@ -1519,7 +1529,17 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   What does **not** follow is that the older `authored=0` / `px_front=none` facts differ from today's
   run *because of regime*. Those runs are days and several merges apart, so code state, route and
   `PROSPER_RENDER_SCALE` are equally live explanations. Attach the run, not just the regime — and the
-  cheap way to settle it is one run collecting the census and those counters together.
+  cheap way to settle it is one run collecting the census and those counters together:
+
+  ```
+  PROSPER_PASS_LOG=<window> PROSPER_TARGET_PHYS=1     # census + px_front/px_vo/px_last in ONE run
+  ```
+
+  **Do not reach for `PROSPER_RTTLOG` to get the present counters.** It is in the list at
+  `live_renderer.cpp:1674-1679` that disables `live_gpu_targets`, so it measures a differently
+  configured renderer. The counters do not need it: `px_front`/`px_vo`/`px_last` come from
+  `present_source_name()` printed under `g_pass_log_window`, i.e. `PROSPER_PASS_LOG`, which is **not**
+  in that list.
 
   **The alias hypothesis is dead**, now over the population rather than one slot: **55,868
   resolutions, 0 unresolved, 82 distinct targets** across slots 0-6. Excluding the scanout buffers
