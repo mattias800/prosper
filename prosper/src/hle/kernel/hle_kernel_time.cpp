@@ -15,6 +15,7 @@
 #include "hle/sync/pthread_slot.hpp"   // #2596: resolve a guest sync slot the way libkernel does
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
+#include "diagnostics/env_numeric.hpp"  // #3304: strict numeric env parsing
 #include <pthread.h>
 #include <chrono>
 #if defined(__linux__)
@@ -1609,8 +1610,8 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         auto pred = [&]{ return !s->ready.empty() || s->deleted; };
         if (a4) {
             uint64_t us = *(uint32_t*)P(a4);
-            static const uint64_t cap = [] {   // parsed once (cf. punch_secs in hle_kernel_mem.cpp)
-                const char* e = getenv("PROSPER_WAITCAP"); return e ? (uint64_t)atoll(e) : 0; }();
+            static const uint64_t cap = prosper::diag::env_u64_or_default_capped(
+                "PROSPER_WAITCAP", getenv("PROSPER_WAITCAP"), 0ull, UINT64_MAX, "us", "0 = no cap");
             if (cap && us > cap) us = cap;
             if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus\n", (unsigned long long)us);
             s->cv.wait_for(lk, std::chrono::microseconds(us), pred);

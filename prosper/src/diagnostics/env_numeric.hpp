@@ -165,4 +165,22 @@ inline bool env_u64_or_report(const char* name, const char* text, uint64_t* out,
     return false;
 }
 
+// Tri-state for an A/B experiment lever whose contract is:
+//   "1"            -> forced on (1)
+//   "0"            -> forced off (0)
+//   unset / empty  -> fallback (-1, follow title/SDK contract)
+//   anything else  -> loud refusal on stderr, keeping fallback (-1) and changing nothing
+//
+// Exists because strtol(e, nullptr, 0) returned 0 for non-numeric text, so every spelling an
+// operator plausibly tries (=on, =true, =yes, =enabled) selected FORCED OFF rather than unset (#3304).
+inline int env_tristate_or_default(const char* name, const char* text, int fallback = -1) {
+    if (!text || !*text) return fallback;
+    if (text[0] == '1' && text[1] == '\0') return 1;
+    if (text[0] == '0' && text[1] == '\0') return 0;
+    std::fprintf(stderr,
+                 "[env] %s='%s' is not '0' or '1' -- keeping the default (%d) and changing NOTHING\n",
+                 name, text, fallback);
+    return fallback;
+}
+
 } // namespace prosper::diag

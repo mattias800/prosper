@@ -35,7 +35,7 @@ from pathlib import Path
 # one site this gate could not see, while the success line below asserted full coverage (#3267 N2).
 # Adding a helper to that header without adding it here re-opens exactly that hole.
 CALL_RE = re.compile(
-    r'env_u64_or_(?:default(?:_auto)?(?:_capped)?|report)\s*\(\s*\n?\s*"(PROSPER_[A-Z_0-9]+)"')
+    r'env_(?:u64_or_(?:default(?:_auto)?(?:_capped)?|report)|tristate_or_default)\s*\(\s*\n?\s*"(PROSPER_[A-Z_0-9]+)"')
 ARM_RE = re.compile(r'"(PROSPER_[A-Z_0-9]+)"')
 SKIP_DIRS = {"build-linux", "build-windows", "third_party", ".git", "tmpdir"}
 TEST = Path("tests/diagnostics/test_env_numeric_sites.cpp")

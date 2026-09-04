@@ -250,6 +250,29 @@ static uint64_t image_cache_old(const char* t) {
     return mib * 1024ull * 1024ull;
 }
 
+// --- src/hle/kernel/hle_kernel_time.cpp : PROSPER_WAITCAP ---------------------------------------
+// 0 = no cap. atoll("-1") wrapped to UINT64_MAX, which was non-zero so it passed the `cap &&` guard
+// but `us > UINT64_MAX` never fired, silently disabling the clamp an operator armed (#3304).
+static uint64_t waitcap_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 0ull, UINT64_MAX, "us", "0 = no cap");
+}
+static uint64_t waitcap_old(const char* t) {
+    return t ? (uint64_t)std::atoll(t) : 0ull;
+}
+
+// --- src/gpu/pm4/command_processor.cpp : PROSPER_POST_SUBMIT_VISIBILITY -----------------------
+// Tri-state: 1 = forced on, 0 = forced off, -1 = unset (follow SDK). A typo like =on, =true,
+// =enabled used to fall to strtol's 0 (FORCED OFF), turning an intended "lever on" experiment into
+// the forced-off arm (#3304).
+static uint64_t post_submit_vis_new(const char* n, const char* t) {
+    return static_cast<uint64_t>(static_cast<int64_t>(
+        prosper::diag::env_tristate_or_default(n, t, -1)));
+}
+static uint64_t post_submit_vis_old(const char* t) {
+    const int v = t ? (int)std::strtol(t, nullptr, 0) : -1;
+    return static_cast<uint64_t>(static_cast<int64_t>(v));
+}
+
 static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
 
@@ -341,6 +364,12 @@ static const Site kSites[] = {
      "0x2000 groups", 0ull, "0x2000", 8192ull},
     {"command_processor.cpp PROSPER_REL1_FORGE_GUARD (base-0 off kept)",
      "PROSPER_REL1_FORGE_GUARD", default_on_new, default_on_old, "0xzz", 1, "0x0", 0},
+
+    // #3304: waitcap wraps -1 to UINT64_MAX; post-submit visibility typos select FORCED OFF.
+    {"hle_kernel_time.cpp PROSPER_WAITCAP", "PROSPER_WAITCAP",
+     waitcap_new, waitcap_old, "-1", 0ull, "500000", 500000ull},
+    {"command_processor.cpp PROSPER_POST_SUBMIT_VISIBILITY", "PROSPER_POST_SUBMIT_VISIBILITY",
+     post_submit_vis_new, post_submit_vis_old, "on", static_cast<uint64_t>(-1LL), "1", 1ull},
 
     // #3253's own six, plus the two the same PR added. Every fallback below is that site's
     // documented default; every legacy answer below is the aggressive end of its own policy.

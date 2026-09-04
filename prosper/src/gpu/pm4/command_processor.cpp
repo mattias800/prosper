@@ -2934,8 +2934,8 @@ std::atomic<bool> g_post_submit_visibility{false};
 // pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
 bool post_submit_visibility_enabled() {
     static const int forced = [] {
-        const char* e = getenv("PROSPER_POST_SUBMIT_VISIBILITY");
-        const int v = e ? (int)strtol(e, nullptr, 0) : -1;
+        const int v = prosper::diag::env_tristate_or_default(
+            "PROSPER_POST_SUBMIT_VISIBILITY", getenv("PROSPER_POST_SUBMIT_VISIBILITY"), -1);
         if (v == 1)
             fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
                             "stay private until the submit scope closes, regardless of SDK version\n");
