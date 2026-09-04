@@ -6513,6 +6513,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_source_size);
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
+                            // PROSPER_NO_TEXTURE_PREFIX_INHERIT restores the `assign()` spelling:
+                            // free the outgoing buffer, allocate a new one. It exists because
+                            // WITHOUT it this optimisation has no off-switch, and a discriminator
+                            // that cannot disable everything the change does is not a
+                            // discriminator -- it silently under-reports the change it is
+                            // attributing. Measured on Stray: an A/B armed with
+                            // PROSPER_NO_DIRECT_TEXTURE_SOURCE and PROSPER_DECODE_SCRATCH_MB=0
+                            // returned the texture leaf to 918.2 ms rather than the 1110.1 ms
+                            // baseline, and the missing 191.9 ms was this, still switched on.
+                            static const bool no_prefix_inherit =
+                                PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_PREFIX_INHERIT") != nullptr;
                             // The entry this decode replaces holds a source_prefix buffer of the
                             // same shape. Taking its allocation instead of letting `assign` build a
                             // new one is worth naming on a surface the guest rewrites every frame:
@@ -6557,7 +6568,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 // Taken AFTER the ledger has been debited by the old entry's
                                 // `bytes()`, which reads `source_prefix.size()`: moving first would
                                 // debit zero and leak the entry's bytes from the budget forever.
-                                inherited_source_prefix = std::move(old->second.source_prefix);
+                                if (!no_prefix_inherit)
+                                    inherited_source_prefix = std::move(old->second.source_prefix);
                                 persistent_decoded_textures.erase(old);
                             }
                             const size_t required =
