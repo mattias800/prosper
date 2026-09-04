@@ -149,13 +149,11 @@ std::vector<fs::path> collect_modules(const std::string& input) {
 // that population. `prefix` is "# " for --tsv (comment lines a consumer skips) and "" for the
 // human report.
 //
-// The two divergences worth stating explicitly, because they SILENTLY REMOVE ROWS:
+// The divergence worth stating explicitly, because it SILENTLY REMOVES ROWS:
 //   * a module that failed to parse contributes no imports, so its NIDs read as "not imported
-//     by anything" rather than "not measured";
-//   * this scans the tree for modules, while the loader links a FIXED set (boot_program.cpp) —
-//     it takes exactly two entries from sce_module/, auto-discovers only Media/Plugins/, and
-//     never auto-links .sprx. So a NID satisfied here by a sibling export the loader would not
-//     have linked is excluded from the census but WOULD reach the dispatcher at runtime.
+//     by anything" rather than "not measured".
+// Module discovery uses the loader's actual link set (boot_link_inputs, #2199), so cross-module
+// exclusions match what the guest will actually resolve at runtime.
 void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
                  size_t unregistered, size_t shown, size_t satisfied_cross_module,
                  size_t mismatches, const std::string& lib_filter, bool self_check) {
@@ -180,9 +178,8 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
            "listed here may never execute, and a fault is not explained by its presence. For what a "
            "run actually called, use prosper_on_unimpl's first-seen census from a live boot, or "
            "hle_calls (#1980), and bound it to the window the behaviour occurs in.\n", prefix);
-    printf("%sNOTE: module set is a tree scan, not the loader's link set (boot_program.cpp): "
-           "only Media/Plugins is auto-discovered, .sprx is never auto-linked, and sce_module "
-           "contributes exactly two. Cross-module exclusions are computed over THIS set.\n",
+    printf("%sNOTE: module set is the loader's actual link set (boot_program.cpp, #2199) -- "
+           "cross-module exclusions match what the guest will resolve at runtime.\n",
            prefix);
 }
 
