@@ -2036,6 +2036,19 @@ int main(int argc, char** argv) {
     // itself, because firing at an unintended moment is worse than not firing. This is a safety CAP,
     // not a trigger -- disabling it would mean an unbounded span -- so a malformed or zero value
     // falls back to the default, and says so rather than doing it quietly.
+    // How many GUEST presents the span covers, default 1 (#3321). One is right for a title whose
+    // frame is self-contained, and demonstrably wrong for one that builds its screen across several
+    // frames: Stray's title screen renders its 3D element in a frame that carries no UI, so a
+    // one-present capture holds a cat and no menu while the screen shows a menu and no cat. Widening
+    // the span is the only way to see a whole cycle. Same fallback-and-announce contract as the cap
+    // below -- this bounds a span, it does not aim one.
+    const uint64_t renderdocPresentsParsed =
+        prosper::frontend::parse_capture_frame(getenv("PROSPER_RENDERDOC_PRESENTS"));
+    const uint64_t renderdocPresents = renderdocPresentsParsed ? renderdocPresentsParsed : 1;
+    if (const char* np = getenv("PROSPER_RENDERDOC_PRESENTS"); np && !renderdocPresentsParsed)
+        std::fprintf(stderr, "[renderdoc] ignoring malformed PROSPER_RENDERDOC_PRESENTS=\"%s\" "
+                             "(expected a positive present count); spanning %llu\n",
+                     np, (unsigned long long)renderdocPresents);
     const uint64_t renderdocMaxItersParsed =
         prosper::frontend::parse_capture_frame(getenv("PROSPER_RENDERDOC_MAX_ITERS"));
     const uint64_t renderdocMaxIterations = renderdocMaxItersParsed ? renderdocMaxItersParsed : 2000;
@@ -2060,6 +2073,9 @@ int main(int argc, char** argv) {
         } else {
             // Never leave this at RenderDoc's default, which is under /tmp -- see the header.
             rdoc.set_path_template(grabDir + "/prosper_frame");
+            if (renderdocPresents != 1)
+                std::fprintf(stderr, "[renderdoc] span set to %llu guest presents\n",
+                             (unsigned long long)renderdocPresents);
             if (scheduledRdocFrame)
                 std::fprintf(stderr, "[renderdoc] capture scheduled at host frame %llu (into %s)\n",
                              (unsigned long long)scheduledRdocFrame, grabDir.c_str());
@@ -2278,7 +2294,8 @@ int main(int argc, char** argv) {
         // by a missing file.
         if (renderdocCaptureOpen) {
             const uint64_t guestNow = gpu::present_count();
-            const bool guestPresented = guestNow > renderdocOpenedAtGuestPresent;
+            const bool guestPresented =
+                guestNow - renderdocOpenedAtGuestPresent >= renderdocPresents;
             const bool hitCap = ++renderdocOpenIterations >= renderdocMaxIterations;
             if (guestPresented || hitCap) {
                 renderdocCaptureOpen = false;
