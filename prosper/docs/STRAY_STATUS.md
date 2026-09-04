@@ -127,6 +127,41 @@ allocates its 33 MiB output buffer fresh (~4.4 ms) — [#3310](https://github.co
 Fixing it needs a decision about buffer ownership between `texstore` and the persistent cache, which
 hands its buffer out as a `shared_ptr<const std::vector>` that never comes back.
 
+### Measured on the fix, live, 2026-09-04 (#3309)
+
+Same route and same F8 window, three arms on one binary. **The prediction was 660 ms and the
+measurement is 497.7.**
+
+| | baseline `fc21d46ca` | with #3309 | lever arm |
+| --- | --- | --- | --- |
+| rendered | 9.76 /s | **11.55 /s** | 10.15 /s |
+| `build_resources` texture | 1110.1 ms | **497.7 ms** | 918.2 ms |
+| ...of which `persist_invalid` | (no bucket yet) | 221.3 | 631.9 |
+| ...of which unclassified `other` | +930.8 | +144.3 | — |
+| renderer-resource | 1895.5 ms | 1384.1 ms | — |
+
+The 63.8 MiB RGBA16F witness is **gone from the top**: the slowest unclassified reference is now
+7.3 ms on a different, tiny surface (`0x30a0ac0000`, `fmt=7/1c`, `persist_cand=0`).
+
+**The derivation above survives in direction and rank, not in magnitude, and the magnitudes are not
+quotable.** It predicted `other` ≈ 0 with `persist_invalid` ≈ 900. What happened is `other` fell
+930.8 → 144.3 and `persist_invalid` is the largest single class — but at 221.3, because the same
+change that gave the residual a name also removed most of the cost the name was going to hold. A
+prediction whose own fix invalidates its arithmetic is confirmed about *which* state, not about
+*how much*.
+
+**The lever arm's gap is explained, not noise.** It returns the leaf to 918.2 rather than 1110.1
+because at the time it was run **one of the four changes had no off-switch** — the `source_prefix`
+inheritance — so it was still active in the "off" arm. The missing 191.9 ms is that, and it is
+consistent with the 13.00 ms per-invalidation figure above over ~14 references.
+`PROSPER_NO_TEXTURE_PREFIX_INHERIT` closes that gap; the arm above therefore **under-reports** what
+#3309 is worth, and a re-run with all three levers is the one to quote.
+
+**Compute rose 1981.5 → 2351.4 ms in the same window, and that is not a regression** — the window
+is fixed at 5.02 s, so a pipeline that renders 18% more frames also issues more dispatches into it.
+The bucket total is throughput, not cost. The discriminating pair is mean-ms-per-dispatch and
+dispatch count, both of which the report already prints per program.
+
 ### The lever that is worth more than all of this
 
 The witness says `compute_cand=1`: the surface is a **compute image candidate whose import misses

@@ -32,6 +32,8 @@ reference, and past glibc's mmap threshold that is not an allocation but sixteen
 faults and a munmap, so **17.8 of the 26.0 ms was the allocator and the kernel rather than the
 detile**. The buffers are pooled now and the tiled source is read where it already lives, because
 guest memory is mapped 1:1 and copying it only ever produced a second address for the same bytes.
+That leaf went 1110 ms to 498, and the title screen from **9.76 to 11.55 frames a second** — the
+picture is unchanged, which is the point.
 [#3309](https://github.com/mattias800/prosper/pull/3309)
 
 ## 2026-09-03
