@@ -302,9 +302,18 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   This is worth a line because the failure mode was expensive rather than obvious: a correct branch
   diffed against the stale `master` reported **3,296 commits of divergence**, and the session-trailer
   gate below read **582** instead of 0 — so a *clean* branch looked contaminated, and the natural
-  repair (rebuild it onto `master`) moved good work onto the dead line. Instrument-trap rows and dated
-  status docs still say `origin/master` because they record what was true when written; do not
-  "correct" those, and do not run their commands verbatim. #3333.
+  repair (rebuild it onto `master`) moved good work onto the dead line.
+
+  **Which mentions of `master` were repointed and which were left, as a TEST rather than a list** —
+  a list is what let two live references through the first sweep, both of them in categories the list
+  did not name: **a record of what was true keeps `master`; anything a reader would run or follow gets
+  repointed.** So instrument-trap rows, dated A/B arms and past-tense CI commentary keep the old name,
+  while recipes, `git` commands, workflow triggers and present-tense descriptions of how the project
+  works today do not. Do not "correct" a record, and do not run a record's commands verbatim.
+
+  **When sweeping, match the bare word too.** The first pass here searched `origin/master` and missed
+  every reference spelled just `master` — including `git fetch origin master` at the head of the
+  recipe every subagent is told to start from. #3333.
 
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:
@@ -978,8 +987,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   move — `git checkout <old-branch> -- <file>` — reverts that file to its old state wherever ANOTHER
   lane has since edited it, with no conflict, no failing check, and a diff that reads as your own edit.
   It cost #1701 ten lines of documentation this way, caught only because `--stat` showed deletions in a
-  file believed touched once. Re-apply your own hunks onto master's version instead; when you do take a
-  file whole, **diff it against `master` and read the `-` lines**. The `Docs` CI gate does not cover
+  file believed touched once. Re-apply your own hunks onto `main`'s version instead; when you do take a
+  file whole, **diff it against `origin/main` and read the `-` lines**. The `Docs` CI gate does not cover
   this: it validates table structure and numbering, never prose. See instrument-trap 41.
 - **A pipeline's exit status is its LAST stage's.** `cmd | tail`, `cmd | head` and `cmd | grep` all
   discard `cmd`'s failure, so `build && test | tail -3 && commit` commits through a red test. Capture

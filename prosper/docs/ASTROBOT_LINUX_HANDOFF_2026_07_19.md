@@ -429,10 +429,15 @@ paste title shader bytes into the repository.
 
 ### 1. Establish a clean native baseline
 
+> **This recipe no longer runs as written (checked 2026-09-05).** Its branch
+> `fix/issue-1054-astro-pcrel` no longer exists on the remote, and the `master` it rebased onto was
+> deleted (#3333). Both lines are kept because they record what the handoff did; start from
+> `origin/main` and the tracker instead of running them.
+
 ```sh
 git fetch origin --prune
-git switch fix/issue-1054-astro-pcrel
-git rebase origin/main   # was origin/master; that branch was deleted (see CLAUDE.md)
+git switch fix/issue-1054-astro-pcrel   # HISTORICAL: this branch is gone
+git rebase origin/master                # HISTORICAL: master was deleted -- use origin/main
 
 cd prosper
 cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=RelWithDebInfo

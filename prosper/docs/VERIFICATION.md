@@ -230,7 +230,7 @@ rather than decoration:**
    flagged module twice, once where its exports collide and once where a single export NID differs; a
    guard that skipped every flagged module would pass the first arm exactly as well as a correct one.
 
-## PROGRESS_TRACKER.md regenerates itself on master — it is no longer a gate
+## PROGRESS_TRACKER.md regenerates itself on main — it is no longer a gate
 
 `PROGRESS_TRACKER.md` is **generated** from the `tracker:game` issues. It used to be gated on every
 PR (`gen_progress_tracker.py --check`), and **that gate was removed on 2026-08-27** because one of

@@ -839,7 +839,7 @@ Every game subagent should receive and follow this contract:
 Never build or edit in the shared checkout. A typical assignment begins with:
 
 ```bash
-git fetch origin master
+git fetch origin main
 git worktree add .claude/worktrees/<agent-title> \
   -b investigate/<title-question> origin/main
 cd .claude/worktrees/<agent-title>
