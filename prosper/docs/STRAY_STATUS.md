@@ -498,6 +498,26 @@ pc4 was therefore refused for a save 153 dwords *ahead* of it. #3308 replaces th
 entry-rooted forward MAY dataflow; the reject then moves to pc145 and the emitted-word count from
 3220 to 8931.
 
+### What #3308 is worth on this screen — length-matched
+
+12 frames per arm, same route and warmup, back to back. **Run lengths must match**: an earlier
+unmatched pair (30 frames vs 12) produced *three* false readings from one comparison, in both
+directions — a program that looked newly skipped was actually newly *fixed*, a program that looked
+fixed was unchanged, and a `[mimg-unresolved]` "10 → 4" improvement was not one.
+
+| | `origin/main` | with #3308 |
+| --- | --- | --- |
+| programs skipped | `0x300ba70000`, `0x300e390000`, `0x30131d0000` | `0x300e390000`, `0x30131d0000` |
+| reject PCs | pc=3, pc=4, pc=50 | **pc=412**, pc=50 |
+| `[mimg-unresolved]` | 8 | 8 |
+| `max_nonblack` | 0.0052 | 0.0052 |
+
+Two effects, both real: `0x300e390000` advances pc4 → pc412, and **`0x300ba70000` stops being skipped
+altogether** — it was rejecting at pc=3, three dwords in, on the same entry-block token. Nothing
+regresses. `0x30131d0000` is unchanged at pc=50 and is *not* a second program fixed.
+
+**The screen does not change**, because the two programs that still drop take the picture with them.
+
 **It still does not compile, and the remaining blocker is unrelated to either.** Live, with a native
 64-wide subgroup adopted, the reject moves to **pc412** — `s_mov_b64 exec, s[74:75]`, where the pair
 is a wave mask the guest spilled through a scalar copy and a `v_writelane`/`v_readlane` lane slot and
@@ -565,7 +585,7 @@ disagree.**
 | candidate | measurement (calibration) | title-screen status |
 | --- | --- | --- |
 | dropped draws | 7 `shader-recompile`, ~30,000 draws executed | **FALSIFIED for the title screen** — ~3800 there, see below |
-| skipped compute | `0x300ba70000` executed **7455**, skipped **2** (`PROSPER_COMPUTE_PROGRAM_CENSUS=1`) | not re-measured on the title screen |
+| skipped compute | `0x300ba70000` executed **7455**, skipped **2** (`PROSPER_COMPUTE_PROGRAM_CENSUS=1`) | superseded — on the title screen it was skipped outright at pc=3, and #3308 removes that skip |
 | lost colour write masks | present and decoded on 32,649 of 32,649 traced draws | **VOID** — a trace run only on calibration says nothing about which registers reach the GPU on the title screen |
 | composite / tonemap | the HDR sources are black before it runs | holds — established on the title-screen bundle |
 
