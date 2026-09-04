@@ -109,6 +109,12 @@ guard's own env, route and scale to get a manifest to sweep. Exit status is a co
 the sweep ran and the printed scores are the answer *including when nothing matched*; **2** means it
 refused and no number it printed is a result.
 
+**Read that exit status directly, never through a pipe.** `when_matched.py … | tail -1; echo $?`
+reports `tail`'s status, so a refusal reads as success — which is exactly the failure the contract
+exists to prevent, arriving through the one channel you are not watching while you concentrate on the
+output. The tool's own author hit it on the first test (charter trap 40, a pipeline's status is its
+last stage's): use `cmd > out 2> err; rc=$?`, or `set -o pipefail`, or read `${PIPESTATUS[0]}`.
+
 First use, #2899: it contradicted the person who wrote it. A `cobra-gameplay` run whose frames were
 visibly the right level scored **0.7757 at best anywhere** against a 0.85 floor, with the in-window
 best at **0.7582** — and it is that comparison, not the bare "nothing cleared the floor", that
