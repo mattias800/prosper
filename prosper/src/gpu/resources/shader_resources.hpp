@@ -783,6 +783,31 @@ inline bool is_proven_null_nullable_raw_buffer(const ShaderResource& resource) {
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
+// Which resource class an image instruction can accept. RDNA2 splits MIMG by operation, not by
+// descriptor: image_store and every integer image atomic are read-modify-write and therefore can
+// only target a StorageImage, an ordinary sample can only use a Texture, and IMAGE_LOAD (0x00) /
+// IMAGE_GET_RESINFO (0x0e) read a descriptor that may legitimately be either. Keeping the three
+// cases in one enum means the lookup and the post-lookup validation cannot drift apart -- the
+// project has already paid for that drift once, when a widened storage classifier met an
+// un-widened acceptance test and made resolution reject HARDER than before the fix (#2275).
+enum class ImageResourceRequirement : uint32_t {
+    SampledOnly,    // ordinary image_sample/gather: Texture
+    StorageOnly,    // image_store + integer image atomics: StorageImage
+    Either,         // IMAGE_LOAD / IMAGE_GET_RESINFO: whichever the front half classified it as
+};
+
+// Single acceptance predicate shared by the class-filtered lookups and by the recompiler's
+// post-resolution validation, so "which classes may this op use" is stated exactly once.
+inline bool image_resource_class_satisfies(ResourceClass cls, ImageResourceRequirement requirement) {
+    switch (requirement) {
+        case ImageResourceRequirement::SampledOnly: return cls == ResourceClass::Texture;
+        case ImageResourceRequirement::StorageOnly: return cls == ResourceClass::StorageImage;
+        case ImageResourceRequirement::Either:
+            return cls == ResourceClass::Texture || cls == ResourceClass::StorageImage;
+    }
+    return false;
+}
+
 struct ShaderResourceTable {
     std::vector<ShaderResource> resources;
     // Exact dispatch contracts may materialize immutable host-only resources. ShaderResource keeps
@@ -817,6 +842,23 @@ struct ShaderResourceTable {
     // Resolve the vertex buffer for the fetch instruction at `pc` (per-fetch provenance — disambiguates an
     // SRSRC SGPR reloaded with a different V# per attribute). nullptr if none.
     const ShaderResource* by_fetch_pc(uint32_t pc) const;
+
+    // CLASS-FILTERED lookups for an image op (MIMG). The three plain lookups above are first-match
+    // wins AND class-blind, which is safe only for a caller that can use whatever class comes back.
+    // An image op cannot: it needs a Texture or a StorageImage, and one key can legitimately carry
+    // several resources of different classes -- a live vertex stage has been observed with a
+    // ConstantBuffer and two VertexBuffers all at sgpr_base 8. Taking the first hit and discarding
+    // it on class (which is what the MIMG resolver did) makes an image resource behind a
+    // buffer-class one at the same key UNREACHABLE, and, worse, a wrong-class hit on the SRT route
+    // also suppressed the SGPR fallback because `res` was non-null when that fallback was tested.
+    // Filtering inside the lookup removes both failure modes: the search continues past a
+    // wrong-class entry instead of stopping on it. See #3126 / #1634.
+    const ShaderResource* image_by_srt_offset(uint32_t srt_offset,
+                                              ImageResourceRequirement requirement) const;
+    const ShaderResource* image_by_sgpr_base(uint32_t sgpr,
+                                             ImageResourceRequirement requirement) const;
+    const ShaderResource* image_by_fetch_pc(uint32_t pc,
+                                            ImageResourceRequirement requirement) const;
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };

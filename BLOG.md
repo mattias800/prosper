@@ -36,6 +36,19 @@ That leaf went 1110 ms to 498, and the title screen from **9.76 to 11.55 frames 
 picture is unchanged, which is the point.
 [#3309](https://github.com/mattias800/prosper/pull/3309)
 
+### The line that said the texture was missing was printing the wrong field
+
+No picture. Stray's title screen renders its menu over black, and five image samples report their
+descriptor unresolved; the reject line prints four provenance fields, all empty, which everyone
+(including this lane, at first) read as "the texture is not there". Four of the five sites also say
+the shader never wrote the register the descriptor lives in — which means none of those four routes
+could have fired, so the emptiness restated the question instead of answering it. The route that did
+run was the one field the line never printed, and in three of the four it had found something the
+whole time: a constant buffer sitting at exactly the requested register, thrown away for being the
+wrong kind of thing without a word in the log.
+[#3126](https://github.com/mattias800/prosper/issues/3126)
+[#1634](https://github.com/mattias800/prosper/issues/1634)
+
 ## 2026-09-03
 
 ### The frozen frame that gave five pictures now gives one, 3,875 times running

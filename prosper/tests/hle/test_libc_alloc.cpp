@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include "support/death_test.hpp"
 
 using namespace prosper;
 
@@ -35,6 +36,11 @@ int main(int argc, char** argv) {
     // The parent first proves that the quoted self-launch works, then requires these modes to
     // terminate before returning from the HLE call.
     if (argc == 2) {
+        // Every mode below this line is a child the parent requires to DIE; the `probe` mode is the
+        // control that proves the self-launch works and must still exit cleanly. Suppress the dump
+        // for all of them -- these corpses are never opened, and the handler that stores them stalls
+        // concurrent suites (#3269).
+        prosper::test::suppress_coredump();
         if (!strcmp(argv[1], "probe")) return 0;
         if (!strcmp(argv[1], "throwing-new")) {
             Hle::lookup(nid_hash("_Znwm"))(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0);

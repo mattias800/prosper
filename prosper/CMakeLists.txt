@@ -830,6 +830,7 @@ if(TARGET prosper_core)
     add_executable(test_raw_syscall tests/host/platform/test_raw_syscall.cpp)
     # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
     target_include_directories(test_raw_syscall PRIVATE src)
+    target_include_directories(test_raw_syscall PRIVATE tests)
     add_test(NAME raw_syscall COMMAND test_raw_syscall)
   endif()
 
@@ -901,6 +902,7 @@ if(TARGET prosper_core)
   # allocations intentionally share one compatible family on that host.
   add_executable(test_libc_alloc tests/hle/test_libc_alloc.cpp)
   target_link_libraries(test_libc_alloc PRIVATE prosper_core)
+  target_include_directories(test_libc_alloc PRIVATE tests)
   add_test(NAME libc_alloc COMMAND test_libc_alloc)
 
   # EventFlag/Sema delete-under-waiter safety (issue #104): delete wakes parked waiters with EACCES
@@ -1808,6 +1810,11 @@ if(TARGET prosper_core)
   add_executable(test_direct_descriptor_copy tests/gpu/recompiler/test_direct_descriptor_copy.cpp)
   target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
   add_test(NAME direct_descriptor_copy COMMAND test_direct_descriptor_copy)
+
+  add_executable(test_image_descriptor_class_lookup
+                 tests/gpu/recompiler/test_image_descriptor_class_lookup.cpp)
+  target_link_libraries(test_image_descriptor_class_lookup PRIVATE prosper_core)
+  add_test(NAME image_descriptor_class_lookup COMMAND test_image_descriptor_class_lookup)
 
   # Bounded graphics-shader cache: cached modules must match the direct recompiler byte-for-byte.
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
