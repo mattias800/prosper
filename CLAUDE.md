@@ -294,6 +294,18 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
 
+- **The branch is `main`. There is no `master`, and older text that names one is historical.**
+  The repository's history was rewritten around 2026-07-04; `main` carries the rewritten line and is
+  the default branch. The pre-rewrite `master` was left behind, went stale on 2026-09-02, and was
+  **deleted on 2026-09-04** — its tip is preserved as the tag `archive/pre-rewrite-master-2026-09-02`
+  if anyone ever needs it, and nothing unique lives there (same content as `main`, different SHAs).
+  This is worth a line because the failure mode was expensive rather than obvious: a correct branch
+  diffed against the stale `master` reported **3,296 commits of divergence**, and the session-trailer
+  gate below read **582** instead of 0 — so a *clean* branch looked contaminated, and the natural
+  repair (rebuild it onto `master`) moved good work onto the dead line. Instrument-trap rows and dated
+  status docs still say `origin/master` because they record what was true when written; do not
+  "correct" those, and do not run their commands verbatim. #3333.
+
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:
   branch-switching, staging, or `cmake --build` there collides with whatever someone else is
@@ -750,15 +762,15 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     ```bash
     F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
     B=$(mktemp)                    # mktemp, not a fixed name: several agents run this concurrently
-    git fetch origin -q && git show "origin/master:$F" > "$B"
+    git fetch origin -q && git show "origin/main:$F" > "$B"
     python3 prosper/tools/docs/check_numbered_table.py --ordered \
         --table-header Instrument --baseline "$B" "$F"
     git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py
     ```
     This matters most for `GAME_COMPAT_ORCHESTRATION.md`'s numbered tables. The gate requires rows to be
     unique and ascending, and requires that **no row present in the base is missing** (`--baseline`).
-    Note the local baseline is `origin/master`, while **CI passes `HEAD^1`** — the base *as of when the
-    event fired*. `origin/master` is the fresher and therefore stricter of the two, which is why it is
+    Note the local baseline is `origin/main`, while **CI passes `HEAD^1`** — the base *as of when the
+    event fired*. `origin/main` is the fresher and therefore stricter of the two, which is why it is
     the right one to check by hand; the gap between them is the subject of instrument trap 189.
     **Gaps are legal** — `--sequential` and its gapless rule were removed on 2026-08-17 (#2089) because a
     gap is usually another lane's unmerged number, which no edit of *your* branch can supply, so the check
@@ -769,11 +781,11 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     reading master alone is what produced the #2574/#2581 collision.
     **On a PR that touches a numbered table, run the gate against the MERGE RESULT immediately before
     merging** — `python3 prosper/tools/docs/check_merge_result.py` fetches, merges into
-    `origin/master` in the object database (no checkout, no index), and runs the gate on the result.
+    `origin/main` in the object database (no checkout, no index), and runs the gate on the result.
     A green `Docs` job is a statement about a merge that may no longer exist, and unlike a red one
     nobody re-derives it (#2211, instrument trap 189); this is the only check that sees a concurrent
     append, and it is stale the moment another lane lands, so run it last and merge promptly.
-    Confirm the diff really is `.md`-only — `git diff --name-only origin/master...HEAD | grep -v '\.md$'`
+    Confirm the diff really is `.md`-only — `git diff --name-only origin/main...HEAD | grep -v '\.md$'`
     should be empty. The exception is about the *diff*, not the intent; one stray file makes it an
     ordinary PR again.
     **This waives the CI wait only.** It does not waive independent review where review is warranted — a
@@ -939,10 +951,10 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     ```bash
     # Gate before pushing — answers "any?", expect 0. `grep -c` exits 1 on zero matches, so never
     # put it in an `&&` chain.
-    git log origin/master..HEAD --format=%B | grep -c '^Claude-Session:'
+    git log origin/main..HEAD --format=%B | grep -c '^Claude-Session:'
 
     # How many COMMITS carry one — a different question, and the one to quote as a statistic.
-    git log origin/master -100 --format=%H | while read h; do
+    git log origin/main -100 --format=%H | while read h; do
         git log -1 --format=%B "$h" | grep -q '^Claude-Session:' && echo "$h"; done | wc -l
     ```
     **The two commands disagree, systematically and always in the same direction.** Over the same

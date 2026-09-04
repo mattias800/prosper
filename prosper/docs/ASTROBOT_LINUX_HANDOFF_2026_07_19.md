@@ -432,7 +432,7 @@ paste title shader bytes into the repository.
 ```sh
 git fetch origin --prune
 git switch fix/issue-1054-astro-pcrel
-git rebase origin/master
+git rebase origin/main   # was origin/master; that branch was deleted (see CLAUDE.md)
 
 cd prosper
 cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=RelWithDebInfo
