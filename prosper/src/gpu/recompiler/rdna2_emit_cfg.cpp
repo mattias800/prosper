@@ -1992,11 +1992,15 @@ bool emit_cfg_state_machine(
     // can never newly reject a program that compiled before. Its cost is that a register saved in an
     // earlier phase and NOT saved again in this one is not re-armed here -- a hole that predates this
     // change and that the old code did not cover either, since its own set was per-region too. It is
-    // #3314, along with the reason neither the seed nor the hole has a regression arm: reaching this
-    // path needs a phased region nested inside a dispatcher (`initial_dispatch_active`), which is
-    // Astro Bot's `0x500571000` shape rather than a synthesizable fixture. The seed below is
-    // therefore UNCOVERED BY TESTS; `test_entry_m0_dispatcher` records the two fixtures that were
-    // tried and the named mechanism that blocked each.
+    // #3314. The seed below is UNCOVERED BY TESTS, and `test_entry_m0_dispatcher` records the two
+    // fixtures that were tried and the named mechanism that blocked each. It also records the shape
+    // that should work and was not tried: the multi-region path does NOT need a dispatcher nested
+    // inside a dispatcher. `emit_body` gates it on
+    // `phased.guarded || initial_dispatch_active || force_barrier_phases`, and the THIRD disjunct is
+    // set automatically -- an unguarded barrier-phased kernel whose `cfg_dispatch_safe` is false (a
+    // NESTED WAVE BRANCH) re-enters `emit_body` with `force_barrier_phases=true` and
+    // `initial_dispatch_active=0`, after which every phase goes to `emit_cfg_state_machine`. That is
+    // the ordinary route for such a kernel, not an exotic one.
     std::set<int> inherited_entry_m0;
     for (const int reg : entry_m0_may_hold)
         if (entry_m0_live(initial, reg)) inherited_entry_m0.insert(reg);

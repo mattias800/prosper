@@ -333,13 +333,21 @@ int main() {
     //       readlane are incompatible, and the readlane is how every other program here forces the
     //       dispatcher.
     //   unguarded two-phase kernel, no readlane          -> `emit_body` never takes the phased path:
-    //       it needs `phased.guarded || initial_dispatch_active || force_barrier_phases`. The
-    //       straight-line emitter handled it instead and refused the cross-phase read at pc5 from
-    //       the shared `RegState`'s own token -- a PASS for the wrong reason, which is why that arm
+    //       it needs `phased.guarded || initial_dispatch_active || force_barrier_phases`, and this
+    //       program satisfied none of the three. The straight-line emitter handled it instead and
+    //       refused the cross-phase read at pc5 from the shared `RegState`'s own token -- a PASS for
+    //       the wrong reason, green with the seed AND with the seed deleted, which is why that arm
     //       was deleted rather than kept.
     //
-    // Reaching it needs `initial_dispatch_active`, i.e. a phased region nested inside a dispatcher
-    // -- Astro Bot's `0x500571000` shape, not a ten-line fixture. Tracked as #3314.
+    // THE THIRD SHAPE, NOT TRIED, AND IT SHOULD WORK. This file previously said the path needs
+    // `initial_dispatch_active` -- a dispatcher nested inside a dispatcher. That is wrong, and the
+    // wrong reason is what closed the search: `force_barrier_phases` is the reachable disjunct and
+    // the code sets it ITSELF. An unguarded barrier-phased kernel whose `cfg_dispatch_safe` is false
+    // re-enters `emit_body` with `force_barrier_phases=true` and `initial_dispatch_active=0`, and
+    // `emit_phase` then routes every phase to `emit_cfg_state_machine`. The missing ingredient in
+    // fixture 2 was therefore a **nested wave branch**, not a nested dispatcher and not the
+    // readlane. That is the ordinary route for such a kernel, so the hole is on a common path.
+    // Tracked as #3314, which is where the fixture belongs.
     //
     // Measured mutation signatures, so a future reader can tell a real regression from a fixture
     // that drifted. Every one built cleanly (rc=0) before being believed.
