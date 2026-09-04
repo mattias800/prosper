@@ -480,6 +480,42 @@ two arms' tallies taken at different points in a run is the mistake that produce
 `PROSPER_WRITE_WATCH_MAX_KB` is an emergency host-wide range
 limit (zero/unset is unbounded); a declined watch always returns to exact comparison.
 
+`PROSPER_COMPUTE_BORROW_CENSUS=1` reports the other side of the same boundary, on the same cadence:
+whether a graphics sampled descriptor managed to lease the device image a compute dispatch had just
+produced, instead of re-reading the surface out of guest memory. Four `[compute-borrow-census]`
+lines, all running totals with their own denominators — the consumer's precondition partitioned by
+term, the borrow's outcome partitioned by gate (`no_cache_entry`, `export_unpublished`,
+`content_invalid`, `no_image`, `authority_changed`, `hit`), why `authority_changed` fired (a real
+overlapping guest write, an unarmed submit journal, or a cross-submit export; and what the page
+watch said), and the producer's publish gate partitioned the same way. A zero bucket still prints.
+
+Two of its fields answer questions nothing else can. On a lookup miss the variable additionally
+enables an O(cache) scan for an entry at the same guest address, which turns "nothing is cached
+under this key" into "an entry here disagrees on `tile_mode`" — the twenty-three-field cache key
+otherwise makes those indistinguishable. **That field list belongs to the EXACT key only.** When the
+exact key misses, the importer retries under a format-*aliased* key, and that key rewrites `format`
+and `vk_format` by construction — so scanning it would report those two as differing on every miss
+whether or not they were the reason, and would point a reader at exactly the normalisation the alias
+arm forbids. The retry is therefore not scanned, which is also why `exact_key_scans` (scans
+performed) and `no_cache_entry` (final outcomes) are different numbers. Read the field list against
+**`same_addr=`, and against nothing else** — a field bit and `same_addr` are incremented under one
+and the same condition, so that is the list's exact denominator. The three numbers on that line nest
+(`exact_key_scans` ⊇ non-`rescued` ⊇ `same_addr`), and dividing by either wider one dilutes the field
+list with lookups that found nothing at the address at all — which is the *other* decision-table row,
+the one where the producer is absent rather than keyed differently.
+
+`rescued=` counts the exact-key misses the format-alias retry then saved. Those are successful
+imports whose mask names `format`/`vk_format` by construction, so they are counted and their fields
+deliberately excluded — otherwise a title whose alias path routinely succeeds reports a field list
+dominated by the alias working as designed. And the `Unknown` that `guest_gpu_writes_since` returns —
+which its own header warns a caller cannot decompose — is split into the three parts that ARE
+separable from the borrow site: `journal_unarmed` (not armed on the consuming thread),
+`journal_unjournaled` (the producer's publish carried no submit serial, so it was stamped while the
+journal was inactive or already overflowed), and `journal_undecided` (armed, serial present — a
+different submit, or this submit's journal has since overflowed). The last name is deliberately
+vague, because it covers two causes this instrument cannot tell apart and a narrower name would be
+a claim rather than a count.
+
 Proven-full write-only storage targets at least 16 MiB do not copy their first successful result into
 an immediately redundant CPU source baseline. The submit journal remains the initial source authority;
 if another architectural writer invalidates it, the next invocation takes ordinary writeback and
