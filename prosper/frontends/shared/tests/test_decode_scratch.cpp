@@ -152,12 +152,22 @@ int main() {
         CHECK(pool.retained_bytes() == 0);
     }
 
-    // --- the knob: strict parsing, and a typo selects the SAFE sentinel --------------------------
+    // --- the knob, and WHICH WAY a typo fails ----------------------------------------------------
+    //
+    // This block is the record of a claim that was made here and was false. The header used to say
+    // a mistyped value "selects the SAFE sentinel"; these assertions say otherwise and always did.
+    // A malformed value keeps the 512 MiB DEFAULT, which leaves pooling fully ON -- and since this
+    // knob's main use is disarming the pool for an A/B, the dangerous typo is one meant to turn the
+    // optimisation off. Anyone restating the old claim has to delete a passing assertion to do it.
     CHECK(decode_scratch_budget_bytes(nullptr) == (512ull << 20));
     CHECK(decode_scratch_budget_bytes("") == (512ull << 20));
     CHECK(decode_scratch_budget_bytes("64") == (64ull << 20));
+    // Only the exact spelling disarms the pool...
     CHECK(decode_scratch_budget_bytes("0") == 0);
-    // Malformed keeps the default and says so on stderr; it must not parse to 0 or to garbage.
+    // ...and every near-miss of it does NOT. These are the spellings an operator actually types.
+    CHECK(decode_scratch_budget_bytes("0mb") == (512ull << 20));
+    CHECK(decode_scratch_budget_bytes("0MB") == (512ull << 20));
+    CHECK(decode_scratch_budget_bytes(" 0") == (512ull << 20));
     CHECK(decode_scratch_budget_bytes("64mb") == (512ull << 20));
     CHECK(decode_scratch_budget_bytes(" 64") == (512ull << 20));
 

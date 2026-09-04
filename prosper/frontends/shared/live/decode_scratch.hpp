@@ -32,9 +32,20 @@
 // call site and it restores exactly the bytes value-initialisation produced — but it is also the one
 // way to get this wrong silently, so it is stated in the API rather than left to the reader.
 //
-// `PROSPER_DECODE_SCRATCH_MB` bounds what a thread retains between references (default 512 MiB).
-// **0 retains nothing**, which is exactly the pre-pool behaviour: the sentinel that a mistyped value
-// selects is the SAFE one, per #3253 and `diagnostics/env_numeric.hpp`.
+// `PROSPER_DECODE_SCRATCH_MB` bounds what a THREAD retains between references (default 512 MiB).
+// Spelled `0` it retains nothing, which is the pre-pool behaviour exactly.
+//
+// **A mistyped value keeps the 512 MiB default, so pooling stays ON.** This is the direction that
+// matters and the first version of this comment had it backwards: it claimed a typo selected the
+// safe sentinel, which is false, and the misreading was doubled by passing "0 = retain nothing" as
+// `env_u64_or_default_capped`'s `default_note` -- that parameter glosses the DEFAULT, so the refusal
+// printed "keeping the default (512, 0 = retain nothing)", which reads as "512 retains nothing".
+//
+// The consequence is specific rather than theoretical. This knob's main use is disarming the pool
+// for an A/B, so the dangerous typo is one intended to turn the optimisation OFF -- `=0mb`, `=0MB`,
+// `= 0` -- and it leaves the arm fully armed. `env_numeric.hpp` does the right thing (refuse loudly,
+// keep the default), so the stderr line IS the signal, and it is the only one: nothing else in a run
+// says which arm you got. Read it before quoting a number from an arm you believe you disarmed.
 #pragma once
 
 #include <algorithm>
@@ -77,11 +88,12 @@ public:
         ~Lease() { release(); }
 
         // The requested extent. The backing store may be LARGER (a previous, bigger surface's
-        // buffer); nothing beyond `size()` is part of this lease.
+        // buffer); nothing beyond `size()` is part of this lease. `data()` for a zero-extent lease
+        // is UNSPECIFIED -- it may be a live pointer into a retained buffer where a fresh
+        // `std::vector<uint8_t>(0)` gave nullptr, so test `size()`, never `data() != nullptr`.
         uint8_t* data() { return bytes_.data(); }
         const uint8_t* data() const { return bytes_.data(); }
         size_t size() const { return size_; }
-        bool valid() const { return bytes_.size() >= size_; }
         uint8_t& operator[](size_t i) { return bytes_[i]; }
         const uint8_t& operator[](size_t i) const { return bytes_[i]; }
 
@@ -174,11 +186,12 @@ private:
     size_t max_retained_ = 0;
 };
 
-// Retention budget in bytes, read once. 0 = retain nothing, i.e. the pre-pool behaviour.
+// Retention budget in bytes, read once. Spelled `0` it retains nothing, i.e. the pre-pool
+// behaviour; a malformed value keeps the 512 MiB default, which leaves pooling ON (see the head).
 inline size_t decode_scratch_budget_bytes(const char* text) {
     const uint64_t mib = prosper::diag::env_u64_or_default_capped(
         "PROSPER_DECODE_SCRATCH_MB", text, 512ull, SIZE_MAX / (1024ull * 1024ull), "MiB",
-        "0 = retain nothing");
+        "512 MiB retained per thread; spell 0 exactly to retain nothing");
     return static_cast<size_t>(mib * 1024ull * 1024ull);
 }
 
