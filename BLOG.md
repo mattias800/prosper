@@ -21,6 +21,27 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-04
 
+### RenderDoc works on prosper now, and the first capture was a beautiful picture of the wrong thing
+
+No picture — or rather, 56 of them, all useless. RenderDoc has been installed on the dev box the
+whole time and unusable, because `renderdoccmd` only starts a capture on a **keypress** and every
+agent here runs headless. prosper now drives RenderDoc's in-application API itself, so a capture can
+be aimed at a frame ordinal or a wall-clock moment exactly like F8 and F9.
+
+The first working capture contained **zero draws**, and the reason is the good bit: prosper runs two
+Vulkan instances — one that presents, one that actually renders the game — and RenderDoc, asked
+politely to pick, picks the one holding the swapchain. Same build, same route, only the aim differing:
+
+| aimed at | chunks | draws | dispatches | pipelines |
+| --- | ---: | ---: | ---: | ---: |
+| whatever RenderDoc picks | 56 | **0** | **0** | **0** |
+| the renderer's device | **406** | **11** | **2** | **6** |
+
+That first capture isn't corrupt or truncated. It opens perfectly, converts perfectly, and contains
+nothing anyone wants — a working instrument reporting a confident negative. Worth remembering next
+time a tool says "nothing here".
+
+
 ### Two thirds of Stray's biggest render cost was the allocator, not the work
 
 No picture. The largest single leaf in a capture of Stray's 9.76 fps title screen is the graphics
