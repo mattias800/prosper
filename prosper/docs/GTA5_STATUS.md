@@ -6076,6 +6076,19 @@ program's own first dword** — so a differing prologue cannot explain the miss.
 
 ## Other open defects
 
+- **Prologue cutscene timeline/animation desynchronization at low framerates**: In the opening story mode
+  prologue cutscene (Bank Heist), the scripted sequence consists of six sequential camera angles:
+  1) Robber throws a woman to the floor, camera pans down with her on the floor;
+  2) Camera switches angle, looking up from the floor at the robbers;
+  3) Close-up shot on one robber's face speaking;
+  4) Zoomed-out shot, robber hits the teller window;
+  5) Close-up shot on the robber ordering the clerk to open the door;
+  6) Camera zooms out, robber kicks the security door open.
+  At sub-10 FPS throughput, RAGE cutscene progression (advancing against real process time via
+  `sceKernelGetProcessTimeCounter`) desynchronizes from rendered animation states: the presentation
+  immediately skips the first five camera angles and jumps directly to the robber kicking the door open,
+  with the woman already lying static on the floor. Once throughput reaches real-time targets, animation
+  event triggers align with the script timeline.
 - **#2445** — specific lowercase glyphs (`r`, `s`, `m`) dropped from UI text: "Ente ing Sto y Mode".
   Surrounding text is intact, so it is per-glyph, not a font failure.
 - **#2429** — the world cannot render on 32-wide devices: the EXEC-population-count fix requires

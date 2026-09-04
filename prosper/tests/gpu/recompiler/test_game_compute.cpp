@@ -702,6 +702,120 @@ int main() {
               "None coverage name contains NONE-COVERAGE");
         CHECK(std::string(seed_coverage_name(SeedCoverage::Partial)).find("PARTIAL-COVERAGE") != std::string::npos,
               "Partial coverage name contains PARTIAL-COVERAGE");
+
+        // #3328 B1/N2/N3: near-full coverage classification and reprove eligibility.
+        using prosper::frontend::classify_near_full_coverage;
+        using prosper::frontend::seed_verdict_reprove_eligible;
+
+        // classify_near_full_coverage:
+        CHECK(classify_near_full_coverage(0, 8294400),
+              "zero survivors classifies as near-full coverage");
+        CHECK(classify_near_full_coverage(0, 100),
+              "zero survivors on small target classifies as near-full coverage");
+        // Target < 1000 texels cannot be near-full unless 0 survived
+        CHECK(!classify_near_full_coverage(1, 999),
+              "sub-1000 texel target with 1 survivor is not near-full");
+        // 1000 texel target: 0.2% threshold is 2 texels (2 * 500 <= 1000)
+        CHECK(classify_near_full_coverage(2, 1000),
+              "1000 texels with 2 survivors clears 0.2% near-full bound");
+        CHECK(!classify_near_full_coverage(3, 1000),
+              "1000 texels with 3 survivors exceeds 0.2% near-full bound");
+        // 4K target (3840x2160 = 8,294,400 texels): minimap/cutout tolerance
+        CHECK(classify_near_full_coverage(16000, 8294400),
+              "4K target with 16000 unwritten texels (minimap cutout ~0.19%) classifies as near-full");
+        CHECK(!classify_near_full_coverage(17000, 8294400),
+              "4K target with 17000 unwritten texels (>0.2%) rejects near-full");
+
+        // seed_verdict_reprove_eligible (#3328 B1/N2):
+        // Full and None verdicts are always eligible for periodic re-proving
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Full, ~0ULL, false),
+              "Full coverage verdict is reprove-eligible");
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::None, ~0ULL, false),
+              "None coverage verdict is reprove-eligible");
+        // Default Partial verdict (untouched, no active optimization) seeds every time, no re-proving needed
+        CHECK(!seed_verdict_reprove_eligible(SeedCoverage::Partial, ~0ULL, false),
+              "unoptimized Partial verdict does not re-prove (always seeds)");
+        // Partial verdict with active layer mask optimization MUST periodically re-prove (B1)
+        constexpr uint64_t kLayer0Only = 0x1ULL;
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, false),
+              "Partial verdict with layer mask is reprove-eligible (B1 bounds staleness)");
+        // Partial verdict with active near-full coverage bypass MUST periodically re-prove (N2)
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, ~0ULL, true),
+              "Partial verdict with near-full coverage is reprove-eligible (N2 bounds staleness)");
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, true),
+              "Partial verdict with both layer mask and near-full is reprove-eligible");
+
+        // B1 cycle verification: Partial with layer mask fires on interval and resets
+        {
+            uint32_t partial_skips = 0;
+            const bool eligible = seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, false);
+            CHECK(eligible, "layer-masked partial is eligible");
+            bool fired = false;
+            for (uint32_t i = 0; i < 3; ++i) {
+                if (eligible && seed_reprove_due(partial_skips, 3)) fired = true;
+            }
+            CHECK(fired && partial_skips == 0,
+                  "reprove_eligible Partial verdict fires re-proving at interval and resets counter");
+        }
+
+        // #3328 B2: the >64-layer array mask. Each arm below FAILS on the previous revision, which
+        // set `written_layers = (survived < texels) ? 1 : 0` for these resources -- bit 0 as a
+        // boolean. That is not a conservative approximation: the retile/pack consumers read bit
+        // `layer`, so layers 1..63 were skipped as untouched while layers >= 64 fell through the
+        // `layer < 64` guard and were written from non-zero-filled scratch.
+        {
+            using prosper::frontend::classify_array_layer_coverage;
+            using prosper::frontend::array_all_layers_written;
+
+            // A fully-written 100-layer array. Old code: written_layers == 1 (bit 0 only).
+            std::vector<size_t> none_survived(100, 0);
+            const auto deep_full = classify_array_layer_coverage(100, none_survived.data(), 64,
+                                                                 /*survived=*/0, /*texels=*/6400);
+            CHECK(deep_full.written_layers == ~0ULL,
+                  "depth>64 publishes the no-masking sentinel, never a bit-0 boolean");
+            CHECK(!deep_full.exact, "depth>64 mask is marked inexact");
+            CHECK(!array_all_layers_written(100, deep_full.written_layers, deep_full.exact),
+                  "an inexact sentinel mask must not promote coverage to Full");
+
+            // The dangerous direction: NOTHING written on a >64-layer array. A sentinel that were
+            // trusted would compare all-ones and promote an untouched surface to Full.
+            std::vector<size_t> all_survived(100, 64);
+            const auto deep_none = classify_array_layer_coverage(100, all_survived.data(), 64,
+                                                                 /*survived=*/6400, /*texels=*/6400);
+            CHECK(!array_all_layers_written(100, deep_none.written_layers, deep_none.exact),
+                  "untouched depth>64 array is never promoted to Full");
+            CHECK(!deep_none.any_written_partial, "untouched array reports no partial write");
+
+            // No per-layer counts (layer_texels == 0) had the identical defect at ANY depth.
+            const auto no_counts = classify_array_layer_coverage(8, nullptr, 0, 10, 100);
+            CHECK(no_counts.written_layers == ~0ULL && !no_counts.exact,
+                  "missing per-layer counts disable masking rather than approximate it");
+
+            // Exactly 64 layers still works and must not use the UB `1ULL << 64`.
+            std::vector<size_t> s64(64, 0);
+            const auto d64 = classify_array_layer_coverage(64, s64.data(), 16, 0, 1024);
+            CHECK(d64.exact && d64.written_layers == ~0ULL,
+                  "depth==64 computes a real all-ones mask");
+            CHECK(array_all_layers_written(64, d64.written_layers, d64.exact),
+                  "depth==64 fully written is promoted");
+
+            // Ordinary masked case still behaves: layers 0 and 2 of 4 written.
+            std::vector<size_t> mixed{0, 16, 0, 16};
+            const auto part = classify_array_layer_coverage(4, mixed.data(), 16, 32, 64);
+            CHECK(part.exact && part.written_layers == 0b0101ULL,
+                  "per-layer mask is exact below 64 layers");
+            CHECK(!array_all_layers_written(4, part.written_layers, part.exact),
+                  "partially written array is not promoted");
+
+            // The ONE input where `exact` decides the answer. Below 64 the comparison is against
+            // (1<<depth)-1, which ~0ULL fails anyway; above 64 the depth guard returns first. So
+            // depth==64 with no per-layer counts is the only case that can catch a future edit
+            // deleting the `!exact ||` guard -- and without this arm, deleting it passes everything.
+            const auto d64_nocounts = classify_array_layer_coverage(64, nullptr, 0,
+                                                                    /*survived=*/10, /*texels=*/1024);
+            CHECK(!array_all_layers_written(64, d64_nocounts.written_layers, d64_nocounts.exact),
+                  "a depth-64 sentinel mask must not promote an unmeasured surface to Full");
+        }
     }
 
     // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is

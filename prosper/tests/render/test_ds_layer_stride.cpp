@@ -314,6 +314,33 @@ int main() {
               "a preserving write outside every plane of this surface invalidates nothing");
     }
 
+    // ---- 10. Cube depth selection accepts partial cubes (e.g. 5 faces in GTA V) ----------------
+    {
+        constexpr uint64_t kCubeBase = 0x2094ec0000ull;
+        constexpr uint32_t kW = 512, kH = 512;
+        auto& ds_cache = prosper::test::persistent_ds_cache();
+        for (uint32_t slice = 0; slice < 5u; ++slice) {
+            PersistentDsKey key{};
+            key.dr = kCubeBase;
+            key.dw = kCubeBase;
+            key.w = kW;
+            key.h = kH;
+            key.slice = slice;
+            auto& img = ds_cache[key];
+            img.depth_valid = true;
+            img.layout_initialized = true;
+            img.image = reinterpret_cast<VkImage>(static_cast<uintptr_t>(0x1234 + slice));
+            img.last_depth_write = 100 + slice;
+        }
+        const auto sel = prosper::test::select_persistent_ds_cube_depth(kCubeBase, kW, kH);
+        check(sel.present_mask == 0x1fu, "5-face cube reports present_mask 0x1f");
+        check(sel.overlay_version == 104, "overlay_version matches newest face last_depth_write");
+        for (uint32_t slice = 0; slice < 5u; ++slice) {
+            check(sel.faces[slice] != nullptr, "face 0..4 is populated");
+        }
+        check(sel.faces[5] == nullptr, "face 5 is null");
+    }
+
     if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }
     std::fprintf(stderr, "== PASS ==\n");
     return 0;
