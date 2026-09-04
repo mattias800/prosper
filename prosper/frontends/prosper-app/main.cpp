@@ -2031,8 +2031,18 @@ int main(int argc, char** argv) {
     void* renderdocDevicePointer = nullptr;
     uint64_t renderdocOpenedAtGuestPresent = 0;
     uint64_t renderdocOpenIterations = 0;
-    const uint64_t renderdocMaxIterations =
-        prosper::frontend::parse_capture_frame(getenv("PROSPER_RENDERDOC_MAX_ITERS")) ?: 2000;
+    // `?:` was a GNU extension and the repo's only use; spelled out so MSVC and -Wpedantic are clean.
+    // Note the contract differs from the two TRIGGERS deliberately: a malformed trigger disables
+    // itself, because firing at an unintended moment is worse than not firing. This is a safety CAP,
+    // not a trigger -- disabling it would mean an unbounded span -- so a malformed or zero value
+    // falls back to the default, and says so rather than doing it quietly.
+    const uint64_t renderdocMaxItersParsed =
+        prosper::frontend::parse_capture_frame(getenv("PROSPER_RENDERDOC_MAX_ITERS"));
+    const uint64_t renderdocMaxIterations = renderdocMaxItersParsed ? renderdocMaxItersParsed : 2000;
+    if (getenv("PROSPER_RENDERDOC_MAX_ITERS") && !renderdocMaxItersParsed)
+        std::fprintf(stderr, "[renderdoc] PROSPER_RENDERDOC_MAX_ITERS is not a usable count; using "
+                             "the default cap of %llu iterations\n",
+                     (unsigned long long)renderdocMaxIterations);
     const bool renderdocWanted = scheduledRdocFrame != 0 || automaticRdocAfter.delay_ns() != 0;
     if (renderdocWanted) {
         auto& rdoc = prosper::frontend::RenderDocCapture::instance();
@@ -2068,7 +2078,15 @@ int main(int argc, char** argv) {
     };
     auto arm_renderdoc_capture = [&](const char* why) {
         auto& rdoc = prosper::frontend::RenderDocCapture::instance();
-        if (!rdoc.available() || renderdocCaptureOpen) return;
+        if (!rdoc.available()) return;
+        if (renderdocCaptureOpen) {
+            // Both axes can come due inside one still-open span. Say so: the second trigger has been
+            // consumed and will not fire again, and a reader who set both deserves to know which one
+            // actually opened the capture they got.
+            std::fprintf(stderr, "[renderdoc] %s came due while a capture was already open; it is "
+                                 "consumed without opening a second one\n", why);
+            return;
+        }
         renderdocDevicePointer = renderdoc_device_pointer();
         if (!renderdocDevicePointer)
             std::fprintf(stderr, "[renderdoc] WARNING: the live renderer has not published a Vulkan "
@@ -3064,6 +3082,29 @@ int main(int argc, char** argv) {
         }
     }
 
+    // B1 (#3322 review): the span closes at the TOP of the loop, so every exit path -- --frames
+    // satisfied, SDL_EVENT_QUIT, or the elapsed trigger firing shortly before a title exits -- left
+    // an armed capture open and the artifact was lost with no line saying so. That is precisely the
+    // silent-instrument failure this trigger exists to prevent, so it is closed here too.
+    //
+    // Unlike its F8 sibling below, this CLOSES rather than cancels. RenderDoc decides for itself
+    // whether the span held anything: a span containing real work is written and worth having even
+    // though it ended at shutdown rather than on a guest present, and one containing nothing returns
+    // 0 and reports ABANDONED. Either way the run says what happened, which cancelling could not.
+    if (renderdocCaptureOpen) {
+        renderdocCaptureOpen = false;
+        const std::string rdocPath =
+            prosper::frontend::RenderDocCapture::instance().end(renderdocDevicePointer);
+        if (rdocPath.empty())
+            std::fprintf(stderr, "[renderdoc] capture ABANDONED at shutdown after %llu app-loop "
+                                 "iteration(s) -- RenderDoc recorded no API work in the span\n",
+                         (unsigned long long)renderdocOpenIterations);
+        else
+            std::fprintf(stderr, "[renderdoc] capture written: %s (closed by SHUTDOWN after %llu "
+                                 "app-loop iteration(s), NOT by a guest present -- it may hold only "
+                                 "part of a frame)\n",
+                         rdocPath.c_str(), (unsigned long long)renderdocOpenIterations);
+    }
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);

@@ -15,7 +15,7 @@
   versions this struct explicitly (`eRENDERDOC_API_Version_*`) precisely so a consumer can pin one;
   prosper requests **1.4.1**, well below the installed 1.45, so an older RenderDoc still works.
 - **Prosper glue lives elsewhere:** the loader, the frame triggers and the capture-path reporting are
-  prosper's own code in `frontends/shared/diagnostics/renderdoc_capture.{hpp,cpp}`. This directory is
+  prosper's own code in `frontends/shared/diagnostics/renderdoc_capture.hpp` (header-only). This directory is
   the unmodified upstream header.
 
 Do not edit this header — keep it byte-identical to upstream so the vendored copy is auditable and

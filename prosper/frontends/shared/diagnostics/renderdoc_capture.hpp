@@ -66,12 +66,18 @@ public:
     // perfectly valid and contains no draws -- measured on The Messenger before this parameter
     // existed (#3321): 56 chunks, every one of them presentation.
     //
-    // prosper runs TWO Vulkan instances. prosper-app owns one for presentation (main.cpp), and the
-    // live renderer owns another (tests/fixtures/render_runner.h -- the directory name is a
-    // misnomer; that header IS the renderer), which it publishes through
-    // prosper::gpu::set_shared_vulkan_context. Every guest draw and dispatch happens on the
-    // renderer's. Passing NULL lets RenderDoc pick, and it picks the one holding the swapchain --
-    // the presentation device, whose entire contribution is a blit and a present.
+    // On the default headless route prosper runs TWO Vulkan instances. prosper-app owns one for
+    // presentation (main.cpp), and the live renderer owns another (tests/fixtures/render_runner.h --
+    // the directory name is a misnomer; that header IS the renderer), which it publishes through
+    // prosper::gpu::set_shared_vulkan_context, and every guest draw and dispatch is on the
+    // renderer's. Two is this route's count and not an invariant: live_compute.cpp can create a
+    // third private instance when it declines to adopt the renderer's, and present unification
+    // (#1270) can collapse the two into one. Hence the caller passes the device rather than the
+    // trigger assuming a topology. Passing NULL lets RenderDoc pick the device, and RenderDoc documents that choice
+    // as arbitrary; here it took the one holding the swapchain -- the presentation device, whose
+    // entire contribution is a blit and a present. So the rule is to pass the device ALWAYS, not to
+    // rely on the observed pick: a choice that is arbitrary and happens to be right will not stay
+    // right.
     //
     // So the caller passes the renderer's VkInstance, converted with RenderDoc's own macro. NULL
     // remains meaningful: it captures whatever RenderDoc would have chosen, which is the right

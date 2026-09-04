@@ -90,16 +90,25 @@ capture *explicitly*, so they need neither a keypress nor a present. prosper dri
 
 ### Aim it at the RENDERER's device. A capture of the wrong one looks perfectly healthy.
 
-**prosper runs two Vulkan instances.** prosper-app owns one for presentation (`main.cpp`); the live
-renderer owns another (`tests/fixtures/render_runner.h` — that header *is* the renderer) and
-publishes it through `prosper::gpu::set_shared_vulkan_context`. Every guest draw is on the
-renderer's. Passing NULL lets RenderDoc choose and **it chooses the swapchain's** — the presentation
-device. Measured on *The Messenger*, same build and route, only the aim differing:
+**On the default headless route prosper runs two Vulkan instances.** prosper-app owns one for
+presentation (`main.cpp`); the live renderer owns another (`tests/fixtures/render_runner.h` — that
+header *is* the renderer) and publishes it through `prosper::gpu::set_shared_vulkan_context`. On that
+route every guest draw is on the renderer's. **Two qualifications**: `live_compute.cpp:2913` can
+create a *third*, private instance when it declines to adopt the renderer's, and present unification
+(#1270) can collapse the two into one when the renderer's instance is surface-capable — so "two" is
+this route's count, not an invariant.
 
-| aimed at | chunks | `vkCmdDrawIndexed` | `vkCmdDispatch` | pipelines |
-| --- | ---: | ---: | ---: | ---: |
-| NULL (RenderDoc picks) | 56 | **0** | **0** | **0** |
-| the renderer's instance | **406** | **9** | **2** | **6** |
+Passing NULL lets RenderDoc choose the device. RenderDoc documents that choice as arbitrary; observed
+here (n=1) it took the one holding the swapchain. **The lesson is therefore "always pass the device
+explicitly", not "it picks the swapchain"** — an arbitrary choice that happens to be right once is
+worse than a wrong one, because it will not stay right. Measured on *The Messenger*, same route and
+identical span logic, differing only in which device the capture is aimed at (two builds, one edit
+apart):
+
+| aimed at | chunks | `vkCmdDrawIndexed` | `vkCmdDispatch` | graphics pipelines | compute pipelines |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NULL (RenderDoc picks) | 56 | **0** | **0** | **0** | **0** |
+| the renderer's instance | **406** | **9** | **2** | **6** | **1** |
 
 The 56-chunk capture is not corrupt and not truncated — it is a **complete, valid capture of the
 wrong device**, and it converts and opens perfectly while containing nothing anyone wants. It reads
