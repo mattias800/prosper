@@ -1061,6 +1061,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_module_label PRIVATE prosper_core)
   add_test(NAME guest_module_label COMMAND test_guest_module_label)
 
+  # The frame-pointer walk shared by the fault reporter and PROSPER_HWBP_STACK. It dereferences
+  # guest-controlled pointers inside a signal handler, so every stop condition (cycle, unreadable
+  # frame, depth cap) is a safety property. Header-only; no dump, no device.
+  add_executable(test_rbp_chain tests/host/fault/test_rbp_chain.cpp)
+  target_link_libraries(test_rbp_chain PRIVATE prosper_core)
+  add_test(NAME rbp_chain COMMAND test_rbp_chain)
+
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
   add_executable(test_platform_ui tests/hle/service/test_platform_ui.cpp)
