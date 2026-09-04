@@ -4,9 +4,16 @@
 AGC path, but **no real frame is ever composited** — the only picture prosper produces is a flat
 white 3840x2160 clear, which is not content. It has not reached rung 1.
 
-The blocker is **not** a memory shortage and **not** anything prosper refuses: the guest exhausts
-its own 511.75 GiB virtual-address arena and calls `abort()`. See *Blocker 2, re-framed*
-(2026-09-05) for the mechanism, the disassembly and the one measurement still outstanding.
+**Blocker 2 is FIXED (2026-09-05).** It was not a memory shortage and not anything prosper refused:
+two unregistered `libScePsml` NIDs answered `SCE_OK` and left the caller's out-struct untouched, so
+the guest read stack residue as a count, multiplied it by 16, and asked its allocator for a quarter
+of a petabyte — exhausting the 511.75 GiB virtual-address arena it had reserved at boot. Registering
+both to report failure takes the guest from **dying at 8.6 s in every run** to **running the full
+200 s window and 39,920 frames** with no `PS5 Out of Memory`, no `Fatal error!` and no `SIGSEGV`.
+See *Blocker 2, re-framed* for the mechanism and the disassembly.
+
+The rung is still 0 until a **rendered frame** is captured: a guest that reaches its frame loop is
+not a picture, and this fix makes no claim about the renderer.
 
 First brought up 2026-08-22 from nothing: no tracker, no `COMPATIBILITY.md` row, no route, no prior
 work of any kind. Everything below is from that session unless a link says otherwise.
@@ -384,6 +391,70 @@ PROSPER_HWBP=0x1562753 PROSPER_PEEK="rbx:0x20,0x28,0x48,0x30" \
 `0x1562753` is on the OOM branch only, so it fires exactly once and reports base / end / cursor /
 size at the instant of the decision.
 
+### The measurement, and the cause (2026-09-05)
+
+The run above fired exactly once. `rdi` / `rbx` = `0x41d2ca638` (pool 0) and `rax` = `0x9fc0000000`
+(its end VA), both matching the offline derivation. Then:
+
+| quantity | value |
+| --- | --- |
+| arena cursor before the failing request | **arena + 66.354 GiB** (the commit map predicted 66.4) |
+| the failing request | **0xf484c0000000 = 244.5 TiB, in ONE allocation** |
+| arena free at the moment of the assert | **87%** |
+
+So it is branch (A), and nothing leaked. **The size is different on every run** — `0xf484c0000000`
+and `0xff599e000000` on two runs of one build — which is what identifies it as *stack residue*
+rather than a computation, and is also why an attempt to filter a breakpoint on the observed value
+(`PROSPER_HWBP_R14=…`) never fired. That silence was read as silence, not as a small number.
+
+`PROSPER_HWBP_STACK=20` (added for this, `src/host/fault/rbp_chain.hpp`) gives the caller chain, and
+every link was then confirmed by disassembling the named call site:
+
+```text
+[hwbp-stack] #1 eboot+0x156234d eboot+0x1603bfd eboot+0xe74bbe eboot+0x17eed93 … eboot+0xbf
+```
+
+`eboot+0xe74bbe` is the return address of the allocation, inside `eboot+0xe74b20`:
+
+```text
+e74b51  mov $0x137,%edi ; call <sceSysmoduleLoadModule>
+e74b74  call 0x5001cf0                    ; -> jmp 0x8eb1300 = libScePsml::3WVD91e12ZQ   -> r15d
+e74b8e  lea -0x48(%rbp),%rdi              ; an OUT struct, NOT initialised by the guest
+e74b96  vmovups %ymm0,0x18(%rbx)          ;   (the zeroing here targets a DIFFERENT buffer)
+e74b9e  call 0x5001d00                    ; -> jmp 0x8eb1310 = libScePsml::+2KpvixvL6E   -> eax
+e74ba3  or %r15d,%eax ; jne 0xe74dc2      ; either non-zero -> clean early return
+e74bac  mov -0x38(%rbp),%rdi              ; N := out[+0x10]   (uninitialised stack)
+e74bb5  shl $0x4,%rdi                     ; size = N * 16
+e74bb9  call <FMemory::Malloc>            ; ~244 TiB
+```
+
+Those are the same two NIDs whose `[prosper] unimplemented: … -> returning 0` lines appear
+immediately above the banner in every run log. **The dispatcher's `return 0` is a success claim, and
+for a contract with out-parameters that is a lie** — the same shape as *Metaphor: ReFantazio*'s
+`sceFontRenderCharGlyphImage` (#2951), which divided by the untouched value where this one
+multiplies by it.
+
+The fix registers both to report failure. It is not a shim: `eboot+0xe74dc2` is a stack-cookie check,
+the epilogue and `ret`, so a non-zero return is the guest's **own** "this feature is unavailable"
+path, and prosper is answering truthfully that it does not implement the library. `CONFIDENCE: HIGH`
+that non-zero is correct and graceful (disassembled); `CONFIDENCE: LOW` on the specific value, since
+libScePsml is absent from the PS5 3.20 reference set — the guest tests only zero versus non-zero.
+Pinned by `tests/hle/service/test_psml_unimplemented.cpp`, which transcribes the guest's `or`/`jne`
+as a predicate and carries the counter-arm (with both calls answering 0 the same predicate reaches
+the allocation).
+
+Measured effect, `PROSPER_NO_COMPUTE=1 boot_trace`, default route:
+
+| | before | after |
+| --- | --- | --- |
+| guest lifetime | dies at **8.6 s**, every run | **200 s window survived** (killed by the harness, `EXIT=137`) |
+| frames | — | **39,920** at t=189.3 s |
+| `PS5 Out of Memory` / `Fatal error!` / `SIGSEGV` | 1 / 1 / 1 | **0 / 0 / 0** |
+| audio | — | `[audio2] port1: …` — the audio layer is live |
+
+**Sifu (`PPSA03001`) is NOT fixed by this.** It calls `libScePsml` zero times and its identical
+banner has a different cause; see the corrected `## Ruled out` row.
+
 ## Ruled out
 
 Each row is an executed experiment, not an opinion.
@@ -407,7 +478,7 @@ Each row is an executed experiment, not an opinion.
 | The `SIGSEGV at addr=(nil)` is a terminal-frame **null read** that `PROSPER_NULL_PAGE=1` would satisfy — the *Beneath* (`PPSA27640`) shape | Falsified 2026-09-05 on `c067aeef`. Three arms of the doc repro, `tools/screenshot --seconds 5 --count 12`, fresh save roots per arm: **A** the repro as written; **B** = A + `PROSPER_NULL_PAGE=1`; **C** = `PROSPER_GUEST_ARGS=` (empty, the UE4 recipe used by *Dragon Quest VII* / *Crisis Core* / *Little Nightmares III*) + `PROSPER_NULL_PAGE=1`. All three die identically: `PS5 Out of Memory:` at ~8.6 s, then `Fatal error!`, then `guest thread ended: kind=2 detail=SIGSEGV at addr=(nil) rip=0x5c0004a20 (image+0x1b0004a20)`, `stop=guest-fault source-distinct=1 pixel-distinct=1 guest=faulted status=GUEST-FAULT`, one saved frame whose manifest `source` is `composited` — the known flat white 3840x2160 clear. The fault is UE's crash handler running after the assert, exactly as this document already said; the flag changes nothing because there is no low read to satisfy. **The same three arms also clear `-force-gfx-direct`**: dropping it (arm C) changes neither the timing nor the outcome, so the Unity-vs-UE4 guest-argument variable is not in play on this title either. |
 | The guest asserts because a prosper memory call **refused** something | Falsified 2026-09-05 on `c067aeef`, `PROSPER_MEMLOG=1`, 38,035-line run log. Between the halving probe and the assert there is **not one failing memory call**: every `sceKernelBatchMap` in the run answers `-> 0x0`, the last of them 21 lines before the `PS5 Out of Memory:` banner. The `PS5 Out of Memory` figures are UE's own arithmetic over its own pool, and the arithmetic closes exactly — see *Blocker 2, re-framed*. |
 | The `LogDataTable … Fatal` line just before the memory report is the assert | It is UE's log-category **verbosity listing** (`%-40s %-12s`, empty message body), and it lands ~27,000 log lines before the crash in both runs. Restated here because it looks exactly like a fatal assert when grepped for. |
-| `libScePsml::3WVD91e12ZQ` / `+2KpvixvL6E`, reached immediately before the OOM, are implicated | Not shared with the other carrier: **Sifu calls `libScePsml` zero times** and asserts identically. Their position in Khazan's log is proximity, not evidence. |
+| `libScePsml::3WVD91e12ZQ` / `+2KpvixvL6E`, reached immediately before the OOM, are implicated | **WRONG, and corrected 2026-09-05: they ARE the cause on this title.** The original evidence is sound and its conclusion does not follow from it. *Sifu* calling `libScePsml` zero times and asserting identically rules them out as a **shared** cause — Sifu's OOM prints the same banner for a different reason, and is untouched by the fix — but says nothing about Khazan, and the row generalised from one title to the other. The caller chain from the failing allocation (`PROSPER_HWBP_STACK`) lands on `eboot+0xe74bbe`, and the two calls immediately above it are these NIDs; unregistered, they answered `SCE_OK` and left the out-struct untouched, so the guest read stack residue as a count. Fixed by registering both to report failure. Recorded rather than deleted because the mistake is instructive: *proximity is not evidence* was the right instinct and the disproof offered for it was about a different title. |
 
 ## Evidence
 
