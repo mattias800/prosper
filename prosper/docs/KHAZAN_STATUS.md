@@ -4,6 +4,10 @@
 AGC path, but **no real frame is ever composited** — the only picture prosper produces is a flat
 white 3840x2160 clear, which is not content. It has not reached rung 1.
 
+The blocker is **not** a memory shortage and **not** anything prosper refuses: the guest exhausts
+its own 511.75 GiB virtual-address arena and calls `abort()`. See *Blocker 2, re-framed*
+(2026-09-05) for the mechanism, the disassembly and the one measurement still outstanding.
+
 First brought up 2026-08-22 from nothing: no tracker, no `COMPATIBILITY.md` row, no route, no prior
 work of any kind. Everything below is from that session unless a link says otherwise.
 
@@ -162,6 +166,13 @@ parameter error.
 
 ## Blocker 2 — the guest calls its own OOM handler at ~6 s (OPEN; the direct-memory reading below is superseded)
 
+> **Read *Blocker 2, re-framed* (2026-09-05) first.** This section and the 2026-08-23
+> re-measurement below are both kept, because their negative results still stand, but the
+> assert is now known to be an **address-space** decision the guest makes about its own
+> 511.75 GiB arena, with no Sony call on the path at all — so every question phrased in
+> terms of physical memory, the direct-memory pool or the advertised budget is asking
+> about the wrong quantity.
+
 At ~6 s the guest prints its own out-of-memory report and asserts:
 
 ```text
@@ -263,6 +274,116 @@ handler takes over. The next step is the guest's own disassembly at that call si
 memory-layer experiment: every memory-layer question this document could ask has now been answered
 in the negative. Tracked separately as the reframed blocker.
 
+## Blocker 2, re-framed — the guest exhausts its OWN virtual-address arena, and no prosper call is involved (2026-09-05)
+
+Measured on `c067aeef` (`origin/main`) with `tools/screenshot`, `PROSPER_MEMLOG=1`, and offline
+disassembly of the flattened eboot (`tools/il2cpp/prx_to_elf.py` + `tools/re/xref.py` + `objdump`).
+Nothing here needed a new diagnostic in prosper.
+
+### The `SIGSEGV at addr=(nil)` is the guest calling `abort()`
+
+It is not a null dereference, it is not in the eboot, and it is not a defect to chase. The chain,
+each link checked by disassembly rather than by trusting the rbp walk:
+
+* Backtrace frame 0 is `eboot+0x1565b55`, the instruction **after** `call 0x8eafbb0`, and
+  `0x8eafbb0` is a PLT thunk: `jmp *0xd0ab2d8(%rip); push $0x5ac`.
+* GOT slot `0xd0ab2d8` -> `DT_JMPREL` entry -> symbol index 1487 -> `L1SBTkC+Cvw#1#z`. That NID has
+  exactly one hit in the PS5 3.20 reference set: `libSceLibcInternal.c`'s `__ptr_abort`. The
+  adjacent thunk `0x8eafbe0` is `qdGFBoLVNKI` = `quick_exit`; both are followed by `ud2`.
+* The fault rip `0x5c0004a20` is not garbage. `BOOT_LIBC = 0x5c0000000`
+  (`src/host/image/boot_program.hpp`), and prosper preloads the dump's own
+  `sce_module/libc.prx` there, so the rip is **`libc.prx+0x4a20`**.
+* Disassembling that libc.prx gives the whole function:
+  `4a10: push %rbp; mov %rsp,%rbp; movl $0xa002000b,%fs:0x28; 4a20: int $0x45; nop; ud2`.
+  `int $0x45` is the PS5's deliberate-abort trap; from user space on Linux it raises **SIGSEGV with
+  `si_addr = 0`**, which is the entire origin of the `addr=(nil)` shape. The fault report's
+  `rbp == rsp` is exactly what that two-instruction prologue leaves, so the register state pins the
+  attribution as well as the address does.
+
+**The reason this cost a session is a prosper diagnostic defect, now fixed.** The fault line read
+`rip=0x5c0004a20 (image+0x1b0004a20)` — a libc.prx address labelled as an eboot offset 6.75 GiB past
+the end of a 250 MiB image. Three fault sites in `exec_image_linux.cpp` computed `rip - eboot_base`
+and printed a hard-coded `image+`, instead of using the shared module labeller `boot_program.hpp`
+has carried since #1659. They now call `format_guest_module_label`, so the same fault prints
+`libc.prx+0x4a20`; pinned by `tests/host/image/test_guest_module_label.cpp`.
+
+### The OOM is an ADDRESS-SPACE decision the guest makes about its own arena
+
+`PS5 Out of Memory:` is printed inline in a **bump allocator over a fixed virtual-address arena**, at
+`eboot+0x1562630`:
+
+```text
+1562737  mov %rbx,%rdi ; mov %r14,%rsi
+156273d  call *(%rax)            ; virtual method 0: cursor += size, returns the OLD cursor
+1562746  lea (%rax,%r14,1),%r13  ; newTop = oldTop + size
+156274a  mov 0x28(%rbx),%rax     ; the arena's END VA
+156274e  cmp %rax,%r13
+1562751  jbe 0x156278e           ; newTop <= end -> the allocation succeeds and nothing is printed
+1562753  sub 0x20(%rbx),%rax     ; else: the reported "size" is end - base, i.e. the ARENA SIZE
+1562765  call 0x1561c80          ; FPlatformMemory::GetStats() into a 0xa0-byte local
+1562772  lea ...                 ; "\r\nPS5 Out of Memory:\r\n    AvailablePhysical: %lld..."
+1562789  call 0x15d3110          ; FPlatformMemory::OnOutOfMemory(size, alignment=0)
+```
+
+The virtual method (`eboot+0x1589ad0`) is four instructions and touches nothing outside the object:
+`0x48 += size; 0x668 = 0x48 - 0x20`. **There is no Sony call anywhere on this path.** That is why
+`PROSPER_MEMLOG=1` shows every call succeeding right up to the banner — the arena is reserved once at
+boot and then sub-allocated entirely inside the guest. The `AvailablePhysical`/`UsedPhysical` figures
+are a courtesy print from `GetStats()`; they are not what the branch tests.
+
+Object layout, from the constructor at `eboot+0x15899b0`: `+0x20` base VA, `+0x28` end VA, `+0x30`
+size, `+0x38` granularity (0x10000), `+0x40` minimum chunk, `+0x48` **cursor, initialised to the
+base**, `+0x60` flag, `+0x68`.. per-size-class free lists.
+
+There are exactly two arenas (`GetPool`, `eboot+0x1562510`), and their bounds are the two lines the
+title prints at boot:
+
+| pool | range | size | the title's own banner |
+| --- | --- | --- | --- |
+| 0 | `[0x2000000000, 0x9fc0000000)` | **511.75 GiB** | `Memory va range 2000000000 - 9fc0000000` |
+| 1 | `[0x9fc0000000, 0xa000000000)` | 1 GiB | `Frame Buffer va range 9fc0000000 - a000000000` |
+
+prosper's `PROSPER_MEMLOG` line 7 is `reserve -> 0x2000000000 len=0x8000000000`: the guest asked for
+512 GiB at that address and got exactly that. **prosper is faithful here.**
+
+The failing pool is **pool 0** (`xor %edx,%edx` at `eboot+0x1603bd2`, with no write to `rdx` before
+the call at `+0x1603bf8`), reached from `FMallocBinned3`'s large-allocation path at
+`eboot+0x1603ad0` — anything with `size > 0x20000` or `alignment > 0x10` is rounded up to 64 KiB and
+taken straight from the arena, which then rounds it again to the next power of two whenever
+`2*size < arena size`.
+
+So the title exhausts **511.75 GiB of its own virtual address space** while holding 2.4 GiB of
+physical. "Out of memory" here means address space, not memory.
+
+### What the commit map already shows
+
+Reconstructed from the 15,377 `sceKernelBatchMap` VAs in one `PROSPER_MEMLOG=1` run — no new
+instrument:
+
+* **74 regions spaced exactly `0x20000000` (512 MiB) apart**, from arena+0.000 GiB to arena+36.5 GiB,
+  each beginning `+0xdf0000` into its block. That is Binned3's small-pool block table, one 512 MiB
+  block per size class.
+* then a clean jump to **arena+64.014 GiB**, with dense traffic above it — small pools occupy a fixed
+  `[0, 64 GiB)` sub-region and large allocations bump upward from 64 GiB.
+* highest committed VA `0x3099ab0000` = **arena+66.4 GiB**; total committed 2.77 GiB.
+
+So at the assert the cursor is somewhere in `[66.4 GiB, 511.75 GiB]`, and **which end it is at decides
+the shape of the bug**: near 66 GiB means one absurd request (> 445 GiB) and the next step is its
+caller; near 511 GiB means many large reservations that are never returned to the free lists, and the
+next step is a size census. This is written down before the measurement so the reading cannot be
+chosen after the fact.
+
+The measurement that settles it is one Vulkan-free run:
+
+```bash
+PROSPER_NO_COMPUTE=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_HWBP=0x1562753 PROSPER_PEEK="rbx:0x20,0x28,0x48,0x30" \
+  ./build-linux/boot_trace <DUMP_ROOT>/PPSA20447-app0
+```
+
+`0x1562753` is on the OOM branch only, so it fires exactly once and reports base / end / cursor /
+size at the instant of the decision.
+
 ## Ruled out
 
 Each row is an executed experiment, not an opinion.
@@ -281,8 +402,10 @@ Each row is an executed experiment, not an opinion.
 | The guest's `13.4 GiB available / 2.3 GiB used` report **contradicts** prosper's exhausted pool, so prosper is losing memory it handed out | It is not a contradiction. Those are UE's figures for the heap it reserved from prosper, sub-allocated 2.3 GiB of, and still considers 13.4 GiB free inside. Both statements are true at once. |
 | This title is in the pre-SDK-13 post-submit-visibility family (#2219) | It reports **SDK version 13**, so that contract is already armed for it. |
 | Blocker 2 is prosper's **direct-memory pool running out** | Falsified 2026-08-23 on the #2908 build. At the moment the guest asserts, the largest free block in the pool is **230.1 MiB** (Khazan) / **234.2 MiB** (Sifu), there are **zero** post-probe `alloc_main_dmem` failures, and **no prosper call of any kind fails in the entire run**. The 19 `ENOMEM (pool exhausted)` answers are the halving probe's own, by design, and *Unbound: Worlds Apart* takes the same 19 and renders its title screen. #2908. |
-| The **`ampr push-map … -> FAILED`** lines are lost page commits — the guest's allocator cannot commit, so it declares OOM | Falsified 2026-08-23 by case analysis over the refusal's own code path; no probe is involved and none is needed. `map_phys_at(fixed=true)` returns null only when `range_is_free_reservation` declined **and** `prosper_mmap_noreplace` then failed (`src/host/platform/posix_shim.hpp:318` — `MAP_FIXED_NOREPLACE`, so `EEXIST` means a host VMA already covers part of the range and `EINVAL` means the address or length is not page-aligned, which no page commit ever is); `map_at` adds two further nulls that cannot arise here — an unavailable memfd, and a failed `MAP_FIXED` over one of prosper's own free reservations. So for every page of a refused range, `prosper_reserved_range_state` (`src/hle/memory/hle_kernel_mem.cpp:2921`, and note it answers about **one address**, not a range) returns one of **0 / 1 / 2 / 4** on POSIX — the full contract is 0/1/2/3/4 with **3** Windows-only and **4** POSIX-only, enumerated at `:2906-2910`; the earlier "exactly three states" here was wrong and the comment two lines above the line it cited says so. **None of the four loses the guest memory.** **2 = committed**: the guest already holds it. **1 = reserved, uncommitted**: the lazy-commit fault arm backs it on first touch (`src/host/image/exec_image_linux.cpp:2150`, gated on exactly `== 1` and on `addr >= 0x1000000000`), and the arm is live in this address region rather than merely gated for it: a Sifu census run logs `[lazy-commit] #1 mapped page=0x20e1520000` — 131.5 GiB. That page is **not** one of the refused VAs, so it evidences the mechanism working up here, not the disposal of any particular refusal. **4 = reserved but declining lazy commit** disposes exactly as 0 does, and cannot arise here anyway: the AMM window is searched upward from `kAmmWindowSearch` = 1 TiB (`:2537`), far above these VAs. **0 = untracked**: nothing rescues it — the unified-memory fallback spans only `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit at **129.5-156.5 GiB** — so a genuinely lost commit would be a **fatal** SIGSEGV at that address. **Neither title takes one, and the fault each does take is the discriminator — by its ADDRESS, which is the part that carries it.** A lost commit at one of these VAs would fault *at* that VA, somewhere in 129.5-156.5 GiB. Both titles instead die at `SIGSEGV addr=(nil)`, on UE's own `int $0x45 ; nop ; ud2` trap, and a grep of both census runs finds no fault at any address in the Ampr range at all. (Both rescue arms also being floored far above zero is consistent with that but is not what settles it.) One thing the census below does **not** license, and an earlier version of this row claimed it did: it cannot say which of the four states the refused pages are in. `mincore` reports whether a **VMA exists**; `prosper_reserved_range_state` reports whether **prosper tracks the range**, and states 1 and 2 both require tracking (`hle_kernel_mem.cpp:2928`, `:2931` return 0 for anything absent from `g_maps`). Untracked-but-mapped is *part* of the population that produces an `EEXIST` refusal — the rest is tracked-and-committed, which `range_is_free_reservation` also declines — and a VMA census cannot separate them, so "the argument runs through states 1 and 2" was an inference from the wrong instrument — the same instrument-measures-X-claim-is-about-Y error this row already records once. The case analysis is complete over all four states, which is why it does not need to know. Refusing is protective: it is the #88 / #107 clobber the flavor discriminator exists to prevent. **Correction, and it matters more than the conclusion:** this row first rested on a measured "100% of refusals target memory the guest ALREADY HAS MAPPED", from a `mincore` probe of **one page** against ranges that are mostly `0x4000` — four host pages — while `MAP_FIXED_NOREPLACE` fails if *any* page is mapped. A quarter of each range was examined and the result asserted for all of it, in the direction the author wanted. Its replacement then claimed a structural argument that skipped the `prosper_mmap_noreplace` step and was not exhaustive over the null paths. Both were caught in review of #2947; the case analysis above is the third attempt and the first that closes. **The widened probe corroborates it, and this time the instrument measured what the claim says.** Every page of every refused range, whole-range `mincore`: Khazan **4,646 / 4,646**, Sifu **31,716 / 31,716** — 36,362 refusals, none containing an unmapped page. Splitting the alignment report also showed something the old line could not: 14 Khazan and 5 Sifu refusals have a page-aligned VA with an UNALIGNED length, a shape the single "page-aligned" flag hid entirely. #2908 / #2947. |
+| The **`ampr push-map … -> FAILED`** lines are lost page commits — the guest's allocator cannot commit, so it declares OOM | Falsified 2026-08-23 by case analysis over the refusal's own code path; no probe is involved and none is needed. `map_phys_at(fixed=true)` returns null only when `range_is_free_reservation` declined **and** `prosper_mmap_noreplace` then failed (`src/host/platform/posix_shim.hpp:318` — `MAP_FIXED_NOREPLACE`, so `EEXIST` means a host VMA already covers part of the range and `EINVAL` means the address or length is not page-aligned, which no page commit ever is); `map_at` adds two further nulls that cannot arise here — an unavailable memfd, and a failed `MAP_FIXED` over one of prosper's own free reservations. So for every page of a refused range, `prosper_reserved_range_state` (`src/hle/memory/hle_kernel_mem.cpp:2921`, and note it answers about **one address**, not a range) returns one of **0 / 1 / 2 / 4** on POSIX — the full contract is 0/1/2/3/4 with **3** Windows-only and **4** POSIX-only, enumerated at `:2906-2910`; the earlier "exactly three states" here was wrong and the comment two lines above the line it cited says so. **None of the four loses the guest memory.** **2 = committed**: the guest already holds it. **1 = reserved, uncommitted**: the lazy-commit fault arm backs it on first touch (`src/host/image/exec_image_linux.cpp:2150`, gated on exactly `== 1` and on `addr >= 0x1000000000`), and the arm is live in this address region rather than merely gated for it: a Sifu census run logs `[lazy-commit] #1 mapped page=0x20e1520000` — 131.5 GiB. That page is **not** one of the refused VAs, so it evidences the mechanism working up here, not the disposal of any particular refusal. **4 = reserved but declining lazy commit** disposes exactly as 0 does, and cannot arise here anyway: the AMM window is searched upward from `kAmmWindowSearch` = 1 TiB (`:2537`), far above these VAs. **0 = untracked**: nothing rescues it — the unified-memory fallback spans only `GPU_VA_LO`..`GPU_VA_HI` = 4-64 GiB (`exec_image_linux.cpp:1115-1116`) while these VAs sit at **129.5-156.5 GiB** — so a genuinely lost commit would be a **fatal** SIGSEGV at that address. **Neither title takes one, and the fault each does take is the discriminator — by its ADDRESS, which is the part that carries it.** A lost commit at one of these VAs would fault *at* that VA, somewhere in 129.5-156.5 GiB. Both titles instead die at `SIGSEGV addr=(nil)`, on an `int $0x45 ; nop ; ud2` trap — which is **`abort()` in the dump's own `libc.prx`, at `libc.prx+0x4a20`**, not UE's own code; identified 2026-09-05, see *Blocker 2, re-framed*, and a grep of both census runs finds no fault at any address in the Ampr range at all. (Both rescue arms also being floored far above zero is consistent with that but is not what settles it.) One thing the census below does **not** license, and an earlier version of this row claimed it did: it cannot say which of the four states the refused pages are in. `mincore` reports whether a **VMA exists**; `prosper_reserved_range_state` reports whether **prosper tracks the range**, and states 1 and 2 both require tracking (`hle_kernel_mem.cpp:2928`, `:2931` return 0 for anything absent from `g_maps`). Untracked-but-mapped is *part* of the population that produces an `EEXIST` refusal — the rest is tracked-and-committed, which `range_is_free_reservation` also declines — and a VMA census cannot separate them, so "the argument runs through states 1 and 2" was an inference from the wrong instrument — the same instrument-measures-X-claim-is-about-Y error this row already records once. The case analysis is complete over all four states, which is why it does not need to know. Refusing is protective: it is the #88 / #107 clobber the flavor discriminator exists to prevent. **Correction, and it matters more than the conclusion:** this row first rested on a measured "100% of refusals target memory the guest ALREADY HAS MAPPED", from a `mincore` probe of **one page** against ranges that are mostly `0x4000` — four host pages — while `MAP_FIXED_NOREPLACE` fails if *any* page is mapped. A quarter of each range was examined and the result asserted for all of it, in the direction the author wanted. Its replacement then claimed a structural argument that skipped the `prosper_mmap_noreplace` step and was not exhaustive over the null paths. Both were caught in review of #2947; the case analysis above is the third attempt and the first that closes. **The widened probe corroborates it, and this time the instrument measured what the claim says.** Every page of every refused range, whole-range `mincore`: Khazan **4,646 / 4,646**, Sifu **31,716 / 31,716** — 36,362 refusals, none containing an unmapped page. Splitting the alignment report also showed something the old line could not: 14 Khazan and 5 Sifu refusals have a page-aligned VA with an UNALIGNED length, a shape the single "page-aligned" flag hid entirely. #2908 / #2947. |
 | Fixing the Ampr pool leak gets the title past the assert | It does not, and this is the difference between *a* cause and *the* cause. The fix demonstrably works — allocations go from fragmented to contiguous and the guest gets one more allocation than before — and the assert lands at the same point. #2908, and #2747 is the standing reminder. |
+| The `SIGSEGV at addr=(nil)` is a terminal-frame **null read** that `PROSPER_NULL_PAGE=1` would satisfy — the *Beneath* (`PPSA27640`) shape | Falsified 2026-09-05 on `c067aeef`. Three arms of the doc repro, `tools/screenshot --seconds 5 --count 12`, fresh save roots per arm: **A** the repro as written; **B** = A + `PROSPER_NULL_PAGE=1`; **C** = `PROSPER_GUEST_ARGS=` (empty, the UE4 recipe used by *Dragon Quest VII* / *Crisis Core* / *Little Nightmares III*) + `PROSPER_NULL_PAGE=1`. All three die identically: `PS5 Out of Memory:` at ~8.6 s, then `Fatal error!`, then `guest thread ended: kind=2 detail=SIGSEGV at addr=(nil) rip=0x5c0004a20 (image+0x1b0004a20)`, `stop=guest-fault source-distinct=1 pixel-distinct=1 guest=faulted status=GUEST-FAULT`, one saved frame whose manifest `source` is `composited` — the known flat white 3840x2160 clear. The fault is UE's crash handler running after the assert, exactly as this document already said; the flag changes nothing because there is no low read to satisfy. **The same three arms also clear `-force-gfx-direct`**: dropping it (arm C) changes neither the timing nor the outcome, so the Unity-vs-UE4 guest-argument variable is not in play on this title either. |
+| The guest asserts because a prosper memory call **refused** something | Falsified 2026-09-05 on `c067aeef`, `PROSPER_MEMLOG=1`, 38,035-line run log. Between the halving probe and the assert there is **not one failing memory call**: every `sceKernelBatchMap` in the run answers `-> 0x0`, the last of them 21 lines before the `PS5 Out of Memory:` banner. The `PS5 Out of Memory` figures are UE's own arithmetic over its own pool, and the arithmetic closes exactly — see *Blocker 2, re-framed*. |
 | The `LogDataTable … Fatal` line just before the memory report is the assert | It is UE's log-category **verbosity listing** (`%-40s %-12s`, empty message body), and it lands ~27,000 log lines before the crash in both runs. Restated here because it looks exactly like a fatal assert when grepped for. |
 | `libScePsml::3WVD91e12ZQ` / `+2KpvixvL6E`, reached immediately before the OOM, are implicated | Not shared with the other carrier: **Sifu calls `libScePsml` zero times** and asserts identically. Their position in Khazan's log is proximity, not evidence. |
 
