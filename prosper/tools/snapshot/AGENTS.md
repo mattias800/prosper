@@ -42,6 +42,53 @@ Neither entry means the guarded title is broken, and neither should be "fixed" b
 threshold — that trades a false alarm for a guard that asserts less. Both need a re-profiled window
 against the current boot, which is its own reviewed baseline change.
 
+## When a guard fails on STRUCTURE only: `when_matched.py`
+
+`FAIL — structural matches 0 < 21` is the one verdict that does not say what happened. The title
+rendered (the other counters crossed) and did not match the reviewed references, and two very
+different situations produce that same line:
+
+- the title still reaches the reviewed state but at a **different wall-clock time**, because
+  something upstream changed how long the boot takes. The route's anchors then point at the wrong
+  moment. Re-capturing the baseline here would be laundering — the references are still right and
+  the ROUTE is what drifted.
+- the title **never reaches the reviewed state at all**. That is content loss, and re-capturing the
+  baseline would delete the evidence of it.
+
+```bash
+python3 tools/snapshot/when_matched.py <guard-name> <a run's capture.jsonl>
+```
+
+It scores **every** sample of a capture against that guard's `structural_references`, using the
+checker's own SSIM over the `luma16x9` signatures the manifest already carries — so it needs no
+images, no image library, and it cannot disagree with the checker about what "matching" means. It
+prints the best-scoring samples with their timestamps, the best inside the guarded window, the best
+anywhere, and how many samples clear the floor at any point in the run.
+
+Read it as: **a sample at or above the floor outside the window** is the timeline shift, demonstrated
+rather than argued. **Nothing at or above the floor anywhere** is not a timeline shift, whatever the
+frames look like to the eye — and it is the answer that must survive wanting the other one.
+
+`snapshot.py check` deletes its capture directory, so run `tools/screenshot` separately with the
+guard's own env, route and scale to get a manifest to sweep. Exit status is a contract: **0** means
+the sweep ran and the printed scores are the answer *including when nothing matched*; **2** means it
+refused and no number it printed is a result.
+
+First use, #2899: it contradicted the person who wrote it. A `cobra-gameplay` run whose frames were
+visibly the right level scored **0.7757 at best anywhere** against a 0.85 floor, with the in-window
+best at **0.7582** — and it is that comparison, not the bare "nothing cleared the floor", that
+settles it: the in-window best sits barely below the run's global best, so the window is not aimed
+at the wrong moment, it is aimed at very nearly the closest thing the route ever produces. The "it
+arrives at a different time" reading the author had built from three crossed counters and his own
+eyes on the frames was false, and no baseline was touched.
+
+That run also exposed a gap in the guard itself, worth knowing before anyone reads a score from it:
+`cobra-gameplay`'s `_note` records exactly two calibration points, an off-scene pre-gameplay movie
+frame at **0.3074** and a reviewed in-window worst of **0.8606**. Nothing between them was ever
+observed, so a run scoring 0.70-0.78 lands in a band the guard cannot interpret — it distinguishes
+"wrong scene" from "the reviewed scene" and says nothing about "right scene, degraded", which is
+where that title now sits.
+
 ## Contract
 
 - Local only. Game dumps and captured imagery must never be committed.

@@ -27,6 +27,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   an intentional cross-title tradeoff. Release review
   decides whether to fix or explicitly accept and document it. New or changed
   baselines require two-run image inspection; see `snapshot/AGENTS.md`.
+  `snapshot/when_matched.py` answers the one verdict a red guard cannot explain by itself --
+  when a guard fails on STRUCTURE alone, it scores every sample of a run against that guard's
+  reviewed references and says whether the run reaches them at any point, which separates "the
+  route's timing drifted" from "the state is never reached". **It falsified its own author on its
+  first use** (#2899): the timeline-shift reading he had built from three crossed counters and his
+  own eyes on the frames did not survive the sweep. That is recorded because an instrument which has
+  only ever agreed with the person holding it is indistinguishable from a restatement of what he
+  already believed.
 - **`vkval/`** — runs the ctest suite under `VK_LAYER_KHRONOS_validation` and **fails on any
   validation message id that is not itemised in `vkval/allowlist.txt`** (#1704). This is the guard
   for the whole class #1690 belongs to: a descriptor bound to a module that declares something
