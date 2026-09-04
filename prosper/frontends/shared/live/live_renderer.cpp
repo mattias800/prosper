@@ -9917,10 +9917,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         guest_scanout_pixels.reset();
                         prosper::VideoOutLinearRead read;
                         const bool got = prosper::videoout_read_front_linear(read);
+                        // Named rather than inlined so the #2932 probe below can REPORT it. Whether
+                        // the renderer owns a target at the flipped VA is the first thing
+                        // guest_scanout_publishable tests, and it short-circuits ahead of
+                        // guest_authored -- so a decline of SkipNotAuthored is itself evidence that
+                        // this was false at that flip. Reading that off the decision name is
+                        // inference; printing the input is measurement.
+                        const bool renderer_owns_flip =
+                            got && g_rtt.find(read.metadata.address) != g_rtt.end();
                         const auto decision = prosper::frontend::guest_scanout_publishable(
                             got ? read.pixels.size() : 0u, present_extent_bytes,
                             got && read.metadata.address != 0,
-                            got && g_rtt.find(read.metadata.address) != g_rtt.end(),
+                            renderer_owns_flip,
                             read.guest_authored);
                         if (decision == prosper::frontend::GuestScanoutDecision::Publish)
                             guest_scanout_pixels = std::make_shared<const std::vector<uint8_t>>(
@@ -9952,6 +9960,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     prosper::frontend::guest_scanout_decision_name(decision), w, h,
                                     read.metadata.tiling_mode, (int)read.guest_authored,
                                     read.padded_footprint ? "padded" : "nominal");
+                        // #2932: what is actually true of the flipped buffer at the moment we
+                        // decline to publish it? Three facts, printed together because separately
+                        // each one invites a wrong inference:
+                        //
+                        //   phys=      the physical page behind the flipped VA. This began as a test
+                        //              of "scanout and the render targets are two mappings of one
+                        //              allocation"; that is FALSE (STRAY_STATUS.md, Ruled out).
+                        //   aliases=N  the SEARCHED DOMAIN. The table is populated only while
+                        //              page-protection watches are armed, so N=0 means "nothing was
+                        //              searched" and says nothing about this VA. A miss reported
+                        //              without its domain is how an unarmed instrument gets recorded
+                        //              as a negative result.
+                        //   rtt_owns=  whether g_rtt holds a target at this VA -- the FIRST input
+                        //              guest_scanout_publishable tests, short-circuiting ahead of
+                        //              guest_authored. Measured, not inferred from the decision name.
+                        //
+                        // Deliberately NOT asserted here: that no VA-keyed lookup can connect the
+                        // flipped buffer to a render target. Stray's scanout VAs appear in the
+                        // colour-target census as 4K attachments in passes carrying draws, so that
+                        // sentence -- which earlier revisions of this comment stated as fact -- is
+                        // withdrawn. rtt_owns is printed precisely so nobody has to assume it again.
+                        if (read.metadata.address && prosper::diag_should_print(ord)) {
+                            uint64_t flip_phys = 0;
+                            size_t alias_n = 0;
+                            const bool ok = prosper::host::guest_write_watch_va_to_phys(
+                                read.metadata.address, flip_phys, &alias_n);
+                            if (ok)
+                                fprintf(stderr,
+                                        "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> phys=0x%llx "
+                                        "(aliases=%zu rtt_owns=%d decision=%s)\n",
+                                        (unsigned long long)ord,
+                                        (unsigned long long)read.metadata.address,
+                                        (unsigned long long)flip_phys, alias_n,
+                                        (int)renderer_owns_flip,
+                                        prosper::frontend::guest_scanout_decision_name(decision));
+                            else
+                                fprintf(stderr,
+                                        "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> UNRESOLVED "
+                                        "(aliases=%zu rtt_owns=%d decision=%s; %s)\n",
+                                        (unsigned long long)ord,
+                                        (unsigned long long)read.metadata.address, alias_n,
+                                        (int)renderer_owns_flip,
+                                        prosper::frontend::guest_scanout_decision_name(decision),
+                                        alias_n ? "no alias range covers this VA"
+                                                : "alias table EMPTY -- nothing was searched");
+                        }
                     }
                     // Re-check the size on the cached path too: a two-set geometry switch can change
                     // the present extent between spans of one flip, and the cache is keyed on the

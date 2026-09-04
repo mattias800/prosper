@@ -216,6 +216,36 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
 void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size);
 void guest_write_watch_invalidate_all();
 
+// PROSPER_TARGET_PHYS (#2932): resolve a guest VA to its physical address through the DIRECT-MAPPING
+// ALIAS TABLE -- the ranges recorded by guest_write_watch_notify_direct_mapping_added above, not the
+// dmem write-trace, which is a narrower thing armed for one investigation at a time.
+//
+// Written to test one hypothesis about Stray (#2932): that a flipped scanout buffer and the render
+// targets were two virtual mappings of ONE physical allocation, which would have explained a missing
+// composite with no further defect. It exposes resolution the write-watch already performs -- it
+// models exactly this aliasing in `WatchedPage { phys; aliases; }` -- so the idea could be TESTED
+// before anything was built on it. It was FALSIFIED (`docs/STRAY_STATUS.md`, § Ruled out): nothing
+// is aliased, and the scanout buffers turn out to be ordinary render targets in their own right.
+//
+// Kept because the question recurs and the answer should cost one run, not a rediscovery. Do NOT
+// restate the framing that motivated it -- "prosper renders into one VA range while the guest flips
+// a distant one, so no VA-keyed lookup can connect them" -- which earlier revisions of this comment
+// asserted as fact and which the census disproved.
+//
+// Diagnostic only; no production path calls it. Two limits a caller MUST respect:
+//   * It returns the FIRST range containing `addr` and does NOT check that the range extends far
+//     enough for the intended access. Fine for a probe; a production caller needs the size check.
+//   * `false` means "no alias covers this VA" OR "the alias table holds nothing to search", which
+//     are very different facts. Pass `alias_count` and report it beside a false, or the reader will
+//     take an unarmed instrument for a negative result.
+//
+// `alias_count` (optional) receives the SEARCHED DOMAIN -- how many direct-mapping alias ranges were
+// available to match against -- read under the SAME lock acquisition as the lookup, so the pair is
+// mutually consistent rather than two samples of a table that can change between them. Zero on
+// Windows (page-protection watches never arm there) and on any run that never reached
+// guest_write_watch_set_fault_onstack.
+bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys, size_t* alias_count = nullptr);
+
 // Called by the HLE, by guest VA range, immediately BEFORE a host/kernel store into guest memory (e.g. a
 // read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages
 // the range overlaps and marks them Dirty. No-op on Windows/macOS (no pages are ever armed there).

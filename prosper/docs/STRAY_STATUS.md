@@ -1445,3 +1445,142 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   nsa=1 materialized_mips=1 compute=0`. The disassembly is unambiguous that the level is genuinely
   dynamic — `v_min_i32 / v_max_i32` clamp a log2-derived LOD into `v5`, and the x/y coordinates are
   shifted right by that same `v5` — so `Lod=0` remains the wrong answer. #3134, #2818.
+- **"The scanout buffer and the render targets are two virtual mappings of ONE physical allocation,
+  so the VA-keyed present match is the whole defect."** Falsified across **every colour slot**, and
+  the run that falsified it also **corrected the premise the hypothesis was built on**.
+
+  **The scanout buffers are render targets.** Both flipped VAs appear in the colour-target census as
+  4K slot-0 persistent colour attachments, throughout the failing run (title route, steady state
+  confirmed by eye: menu over black at 8x brightness):
+
+  | flipped VA | physical | size | census lines (passes) |
+  | --- | --- | --- | --- |
+  | `0x9fc0000000` | `0x230000` | 3840x2160 | 946 |
+  | `0x9fc2000000` | `0x2210000` | 3840x2160 | 976 |
+
+  A draft of this row carried a fourth column of `no-effect(early)` drops "measured on the title route
+  where this diagnostic had never been run". **Both halves were wrong**, and the correction is worth
+  more than the column was. § *The title screen's REAL numbers* already records this census on this
+  screen (8192 discarded, `no-effect` ~4400) and states the methodology: *census read at the same
+  cumulative total in every arm*. `report_dropped_draw_target` emits only at power-of-two totals, so
+  the draft's reading at 4,096 was a **snapshot one emission earlier**, not a run total — and its
+  1,143 + 1,154 = 2,297 is almost exactly half of ~4,400, which is what that same measurement looks
+  like one emission back. It was also unit-mismatched against the census column beside it: passes
+  against draws. Use the existing table; do not quote the withdrawn one.
+
+  **Read the census column precisely.** The line is printed after the empty-draw early-out, so it
+  means *this VA was bound as slot 0 of a pass carrying at least one draw*. It does **not** mean a
+  draw's output reached memory — masks, discards and store behaviour are all downstream. So the
+  correct statement is "the scanout buffers are attachments of passes that carry draws", not "prosper
+  renders into them".
+
+  So the framing this row originally supported — *"prosper renders into `0x30…` while the guest flips
+  `0x9fc…`, ~450 GiB apart, so no VA-keyed lookup can connect them"* — **is withdrawn**. Those VAs
+  are not a region the renderer never touches.
+
+  **But do not swap it for the opposite error.** "The present path can therefore see them" is *also*
+  unmeasured. `guest_scanout_publishable` tests `renderer_owns_target` (a `g_rtt` hit on the flipped
+  VA) **first**, short-circuiting ahead of `guest_authored`, so a decline of `SkipNotAuthored` is
+  itself evidence that `g_rtt` did **not** hold the VA at that flip. The census (pass-render time) and
+  the publish check (flip time) are different moments and must not be read as one. The probe now
+  prints `rtt_owns=` and the decision name beside the physical address so this becomes a measurement.
+
+  **TWO STATES, and this row previously blurred them — the same mistake this file's own banner warns
+  about for `max_nonblack`.** They are different failure states and their evidence does not transfer:
+
+  | state | what reaches the screen | source of the `authored=0` / `SkipNotAuthored` evidence |
+  | --- | --- | --- |
+  | **title screen** (measured here) | a menu frame exists, so something published | a *different run*, days and several merges earlier |
+  | **main menu / first map** | nothing (`fresh=0 retained=0`) | that run |
+
+  The right-hand column deliberately says *run*, not *regime*. The two sets of facts were collected
+  days and several merges apart, so code state, route and `PROSPER_RENDER_SCALE` explain the
+  difference as readily as the screen does, and nothing here separates them. One run collecting the
+  census and those counters together settles it; until then, cite the run.
+
+  The guest-scanout fallback's stage-1 gate declines for **four** reasons, and only two of them
+  (`SkipPublishedGpu`, `SkipRendererSource`) mean something else published; the other two are
+  `SkipNoPresentContract` and `SkipScaledPresent`. All four print nothing, so they are
+  indistinguishable in a log. `guest_scanout_present.hpp` says so itself, and records the precedent:
+  Bendy's (PPSA27616) zero-line control is reported as **"never reached"** rather than as a decline,
+  because the instrument cannot tell those apart today.
+
+  So: measured, **0** `[rtt] GUEST SCANOUT` lines across a full title-route run that reached and held
+  the failing steady state — and that is honestly reported as **never reached**, not as evidence of
+  what published. A draft of this row inferred "the menu therefore publishes" from the zero count;
+  that inference is withdrawn, having violated a precedent written into the header it reasoned about.
+  **The publishing claim rests on the frame instead** — and it rests on the frame's RECORDED SOURCE,
+  not on the image. `tools/screenshot` captures through `present_snapshot`, which **falls back to the
+  guest's own display buffer** when the renderer published nothing (`videoout_present.cpp:187-196`,
+  returning `RawScanout`), and saves it by default (`render_first` defaults to 0). So a menu-bearing
+  PNG on its own proves nothing: the guest composites its menu into `0x9fc0000000` itself, and that
+  image would look identical.
+
+  The discriminator is recorded per capture, so no re-run is needed. Across both title-route runs the
+  manifest reports **29 of 30 captures as `composited`** (`CaptureSource::Rendered`) with only index 0
+  — the all-black first frame — as `raw_scanout`. The steady-state menu frame examined by eye is
+  `composited`. **That** is the evidence a frame was published: prosper composited it, rather than the
+  tool echoing back guest memory.
+
+  (Do not cite `present_readback` here, as a draft of this row did. `tools/screenshot` never calls it
+  — `screenshot.cpp:5`'s comment says otherwise and is stale — and it carries the same fallback
+  hazard at `videoout_present.cpp:132-138` regardless.)
+
+  Do not substitute the renderer's own `frame_%04d.bmp` for this without collecting it: that dump is
+  fed by `selected_pixels` (`live_renderer.cpp:10160` → `:10184`), so it would prove
+  `have_selected_pixels` — stage 1's second input — which is a *stronger* statement about the gate but
+  a different artifact, and it was not produced by these runs. An RTT dump would be weaker than
+  either: it would show only that the menu was drawn somewhere.
+
+  Two things survive this correction intact. `rtt_owns=` **cannot be collected on the title route**
+  (the report sits inside the stage-1 `Publish` branch). And the forward direction holds: any
+  `authored=` or `rtt_owns=` datum necessarily came from a moment where stage 1 returned `Publish`.
+
+  What does **not** follow is that the older `authored=0` / `px_front=none` facts differ from today's
+  run *because of regime*. Those runs are days and several merges apart, so code state, route and
+  `PROSPER_RENDER_SCALE` are equally live explanations. Attach the run, not just the regime — and the
+  cheap way to settle it is one run collecting the census and those counters together:
+
+  ```
+  PROSPER_PASS_LOG=<window> PROSPER_TARGET_PHYS=1     # census + px_front/px_vo/px_last in ONE run
+  ```
+
+  **Do not reach for `PROSPER_RTTLOG` to get the present counters.** It is in the list at
+  `live_renderer.cpp:1674-1679` that disables `live_gpu_targets`, so it measures a differently
+  configured renderer. The counters do not need it: `px_front`/`px_vo`/`px_last` come from
+  `present_source_name()` printed under `g_pass_log_window`, i.e. `PROSPER_PASS_LOG`, which is **not**
+  in that list.
+
+  **The alias hypothesis is dead**, now over the population rather than one slot: **55,868
+  resolutions, 0 unresolved, 82 distinct targets** across slots 0-6. Excluding the scanout buffers
+  themselves, targets whose *physical extent* overlaps either scanout buffer: **0**; nearest is
+  **390 MB** away. The slot coverage was added after review and earned its keep — **24% of
+  resolutions (13,669) are in slots 1-6**, and since `is_live_render_target` consults `g_rtt`, which
+  is populated for every slot, an alias there would have been exactly the proposed link, in exactly
+  the region a slot-0 census cannot see. (One gap remains in "population": a *declined* MRT1 base
+  never sets `persistent_id1`, so it cannot reach the census.)
+
+  **What is left is a three-way question, and this file already answers part of it.** The two
+  tempting branches are "only the UI is ever drawn there" and "the scene is drawn and then wiped".
+  Neither is the branch already measured above: the scene **reaches** the target and is **stored as
+  black by magnitude** — PixelHistory has tonemap `shaderOut 0.001099` storing `0`, because
+  `0.001099 x 255 = 0.28` rounds to zero in `R8G8B8A8_UNORM`, and § *This is not a composite defect*
+  records that the draws run and write nothing. An A/B between the first two branches would exclude
+  the answer already in hand. The open part is why the value arriving at the store is that small, not
+  where the picture goes.
+
+  The strangest remaining fact, with its regime attached: **in the non-publishing regime**
+  `select_present_source` returns `None` (`px_front=none px_vo=none px_last=none`, `fresh=0
+  retained=0`) for buffers that — on the title route at least — are attachments of drawing passes.
+  Whether that also holds of the flipped buffer *in that regime* is untested, because the census and
+  those counters have not yet been collected in one run. That is the cheap next measurement.
+
+  This also dissolves a puzzle instead of deepening it: if prosper renders into a `VkImage` keyed by
+  the scanout VA, guest memory at that VA need never be written, which is consistent with
+  `videoout_buffer_authored_locked` reporting `authored=0` with nothing wrong at that point at all.
+
+  **Caveats.** `guest_write_watch_va_to_phys` returns the FIRST range containing the address without
+  checking it is large enough — fine for a probe, not for a production caller. And `authored=0` has
+  four causes, of which **two** are a blind instrument rather than an absent write
+  (`!buffer_digest_valid[slot]`, i.e. no baseline seeded; and a write covering none of the digest's
+  sample points), so `buffer_digest_valid` alone does not separate them. #2932, #3126.

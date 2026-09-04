@@ -536,6 +536,16 @@ void guest_dmem_write_trace_unlock_state_for_test() {}
 
 void guest_write_watch_set_fault_onstack(bool) {}   // Windows never arms page-protection watches
 
+// #2932 VA->phys probe. Stubbed on the same grounds as everything above it: the alias table is
+// populated only while page-protection watches are armed, and Windows' create() always refuses, so
+// there is never anything here to search. Returning false with a count of 0 is the honest answer --
+// and it is why the count is part of the contract, so a caller cannot read this platform's
+// structural "nothing to search" as a measured "no alias covers that VA".
+bool guest_write_watch_va_to_phys(uint64_t, uint64_t&, size_t* alias_count) {
+    if (alias_count) *alias_count = 0;
+    return false;
+}
+
 } // namespace prosper::host
 
 #else   // ---- Linux / macOS: real page-protection dirty-tracking (mprotect + SIGSEGV) --------------
@@ -1136,6 +1146,32 @@ bool trace_va_to_phys_locked(const DmemTraceState& trace, uint64_t addr, uint64_
 }
 
 } // namespace
+
+// Diagnostic resolution of a guest VA to its physical address (#2932). Resolves over the LIVE
+// DIRECT-MAPPING ALIAS TABLE rather than adding a second notion of "which VAs map this page": a
+// duplicated resolver that could disagree with the write-watch would be worse than none, because
+// two subsystems would then answer the same question differently.
+bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys, size_t* alias_count) {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    // Publish the searched domain under the SAME acquisition as the lookup: reporting a miss beside
+    // a separately-sampled count would let the two describe different tables, and the count only
+    // exists to qualify the miss.
+    if (alias_count) *alias_count = w.aliases.size();
+    if (!addr) return false;
+    // `w.aliases` is the LIVE DMEM TOPOLOGY -- every direct mapping the guest has made, recorded by
+    // guest_write_watch_notify_direct_mapping_added. `w.trace.pages` is a different thing: a narrow
+    // write-trace armed for one investigation at a time. An earlier revision of this probe resolved
+    // against the trace and reported UNRESOLVED for a scanout buffer, which reads as "prosper does
+    // not know this mapping" when it means "this diagnostic was not armed for it" -- the instrument
+    // answering a different question than the one asked.
+    for (const AliasRange& a : w.aliases) {
+        if (!a.size || addr < a.addr || addr - a.addr >= a.size) continue;
+        phys = a.phys + (addr - a.addr);
+        return true;
+    }
+    return false;
+}
 
 GuestWriteWatch::~GuestWriteWatch() { reset(); }
 GuestWriteWatch::GuestWriteWatch(GuestWriteWatch&& other) noexcept

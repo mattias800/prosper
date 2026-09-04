@@ -3,6 +3,7 @@
 // pixels. Used to verify recompiled shaders end-to-end (render -> readback -> pixel asserts). The
 // including test links Vulkan::Vulkan.
 #pragma once
+#include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
 #include "gpu/capture/gpu_capture.hpp"
@@ -5434,6 +5435,48 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     PersistentColorTargetImage* cached_color = nullptr;
     if (persistent_color) {
         color_key = {color_target->persistent_id, W, H, FMT};
+        // PROSPER_TARGET_PHYS (#2932): print each colour target's guest VA and the physical address
+        // it maps to, to test whether any target ALIASES the page a title flips to the display. On
+        // Stray the answer is no -- and the same census answered a question it was not built for,
+        // which is why it is still here: the flipped VAs 0x9fc0000000 / 0x9fc2000000 turn up in this
+        // very census as 4K colour attachments, so those buffers are render targets rather than a
+        // separate region the renderer never touches (`docs/STRAY_STATUS.md`, § Ruled out).
+        //
+        // What a line here does and does not license: it is printed after the empty-draw early-out,
+        // so the target was BOUND as an attachment of a pass carrying at least one draw. It does not
+        // say a draw's output reached memory -- masks, discards and store behaviour all sit
+        // downstream -- so do not read a line here as "the picture was written".
+        //
+        // EVERY colour slot is censused, not just slot 0, and that scope is the whole point rather
+        // than thoroughness for its own sake. `is_live_render_target` consults `g_rtt`, and `g_rtt`
+        // is populated for every slot (`live_renderer.cpp` keys it by `pass_bases[slot]`), so a
+        // slot-1..7 target aliasing the scanout page would be a live render target the present path
+        // ALREADY knows by VA -- exactly the link the alias hypothesis proposes. A slot-0-only
+        // census would leave that case unobserved while reading like a general answer, which is the
+        // charter's "positive control tests the discriminator, never the domain" in miniature.
+        static const bool target_phys_census = std::getenv("PROSPER_TARGET_PHYS") != nullptr;
+        if (target_phys_census) {
+            const auto census_slot = [&](unsigned slot, uint64_t va) {
+                if (!va) return;
+                uint64_t tphys = 0;
+                size_t alias_n = 0;
+                if (prosper::host::guest_write_watch_va_to_phys(va, tphys, &alias_n))
+                    std::fprintf(stderr, "[target-phys] slot%u va=0x%llx %ux%u -> phys=0x%llx\n",
+                                 slot, (unsigned long long)va, W, H, (unsigned long long)tphys);
+                else
+                    std::fprintf(stderr, "[target-phys] slot%u va=0x%llx %ux%u -> UNRESOLVED "
+                                         "(aliases=%zu)\n",
+                                 slot, (unsigned long long)va, W, H, alias_n);
+            };
+            census_slot(0, color_target->persistent_id);
+            // Slot 1 lives in its own field; only report it when it is a DISTINCT surface, matching
+            // the test the MRT path itself applies, so a single-target pass does not print twice.
+            if (color_target->persistent_id1 &&
+                color_target->persistent_id1 != color_target->persistent_id)
+                census_slot(1, color_target->persistent_id1);
+            for (size_t sl = 2; sl < color_target->persistent_id_slots.size(); ++sl)
+                census_slot((unsigned)sl, color_target->persistent_id_slots[sl]);
+        }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
         cached_color->last_use = color_target_generation;
