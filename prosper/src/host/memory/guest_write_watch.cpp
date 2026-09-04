@@ -1137,6 +1137,28 @@ bool trace_va_to_phys_locked(const DmemTraceState& trace, uint64_t addr, uint64_
 
 } // namespace
 
+// Diagnostic resolution of a guest VA to its physical address (#2932). Reuses the trace's own alias
+// table rather than adding a second notion of "which VAs map this page": a duplicated resolver that
+// could disagree with the write-watch would be worse than none, because two subsystems would then
+// answer the same question differently.
+bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys) {
+    if (!addr) return false;
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    // `w.aliases` is the LIVE DMEM TOPOLOGY -- every direct mapping the guest has made, recorded by
+    // guest_write_watch_notify_direct_mapping_added. `w.trace.pages` is a different thing: a narrow
+    // write-trace armed for one investigation at a time. An earlier revision of this probe resolved
+    // against the trace and reported UNRESOLVED for a scanout buffer, which reads as "prosper does
+    // not know this mapping" when it means "this diagnostic was not armed for it" -- the instrument
+    // answering a different question than the one asked.
+    for (const AliasRange& a : w.aliases) {
+        if (!a.size || addr < a.addr || addr - a.addr >= a.size) continue;
+        phys = a.phys + (addr - a.addr);
+        return true;
+    }
+    return false;
+}
+
 GuestWriteWatch::~GuestWriteWatch() { reset(); }
 GuestWriteWatch::GuestWriteWatch(GuestWriteWatch&& other) noexcept
     : id_(std::exchange(other.id_, 0)) {}

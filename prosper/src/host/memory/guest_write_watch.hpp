@@ -213,6 +213,20 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
 void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t size);
 void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t size,
                                                         uint32_t protection);
+// PROSPER_SCANOUT_PHYS (#2932): resolve a guest VA to its physical address through the dmem trace.
+//
+// The present path matches a flipped scanout buffer against render targets by VIRTUAL address only
+// (`is_live_render_target`), and `hle_graphics.cpp`'s scanout registry has no aliasing concept at
+// all. Stray renders into 0x30... and flips 0x9fc0000000 -- ~450 GiB apart -- so no VA-keyed lookup
+// can connect them, and BOTH publish paths fail: no pass "targets" the flip, and the scanout bytes
+// are unchanged since registration so the guest-authored fallback declines too.
+//
+// If those are two mappings of one set of physical pages, every one of those observations follows
+// with no further defect. This exposes the resolution the write-watch already performs -- it models
+// exactly this aliasing in `WatchedPage { phys; aliases; }` -- so the hypothesis can be TESTED
+// before anything is built on it. Diagnostic only; no production path calls it.
+bool guest_write_watch_va_to_phys(uint64_t addr, uint64_t& phys);
+
 void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size);
 void guest_write_watch_invalidate_all();
 
