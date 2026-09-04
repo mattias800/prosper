@@ -1160,10 +1160,13 @@ the same guest state across runs.
     `0x0004dfac00000001` — `addr … unreadable` — after which every scalar is `ok=0` and the fetch is
     "left unresolved (not folded to 0)".
   - **This is #305, on a third title — and note WHICH sites, because this file also withdraws a #305
-    attribution a few rows below.** That withdrawal covers the **five unresolved IMAGE ops** (read at
-    user-data dword 0 of a declared `[0,20)` window, `[udcand]` reporting `FITS-BLOCK`, so the
-    larger-block-than-window condition is absent there). This row covers the **VERTEX stages**, whose
-    window is `USER_SGPR = 8`. Both cite the same `0x0004dfac` constant family, so the two are easy to
+    attribution ABOVE this row**, in this same section (§ *The title screen's black composite*) and
+    again far earlier under § *Withdrawn 1*. Nothing below this row mentions #305 at all. That
+    withdrawal covers the **five unresolved IMAGE ops** (read at user-data dword 0 of declared
+    `[0,20)`/`[0,30)` windows, `[udcand]` reporting `FITS-BLOCK`, so the larger-block-than-window
+    condition is absent there). This row covers the **VERTEX stages**, whose window is
+    `USER_SGPR = 8` — and `RSRC2_GS` is the right register for a vertex stage on RDNA2, where vertex
+    is merged into the GS hardware stage, so "GS" beside "VERTEX" is expected rather than a slip. Both cite the same `0x0004dfac` constant family, so the two are easy to
     confuse and the verdicts do not transfer in either direction: do not use the image withdrawal to
     dismiss this row, and do not use this row to revive the image attribution.
     `PROSPER_UDPROV=1` shows the draw's own bind writing twelve
