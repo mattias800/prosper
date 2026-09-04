@@ -134,16 +134,161 @@ stage and a different kind of evidence — a class that changes between two disp
 An earlier usage-driven fix attempt is also already recorded there as not firing; do not restart from
 it without reading why.
 
-**The next run, and it is one run.** `PROSPER_DYNTRACE_FAIL=1` (plus `PROSPER_SHARPLOG=1`) on this same
-route. `resolve_dynamic_fetch` already handles the direct case — `untouched_seed_range(tbase, 8)`
-publishes a `SrtUse` with the live eight dwords and `use_pc`, which becomes `fetch_pc` provenance, the
-resolver's *first* lookup — so `pc_res=null` at all five sites means either the fold declined
-(`plausible_seed` false: the user-data dwords are not an image) or materialization dropped it.
-`[dyntrace] MIMG pc=… have_t8=… seed_t8=… t8=<8 dwords> -> base=… type=… fmt=…` separates those in one
-line. Expectation, stated to be falsifiable: for the graphics sites the fold had all 32 user SGPRs, so
-the discriminator should be `plausible_seed` — i.e. the #305/#3137 window family, not a recompiler gap.
-The vertex row is consistent with that already: its cbufs sit at `s16`/`s20`, VS user dwords 8 and 12,
-outside an 8-dword window.
+**MEASURED, same route, `PROSPER_DYNTRACE_FAIL=1` — the five sites have no descriptor bytes to find, by
+either route.** `resolve_dynamic_fetch` handles the direct case as well as the table one:
+`untouched_seed_range(tbase, 8)` publishes a `SrtUse` with the live eight dwords and `use_pc`, which
+becomes `fetch_pc` provenance — the resolver's *first* lookup. So `pc_res=null` could have meant "the
+fold declined the bytes" or "it produced them and materialization dropped them", and `[dyntrace]`
+separates those in one line:
+
+```
+MIMG pc=32 op=0x00 srsrc=s8  ssamp=s0   have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=69 op=0x20 srsrc=s8  ssamp=s72  have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=47 op=0x20 srsrc=s0  ssamp=s8   have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=50 op=0x20 srsrc=s0  ssamp=s8   have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=77 op=0x08 srsrc=s0  ssamp=s0   have_t8=1 seed_t8=0  key=0x20        t8=3096cb00 c0d00000 …
+```
+
+Every `written=0` site is `have_t8=0 seed_t8=0`: no traced T#, **and** the entry user-data bytes were not
+a plausible T#. The `written=1` row is again the control — `have_t8=1`, `key=0x20`, real descriptor
+words, the one site whose route ran.
+
+**The zero is a measurement, not a silence, because both routes demonstrably fire elsewhere in the same
+run**: 29 lines `have_t8=1 seed_t8=0` (traced), 21 `have_t8=0 seed_t8=1` (plausible seed), 9
+`have_t8=0 seed_t8=0`. A working seed for contrast: `pc=82 srsrc=s0 seed_t8=1 → base=0x3072050000
+240x1`. Without that population the null would be void rather than negative.
+
+**No lookup route could have resolved these five** — which is why #3313's class-filtered lookup,
+correctly, resolves none of them. Beyond that the attribution is **OPEN**, and two attributions have
+already been proposed and withdrawn; read the next two paragraphs before proposing a third.
+
+**Withdrawn 1 — "#305/#3137 user-data window family".** The `[resdump]`/`[udcand]` output of the same
+run does not support it. #305's condition is a programmed block *larger* than the pipeline's user-SGPR
+window; site 1 declares `range=[0,20)` and the failing `srsrc=s8` is user-data dword **0**, the very
+first dword of that window (#305 measurement 4: user data begins at shader SGPR `s8`). `0x3013c60000`
+declares `[0,30)` likewise. `[udcand]` reports **`FITS-BLOCK`**, not a misfit. The one real link is that
+`0x0004dfac` appears three times in the block and #305 records that constant family — but it is a V#
+`dword3` in this title, so its presence is what a V# looks like, not evidence of a window fault.
+
+**Withdrawn 2 — "a texture descriptor is being consumed as a buffer".** The bytes at that offset are
+**present, readable, and a well-formed V#** — which is the opposite of a misclassified T#:
+
+```
+[resdump] sgprs@0x8c: 2f65b3cc 00100030 00000010 0004dfac  40f1a5c0 00100020 00000003 0004dfac …
+   dw0..3 as V#: base=0x302f65b3cc stride=16 num_records=16 size=256   -> V#-shape gate PASSES
+   dw4..7 as V#: base=0x2040f1a5c0 stride=16 num_records=3  size=48    -> V#-shape gate PASSES
+   dw0..7 as T#: base=0x302f65b3cc00 65x1 type=0                       -> bad-image-type
+```
+
+Two consecutive four-dword V#s, both with plausible PS5 guest VAs. So `seed_t8=0` is a *shape* verdict,
+not a residency one, and the V#-shape gate is not misfiring on ambiguous bytes: it is claiming bytes
+that really are a V#. `sharp[0]` declares one slot at `offset_dw 0` and `sharp[3]` two at 8 and 12,
+which maps exactly onto this stage's `[b4 cbuf s8] [b2 cbuf s16] [b3 cbuf s20]` (VS `user_sgpr_base = 8`).
+
+**And it is OBSERVED, not just derived — the same slot is dropped for both reasons in one run.**
+`tex_drop` keys on the reason as well as the slot, so both buckets print:
+
+```
+[sharp] ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: claimed by the V# path
+[sharp] ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: degenerate T# (bad-image-type)
+        base=0x300ae8fb5400 13713x11172x1 type=0 fmt=0
+        raw 0ae8fb54 00000030 0ae8fd64 00000030 00000000 00700000 00000000 00000000
+```
+
+Run-wide: **97 `claimed by the V# path`, 4 `degenerate T# (bad-image-type)`** — so on the 4 draws where
+the V# path did *not* claim it, the texture decoder reached those bytes and rejected them exactly as
+derived above. The prediction is measured.
+
+**The discriminator between the two buckets is one half-word**, and it is derivable from the raw dwords:
+`dw1`'s upper half is the V# `STRIDE` field. `0x00100030` → stride 16 → the read-only V# gate claims it;
+`0x00000030` → stride 0 → `!d.stride` rejects, the slot falls through to the texture loop, `type=0`,
+`bad-image-type`. Nothing else about the two buckets differs in kind.
+
+**Three different contents at one declared slot in one run**, none of them an image:
+
+| observed at user dwords 0..7 | as a V# | as two 64-bit pointers |
+| --- | --- | --- |
+| `2f65b3cc 00100030 00000010 0004dfac …` | base `0x302f65b3cc` stride 16, 16 records | not pointer-shaped |
+| `0ae8fb54 00000030 0ae8fd64 00000030 …` | stride 0 → rejected | `0x300ae8fb54`, `0x300ae8fd64` (Δ `0x210`) |
+| `2f70fbb8 00000030 2f70fdcc 00000030 …` | stride 0 → rejected | `0x302f70fbb8`, `0x302f70fdcc` (Δ `0x214`) |
+
+Both `bad-image-type` samples are two clean, adjacent guest pointers plus a constant `0x00700000` at
+dword 5. So the payload is not one stable wrong value — it **varies by draw**, and across 101 sampled
+drops the declared image slot never once held an image descriptor.
+
+**Settled: the guest declares an eight-dword T# there.** `PROSPER_SHARPLOG=1` together with
+`PROSPER_DYNTRACE_FAIL=1` — both are needed, because `[sharp]` keys on `ud=` and only `[resdump]` ties a
+`ud` pointer to a code address, and the pointer differs between runs:
+
+```
+[sharp] ud=0x21e0e55590 nsgpr=32 base=8 eud_size_dw=0 srt_size_dw=0 counts: ro=1 rw=0 samp=0 cbuf=2 direct=11
+[sharp]   ro[0]:   bits=0x0000 offset_dw=0  size=0        <- eight-dword T#
+[sharp]   cbuf[0]: bits=0x8008 offset_dw=8  size=1
+[sharp]   cbuf[1]: bits=0x800c offset_dw=12 size=1
+[sharp]   direct[8]:  sgpr=16      (type 8  = vertex buffer)
+[sharp]   direct[10]: sgpr=18      (type 10 = vertex attrib)
+```
+
+So the **declaration and the memory disagree at slot 0 and nowhere else**: an 8-dword read-only image is
+declared at user dword 0, and what is there is two well-formed 4-dword V#s. That kills reading 2 above
+(it is not a genuine V# slot prosper mis-declares).
+
+**The seeding base is right, corroborated twice and independently of the disagreement.** The declared
+layout occupies dwords 0..19 and `[resdump]` reports `user_data_range_end = 20` — exact. And
+`direct[8]`/`direct[10]` at dwords 16 and 18 land on two mapped 64-bit guest pointers, the first of
+which dereferences to a well-formed V#:
+
+```
+[direct-reject] type=8  sgpr=16 words=0a852a6c:00000030:a0eeabd0:00000022   (two pointer pairs)
+[direct-deref]  type=8  sgpr=16 at=0x300a852a6c -> base=0x2120e82400 rd=1 size=192 stride=32 fmt=11
+[direct-deref]  type=10 sgpr=18 at=0x22a0eeabd0 -> base=0x2020f80026e0 rd=0 size=65024 stride=4
+```
+
+An eight-dword shift of the window would have to put a cbuf V#'s leading dwords exactly where two
+dereferenceable guest pointers are. So this is not a seeding fault.
+
+The shader-SGPR half of the mapping (`user_sgpr_base = 8` for a non-PS stage, hardcoded in
+`build_stage_table`) is corroborated separately, and cheaply: this stage declares **exactly one**
+read-only image, at user dword 0, and has **exactly one** image op, naming `s8`. Under the +8 mapping
+those are the same slot. If the mapping were wrong, that agreement would be a coincidence.
+
+**Therefore the classification fix cannot fix this site — falsified from the bytes, no run needed.**
+The direction #3126's thread has circled since 2026-08-30 is "let usage, or the declared width, beat the
+V#-shape heuristic". Suppose it did, and slot 0 were never claimed as a V#. The read-only texture loop
+would then decode those same eight dwords as a T#: `type = (t[3] >> 28) = (0x0004dfac >> 28) = 0`, and
+`valid_image_type` admits only 8..15 (`agc_shader_layout.hpp:183`), so
+`image_descriptor_reject_reason` returns **`bad-image-type`** and the slot is dropped anyway. Same
+rejection, a different `continue`. **The defect is upstream of classification entirely.** A
+classification change may still be right on its own merits for other titles; it is not this site's fix,
+and an A/B of it here would come back "unchanged" for a reason that has nothing to do with the change.
+
+**Instrument note, so nobody reads a signal into it.** The run reports 235,016 `[direct-reject]` against
+235,008 `[direct-deref]`. That near-parity is structural, not a finding: the deref line is printed
+*inside* the reject branch (`agc_shader_layout.cpp`, the `#2412` block) and only when `d.base` is
+mapped, so derefs are a subset of rejects by construction and the 8-line difference is 8 slots whose
+base was zero or unmapped. Both lines describe one event.
+
+**What is still open** is reading 1 versus reading 3: the guest wrote V#s into a slot it declares as a
+T# (a guest/driver-state question), or the image op sits on a path this binding never serves. Two
+next steps, in order:
+
+1. **Free — grep the run we already have.** `PROSPER_SHARPLOG`'s `tex_drop` names why a declared
+   texture slot was dropped: `[sharp] ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: …`.
+   If it says `claimed by the V# path`, the chain is closed end to end from one log; if it says
+   `degenerate T# (bad-image-type)`, the V# path never even claimed it and the paragraph above is
+   already the whole story.
+2. **One run — `PROSPER_UDPROV=1`** (with the same two switches). It records each SH register's
+   last-write `command_order` and path into the per-draw snapshot, which answers the only question
+   left: who last wrote user dwords 0..7 before this draw, and did a T# ever occupy them. Read dwords
+   0..7 against 8..19 in the same snapshot; the second group is known-good, so it is a built-in
+   control. **If dwords 0..7 come back with an OLDER `command_order` than 8..19, do not quietly
+   resurrect #305's founding premise** — "the user-data block is a previous pipeline's leftover" is
+   recorded as falsified in `RESOURCE_BINDING.md` § Ruled out, measured at 21 stages on other titles,
+   so a contrary result here is a new finding that has to be argued against that measurement, not a
+   return to it.
+
+Note the scope: the `have_t8=0 seed_t8=0` result above covers all five sites, but this byte-level
+reading is established for **site 1 only** — `[resdump]` was captured for that stage.
 
 Separately, four stages declare a *writable* 8-dword T# that reaches no resource table at all
 ([#3128](https://github.com/mattias800/prosper/issues/3128)); one of them has four image ops against a
@@ -362,6 +507,53 @@ A ~13% reduction, groups non-overlapping. The visible frame does not change — 
 drops still discard the background.
 
 ## Ruled out
+
+- **"A recompile fix — resolving the unresolved image ops — restores the title-screen background."**
+  **Falsified on the title screen, and this row exists because the measurement was recorded NOWHERE a
+  hypothesis-former would look**: it lived only in a comment inside `rdna2_emit_alu.cpp` and in a
+  2026-08-30 issue thread, so the next three sessions (including this one) re-entered the descriptor
+  question without it. `PROSPER_MIMG_SOFT=1` writes a constant instead of failing the stage when an
+  image op cannot resolve, which answers the only question that matters for the goal: *how much of the
+  picture rides on this resolution failure*. On a **verified title-screen frame** the composite
+  compiled, zero `shader-recompile` drops landed on either swap-chain buffer, and `max_nonblack` stayed
+  **0.0069** — unchanged, still menu-only. Note the caveat and that it was cleared: the first run of
+  this instrument was unsound (it sat after the once-per-`(program, pc, srsrc)` dedupe, so only the
+  first compile of each site was softened, #3141 B3), and the result was **re-established on the fixed
+  instrument**, same conclusion. The background's blocker is upstream — the scene targets are black at
+  source, draws run and write nothing (§ *The scene targets are black AT SOURCE*), the same family as
+  *Grand Theft Auto V* and *Sonic Frontiers*. **Descriptor forensics on the five image ops is a
+  correctness matter, not the rung-3 blocker; do not spend a GPU run on it expecting a picture.**
+  #3126, #3138, #3140, #3141.
+
+- **"The five unresolved image ops are the #305/#3137 user-data window family"** and **"a texture
+  descriptor is being consumed as a buffer at the SGPR the image op names."** Both proposed and
+  **withdrawn on 2026-09-04**, within the hour, on the `PROSPER_DYNTRACE_FAIL=1` run's own
+  `[resdump]`/`[udcand]` output. The failing `srsrc=s8` is user-data dword **0** of a declared
+  `[0,20)` window with `[udcand]` reporting `FITS-BLOCK`, so #305's larger-block-than-window condition
+  is absent; and the eight dwords there are present, readable, and **two well-formed V#s**
+  (`base=0x302f65b3cc stride=16 num_records=16`, then `base=0x2040f1a5c0 stride=16 num_records=3`),
+  whose T# reading is `type=0` → `bad-image-type`. So `seed_t8=0` is a **shape** verdict, not a
+  residency one, and the V#-shape gate is claiming bytes that really are a V#. The shared `0x0004dfac`
+  constant is a V# `dword3` in this title, which is why it resembles #305's signature without being it.
+  What remains open is in § *The unresolved image ops* above. #3126, #3313.
+
+- **"Making classification obey usage, or the guest's declared slot width, instead of the four-dword
+  V#-shape heuristic will resolve `0x3013540000`'s image op."** **Falsified from the bytes, no run
+  needed**, 2026-09-04 — and it is the direction #3126's thread has circled since 2026-08-30, so it is
+  the most likely thing to be tried next. `PROSPER_SHARPLOG` confirms the guest declares slot 0 as an
+  eight-dword T# (`ro[0]: offset_dw=0 size=0`), so the premise is right; the conclusion is not. With the
+  V# claim suppressed, the read-only texture loop decodes those same eight dwords and gets
+  `type = (0x0004dfac >> 28) = 0`, which `valid_image_type` (8..15, `agc_shader_layout.hpp:183`)
+  rejects as **`bad-image-type`** — the slot is dropped either way, by a different `continue`. An A/B of
+  that change on this title would report "unchanged" for a reason unrelated to the change. The defect is
+  upstream of classification. #3126, #3313.
+
+- **"The user-data seeding base is wrong for this stage."** Falsified on the same run. The declared
+  layout occupies dwords 0..19 and `user_data_range_end = 20` exactly; `direct[8]`/`direct[10]` at
+  dwords 16 and 18 land on two mapped 64-bit guest pointers, and the first dereferences to a well-formed
+  V# (`base=0x2120e82400 stride=32 size=192`). An eight-dword shift would have to put a cbuf V#'s
+  leading dwords precisely where two dereferenceable pointers are. Slot 0 is the only place declaration
+  and memory disagree. #3126.
 
 - **"The surfaces prosper renders into read black because the live RTT cache does not treat them as
   authoritative, so the sampler falls through to zeroed guest memory."** Falsified (#3140) — 58,569
