@@ -19,6 +19,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-04
+
+### Two thirds of Stray's biggest render cost was the allocator, not the work
+
+No picture. The largest single leaf in a capture of Stray's 9.76 fps title screen is the graphics
+frontend's texture materializer, 1110 of 5020 ms, and 84% of it turned out to be one surface: a 4K
+HDR intermediate that a compute dispatch rewrites every frame and the renderer decodes back out of
+guest memory every time it is sampled.
+The part worth reading is what that decode was spending — it built two 63 MiB scratch buffers per
+reference, and past glibc's mmap threshold that is not an allocation but sixteen thousand page
+faults and a munmap, so **17.8 of the 26.0 ms was the allocator and the kernel rather than the
+detile**. The buffers are pooled now and the tiled source is read where it already lives, because
+guest memory is mapped 1:1 and copying it only ever produced a second address for the same bytes.
+[#3309](https://github.com/mattias800/prosper/pull/3309)
+
 ## 2026-09-03
 
 ### The frozen frame that gave five pictures now gives one, 3,875 times running
