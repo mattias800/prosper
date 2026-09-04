@@ -387,6 +387,15 @@ static void set_synthetic_frames(const char* value) {
 
 static uint32_t events[8]{};
 static int event_count = 0;
+// The warning channel carries its meaning in the PAYLOAD, not in the event id, so recording ids
+// alone cannot see it: every warning would read as one indistinguishable `0x20`. #2899.
+static uint32_t warning_codes[8]{};
+static int warning_count = 0;
+static void record_avplayer_event(uint32_t event, const void* data) {
+    if (event_count < 8) events[event_count++] = event;
+    if (event == 0x20u && data && warning_count < 8)
+        warning_codes[warning_count++] = *static_cast<const uint32_t*>(data);
+}
 static int texture_alloc_count = 0, texture_free_count = 0;
 static uint32_t texture_last_align = 0, texture_last_size = 0;
 static void* texture_expected_object = nullptr;
@@ -410,8 +419,8 @@ static void texture_deallocate_host(void* object, void* allocation) {
 }
 
 #ifdef _WIN32
-extern "C" void on_avplayer_event_host(uint32_t event) {
-    if (event_count < 8) events[event_count++] = event;
+extern "C" void on_avplayer_event_host(uint32_t event, const void* data) {
+    record_avplayer_event(event, data);
 }
 extern "C" void on_avplayer_event();
 extern "C" void* on_avplayer_texture_allocate_host(void* object, uint32_t align, uint32_t size) {
@@ -428,6 +437,7 @@ __asm__(
     ".text\n"
     ".globl on_avplayer_event\n"
     "on_avplayer_event:\n"
+    "  movq %rcx, %rdx\n"          // SysV eventData -> MS second argument, BEFORE ecx is clobbered
     "  movl %esi, %ecx\n"
     "  subq $40, %rsp\n"
     "  callq on_avplayer_event_host\n"
@@ -455,8 +465,8 @@ __asm__(
     "  addq $40, %rsp\n"
     "  retq\n");
 #else
-static void PROSPER_SYSV_ABI on_avplayer_event(void*, uint32_t event, int32_t, void*) {
-    if (event_count < 8) events[event_count++] = event;
+static void PROSPER_SYSV_ABI on_avplayer_event(void*, uint32_t event, int32_t, void* data) {
+    record_avplayer_event(event, data);
 }
 static void* PROSPER_SYSV_ABI on_avplayer_texture_allocate(void* object, uint32_t align,
                                                            uint32_t size) {
@@ -740,6 +750,7 @@ int main() {
         SeekingVideoBackend seeker;
         prosper::video::set_backend(&seeker);
         event_count = 0;
+        warning_count = 0;
         uint64_t seek_handle = init((uint64_t)(uintptr_t)&seek_data, 0, 0, 0, 0, 0);
         CHECK(add(seek_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
                   start(seek_handle, 0, 0, 0, 0, 0) == 0,
@@ -756,10 +767,26 @@ int main() {
         CHECK(video(seek_handle, (uint64_t)(uintptr_t)&paused_frame, 0, 0, 0, 0) == 0,
               "a paused player with no pending seek still delivers nothing");
 
+        const int warnings_before_jump = warning_count;
         CHECK(jump(seek_handle, 2000, 0, 0, 0, 0) == 0,
               "sceAvPlayerJumpToTime succeeds on a backend that can seek");
         CHECK(seeker.seek_calls == 1 && seeker.last_seek_us == 2'000'000,
               "the millisecond guest target reaches the backend as the same microsecond position");
+        // #2899: repositioning is only half of the seek. The guest is told the seek LANDED through
+        // the callback's WARNING channel, and until it hears that it sits in its own wait -- Space
+        // Adventure Cobra (PPSA17337) burns its full 15,000 ms budget there, measured at 15,003 ms.
+        // The notification's meaning is in the PAYLOAD: the guest's callback replaces the event id
+        // with *(uint32_t*)eventData for a warning and compares THAT, so an assertion on the event
+        // id alone would pass on any warning whatsoever and prove nothing.
+        //
+        // This arm fails without the publish in s_avp_jumptotime: delete the avp_fire_data call
+        // there and warning_count stays at warnings_before_jump, which is the mutation that
+        // separates "a warning was delivered" from "nothing was".
+        CHECK(warning_count == warnings_before_jump + 1,
+              "a successful sceAvPlayerJumpToTime publishes exactly one warning-channel event");
+        CHECK(warning_count > warnings_before_jump &&
+                  warning_codes[warnings_before_jump] == 0x806a00a3u,
+              "the published notification code is the seek-completion code the guest waits for");
         CHECK(current(seek_handle, 0, 0, 0, 0, 0) == 2000,
               "sceAvPlayerCurrentTime reports the new position before any frame is pulled");
 
@@ -777,8 +804,15 @@ int main() {
               "playback continues forward from the seek target once the guest resumes");
 
         seeker.support_seek = false;
+        const int warnings_before_failed_jump = warning_count;
         CHECK(jump(seek_handle, 500, 0, 0, 0, 0) != 0 && seeker.cursor > 0,
               "a backend that refuses the seek yields an error and leaves the position alone");
+        // The negative arm, and it is the one that keeps the positive arm honest: a publish that
+        // fired unconditionally would satisfy every assertion above while telling a guest that a
+        // seek which never happened had completed. A failed seek reports itself through the return
+        // code the guest already tests, and must announce nothing.
+        CHECK(warning_count == warnings_before_failed_jump,
+              "a FAILED sceAvPlayerJumpToTime publishes no seek-completion notification");
         close(seek_handle, 0, 0, 0, 0, 0);
     }
 
