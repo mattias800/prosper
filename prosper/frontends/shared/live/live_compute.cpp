@@ -10212,24 +10212,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         w_max_y = std::max(w_max_y, py);
                     }
                 }
-                uint64_t written_layers = 0;
-                bool any_written_partial = false;
-                if (r->depth > 1 && layer_texels > 0 && r->depth <= 64) {
-                    for (uint32_t l = 0; l < r->depth; ++l) {
-                        if (layer_survived[l] < layer_texels) {
-                            written_layers |= (1ULL << l);
-                            if (layer_survived[l] > 0) {
-                                any_written_partial = true;
-                            }
-                        }
-                    }
-                } else {
-                    written_layers = (survived < texels) ? 1ULL : 0ULL;
-                    any_written_partial = (survived > 0 && survived < texels);
-                }
+                // Lifted into seed_reprove.hpp so the >64-layer case is testable in isolation --
+                // it was silently corrupting guest memory here and no test could reach it.
+                const ArrayLayerCoverage layers = classify_array_layer_coverage(
+                    r->depth, layer_survived.data(), layer_texels, survived, texels);
+                const uint64_t written_layers = layers.written_layers;
+                const bool any_written_partial = layers.any_written_partial;
                 SeedCoverage cov = classify_seed_coverage(survived, texels);
-                const bool all_layers_written = (r->depth > 1) &&
-                    (written_layers == ((r->depth >= 64) ? ~0ULL : ((1ULL << r->depth) - 1)));
+                const bool all_layers_written =
+                    array_all_layers_written(r->depth, written_layers, layers.exact);
                 if (r->depth > 1 && all_layers_written && !any_written_partial) {
                     cov = SeedCoverage::Full;
                 }

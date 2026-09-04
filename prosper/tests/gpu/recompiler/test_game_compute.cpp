@@ -757,6 +757,56 @@ int main() {
             CHECK(fired && partial_skips == 0,
                   "reprove_eligible Partial verdict fires re-proving at interval and resets counter");
         }
+
+        // #3328 B2: the >64-layer array mask. Each arm below FAILS on the previous revision, which
+        // set `written_layers = (survived < texels) ? 1 : 0` for these resources -- bit 0 as a
+        // boolean. That is not a conservative approximation: the retile/pack consumers read bit
+        // `layer`, so layers 1..63 were skipped as untouched while layers >= 64 fell through the
+        // `layer < 64` guard and were written from non-zero-filled scratch.
+        {
+            using prosper::frontend::classify_array_layer_coverage;
+            using prosper::frontend::array_all_layers_written;
+
+            // A fully-written 100-layer array. Old code: written_layers == 1 (bit 0 only).
+            std::vector<size_t> none_survived(100, 0);
+            const auto deep_full = classify_array_layer_coverage(100, none_survived.data(), 64,
+                                                                 /*survived=*/0, /*texels=*/6400);
+            CHECK(deep_full.written_layers == ~0ULL,
+                  "depth>64 publishes the no-masking sentinel, never a bit-0 boolean");
+            CHECK(!deep_full.exact, "depth>64 mask is marked inexact");
+            CHECK(!array_all_layers_written(100, deep_full.written_layers, deep_full.exact),
+                  "an inexact sentinel mask must not promote coverage to Full");
+
+            // The dangerous direction: NOTHING written on a >64-layer array. A sentinel that were
+            // trusted would compare all-ones and promote an untouched surface to Full.
+            std::vector<size_t> all_survived(100, 64);
+            const auto deep_none = classify_array_layer_coverage(100, all_survived.data(), 64,
+                                                                 /*survived=*/6400, /*texels=*/6400);
+            CHECK(!array_all_layers_written(100, deep_none.written_layers, deep_none.exact),
+                  "untouched depth>64 array is never promoted to Full");
+            CHECK(!deep_none.any_written_partial, "untouched array reports no partial write");
+
+            // No per-layer counts (layer_texels == 0) had the identical defect at ANY depth.
+            const auto no_counts = classify_array_layer_coverage(8, nullptr, 0, 10, 100);
+            CHECK(no_counts.written_layers == ~0ULL && !no_counts.exact,
+                  "missing per-layer counts disable masking rather than approximate it");
+
+            // Exactly 64 layers still works and must not use the UB `1ULL << 64`.
+            std::vector<size_t> s64(64, 0);
+            const auto d64 = classify_array_layer_coverage(64, s64.data(), 16, 0, 1024);
+            CHECK(d64.exact && d64.written_layers == ~0ULL,
+                  "depth==64 computes a real all-ones mask");
+            CHECK(array_all_layers_written(64, d64.written_layers, d64.exact),
+                  "depth==64 fully written is promoted");
+
+            // Ordinary masked case still behaves: layers 0 and 2 of 4 written.
+            std::vector<size_t> mixed{0, 16, 0, 16};
+            const auto part = classify_array_layer_coverage(4, mixed.data(), 16, 32, 64);
+            CHECK(part.exact && part.written_layers == 0b0101ULL,
+                  "per-layer mask is exact below 64 layers");
+            CHECK(!array_all_layers_written(4, part.written_layers, part.exact),
+                  "partially written array is not promoted");
+        }
     }
 
     // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is
