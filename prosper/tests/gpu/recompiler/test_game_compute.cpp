@@ -702,6 +702,61 @@ int main() {
               "None coverage name contains NONE-COVERAGE");
         CHECK(std::string(seed_coverage_name(SeedCoverage::Partial)).find("PARTIAL-COVERAGE") != std::string::npos,
               "Partial coverage name contains PARTIAL-COVERAGE");
+
+        // #3328 B1/N2/N3: near-full coverage classification and reprove eligibility.
+        using prosper::frontend::classify_near_full_coverage;
+        using prosper::frontend::seed_verdict_reprove_eligible;
+
+        // classify_near_full_coverage:
+        CHECK(classify_near_full_coverage(0, 8294400),
+              "zero survivors classifies as near-full coverage");
+        CHECK(classify_near_full_coverage(0, 100),
+              "zero survivors on small target classifies as near-full coverage");
+        // Target < 1000 texels cannot be near-full unless 0 survived
+        CHECK(!classify_near_full_coverage(1, 999),
+              "sub-1000 texel target with 1 survivor is not near-full");
+        // 1000 texel target: 0.2% threshold is 2 texels (2 * 500 <= 1000)
+        CHECK(classify_near_full_coverage(2, 1000),
+              "1000 texels with 2 survivors clears 0.2% near-full bound");
+        CHECK(!classify_near_full_coverage(3, 1000),
+              "1000 texels with 3 survivors exceeds 0.2% near-full bound");
+        // 4K target (3840x2160 = 8,294,400 texels): minimap/cutout tolerance
+        CHECK(classify_near_full_coverage(16000, 8294400),
+              "4K target with 16000 unwritten texels (minimap cutout ~0.19%) classifies as near-full");
+        CHECK(!classify_near_full_coverage(17000, 8294400),
+              "4K target with 17000 unwritten texels (>0.2%) rejects near-full");
+
+        // seed_verdict_reprove_eligible (#3328 B1/N2):
+        // Full and None verdicts are always eligible for periodic re-proving
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Full, ~0ULL, false),
+              "Full coverage verdict is reprove-eligible");
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::None, ~0ULL, false),
+              "None coverage verdict is reprove-eligible");
+        // Default Partial verdict (untouched, no active optimization) seeds every time, no re-proving needed
+        CHECK(!seed_verdict_reprove_eligible(SeedCoverage::Partial, ~0ULL, false),
+              "unoptimized Partial verdict does not re-prove (always seeds)");
+        // Partial verdict with active layer mask optimization MUST periodically re-prove (B1)
+        constexpr uint64_t kLayer0Only = 0x1ULL;
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, false),
+              "Partial verdict with layer mask is reprove-eligible (B1 bounds staleness)");
+        // Partial verdict with active near-full coverage bypass MUST periodically re-prove (N2)
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, ~0ULL, true),
+              "Partial verdict with near-full coverage is reprove-eligible (N2 bounds staleness)");
+        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, true),
+              "Partial verdict with both layer mask and near-full is reprove-eligible");
+
+        // B1 cycle verification: Partial with layer mask fires on interval and resets
+        {
+            uint32_t partial_skips = 0;
+            const bool eligible = seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, false);
+            CHECK(eligible, "layer-masked partial is eligible");
+            bool fired = false;
+            for (uint32_t i = 0; i < 3; ++i) {
+                if (eligible && seed_reprove_due(partial_skips, 3)) fired = true;
+            }
+            CHECK(fired && partial_skips == 0,
+                  "reprove_eligible Partial verdict fires re-proving at interval and resets counter");
+        }
     }
 
     // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is

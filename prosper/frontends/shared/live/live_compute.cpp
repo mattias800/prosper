@@ -5530,7 +5530,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // cached Partial and always seeds (safe).
     using prosper::frontend::SeedCoverage;
     using prosper::frontend::classify_seed_coverage;
+    using prosper::frontend::classify_near_full_coverage;
     using prosper::frontend::seed_coverage_name;
+    using prosper::frontend::seed_verdict_reprove_eligible;
     // #1127: 'prove once, trust forever' is unsound for a DATA-DEPENDENT store (full on the proving
     // frame, partial later). Re-prove a Full or None verdict every kSeedReproveInterval fast-skips: a shader
     // that ever covers partially is then re-cached Partial and always seeds, bounding the corruption
@@ -6701,11 +6703,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.written_layers_mask = it->second.written_layers;
                         bi.near_full_coverage = it->second.near_full;
                         // #1127: periodically re-prove a Full, None, or layer-masked/near-full Partial verdict
-                        // so a data-dependent store that later changes coverage is caught. The helper resets
-                        // the counter, so concurrent dispatches on this key don't all re-prove at once.
-                        const bool partial_optimised = (it->second.cov == SeedCoverage::Partial) &&
-                            (it->second.written_layers != ~0ULL || it->second.near_full);
-                        if ((proven_full || proven_none || partial_optimised) &&
+                        // so a data-dependent store that later changes coverage is caught (#3328 B1/N2). The helper
+                        // resets the counter, so concurrent dispatches on this key don't all re-prove at once.
+                        if (seed_verdict_reprove_eligible(it->second.cov, it->second.written_layers, it->second.near_full) &&
                             seed_reprove_due(it->second.skips, kSeedReproveInterval))
                             reprove_due = true;
                     }
@@ -10233,10 +10233,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (r->depth > 1 && all_layers_written && !any_written_partial) {
                     cov = SeedCoverage::Full;
                 }
-                // Near-full threshold: permits up to 0.2% (1/500) unwritten texels for targets with >= 1000 texels.
-                // This accounts for small unwritten UI margins or minimap cutouts on 4K post-processing surfaces
-                // (e.g. ~16,000 unwritten margin texels on an ~8.3M 4K target is ~0.19%, just under the 0.2% bound).
-                const bool near_full = (survived == 0) || (texels >= 1000 && survived * 500 <= texels);
+                const bool near_full = classify_near_full_coverage(survived, texels);
                 bi.written_layers_mask = written_layers;
                 bi.near_full_coverage = near_full;
                 {

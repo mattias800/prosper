@@ -68,4 +68,22 @@ constexpr const char* seed_coverage_name(SeedCoverage cov) {
     return "unknown";
 }
 
+// Near-full coverage classification: permits up to 0.2% (1/500) unwritten texels for targets with >= 1000 texels.
+// This accounts for small unwritten UI margins or minimap cutouts on 4K post-processing surfaces
+// (e.g. ~16,000 unwritten margin texels on an ~8.3M 4K target is ~0.19%, just under the 0.2% bound).
+constexpr bool classify_near_full_coverage(size_t survived, size_t texels) {
+    return (survived == 0) || (texels >= 1000 && survived * 500 <= texels);
+}
+
+// Determines whether a cached seed verdict should participate in periodic re-proving.
+// In addition to Full and None, any Partial verdict that carries an active optimization
+// (a non-default layer mask or near-full coverage bypass) must periodically re-prove so
+// that data-dependent stores changing which layers/texels are written do not remain stale
+// beyond one reprove interval (#3328 B1/N2).
+constexpr bool seed_verdict_reprove_eligible(SeedCoverage cov, uint64_t written_layers, bool near_full) {
+    if (cov == SeedCoverage::Full || cov == SeedCoverage::None) return true;
+    if (cov == SeedCoverage::Partial && (written_layers != ~0ULL || near_full)) return true;
+    return false;
+}
+
 }  // namespace prosper::frontend
