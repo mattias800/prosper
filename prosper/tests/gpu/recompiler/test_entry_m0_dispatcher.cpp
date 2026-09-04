@@ -323,6 +323,24 @@ int main() {
           "or the region shape -- pinning WHERE, since it cannot pin WHY");
     if (fails) printf("  [info] arm F reject reason: '%s'\n", reason_f.c_str());
 
+    // NOT COVERED HERE, and recorded so nobody assumes otherwise: the block-0 seed that carries an
+    // entry-M0 token ACROSS a dispatcher-region boundary (`inherited_entry_m0` in
+    // `rdna2_emit_cfg.cpp`). Every program in this file is single-region, so the seed is a no-op for
+    // all of them and removing it reddens nothing. Two fixtures were built and neither reaches it:
+    //
+    //   unguarded two-phase kernel + the readlane route -> refused outright with
+    //       `portable-readlane-dispatcher-unsafe guest-barrier=1`; a guest barrier and a portable
+    //       readlane are incompatible, and the readlane is how every other program here forces the
+    //       dispatcher.
+    //   unguarded two-phase kernel, no readlane          -> `emit_body` never takes the phased path:
+    //       it needs `phased.guarded || initial_dispatch_active || force_barrier_phases`. The
+    //       straight-line emitter handled it instead and refused the cross-phase read at pc5 from
+    //       the shared `RegState`'s own token -- a PASS for the wrong reason, which is why that arm
+    //       was deleted rather than kept.
+    //
+    // Reaching it needs `initial_dispatch_active`, i.e. a phased region nested inside a dispatcher
+    // -- Astro Bot's `0x500571000` shape, not a ten-line fixture. Tracked as #3314.
+    //
     // Measured mutation signatures, so a future reader can tell a real regression from a fixture
     // that drifted. Every one built cleanly (rc=0) before being believed.
     //

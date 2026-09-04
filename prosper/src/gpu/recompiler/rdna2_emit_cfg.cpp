@@ -1934,8 +1934,11 @@ bool emit_cfg_state_machine(
     // background it belongs to is #3126). It saves M0 into s14 at pc157 and pc274 -- and s14 is ALSO
     // the compute stage's workgroup-id X, so `v_lshl_add_u32 v11, s14, 3, v0` at pc4, the shader's
     // own global-thread-index computation four dwords into the program, read a token for a save 153
-    // dwords AHEAD of it and the whole dispatch was skipped. Grand Theft Auto V and The Plucky
-    // Squire each have a kernel with the byte-identical defect.
+    // dwords AHEAD of it and the whole dispatch was skipped. The Plucky Squire's `0x3015ab0000`
+    // carries the byte-identical defect. Grand Theft Auto V's `lighting.bin` carries the byte-
+    // identical PATTERN -- it saves into s6/s7 and its pc1 is `v_lshl_add_u32 v5, s6, 6, v0` -- but
+    // is NOT a demonstrated carrier: it lowers through the straight-line emitter and rejects on an
+    // earlier MUBUF, so it never reaches `load_state` at all.
     //
     // Narrow it to an entry-rooted forward MAY dataflow over the same CFG the mask analyses below
     // walk: GEN on #3133's own save shape, a UNION join, and DELIBERATELY NO KILL. The two bounds
@@ -1946,10 +1949,13 @@ bool emit_cfg_state_machine(
     //          tokens relative to #3133, and a removed token can never turn an accepted program into
     //          a rejected one.
     //   LOWER  entry_m0_in[B] contains every register whose token the EMITTER could hold live on
-    //          entry to B. The emitter creates a token only at a save (`rdna2_emit_alu.cpp:1337`)
-    //          and erases one in only one place (`:1354`); it never creates one anywhere else. A
-    //          union over every path from every save is therefore a superset of whatever the emitter
-    //          can be carrying, whichever path it arrived by.
+    //          entry to B, for saves inside this region. The only site that ORIGINATES a token is a
+    //          save (`rdna2_emit_alu.cpp:1337`); `emit_alu:1354` erases one, and
+    //          `join_entry_m0` (`rdna2_to_spirv_internal.hpp:4957-4964`) both inserts and erases but
+    //          only PROPAGATES an existing one across a structured join -- it cannot invent a token
+    //          for a register no save ever wrote. A union over every path from every save is
+    //          therefore a superset of whatever the emitter can be carrying, whichever path it
+    //          arrived by.
     //
     // The LOWER bound is why there is no KILL, and it is not an oversight. Dropping a token that the
     // emitter would keep is NOT the safe direction: `load_state` gives every referenced scalar a
@@ -1965,13 +1971,45 @@ bool emit_cfg_state_machine(
     // this dispatcher path now agrees with the emitter instead of being more permissive than it.
     // A precise KILL wants a value-publishing predicate shared with `emit_alu`, so that the two
     // cannot drift; that is follow-up work, not a thing to approximate here.
+    //
+    // BOTH BOUNDS ARE SCOPED TO ONE DISPATCHER REGION, and `emit_body` runs several: a
+    // barrier-phased compute kernel calls this function once per phase with the SAME `RegState&`
+    // (`emit_phase` below). A token can therefore be live on ENTRY to this region, created by a save
+    // in an earlier phase -- which is why the LOWER bound is not "no save has executed", and why
+    // block 0 is seeded rather than left empty.
+    //
+    // It has to be seeded explicitly because the token does not survive the boundary on its own:
+    // the previous region ends with `initial = load_state()`, whose `RegState` is
+    // default-constructed and copies seven named fields from `initial`, `sreg_entry_m0` NOT among
+    // them -- while the stamp it does apply erases those registers from `initial.sreg`. The next
+    // region's prologue then stores ZERO into their Function variables (the `sv` loop below), so an
+    // unseeded block 0 reads the token-bearing register back as 0 with `ok` true. Before this
+    // narrowing that was covered by accident, because the old whole-stream stamp re-armed the set at
+    // every block entry of every phase.
+    //
+    // The INTERSECTION with `entry_m0_may_hold` is load-bearing, not tidiness: it is what keeps the
+    // UPPER bound true across the seed, so this can still only remove tokens relative to #3133 and
+    // can never newly reject a program that compiled before. Its cost is that a register saved in an
+    // earlier phase and NOT saved again in this one is not re-armed here -- a hole that predates this
+    // change and that the old code did not cover either, since its own set was per-region too. It is
+    // #3314, along with the reason neither the seed nor the hole has a regression arm: reaching this
+    // path needs a phased region nested inside a dispatcher (`initial_dispatch_active`), which is
+    // Astro Bot's `0x500571000` shape rather than a synthesizable fixture. The seed below is
+    // therefore UNCOVERED BY TESTS; `test_entry_m0_dispatcher` records the two fixtures that were
+    // tried and the named mechanism that blocked each.
+    std::set<int> inherited_entry_m0;
+    for (const int reg : entry_m0_may_hold)
+        if (entry_m0_live(initial, reg)) inherited_entry_m0.insert(reg);
+
     std::vector<std::set<int>> entry_m0_in(starts.size());
     std::vector<bool> entry_m0_reachable(starts.size(), false);
     if (!entry_m0_may_hold.empty() && !starts.empty()) {
-        // Block 0 is the program entry, as it is for the mask analyses below. Its in-set starts
-        // empty and STAYS empty unless a back edge reaches it -- which is legal, and then the union
-        // below correctly puts the token back. The guarantee is "no save has executed on entry",
-        // not "this set is empty", and only the first is true by construction.
+        // Block 0 is this REGION's entry, as it is for the mask analyses below. Its in-set is the
+        // inherited set above -- empty for a single-region shader, and for the first phase of a
+        // phased one -- and it grows only if a back edge reaches block 0, which is legal and which
+        // the union below handles. The guarantee is "no save in THIS region has executed on entry",
+        // not "this set is empty"; only the first is true by construction.
+        entry_m0_in.front() = inherited_entry_m0;
         entry_m0_reachable.front() = true;
         std::vector<uint32_t> pending{0};
         while (!pending.empty()) {
@@ -1983,10 +2021,12 @@ bool emit_cfg_state_machine(
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
                 // `is_end` is skipped rather than treated as a terminator, where the whole-stream
-                // scan at the MAY set above stops at the first one. That makes this set no smaller
-                // than it would otherwise be past an early `s_endpgm`, which is the direction the
-                // UPPER bound needs, so the two disagreeing here is safe in the one direction that
-                // matters.
+                // scan that builds the MAY set stops at the first one. So this walk can GEN from a
+                // save past an early `s_endpgm` that the MAY set never saw, which makes the set
+                // potentially LARGER, not smaller -- the direction the LOWER bound wants and the one
+                // that would break UPPER if the two disagreed. They cannot: a save past an early
+                // `s_endpgm` is unreachable, so no `successors` edge leads to its block and the walk
+                // never visits it. UPPER therefore holds for the sets that are actually consulted.
                 if (in.is_end) continue;
                 if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
                     in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
