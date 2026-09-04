@@ -2418,13 +2418,13 @@ namespace {
             static std::atomic<long> dump_owner{0};
             long expected = 0;
             if (!prosper::host::claim_fault_report(dump_owner, fc.tid, &expected)) {
-                char cb2[224];
+                char cb2[224], where2[64];
+                prosper::format_guest_module_label(where2, sizeof where2, fc.rip);
                 int cn2 = snprintf(cb2, sizeof cb2,
                     "[prosper] CONCURRENT WORKER-THREAD FAULT: tid=%ld sig=%d addr=%p rip=0x%llx "
-                    "(image+0x%llx) -- full dump suppressed, tid=%ld is already reporting\n",
+                    "(%s) -- full dump suppressed, tid=%ld is already reporting\n",
                     fc.tid, fc.sig, (void*)(uintptr_t)fc.addr, (unsigned long long)fc.rip,
-                    (unsigned long long)(g_base && fc.rip >= g_base ? fc.rip - g_base : fc.rip),
-                    expected);
+                    where2, expected);
                 raw_write_fmt(2, cb2, sizeof cb2, cn2);
                 // Wait for the owner to finish before ending the process — `_exit` here would
                 // truncate the very report this gate exists to keep whole (measured: the header
@@ -2449,11 +2449,11 @@ namespace {
                 if (getenv("PROSPER_WORKER_PARK")) { for (;;) pause(); }
                 _exit(90);
             }
-            char b[200];
-            int n = snprintf(b, sizeof b, "[prosper] WORKER-THREAD FAULT: sig=%d addr=%p rip=0x%llx (image+0x%llx) rbp=0x%llx tid=%ld\n",
+            char b[200], where3[64];
+            prosper::format_guest_module_label(where3, sizeof where3, fc.rip);
+            int n = snprintf(b, sizeof b, "[prosper] WORKER-THREAD FAULT: sig=%d addr=%p rip=0x%llx (%s) rbp=0x%llx tid=%ld\n",
                              fc.sig, (void*)(uintptr_t)fc.addr, (unsigned long long)fc.rip,
-                             (unsigned long long)(g_base && fc.rip >= g_base ? fc.rip - g_base : fc.rip),
-                             (unsigned long long)fc.rbp, fc.tid);
+                             where3, (unsigned long long)fc.rbp, fc.tid);
             raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
             // Classify the fault rip + fault-addr regions (which mapping / module) and dump the instruction
             // bytes at rip — turns the ASLR-relocated "rip=0x...48b" into an identifiable location.
@@ -2896,9 +2896,14 @@ namespace {
         const char* sn = g_trap_sig == SIGILL ? "SIGILL"
                        : g_trap_sig == SIGBUS ? "SIGBUS"
                        : g_trap_sig == SIGFPE ? "SIGFPE" : "SIGSEGV";
-        uint64_t off = (g_base && g_fault_rip >= g_base) ? g_fault_rip - g_base : 0;
-        snprintf(buf, sizeof buf, "%s at addr=%p  rip=0x%llx (image+0x%llx)",
-                 sn, g_fault_addr, (unsigned long long)g_fault_rip, (unsigned long long)off);
+        // Label the rip with the SHARED module lookup (#1659), not `rip - eboot_base`. The old
+        // arithmetic printed "image+<rip - g_base>" for EVERY rip, so a fault in any module other
+        // than the eboot rendered as a nonsense eboot offset -- on PPSA20447 a libc.prx address
+        // came out as image+0x1b0004a20, 6.75 GiB past the end of a 250 MiB image.
+        char where[64];
+        prosper::format_guest_module_label(where, sizeof where, g_fault_rip);
+        snprintf(buf, sizeof buf, "%s at addr=%p  rip=0x%llx (%s)",
+                 sn, g_fault_addr, (unsigned long long)g_fault_rip, where);
         return buf;
     }
 
