@@ -3,6 +3,7 @@
 // pixels. Used to verify recompiled shaders end-to-end (render -> readback -> pixel asserts). The
 // including test links Vulkan::Vulkan.
 #pragma once
+#include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
 #include "gpu/capture/gpu_capture.hpp"
@@ -5154,6 +5155,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     PersistentColorTargetImage* cached_color = nullptr;
     if (persistent_color) {
         color_key = {color_target->persistent_id, W, H, FMT};
+        // PROSPER_TARGET_PHYS (#2932): print each colour target's guest VA and the physical address
+        // it maps to. The present path matches a flipped scanout buffer against targets by VIRTUAL
+        // address, and Stray renders into 0x30... while flipping 0x9fc0000000 (phys 0x230000). If a
+        // target's physical range covers that page, the two are aliases of one allocation and the
+        // VA-keyed match is the whole defect; if none does, the guest copies between distinct
+        // allocations and the question moves to which packet performs it.
+        static const bool target_phys_census = std::getenv("PROSPER_TARGET_PHYS") != nullptr;
+        if (target_phys_census && color_target->persistent_id) {
+            uint64_t tphys = 0;
+            const bool ok = prosper::host::guest_write_watch_va_to_phys(
+                color_target->persistent_id, tphys);
+            std::fprintf(stderr, "[target-phys] va=0x%llx %ux%u -> %s0x%llx\n",
+                         (unsigned long long)color_target->persistent_id, W, H,
+                         ok ? "phys=" : "UNRESOLVED ", (unsigned long long)tphys);
+        }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
         cached_color->last_use = color_target_generation;

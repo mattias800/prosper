@@ -9744,6 +9744,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     prosper::frontend::guest_scanout_decision_name(decision), w, h,
                                     read.metadata.tiling_mode, (int)read.guest_authored,
                                     read.padded_footprint ? "padded" : "nominal");
+                        // #2932: does the flipped VA resolve to a physical page the write-watch
+                        // knows? The present path matches scanout against render targets by VIRTUAL
+                        // address only, and this title renders into 0x30... while flipping
+                        // 0x9fc0000000 -- ~450 GiB apart, so no VA-keyed lookup can connect them.
+                        // If the two are aliases of one physical range, that gap is the whole defect
+                        // and the fix reuses resolution prosper already performs. Printed beside the
+                        // decision so the answer arrives with the failure rather than in a separate
+                        // run whose guest state may differ.
+                        if (prosper::diag_should_print(ord)) {
+                            uint64_t flip_phys = 0;
+                            const bool ok = prosper::host::guest_write_watch_va_to_phys(
+                                read.metadata.address, flip_phys);
+                            fprintf(stderr,
+                                    "[rtt] GUEST SCANOUT #%llu phys: va=0x%llx -> %s\n",
+                                    (unsigned long long)ord,
+                                    (unsigned long long)read.metadata.address,
+                                    ok ? "" : "UNRESOLVED (no direct mapping covers this VA)");
+                            if (ok)
+                                fprintf(stderr, "[rtt]   flip phys=0x%llx\n",
+                                        (unsigned long long)flip_phys);
+                        }
                     }
                     // Re-check the size on the cached path too: a two-set geometry switch can change
                     // the present extent between spans of one flip, and the cache is keyed on the
