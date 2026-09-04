@@ -452,6 +452,45 @@ Measured effect, `PROSPER_NO_COMPUTE=1 boot_trace`, default route:
 | `PS5 Out of Memory` / `Fatal error!` / `SIGSEGV` | 1 / 1 / 1 | **0 / 0 / 0** |
 | audio | — | `[audio2] port1: …` — the audio layer is live |
 
+### Cross-title scope of the fix: three titles import these NIDs, and only one reads the answer
+
+The change was scoped as "two NIDs, one title". It is not: three dumps in the local corpus carry both
+NIDs in their import tables — `PPSA20447` (Khazan), `PPSA05143` (*Little Nightmares III*, **rung 2**)
+and `PPSA31334` (*Yakuza Kiwami*). Linked is not called, and called is not *read*, so both were
+resolved by disassembly rather than by a boot.
+
+In each eboot the call site is reached the same way — PLT entry → a single `jmp` thunk → a single
+`call` — and all three have the identical shape: `sceSysmoduleLoadModule(0x137)`, the two libScePsml
+calls, then an allocation sized from the out-struct. They differ in exactly one instruction:
+
+| title | after the second call | effect of registering an error |
+| --- | --- | --- |
+| Khazan `PPSA20447` | `or %r15d,%eax ; jne 0xe74dc2` — **tests both return codes** | **fixed** — takes the guest's own clean early return |
+| *Little Nightmares III* `PPSA05143` | `mov -0x48(%rbp),%rsi ; shl $0x4,%rsi` — return value never examined | **inert** |
+| *Yakuza Kiwami* `PPSA31334` | `mov -0xc8(%rbp),%r15 ; imul -0xb8(%rbp),%r15` — return value never examined | **inert** |
+
+Neither `eax` is tested, spilled or read anywhere between the call and the allocation in the two
+inert titles, and the handler writes nothing through either pointer, so there is no path by which the
+change can alter them. The "one call site" claim is not a scan artefact: in all three eboots the PLT
+entry has exactly one referrer (its thunk), each thunk has exactly one referrer (the call), and
+**zero** data-pointer relocations carry a thunk or PLT address as an addend, so there is no
+address-taken or indirect path either.
+
+Two things fall out that are **not** Khazan's to fix:
+
+- **The other two titles carry the same uninitialised read today**, on master, unchanged by this fix.
+  *Yakuza Kiwami* multiplies **two** untouched fields (`out[+0x00] * out[+0x18]`). They survive it,
+  which means either the path is not reached during boot — *Little Nightmares III* gates it behind two
+  global byte checks before the sysmodule load — or the residue happens to be benign. Neither is a
+  guarantee, and both are one stack-layout change away from Khazan's failure.
+- **Do not "improve" this fix by zeroing the out-struct.** It is the obvious next step, since two of
+  the three titles ignore the return code and an error therefore does not protect them — and it would
+  **crash Khazan**. Its struct is at `rbp-0x48` and its stack cookie at `rbp-0x30`; the minimum span
+  covering every field the three titles read (`+0x00`, `+0x10`, `+0x18`) is 0x20 bytes from
+  `rbp-0x48`, which lands on the cookie and trips `__stack_chk_fail`. The layouts are genuinely
+  unknowable, and this is what "guessing at an unknown struct replaces one fabrication with another"
+  looks like in concrete terms.
+
 **Sifu (`PPSA03001`) is NOT fixed by this.** It calls `libScePsml` zero times and its identical
 banner has a different cause; see the corrected `## Ruled out` row.
 
