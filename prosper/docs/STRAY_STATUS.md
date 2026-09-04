@@ -919,11 +919,25 @@ sh=/221 pc=66 words=e0042000,6b020900 op=0x1 src=0(k2),8(k1),107(k6)  stage=vert
 
 Both are `buffer_load_format_*` with `idxen` — **vertex attribute fetch** — in small vertex shaders,
 with `VCC_LO`/`VCC_HI` as the soffset. The opcodes themselves are implemented (`0x0`-`0x3` are all
-handled), so the reject is an operand, not a missing instruction. The next thing to establish is
-whether the failing operand is the soffset or the SRSRC: `allow_smem` is `(rt != nullptr)` for
-graphics, so **a vertex stage that arrives with no resource table fails every buffer op it has**, and
-vertex fetch is a buffer op — that would take the draw with it. A probe on `rt == nullptr` at the
-vertex recompile answers it in one run.
+handled), so the reject is an operand, not a missing instruction.
+
+**This paragraph used to end by proposing an `rt == nullptr` probe "answers it in one run". Do not
+run it — § *Ruled out* already did, and killed it:** the disposition line reports `rt=1` with five
+resources, and the `VCC_LO`/`VCC_HI` soffset is not it either (`operand_bits` has a vertex-stage
+branch for exactly that, and the reject happens before the address is formed). The pointer outlived
+the answer by sitting a hundred lines above the row that falsified it, which is the failure mode the
+`## Ruled out` convention exists to prevent — so it is corrected here rather than only there.
+
+**What actually fails is SRSRC provenance, and that is the frontier for this screen.** Both failing
+stages build their own descriptor at runtime — `s_load_dwordx4 s[4:7], s[12:13], vcc_hi` with a
+*register* offset, then a `s_and`/`s_or`/`s_cselect_b32 s7, …` patch of dword 3 — so there is no SRT
+key and the SRSRC range is rewritten by the shader itself. See § *Ruled out* for the full
+disassembly and why the direct-SGPR fallbacks are correctly suppressed.
+
+**Why this is the thing to work on, in one number:** `shader-recompile` discards **~3800 of 8192** on
+the title screen against **7 of 1024** on calibration. That is not a difference of degree between the
+two screens; it is the difference between them, and the census table above is measured at the same
+cumulative total in both arms.
 
 ### What #3133 is worth here
 
@@ -1388,11 +1402,27 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
 - **"The world renders into an HDR target that the composite then loses."** Falsified: every seeded
   scene target in the title-screen frame is black at source (brightest channel 0-6 across five HDR
   targets). #3126.
-- **VOID — "A skipped compute dispatch collapses the composite" (the charter's LUT/exposure shape).**
-  `PROSPER_COMPUTE_PROGRAM_CENSUS` reports the only program with any skips at **executed=7455,
-  skipped=2** — but that census was read on **calibration** and has not been re-run on the title
-  screen, so it is not a falsification for it. This row said `Falsified` and was corrected: the
-  measurement is real, the scope was overclaimed. #3126.
+- **"A skipped compute dispatch collapses the composite" (the charter's LUT/exposure shape).**
+  **Falsified on the title screen, 2026-09-04** — this row was VOID for the right reason (the census
+  had only been read on **calibration**), and the missing arm has now been run.
+
+  Title route, steady state confirmed by capture provenance and by eye (29/30 `composited`, menu over
+  black): **65,536 dispatch decisions across 21 programs**, and exactly **one** program ever skips —
+
+  ```
+  program=0x300ba70000 executed=15103 skipped=1 groups=640x1x1 local=64x1 threads=40960x1
+  ```
+
+  One skip in 15,104. Nothing is being systematically dropped. The dispatch shape settles it twice
+  over: `640x1x1` groups of `64x1` is a **1-D** launch of 40,960 threads, not the ~`480x270` a
+  full-screen 4K pass would take, so this program is not a scene writer whatever its skip rate.
+
+  **The cross-check is the strongest part, and it was free.** Read at the same cumulative total the
+  calibration arm used (32,768 decisions — the methodology § *The title screen's REAL numbers*
+  requires), the two screens report **`executed=7455 skipped=2`** (calibration) against
+  **`executed=7455 skipped=1`** (title). Identical to the dispatch. So compute behaviour does not
+  distinguish the screen that renders correctly from the one that is black, and no fix aimed at
+  compute skipping can explain the difference. Two independent runs agreed. #3126, #2932.
 - **MIMG `SRSRC` is not a user-SGPR index.** It names any SGPR, so a scan that treats every SRSRC as
   a user-data slot reports mostly false positives — scratch registers the shader loaded a descriptor
   into. An earlier list of "bases missing from the table" derived that way is discarded. #3126.
