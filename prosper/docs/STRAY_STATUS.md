@@ -316,9 +316,13 @@ which maps exactly onto this stage's `[b4 cbuf s8] [b2 cbuf s16] [b3 cbuf s20]` 
         raw 0ae8fb54 00000030 0ae8fd64 00000030 00000000 00700000 00000000 00000000
 ```
 
-Run-wide: **97 `claimed by the V# path`, 4 `degenerate T# (bad-image-type)`** — so on the 4 draws where
-the V# path did *not* claim it, the texture decoder reached those bytes and rejected them exactly as
-derived above. The prediction is measured.
+Run-wide: **97 `claimed by the V# path`, 4 `degenerate T# (bad-image-type)`**. Read those counts
+correctly: `tex_drop` dedupes on **(user-data block, slot, reason)**, so they count *distinct blocks per
+reason*, **not draws** — a block that is dropped for one reason on ten thousand draws contributes one.
+They establish that both buckets occur and roughly how many blocks land in each; they are not a per-draw
+census and must not be quoted as one. What the second bucket does establish is the thing that matters:
+where the V# path did *not* claim the slot, the texture decoder reached those bytes and rejected them
+exactly as derived above. The prediction is measured.
 
 **The discriminator between the two buckets is one half-word**, and it is derivable from the raw dwords:
 `dw1`'s upper half is the V# `STRIDE` field. `0x00100030` → stride 16 → the read-only V# gate claims it;
@@ -334,8 +338,10 @@ derived above. The prediction is measured.
 | `2f70fbb8 00000030 2f70fdcc 00000030 …` | stride 0 → rejected | `0x302f70fbb8`, `0x302f70fdcc` (Δ `0x214`) |
 
 Both `bad-image-type` samples are two clean, adjacent guest pointers plus a constant `0x00700000` at
-dword 5. So the payload is not one stable wrong value — it **varies by draw**, and across 101 sampled
-drops the declared image slot never once held an image descriptor.
+dword 5. So the payload is not one stable wrong value — it **varies between blocks**, and in no sampled
+drop did the declared image slot hold an image descriptor. (Deliberately not "across 101 draws": see the
+dedupe note above. The per-draw claim this section rests on is the 1:1 slot/op correspondence below,
+which is read off one run's drops and rejects rather than off these counts.)
 
 **Settled: the guest declares an eight-dword T# there.** `PROSPER_SHARPLOG=1` together with
 `PROSPER_DYNTRACE_FAIL=1` — both are needed, because `[sharp]` keys on `ud=` and only `[resdump]` ties a

@@ -781,8 +781,6 @@ inline bool is_proven_null_nullable_raw_buffer(const ShaderResource& resource) {
            resource.fetch_pc != 0xFFFFFFFFu && valid_host_witness;
 }
 
-// The set of resources a shader uses. The front-half builds it from the shader's user_data; the
-// recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 // Which resource class an image instruction can accept. RDNA2 splits MIMG by operation, not by
 // descriptor: image_store and every integer image atomic are read-modify-write and therefore can
 // only target a StorageImage, an ordinary sample can only use a Texture, and IMAGE_LOAD (0x00) /
@@ -808,6 +806,8 @@ inline bool image_resource_class_satisfies(ResourceClass cls, ImageResourceRequi
     return false;
 }
 
+// The set of resources a shader uses. The front-half builds it from the shader's user_data; the
+// recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {
     std::vector<ShaderResource> resources;
     // Exact dispatch contracts may materialize immutable host-only resources. ShaderResource keeps
