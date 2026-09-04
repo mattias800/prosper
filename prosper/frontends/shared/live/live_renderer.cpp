@@ -5962,15 +5962,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 flin.zero_tail(copy_resource(
                                     flin.data(), sampled_source_addr, flin.size()));
                             }
-                            for (size_t t = 0; t < volume_texels; ++t) {
-                                for (uint32_t c = 0; c < 4; ++c) {
-                                    float value = c == 3 ? 1.0f : 0.0f;
-                                    if (c < nc)
-                                        std::memcpy(&value, flin.data() + t * bpt + c * 4, 4);
-                                    const uint16_t half = prosper::gpu::float_to_half(value);
-                                    std::memcpy(texture_pixels.data() + t * 8 + c * 2, &half, 2);
-                                }
-                            }
+                            // Was a per-texel/per-channel scalar loop around float_to_half with a
+                            // 4-byte and a 2-byte memcpy each -- 8.3 M conversions and 16.6 M small
+                            // copies for one 1920x1080 reference, single-threaded, next to an
+                            // already-vectorised sibling. The helper below IS that sibling, widened
+                            // to the narrower component counts; it keeps the same (0,0,0,1) fill and
+                            // the same bit-for-bit rounding/NaN-payload contract.
+                            prosper::frontend::pack_float32_to_rgba16f_range(
+                                flin.data(), nc, bpt, volume_texels, texture_pixels.data());
                             f32_done = true;
                         } else if (f16) {
                             // fp16 texture (#290 wall 1): read at the REAL bytes-per-texel and detile
