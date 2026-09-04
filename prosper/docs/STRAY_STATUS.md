@@ -267,22 +267,39 @@ penalty is **0.185 ms at 16 MiB** rather than the 11.279 ms at 64 MiB. The dynam
 upward after the first free, so a repeated 19.5 MiB allocation comes from the arena; a 63.3 MiB one
 never can.
 
-**That mean does not support the conclusion, and the conclusion is therefore a candidate rather than
-a finding.** A mean is the wrong statistic when the cost function has a **discontinuity inside the
-distribution**, which is exactly the case here: the 32 MiB cap is a step, not a slope. 253,284.7 MiB
-over 13,001 snapshots is equally consistent with ~3,000 allocations at 63.3 MiB — 190 GiB, most of
-the volume and by the table above most of the *cost* — plus ~10,000 averaging 6.3 MiB. The mean reads
-19.5 either way, so it cannot distinguish the two populations, and only one of them supports "the
-surfaces are mostly small".
+**Separate what is established from what is not, because they are different halves of this
+paragraph.**
 
-The route's own census cuts against it: `3840x2160 bpe=8 evaluated=4879 seed_skip=2469` is roughly
-2,410 seeds at 63.3 MiB, which at the table's 11.279 ms predicts **~27 s** against a `setup_ms` total
-of 51,062.6 ms. **If that saving were real the A/B could not have come back null**, so something in
-the chain is wrong and "the surfaces are mostly small" is one of at least three candidates. The
-others: the micro-benchmark's tight-loop allocator behaviour may not reproduce in a live run, and the
-census and the phase-timing run are **different runs on different heads**. Separating them needs a
-size histogram, not another mean. Do not generalise the null past this route, and do not quote the
-~60x as measured.
+*Established, and not in doubt:* the benchmark table is a direct measurement, and glibc's dynamic
+`M_MMAP_THRESHOLD` is capped at 32 MiB by documented allocator behaviour. So **the pooling's value is
+a step function of lease size** — large where a lease cannot come from the arena, small where it can.
+That much is a finding.
+
+*Not established:* where **this route's** leases fall relative to that step. The mean cannot say, and
+that is the specific defect in the original argument — a mean is the wrong statistic when the cost
+function has a **discontinuity inside the distribution**. 253,284.7 MiB over 13,001 snapshots is
+equally consistent with ~3,000 allocations at 63.3 MiB (190 GiB, most of the volume and by the table
+most of the *cost*) plus ~10,000 averaging 6.3 MiB. The mean reads 19.5 either way, so it cannot
+distinguish the two populations and only one of them supports "the surfaces are mostly small".
+
+**The null does not settle it either, and the reason is power rather than population.** The route's
+census — `3840x2160 bpe=8 evaluated=4879 seed_skip=2469`, roughly 2,410 seeds at 63.3 MiB — predicts
+**~27 s** at the table's 11.279 ms. That figure is a **whole-run** number built from a census on
+`fc21d46ca` plus a 62,556-dispatch phase-timing run, while the A/B is a **5.02 s window at t=175 s**:
+the two are not commensurable, and an earlier draft of this row wrongly argued "if the saving were
+real the A/B could not have come back null". It could. `main` alone spans **11% at n=2** on this
+route, and #3307's own conclusion is that **n<6 is unpublishable here** after a three-arm "+22%"
+collapsed on the fourth arm.
+
+So there are **four** candidates, not three, and the fourth is the most likely on these numbers:
+1. the surfaces really are mostly small;
+2. the micro-benchmark's tight-loop allocator behaviour does not reproduce in a live run;
+3. the census and the phase-timing run are **different runs on different heads**;
+4. **the saving is real and the A/B cannot see it** — the arms lack the resolving power for an effect
+   of this size, which is a statement about the experiment rather than about the code.
+
+Separating these needs a **size histogram** and an arm count that can resolve the effect, not another
+mean. Do not generalise the null past this route, and do not quote the ~60x as measured.
 
 `main` alone spans 11% across two arms, so **single-arm fps comparisons on this route are not
 evidence**; the 2026-09-04 "#3309 gave +18%" figure was one arm each and has been retracted.
@@ -965,7 +982,11 @@ drops still discard the background.
   `protection_runs` skips any page whose protection already matches what is being asked
   (`guest_write_watch.cpp:749`) — so a notify over already-disarmed pages issues **zero** `mprotect`s
   while still incrementing `pages_hit`. A large global count is therefore consistent with this span
-  issuing none. The reconciliation is recorded here rather than left in the issue thread, because a
+  issuing none. Two further notes for anyone re-aggregating that log: **`lock_contended` did not exist
+  in the 08:01 run at all**, so candidate 2 below is not merely unmeasured there but unmeasurable from
+  it; and the discriminator that *would* isolate the span is two lines — `pages_hit` is bumped at
+  `guest_write_watch.cpp:1956` immediately before `set_pages_armed` at `:1957`, so a counter taken
+  between them attributes the call to this span rather than to the process. The reconciliation is recorded here rather than left in the issue thread, because a
   correction that lives only in a comment is the failure `## Ruled out` exists to prevent. Three candidates remain live and the counters that separate them now exist on
   `PROSPER_RENDER_TIMING`'s `write_watch` line:
   1. `page_protect=<calls>/<MiB>` and `pages_hit` — the `mprotect` reading. A first live run's
