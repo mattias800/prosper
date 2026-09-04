@@ -90,7 +90,7 @@ the census is what would assign them.
 | program | pc | op | srsrc | `written` | resource AT that key |
 |---|---|---|---|---|---|
 | `0x3013540000` (VS) | 32 | `0x00` IMAGE_LOAD | s8 | 0 | **`cbuf`** — plus two `vbuf`, all three at `sgpr_base 8` |
-| `0x3013c60000` (PS) | 69 | `0x20` IMAGE_SAMPLE | s8 | 0 | none (its textures are at s0 and s16) |
+| `0x3013c60000` (PS) | 69 | `0x20` IMAGE_SAMPLE | s8 | 0 | none *that run* — see below: this stage declares image slots at dw 0, 8 **and** 16, samples all three, and which of them is intact varies per draw |
 | `0x30be9c0000` (PS) | 47 | `0x20` IMAGE_SAMPLE | s0 | 0 | **`cbuf`** |
 | `0x30131d0000` (CS) | 77 | `0x08` IMAGE_STORE | s0 | **1** | none at `srt=0x20` (the tag it carries) |
 | `0x30131d0000` (CS) | 50 | `0x47` | s0 | 0 | **`cbuf`** |
@@ -268,6 +268,69 @@ and an A/B of it here would come back "unchanged" for a reason that has nothing 
 mapped, so derefs are a subset of rejects by construction and the 8-line difference is 8 slots whose
 base was zero or unmapped. Both lines describe one event.
 
+**Resolved on the `PROSPER_UDPROV` run: a declared descriptor slot is partially rewritten between the
+pipeline bind and the draw, and whichever slot the sampled op needs is sometimes the mangled one.**
+
+The pixel stage `0x3013c60000` makes this exact, because it has several image ops and its slots fail
+*independently*. It declares four read-only slots:
+
+```
+[sharp] ud=0x21e0e52b48 nsgpr=32 base=0 eud_size_dw=28 counts: ro=4 rw=0 samp=4 cbuf=2 direct=11
+[sharp]   ro[0]: offset_dw=0  size=0     ro[1]: offset_dw=8  size=0
+[sharp]   ro[2]: offset_dw=16 size=0     ro[3]: offset_dw=32 size=0 (EUD)
+```
+
+In one run, exactly two of them are dropped, and exactly the two ops that sample those two slots fail —
+a **1:1 correspondence, with the third op never appearing**:
+
+| slot | outcome that run | op sampling it |
+| --- | --- | --- |
+| `ro[0]` dw0 | `DROPPED as texture: claimed by the V# path` | `pc=82 srsrc=s0` → `[mimg-unresolved]` |
+| `ro[1]` dw8 | kept — `[b37 tex s8]` in both available lists | never fails |
+| `ro[2]` dw16 | `DROPPED: degenerate T# (base-below-low-pointer-guard) base=0x9200` | `pc=89 srsrc=s16` → `[mimg-unresolved]` |
+
+So "the descriptor is absent" was never the right description. **`ro[1]`'s eight dwords decode as a
+perfectly ordinary render-target-sized texture** — `base=0x307c620000 1920x1080 type=9 (2D) fmt=36
+tile_mode=27 base_level=0` — and its op resolves. The failures track the slot, not the shader.
+
+**The provenance says what mangles a slot, and it lands MID-DESCRIPTOR.** The pixel stage's own block
+is `base=0xc` (`SPI_SHADER_USER_DATA_PS_0`; `[udprov]` dumps all three candidate bases per stage, and
+`0x8c` is the *GS* block, i.e. the vertex stage's — do not read the PS's failure off the `0x8c` rows):
+
+```
+base=0xc  dw0..dw3   @d564819 / q3, f2990      <- rewritten, next frame, different queue
+          dw4..dw29  @d564801 / q1, f2989      <- same fold as the bind at i564796/q1,f2989
+draw_order = 564827
+```
+
+`ro[0]` occupies dwords 0..7, so the split falls **four dwords into an eight-dword descriptor**. Its
+surviving tail still looks like a T# tail (`00000000 00700000 006b0000 003070c0`, near-identical to the
+intact `ro[1]`'s `00000000 00700000 006b0000 00307d62`), while its head is now a V#
+(`base=0x20e0e42400 stride=16 num_records=8`) — which is precisely why that slot prints `claimed by the
+V# path`. A producer rebinding an image slot would write all eight dwords; writing exactly the first
+four is a **different producer with a different layout**, one for which dwords 0..3 are a four-dword
+slot.
+
+The vertex stage shows the same shape at its own boundary: `base=0x8c` splits at dword 8, exactly the
+extent of its single declared `ro[0]`, `dw0..7 @d564823/q3,f2990` against `dw8..19 @d564799/q1,f2989`.
+
+**This does not name a fix, and two obvious ones are already dead.** `RESOURCE_BINDING.md` § Ruled out
+records that giving DcbFinal its own `GpuState` was tested and ruled out as a fix, and that re-seeding
+the block from the `[udcand]` implied offset is falsified — and this run agrees with the second
+independently: `[udmap] … specials raw=[0,20) seeded=0 implied=0`, i.e. the implied-seed search finds
+no better offset. What is new is that the corruption is a **partial, mid-descriptor overwrite from the
+following frame's fold**, which is a sharper statement than "the block is wrong".
+
+**Two things here bear on #305 and belong in that issue, not this one.** First, the recorded frontier
+signature — "the pipeline was bound in a `q1` (Dcb) fold *N*, while the … user-data block was written
+in the following `q3` (DcbFinal) fold *N+1*" — reproduces here on a third title, and the decisive
+measurement #305 names (queue identity beside `command_order`) is what produced these numbers. Second,
+a **counter-example to a recorded observation**: #305 says the signature "appears in 8/12/28-dword
+vertex windows and not in 30/32-dword" and that pixel stages in that run had 30-dword windows. This
+pixel stage declares `[0,30)` and shows the split. Window fit does not predict the result here.
+(The GS-versus-PS asymmetry is *not* a tension — that acceptance test is retired; see § Current
+frontier.)
+
 **What is still open** is reading 1 versus reading 3: the guest wrote V#s into a slot it declares as a
 T# (a guest/driver-state question), or the image op sits on a path this binding never serves. Two
 next steps, in order:
@@ -287,8 +350,11 @@ next steps, in order:
    so a contrary result here is a new finding that has to be argued against that measurement, not a
    return to it.
 
-Note the scope: the `have_t8=0 seed_t8=0` result above covers all five sites, but this byte-level
-reading is established for **site 1 only** — `[resdump]` was captured for that stage.
+Note the scope: the `have_t8=0 seed_t8=0` result above covers all five sites, and the byte-level reading
+was first established for site 1 only. The `PROSPER_UDPROV` run extends it to the pixel stage, and in
+doing so shows the census row above is **run-specific**: on that run `0x3013c60000` fails at `pc=82
+srsrc=s0` and `pc=89 srsrc=s16` and resolves `s8`, the exact complement of the earlier run. Read the
+census as a sample of a varying state, not as a property of a shader.
 
 Separately, four stages declare a *writable* 8-dword T# that reaches no resource table at all
 ([#3128](https://github.com/mattias800/prosper/issues/3128)); one of them has four image ops against a

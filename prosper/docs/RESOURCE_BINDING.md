@@ -180,6 +180,23 @@ the vertex fetch that consumes the descriptor is left unresolved.
 | A selected descriptor table's `resolved=0` declines mean the table's **records were unreadable** — Linux's `guest_readable` not committing sparse dmem | **Falsified.** The records are readable; they simply hold data that is not a descriptor. An unselected arena slot carries stale bytes (`base=0`, `size_bytes` read as `0x3f800000`, i.e. `1.0f`), so `decode_buffer_descriptor` rejects it and the whole table was declined. Nothing about residency or sparse commit is involved, and no `guest_readable` change was needed — the fix binds a null descriptor for such a slot while keeping the array's arity exact (#2534). **A residency hypothesis that would have required kernel-side work was really a data-shape question answerable from four dwords.** | #2481, #2534 |
 | A **wrong seeding origin** or **header decode** explains the unmapped pointers | **Falsified**, and the same measurement *confirms* two assumptions previously taken on faith: the seeding base `USER_DATA_<stage>_0 + user_data_range_start` (`range_start` is 0 for every shader, `range_end` = last declared direct offset + 2), and the merged-stage convention that user data begins at shader SGPR `s8`. The shader's own `SBASE` equals the header's declared offset in all ten stages disassembled. | #1607, #305 |
 
+**Third-title reproduction, and one counter-example to the paragraph below (2026-09-04, Stray
+`PPSA02101`, #3126).** `PROSPER_UDPROV` on the title-screen route reproduces the frontier signature
+exactly — pipeline bound at `i564796/q1,f2989`, part of the user-data block rewritten at
+`d564819..564823/q3,f2990`, draw at `564827` — and adds two things. **(1) The overwrite is partial and
+lands MID-DESCRIPTOR.** The pixel stage's block (`base=0xc`) splits at dword 4 inside an eight-dword
+declared image slot: the head is now a V# (`base=0x20e0e42400 stride=16 num_records=8`) while the tail
+is still the original T#'s tail, which is exactly why that slot prints `claimed by the V# path`. A
+producer rebinding an image slot writes all eight dwords; writing the first four is a different
+producer with a four-dword slot at that offset. **(2) The window-fit prediction below does not hold
+here** — "the signature appears in 8/12/28-dword vertex windows and not in 30/32-dword vertex windows;
+every pixel stage with a declared pointer in the measured run also had a 30-dword window". This pixel
+stage declares `[0,30)` and shows the split. The consequence is measurable rather than theoretical: the
+stage declares image slots at dwords 0, 8 and 16 and samples all three, exactly the slots that are
+mangled are dropped, and exactly the ops sampling those slots fail — 1:1, with the op sampling the
+intact slot never failing. Which slot is intact varies per draw. Details in `STRAY_STATUS.md`
+§ *The unresolved image ops*.
+
 **Current frontier.** The source of each write is already observable: for every sampled misfit the
 pipeline was bound in a `q1` (Dcb) fold *N*, while the larger user-data block was written in the
 following `q3` (`w1KFAHVqpaU` / DcbFinal) fold *N+1*. `PROSPER_UDPROV` retains order, direct/indirect
