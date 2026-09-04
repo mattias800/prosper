@@ -85,7 +85,7 @@ def effective_mask(rec):
     return t & s & 0xFF
 
 
-def report(records, scanout_prefix, top, out=sys.stdout):
+def report(records, scanout_prefix, top, out=sys.stdout, by_program=False):
     def hits_scanout(rec):
         return any(t["addr"].startswith(scanout_prefix) for t in rec["targets"])
 
@@ -94,6 +94,11 @@ def report(records, scanout_prefix, top, out=sys.stdout):
     per_minute = defaultdict(Counter)
     per_minute_suppressed = Counter()
     addrs = Counter()
+    # Per pixel-shader program, for --by-program. A flat scanout is written by SOME program, and
+    # "which one" is the question a mode/mask census cannot answer -- two programs with identical
+    # colour state are one row there and two rows here.
+    per_program = defaultdict(lambda: {"draws": 0, "writing": 0,
+                                       "modes": Counter(), "effs": Counter()})
 
     for rec in records:
         total += 1
@@ -114,6 +119,11 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         for t in rec["targets"]:
             if t["addr"].startswith(scanout_prefix):
                 addrs[(t["addr"], t["w"], t["h"], writes_colour)] += 1
+        entry = per_program[rec["ps"]]
+        entry["draws"] += 1
+        entry["writing"] += 1 if writes_colour else 0
+        entry["modes"][rec["mode"]] += 1
+        entry["effs"][eff] += 1
 
     print(f"colour-state draw records: {total}", file=out)
     print(f"  writing scanout ({scanout_prefix}...): {scan}", file=out)
@@ -148,6 +158,22 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         modes = " ".join(f"mode{m}={n}" for m, n in sorted(c.items()))
         print(f"  {minute}  total={tot:7d}  suppressed={100.0 * supp / tot:5.1f}%  "
               f"{modes}", file=out)
+    if by_program:
+        # Which SHADER writes the presented surface. The mode/mask census above answers "with what
+        # colour state"; it cannot answer "which draw", and when a scanout goes flat that is the
+        # question -- a single fullscreen program covering the surface is one row here and is
+        # indistinguishable from a thousand small draws in every other section of this report.
+        # The program address is what PROSPER_SKIP_DRAW_PROGRAM takes, so a row here is directly
+        # actionable as a one-program A/B rather than a process-wide lever.
+        print("\nscanout draws by pixel-shader program (--by-program):", file=out)
+        ranked = sorted(per_program.items(),
+                        key=lambda kv: kv[1]["draws"], reverse=True)[:top]
+        for ps, e in ranked:
+            modes = ",".join(f"{MODE_NAMES.get(m, m)}={n}"
+                             for m, n in sorted(e["modes"].items()))
+            effs = ",".join(f"{v:02x}={n}" for v, n in sorted(e["effs"].items()))
+            print(f"  ps={ps:<14} draws={e['draws']:<7d} writing-colour={e['writing']:<7d} "
+                  f"modes[{modes}] effective[{effs}]", file=out)
 
 
 SELFTEST = """\
@@ -181,6 +207,19 @@ def selftest():
     assert "colour writes suppressed" in text, text
     # The offscreen-only draw must not be counted as reaching the scanout.
     assert "0x3005120000" not in text, text
+    # --by-program must name the shader that writes the scanout and separate it from the one whose
+    # colour is suppressed. Without the section (or with the two programs merged) these fail: the
+    # mode/mask census above cannot distinguish them, which is the reason the section exists.
+    buf2 = io.StringIO()
+    report(list(parse(SELFTEST.splitlines())), "0x9fc", 10, out=buf2, by_program=True)
+    prog = buf2.getvalue()
+    assert "scanout draws by pixel-shader program" in prog, prog
+    assert "ps=0x2" in prog and "ps=0x3" in prog, prog
+    # ps=0x2 writes colour; ps=0x3 is masked off. Same surface, same section, opposite verdicts.
+    assert "ps=0x2            draws=1       writing-colour=1" in prog, prog
+    assert "ps=0x3            draws=1       writing-colour=0" in prog, prog
+    # The offscreen program must not appear in a SCANOUT breakdown.
+    assert "ps=0x4" not in prog, prog
     print("selftest OK")
 
 
@@ -193,6 +232,9 @@ def main():
                     help="address prefix of the guest scanout, e.g. 0x9fc "
                          "(from the guest's 'Frame Buffer va range' line)")
     ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--by-program", action="store_true",
+                    help="also break scanout draws down by pixel-shader program address, which is "
+                         "what PROSPER_SKIP_DRAW_PROGRAM takes")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -202,7 +244,8 @@ def main():
         ap.error("LOG and --scanout-prefix are required "
                  "(the scanout VA is title-specific; the tool will not guess)")
     with open(args.log, "r", errors="replace") as fh:
-        report(parse(fh), args.scanout_prefix.lower(), args.top)
+        report(parse(fh), args.scanout_prefix.lower(), args.top,
+               by_program=args.by_program)
     return 0
 
 
