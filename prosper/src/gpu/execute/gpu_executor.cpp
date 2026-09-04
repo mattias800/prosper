@@ -2337,7 +2337,19 @@ inline void note_compute_program_outcome(uint64_t code_addr, bool executed,
     // is the whole difficulty for a program that never executes. A full-screen 4K pass at 8x8 groups
     // is 480x270; anything much smaller is not writing the scene.
     if (gx) { entry.gx = gx; entry.gy = gy; entry.gz = gz; entry.lx = lx; entry.ly = ly; }
-    if ((n & (n - 1)) != 0 || n < 512) return;
+    // Emit at every power of two, with NO floor. The floor was 512, so any run making fewer
+    // decisions than that printed nothing at all -- a null indistinguishable from "the census is
+    // off", "the hook is not on this path" and "this build lacks the diagnostic". A small population
+    // is a legitimate answer to "how much compute does this screen run", and the floor made it the
+    // one answer the instrument could not give.
+    //
+    // Honest provenance, since the first version of this comment claimed a Stray run had hit the
+    // floor: it had not. That run recorded 65,536 decisions and printed eight census blocks; the
+    // author had grepped for a string that does not occur ("program-census") and then for one that
+    // matched the run's own DIRECTORY NAME, and read the resulting silence as a measurement. The
+    // floor did not cause that and removing it would not have prevented it. It is removed because
+    // an unreadable null is a real hazard on its own terms, not because it was the culprit here.
+    if ((n & (n - 1)) != 0) return;
     std::fprintf(stderr, "[compute-census] %llu dispatch decisions over %zu program(s)\n",
                  (unsigned long long)n, outcomes.size());
     for (const auto& [addr, counts] : outcomes)

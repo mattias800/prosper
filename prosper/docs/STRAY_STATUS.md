@@ -919,11 +919,31 @@ sh=/221 pc=66 words=e0042000,6b020900 op=0x1 src=0(k2),8(k1),107(k6)  stage=vert
 
 Both are `buffer_load_format_*` with `idxen` — **vertex attribute fetch** — in small vertex shaders,
 with `VCC_LO`/`VCC_HI` as the soffset. The opcodes themselves are implemented (`0x0`-`0x3` are all
-handled), so the reject is an operand, not a missing instruction. The next thing to establish is
-whether the failing operand is the soffset or the SRSRC: `allow_smem` is `(rt != nullptr)` for
-graphics, so **a vertex stage that arrives with no resource table fails every buffer op it has**, and
-vertex fetch is a buffer op — that would take the draw with it. A probe on `rt == nullptr` at the
-vertex recompile answers it in one run.
+handled), so the reject is an operand, not a missing instruction.
+
+**This paragraph used to end by proposing an `rt == nullptr` probe "answers it in one run". Do not
+run it — § *Ruled out* already did, and killed it:** the disposition line reports `rt=1` with five
+resources, and the `VCC_LO`/`VCC_HI` soffset is not it either (`operand_bits` has a vertex-stage
+branch for exactly that, and the reject happens before the address is formed). The pointer outlived
+the answer by sitting a hundred lines above the row that falsified it, which is the failure mode the
+`## Ruled out` convention exists to prevent — so it is corrected here rather than only there.
+
+**What actually fails is SRSRC provenance, and that is the frontier for this screen.** Both failing
+stages build their own descriptor at runtime — `s_load_dwordx4 s[4:7], s[12:13], vcc_hi` with a
+*register* offset, then a `s_and`/`s_or`/`s_cselect_b32 s7, …` patch of dword 3 — so there is no SRT
+key and the SRSRC range is rewritten by the shader itself. See § *Ruled out* for the full
+disassembly and why the direct-SGPR fallbacks are correctly suppressed.
+
+**Why this is the thing to work on, with its denominators stated:** `shader-recompile` discards
+**~3800 of 8192** discarded draws on the title screen against **7 of 1024** on calibration — roughly
+**46%** against **0.7%**. That is not a difference of degree between the two screens; it is the
+difference between them.
+
+Note the two arms are read at **different** cumulative totals, 8192 and 1024, as the table's own first
+row shows. An earlier draft claimed they were "measured at the same cumulative total in both arms":
+this section's same-total rule governs the title-screen `PROSPER_NULL_PAGE=1` arms among themselves,
+and calibration is a separate earlier reference. The contrast survives being stated honestly — it did
+not need the false justification.
 
 ### What #3133 is worth here
 
@@ -1139,7 +1159,17 @@ the same guest state across runs.
     shows the whole chain hanging off `s_load_dwordx4 s[16:19], s[14:15]`, whose base reads
     `0x0004dfac00000001` — `addr … unreadable` — after which every scalar is `ok=0` and the fetch is
     "left unresolved (not folded to 0)".
-  - **This is #305, on a third title.** `PROSPER_UDPROV=1` shows the draw's own bind writing twelve
+  - **This is #305, on a third title — and note WHICH sites, because this file also withdraws a #305
+    attribution ABOVE this row**, in this same section (§ *The title screen's black composite*) and
+    again far earlier under § *Withdrawn 1*. Nothing below this row mentions #305 at all. That
+    withdrawal covers the **five unresolved IMAGE ops** (read at user-data dword 0 of declared
+    `[0,20)`/`[0,30)` windows, `[udcand]` reporting `FITS-BLOCK`, so the larger-block-than-window
+    condition is absent there). This row covers the **VERTEX stages**, whose window is
+    `USER_SGPR = 8` — and `RSRC2_GS` is the right register for a vertex stage on RDNA2, where vertex
+    is merged into the GS hardware stage, so "GS" beside "VERTEX" is expected rather than a slip. Both cite the same `0x0004dfac` constant family, so the two are easy to
+    confuse and the verdicts do not transfer in either direction: do not use the image withdrawal to
+    dismiss this row, and do not use this row to revive the image attribution.
+    `PROSPER_UDPROV=1` shows the draw's own bind writing twelve
     contiguous user dwords in one direct `SET_SH_REG`, while `RSRC2_GS.USER_SGPR = 8` equals the
     shader's `user_data_range_end = 8`. The two mapped 64-bit pointers the shader wants sit at dwords
     8 and 10, outside that window; dwords 6:7 hold the `num_records`/`dword3` tail of the preceding
@@ -1388,11 +1418,51 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
 - **"The world renders into an HDR target that the composite then loses."** Falsified: every seeded
   scene target in the title-screen frame is black at source (brightest channel 0-6 across five HDR
   targets). #3126.
-- **VOID — "A skipped compute dispatch collapses the composite" (the charter's LUT/exposure shape).**
-  `PROSPER_COMPUTE_PROGRAM_CENSUS` reports the only program with any skips at **executed=7455,
-  skipped=2** — but that census was read on **calibration** and has not been re-run on the title
-  screen, so it is not a falsification for it. This row said `Falsified` and was corrected: the
-  measurement is real, the scope was overclaimed. #3126.
+- **"A skipped compute dispatch collapses the composite" (the charter's LUT/exposure shape).**
+  **Falsified on the title screen, 2026-09-04** — this row was VOID for the right reason (the census
+  had only been read on **calibration**), and the missing arm has now been run.
+
+  Title route, steady state confirmed by capture provenance and by eye (29/30 `composited`, menu over
+  black): **65,536 dispatch decisions across 21 programs**, and exactly **one** program ever skips —
+
+  ```
+  program=0x300ba70000 executed=15103 skipped=1 groups=640x1x1 local=64x1 threads=40960x1
+  ```
+
+  One skip in 15,104. Nothing is being systematically dropped. The dispatch shape points the same way
+  — `640x1x1` groups of `64x1` is a **1-D** launch of 40,960 threads, not the ~`480x270` a
+  full-screen 4K pass would take — but treat it as corroboration rather than a second proof: the
+  census stores the shape with `if (gx) { entry.gx = gx; … }`, which **overwrites**, so the printed
+  grid is the program's *last observed* launch and not necessarily the skipped one. The 1-in-15,104
+  ratio carries the row on its own.
+
+  **A draft of this row called the following a free cross-check and leaned on it. It is withdrawn as
+  an argument and kept only as an observation, because it proves something much weaker than it
+  appears to.** At 32,768 decisions the title run reports `executed=7455 skipped=1` against the
+  calibration figure of `executed=7455 skipped=2` — matching **to the digit**. Two different screens
+  running two different workloads do not produce byte-identical per-program counters by coincidence;
+  an exact match means the interval measured is **common to both**, i.e. shared boot code before
+  either screen's behaviour begins. Read that way it is a useful signature — the runs are still in
+  common code at that ordinal — and not evidence about the screens at all.
+
+  Three separate faults in the draft, each enough on its own:
+  - **32,768 is the MIDPOINT of the title run's 65,536**, so it read that arm halfway — trap 257,
+    whose remedy is "take the census from the block printed at exit". The draft cited trap 257
+    approvingly elsewhere in the same change.
+  - **The calibration figure carries no cumulative total in this doc**, so "the same total the
+    calibration arm used" is not in the record. If that figure was calibration's *exit*, the
+    comparison is a whole run against half a run.
+  - **§ *The title screen's REAL numbers* governs the DRAWS-DISCARDED census, not compute decisions**,
+    so invoking its same-total methodology here is a cross-census substitution.
+
+  **None of this touches the falsification**, which rests on the title run's own **last census block**
+  alone: 65,536 decisions, 21 programs, one skip in 15,104. Note "last block", not "exit block" —
+  a draft said the latter and **there is no exit block**: the census emits only at powers of two
+  (no `atexit`, no separate report), so decisions after 65,536 are unreported. The ratio is far too
+  extreme for an unmeasured tail to threaten, but the instrument does not have the property the
+  phrase claimed. Giving this census an at-exit flush is the natural follow-up, and it is also the
+  other half of trap 257's own remedy — *"take the census from the block printed at exit"* — which is
+  currently **not available for this instrument**. #3126, #2932.
 - **MIMG `SRSRC` is not a user-SGPR index.** It names any SGPR, so a scan that treats every SRSRC as
   a user-data slot reports mostly false positives — scratch registers the shader loaded a descriptor
   into. An earlier list of "bases missing from the table" derived that way is discarded. #3126.
