@@ -265,9 +265,24 @@ write-watch registers **193,248 pages across 86 registrations — ~8.8 MiB each*
 surface here is well under glibc's 32 MiB `M_MMAP_THRESHOLD` cap, where the measured allocation
 penalty is **0.185 ms at 16 MiB** rather than the 11.279 ms at 64 MiB. The dynamic threshold adapts
 upward after the first free, so a repeated 19.5 MiB allocation comes from the arena; a 63.3 MiB one
-never can. **The pooling is worth ~60x less on the population that dominates this route than on the
-4K surface that motivated it** — and a route whose surfaces were mostly over 32 MiB would see the
-large number. Do not generalise the null past this route.
+never can.
+
+**That mean does not support the conclusion, and the conclusion is therefore a candidate rather than
+a finding.** A mean is the wrong statistic when the cost function has a **discontinuity inside the
+distribution**, which is exactly the case here: the 32 MiB cap is a step, not a slope. 253,284.7 MiB
+over 13,001 snapshots is equally consistent with ~3,000 allocations at 63.3 MiB — 190 GiB, most of
+the volume and by the table above most of the *cost* — plus ~10,000 averaging 6.3 MiB. The mean reads
+19.5 either way, so it cannot distinguish the two populations, and only one of them supports "the
+surfaces are mostly small".
+
+The route's own census cuts against it: `3840x2160 bpe=8 evaluated=4879 seed_skip=2469` is roughly
+2,410 seeds at 63.3 MiB, which at the table's 11.279 ms predicts **~27 s** against a `setup_ms` total
+of 51,062.6 ms. **If that saving were real the A/B could not have come back null**, so something in
+the chain is wrong and "the surfaces are mostly small" is one of at least three candidates. The
+others: the micro-benchmark's tight-loop allocator behaviour may not reproduce in a live run, and the
+census and the phase-timing run are **different runs on different heads**. Separating them needs a
+size histogram, not another mean. Do not generalise the null past this route, and do not quote the
+~60x as measured.
 
 `main` alone spans 11% across two arms, so **single-arm fps comparisons on this route are not
 evidence**; the 2026-09-04 "#3309 gave +18%" figure was one arm each and has been retracted.
@@ -939,7 +954,19 @@ drops still discard the background.
   `set_pages_armed` issues. The supporting numbers are real (one `mprotect` over 64 MiB costs 0.39 ms
   idle and 0.63 ms with twelve busy threads, which fits the 0.33 ms mean), but they were measured in
   a standalone benchmark and **nobody has yet measured whether that call happens in this span at
-  all**. Three candidates remain live and the counters that separate them now exist on
+  all**.
+
+  **This row postdates, and deliberately does not adopt, #3307's 2026-09-04 08:01 UTC comment**, which
+  published the untruncated line — `18210 calls/429447.0 MiB`, `pages_hit=62103696`,
+  `host_write=55651` — and concluded that the `watch_ms` attribution stands. Those numbers are real
+  and they still do not isolate this span, for two reasons that are in the code rather than in the
+  reading: the protection counter is **process-global** (`guest_write_watch.cpp:592`), so it cannot be
+  attributed to any one span; and `pages_hit` counts **index hits, not protection changes**, because
+  `protection_runs` skips any page whose protection already matches what is being asked
+  (`guest_write_watch.cpp:749`) — so a notify over already-disarmed pages issues **zero** `mprotect`s
+  while still incrementing `pages_hit`. A large global count is therefore consistent with this span
+  issuing none. The reconciliation is recorded here rather than left in the issue thread, because a
+  correction that lives only in a comment is the failure `## Ruled out` exists to prevent. Three candidates remain live and the counters that separate them now exist on
   `PROSPER_RENDER_TIMING`'s `write_watch` line:
   1. `page_protect=<calls>/<MiB>` and `pages_hit` — the `mprotect` reading. A first live run's
      `faults=539` says protections *do* happen somewhere (a page cannot fault unless it was armed),
