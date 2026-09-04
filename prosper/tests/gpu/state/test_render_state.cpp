@@ -9,6 +9,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -997,6 +998,42 @@ int main() {
     // #309: CB fast-clear word extraction + format-aware decode in resolve_pipeline_state.
     CHECK(rs.color0_has_clear, "color0_has_clear = true (CLEAR_WORD programmed)");
     CHECK(rs.color0_clear_word0 == 0x11223344u, "color0_clear_word0 preserved");
+    {
+        // PROSPER_CLEARLOG must report the words the guest actually programmed.
+        //
+        // This asserts the DIAGNOSTIC's output, not the extractor's fields, because the two can
+        // disagree: the log used to sit ABOVE the two assignments that fill
+        // `color0_clear_word0`/`_word1`, so it read `RenderState`'s member initializers and printed
+        // `word0=0x00000000 word1=0x00000000` for every target in every title, while the fields
+        // themselves were correct and the assertions above passed. A hypothesis on #2014 was
+        // retired on that constant. The mutation this arm exists to catch is exactly that move:
+        // put the `if (clearlog)` block back above the `rs.color0_clear_word0 = ...` assignments
+        // in `extract_render_state` and this CHECK fails while every other CHECK in this file
+        // still passes.
+        //
+        // The dedup set inside the diagnostic is keyed on (base, format, word0) and is a
+        // function-local static, so this must be the first CLEARLOG-armed extraction of this
+        // (base, format, word) triple in the process. Nothing else in this file arms the env.
+#ifdef _WIN32
+        _putenv_s("PROSPER_CLEARLOG", "1");
+#else
+        setenv("PROSPER_CLEARLOG", "1", 1);
+#endif
+        const std::string clear_diag = capture_stderr([&] {
+            (void)extract_render_state(st);
+        });
+#ifdef _WIN32
+        _putenv_s("PROSPER_CLEARLOG", "");
+#else
+        unsetenv("PROSPER_CLEARLOG");
+#endif
+        CHECK(occurrence_count(clear_diag, "[clearlog]") == 1u,
+              "PROSPER_CLEARLOG prints one line for this target");
+        CHECK(clear_diag.find("word0=0x11223344") != std::string::npos,
+              "PROSPER_CLEARLOG reports the programmed CLEAR_WORD0, not the unassigned default");
+        CHECK(clear_diag.find("word0=0x00000000") == std::string::npos,
+              "PROSPER_CLEARLOG does not report a zero word for a programmed fast-clear");
+    }
     {
         // This target is ALT/BGRA + SRGB, so byte0=B, byte1=G, byte2=R, byte3=A, with RGB linearized.
         ResolvedPipelineState ps = resolve_pipeline_state(rs);

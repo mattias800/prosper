@@ -299,12 +299,25 @@ RenderState extract_render_state(const GpuState& st) {
     // CB fast-clear color (CB_COLOR0_CLEAR_WORD0/1). Present only when the game programs a fast-clear
     // for MRT 0; the words carry the clear value in the target's pixel format (decoded in resolve).
     rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);
+    rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
+    rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
     // PROSPER_CLEARLOG=1 -- diagnostic only, no behaviour change. `st.cx` is the PERSISTENT context
     // register map, so `count()` answers "has this register ever been written", not "was it written
     // for THIS target". If a title programs a fast-clear once and later binds a different colour
     // target without reprogramming it, the stale value still reaches the render pass as its loadOp
     // clear. This prints what each resolve actually decided, keyed to the target it decided it for,
     // so that hypothesis can be confirmed or killed on a real run before anything is changed (#2014).
+    //
+    // IT MUST STAY BELOW THE TWO ASSIGNMENTS ABOVE. It used to sit above them and read
+    // `rs.color0_clear_word0`/`_word1` while they still held `RenderState`'s member initializer,
+    // so EVERY line this diagnostic has ever printed said `word0=0x00000000 word1=0x00000000` --
+    // in every title, for every target, whatever the guest programmed. That is the worst shape a
+    // diagnostic can take: not silence, which invites suspicion, but a confident constant that
+    // reads as a measurement. On #2014 a whole hypothesis was retired on it ("across a 320 s run
+    // all 33 distinct combinations report word0=0x00000000, so the decode cannot produce this
+    // title's colour"), and the run could not have produced any other number. The dedup key was
+    // built from the same unassigned field, so the "distinct combinations" it counted were really
+    // just distinct (base, format) pairs.
     if (const char* clearlog = std::getenv("PROSPER_CLEARLOG")) {
         if (clearlog[0] == '1' && clearlog[1] == '\0') {
             static std::mutex clear_mutex;
@@ -324,8 +337,6 @@ RenderState extract_render_state(const GpuState& st) {
                         rs.color0_clear_word0, rs.color0_clear_word1);
         }
     }
-    rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
-    rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
 
     // Color MRT 1 uses the same field layouts as MRT0, with the RDNA2 target-block stride encoded by
     // the named register constants in pm4_registers.hpp.
