@@ -480,6 +480,22 @@ two arms' tallies taken at different points in a run is the mistake that produce
 `PROSPER_WRITE_WATCH_MAX_KB` is an emergency host-wide range
 limit (zero/unset is unbounded); a declined watch always returns to exact comparison.
 
+`PROSPER_COMPUTE_BORROW_CENSUS=1` reports the other side of the same boundary, on the same cadence:
+whether a graphics sampled descriptor managed to lease the device image a compute dispatch had just
+produced, instead of re-reading the surface out of guest memory. Four `[compute-borrow-census]`
+lines, all running totals with their own denominators — the consumer's precondition partitioned by
+term, the borrow's outcome partitioned by gate (`no_cache_entry`, `export_unpublished`,
+`content_invalid`, `no_image`, `authority_changed`, `hit`), why `authority_changed` fired (a real
+overlapping guest write, an unarmed submit journal, or a cross-submit export; and what the page
+watch said), and the producer's publish gate partitioned the same way. A zero bucket still prints.
+
+Two of its fields answer questions nothing else can. On a lookup miss the variable additionally
+enables an O(cache) scan for an entry at the same guest address, which turns "nothing is cached
+under this key" into "an entry here disagrees on `tile_mode`" — the twenty-three-field cache key
+otherwise makes those indistinguishable. And `journal_unarmed` versus `journal_cross_submit` splits
+the `Unknown` that `guest_gpu_writes_since` returns for two structurally different reasons, which
+its own header warns cannot be told apart by a caller.
+
 Proven-full write-only storage targets at least 16 MiB do not copy their first successful result into
 an immediately redundant CPU source baseline. The submit journal remains the initial source authority;
 if another architectural writer invalidates it, the next invocation takes ordinary writeback and

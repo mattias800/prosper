@@ -1,6 +1,7 @@
 #include "shared/live/live_compute.hpp"
 #include "shared/diagnostics/trip_bound_witness.hpp"
 #include "shared/compute/compute_authority_live_census.hpp"
+#include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/live/live_target_format.hpp"
@@ -373,6 +374,29 @@ void report_write_watch_census() {
     char line[1024];
     const size_t used = prosper::frontend::format_write_watch_census(
         g_write_watch_census.snapshot(), line, sizeof line);
+    if (used) std::fwrite(line, 1, used, stderr);
+}
+
+// #3307 compute->graphics image borrow census. Same contract as the write-watch census above:
+// counting is unconditional (a handful of relaxed adds per import, against a path whose alternative
+// is a multi-megabyte detile), only the report is gated. See
+// shared/compute/compute_image_borrow_census.hpp for why every decline branch is counted rather
+// than the one a status doc guessed at.
+prosper::frontend::ComputeImageBorrowCensus g_image_borrow_census;
+
+bool image_borrow_census_report_enabled() {
+    static const bool on = std::getenv("PROSPER_COMPUTE_BORROW_CENSUS") != nullptr;
+    return on;
+}
+
+void report_image_borrow_census() {
+    // 2 KiB: four lines carrying eleven decline buckets, six outcome buckets, seven publish buckets
+    // and up to twenty-three key-field names. Truncation drops whole trailing lines, and the last
+    // line is the producer partition -- the half that separates "the key differs" from "nothing was
+    // ever published".
+    char line[2048];
+    const size_t used = prosper::frontend::format_compute_image_borrow_census(
+        g_image_borrow_census.snapshot(), line, sizeof line);
     if (used) std::fwrite(line, 1, used, stderr);
 }
 
@@ -963,6 +987,46 @@ ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource&
         resource.mip_tail_x, resource.mip_tail_y,
         static_cast<uint32_t>(native_format), true, resource.in_mip_tail,
         resource.srgb, resource.depth_compare, mip_levels};
+}
+
+// Which fields two same-address cache keys disagree on, as a bitmask over ComputeImageKeyField.
+// #3307: a borrow that finds nothing under its key needs to say whether a producer is absent or
+// merely keyed differently, and only a field-by-field comparison can. Diagnostic only -- the key's
+// own `operator==` remains the identity used by the cache.
+//
+// `gpu_addr` is deliberately absent: it is the predicate that selects which entries are compared at
+// all, so it can never differ among them.
+uint32_t compute_image_key_field_diff_mask(const ComputeImageCacheKey& a,
+                                           const ComputeImageCacheKey& b) {
+    using Field = prosper::frontend::ComputeImageKeyField;
+    uint32_t mask = 0;
+    const auto note = [&](Field field, bool differs) {
+        if (differs) mask |= 1u << static_cast<uint32_t>(field);
+    };
+    note(Field::HostData, a.host_data != b.host_data);
+    note(Field::GuestBytes, a.guest_bytes != b.guest_bytes);
+    note(Field::ResourceBytes, a.resource_bytes != b.resource_bytes);
+    note(Field::Width, a.width != b.width);
+    note(Field::Height, a.height != b.height);
+    note(Field::Depth, a.depth != b.depth);
+    note(Field::Format, a.format != b.format);
+    note(Field::Components, a.components != b.components);
+    note(Field::TileMode, a.tile_mode != b.tile_mode);
+    note(Field::ImgDim, a.img_dim != b.img_dim);
+    note(Field::LinearRowPitch, a.linear_row_pitch != b.linear_row_pitch);
+    note(Field::LayerStride, a.layer_stride != b.layer_stride);
+    note(Field::LayerMipOffset, a.layer_mip_offset != b.layer_mip_offset);
+    note(Field::MipTailOffset, a.mip_tail_offset != b.mip_tail_offset);
+    note(Field::MipTailBytes, a.mip_tail_bytes != b.mip_tail_bytes);
+    note(Field::MipTailX, a.mip_tail_x != b.mip_tail_x);
+    note(Field::MipTailY, a.mip_tail_y != b.mip_tail_y);
+    note(Field::VkFormat, a.vk_format != b.vk_format);
+    note(Field::Storage, a.storage != b.storage);
+    note(Field::InMipTail, a.in_mip_tail != b.in_mip_tail);
+    note(Field::Srgb, a.srgb != b.srgb);
+    note(Field::DepthCompare, a.depth_compare != b.depth_compare);
+    note(Field::MipLevels, a.mip_levels != b.mip_levels);
+    return mask;
 }
 
 struct CachedComputeImage {
@@ -1883,6 +1947,17 @@ struct VulkanComputeContext {
     }
     uint64_t write_watch_census_submits = 0;
 
+    // #3307. Separate counter and separate gate from the write-watch census above: the two answer
+    // different questions and are read in different runs, and sharing a period would make one
+    // report's cadence an artefact of the other's variable being set.
+    void report_image_borrow_census_periodically() {
+        if (!image_borrow_census_report_enabled()) return;
+        if (++image_borrow_census_submits % 256 == 0) report_image_borrow_census();
+        static const bool once = [] { std::atexit(report_image_borrow_census); return true; }();
+        (void)once;
+    }
+    uint64_t image_borrow_census_submits = 0;
+
     bool may_promote_write_watch_before_exact(size_t source_bytes,
                                               uint32_t stable_validations) {
         const uint32_t promotion_validations =
@@ -2312,14 +2387,18 @@ struct VulkanComputeContext {
         found->second.compute_transfer_valid = false;
     }
 
-    void authorize_cached_image_export(const ComputeImageCacheKey& key,
+    // Returns whether an entry was actually published. A publish-eligible binding whose cache entry
+    // was evicted or invalidated between writeback and here leaves the consumer with nothing to
+    // borrow, and that is a different failure from an ineligible binding (#3307).
+    bool authorize_cached_image_export(const ComputeImageCacheKey& key,
                                        uint64_t producer_command_order) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
-            return;
+            return false;
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_command_order = producer_command_order;
         found->second.graphics_export_valid = true;
+        return true;
     }
 
     bool authorize_cached_image_compute_transfer(const ComputeImageCacheKey& key) {
@@ -2364,34 +2443,94 @@ struct VulkanComputeContext {
 #endif
     }
 
-    bool borrow_cached_image_for_graphics(const ComputeImageCacheKey& key,
-                                          VkImage& image,
-                                          uint64_t& producer_command_order) {
+    // `observation`, when supplied, records WHICH of the five declines below fired. It never
+    // changes what the function decides and never evaluates a predicate the decision did not
+    // already evaluate -- in particular `write_watch.query()` stays behind exactly the same
+    // short circuit, because a census that pays for a query the borrow skips would be measuring
+    // its own cost. #3307.
+    bool borrow_cached_image_for_graphics(
+        const ComputeImageCacheKey& key, VkImage& image, uint64_t& producer_command_order,
+        prosper::frontend::ComputeImageBorrowObservation* observation = nullptr) {
+        using Outcome = prosper::frontend::ComputeImageBorrowOutcome;
+        const auto set_outcome = [&](Outcome outcome) {
+            if (observation) observation->outcome = outcome;
+        };
         const auto found = image_cache.find(key);
-        if (found == image_cache.end()) return false;
+        if (found == image_cache.end()) {
+            set_outcome(Outcome::NoCacheEntry);
+            if (observation && image_borrow_census_report_enabled())
+                scan_image_cache_for_near_miss(key, *observation);
+            return false;
+        }
         CachedComputeImage& cached = found->second;
-        if (!cached.graphics_export_valid || !cached.content_valid || !cached.image) return false;
+        if (!cached.graphics_export_valid || !cached.content_valid || !cached.image) {
+            set_outcome(!cached.graphics_export_valid ? Outcome::ExportNotAuthorized
+                        : !cached.content_valid      ? Outcome::ContentInvalid
+                                                     : Outcome::NoImage);
+            return false;
+        }
         const prosper::gpu::GuestGpuWriteQuery submit_query =
             prosper::gpu::guest_gpu_writes_since(cached.graphics_export_snapshot,
                                                   key.gpu_addr, key.guest_bytes);
         const bool submit_unchanged =
             submit_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
-        const bool watch_unchanged = !submit_unchanged && cached.write_watch &&
-            cached.write_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged;
+        const bool watch_consulted = !submit_unchanged && static_cast<bool>(cached.write_watch);
+        const prosper::host::GuestWriteWatchQuery watch_query = watch_consulted
+            ? cached.write_watch.query() : prosper::host::GuestWriteWatchQuery::Unknown;
+        const bool watch_unchanged =
+            watch_consulted && watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
         // An exact mirror is the fail-closed fallback only when neither ordered journal nor page
         // watch can decide. It must never launder a KNOWN architectural writer whose bytes happened
         // to compare equal (for example a same-value clear or the explicit GPU-write test hook).
         const bool exact_unchanged =
             submit_query == prosper::gpu::GuestGpuWriteQuery::Unknown && !watch_unchanged &&
             cached_image_exact_guest_mirror_unchanged(key, cached);
-        if (!submit_unchanged && !watch_unchanged && !exact_unchanged) return false;
+        if (!submit_unchanged && !watch_unchanged && !exact_unchanged) {
+            set_outcome(Outcome::AuthorityChanged);
+            if (observation) {
+                observation->journal_armed = prosper::gpu::guest_gpu_write_tracking_active();
+                observation->submit_query = static_cast<uint8_t>(submit_query);
+                observation->watch_present = watch_consulted;
+                observation->watch_query = static_cast<uint8_t>(watch_query);
+#if defined(_WIN32)
+                observation->exact_mirror_supported = true;
+#endif
+            }
+            return false;
+        }
         if (exact_unchanged)
             cached.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         cached.last_use = ++image_cache_clock;
         ++cached.pins;
         image = cached.image;
         producer_command_order = cached.graphics_export_command_order;
+        set_outcome(Outcome::Hit);
         return true;
+    }
+
+    // Turn "nothing is cached under this key" into "an entry at this address disagrees on
+    // `tile_mode`". The importer's key carries twenty-three fields, so a lookup miss on its own
+    // cannot distinguish a producer that never ran from a producer whose descriptor differs in one
+    // of them -- and those have completely different fixes. O(cache) rather than O(1), so it runs
+    // only under PROSPER_COMPUTE_BORROW_CENSUS. The NEAREST entry wins: an address holding several
+    // retained descriptors would otherwise report the union of their differences as if one entry
+    // disagreed on everything.
+    void scan_image_cache_for_near_miss(
+        const ComputeImageCacheKey& key,
+        prosper::frontend::ComputeImageBorrowObservation& observation) const {
+        observation.no_entry_scanned = true;
+        uint32_t best_mask = 0;
+        int best_bits = -1;
+        for (const auto& [candidate, cached] : image_cache) {
+            (void)cached;
+            if (candidate.gpu_addr != key.gpu_addr) continue;
+            const uint32_t mask = compute_image_key_field_diff_mask(key, candidate);
+            const int bits = __builtin_popcount(mask);
+            if (best_bits < 0 || bits < best_bits) { best_bits = bits; best_mask = mask; }
+        }
+        if (best_bits < 0) return;
+        observation.no_entry_same_addr = true;
+        observation.no_entry_field_diff_mask = best_mask;
     }
 
     bool borrow_cached_image_for_compute_transfer(const ComputeImageCacheKey& key,
@@ -10335,8 +10474,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         image.resource->gpu_addr, image.guest_bytes),
                     authorized);
             }
-            if (publish_eligible && image.graphics_sampled_usage)
+            const bool graphics_export_authorized = publish_eligible &&
+                image.graphics_sampled_usage &&
                 ctx.authorize_cached_image_export(image.cache_key, item.command_order);
+            // #3307: the producer half of the borrow partition. Without it, a consumer that finds
+            // no cache entry cannot tell a producer that declined to publish from a producer that
+            // published under a different key.
+            prosper::frontend::ComputeImagePublishInputs publish_gates;
+            publish_gates.native_exact_storage = native_exact_storage;
+            publish_gates.unique = unique;
+            publish_gates.cache_candidate = image.cache_candidate;
+            publish_gates.persistent = image.persistent;
+            publish_gates.graphics_sampled_usage = image.graphics_sampled_usage;
+            publish_gates.export_authorized = graphics_export_authorized;
+            g_image_borrow_census.record_publish(
+                prosper::frontend::classify_compute_image_publish(publish_gates));
         }
         writeback_publish_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_publish_start).count();
@@ -10737,27 +10889,41 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
          sampled_resource.format == prosper::gpu::DataFormat::Float16) &&
         (sampled_resource.num_components ? sampled_resource.num_components : 1u) == 1u &&
         sampled_resource.layer_stride_bytes != 0;
-    if (!context || !context->device || !sampled_resource.gpu_addr ||
-        sampled_resource.cls != prosper::gpu::ResourceClass::Texture ||
-        sampled_resource.host_data || !guest_bytes || guest_bytes > UINT32_MAX ||
-        (!ordinary_shape && !cube_array_alias) ||
-        sampled_resource.declared_mip_levels != 1 || sampled_resource.in_mip_tail ||
-        sampled_resource.srgb ||
-        sampled_resource.depth_compare)
-        return false;
     const uint32_t components = sampled_resource.num_components
         ? sampled_resource.num_components : 1u;
+    // Hoisted above the precondition so the classifier below sees every term at once. It is a pure
+    // switch over the guest format enum and is safe with a null context.
     const VkFormat sampled_native_format =
         native_storage_vk_format(sampled_resource.format, components);
-    if (sampled_native_format == VK_FORMAT_UNDEFINED) return false;
+    // #3307: one classifier instead of one `||` chain, so a decline names the term that declined.
+    // `classify_compute_image_import(...) == None` is exactly the negation of the chain this
+    // replaced; `test_compute_image_borrow_census` asserts that over the complete boolean product,
+    // because the failure this guards against is a term silently dropped in the rewrite.
+    prosper::frontend::ComputeImageImportInputs gates;
+    gates.have_context = context && context->device;
+    gates.have_gpu_addr = sampled_resource.gpu_addr != 0;
+    gates.texture_class = sampled_resource.cls == prosper::gpu::ResourceClass::Texture;
+    gates.host_data = sampled_resource.host_data != nullptr;
+    gates.guest_bytes_in_range = guest_bytes != 0 && guest_bytes <= UINT32_MAX;
+    gates.shape_supported = ordinary_shape || cube_array_alias;
+    gates.single_mip_level = sampled_resource.declared_mip_levels == 1;
+    gates.in_mip_tail = sampled_resource.in_mip_tail;
+    gates.srgb = sampled_resource.srgb;
+    gates.depth_compare = sampled_resource.depth_compare;
+    gates.native_format_defined = sampled_native_format != VK_FORMAT_UNDEFINED;
+    const prosper::frontend::ComputeImageImportDecline decline =
+        prosper::frontend::classify_compute_image_import(gates);
+    g_image_borrow_census.record_import(decline);
+    if (decline != prosper::frontend::ComputeImageImportDecline::None) return false;
     prosper::gpu::ShaderResource storage_identity = sampled_resource;
     if (cube_array_alias) storage_identity.img_dim = 5u; // exact producer DIM=2D_ARRAY identity
     ComputeImageCacheKey key = storage_image_cache_key(
         storage_identity, static_cast<uint32_t>(guest_bytes), sampled_native_format);
     VkImage image = VK_NULL_HANDLE;
     uint64_t producer_command_order = 0;
+    prosper::frontend::ComputeImageBorrowObservation observation;
     bool borrowed = context->borrow_cached_image_for_graphics(
-        key, image, producer_command_order);
+        key, image, producer_command_order, &observation);
     // GTA V writes several full-resolution transition surfaces through integer storage images, then
     // samples the same bits through normalized, Float32, or packed R11 graphics views. The geometry
     // and allocation are identical; only the view's numeric interpretation differs. Retry the exact
@@ -10795,9 +10961,17 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
                 ? 1u : components);
         key = storage_image_cache_key(
             storage_identity, static_cast<uint32_t>(guest_bytes), producer_format);
+        // A fresh observation: the retry is a different key, and carrying the exact key's near-miss
+        // scan into it would attribute one lookup's field differences to the other's.
+        observation = {};
+        g_image_borrow_census.record_alias_retry();
         borrowed = context->borrow_cached_image_for_graphics(
-            key, image, producer_command_order);
+            key, image, producer_command_order, &observation);
     }
+    g_image_borrow_census.record_outcome(observation, guest_bytes);
+    if (observation.no_entry_scanned)
+        g_image_borrow_census.record_no_entry_scan(observation.no_entry_same_addr,
+                                                    observation.no_entry_field_diff_mask);
     if (!borrowed) return false;
     try {
         auto lease = std::make_shared<BorrowedComputeImageLease>();
@@ -10815,10 +10989,28 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         import.lease = std::move(lease);
     } catch (...) {
         context->release_cached_image(key);
+        g_image_borrow_census.record_lease_failure();
         import = {};
         return false;
     }
     return import.valid();
+}
+
+// #3307. Running totals of why a graphics sampled descriptor did or did not borrow the device image
+// a compute dispatch had just produced, and -- from the producer side -- why an image was or was
+// not published for borrowing at all. Always collected (per import, not per byte);
+// PROSPER_COMPUTE_BORROW_CENSUS additionally prints them every 256 submits and at exit, and enables
+// the O(cache) near-miss key scan that turns a lookup miss into a named field difference.
+ComputeImageBorrowCensusSnapshot live_compute_image_borrow_census() {
+    return g_image_borrow_census.snapshot();
+}
+
+// The renderer's own post-import check (format, extent, device) can reject an image the borrow
+// handed over. That verdict is invisible from inside the compute backend, and a borrow that hits
+// and is then discarded costs exactly as much as one that missed -- so the renderer reports it here
+// rather than the two halves each believing the boundary worked.
+void live_compute_record_image_borrow_renderer_verdict(bool accepted) {
+    g_image_borrow_census.record_renderer_verdict(accepted);
 }
 
 uint64_t live_compute_buffer_gpu_result_skips() {
@@ -11134,6 +11326,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     g_perf_compute_writeback_ms = 0.0;
     g_perf_compute_cleanup_ms = 0.0;
     context.begin_write_watch_promotions();
+    context.report_image_borrow_census_periodically();
     // Dispatches are independent PM4-order operations: one item failing (e.g. an image shape the
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.

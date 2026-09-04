@@ -176,13 +176,26 @@ dispatch count, both of which the report already prints per program.
 ### The lever that is worth more than all of this
 
 The witness says `compute_cand=1`: the surface is a **compute image candidate whose import misses
-every frame**. `import_live_compute_storage_image` finds nothing under its key, so graphics falls
-through to the guest-byte decode. If that import hit, the 63.8 MiB writeback → detile → convert
-disappears **on both sides of the boundary** — the graphics decode and the compute writeback that
-feeds it. That is a bigger lever than every allocation above put together, and it lives in the
-compute cache's admission, not in the materializer. Both halves of that round trip are read
-together in [#3307](https://github.com/mattias800/prosper/issues/3307): the compute side's re-tile
-into guest memory, and the graphics side's read of those same bytes back out.
+every frame**, so graphics falls through to the guest-byte decode. If that import hit, the 63.8 MiB
+writeback → detile → convert disappears **on both sides of the boundary** — the graphics decode and
+the compute writeback that feeds it. That is a bigger lever than every allocation above put
+together. Both halves of that round trip are read together in
+[#3307](https://github.com/mattias800/prosper/issues/3307): the compute side's re-tile into guest
+memory, and the graphics side's read of those same bytes back out.
+
+**WHY it misses is not established, and this paragraph used to say it was.** It read
+*"`import_live_compute_storage_image` finds nothing under its key"* and *"it lives in the compute
+cache's admission"*, which name one specific branch out of six — and nobody had measured which one
+fires. The importer plus `borrow_cached_image_for_graphics` decline through: the consumer's own
+precondition; no cache entry under the key; an entry whose export authority was never published or
+was invalidated; an entry with no image; a published entry that no proof says still matches guest
+memory; and a lease the renderer accepts and then rejects on format/extent/device. Every one of
+those used to be the same bare `return false`.
+
+`PROSPER_COMPUTE_BORROW_CENSUS=1` now partitions them (`[compute-borrow-census]`, four lines, every
+256 submits and at exit), including the producer's own publish gate and — on a lookup miss — a scan
+for a same-address entry that names the key field it disagreed on. **Read that before proposing a
+fix here**; the branch it reports selects between fixes that have nothing to do with one another.
 
 ## The unresolved image ops — established on CALIBRATION
 
@@ -795,6 +808,16 @@ A ~13% reduction, groups non-overlapping. The visible frame does not change — 
 drops still discard the background.
 
 ## Ruled out
+
+- **"`import_live_compute_storage_image` finds nothing under its key, so the compute-image borrow
+  fails in the cache's ADMISSION."** Not falsified — **withdrawn as unmeasured**, 2026-09-04. It was
+  written into § *The lever that is worth more than all of this* as a statement of fact, and it is
+  an inference: the importer and the borrow it calls have six independent decline branches and all
+  six returned the same bare `false`, so no run could have distinguished them. This row exists
+  because the sentence was already being quoted as the starting point for a fix, and a fix aimed at
+  the admission gate would report "no change" for a reason unrelated to the change if the miss is
+  really the export-authority or the write-proof branch. The instrument that decides it is
+  `PROSPER_COMPUTE_BORROW_CENSUS=1`. #3307.
 
 - **"A recompile fix — resolving the unresolved image ops — restores the title-screen background."**
   **Falsified on the title screen, and this row exists because the measurement was recorded NOWHERE a

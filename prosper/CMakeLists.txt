@@ -1309,6 +1309,14 @@ if(TARGET prosper_core)
   target_include_directories(test_decode_scratch PRIVATE frontends src)
   add_test(NAME decode_scratch COMMAND test_decode_scratch)
 
+  # #3307 compute->graphics image borrow census. Header-only and device-free: the load-bearing arm
+  # is the 2048-case equivalence between the importer's precondition classifier and the `||` chain
+  # it replaced, which needs no Vulkan and must never be skipped on a host without it.
+  add_executable(test_compute_image_borrow_census
+                 frontends/shared/tests/test_compute_image_borrow_census.cpp)
+  target_include_directories(test_compute_image_borrow_census PRIVATE frontends)
+  add_test(NAME compute_image_borrow_census COMMAND test_compute_image_borrow_census)
+
   add_executable(test_texture_decode_diagnostic
                  frontends/shared/tests/test_texture_decode_diagnostic.cpp)
   target_include_directories(test_texture_decode_diagnostic PRIVATE frontends src)

@@ -182,10 +182,15 @@ int main() {
     _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
     _putenv_s("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
     _putenv_s("PROSPER_NO_DISK_PIPELINE_CACHE", "1");
+    _putenv_s("PROSPER_COMPUTE_BORROW_CENSUS", "1");
 #else
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
     setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
     setenv("PROSPER_NO_DISK_PIPELINE_CACHE", "1", 1);
+    // #3307. The borrow census counts unconditionally, but its near-miss key SCAN is O(cache) and
+    // therefore gated on the same variable as the report. The typed-storage borrow arms below
+    // assert that scan names the right field, so it has to be armed before the first import.
+    setenv("PROSPER_COMPUTE_BORROW_CENSUS", "1", 1);
 #endif
 
 #if defined(__linux__)
@@ -2114,6 +2119,13 @@ int main() {
             consumer.draw_index = 60;
             consumer.command_order = 20;
             bool imported = false;
+            // #3307. The borrow census is asserted on the REAL path -- a real device, a real
+            // producer dispatch, a real ordered submit -- because the unit test can only prove the
+            // classifier is self-consistent. The three snapshots bracket one hit and one
+            // deliberately mis-keyed miss taken back to back inside the same consumer callback.
+            const auto census_before = prosper::frontend::live_compute_image_borrow_census();
+            prosper::frontend::ComputeImageBorrowCensusSnapshot census_after_hit{};
+            prosper::frontend::ComputeImageBorrowCensusSnapshot census_after_miss{};
             const OrderedSubmitResult ordered = execute_ordered_items(
                 {{SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order},
                  {SubmitOperationKind::Draw, consumer.draw_index, consumer.command_order}},
@@ -2126,6 +2138,17 @@ int main() {
                         sampled, sampled.size, compute_import) && compute_import.valid() &&
                         compute_import.native_format == 100u &&
                         compute_import.producer_command_order == item.command_order;
+                    census_after_hit = prosper::frontend::live_compute_image_borrow_census();
+                    // The same guest allocation with ONE key field changed. The borrow must miss,
+                    // and the near-miss scan must name that field -- otherwise "nothing is cached
+                    // under this key" and "the producer never ran" stay indistinguishable, which
+                    // is exactly the ambiguity this census exists to remove.
+                    ShaderResource mismatched = sampled;
+                    mismatched.tile_mode = sampled.tile_mode + 1u;
+                    prosper::frontend::LiveComputeImageImport mismatched_import;
+                    (void)prosper::frontend::import_live_compute_storage_image(
+                        mismatched, mismatched.size, mismatched_import);
+                    census_after_miss = prosper::frontend::live_compute_image_borrow_census();
                     return RenderedFrame{};
                 },
                 [&](const std::vector<ComputeItem>& items) {
@@ -2138,6 +2161,39 @@ int main() {
                   "typed R32_SFLOAT fill executes and writes every finite value exactly");
             CHECK(imported,
                   "same-submit graphics consumer leases the exact typed R32_SFLOAT result");
+            {
+                using Outcome = prosper::frontend::ComputeImageBorrowOutcome;
+                using Publish = prosper::frontend::ComputeImagePublishDecline;
+                using Field = prosper::frontend::ComputeImageKeyField;
+                constexpr size_t kHit = static_cast<size_t>(Outcome::Hit);
+                constexpr size_t kNoEntry = static_cast<size_t>(Outcome::NoCacheEntry);
+                constexpr size_t kAuthorized = static_cast<size_t>(Publish::Authorized);
+                constexpr size_t kTileMode = static_cast<size_t>(Field::TileMode);
+                constexpr size_t kWidth = static_cast<size_t>(Field::Width);
+                CHECK(census_after_hit.outcomes[kHit] == census_before.outcomes[kHit] + 1,
+                      "the borrow census records the same-submit lease as a hit");
+                CHECK(census_after_hit.publishes[kAuthorized] >
+                          census_before.publishes[kAuthorized],
+                      "the borrow census records the producer's export authorization");
+                CHECK(census_after_miss.outcomes[kNoEntry] ==
+                          census_after_hit.outcomes[kNoEntry] + 1,
+                      "a one-field key difference is recorded as a cache-entry miss");
+                // Float32x1 aliases to R32_UINT, so the importer retries under the producer
+                // identity before giving up. Pin that: the recorded observation is the RETRY's,
+                // and reading it as the exact key's would misattribute the format fields.
+                CHECK(census_after_miss.alias_retries == census_after_hit.alias_retries + 1,
+                      "the format-alias retry is counted separately from the outcome");
+                CHECK(census_after_miss.no_entry_same_addr ==
+                          census_after_hit.no_entry_same_addr + 1 &&
+                      census_after_miss.key_field_diffs[kTileMode] ==
+                          census_after_hit.key_field_diffs[kTileMode] + 1,
+                      "the near-miss scan finds the same-address entry and names tile_mode");
+                // ...and names only the fields that actually differ. A mask that set every bit
+                // would satisfy the arm above and say nothing.
+                CHECK(census_after_miss.key_field_diffs[kWidth] ==
+                          census_after_hit.key_field_diffs[kWidth],
+                      "the near-miss scan does not attribute a field that matched");
+            }
         }
     }
     {

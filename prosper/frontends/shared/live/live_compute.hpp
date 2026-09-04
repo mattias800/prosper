@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/execute/gpu_execute.hpp"
+#include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/texture/write_watch_census.hpp"
 
 #include <cstddef>
@@ -278,6 +279,21 @@ uint64_t live_compute_buffer_gpu_result_skips();
 // `decisions=`/`validated=` denominators before any ratio: comparing two arms' totals taken at
 // different points in a run is exactly the mistake that produced this issue's retracted numbers.
 WriteWatchCensusSnapshot live_compute_write_watch_census();
+// #3307. Running totals of the compute->graphics image borrow: why each graphics sampled
+// descriptor did or did not lease the device image a compute dispatch had just produced, and -- on
+// the producer side -- why an image was or was not published for borrowing at all. The two
+// partitions together separate "the consumer's key finds nothing" from "nothing was ever
+// published" from "the entry is published but no proof says guest memory still matches it", which
+// is exactly the five-way branch a single `return false` used to collapse.
+//
+// Always collected. PROSPER_COMPUTE_BORROW_CENSUS additionally prints the totals every 256 submits
+// and at exit, and enables the O(cache) near-miss scan that turns a lookup miss into a named key
+// field. Read the `imports=` / `attempted=` / `publish_evaluated=` denominators before any ratio.
+ComputeImageBorrowCensusSnapshot live_compute_image_borrow_census();
+// The renderer's verdict on an import that succeeded: it re-checks format, extent and device, and
+// a rejection there costs exactly what a miss costs. Recorded from `live_renderer.cpp` because only
+// the consumer knows it happened.
+void live_compute_record_image_borrow_renderer_verdict(bool accepted);
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();

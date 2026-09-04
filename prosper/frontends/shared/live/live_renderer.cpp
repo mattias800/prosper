@@ -3868,6 +3868,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 compute_image_import.depth == r.depth && render_context.ok &&
                                 compute_image_import.device ==
                                     static_cast<void*>(render_context.dev);
+                            // #3307: a borrow the renderer then discards costs exactly what a miss
+                            // costs, and the compute backend cannot see it happen.
+                            prosper::frontend::live_compute_record_image_borrow_renderer_verdict(
+                                resource_compute_image_hit);
                             if (!resource_compute_image_hit) compute_image_import = {};
                         }
                         if (resource_compute_image_hit &&
