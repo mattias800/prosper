@@ -28,6 +28,18 @@ unusable, because it only starts a capture on a *keypress* and every agent here 
 prosper now drives its in-application API itself, so a capture aims at a frame ordinal like F8 and F9
 do. The first working one held zero draws: prosper runs two Vulkan devices, and asked to pick,
 RenderDoc took the one that only presents. Details in [#3321](https://github.com/mattias800/prosper/issues/3321).
+### The compute half of that same round trip was doing it too
+
+No picture, and the headline is a null. #3309 pooled the *graphics* side's 63 MiB scratch buffers;
+the compute side was still allocating one per dispatch, for the same surfaces, at the same size.
+Measured here: 14.4 ms to allocate and fill 64 MiB against 3.1 ms into a buffer that is already
+mapped — and pooling it **did not move Stray's frame rate at all**, because the surfaces that
+actually dominate this route average 19.5 MiB, under the threshold where that penalty exists.
+What the same runs did settle is where to look next: compute **setup** turns out to be the larger
+half (51.1 s against 46.8 s of writeback, over 62,556 dispatches) and nobody had ever measured it,
+and 247 GiB of full-surface snapshot copying happens because a class of dispatches writes about a
+quarter of a surface and has to bring the other three quarters in first.
+[#3307](https://github.com/mattias800/prosper/issues/3307)
 
 ### Two thirds of Stray's biggest render cost was the allocator, not the work
 

@@ -585,7 +585,16 @@ bool cpu_writable(uint32_t p) { return (p & 0x2) != 0; }
 // advance is merely spurious, which costs one cache refill and can never produce a wrong answer.
 // Per-call rather than once per batch for the same reason -- spurious advances are free, and a
 // batched notify is one more thing to get wrong on the rollback paths.
+// Counted here rather than in AtomicStats below, because this function is defined above it and
+// every protection change in this arm funnels through it. #3307: the compute writeback's `watch_ms`
+// stage is either a page-index walk or an mprotect over the whole surface, and only the syscall
+// volume distinguishes them.
+std::atomic<uint64_t> g_protect_calls{0};
+std::atomic<uint64_t> g_protect_bytes{0};
+
 int watch_mprotect(void* addr, size_t len, int prot) {
+    g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+    g_protect_bytes.fetch_add(len, std::memory_order_relaxed);
     const int rc = mprotect(addr, len, prot);
     notify_guest_page_protection_changed();
     return rc;
@@ -690,7 +699,9 @@ struct AtomicStats {
         create_bytes_gt_32m{0},
         create_protect_failures{0},
         queries{0}, unchanged{0}, dirty{0}, unknown{0}, faults{0}, stale_faults{0},
-        physical_writes{0}, rearms{0};
+        physical_writes{0}, rearms{0},
+        host_write_notifies{0}, host_write_no_alias{0}, host_write_pages_hit{0},
+        host_write_lock_contended{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
@@ -1349,7 +1360,10 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.create_bytes_gt_32m.load(), v.create_protect_failures.load(),
             v.queries.load(), v.unchanged.load(), v.dirty.load(),
             v.unknown.load(), v.faults.load(), v.stale_faults.load(),
-            v.physical_writes.load(), v.rearms.load()};
+            v.physical_writes.load(), v.rearms.load(),
+            v.host_write_notifies.load(), v.host_write_no_alias.load(),
+            v.host_write_pages_hit.load(), v.host_write_lock_contended.load(),
+            g_protect_calls.load(), g_protect_bytes.load()};
 }
 
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
@@ -1877,7 +1891,16 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // Hot path: the HLE calls this before EVERY read()/pread(), mostly into non-dmem heap buffers. When
     // the feature is off (the default) nothing is ever armed, so skip without even taking the lock.
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(w.mutex);
+    // try_lock first purely to COUNT contention: `query()` holds this same mutex while walking every
+    // page of a registration, so a notification can spend its whole duration waiting rather than
+    // working -- and `watch_ms` cannot tell those apart. Costs one uncontended atomic exchange when
+    // the lock is free, which is the case this must not slow down.
+    std::unique_lock lock(w.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        bump(stats().host_write_lock_contended);
+        lock.lock();
+    }
+    bump(stats().host_write_notifies);
     // A host/kernel store into an armed (read-only) guest page would EFAULT — e.g. sceKernelPread
     // streaming texture bytes straight into a watched dmem buffer returns an I/O error where real
     // hardware succeeds (review B5). The HLE calls this by guest VA range BEFORE such a write: restore
@@ -1885,7 +1908,8 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // Dirty (the bytes are about to change). Runs in normal context, so set_pages_armed may allocate.
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
-    if (!va_range_has_alias(w, begin, end)) return;   // not a dmem buffer -> skip the per-page scan
+    // not a dmem buffer -> skip the per-page scan
+    if (!va_range_has_alias(w, begin, end)) { bump(stats().host_write_no_alias); return; }
     if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
         w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
         uint64_t ignored_phys = 0;
@@ -1929,6 +1953,7 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
         if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
     }
     if (hit.empty()) return;
+    stats().host_write_pages_hit.fetch_add(hit.size(), std::memory_order_relaxed);
     set_pages_armed(w, hit, false);
     for (WatchedPage* page : hit) page->generation++;
 }

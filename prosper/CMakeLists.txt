@@ -1308,6 +1308,16 @@ if(TARGET prosper_core)
   add_executable(test_decode_scratch frontends/shared/tests/test_decode_scratch.cpp)
   target_include_directories(test_decode_scratch PRIVATE frontends src)
   add_test(NAME decode_scratch COMMAND test_decode_scratch)
+  # The two arms the pooling claim rests on, each asserting the COMPLEMENT of the default run so
+  # neither can pass by accident: with retention disabled the shared pool must keep nothing (and a
+  # ScratchBuffer must therefore not reuse pages), and with poison armed every lease must arrive
+  # holding 0xCD rather than the incidental zeros a fresh mmap would have given it.
+  add_test(NAME decode_scratch_no_retention COMMAND test_decode_scratch)
+  set_tests_properties(decode_scratch_no_retention PROPERTIES
+    ENVIRONMENT "PROSPER_DECODE_SCRATCH_MB=0")
+  add_test(NAME decode_scratch_poisoned COMMAND test_decode_scratch)
+  set_tests_properties(decode_scratch_poisoned PROPERTIES
+    ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
   # #3307 compute->graphics image borrow census. Header-only and device-free: the load-bearing arm
   # is the 2048-case equivalence between the importer's precondition classifier and the `||` chain
@@ -2425,6 +2435,15 @@ if(TARGET prosper_core)
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+      # The compute path's full-surface seed/pack intermediates are pooled rather than freshly
+      # allocated. Their old allocation was `make_unique_for_overwrite`, i.e. nominally
+      # indeterminate -- but at these sizes it was a fresh mmap, which reads as ZERO, so a call site
+      # could be depending on zeroing it never asked for. This arm hands every lease 0xCD instead:
+      # it fails exactly when such a dependency exists, which is the only way that claim is testable
+      # against the real backend rather than argued from the diff.
+      add_test(NAME game_compute_exec_scratch_poison COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_scratch_poison PROPERTIES
+        ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
       # Local-only realized-submit replayer (#514), on Windows since #2331. Same target as the UNIX
       # block below, including the -Werror=switch gate: gpu_replay maps LiveTargetPixelFormat itself
@@ -2797,6 +2816,15 @@ if(TARGET prosper_core)
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+      # The compute path's full-surface seed/pack intermediates are pooled rather than freshly
+      # allocated. Their old allocation was `make_unique_for_overwrite`, i.e. nominally
+      # indeterminate -- but at these sizes it was a fresh mmap, which reads as ZERO, so a call site
+      # could be depending on zeroing it never asked for. This arm hands every lease 0xCD instead:
+      # it fails exactly when such a dependency exists, which is the only way that claim is testable
+      # against the real backend rather than argued from the diff.
+      add_test(NAME game_compute_exec_scratch_poison COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_scratch_poison PROPERTIES
+        ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
       add_executable(test_live_compute_descriptor_array
                      tests/shared/live/test_live_compute_descriptor_array.cpp)

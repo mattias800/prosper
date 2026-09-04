@@ -15,7 +15,9 @@
 #include <vector>
 
 using prosper::frontend::DecodeScratchPool;
+using prosper::frontend::ScratchBuffer;
 using prosper::frontend::decode_scratch_budget_bytes;
+using prosper::frontend::decode_scratch_pool;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -170,6 +172,107 @@ int main() {
     CHECK(decode_scratch_budget_bytes(" 0") == (512ull << 20));
     CHECK(decode_scratch_budget_bytes("64mb") == (512ull << 20));
     CHECK(decode_scratch_budget_bytes(" 64") == (512ull << 20));
+
+    // --- the poison arm actually poisons -----------------------------------------------------
+    //
+    // The whole equivalence claim for the `make_unique_for_overwrite` call sites is "indeterminate
+    // bytes stayed indeterminate". PROSPER_DECODE_SCRATCH_POISON exists to make a call site that
+    // secretly relied on the old allocation's incidental zeroing fail loudly, and a poison arm that
+    // does not poison would launder exactly that. Assert it in whichever direction this run is.
+    {
+        DecodeScratchPool pool(64u << 20);
+        auto lease = pool.take(4096);
+        if (prosper::frontend::decode_scratch_poison_enabled()) {
+            bool all_poison = true;
+            for (size_t i = 0; i < lease.size(); ++i) all_poison &= lease.data()[i] == 0xCD;
+            CHECK(all_poison);
+        } else {
+            // A pristine pool's first buffer is value-initialised, so the default arm can state the
+            // complement rather than merely skipping.
+            bool any_poison = false;
+            for (size_t i = 0; i < lease.size(); ++i) any_poison |= lease.data()[i] == 0xCD;
+            CHECK(!any_poison);
+        }
+    }
+
+    // --- ScratchBuffer: the adapter live_compute.cpp's per-dispatch intermediates use ------------
+    //
+    // Asserted against the THREAD pool the production call sites use, not a local one. An adapter
+    // that quietly kept allocating would pass every local-pool assertion above and change nothing
+    // in production, so the discriminator has to be the shared pool's own retention counter.
+    {
+        const bool retaining =
+            decode_scratch_budget_bytes(std::getenv("PROSPER_DECODE_SCRATCH_MB")) != 0;
+        // The poison arm deliberately overwrites the previous tenant, so the "same pages still hold
+        // what I wrote" half of this only means anything when poison is off. Reuse of the pointer
+        // itself is asserted in both arms.
+        const bool tenant_survives = retaining && !prosper::frontend::decode_scratch_poison_enabled();
+        const size_t n = 1u << 20;
+        const size_t retained_before = decode_scratch_pool().retained_buffers();
+        uint8_t* first = nullptr;
+        {
+            ScratchBuffer scratch;
+            scratch.reset(n, /*zero_fill=*/false);
+            CHECK(static_cast<bool>(scratch));
+            first = scratch.get();
+            CHECK(first != nullptr);
+            std::memset(first, 0x3C, n);
+        }
+        if (retaining) {
+            // The lease went back to the shared pool: that is the one observable fact separating
+            // "ScratchBuffer uses the pool" from "ScratchBuffer allocates and frees".
+            CHECK(decode_scratch_pool().retained_buffers() > retained_before);
+            ScratchBuffer scratch;
+            scratch.reset(n, /*zero_fill=*/false);
+            CHECK(scratch.get() == first);        // same pages: no mmap, no fault-in
+            if (tenant_survives)
+                CHECK(scratch.get()[0] == 0x3C);  // ...holding the previous tenant, which is
+                                                  //    precisely why zero_fill exists
+        } else {
+            CHECK(decode_scratch_pool().retained_buffers() == 0);
+        }
+    }
+
+    // --- ScratchBuffer zero_fill is load-bearing, in both directions -----------------------------
+    {
+        const bool tenant_survives =
+            decode_scratch_budget_bytes(std::getenv("PROSPER_DECODE_SCRATCH_MB")) != 0 &&
+            !prosper::frontend::decode_scratch_poison_enabled();
+        const size_t n = 1u << 20;
+        { ScratchBuffer dirty; dirty.reset(n, false); std::memset(dirty.get(), 0xA5, n); }
+        {
+            ScratchBuffer scratch;
+            scratch.reset(n, /*zero_fill=*/true);
+            bool all_zero = true;
+            for (size_t i = 0; i < n; ++i) all_zero &= scratch.get()[i] == 0;
+            CHECK(all_zero);
+        }
+        { ScratchBuffer dirty; dirty.reset(n, false); std::memset(dirty.get(), 0xA5, n); }
+        {
+            ScratchBuffer scratch;
+            scratch.reset(n, /*zero_fill=*/false);
+            // MUTATION ARM: without the flag the previous tenant survives. If this ever reads zero
+            // the flag has stopped discriminating and the zero_fill=true assertion above is vacuous.
+            if (tenant_survives) CHECK(scratch.get()[0] == 0xA5);
+            // ...and under the poison arm the complement: the lease must NOT arrive zeroed either,
+            // or `zero_fill=false` would be indistinguishable from `zero_fill=true` there too.
+            if (prosper::frontend::decode_scratch_poison_enabled())
+                CHECK(scratch.get()[0] == 0xCD);
+        }
+    }
+
+    // --- a zero-extent reset leases nothing and stays null ---------------------------------------
+    //
+    // The call sites guard on a non-zero extent, but `take(0)` would still claim a retained buffer
+    // and hand it straight back, so state the contract here rather than relying on the guards.
+    {
+        const size_t retained_before = decode_scratch_pool().retained_buffers();
+        ScratchBuffer scratch;
+        scratch.reset(0, /*zero_fill=*/true);
+        CHECK(scratch.get() == nullptr);
+        CHECK(!static_cast<bool>(scratch));
+        CHECK(decode_scratch_pool().retained_buffers() == retained_before);
+    }
 
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("decode scratch pool: all checks passed\n");

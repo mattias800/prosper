@@ -16,13 +16,17 @@ found Vulkan.
   memory, dispatched, and written back into guest memory synchronously.
 - `live_target_format.hpp` — the guest↔Vulkan pixel-format mapping. Compiled with `-Werror=switch`
   on purpose: a silent RGBA8 fallback has cost two titles a whole render layer.
-- `decode_scratch.hpp` — the pooled full-surface intermediates the texture decode branches in
-  `live_renderer.cpp` stage through. Header-only and Vulkan-free. It is here rather than in
+- `decode_scratch.hpp` — the pooled full-surface intermediates that both the texture decode branches
+  in `live_renderer.cpp` and the per-dispatch seed/pack buffers in `live_compute.cpp` stage through
+  (`ScratchBuffer` is the drop-in shape for the latter's old `std::unique_ptr<uint8_t[]>`).
+  Header-only and Vulkan-free. It is here rather than in
   `shared/texture/` because that folder holds *decision* logic that owns no memory, and this owns
   the memory. The one rule it exists to make explicit: a lease arrives holding the PREVIOUS
   surface, so a caller that fills it partially must say so (`zero_tail`) — a fresh
   `std::vector<uint8_t>(n, 0)` used to supply that tail for free, and nothing else would notice it
-  had stopped.
+  had stopped. `PROSPER_DECODE_SCRATCH_POISON=1` is the arm that makes such a caller fail loudly
+  instead: it fills every lease before handing it out, so nothing can quietly inherit the zeros a
+  fresh mmap used to supply.
 
 ## The boundary that is easy to get wrong
 

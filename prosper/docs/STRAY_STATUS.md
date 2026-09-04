@@ -197,6 +197,136 @@ those used to be the same bare `return false`.
 for a same-address entry that names the key field it disagreed on. **Read that before proposing a
 fix here**; the branch it reports selects between fixes that have nothing to do with one another.
 
+### The compute side of the same round trip (2026-09-04, `df1bbae32`)
+
+#3309 found that two thirds of the *graphics* materializer's cost was the allocator rather than the
+decode. **The compute half was still doing it**, at the same sizes and on the same surfaces.
+`live_compute.cpp` gave every dispatch a fresh `make_unique_for_overwrite<uint8_t[]>` for its
+full-surface intermediates — the linear buffer a tiled storage image is detiled into before it is
+seeded, and the one a non-exact writeback is packed through. Stray's dominant storage geometry is
+3840×2160 at 8 bytes per texel, so that is **63.3 MiB per allocation**, past glibc's 32 MiB mmap
+threshold and therefore an `mmap`, 16,384 page faults as the detile touches it, and a `munmap`.
+
+Measured on this machine, allocate-and-fill against fill-into-a-retained-buffer:
+
+| extent | fresh alloc + fill | reused + fill | penalty |
+| --- | --- | --- | --- |
+| 4 MiB | 0.107 ms | 0.077 ms | 0.031 ms |
+| 16 MiB | 0.644 ms | 0.459 ms | 0.185 ms |
+| **33 MiB** | **7.371 ms** | **1.413 ms** | **5.958 ms** |
+| **64 MiB** | **14.396 ms** | **3.117 ms** | **11.279 ms** |
+
+The cliff between 16 and 33 MiB is glibc's dynamic `M_MMAP_THRESHOLD`, whose cap is 32 MiB: below it
+the heap recycles the block, above it every allocation is a fresh mapping.
+
+**This lands in `setup`, not in writeback**, which is why #3307's stage table does not show it: the
+seed detile runs in the image-setup loop. On the dominant geometry the storage-gate census reports
+`seed_skip=2469` of `evaluated=4879`, so roughly **half** of those bindings seed — and each seed is
+one of these allocations. The fix is #3309's, reused: `DecodeScratchPool` from
+`frontends/shared/live/decode_scratch.hpp`.
+
+### What `layout_ms` and `watch_ms` actually are
+
+`layout_ms` is the CPU re-tile running at memory-bandwidth speed, so it can only be reduced by
+re-tiling **fewer** surfaces. `watch_ms` is **not** the page-index walk it was attributed to — and is
+not yet attributed to anything else either; #3317's `mprotect` reading is a live hypothesis, not a
+result. See `## Ruled out`, including which counter decides it.
+
+### Measured on the phase timers, 2026-09-04 — setup exceeds writeback
+
+`PROSPER_COMPUTE_PHASE_TIMING=1`, whole-run totals over **62,556 dispatches**:
+
+| phase | total |
+| --- | --- |
+| **`setup_ms`** | **51,062.6 ms** |
+| `writeback_ms` | 46,775.3 ms |
+| ├ `writeback_images_ms` | 45,513.8 ms |
+| `setup_buffers_ms` | 3,830.9 ms |
+| `setup_validate_ms` | 628.9 ms |
+
+**Setup is the larger half and had never been quoted**: #3307's stage table covers `writeback_*`
+only. Roughly 46.6 s of setup is the image path — the seed detile and everything around it.
+
+### The A/B on pooling is NULL, and why that is consistent
+
+Three arms of #3317 against two of `origin/main`, same route, F8 at t=175 s:
+
+| build | arms | rendered fps | mean |
+| --- | --- | --- | --- |
+| `origin/main` | 2 | 8.76, 9.75 | 9.25 |
+| #3317 (pooled) | 3 | 8.96, 9.23, 10.06 | 9.42 |
+
+Ranges overlap; the best branch arm beats every `main` arm and the worst loses to one. **Pooling the
+allocation does not move the frame rate on this route.**
+
+That is consistent with the benchmark rather than against it, and the reason is a number from the
+same run: **the image-source snapshots average ~19.5 MiB** (13,001 of them, 247 GiB total), and the
+write-watch registers **193,248 pages across 86 registrations — ~8.8 MiB each**. So the *typical*
+surface here is well under glibc's 32 MiB `M_MMAP_THRESHOLD` cap, where the measured allocation
+penalty is **0.185 ms at 16 MiB** rather than the 11.279 ms at 64 MiB. The dynamic threshold adapts
+upward after the first free, so a repeated 19.5 MiB allocation comes from the arena; a 63.3 MiB one
+never can.
+
+**Separate what is established from what is not, because they are different halves of this
+paragraph.**
+
+*Established, and not in doubt:* the benchmark table is a direct measurement, and glibc's dynamic
+`M_MMAP_THRESHOLD` is capped at 32 MiB by documented allocator behaviour. So **the pooling's value is
+a step function of lease size** — large where a lease cannot come from the arena, small where it can.
+That much is a finding.
+
+*Not established:* where **this route's** leases fall relative to that step. The mean cannot say, and
+that is the specific defect in the original argument — a mean is the wrong statistic when the cost
+function has a **discontinuity inside the distribution**. 253,284.7 MiB over 13,001 snapshots is
+equally consistent with ~3,000 allocations at 63.3 MiB (190 GiB, most of the volume and by the table
+most of the *cost*) plus ~10,000 averaging 6.3 MiB. The mean reads 19.5 either way, so it cannot
+distinguish the two populations and only one of them supports "the surfaces are mostly small".
+
+**The null does not settle it either, and the reason is power rather than population.** The route's
+census — `3840x2160 bpe=8 evaluated=4879 seed_skip=2469`, roughly 2,410 seeds at 63.3 MiB — predicts
+**~27 s** at the table's 11.279 ms. That figure is a **whole-run** number built from a census on
+`fc21d46ca` plus a 62,556-dispatch phase-timing run, while the A/B is a **5.02 s window at t=175 s**:
+the two are not commensurable, and an earlier draft of this row wrongly argued "if the saving were
+real the A/B could not have come back null". It could. `main` alone spans **11% at n=2** on this
+route, and #3307's own conclusion is that **n<6 is unpublishable here** after a three-arm "+22%"
+collapsed on the fourth arm.
+
+So there are **four** candidates, not three, and the fourth is the most likely on these numbers:
+1. the surfaces really are mostly small;
+2. the micro-benchmark's tight-loop allocator behaviour does not reproduce in a live run;
+3. the census and the phase-timing run are **different runs on different heads**;
+4. **the saving is real and the A/B cannot see it** — the arms lack the resolving power for an effect
+   of this size, which is a statement about the experiment rather than about the code.
+
+Separating these needs a **size histogram** and an arm count that can resolve the effect, not another
+mean. Do not generalise the null past this route, and do not quote the ~60x as measured.
+
+`main` alone spans 11% across two arms, so **single-arm fps comparisons on this route are not
+evidence**; the 2026-09-04 "#3309 gave +18%" figure was one arm each and has been retracted.
+
+### The volume that is left: 247 GiB of image-source snapshots
+
+From the same run:
+
+```
+compute_image_source snapshots=13001 253284.7 MiB storage_results=8109 181752.1 MiB
+compute_snapshot_reason rmw=7945 181066.4 MiB changed=4846 70924.6 MiB
+```
+
+**176.8 GiB of it is `rmw`** — read-modify-write, storage images whose prior contents must be
+brought in because the dispatch does not cover them. That is the same population as #3307's
+`PARTIAL-COVERAGE` finding: 21 bindings that always seed, every one at a uniform **~0.75
+poison-survival ratio**, i.e. a dispatch writing about a quarter of the surface forcing a
+full-surface snapshot. At ~2,250 rendered frames that is ~5.8 snapshots and **~113 MiB per frame**,
+about 1 GiB/s at 9 fps — so 30 fps would need ~3.4 GiB/s of snapshot traffic on top of everything
+else.
+
+**This is a volume problem, not a per-call cost problem**, which is exactly why pooling the
+allocator made no difference. The uniformity of the 0.75 ratio across sizes from 32 K to 8.3 M
+texels says it is structural (a quarter-resolution write), therefore predictable, therefore
+narrowable. And it joins the lever in the section above: if
+`import_live_compute_storage_image` hit, the RMW side would not need a host snapshot at all.
+
 ## The unresolved image ops — established on CALIBRATION
 
 > **The five-op census below was read on the calibration screen**, like every other live census above
@@ -818,6 +948,61 @@ drops still discard the background.
   the admission gate would report "no change" for a reason unrelated to the change if the miss is
   really the export-authority or the write-proof branch. The instrument that decides it is
   `PROSPER_COMPUTE_BORROW_CENSUS=1`. #3307.
+- **"`layout_ms` — 61% of compute-image writeback — can be cut by making the CPU re-tile faster."**
+  Falsified by micro-benchmark on this machine, 2026-09-04. At Stray's dominant geometry
+  (3840×2160, 8 bytes per texel, tile mode 27 = `SW_64KB_R_X`) `tile_surface` runs at **1.83 ms best
+  / 2.21 ms mean**, while a single-threaded `memcpy` of the same 63.3 MiB is **2.75 ms** — i.e. the
+  re-tile already moves 127 MiB of traffic (63.3 read + 63.8 written) faster than one core copies
+  63. It is already threaded over block rows (7.77 ms at one thread, 1.69 ms at eight, so the
+  parallelism is real and thread spawn is not the cost), and its bpe=8 AVX2 inner loop already
+  stores the **longest contiguous run the swizzle permits**: in the 16-pipe R_X pattern for 8-byte
+  elements, consecutive `x` differ only in address bit 3, so two texels are adjacent and `x+2` jumps
+  to bit 5 — 16 bytes is the maximum, and the code stores 16. **`layout_ms` can only be reduced by
+  re-tiling fewer surfaces, never by re-tiling faster.** #3307.
+- **"`watch_ms` — 31% of compute-image writeback — is per-writeback write-watch *registration*, i.e.
+  the per-page index walk."** Falsified, 2026-09-04, and **this is the only half of the original
+  claim that is established.** The span `prepare_done → watch_done` contains only the (rare)
+  poison-coverage scan and one `guest_write_watch_notify_host_write`, and that function's page loop —
+  one `pages_by_addr.find` per 4 KiB, plus the hit vector and the generation bumps — was modelled
+  exactly and costs **0.05 ms per 64 MiB when every page in the range is watched** and 0.0035 ms when
+  none is, against a measured `watch_ms` mean of 0.33 ms. The walk cannot be it. #3307, #3317.
+- **`watch_ms`'s actual contents are UNATTRIBUTED. Do not quote the `mprotect` reading — it was mine
+  and it is not established.** #3317 recorded, as fact, that the stage is the `mprotect`
+  `set_pages_armed` issues. The supporting numbers are real (one `mprotect` over 64 MiB costs 0.39 ms
+  idle and 0.63 ms with twelve busy threads, which fits the 0.33 ms mean), but they were measured in
+  a standalone benchmark and **nobody has yet measured whether that call happens in this span at
+  all**.
+
+  **This row postdates, and deliberately does not adopt, #3307's 2026-09-04 08:01 UTC comment**, which
+  published the untruncated line — `18210 calls/429447.0 MiB`, `pages_hit=62103696`,
+  `host_write=55651` — and concluded that the `watch_ms` attribution stands. Those numbers are real
+  and they still do not isolate this span, for two reasons that are in the code rather than in the
+  reading: the protection counter is **process-global** (`guest_write_watch.cpp:592`), so it cannot be
+  attributed to any one span; and `pages_hit` counts **index hits, not protection changes**, because
+  `protection_runs` skips any page whose protection already matches what is being asked
+  (`guest_write_watch.cpp:749`) — so a notify over already-disarmed pages issues **zero** `mprotect`s
+  while still incrementing `pages_hit`. A large global count is therefore consistent with this span
+  issuing none. Two further notes for anyone re-aggregating that log: **`lock_contended` did not exist
+  in the 08:01 run at all**, so candidate 2 below is not merely unmeasured there but unmeasurable from
+  it; and the discriminator that *would* isolate the span is two lines — `pages_hit` is bumped at
+  `guest_write_watch.cpp:1956` immediately before `set_pages_armed` at `:1957`, so a counter taken
+  between them attributes the call to this span rather than to the process. The reconciliation is recorded here rather than left in the issue thread, because a
+  correction that lives only in a comment is the failure `## Ruled out` exists to prevent. Three candidates remain live and the counters that separate them now exist on
+  `PROSPER_RENDER_TIMING`'s `write_watch` line:
+  1. `page_protect=<calls>/<MiB>` and `pages_hit` — the `mprotect` reading. A first live run's
+     `faults=539` says protections *do* happen somewhere (a page cannot fault unless it was armed),
+     but not that they happen here.
+  2. `lock_contended` — the notification blocks on the one global state mutex, which
+     `GuestWriteWatch::query()` holds while walking a whole registration. That run measured
+     **89,938 queries over 193,248 watched pages**, so the mutex is genuinely busy. **A notification
+     that merely waits reports the same `watch_ms` as one doing work**, and no other counter can
+     tell them apart.
+  3. The poison-coverage scan, which shares the span. This needs **no new instrument**: every
+     `[compute-image-writeback]` record already prints `poison=`, so re-aggregating an existing
+     `PROSPER_COMPUTE_IMAGE_TIMING` log by that field settles it. Do that first — it is free.
+  **Read the whole `write_watch` line, never one field of it.** The first run of the new counters was
+  read off a truncation in which `protect=0` — the *pre-existing* `create_protect_failures`, whose
+  healthy value is zero — was taken for the new call counter (instrument trap 256). #3307, #3317.
 
 - **"A recompile fix — resolving the unresolved image ops — restores the title-screen background."**
   **Falsified on the title screen, and this row exists because the measurement was recorded NOWHERE a
