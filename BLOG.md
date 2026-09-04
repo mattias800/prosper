@@ -27,7 +27,7 @@ No picture worth showing: the frame is still the menu over black. The finding is
 We had assumed the game built its picture in one place and copied it to the buffer the screen reads,
 and that we were losing the copy. Measuring every render target this time, rather than only the
 first, says otherwise — the two display buffers are themselves render targets, attached to passes
-that carry thousands of draws. Nothing is being lost in transit. What the existing pixel traces
+that carry draws. Nothing is being lost in transit. What the existing pixel traces
 already showed, and what this reframes, is that the world's colour reaches the end of the pipeline so
 faint that storing it rounds it to zero. So the question stops being "where did the picture go" and
 becomes "why is it arriving that dim", which is a much better question to be stuck on.

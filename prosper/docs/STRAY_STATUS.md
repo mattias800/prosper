@@ -1453,10 +1453,20 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   4K slot-0 persistent colour attachments, throughout the failing run (title route, steady state
   confirmed by eye: menu over black at 8x brightness):
 
-  | flipped VA | physical | size | census lines | draws dropped `no-effect(early)` |
-  | --- | --- | --- | --- | --- |
-  | `0x9fc0000000` | `0x230000` | 3840x2160 | 946 | **1,143** |
-  | `0x9fc2000000` | `0x2210000` | 3840x2160 | 976 | **1,154** |
+  | flipped VA | physical | size | census lines (passes) |
+  | --- | --- | --- | --- |
+  | `0x9fc0000000` | `0x230000` | 3840x2160 | 946 |
+  | `0x9fc2000000` | `0x2210000` | 3840x2160 | 976 |
+
+  A draft of this row carried a fourth column of `no-effect(early)` drops "measured on the title route
+  where this diagnostic had never been run". **Both halves were wrong**, and the correction is worth
+  more than the column was. § *The title screen's REAL numbers* already records this census on this
+  screen (8192 discarded, `no-effect` ~4400) and states the methodology: *census read at the same
+  cumulative total in every arm*. `report_dropped_draw_target` emits only at power-of-two totals, so
+  the draft's reading at 4,096 was a **snapshot one emission earlier**, not a run total — and its
+  1,143 + 1,154 = 2,297 is almost exactly half of ~4,400, which is what that same measurement looks
+  like one emission back. It was also unit-mismatched against the census column beside it: passes
+  against draws. Use the existing table; do not quote the withdrawn one.
 
   **Read the census column precisely.** The line is printed after the empty-draw early-out, so it
   means *this VA was bound as slot 0 of a pass carrying at least one draw*. It does **not** mean a
@@ -1475,19 +1485,41 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   the publish check (flip time) are different moments and must not be read as one. The probe now
   prints `rtt_owns=` and the decision name beside the physical address so this becomes a measurement.
 
-  **TWO REGIMES, and this row previously blurred them — the same mistake this file's own banner warns
+  **TWO STATES, and this row previously blurred them — the same mistake this file's own banner warns
   about for `max_nonblack`.** They are different failure states and their evidence does not transfer:
 
-  | regime | what publishes | where the `authored=0` / `SkipNotAuthored` evidence comes from |
+  | state | what reaches the screen | source of the `authored=0` / `SkipNotAuthored` evidence |
   | --- | --- | --- |
-  | **title screen** (measured here) | the menu **does** publish | *not this regime* |
-  | **main menu / first map** | nothing publishes (`fresh=0 retained=0`) | this one |
+  | **title screen** (measured here) | a menu frame exists, so something published | a *different run*, days and several merges earlier |
+  | **main menu / first map** | nothing (`fresh=0 retained=0`) | that run |
 
-  The guest-scanout fallback is gated on `guest_scanout_read_warranted(...) == Publish`, i.e. it runs
-  **only when nothing else published**. On the title route it is therefore never entered — measured:
-  **0** `[rtt] GUEST SCANOUT` lines across a full run that reached and held the failing steady state.
-  So `rtt_owns=` cannot be collected on this route at all, and every `authored=0` / `px_front=none`
-  fact in this section belongs to the *other* regime. Quote them with the regime attached.
+  The right-hand column deliberately says *run*, not *regime*. The two sets of facts were collected
+  days and several merges apart, so code state, route and `PROSPER_RENDER_SCALE` explain the
+  difference as readily as the screen does, and nothing here separates them. One run collecting the
+  census and those counters together settles it; until then, cite the run.
+
+  The guest-scanout fallback's stage-1 gate declines for **four** reasons, and only two of them
+  (`SkipPublishedGpu`, `SkipRendererSource`) mean something else published; the other two are
+  `SkipNoPresentContract` and `SkipScaledPresent`. All four print nothing, so they are
+  indistinguishable in a log. `guest_scanout_present.hpp` says so itself, and records the precedent:
+  Bendy's (PPSA27616) zero-line control is reported as **"never reached"** rather than as a decline,
+  because the instrument cannot tell those apart today.
+
+  So: measured, **0** `[rtt] GUEST SCANOUT` lines across a full title-route run that reached and held
+  the failing steady state — and that is honestly reported as **never reached**, not as evidence of
+  what published. A draft of this row inferred "the menu therefore publishes" from the zero count;
+  that inference is withdrawn, having violated a precedent written into the header it reasoned about.
+  **The publishing claim rests on the frame instead**: a captured title-screen frame exists and shows
+  the menu, which is direct evidence something published.
+
+  Two things survive this correction intact. `rtt_owns=` **cannot be collected on the title route**
+  (the report sits inside the stage-1 `Publish` branch). And the forward direction holds: any
+  `authored=` or `rtt_owns=` datum necessarily came from a moment where stage 1 returned `Publish`.
+
+  What does **not** follow is that the older `authored=0` / `px_front=none` facts differ from today's
+  run *because of regime*. Those runs are days and several merges apart, so code state, route and
+  `PROSPER_RENDER_SCALE` are equally live explanations. Attach the run, not just the regime — and the
+  cheap way to settle it is one run collecting the census and those counters together.
 
   **The alias hypothesis is dead**, now over the population rather than one slot: **55,868
   resolutions, 0 unresolved, 82 distinct targets** across slots 0-6. Excluding the scanout buffers
