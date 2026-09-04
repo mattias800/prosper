@@ -269,7 +269,7 @@ int main() {
         CHECK(text.find("accepted=1 (50.0%)") != std::string::npos);
         CHECK(text.find("attempted=1") != std::string::npos);
         // Present even at zero: an outcome bucket that vanishes when empty cannot be told from one
-        // the instrument never reached. That ambiguity is instrument trap 256 in this repository.
+        // the instrument never reached. That ambiguity has already cost this issue a night (#3307).
         CHECK(text.find("no_cache_entry=0") != std::string::npos);
         CHECK(text.find("hit=0 (0.0%)") != std::string::npos);
         CHECK(text.find("authority_changed=1 (100.0%)") != std::string::npos);

@@ -436,7 +436,8 @@ private:
 // the line stays readable, EXCEPT the denominators and the outcome partition, which always print --
 // a bucket that is absent because it is zero and a bucket that is absent because the instrument
 // never reached it look identical otherwise, and this project has already lost a night to exactly
-// that ambiguity (instrument trap 256).
+// that ambiguity -- a healthy zero on `[render-timing]`'s mprotect FAILURE counter, read as the
+// activity counter whose name shares its prefix further along the same line (#3307).
 inline size_t format_compute_image_borrow_census(
     const ComputeImageBorrowCensusSnapshot& census, char* output, size_t capacity) {
     if (!output || !capacity) return 0;

@@ -24,7 +24,10 @@ report them. Cache materialization, Vulkan resource creation and the guest↔dev
 observation lands in exactly one bucket, the report always prints the denominator, and a bucket that
 is zero still prints. The last part is deliberate and has been paid for — a bucket that disappears
 when empty is indistinguishable from an instrument that never reached it, which is how a correct
-finding got falsified by a zero read off the wrong field (instrument trap 256). Counting is
+finding got falsified by a zero read off the wrong field: `[render-timing]`'s pre-existing
+`protect=` counts mprotect *failures* and is healthily zero, and a truncated grep read it as the
+activity counter that sits further along the same 288-character line (#3307, and the
+instrument-trap row #3317 adds). Counting is
 unconditional wherever the counted branch is expensive enough that a relaxed atomic add is free by
 comparison; only the *report* is gated on an environment variable.
 
