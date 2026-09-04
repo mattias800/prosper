@@ -6700,11 +6700,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         proven_none = it->second.cov == SeedCoverage::None;
                         bi.written_layers_mask = it->second.written_layers;
                         bi.near_full_coverage = it->second.near_full;
-                        // #1127: periodically re-prove a Full or None verdict so a data-dependent store that
-                        // later changes coverage is caught (re-cached Partial, then always seeds). The
-                        // helper resets the counter, so concurrent dispatches on this key don't all
-                        // re-prove at once.
-                        if ((proven_full || proven_none) &&
+                        // #1127: periodically re-prove a Full, None, or layer-masked/near-full Partial verdict
+                        // so a data-dependent store that later changes coverage is caught. The helper resets
+                        // the counter, so concurrent dispatches on this key don't all re-prove at once.
+                        const bool partial_optimised = (it->second.cov == SeedCoverage::Partial) &&
+                            (it->second.written_layers != ~0ULL || it->second.near_full);
+                        if ((proven_full || proven_none || partial_optimised) &&
                             seed_reprove_due(it->second.skips, kSeedReproveInterval))
                             reprove_due = true;
                     }
@@ -7770,18 +7771,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     *r, static_cast<uint32_t>(guest_bytes), image_format);
                 bi.cache_candidate =
                     compute_storage_cache_gate_candidate(storage_cache_gates);
-                if (r->gpu_addr == 0x204aee0000) {
-                    std::fprintf(stderr,
-                        "[diag-0x204aee0000] cache_candidate=%d (r_owned=%d dcc_safe=%d "
-                        "poison=%d exact=%d seed_skip=%d pers_en=%d)\n",
-                        (int)bi.cache_candidate,
-                        (int)storage_cache_gates.renderer_owned,
-                        (int)storage_cache_gates.dcc_cache_safe,
-                        (int)storage_cache_gates.poison_verify,
-                        (int)storage_cache_gates.exact_storage,
-                        (int)storage_cache_gates.seed_skip,
-                        (int)storage_cache_gates.persistent_enabled);
-                }
                 if (storage_gate_census_enabled()) {
                     // Report periodically as well as at exit: a bounded run ends in SIGTERM, whose
                     // default action skips atexit handlers entirely.
@@ -10084,11 +10073,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 (bi.seed_skip || bi.near_full_coverage) &&
                 !bi.poison_verify && !bi.mirror_result_to_imported;
             if (skip_exported_writeback) {
-                if (trace || (bi.resource && bi.resource->gpu_addr == 0x204aee0000)) {
+                if (trace) {
                     std::fprintf(stderr,
                         "[compute]   skipped exported storage writeback binding=%u addr=0x%llx\n",
                         bi.binding, (unsigned long long)bi.resource->gpu_addr);
                 }
+                // Announce write range invalidation without modifying host bytes. Safe because graphics
+                // borrows the device image directly via compute export, and no CPU reader observes these
+                // intermediate post-processing surface bytes.
                 if (bi.resource && bi.resource->gpu_addr) {
                     notify_guest_gpu_write_preserving_bytes(bi.resource->gpu_addr, bi.guest_bytes);
                 }
@@ -10236,9 +10228,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     any_written_partial = (survived > 0 && survived < texels);
                 }
                 SeedCoverage cov = classify_seed_coverage(survived, texels);
-                if (r->depth > 1 && written_layers != 0 && !any_written_partial) {
+                const bool all_layers_written = (r->depth > 1) &&
+                    (written_layers == ((r->depth >= 64) ? ~0ULL : ((1ULL << r->depth) - 1)));
+                if (r->depth > 1 && all_layers_written && !any_written_partial) {
                     cov = SeedCoverage::Full;
                 }
+                // Near-full threshold: permits up to 0.2% (1/500) unwritten texels for targets with >= 1000 texels.
+                // This accounts for small unwritten UI margins or minimap cutouts on 4K post-processing surfaces
+                // (e.g. ~16,000 unwritten margin texels on an ~8.3M 4K target is ~0.19%, just under the 0.2% bound).
                 const bool near_full = (survived == 0) || (texels >= 1000 && survived * 500 <= texels);
                 bi.written_layers_mask = written_layers;
                 bi.near_full_coverage = near_full;
@@ -10468,7 +10465,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         *r, static_cast<uint32_t>(guest_texel))
                                   : linear_slice));
                 const size_t layer_stride = r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice;
-                const uint64_t written_range = std::min((uint64_t)(max_written_layer + 1) * layer_stride, bi.guest_bytes);
+                const uint64_t written_range =
+                    std::min<uint64_t>((uint64_t)(max_written_layer + 1) * layer_stride, bi.guest_bytes);
                 notify_guest_gpu_write(r->gpu_addr, written_range);
             } else {
                 notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);

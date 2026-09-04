@@ -3876,25 +3876,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_compute_image_hit);
                             if (!resource_compute_image_hit) compute_image_import = {};
                         }
-                        if (r.gpu_addr == 0x204aee0000) {
-                            const prosper::test::RenderVkCtx& render_context =
-                                prosper::test::render_vk_ctx();
-                            std::fprintf(stderr,
-                                "[diag-0x204aee0000] renderer candidate=%d import_ok=%d valid=%d "
-                                "fmt_match=%d (%u vs %u) size_match=%d (%ux%u vs %ux%u) "
-                                "depth_match=%d (%u vs %u) dev_match=%d hit=%d\n",
-                                (int)compute_image_candidate,
-                                compute_image_import.valid(),
-                                compute_image_import.valid() ? 1 : 0,
-                                compute_image_import.native_format == static_cast<uint32_t>(compute_image_format),
-                                compute_image_import.native_format, (unsigned)compute_image_format,
-                                (compute_image_import.width == tw && compute_image_import.height == th),
-                                compute_image_import.width, compute_image_import.height, tw, th,
-                                compute_image_import.depth == r.depth,
-                                compute_image_import.depth, r.depth,
-                                (render_context.ok && compute_image_import.device == static_cast<void*>(render_context.dev)),
-                                (int)resource_compute_image_hit);
-                        }
                         if (resource_compute_image_hit &&
                             compute_image_import.vertical_stack_layers == 6u) {
                             // The compute image is the exact five-face copy result. A later graphics
