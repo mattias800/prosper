@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using prosper::frontend::ComputeImageBorrowCensus;
 using prosper::frontend::ComputeImageBorrowObservation;
@@ -245,14 +246,25 @@ int main() {
     // ---- 6. The near-miss key scan ---------------------------------------------------------
     {
         ComputeImageBorrowCensus census;
-        census.record_no_entry_scan(false, 0);   // scanned; nothing at this address at all
+        census.record_no_entry_scan(false, 0, false); // scanned; nothing at this address at all
         const uint32_t tile_and_pitch =
             (1u << static_cast<uint32_t>(ComputeImageKeyField::TileMode)) |
             (1u << static_cast<uint32_t>(ComputeImageKeyField::LinearRowPitch));
-        census.record_no_entry_scan(true, tile_and_pitch);
+        census.record_no_entry_scan(true, tile_and_pitch, /*rescued_by_alias=*/false);
+        // A scan whose lookup the format-alias retry then RESCUED. It is counted, and its fields
+        // are deliberately NOT accumulated: a rescued mask names `format`/`vk_format` by
+        // construction, so folding it in would flood the field list with the alias working as
+        // designed. Both halves are asserted below -- the count moves, the fields do not.
+        const uint32_t format_fields =
+            (1u << static_cast<uint32_t>(ComputeImageKeyField::Format)) |
+            (1u << static_cast<uint32_t>(ComputeImageKeyField::VkFormat));
+        census.record_no_entry_scan(true, format_fields, /*rescued_by_alias=*/true);
         const auto snapshot = census.snapshot();
-        CHECK(snapshot.exact_key_scans == 2);
+        CHECK(snapshot.exact_key_scans == 3);
+        CHECK(snapshot.exact_key_scans_rescued == 1);
         CHECK(snapshot.no_entry_same_addr == 1);
+        CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::Format)] == 0);
+        CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::VkFormat)] == 0);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::TileMode)] == 1);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::LinearRowPitch)] == 1);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::VkFormat)] == 0);
@@ -297,11 +309,18 @@ int main() {
         CHECK(std::count(text.begin(), text.end(), '\n') == 4);
     }
 
-    // ---- 7b. A saturated census fits the production buffer, and truncation is ANNOUNCED ----
+    // ---- 7b. The WIDEST census fits the production buffer, and truncation is ANNOUNCED -----
     // The production report writes into a fixed `char[compute_image_borrow_census_report_bytes]`.
     // Sizing it by estimate is how the previous 2 KiB buffer came to be thinner than its own
-    // comment claimed, so pin the worst case instead: every counter at its maximum, which makes
-    // every bucket and every key-field name print at twenty digits.
+    // comment claimed, so the size is pinned by construction instead.
+    //
+    // "Every counter at its maximum" is the obvious construction and it is NOT the widest report,
+    // which is the trap this arm was rewritten to avoid (#3307 review, N1). All-max moves the
+    // numerators and the denominators together, so every percentage collapses to the four
+    // characters "100.0" and the widest percentage a report can print is structurally
+    // inexpressible. The percentages are widest for a LARGE numerator over a SMALL denominator, so
+    // the denominators are skewed to 1 below. That is a genuinely wider report than all-max -- it
+    // is not a hypothetical -- and it is the shape a same-source control could never have produced.
     {
         prosper::frontend::ComputeImageBorrowCensusSnapshot saturated;
         constexpr uint64_t big = UINT64_MAX;
@@ -318,23 +337,58 @@ int main() {
         saturated.authority_watch_unknown = big;
         saturated.renderer_accepted = big; saturated.renderer_rejected = big;
         saturated.publish_evaluated = big;
+        saturated.exact_key_scans_rescued = big;
 
         char full[prosper::frontend::compute_image_borrow_census_report_bytes];
-        const size_t used = format_compute_image_borrow_census(saturated, full, sizeof full);
-        const std::string text(full, used);
-        CHECK(used < sizeof full - 1);
+        const size_t all_max = format_compute_image_borrow_census(saturated, full, sizeof full);
+
+        // The three denominators, skewed to 1 so every percentage prints its widest form.
+        prosper::frontend::ComputeImageBorrowCensusSnapshot widest = saturated;
+        widest.imports = 1;
+        widest.declines[static_cast<size_t>(ComputeImageImportDecline::None)] = 1;
+        widest.publish_evaluated = 1;
+        const size_t widest_used = format_compute_image_borrow_census(widest, full, sizeof full);
+        const std::string text(full, widest_used);
+
+        // The point of the rewrite, asserted rather than asserted-about: skewing really does
+        // produce a wider report than all-max, so the earlier arm was measuring the wrong shape.
+        CHECK(widest_used > all_max);
+        CHECK(widest_used < sizeof full - 1);
         CHECK(std::count(text.begin(), text.end(), '\n') == 4);
         CHECK(text.find("TRUNCATED") == std::string::npos);
+        // The widest report the formatter can produce, against the buffer the production reporter
+        // declares. Headroom, not a coincidence.
+        CHECK(widest_used + 512 < prosper::frontend::compute_image_borrow_census_report_bytes);
         // ...and the marker is not decorative: force the same report into a buffer that cannot
         // hold it and the reader must be told, rather than reading a dropped producer partition as
         // an absent one.
         char cramped[600];
         const size_t cramped_used =
-            format_compute_image_borrow_census(saturated, cramped, sizeof cramped);
+            format_compute_image_borrow_census(widest, cramped, sizeof cramped);
         const std::string cramped_text(cramped, cramped_used);
         CHECK(cramped_used == sizeof cramped - 1);
         CHECK(cramped_text.find("TRUNCATED") != std::string::npos);
         CHECK(cramped[cramped_used] == '\0');
+
+        // ...and a report that EXACTLY fills its buffer is not truncated and must not be marked.
+        // `used == capacity - 1` holds in both states, so a fullness test raises a false alarm here
+        // and eats the producer partition to announce a loss that did not happen -- on the very
+        // field the marker exists to protect (#3307 review, N2). Measure the natural length, then
+        // hand the formatter exactly that much room.
+        ComputeImageBorrowCensus small_census;
+        small_census.record_import(ComputeImageImportDecline::None);
+        const auto small_snapshot = small_census.snapshot();
+        char measure[prosper::frontend::compute_image_borrow_census_report_bytes];
+        const size_t natural =
+            format_compute_image_borrow_census(small_snapshot, measure, sizeof measure);
+        CHECK(natural != 0 && natural + 1 <= sizeof measure);
+        std::vector<char> exact(natural + 1, '\0');
+        const size_t exact_used =
+            format_compute_image_borrow_census(small_snapshot, exact.data(), exact.size());
+        const std::string exact_text(exact.data(), exact_used);
+        CHECK(exact_used == natural);
+        CHECK(exact_text.find("TRUNCATED") == std::string::npos);
+        CHECK(exact_text == std::string(measure, natural));
     }
 
     // ---- 8. Truncation is bounded, not corrupting ------------------------------------------

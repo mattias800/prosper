@@ -10945,15 +10945,12 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     prosper::frontend::ComputeImageBorrowObservation observation;
     bool borrowed = context->borrow_cached_image_for_graphics(
         key, image, producer_command_order, &observation, /*scan_near_miss=*/true);
-    // Recorded HERE, against the exact key, and not from the final observation. The alias retry
-    // below rewrites `format` and `vk_format` by construction, so its field mask would report those
-    // two as differing on every miss whether or not they are the reason -- and the obvious response
-    // to that mask is to normalise the two fields the alias comment immediately below forbids
-    // normalising. The retry therefore asks for no scan at all, and `exact_key_scans` counts scans
-    // performed rather than misses observed. #3307 review.
-    if (observation.no_entry_scanned)
-        g_image_borrow_census.record_no_entry_scan(observation.no_entry_same_addr,
-                                                    observation.no_entry_field_diff_mask);
+    // The exact key's near-miss result is kept here and recorded once the import's fate is known.
+    // Only the EXACT key is scanned: the alias retry below rewrites `format` and `vk_format` by
+    // construction, so its mask would name those two on every miss whether or not they are the
+    // reason -- and the obvious response to that mask is to normalise the two fields the alias
+    // comment immediately below forbids normalising. #3307 review.
+    const prosper::frontend::ComputeImageBorrowObservation exact_key_observation = observation;
     // GTA V writes several full-resolution transition surfaces through integer storage images, then
     // samples the same bits through normalized, Float32, or packed R11 graphics views. The geometry
     // and allocation are identical; only the view's numeric interpretation differs. Retry the exact
@@ -10999,6 +10996,15 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
             key, image, producer_command_order, &observation, /*scan_near_miss=*/false);
     }
     g_image_borrow_census.record_outcome(observation, guest_bytes);
+    // Recorded after the retry, because whether the alias RESCUED this lookup decides whether its
+    // fields belong in the census's field list at all. A rescued scan's mask necessarily names
+    // `format` and `vk_format` -- that is the difference the retry exists to bridge -- so counting
+    // its fields would flood the list with the alias working as designed. Counted, not accumulated.
+    if (exact_key_observation.no_entry_scanned)
+        g_image_borrow_census.record_no_entry_scan(
+            exact_key_observation.no_entry_same_addr,
+            exact_key_observation.no_entry_field_diff_mask,
+            /*rescued_by_alias=*/borrowed);
     if (!borrowed) return false;
     try {
         auto lease = std::make_shared<BorrowedComputeImageLease>();

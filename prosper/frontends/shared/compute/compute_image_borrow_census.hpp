@@ -321,10 +321,20 @@ struct ComputeImageBorrowCensusSnapshot {
     // guest address under a different key. `no_entry_same_addr == 0` means the producer is absent,
     // not that the key disagrees -- which is the whole distinction `STRAY_STATUS.md` guessed at.
     //
-    // `exact_key_scans` counts scans actually performed, and `key_field_diffs` is read against it,
-    // never against `outcomes[NoCacheEntry]`: the alias retry can miss without being scanned, so
-    // the two denominators are different numbers and only this one belongs to the field list.
+    // `exact_key_scans` counts scans actually performed. `key_field_diffs` is read against
+    // `exact_key_scans - exact_key_scans_rescued`, never against `outcomes[NoCacheEntry]`.
+    //
+    // The subtraction is the part that is easy to get wrong, and it is the second half of the
+    // finding that produced this whole section. An exact-key miss that the format-alias retry then
+    // RESCUES is a successful import -- but its exact-key scan still ran, and its mask still names
+    // `format` and `vk_format`, because that is precisely the difference the retry exists to
+    // bridge. On a title where the alias path routinely succeeds (GTA V's integer-storage surfaces
+    // are the normal case), accumulating those masks would flood the field list with the two
+    // fields that are working as designed. So a rescued scan is COUNTED and its fields are NOT
+    // accumulated: `key_field_diffs` describes only lookups where the borrow ultimately failed,
+    // which is the population a normalisation decision is about. #3307 review, N3.
     uint64_t exact_key_scans = 0;
+    uint64_t exact_key_scans_rescued = 0;
     uint64_t no_entry_same_addr = 0;
 
     // (4), refined.
@@ -374,11 +384,15 @@ public:
         else bump(authority_watch_unknown_);
     }
 
-    // Call once per scan PERFORMED, at the point the scan is taken -- never from a later
-    // observation, which is how the exact key's result got replaced by the alias retry's.
-    void record_no_entry_scan(bool same_address_entry, uint32_t field_diff_mask) {
+    // Call once per scan PERFORMED, with the mask the EXACT key produced -- never a later
+    // observation's, which is how the exact key's result got replaced by the alias retry's.
+    // `rescued_by_alias` says the import went on to succeed under the aliased key; such a scan is
+    // counted but contributes no fields, for the reason above the counter's declaration.
+    void record_no_entry_scan(bool same_address_entry, uint32_t field_diff_mask,
+                              bool rescued_by_alias) {
         bump(exact_key_scans_);
-        if (!same_address_entry) return;
+        if (rescued_by_alias) bump(exact_key_scans_rescued_);
+        if (!same_address_entry || rescued_by_alias) return;
         bump(no_entry_same_addr_);
         for (size_t i = 0; i < static_cast<size_t>(ComputeImageKeyField::Count); ++i)
             if (field_diff_mask & (1u << i)) bump(key_field_diffs_[i]);
@@ -409,6 +423,7 @@ public:
         out.hit_bytes = get(hit_bytes_);
         out.miss_bytes = get(miss_bytes_);
         out.exact_key_scans = get(exact_key_scans_);
+        out.exact_key_scans_rescued = get(exact_key_scans_rescued_);
         out.no_entry_same_addr = get(no_entry_same_addr_);
         out.authority_journal_overlap = get(authority_journal_overlap_);
         out.authority_journal_unarmed = get(authority_journal_unarmed_);
@@ -449,6 +464,7 @@ private:
     std::atomic<uint64_t> hit_bytes_{0};
     std::atomic<uint64_t> miss_bytes_{0};
     std::atomic<uint64_t> exact_key_scans_{0};
+    std::atomic<uint64_t> exact_key_scans_rescued_{0};
     std::atomic<uint64_t> no_entry_same_addr_{0};
     std::atomic<uint64_t> authority_journal_overlap_{0};
     std::atomic<uint64_t> authority_journal_unarmed_{0};
@@ -489,15 +505,26 @@ inline size_t format_compute_image_borrow_census(
     // unterminated buffer on exactly the path where the report is least useful.
     output[0] = '\0';
     size_t used = 0;
+    // Truncation is OBSERVED here, never inferred from `used == capacity - 1`. Those are different
+    // states: a report whose natural length is exactly `capacity - 1` fills the buffer without
+    // losing a byte, and inferring truncation from fullness would then overwrite the last line to
+    // announce a loss that did not happen -- a false alarm on the very field the marker exists to
+    // protect. Demonstrated at natural length 838 into capacity 839 (#3307 review, N2).
+    bool truncated = false;
     // snprintf writes at most `room` characters plus a NUL and returns the length it WOULD have
     // written, so the cursor must advance by the clamped value or a truncated line silently moves
     // `used` past the end of the buffer.
     const auto emit = [&](const char* format, auto... args) {
-        if (used + 1 >= capacity) return;
+        if (used + 1 >= capacity) { truncated = true; return; }
         const size_t room = capacity - used - 1;
         const int written = std::snprintf(output + used, room + 1, format, args...);
         if (written < 0) return;
-        used += static_cast<size_t>(written) <= room ? static_cast<size_t>(written) : room;
+        if (static_cast<size_t>(written) > room) {
+            truncated = true;
+            used += room;
+            return;
+        }
+        used += static_cast<size_t>(written);
     };
     const auto percent = [](uint64_t part, uint64_t whole) {
         return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
@@ -532,7 +559,8 @@ inline size_t format_compute_image_borrow_census(
     emit("[compute-borrow-census] running totals -- authority_changed=%llu journal_overlap=%llu "
          "journal_unarmed=%llu journal_unjournaled=%llu journal_undecided=%llu "
          "watch_absent=%llu watch_dirty=%llu "
-         "watch_unknown=%llu | exact_key_scans=%llu same_addr=%llu exact_key_fields:",
+         "watch_unknown=%llu | exact_key_scans=%llu (rescued=%llu, not counted below) "
+         "same_addr=%llu exact_key_fields:",
          (unsigned long long)authority,
          (unsigned long long)census.authority_journal_overlap,
          (unsigned long long)census.authority_journal_unarmed,
@@ -542,6 +570,7 @@ inline size_t format_compute_image_borrow_census(
          (unsigned long long)census.authority_watch_dirty,
          (unsigned long long)census.authority_watch_unknown,
          (unsigned long long)census.exact_key_scans,
+         (unsigned long long)census.exact_key_scans_rescued,
          (unsigned long long)census.no_entry_same_addr);
     for (size_t i = 0; i < static_cast<size_t>(ComputeImageKeyField::Count); ++i)
         if (census.key_field_diffs[i])
@@ -559,10 +588,11 @@ inline size_t format_compute_image_borrow_census(
     emit(" | renderer_accepted=%llu renderer_rejected=%llu\n",
          (unsigned long long)census.renderer_accepted,
          (unsigned long long)census.renderer_rejected);
-    // Announce truncation in the buffer itself. `used == capacity - 1` is exactly the saturated
-    // state, and a reader who sees a report end without the publish partition must be told the
-    // difference between "that line is absent" and "that line did not fit".
-    if (used == capacity - 1) {
+    // Announce truncation in the buffer itself: a reader who sees a report end without the publish
+    // partition must be told the difference between "that line is absent" and "that line did not
+    // fit". The marker costs the tail of what was written, which is only ever correct when
+    // something really was lost -- hence the observed flag rather than a fullness test.
+    if (truncated) {
         constexpr char marker[] = "[compute-borrow-census] TRUNCATED\n";
         constexpr size_t marker_bytes = sizeof marker - 1;
         if (capacity > marker_bytes) {

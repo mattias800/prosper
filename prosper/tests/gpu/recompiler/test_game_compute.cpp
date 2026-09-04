@@ -2215,10 +2215,14 @@ int main() {
             {
                 // The classifier's eleven terms are proven equivalent to the chain they replaced by
                 // a 2048-case sweep in `test_compute_image_borrow_census` -- but that sweep operates
-                // on the abstract booleans. The ten hand-written `gates.* = <descriptor field>`
+                // on the abstract booleans. The hand-written `gates.* = <descriptor field>`
                 // assignments that PRODUCE those booleans are where a lost `!` would actually live,
-                // and nothing covered them. Drive nine of them from the real path, one field at a
-                // time off a descriptor that is otherwise known to import cleanly.
+                // and nothing covered them. Drive them from the real path, one field at a time off a
+                // descriptor that is otherwise known to classify cleanly.
+                //
+                // Ten of the eleven decline terms; `NoContext` is structurally undrivable here,
+                // because reaching this point at all requires a live compute backend. Do not read
+                // this array as covering all eleven.
                 using Decline = prosper::frontend::ComputeImageImportDecline;
                 ShaderResource base = output;
                 base.cls = ResourceClass::Texture;
@@ -2255,6 +2259,23 @@ int main() {
                      [](ShaderResource& r, uint64_t&, uint8_t*) {
                          r.format = DataFormat::Unorm8; r.num_components = 3; }},
                 };
+                // POSITIVE CONTROL, and it is load-bearing rather than decorative. The classifier
+                // returns the FIRST failing term, so a `base` that already declined would let every
+                // case below pass while testing nothing -- each would report its own term only
+                // because the mutation happens to precede the pre-existing failure, or would report
+                // the wrong term entirely. Pin that the unmutated descriptor is accepted, so a
+                // future edit to `output` cannot quietly hollow out the whole array.
+                {
+                    const auto before = prosper::frontend::live_compute_image_borrow_census();
+                    prosper::frontend::LiveComputeImageImport control_import;
+                    (void)prosper::frontend::import_live_compute_storage_image(
+                        base, base.size, control_import);
+                    const auto after = prosper::frontend::live_compute_image_borrow_census();
+                    const size_t accepted_bucket = static_cast<size_t>(Decline::None);
+                    CHECK(after.declines[accepted_bucket] == before.declines[accepted_bucket] + 1,
+                          "the unmutated wiring probe is ACCEPTED, so each mutated arm below is "
+                          "testing its own term rather than a pre-existing decline");
+                }
                 for (const WiringCase& c : wiring) {
                     ShaderResource probe = base;
                     uint64_t bytes = probe.size;

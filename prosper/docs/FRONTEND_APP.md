@@ -497,8 +497,11 @@ exact key misses, the importer retries under a format-*aliased* key, and that ke
 and `vk_format` by construction — so scanning it would report those two as differing on every miss
 whether or not they were the reason, and would point a reader at exactly the normalisation the alias
 arm forbids. The retry is therefore not scanned, which is also why `exact_key_scans` (scans
-performed) and `no_cache_entry` (final outcomes) are different numbers: read the field list against
-the former. And the `Unknown` that `guest_gpu_writes_since` returns —
+performed) and `no_cache_entry` (final outcomes) are different numbers. Read the field list against
+`exact_key_scans` **minus** its `rescued=` term: an exact-key miss the alias retry then rescues is a
+successful import whose mask names `format`/`vk_format` by construction, so those scans are counted
+and their fields deliberately excluded — otherwise a title whose alias path routinely succeeds
+reports a field list dominated by the alias working as designed. And the `Unknown` that `guest_gpu_writes_since` returns —
 which its own header warns a caller cannot decompose — is split into the three parts that ARE
 separable from the borrow site: `journal_unarmed` (not armed on the consuming thread),
 `journal_unjournaled` (the producer's publish carried no submit serial, so it was stamped while the
