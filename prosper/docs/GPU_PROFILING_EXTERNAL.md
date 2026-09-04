@@ -66,22 +66,65 @@ check available before anyone spends time reading it.
 reader, so an agent can *produce* a capture but a human opens it. Say so when handing one over rather
 than implying you read it.
 
-## RenderDoc — installs here, and `convert` is the headless half
+## RenderDoc — aimable headlessly since #3321, and `convert` reads it with no Python
 
 ```bash
-sudo dnf install -y renderdoc      # 1.45 on this box, Vulkan supported
-renderdoccmd convert -f cap.rdc -c chrome.json -o cap.json
+sudo dnf install -y renderdoc renderdoc-devel     # 1.45 on this box, Vulkan supported
+
+# Capture one guest frame, headless, no keypress. Either axis, exactly like F8/F9.
+ENABLE_VULKAN_RENDERDOC_CAPTURE=1 \
+PROSPER_RENDERDOC_AFTER_MS=175000 \
+PROSPER_CAPTURE_DIR=$HOME/work \
+    ./prosper-app <DUMP_ROOT>/<TITLE_ID>-app0
+
+renderdoccmd convert -f cap.rdc -c xml -o frame.xml      # full event list, no Python
 ```
 
-`convert` targets `chrome.json` (Chrome/Perfetto timeline — parseable by script and openable in the
-Perfetto UI) and `xml`. That is the route for headless per-event analysis.
+**This section used to say `renderdoccmd capture` triggers on a keypress "which makes it awkward
+headless", and recommended RGP instead. That was true of `renderdoccmd` and is no longer true of
+prosper.** RenderDoc's in-application API needs no keypress — `librenderdoc.so` exports
+`RENDERDOC_GetAPI`, whose struct carries `StartFrameCapture`/`EndFrameCapture`, and those delimit a
+capture *explicitly*, so they need neither a keypress nor a present. prosper drives them itself:
+`PROSPER_RENDERDOC_AT_FRAME` (ordinal) and `PROSPER_RENDERDOC_AFTER_MS` (wall clock), plus
+`PROSPER_RENDERDOC_MAX_ITERS` for the span cap. `frontends/shared/diagnostics/renderdoc_capture.hpp`.
+
+### Aim it at the RENDERER's device. A capture of the wrong one looks perfectly healthy.
+
+**On the default headless route prosper runs two Vulkan instances.** prosper-app owns one for
+presentation (`main.cpp`); the live renderer owns another (`tests/fixtures/render_runner.h` — that
+header *is* the renderer) and publishes it through `prosper::gpu::set_shared_vulkan_context`. On that
+route every guest draw is on the renderer's. **Two qualifications**: `live_compute.cpp:2913` can
+create a *third*, private instance when it declines to adopt the renderer's, and present unification
+(#1270) can collapse the two into one when the renderer's instance is surface-capable — so "two" is
+this route's count, not an invariant.
+
+Passing NULL lets RenderDoc choose the device. RenderDoc documents that choice as arbitrary; observed
+here (n=1) it took the one holding the swapchain. **The lesson is therefore "always pass the device
+explicitly", not "it picks the swapchain"** — an arbitrary choice that happens to be right once is
+worse than a wrong one, because it will not stay right. Measured on *The Messenger*, same route and
+identical span logic, differing only in which device the capture is aimed at (two builds, one edit
+apart):
+
+| aimed at | chunks | `vkCmdDrawIndexed` | `vkCmdDispatch` | graphics pipelines | compute pipelines |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NULL (RenderDoc picks) | 56 | **0** | **0** | **0** | **0** |
+| the renderer's instance | **406** | **9** | **2** | **6** | **1** |
+
+The 56-chunk capture is not corrupt and not truncated — it is a **complete, valid capture of the
+wrong device**, and it converts and opens perfectly while containing nothing anyone wants. It reads
+as a working instrument reporting a negative result, which is the dangerous shape. The trigger now
+aims itself and warns loudly when the renderer has not yet published a context.
+
+**A prosper frame is the GUEST's, not the app loop's.** A span of one app-loop iteration also yields
+zero draws: guest work is submitted off that thread, and the loop can spin at 260 fps while the guest
+renders far slower. The span closes on a guest present, and the log says which of the two closed it.
 
 **The Fedora package does NOT ship the Python bindings** — `rpm -ql renderdoc` gives `qrenderdoc` (the
-GUI) and `librenderdoc.so`, no `renderdoc.so` python module. So the scripted-analysis route is
-`convert`, not the Python API, and any recipe assuming `import renderdoc` will fail here.
-
-`renderdoccmd capture` triggers on a keypress rather than a frame ordinal, which makes it awkward
-headless; RGP's `MESA_VK_TRACE_FRAME` is the better automated capture.
+GUI) and `librenderdoc.so`, no `renderdoc.so` python module, and there is no `python3-renderdoc` to
+install. So *pixel history*, *per-draw render-target export* and *shader debugging* — the replay-side
+analysis, and the most valuable half — are **not** reachable from a script here without building
+RenderDoc from source. What is reachable headless is `convert` (`xml`, or `chrome.json` for a
+Perfetto-openable timeline), and handing the `.rdc` to a human with `qrenderdoc`.
 
 ## `radeontop` — the 60-second "is this even GPU-bound?" triage
 

@@ -21,6 +21,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-04
 
+### RenderDoc works on prosper now, and the first capture was a beautiful picture of the wrong thing
+
+No picture — or rather 56 of them, all useless. RenderDoc has been installed the whole time and
+unusable, because it only starts a capture on a *keypress* and every agent here runs headless.
+prosper now drives its in-application API itself, so a capture aims at a frame ordinal like F8 and F9
+do. The first working one held zero draws: prosper runs two Vulkan devices, and asked to pick,
+RenderDoc took the one that only presents. Details in [#3321](https://github.com/mattias800/prosper/issues/3321).
+
 ### Two thirds of Stray's biggest render cost was the allocator, not the work
 
 No picture. The largest single leaf in a capture of Stray's 9.76 fps title screen is the graphics

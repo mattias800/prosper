@@ -3403,7 +3403,10 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
                                frontends/prosper-app/library_media.cpp
                                frontends/prosper-app/fps_overlay.cpp)
-    target_include_directories(prosper-app PRIVATE src third_party/stb)
+    # third_party/renderdoc: the vendored in-application API header (#3321). Header-only and
+    # never linked -- librenderdoc.so is dlopen'd at runtime by the capture trigger.
+    target_include_directories(prosper-app PRIVATE src third_party/stb third_party/renderdoc
+                                                   frontends)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
                                               prosper_performance_capture)
     target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
