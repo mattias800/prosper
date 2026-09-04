@@ -245,12 +245,19 @@ def _compute_program_groups(records, limit=10, address_limit=8):
             continue
         group = groups.setdefault(program_hash, {
             "records": 0, "dispatches": 0, "total_ms": 0.0, "max_ms": 0.0,
+            "setup_ms": 0.0, "writeback_ms": 0.0, "dispatch_wait_ms": 0.0,
+            "gpu_device_ms": 0.0, "gpu_shader_ms": 0.0,
             "addresses": set(),
         })
         group["records"] += 1
         group["dispatches"] += dispatches
         group["total_ms"] += total_ms
         group["max_ms"] = max(group["max_ms"], total_ms)
+        group["setup_ms"] += float(record.get("setup_ms", 0.0))
+        group["writeback_ms"] += float(record.get("writeback_ms", 0.0))
+        group["dispatch_wait_ms"] += float(record.get("dispatch_wait_ms", 0.0))
+        group["gpu_device_ms"] += float(record.get("gpu_device_ms", 0.0))
+        group["gpu_shader_ms"] += float(record.get("gpu_shader_ms", 0.0))
         group["addresses"].add(address)
 
     ranked = []
@@ -560,9 +567,21 @@ def print_summary(summary):
         addresses = ",".join(group["addresses"])
         if group["address_count"] > len(group["addresses"]):
             addresses += f",+{group['address_count'] - len(group['addresses'])}"
+        parts = []
+        if group.get("setup_ms", 0.0) >= 0.05:
+            parts.append(f"setup={group['setup_ms']:.1f}ms")
+        if group.get("writeback_ms", 0.0) >= 0.05:
+            parts.append(f"wb={group['writeback_ms']:.1f}ms")
+        if group.get("dispatch_wait_ms", 0.0) >= 0.05:
+            parts.append(f"wait={group['dispatch_wait_ms']:.1f}ms")
+        if group.get("gpu_device_ms", 0.0) >= 0.05:
+            parts.append(f"dev={group['gpu_device_ms']:.1f}ms")
+        if group.get("gpu_shader_ms", 0.0) >= 0.05 and abs(group.get("gpu_shader_ms", 0.0) - group.get("gpu_device_ms", 0.0)) >= 0.05:
+            parts.append(f"shader={group['gpu_shader_ms']:.1f}ms")
+        breakdown_str = f" ({' '.join(parts)})" if parts else ""
         print(f"  {group['program_hash']} records={group['records']} "
               f"dispatches={group['dispatches']} total={group['total_ms']:.1f} ms "
-              f"mean={group['mean_ms']:.2f} ms max={group['max_ms']:.2f} ms "
+              f"mean={group['mean_ms']:.2f} ms max={group['max_ms']:.2f} ms{breakdown_str} "
               f"addresses={addresses}")
     if programs["groups_omitted"]:
         print(f"  ... {programs['groups_omitted']} lower-cost groups omitted")

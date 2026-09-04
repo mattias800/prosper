@@ -4998,9 +4998,21 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     const bool zero_fill = !(pattern[0] | pattern[1] | pattern[2] | pattern[3]);
     if (zero_fill) {
         std::memset(destination, 0, static_cast<size_t>(written_bytes));
-    } else {
+    } else if (records <= 4) {
         for (uint64_t record = 0; record < records; ++record)
             std::memcpy(destination + record * sizeof(pattern), pattern, sizeof(pattern));
+    } else {
+        alignas(64) uint8_t chunk[4096];
+        for (size_t i = 0; i < sizeof(chunk); i += sizeof(pattern))
+            std::memcpy(chunk + i, pattern, sizeof(pattern));
+        size_t offset = 0;
+        const size_t total_bytes = static_cast<size_t>(written_bytes);
+        while (offset + sizeof(chunk) <= total_bytes) {
+            std::memcpy(destination + offset, chunk, sizeof(chunk));
+            offset += sizeof(chunk);
+        }
+        if (offset < total_bytes)
+            std::memcpy(destination + offset, chunk, total_bytes - offset);
     }
     // Match the Vulkan path's conservative invalidation contract: padding beyond the exact launch
     // remains untouched, but every alias of the declared resource must be considered stale.

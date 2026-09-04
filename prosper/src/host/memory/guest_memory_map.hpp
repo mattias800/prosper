@@ -84,6 +84,13 @@ public:
     size_t range_count() const { return ranges_.size(); }
     uint64_t generation() const { return generation_; }
 
+    void assign_sorted_ranges(std::vector<GuestReadableRange> ranges, uint64_t generation) {
+        ranges_ = std::move(ranges);
+        generation_ = generation;
+        last_hit_ = {};
+        have_last_hit_ = false;
+    }
+
 private:
     std::vector<GuestReadableRange> ranges_;
     GuestReadableRange last_hit_;
