@@ -1509,12 +1509,22 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   the failing steady state — and that is honestly reported as **never reached**, not as evidence of
   what published. A draft of this row inferred "the menu therefore publishes" from the zero count;
   that inference is withdrawn, having violated a precedent written into the header it reasoned about.
-  **The publishing claim rests on the frame instead** — and the artifact has to be named, because
-  which buffer was dumped is the whole strength of it. These are `tools/screenshot` PNGs, which come
-  from `present_readback`, which returns what `present_write_frame` wrote
-  (`gpu_executor.cpp:11780`/`:11927`). So a menu-bearing PNG is direct evidence that **a frame was
-  published to the present layer** — the publication itself, not an inference from a decline that
-  never printed.
+  **The publishing claim rests on the frame instead** — and it rests on the frame's RECORDED SOURCE,
+  not on the image. `tools/screenshot` captures through `present_snapshot`, which **falls back to the
+  guest's own display buffer** when the renderer published nothing (`videoout_present.cpp:187-196`,
+  returning `RawScanout`), and saves it by default (`render_first` defaults to 0). So a menu-bearing
+  PNG on its own proves nothing: the guest composites its menu into `0x9fc0000000` itself, and that
+  image would look identical.
+
+  The discriminator is recorded per capture, so no re-run is needed. Across both title-route runs the
+  manifest reports **29 of 30 captures as `composited`** (`CaptureSource::Rendered`) with only index 0
+  — the all-black first frame — as `raw_scanout`. The steady-state menu frame examined by eye is
+  `composited`. **That** is the evidence a frame was published: prosper composited it, rather than the
+  tool echoing back guest memory.
+
+  (Do not cite `present_readback` here, as a draft of this row did. `tools/screenshot` never calls it
+  — `screenshot.cpp:5`'s comment says otherwise and is stale — and it carries the same fallback
+  hazard at `videoout_present.cpp:132-138` regardless.)
 
   Do not substitute the renderer's own `frame_%04d.bmp` for this without collecting it: that dump is
   fed by `selected_pixels` (`live_renderer.cpp:10160` → `:10184`), so it would prove
