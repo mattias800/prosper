@@ -1805,6 +1805,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
   add_test(NAME direct_descriptor_copy COMMAND test_direct_descriptor_copy)
 
+  add_executable(test_image_descriptor_class_lookup
+                 tests/gpu/recompiler/test_image_descriptor_class_lookup.cpp)
+  target_link_libraries(test_image_descriptor_class_lookup PRIVATE prosper_core)
+  add_test(NAME image_descriptor_class_lookup COMMAND test_image_descriptor_class_lookup)
+
   # Bounded graphics-shader cache: cached modules must match the direct recompiler byte-for-byte.
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.

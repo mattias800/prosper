@@ -278,6 +278,33 @@ const ShaderResource* ShaderResourceTable::by_fetch_pc(uint32_t pc) const {
     return nullptr;
 }
 
+const ShaderResource* ShaderResourceTable::image_by_srt_offset(
+        uint32_t srt_offset, ImageResourceRequirement requirement) const {
+    if (srt_offset == 0xFFFFFFFFu) return nullptr;
+    for (const auto& r : resources)
+        if (r.srt_offset == srt_offset && image_resource_class_satisfies(r.cls, requirement))
+            return &r;
+    return nullptr;
+}
+
+const ShaderResource* ShaderResourceTable::image_by_sgpr_base(
+        uint32_t sgpr, ImageResourceRequirement requirement) const {
+    if (sgpr == 0xFFFFFFFFu) return nullptr;
+    for (const auto& r : resources)
+        if (r.sgpr_base == sgpr && image_resource_class_satisfies(r.cls, requirement))
+            return &r;
+    return nullptr;
+}
+
+const ShaderResource* ShaderResourceTable::image_by_fetch_pc(
+        uint32_t pc, ImageResourceRequirement requirement) const {
+    if (pc == 0xFFFFFFFFu) return nullptr;
+    for (const auto& r : resources)
+        if (r.fetch_pc == pc && image_resource_class_satisfies(r.cls, requirement))
+            return &r;
+    return nullptr;
+}
+
 const ShaderResource* ShaderResourceTable::by_binding(uint32_t binding) const {
     for (const auto& r : resources) if (r.binding == binding) return &r;
     return nullptr;

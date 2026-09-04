@@ -7029,23 +7029,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
 
-            // Resolve the T#/U# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
-            const ShaderResource* res = rt->by_fetch_pc(in.pc);
-            if (!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage)) {
-                res = nullptr;
-                uint32_t srt_tag = 0;
-                if (sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag))
-                    res = rt->by_srt_offset(srt_tag);
-                if (!res && !sreg_range_written(rs, in.src[1].value, 8))
-                    res = rt->by_sgpr_base(in.src[1].value);
-                // The SRSRC range reads as written when the shader STAGED a direct descriptor into
-                // it with s_mov_b32, so the lookup above is skipped even though the bits are still
-                // the driver's. Resolve through the copy to where those words actually live (#1773).
-                if (int ud_origin = 0; !res && sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin))
-                    res = rt->by_sgpr_base(ud_origin);
-            }
-            // Exact per-use provenance wins over table keys. A sample and store may consume the same
-            // T# through a colliding offset but require different Vulkan descriptor classes.
+            // Which resource class THIS operation can accept, decided before any lookup runs.
             // image_store plus EVERY integer image atomic. This was the THIRD copy of the 0x08/0x0f/0x11
             // triple -- the others are the storage-image classifier in gpu_executor.cpp and the emitter's
             // own is_atomic test -- and all three must agree for an image atomic to compile. They did
@@ -7061,12 +7045,38 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x09 ||
                                          in.opcode == 0x0f ||
                                          (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
-            if ((storage_only_op && res && res->cls != ResourceClass::StorageImage) ||
-                (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
-                 res && res->cls != ResourceClass::Texture))
-                res = nullptr;
-            if (!res || (res->cls != ResourceClass::Texture &&
-                         res->cls != ResourceClass::StorageImage)) {
+            const ImageResourceRequirement image_requirement =
+                storage_only_op            ? ImageResourceRequirement::StorageOnly
+              : (in.opcode == 0x00 ||
+                 in.opcode == 0x0e)        ? ImageResourceRequirement::Either
+                                           : ImageResourceRequirement::SampledOnly;
+
+            // Resolve the T#/U# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
+            //
+            // Every lookup is CLASS-FILTERED. It used to take the first hit at each key and then null it
+            // out on class further down, which is not the same thing and cost this file two distinct
+            // failures: (a) an image resource sharing a key with an earlier buffer-class resource could
+            // never be found -- one live vertex stage carries a ConstantBuffer and two VertexBuffers all
+            // at sgpr_base 8, so the collision is real, not hypothetical -- and (b) a wrong-class hit on
+            // the SRT route left `res` non-null, which SUPPRESSED the `!res` guard on the SGPR fallback,
+            // so a route that could have resolved was never tried. Filtering inside the lookup makes the
+            // search continue past a wrong-class entry instead of stopping on it. The accepted set is
+            // unchanged (`image_resource_class_satisfies` is exactly the old post-check), so this can
+            // only turn a rejection into a resolution, never bind a class the op cannot use. #3126/#1634.
+            const ShaderResource* res = rt->image_by_fetch_pc(in.pc, image_requirement);
+            if (!res) {
+                uint32_t srt_tag = 0;
+                if (sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag))
+                    res = rt->image_by_srt_offset(srt_tag, image_requirement);
+                if (!res && !sreg_range_written(rs, in.src[1].value, 8))
+                    res = rt->image_by_sgpr_base(in.src[1].value, image_requirement);
+                // The SRSRC range reads as written when the shader STAGED a direct descriptor into
+                // it with s_mov_b32, so the lookup above is skipped even though the bits are still
+                // the driver's. Resolve through the copy to where those words actually live (#1773).
+                if (int ud_origin = 0; !res && sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin))
+                    res = rt->image_by_sgpr_base(ud_origin, image_requirement);
+            }
+            if (!res) {
                 // Resolution-failure diagnostic: which provenance step failed for this image op.
                 //
                 // Ungated, and deduped per (pc, srsrc). It fires only when an image op has already
@@ -7103,15 +7113,40 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     int ud_origin = 0;
                     const bool has_ud_alias = sreg_range_ud_alias(rs, in.src[1].value, 8, ud_origin);
                     const ShaderResource* pa = has_ud_alias ? rt->by_sgpr_base(ud_origin) : nullptr;
-                    fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u op=0x%02x storage=%d srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s written=%d (%zu res)\n",
+                    // sgpr_res: the DIRECT user-data route's own outcome, which this line did not
+                    // report and which is the ONLY route that can fire for the commonest failure
+                    // shape -- `written=0`, i.e. the shader never touched SRSRC, so by construction
+                    // there is no s_load tag and no copy alias for the other three fields to carry.
+                    // For such a site `srt_tag=NONE key_res=null ud_alias=NONE alias_res=null` is a
+                    // restatement of `written=0`, not evidence: those routes did not run. Five sites
+                    // on Stray (PPSA02101, #3126) printed exactly that quadruple while three of them
+                    // had a resource sitting at the requested SGPR the whole time -- of the wrong
+                    // class, discarded in silence. Print the class-BLIND hit so "nothing is here"
+                    // and "something is here and it is a cbuf" stop looking identical. #3126/#1634.
+                    const ShaderResource* ps_direct = rt->by_sgpr_base(in.src[1].value);
+                    auto cls_name = [](const ShaderResource* r) {
+                        if (!r) return "null";
+                        switch (r->cls) {
+                            case ResourceClass::Texture:        return "tex";
+                            case ResourceClass::StorageImage:   return "simg";
+                            case ResourceClass::ConstantBuffer: return "cbuf";
+                            case ResourceClass::VertexBuffer:   return "vbuf";
+                            case ResourceClass::Sampler:        return "samp";
+                        }
+                        return "other-cls";
+                    };
+                    const char* need =
+                        image_requirement == ImageResourceRequirement::StorageOnly ? "storage"
+                      : image_requirement == ImageResourceRequirement::SampledOnly ? "sampled"
+                                                                                   : "either";
+                    fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u op=0x%02x storage=%d need=%s srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s ud_alias=%s%d alias_res=%s sgpr_res=%s written=%d (%zu res)\n",
                             (unsigned long long)b.diagnostic.program_address,
-                            in.pc, in.opcode, (int)storage_only_op,
+                            in.pc, in.opcode, (int)storage_only_op, need,
                             in.src[1].value, has_srt_tag ? "" : "NONE ",
                             has_srt_tag ? srt_tag : 0u,
-                            pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
-                            pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                            cls_name(pk), cls_name(pp),
                             has_ud_alias ? "s" : "NONE ", has_ud_alias ? ud_origin : 0,
-                            pa ? (pa->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                            cls_name(pa), cls_name(ps_direct),
                             sreg_range_written(rs, in.src[1].value, 8) ? 1 : 0,
                             rt->resources.size());
                     // #3126: say what WAS available, not only what failed. "key_res=null pc_res=null"
@@ -7121,21 +7156,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // class and provenance so the miss can be diagnosed from one line instead of a
                     // rebuild. Bounded, and printed once per site regardless of whether the site is
                     // then softened or rejected (#3143).
+                    //
+                    // Print EVERY key a resource carries, not one of them. The old form printed
+                    // `srt=0x%x` whenever sgpr_base was unset, so a resource keyed only by fetch_pc
+                    // -- which is how the const-fold publishes a seed/table-recovered T# -- rendered
+                    // as `srt=0xffffffff` and read as "this entry has no lookup key at all". Four of
+                    // the nine resources in Stray's failing pixel stage printed that way while being
+                    // perfectly well keyed, just not by a key this reader could see (#3126).
                     std::string avail;
                     size_t shown = 0;
                     for (const ShaderResource& r : rt->resources) {
                         if (shown++ >= 16) { avail += " ..."; break; }
-                        char one[96];
-                        const char* cls =
-                            r.cls == ResourceClass::Texture         ? "tex"
-                          : r.cls == ResourceClass::StorageImage    ? "simg"
-                          : r.cls == ResourceClass::ConstantBuffer  ? "cbuf"
-                          : r.cls == ResourceClass::VertexBuffer    ? "vbuf"
-                          : r.cls == ResourceClass::Sampler         ? "samp" : "other";
-                        if (r.sgpr_base == 0xFFFFFFFFu)
-                            snprintf(one, sizeof one, " [b%u %s srt=0x%x]", r.binding, cls, r.srt_offset);
-                        else
-                            snprintf(one, sizeof one, " [b%u %s s%u]", r.binding, cls, r.sgpr_base);
+                        char one[128];
+                        char keys[80];
+                        int used = 0;
+                        if (r.sgpr_base != 0xFFFFFFFFu)
+                            used += snprintf(keys + used, sizeof keys - (size_t)used, " s%u", r.sgpr_base);
+                        if (r.srt_offset != 0xFFFFFFFFu)
+                            used += snprintf(keys + used, sizeof keys - (size_t)used, " srt=0x%x", r.srt_offset);
+                        if (r.fetch_pc != 0xFFFFFFFFu)
+                            used += snprintf(keys + used, sizeof keys - (size_t)used, " pc=%u", r.fetch_pc);
+                        if (!used) snprintf(keys, sizeof keys, " unkeyed");
+                        snprintf(one, sizeof one, " [b%u %s%s]", r.binding, cls_name(&r), keys);
                         avail += one;
                     }
                     fprintf(stderr, "[mimg-unresolved]   available:%s\n",

@@ -19,6 +19,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-04
+
+### The line that said the texture was missing was printing the wrong field
+
+No picture. Stray's title screen renders its menu over black, and five image samples report their
+descriptor unresolved; the reject line prints four provenance fields, all empty, which everyone
+(including this lane, at first) read as "the texture is not there". Four of the five sites also say
+the shader never wrote the register the descriptor lives in — which means none of those four routes
+could have fired, so the emptiness restated the question instead of answering it. The route that did
+run was the one field the line never printed, and in three of the four it had found something the
+whole time: a constant buffer sitting at exactly the requested register, thrown away for being the
+wrong kind of thing without a word in the log.
+[#3126](https://github.com/mattias800/prosper/issues/3126)
+[#1634](https://github.com/mattias800/prosper/issues/1634)
+
 ## 2026-09-03
 
 ### The frozen frame that gave five pictures now gives one, 3,875 times running
