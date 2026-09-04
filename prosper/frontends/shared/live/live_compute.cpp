@@ -2410,6 +2410,11 @@ struct VulkanComputeContext {
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_command_order = producer_command_order;
         found->second.graphics_export_valid = true;
+        if (found->second.write_watch && !found->second.write_watch.rearm())
+            found->second.write_watch.reset();
+        if (!found->second.write_watch)
+            found->second.write_watch = prosper::host::GuestWriteWatch::create(
+                key.gpu_addr, key.guest_bytes);
         return true;
     }
 
@@ -2513,7 +2518,7 @@ struct VulkanComputeContext {
             }
             return false;
         }
-        if (exact_unchanged)
+        if (exact_unchanged || watch_unchanged)
             cached.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         cached.last_use = ++image_cache_clock;
         ++cached.pins;
@@ -2822,7 +2827,7 @@ struct VulkanComputeContext {
         // queries walk one record per host page and were slower than memcmp for Plucky's stable
         // post-process targets. A repeated result keeps one collision-free baseline; an identical
         // GPU skip never reaches this function, so that baseline is not recopied.
-        if (compute_transfer_watch) {
+        if (compute_transfer_watch || cached.graphics_export_valid) {
             if (cached.write_watch && !cached.write_watch.rearm())
                 cached.write_watch.reset();
             if (!cached.write_watch)
@@ -7744,6 +7749,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     *r, static_cast<uint32_t>(guest_bytes), image_format);
                 bi.cache_candidate =
                     compute_storage_cache_gate_candidate(storage_cache_gates);
+                if (r->gpu_addr == 0x204aee0000) {
+                    std::fprintf(stderr,
+                        "[diag-0x204aee0000] cache_candidate=%d (r_owned=%d dcc_safe=%d "
+                        "poison=%d exact=%d seed_skip=%d pers_en=%d)\n",
+                        (int)bi.cache_candidate,
+                        (int)storage_cache_gates.renderer_owned,
+                        (int)storage_cache_gates.dcc_cache_safe,
+                        (int)storage_cache_gates.poison_verify,
+                        (int)storage_cache_gates.exact_storage,
+                        (int)storage_cache_gates.seed_skip,
+                        (int)storage_cache_gates.persistent_enabled);
+                }
                 if (storage_gate_census_enabled()) {
                     // Report periodically as well as at exit: a bounded run ends in SIGTERM, whose
                     // default action skips atexit handlers entirely.
@@ -9359,6 +9376,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip) continue;
+            static const bool no_skip_export_writeback =
+                std::getenv("PROSPER_NO_EXPORTED_STORAGE_WRITEBACK_SKIP") != nullptr;
+            const bool skip_exported_writeback = !no_skip_export_writeback &&
+                bi.graphics_sampled_usage && bi.cache_candidate && bi.persistent &&
+                bi.seed_skip && !bi.poison_verify && !bi.mirror_result_to_imported;
+            if (skip_exported_writeback) continue;
             const ShaderResource* r = bi.resource;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -10030,6 +10053,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "[compute]   skipped untouched storage writeback binding=%u "
                                  "addr=0x%llx\n",
                                  bi.binding, (unsigned long long)bi.resource->gpu_addr);
+                continue;
+            }
+            static const bool no_skip_export_writeback =
+                std::getenv("PROSPER_NO_EXPORTED_STORAGE_WRITEBACK_SKIP") != nullptr;
+            const bool skip_exported_writeback = !no_skip_export_writeback &&
+                bi.graphics_sampled_usage && bi.cache_candidate && bi.persistent &&
+                bi.seed_skip && !bi.poison_verify && !bi.mirror_result_to_imported;
+            if (skip_exported_writeback) {
+                if (trace || (bi.resource && bi.resource->gpu_addr == 0x204aee0000)) {
+                    std::fprintf(stderr,
+                        "[compute]   skipped exported storage writeback binding=%u addr=0x%llx\n",
+                        bi.binding, (unsigned long long)bi.resource->gpu_addr);
+                }
+                if (bi.resource && bi.resource->gpu_addr) {
+                    notify_guest_gpu_write_preserving_bytes(bi.resource->gpu_addr, bi.guest_bytes);
+                }
                 continue;
             }
             const auto image_writeback_start = ComputeClock::now();
@@ -10959,7 +10998,7 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     gates.single_mip_level = sampled_resource.declared_mip_levels == 1;
     gates.in_mip_tail = sampled_resource.in_mip_tail;
     gates.srgb = sampled_resource.srgb;
-    gates.depth_compare = sampled_resource.depth_compare;
+    gates.depth_compare = sampled_resource.depth_compare && !cube_array_alias;
     gates.native_format_defined = sampled_native_format != VK_FORMAT_UNDEFINED;
     const prosper::frontend::ComputeImageImportDecline decline =
         prosper::frontend::classify_compute_image_import(gates);

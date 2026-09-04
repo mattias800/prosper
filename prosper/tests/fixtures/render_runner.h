@@ -2257,6 +2257,7 @@ inline size_t persistent_color_target_count_ceiling(bool eviction_deferred) {
 inline PersistentColorTargetImage* find_persistent_color_target(
     uint64_t id, uint32_t width, uint32_t height, VkFormat format, bool require_valid = true) {
     if (!id) return nullptr;
+    format = backend_color_format(format);
     auto& cache = persistent_color_target_cache();
     auto found = cache.find({id, width, height, format});
     if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
@@ -4421,6 +4422,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(ctx.dev, img, &ir);
         const VkDeviceSize limit = persistent_color_target_limit();
         const size_t count_limit = persistent_color_target_count_limit();
+        const size_t count_ceiling = persistent_color_target_count_ceiling(true);
         if (ir.size <= limit) {
             ++src->pin_count;
             while ((persistent_color_target_cache().size() > count_limit ||
@@ -4433,11 +4435,19 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         iai.allocationSize = ir.size;
         iai.memoryTypeIndex = render_memory_type(ctx.phys, ir.memoryTypeBits, 0);
         if (ir.size > limit || persistent_color_target_bytes() > limit - ir.size ||
-            persistent_color_target_cache().size() > count_limit ||
+            persistent_color_target_cache().size() > count_ceiling ||
             vkAllocateMemory(ctx.dev, &iai, nullptr, &imem) != VK_SUCCESS || !imem) {
             vkDestroyImage(ctx.dev, img, nullptr);
             persistent_color_target_cache().erase(dst_key);
-            error = "resolve destination exceeds the persistent target budget";
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "resolve destination exceeds budget (ir=%llu limit=%llu cur_bytes=%llu "
+                     "cache_size=%zu ceiling=%zu mem_type=%u)",
+                     (unsigned long long)ir.size, (unsigned long long)limit,
+                     (unsigned long long)persistent_color_target_bytes(),
+                     persistent_color_target_cache().size(), count_ceiling,
+                     iai.memoryTypeIndex);
+            error = buf;
             return false;
         }
         if (vkBindImageMemory(ctx.dev, img, imem, 0) != VK_SUCCESS) {
@@ -4680,7 +4690,7 @@ inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_
         if (!read_persistent_ds_depth(*found, width, height, faces[slice], error)) return false;
         ++slices_found;
     }
-    return slices_found == 6u;
+    return slices_found != 0;
 }
 
 // Retained depth faces produced after a compute image. GTA V builds each shadow cube by copying

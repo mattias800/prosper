@@ -26,7 +26,7 @@ struct ComputeStorageCacheGateInputs {
 
 constexpr bool compute_storage_cache_gate_candidate(
     const ComputeStorageCacheGateInputs& inputs) {
-    return !inputs.renderer_owned && inputs.dcc_cache_safe &&
+    return (!inputs.renderer_owned || inputs.seed_skip) && inputs.dcc_cache_safe &&
            !inputs.poison_verify && (inputs.exact_storage || inputs.seed_skip) &&
            inputs.persistent_enabled;
 }
