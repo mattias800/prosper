@@ -220,13 +220,17 @@ void guest_write_watch_invalidate_all();
 // ALIAS TABLE -- the ranges recorded by guest_write_watch_notify_direct_mapping_added above, not the
 // dmem write-trace, which is a narrower thing armed for one investigation at a time.
 //
-// The present path matches a flipped scanout buffer against render targets by VIRTUAL address only
-// (`is_live_render_target`), and `hle_graphics.cpp`'s scanout registry has no aliasing concept at
-// all. Stray renders into 0x30... and flips 0x9fc0000000 -- ~450 GiB apart -- so no VA-keyed lookup
-// can connect them, and neither publish path produces a picture. If those were two mappings of one
-// set of physical pages, that would follow with no further defect. This exposes the resolution the
-// write-watch already performs -- it models exactly this aliasing in `WatchedPage { phys; aliases; }`
-// -- so the hypothesis can be TESTED before anything is built on it.
+// Written to test one hypothesis about Stray (#2932): that a flipped scanout buffer and the render
+// targets were two virtual mappings of ONE physical allocation, which would have explained a missing
+// composite with no further defect. It exposes resolution the write-watch already performs -- it
+// models exactly this aliasing in `WatchedPage { phys; aliases; }` -- so the idea could be TESTED
+// before anything was built on it. It was FALSIFIED (`docs/STRAY_STATUS.md`, § Ruled out): nothing
+// is aliased, and the scanout buffers turn out to be ordinary render targets in their own right.
+//
+// Kept because the question recurs and the answer should cost one run, not a rediscovery. Do NOT
+// restate the framing that motivated it -- "prosper renders into one VA range while the guest flips
+// a distant one, so no VA-keyed lookup can connect them" -- which earlier revisions of this comment
+// asserted as fact and which the census disproved.
 //
 // Diagnostic only; no production path calls it. Two limits a caller MUST respect:
 //   * It returns the FIRST range containing `addr` and does NOT check that the range extends far

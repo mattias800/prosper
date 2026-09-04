@@ -21,15 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-04
 
-### Stray renders its title screen straight into the display buffer, and the world still is not there
+### Stray's world is not going missing on the way to the screen — it arrives, and rounds to black
 
-No picture worth showing — the frame is the menu over black, which is what it has been. The finding
-is what sits behind it. We had assumed the game composed its picture in one place and copied it to
-the buffer the screen reads, and that prosper was losing the copy. Measuring every render target this
-time, rather than only the first one, says otherwise: the two display buffers *are* render targets,
-and prosper draws into them nearly a thousand times in a run that still shows an empty screen. So
-nothing is being lost in transit. Either only the menu is ever drawn there, or the world is drawn and
-then wiped — and those two are quick to tell apart.
+No picture worth showing: the frame is still the menu over black. The finding is what sits behind it.
+We had assumed the game built its picture in one place and copied it to the buffer the screen reads,
+and that we were losing the copy. Measuring every render target this time, rather than only the
+first, says otherwise — the two display buffers are themselves render targets, attached to passes
+that carry thousands of draws. Nothing is being lost in transit. What the existing pixel traces
+already showed, and what this reframes, is that the world's colour reaches the end of the pipeline so
+faint that storing it rounds it to zero. So the question stops being "where did the picture go" and
+becomes "why is it arriving that dim", which is a much better question to be stuck on.
 
 ### RenderDoc works on prosper now, and the first capture was a beautiful picture of the wrong thing
 

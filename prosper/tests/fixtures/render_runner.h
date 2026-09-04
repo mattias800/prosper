@@ -5436,11 +5436,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (persistent_color) {
         color_key = {color_target->persistent_id, W, H, FMT};
         // PROSPER_TARGET_PHYS (#2932): print each colour target's guest VA and the physical address
-        // it maps to. The present path matches a flipped scanout buffer against targets by VIRTUAL
-        // address, and Stray renders into 0x30... while flipping 0x9fc0000000 (phys 0x230000). If a
-        // target's physical range covers that page, the two are aliases of one allocation and the
-        // VA-keyed match is the whole defect; if none does, the guest copies between distinct
-        // allocations and the question moves to which packet performs it.
+        // it maps to, to test whether any target ALIASES the page a title flips to the display. On
+        // Stray the answer is no -- and the same census answered a question it was not built for,
+        // which is why it is still here: the flipped VAs 0x9fc0000000 / 0x9fc2000000 turn up in this
+        // very census as 4K colour attachments, so those buffers are render targets rather than a
+        // separate region the renderer never touches (`docs/STRAY_STATUS.md`, § Ruled out).
+        //
+        // What a line here does and does not license: it is printed after the empty-draw early-out,
+        // so the target was BOUND as an attachment of a pass carrying at least one draw. It does not
+        // say a draw's output reached memory -- masks, discards and store behaviour all sit
+        // downstream -- so do not read a line here as "the picture was written".
         //
         // EVERY colour slot is censused, not just slot 0, and that scope is the whole point rather
         // than thoroughness for its own sake. `is_live_render_target` consults `g_rtt`, and `g_rtt`
