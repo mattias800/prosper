@@ -42,6 +42,12 @@ struct GuestWriteWatchStats {
     uint64_t host_write_notifies = 0;      // reached the state lock (the feature is armed)
     uint64_t host_write_no_alias = 0;      // ...and returned early: not a dmem range at all
     uint64_t host_write_pages_hit = 0;     // watched page aliases found inside the notified range
+    // The remaining candidate once `pages_hit` and `protect_calls` are known. This function takes
+    // the one global state mutex, and `GuestWriteWatch::query()` holds that same mutex while walking
+    // every page of a registration -- 193,248 watched pages across 86 registrations were measured on
+    // Stray, queried 89,938 times. A compute writeback whose notification simply WAITS would report
+    // exactly the same `watch_ms` as one doing work, and no other counter here can tell them apart.
+    uint64_t host_write_lock_contended = 0;
     // Every mprotect this file issues, in both directions. Names the machinery's real syscall
     // volume rather than leaving it inferred from arm/disarm counts of unknown extent.
     uint64_t protect_calls = 0;

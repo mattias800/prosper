@@ -700,7 +700,8 @@ struct AtomicStats {
         create_protect_failures{0},
         queries{0}, unchanged{0}, dirty{0}, unknown{0}, faults{0}, stale_faults{0},
         physical_writes{0}, rearms{0},
-        host_write_notifies{0}, host_write_no_alias{0}, host_write_pages_hit{0};
+        host_write_notifies{0}, host_write_no_alias{0}, host_write_pages_hit{0},
+        host_write_lock_contended{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
@@ -1361,7 +1362,7 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.unknown.load(), v.faults.load(), v.stale_faults.load(),
             v.physical_writes.load(), v.rearms.load(),
             v.host_write_notifies.load(), v.host_write_no_alias.load(),
-            v.host_write_pages_hit.load(),
+            v.host_write_pages_hit.load(), v.host_write_lock_contended.load(),
             g_protect_calls.load(), g_protect_bytes.load()};
 }
 
@@ -1890,7 +1891,15 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // Hot path: the HLE calls this before EVERY read()/pread(), mostly into non-dmem heap buffers. When
     // the feature is off (the default) nothing is ever armed, so skip without even taking the lock.
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(w.mutex);
+    // try_lock first purely to COUNT contention: `query()` holds this same mutex while walking every
+    // page of a registration, so a notification can spend its whole duration waiting rather than
+    // working -- and `watch_ms` cannot tell those apart. Costs one uncontended atomic exchange when
+    // the lock is free, which is the case this must not slow down.
+    std::unique_lock lock(w.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        bump(stats().host_write_lock_contended);
+        lock.lock();
+    }
     bump(stats().host_write_notifies);
     // A host/kernel store into an armed (read-only) guest page would EFAULT — e.g. sceKernelPread
     // streaming texture bytes straight into a watched dmem buffer returns an I/O error where real

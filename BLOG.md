@@ -30,15 +30,15 @@ do. The first working one held zero draws: prosper runs two Vulkan devices, and 
 RenderDoc took the one that only presents. Details in [#3321](https://github.com/mattias800/prosper/issues/3321).
 ### The compute half of that same round trip was doing it too
 
-No picture. #3309 pooled the *graphics* side's 63 MiB scratch buffers; the compute side was still
-allocating one per dispatch, for the same surfaces, at the same size — the linear buffer a tiled
-storage image is detiled into before the GPU is seeded with it. Measured here: 14.4 ms to allocate
-and fill 64 MiB against 3.1 ms into a buffer that is already mapped.
-Two of Stray's named costs also turned out not to be what their names said. The CPU re-tile that is
-61% of compute-image writeback is already running faster than one core can `memcpy` the same bytes,
-so it can only be reduced by re-tiling fewer surfaces, never by re-tiling faster. And the 31%
-attributed to "write-watch registration" is not the page-index walk at all — that costs 0.05 ms per
-64 MiB — it is one `mprotect` over the whole surface, at 0.39 ms.
+No picture, and the headline is a null. #3309 pooled the *graphics* side's 63 MiB scratch buffers;
+the compute side was still allocating one per dispatch, for the same surfaces, at the same size.
+Measured here: 14.4 ms to allocate and fill 64 MiB against 3.1 ms into a buffer that is already
+mapped — and pooling it **did not move Stray's frame rate at all**, because the surfaces that
+actually dominate this route average 19.5 MiB, under the threshold where that penalty exists.
+What the same runs did settle is where to look next: compute **setup** turns out to be the larger
+half (51.1 s against 46.8 s of writeback, over 62,556 dispatches) and nobody had ever measured it,
+and 247 GiB of full-surface snapshot copying happens because a class of dispatches writes about a
+quarter of a surface and has to bring the other three quarters in first.
 [#3307](https://github.com/mattias800/prosper/issues/3307)
 
 ### Two thirds of Stray's biggest render cost was the allocator, not the work

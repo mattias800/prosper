@@ -227,12 +227,73 @@ one of these allocations. The fix is #3309's, reused: `DecodeScratchPool` from
 
 ### What `layout_ms` and `watch_ms` actually are
 
-Both of #3307's two named stages were re-measured against standalone micro-benchmarks of the exact
-code they run, and **neither is what its name suggests**; see `## Ruled out`. The short form:
 `layout_ms` is the CPU re-tile running at memory-bandwidth speed, so it can only be reduced by
-re-tiling **fewer** surfaces; `watch_ms` is an `mprotect` over the whole surface, not the page-index
-walk, so its lever is whether a page-protection watch over a surface prosper itself overwrites every
-dispatch should exist at all.
+re-tiling **fewer** surfaces. `watch_ms` is **not** the page-index walk it was attributed to — and is
+not yet attributed to anything else either; #3317's `mprotect` reading is a live hypothesis, not a
+result. See `## Ruled out`, including which counter decides it.
+
+### Measured on the phase timers, 2026-09-04 — setup exceeds writeback
+
+`PROSPER_COMPUTE_PHASE_TIMING=1`, whole-run totals over **62,556 dispatches**:
+
+| phase | total |
+| --- | --- |
+| **`setup_ms`** | **51,062.6 ms** |
+| `writeback_ms` | 46,775.3 ms |
+| ├ `writeback_images_ms` | 45,513.8 ms |
+| `setup_buffers_ms` | 3,830.9 ms |
+| `setup_validate_ms` | 628.9 ms |
+
+**Setup is the larger half and had never been quoted**: #3307's stage table covers `writeback_*`
+only. Roughly 46.6 s of setup is the image path — the seed detile and everything around it.
+
+### The A/B on pooling is NULL, and why that is consistent
+
+Three arms of #3317 against two of `origin/main`, same route, F8 at t=175 s:
+
+| build | arms | rendered fps | mean |
+| --- | --- | --- | --- |
+| `origin/main` | 2 | 8.76, 9.75 | 9.25 |
+| #3317 (pooled) | 3 | 8.96, 9.23, 10.06 | 9.42 |
+
+Ranges overlap; the best branch arm beats every `main` arm and the worst loses to one. **Pooling the
+allocation does not move the frame rate on this route.**
+
+That is consistent with the benchmark rather than against it, and the reason is a number from the
+same run: **the image-source snapshots average ~19.5 MiB** (13,001 of them, 247 GiB total), and the
+write-watch registers **193,248 pages across 86 registrations — ~8.8 MiB each**. So the *typical*
+surface here is well under glibc's 32 MiB `M_MMAP_THRESHOLD` cap, where the measured allocation
+penalty is **0.185 ms at 16 MiB** rather than the 11.279 ms at 64 MiB. The dynamic threshold adapts
+upward after the first free, so a repeated 19.5 MiB allocation comes from the arena; a 63.3 MiB one
+never can. **The pooling is worth ~60x less on the population that dominates this route than on the
+4K surface that motivated it** — and a route whose surfaces were mostly over 32 MiB would see the
+large number. Do not generalise the null past this route.
+
+`main` alone spans 11% across two arms, so **single-arm fps comparisons on this route are not
+evidence**; the 2026-09-04 "#3309 gave +18%" figure was one arm each and has been retracted.
+
+### The volume that is left: 247 GiB of image-source snapshots
+
+From the same run:
+
+```
+compute_image_source snapshots=13001 253284.7 MiB storage_results=8109 181752.1 MiB
+compute_snapshot_reason rmw=7945 181066.4 MiB changed=4846 70924.6 MiB
+```
+
+**176.8 GiB of it is `rmw`** — read-modify-write, storage images whose prior contents must be
+brought in because the dispatch does not cover them. That is the same population as #3307's
+`PARTIAL-COVERAGE` finding: 21 bindings that always seed, every one at a uniform **~0.75
+poison-survival ratio**, i.e. a dispatch writing about a quarter of the surface forcing a
+full-surface snapshot. At ~2,250 rendered frames that is ~5.8 snapshots and **~113 MiB per frame**,
+about 1 GiB/s at 9 fps — so 30 fps would need ~3.4 GiB/s of snapshot traffic on top of everything
+else.
+
+**This is a volume problem, not a per-call cost problem**, which is exactly why pooling the
+allocator made no difference. The uniformity of the 0.75 ratio across sizes from 32 K to 8.3 M
+texels says it is structural (a quarter-resolution write), therefore predictable, therefore
+narrowable. And it joins the lever in the section above: if
+`import_live_compute_storage_image` hit, the RMW side would not need a host snapshot at all.
 
 ## The unresolved image ops — established on CALIBRATION
 
@@ -867,18 +928,33 @@ drops still discard the background.
   to bit 5 — 16 bytes is the maximum, and the code stores 16. **`layout_ms` can only be reduced by
   re-tiling fewer surfaces, never by re-tiling faster.** #3307.
 - **"`watch_ms` — 31% of compute-image writeback — is per-writeback write-watch *registration*, i.e.
-  the per-page index walk."** Falsified, 2026-09-04. The span `prepare_done → watch_done` contains
-  only the (rare) poison-coverage scan and one `guest_write_watch_notify_host_write`, and that
-  function's page loop — one `pages_by_addr.find` per 4 KiB, plus the hit vector and the generation
-  bumps — was modelled exactly and costs **0.05 ms per 64 MiB when every page in the range is
-  watched** and 0.0035 ms when none is. What costs what `watch_ms` reports is the `mprotect` that
-  `set_pages_armed` issues when pages **are** armed: measured **0.39 ms per 64 MiB idle and 0.63 ms
-  with twelve busy threads**, against a measured `watch_ms` mean of 0.33 ms over 4,291 records. So
-  the stage is the arm/disarm of a page-protection watch over the surface, and the lever is not the
-  loop but whether a watch over a surface prosper's own writeback dirties every dispatch should
-  exist. `PROSPER_RENDER_TIMING`'s `write_watch … host_write=…/… pages_hit=… mprotect=… calls/… MiB`
-  fields (added with this row) decide it in one run: `pages_hit=0` would mean the notifications are
-  walking the index and finding nothing, and the attribution is wrong again. #3307.
+  the per-page index walk."** Falsified, 2026-09-04, and **this is the only half of the original
+  claim that is established.** The span `prepare_done → watch_done` contains only the (rare)
+  poison-coverage scan and one `guest_write_watch_notify_host_write`, and that function's page loop —
+  one `pages_by_addr.find` per 4 KiB, plus the hit vector and the generation bumps — was modelled
+  exactly and costs **0.05 ms per 64 MiB when every page in the range is watched** and 0.0035 ms when
+  none is, against a measured `watch_ms` mean of 0.33 ms. The walk cannot be it. #3307, #3317.
+- **`watch_ms`'s actual contents are UNATTRIBUTED. Do not quote the `mprotect` reading — it was mine
+  and it is not established.** #3317 recorded, as fact, that the stage is the `mprotect`
+  `set_pages_armed` issues. The supporting numbers are real (one `mprotect` over 64 MiB costs 0.39 ms
+  idle and 0.63 ms with twelve busy threads, which fits the 0.33 ms mean), but they were measured in
+  a standalone benchmark and **nobody has yet measured whether that call happens in this span at
+  all**. Three candidates remain live and the counters that separate them now exist on
+  `PROSPER_RENDER_TIMING`'s `write_watch` line:
+  1. `page_protect=<calls>/<MiB>` and `pages_hit` — the `mprotect` reading. A first live run's
+     `faults=539` says protections *do* happen somewhere (a page cannot fault unless it was armed),
+     but not that they happen here.
+  2. `lock_contended` — the notification blocks on the one global state mutex, which
+     `GuestWriteWatch::query()` holds while walking a whole registration. That run measured
+     **89,938 queries over 193,248 watched pages**, so the mutex is genuinely busy. **A notification
+     that merely waits reports the same `watch_ms` as one doing work**, and no other counter can
+     tell them apart.
+  3. The poison-coverage scan, which shares the span. This needs **no new instrument**: every
+     `[compute-image-writeback]` record already prints `poison=`, so re-aggregating an existing
+     `PROSPER_COMPUTE_IMAGE_TIMING` log by that field settles it. Do that first — it is free.
+  **Read the whole `write_watch` line, never one field of it.** The first run of the new counters was
+  read off a truncation in which `protect=0` — the *pre-existing* `create_protect_failures`, whose
+  healthy value is zero — was taken for the new call counter (instrument trap 256). #3307, #3317.
 
 - **"A recompile fix — resolving the unresolved image ops — restores the title-screen background."**
   **Falsified on the title screen, and this row exists because the measurement was recorded NOWHERE a
