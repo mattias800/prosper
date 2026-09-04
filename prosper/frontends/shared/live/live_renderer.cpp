@@ -17,6 +17,7 @@
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/live/live_compute.hpp"
+#include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
 #include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
@@ -1965,6 +1966,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double tex_persist_hit_ms = 0, tex_persist_reuse_ms = 0, tex_persist_miss_ms = 0;
                 uint64_t tex_rtt_n = 0, tex_compute_n = 0, tex_local_n = 0;
                 uint64_t tex_persist_hit_n = 0, tex_persist_reuse_n = 0, tex_persist_miss_n = 0;
+                // The cache entry was FOUND and its guest bytes had changed, so the decode ran
+                // again. It had no bucket of its own, which put it in `other` alongside "this
+                // resource was never cacheable at all" -- two states with opposite fixes. On Stray's
+                // title screen 930.78 of the texture leaf's 1110.10 ms landed in that undivided
+                // residual, and naming this half is what identified the two 63.75 MiB RGBA16F HDR
+                // intermediates that re-decode every frame (#3149 measured the splash, not this).
+                double tex_persist_invalid_ms = 0;
+                uint64_t tex_persist_invalid_n = 0;
                 uint64_t tex_other_n = 0;
                 double tex_other_slowest_ms = 0;
                 uint64_t tex_other_addr = 0, tex_other_source_bytes = 0;
@@ -2297,24 +2306,35 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // the mapping and SIGSEGVs the render thread mid-copy — /dev/null-write "readable" can't catch
             // it because /dev/null discards without faulting. Returns bytes copied; dst is pre-zeroed so a
             // short copy just leaves a transparent/black tail (only the missing region degrades).
-            auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size_t {
+            // How many LEADING bytes of [a, a+n) are mapped, i.e. exactly how many `safe_copy` will
+            // deliver. Split out of `safe_copy` so a caller that needs all n of them can read guest
+            // memory IN PLACE instead of staging a full-surface copy first (see
+            // `direct_resource_source`): the two then cannot disagree about what "readable" means,
+            // which they would within a week if the walk were written twice.
+            //
+            // `safe_copy` used to interleave the per-chunk mapping check with a per-chunk memcpy;
+            // this proves the whole prefix first and then copies it in one call. The set of checks
+            // and the set of bytes copied are identical -- a mapping that changes mid-walk was
+            // equally fatal before -- and one 64 MiB memcpy beats a thousand 64 KiB ones.
+            auto safe_span = [](uint64_t a, size_t n) -> size_t {
+                if (!n) return 0;
                 const size_t PG = 0x10000;   // lazy-commit granularity (64 KB)
 #ifdef _WIN32
                 // Prepare a complete sparse direct-memory resource once. The per-chunk mapping
                 // checks below still stop an over-declared resource at its real guest boundary.
-                if (prosper_try_commit_dmem(a, n, 0)) {
-                    std::memcpy(dst, (const void*)(uintptr_t)a, n);
-                    return n;
-                }
+                if (prosper_try_commit_dmem(a, n, 0)) return n;
 #endif
                 size_t done = 0;
                 while (done < n) {
                     uint64_t cur = a + done;
                     if (cur < 0x1000 || prosper_reserved_range_state(cur) == 0) break;
-                    size_t chunk = std::min(n - done, PG - (size_t)(cur & (PG - 1)));
-                    std::memcpy(dst + done, (const void*)(uintptr_t)cur, chunk);
-                    done += chunk;
+                    done += std::min(n - done, PG - (size_t)(cur & (PG - 1)));
                 }
+                return done;
+            };
+            auto safe_copy = [safe_span](uint8_t* dst, uint64_t a, size_t n) -> size_t {
+                const size_t done = safe_span(a, n);
+                if (done) std::memcpy(dst, (const void*)(uintptr_t)a, done);
                 return done;
             };
             // A uniform DCC clear is self-contained in metadata. If the ordered compute span dirtied
@@ -2735,6 +2755,61 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         size_t take = static_cast<size_t>(std::min<uint64_t>(n, r.host_data_size - off));
                         std::memcpy(dst, r.host_data + off, take);
                         return take;
+                    };
+                    // The same bytes `copy_resource` would deliver, read IN PLACE, or nullptr when it
+                    // would deliver fewer than `n` of them.
+                    //
+                    // Guest memory is 1:1 mapped, so a full-surface staging copy buys nothing except a
+                    // second address for the same bytes -- and on a 4K HDR intermediate that second
+                    // address is 64+ MiB of freshly mmap'd, page-faulted, memset and then munmap'd
+                    // anonymous memory per reference. Stray's title screen paid it twice a frame
+                    // (#3149's `__memmove_avx512` at 14.5% self, and its kernel page-management
+                    // frames, are this).
+                    //
+                    // Returning nullptr on a SHORT range is the load-bearing half: the decode branches
+                    // below rely on `copy_resource`'s partial return to fall back to a linear read or
+                    // to a zero-filled tail, so a sparse or over-declared surface must keep taking the
+                    // staged path rather than being handed a pointer into a hole.
+                    // PROSPER_NO_DIRECT_TEXTURE_SOURCE restores the staged copy on BOTH source kinds.
+                    // A lever that disabled only the guest-memory half would still be named after the
+                    // whole optimisation, and an A/B under it would attribute the remaining half's
+                    // cost to whatever else moved -- the instrument-trap shape this tree records.
+                    static const bool no_direct_texture_source =
+                        PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_TEXTURE_SOURCE") != nullptr;
+                    auto direct_resource_source = [&](uint64_t addr, size_t n) -> const uint8_t* {
+                        if (!n || no_direct_texture_source) return nullptr;
+                        if (r.host_data) {
+                            // Mirrors copy_resource's host_data arm: the same bounds, and `take == n`.
+                            if (addr < r.gpu_addr) return nullptr;
+                            const uint64_t off = addr - r.gpu_addr;
+                            if (off >= r.host_data_size || n > r.host_data_size - off) return nullptr;
+                            return r.host_data + off;
+                        }
+                        if (addr < 0x1000 || addr > UINT64_MAX - n) return nullptr;
+                        return safe_span(addr, n) == n
+                            ? reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr))
+                            : nullptr;
+                    };
+                    // The tiled bytes a detiler will read, without staging a copy of them when the
+                    // range is fully mapped. `lease` must outlive the returned pointer; it stays
+                    // empty on the direct path and holds the staging buffer otherwise, so an early
+                    // exit from a decode branch returns it to the pool either way.
+                    //
+                    // `got` reports what the STAGED path would have delivered, exactly as
+                    // `copy_resource` did, so every downstream `got < ...` fallback keeps its
+                    // meaning. On the direct path `got == n` by construction: the pointer is only
+                    // handed out when the whole range is readable.
+                    auto stage_tiled_source =
+                        [&](prosper::frontend::DecodeScratchPool::Lease& lease, uint64_t addr,
+                            size_t n, size_t& got) -> const uint8_t* {
+                        if (const uint8_t* direct = direct_resource_source(addr, n)) {
+                            got = n;
+                            return direct;
+                        }
+                        lease = prosper::frontend::decode_scratch_pool().take(n);
+                        got = copy_resource(lease.data(), addr, n);
+                        lease.zero_tail(got);   // restores what `std::vector<uint8_t>(n, 0)` gave
+                        return lease.data();
                     };
                     // Avoid allocating and copying storage buffers that are already present in stable,
                     // readable unified guest memory. The callback and backend upload are synchronous;
@@ -5799,24 +5874,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // micro-tile geometry from the block size (bpe) internally (#119) — 16-byte
                             // blocks -> 16x16, 8-byte -> 32x16 — so no tile_side is passed here.
                             size_t comp_bytes = (size_t)bw * bh * bcb;
-                            std::vector<uint8_t> lin(comp_bytes, 0);
+                            auto lin = prosper::frontend::decode_scratch_pool().take(comp_bytes);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
-                                std::vector<uint8_t> traw(tbytes, 0);
-                                copy_resource(traw.data(), sampled_source_addr, tbytes);
-                                if (r.in_mip_tail)
+                                prosper::frontend::DecodeScratchPool::Lease traw_lease;
+                                size_t got = 0;
+                                const uint8_t* traw = stage_tiled_source(
+                                    traw_lease, sampled_source_addr, tbytes, got);
+                                if (r.in_mip_tail) {
+                                    lin.zero_all();
                                     prosper::gpu::detile_elements_level(
-                                        lin.data(), traw.data(), tbytes, bw, bh, bcb,
+                                        lin.data(), traw, tbytes, bw, bh, bcb,
                                         r.tile_mode, r.mip_tail_x, r.mip_tail_y);
-                                else
+                                } else {
+                                    // detile_elements zero-fills every block the (possibly short)
+                                    // source cannot supply, so it covers the whole destination for
+                                    // the element sizes its copiers handle -- pinned by test_tile.
+                                    if (!prosper::gpu::detile_writes_whole_destination(
+                                            r.tile_mode, bcb))
+                                        lin.zero_all();
                                     prosper::gpu::detile_elements(
-                                        lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
+                                        lin.data(), traw, tbytes, bw, bh, bcb, r.tile_mode);
+                                }
                             } else if (linear_padded_read) {
+                                lin.zero_all();
                                 copy_linear_padded_rows(
                                     lin.data(), static_cast<size_t>(bw) * bcb, bh);
                             } else {
-                                copy_resource(lin.data(), sampled_source_addr, comp_bytes);
+                                lin.zero_tail(copy_resource(
+                                    lin.data(), sampled_source_addr, comp_bytes));
                             }
                             if (!prosper::gpu::bc_decode_surface(
                                     texture_pixels.data(), lin.data(), lin.size(), tw, th, r.format))
@@ -5830,7 +5917,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // Power-of-two component counts keep the source texel size compatible with the
                             // supported GFX10 surface detilers (4/8/16 B per texel).
                             const uint32_t nc = bpt / 4;
-                            std::vector<uint8_t> flin(volume_texels * bpt, 0);
+                            auto flin = prosper::frontend::decode_scratch_pool().take(
+                                volume_texels * bpt);
                             const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
@@ -5839,27 +5927,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                           tw, th, r.depth, r.tile_mode, bpt)
                                     : prosper::gpu::tiled_surface_bytes(
                                           tw, th, r.tile_mode, 0, bpt);
-                                std::vector<uint8_t> traw(tbytes, 0);
-                                const size_t got = copy_resource(
-                                    traw.data(), sampled_source_addr, tbytes);
+                                prosper::frontend::DecodeScratchPool::Lease traw_lease;
+                                size_t got = 0;
+                                const uint8_t* traw = stage_tiled_source(
+                                    traw_lease, sampled_source_addr, tbytes, got);
                                 if (got < flin.size()) {
-                                    copy_resource(flin.data(), sampled_source_addr, flin.size());
+                                    flin.zero_tail(copy_resource(
+                                        flin.data(), sampled_source_addr, flin.size()));
                                 } else if (is_volume) {
+                                    flin.zero_all();
                                     prosper::gpu::detile_volume(
-                                        flin.data(), traw.data(), got, tw, th, r.depth,
+                                        flin.data(), traw, got, tw, th, r.depth,
                                         r.tile_mode, bpt);
                                 } else if (r.in_mip_tail) {
+                                    flin.zero_all();
                                     prosper::gpu::detile_surface_level(
-                                        flin.data(), traw.data(), got, tw, th, r.tile_mode,
+                                        flin.data(), traw, got, tw, th, r.tile_mode,
                                         bpt, r.mip_tail_x, r.mip_tail_y);
                                 } else {
+                                    if (!prosper::gpu::detile_writes_whole_destination(
+                                            r.tile_mode, bpt))
+                                        flin.zero_all();
                                     prosper::gpu::detile_surface(
-                                        flin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                                        flin.data(), traw, tw, th, r.tile_mode, 0, bpt);
                                 }
                             } else if (linear_padded_read) {
+                                flin.zero_all();
                                 copy_linear_padded_rows(flin.data(), (size_t)tw * bpt, th);
                             } else {
-                                copy_resource(flin.data(), sampled_source_addr, flin.size());
+                                flin.zero_tail(copy_resource(
+                                    flin.data(), sampled_source_addr, flin.size()));
                             }
                             for (size_t t = 0; t < volume_texels; ++t) {
                                 for (uint32_t c = 0; c < 4; ++c) {
@@ -5884,28 +5981,45 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // unit-tested, but the [0,1] clamp loses >1.0 bloom energy for guest-backed
                             // textures; renderer-owned RTTs retain RGBA16F through the #773 path.
                             const uint32_t nc = bpt / 2;                    // fp16 components per texel
-                            std::vector<uint8_t> hlin(volume_texels * bpt, 0);
+                            // Pooled, so a 4K HDR intermediate does not mmap/fault/munmap 63 MiB per
+                            // reference. It arrives holding the PREVIOUS surface, so every arm below
+                            // either covers it completely or zeroes what it does not fill.
+                            auto hlin = prosper::frontend::decode_scratch_pool().take(
+                                volume_texels * bpt);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
                                     : prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
-                                std::vector<uint8_t> traw(tbytes, 0);
-                                size_t got = copy_resource(
-                                    traw.data(), sampled_source_addr, tbytes);
+                                prosper::frontend::DecodeScratchPool::Lease traw_lease;
+                                size_t got = 0;
+                                const uint8_t* traw = stage_tiled_source(
+                                    traw_lease, sampled_source_addr, tbytes, got);
                                 if (got < hlin.size())
-                                    copy_resource(hlin.data(), sampled_source_addr, hlin.size());  // short backing -> linear fallback
-                                else if (is_volume) prosper::gpu::detile_volume(
-                                    hlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
-                                else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
-                                    hlin.data(), traw.data(), got, tw, th, r.tile_mode, bpt,
-                                    r.mip_tail_x, r.mip_tail_y);
-                                else prosper::gpu::detile_surface(
-                                    hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                                    hlin.zero_tail(copy_resource(hlin.data(), sampled_source_addr,
+                                                                 hlin.size()));  // short backing -> linear fallback
+                                else if (is_volume) { hlin.zero_all(); prosper::gpu::detile_volume(
+                                    hlin.data(), traw, got, tw, th, r.depth, r.tile_mode, bpt); }
+                                else if (r.in_mip_tail) { hlin.zero_all(); prosper::gpu::detile_surface_level(
+                                    hlin.data(), traw, got, tw, th, r.tile_mode, bpt,
+                                    r.mip_tail_x, r.mip_tail_y); }
+                                else {
+                                    // The only arm on Stray's hot path, and the only one whose
+                                    // destination coverage is asserted (test_tile). Everything else
+                                    // pre-zeroes, because a detiler that bounds its writes by a
+                                    // SHORT source would otherwise leave the previous tenant visible.
+                                    if (!prosper::gpu::detile_writes_whole_destination(
+                                            r.tile_mode, bpt))
+                                        hlin.zero_all();
+                                    prosper::gpu::detile_surface(
+                                        hlin.data(), traw, tw, th, r.tile_mode, 0, bpt);
+                                }
                             } else if (linear_padded_read) {
+                                hlin.zero_all();
                                 copy_linear_padded_rows(hlin.data(), (size_t)tw * bpt, th);
                             } else {
-                                copy_resource(hlin.data(), sampled_source_addr, hlin.size());
+                                hlin.zero_tail(copy_resource(hlin.data(), sampled_source_addr,
+                                                             hlin.size()));
                             }
                             // Same NaN/negative/positive-infinity clamp and absent-channel defaults
                             // as the historical scalar loop, exhaustively checked over all binary16
@@ -5951,15 +6065,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // resource instead receives the format-defined missing channels (R,0,0,1), after
                             // which the real T# DST_SEL is applied below. Its R component must be normalized
                             // from both bytes; selecting byte zero makes a smooth ramp a sawtooth (#1186).
-                            std::vector<uint8_t> nlin(volume_texels * bpt, 0);
+                            auto nlin = prosper::frontend::decode_scratch_pool().take(
+                                volume_texels * bpt);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
                                     : prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
-                                std::vector<uint8_t> traw(tbytes, 0);
-                                size_t got = copy_resource(
-                                    traw.data(), sampled_source_addr, tbytes);
+                                prosper::frontend::DecodeScratchPool::Lease traw_lease;
+                                size_t got = 0;
+                                const uint8_t* traw = stage_tiled_source(
+                                    traw_lease, sampled_source_addr, tbytes, got);
                                 // PROSPER_DUMP_RAWTILE (narrow path): the single/dual-channel RAW TILED bytes,
                                 // once per address, for offline 8-bpp de-swizzle sweeps (the SDF font atlas).
                                 if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
@@ -5968,23 +6084,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                                         char bn[512]; snprintf(bn, sizeof bn, "%s/narrowtile_%ux%u_b%u_%llx.bin",
                                                                dd.c_str(), tw, th, bpt, (unsigned long long)r.gpu_addr);
-                                        if (FILE* bf = fopen(bn, "wb")) { fwrite(traw.data(), 1, traw.size(), bf); fclose(bf);
-                                            fprintf(stderr, "[render] narrow raw tiled -> %s (%zu, bpt=%u)\n", bn, traw.size(), bpt); fflush(stderr); }
+                                        if (FILE* bf = fopen(bn, "wb")) { fwrite(traw, 1, tbytes, bf); fclose(bf);
+                                            fprintf(stderr, "[render] narrow raw tiled -> %s (%zu, bpt=%u)\n", bn, tbytes, bpt); fflush(stderr); }
                                     }
                                 }
                                 if (got < nlin.size())
-                                    copy_resource(nlin.data(), sampled_source_addr, nlin.size());  // short backing -> linear fallback
-                                else if (is_volume) prosper::gpu::detile_volume(
-                                    nlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
-                                else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
-                                    nlin.data(), traw.data(), got, tw, th, r.tile_mode, bpt,
-                                    r.mip_tail_x, r.mip_tail_y);
-                                else prosper::gpu::detile_surface(
-                                    nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                                    nlin.zero_tail(copy_resource(nlin.data(), sampled_source_addr,
+                                                                 nlin.size()));  // short backing -> linear fallback
+                                else if (is_volume) { nlin.zero_all(); prosper::gpu::detile_volume(
+                                    nlin.data(), traw, got, tw, th, r.depth, r.tile_mode, bpt); }
+                                else if (r.in_mip_tail) { nlin.zero_all(); prosper::gpu::detile_surface_level(
+                                    nlin.data(), traw, got, tw, th, r.tile_mode, bpt,
+                                    r.mip_tail_x, r.mip_tail_y); }
+                                else {
+                                    if (!prosper::gpu::detile_writes_whole_destination(
+                                            r.tile_mode, bpt))
+                                        nlin.zero_all();
+                                    prosper::gpu::detile_surface(
+                                        nlin.data(), traw, tw, th, r.tile_mode, 0, bpt);
+                                }
                             } else if (linear_padded_read) {
+                                nlin.zero_all();
                                 copy_linear_padded_rows(nlin.data(), (size_t)tw * bpt, th);
                             } else {
-                                copy_resource(nlin.data(), sampled_source_addr, nlin.size());
+                                nlin.zero_tail(copy_resource(nlin.data(), sampled_source_addr,
+                                                             nlin.size()));
                             }
                             const bool unorm16 = r.format == prosper::gpu::DataFormat::Unorm16;
                             for (size_t t = 0; t < volume_texels; t++) {
@@ -6049,14 +6173,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             size_t tiled_bytes = is_volume
                                 ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, tmode, 4)
                                 : prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
-                            std::vector<uint8_t> tiled(tiled_bytes, 0);
-                            size_t got = copy_resource(
-                                tiled.data(), sampled_source_addr, tiled_bytes);
-                            if (got < nb)
+                            // The `got < nb` recovery below WRITES into this buffer, so the source
+                            // may only be read in place when it cannot be reached -- i.e. when the
+                            // padded tiled extent already covers the linear one.
+                            prosper::frontend::DecodeScratchPool::Lease tiled_lease;
+                            size_t got = 0;
+                            const uint8_t* tiled = nullptr;
+                            if (tiled_bytes >= nb) {
+                                tiled = stage_tiled_source(
+                                    tiled_lease, sampled_source_addr, tiled_bytes, got);
+                            } else {
+                                tiled_lease = prosper::frontend::decode_scratch_pool().take(tiled_bytes);
+                                got = copy_resource(
+                                    tiled_lease.data(), sampled_source_addr, tiled_bytes);
+                                tiled_lease.zero_tail(got);
+                                tiled = tiled_lease.data();
+                            }
+                            if (got < nb) {
+                                // Reachable only on the staged path -- the direct branch above
+                                // requires tiled_bytes >= nb and then delivers all of them -- so the
+                                // lease is already the buffer just filled. Re-staging if it somehow
+                                // is not keeps this recovery writing to memory it owns.
+                                if (tiled_lease.size() < tiled_bytes) {
+                                    tiled_lease = prosper::frontend::decode_scratch_pool().take(tiled_bytes);
+                                    got = copy_resource(
+                                        tiled_lease.data(), sampled_source_addr, tiled_bytes);
+                                    tiled_lease.zero_tail(got);
+                                }
                                 // The padded tiled buffer's tail (th rounded to whole 32-row tiles) runs past
                                 // the real backing: fall back to the width*height linear bytes copied above
                                 // rather than an all-zero buffer (which would BLANK the texture).
-                                std::memcpy(tiled.data(), texture_pixels.data(), std::min(nb, tiled_bytes));
+                                std::memcpy(tiled_lease.data(), texture_pixels.data(),
+                                            std::min(nb, tiled_bytes));
+                                tiled = tiled_lease.data();
+                            }
                             // PROSPER_DUMP_RAWTILE: write the EXACT padded tiled bytes to a .bin (no lossy BMP
                             // round-trip) so the de-swizzle can be reversed offline against a known image (#101).
                             if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTILE") && (frame_no < 200 || (tw <= 2048 && th <= 1024))) {
@@ -6069,16 +6219,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     char bn[512];
                                     if (small) snprintf(bn, sizeof bn, "%s/rawtile_%ux%u_%llx.bin", dd.c_str(), tw, th, (unsigned long long)r.gpu_addr);
                                     else snprintf(bn, sizeof bn, "%s/tiled_f%04d_b%u_%ux%u.bin", dd.c_str(), (int)frame_no, r.binding, tw, th);
-                                    if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled.data(), 1, tiled.size(), bf); fclose(bf); }
+                                    if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled, 1, tiled_bytes, bf); fclose(bf); }
                                 }
                             }
                             if (is_volume) prosper::gpu::detile_volume(
-                                texture_pixels.data(), tiled.data(), got, tw, th, r.depth, tmode, 4);
+                                texture_pixels.data(), tiled, got, tw, th, r.depth, tmode, 4);
                             else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
-                                texture_pixels.data(), tiled.data(), got, tw, th, tmode, 4,
+                                texture_pixels.data(), tiled, got, tw, th, tmode, 4,
                                 r.mip_tail_x, r.mip_tail_y);
                             else prosper::gpu::detile_surface(
-                                texture_pixels.data(), tiled.data(), tw, th, tmode, pitch);
+                                texture_pixels.data(), tiled, tw, th, tmode, pitch);
                         }
                         // Legacy fallback for packed R11G11B10F shapes outside the exact native upload
                         // contract above. The texel IS 4 bytes, so the generic read + auto-detile already
@@ -6363,6 +6513,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_source_size);
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
+                            // PROSPER_NO_TEXTURE_PREFIX_INHERIT restores the `assign()` spelling:
+                            // free the outgoing buffer, allocate a new one. It exists because
+                            // WITHOUT it this optimisation has no off-switch, and a discriminator
+                            // that cannot disable everything the change does is not a
+                            // discriminator -- it silently under-reports the change it is
+                            // attributing. Measured on Stray: an A/B armed with
+                            // PROSPER_NO_DIRECT_TEXTURE_SOURCE and PROSPER_DECODE_SCRATCH_MB=0
+                            // returned the texture leaf to 918.2 ms rather than the 1110.1 ms
+                            // baseline, and the missing 191.9 ms was this, still switched on.
+                            static const bool no_prefix_inherit =
+                                PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_PREFIX_INHERIT") != nullptr;
+                            // The entry this decode replaces holds a source_prefix buffer of the
+                            // same shape. Taking its allocation instead of letting `assign` build a
+                            // new one is worth naming on a surface the guest rewrites every frame:
+                            // for Stray's 63.75 MiB HDR intermediate that pair -- free 63.75 MiB,
+                            // then mmap and fault 63.75 MiB back in for the same bytes -- measured
+                            // 13.00 ms per invalidation on this host, against 3.5 ms for the copy
+                            // it exists to hold. The bytes stored are identical either way; only
+                            // the mapping's lifetime changes.
+                            std::vector<uint8_t> inherited_source_prefix;
                             uint32_t inherited_watch_dirty_count = 0;
                             uint32_t inherited_watch_stable_validations = 0;
                             bool inherited_watch_disabled = false;
@@ -6395,6 +6565,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     retired_submit_pixels.push_back(old->second.pixels);
                                 }
                                 persistent_decoded_texture_bytes -= old->second.bytes();
+                                // Taken AFTER the ledger has been debited by the old entry's
+                                // `bytes()`, which reads `source_prefix.size()`: moving first would
+                                // debit zero and leak the entry's bytes from the budget forever.
+                                if (!no_prefix_inherit)
+                                    inherited_source_prefix = std::move(old->second.source_prefix);
                                 persistent_decoded_textures.erase(old);
                             }
                             const size_t required =
@@ -6422,10 +6597,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_size = persistent_source_size;
                                 cached.source_prefix_size = source_prefix_size;
                                 cached.source_matches_pixels = persistent_source_matches_pixels;
-                                if (!persistent_source_matches_pixels)
-                                    cached.source_prefix.assign(
-                                        persistent_validation_scratch.begin(),
-                                        persistent_validation_scratch.begin() + source_prefix_size);
+                                if (!persistent_source_matches_pixels) {
+                                    // Byte-for-byte what `assign(scratch.begin(),
+                                    // scratch.begin() + source_prefix_size)` produced. `resize`
+                                    // before the copy so a SHORT read stores exactly the prefix it
+                                    // read -- `source_prefix.size()` is compared against
+                                    // `persistent_source_size` on the validation path, so growing
+                                    // it to the inherited buffer's extent would silently change
+                                    // which entries revalidate. Shrinking keeps the capacity, which
+                                    // is the whole point.
+                                    cached.source_prefix = std::move(inherited_source_prefix);
+                                    cached.source_prefix.resize(source_prefix_size);
+                                    if (source_prefix_size)
+                                        std::memcpy(cached.source_prefix.data(),
+                                                    persistent_validation_scratch.data(),
+                                                    source_prefix_size);
+                                }
                                 cached.pixels = std::make_shared<const std::vector<uint8_t>>(
                                     std::move(texture_pixels));
                                 cached.output_height = fr.th;
@@ -6921,6 +7108,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             else if (resource_persistent_submit_reuse) { pending_timing.tex_persist_reuse_ms += elapsed; ++pending_timing.tex_persist_reuse_n; }
                             else if (resource_persistent_hit)          { pending_timing.tex_persist_hit_ms += elapsed;   ++pending_timing.tex_persist_hit_n; }
                             else if (resource_persistent_miss)         { pending_timing.tex_persist_miss_ms += elapsed;  ++pending_timing.tex_persist_miss_n; }
+                            else if (resource_persistent_invalidation) { pending_timing.tex_persist_invalid_ms += elapsed; ++pending_timing.tex_persist_invalid_n; }
                             else if (resource_local_reuse)             { pending_timing.tex_local_ms += elapsed;         ++pending_timing.tex_local_n; }
                             else {
                                 ++pending_timing.tex_other_n;
@@ -10006,6 +10194,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_tex_persist_hit_ms = pending_timing.tex_persist_hit_ms;
                     record.frontend_tex_persist_reuse_ms = pending_timing.tex_persist_reuse_ms;
                     record.frontend_tex_persist_miss_ms = pending_timing.tex_persist_miss_ms;
+                    record.frontend_tex_persist_invalid_ms = pending_timing.tex_persist_invalid_ms;
+                    record.frontend_tex_persist_invalid_n = pending_timing.tex_persist_invalid_n;
+                    record.frontend_tex_other_n = pending_timing.tex_other_n;
                     record.frontend_tex_other_slowest_ms =
                         pending_timing.tex_other_slowest_ms;
                     record.frontend_tex_other_addr = pending_timing.tex_other_addr;
@@ -10119,6 +10310,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // double-counting #2246 and #2250 had to be careful about.
                     double tex_rtt_ms = 0, tex_compute_ms = 0, tex_local_ms = 0;
                     double tex_persist_hit_ms = 0, tex_persist_reuse_ms = 0, tex_persist_miss_ms = 0;
+                    double tex_persist_invalid_ms = 0;
+                    uint64_t tex_persist_invalid_n = 0;
                     uint64_t tex_rtt_n = 0, tex_compute_n = 0, tex_local_n = 0;
                     uint64_t tex_persist_hit_n = 0, tex_persist_reuse_n = 0, tex_persist_miss_n = 0;
                     uint64_t tex_other_n = 0;
@@ -10240,6 +10433,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.tex_persist_hit_ms += pending_timing.tex_persist_hit_ms;
                     timing.tex_persist_reuse_ms += pending_timing.tex_persist_reuse_ms;
                     timing.tex_persist_miss_ms += pending_timing.tex_persist_miss_ms;
+                    timing.tex_persist_invalid_ms += pending_timing.tex_persist_invalid_ms;
+                    timing.tex_persist_invalid_n += pending_timing.tex_persist_invalid_n;
                     timing.tex_rtt_n += pending_timing.tex_rtt_n;
                     timing.tex_compute_n += pending_timing.tex_compute_n;
                     timing.tex_local_n += pending_timing.tex_local_n;
@@ -10527,11 +10722,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const double tex_other = totals.texture_ms - totals.tex_rtt_ms -
                                                  totals.tex_compute_ms - totals.tex_local_ms -
                                                  totals.tex_persist_hit_ms - totals.tex_persist_reuse_ms -
-                                                 totals.tex_persist_miss_ms;
+                                                 totals.tex_persist_miss_ms -
+                                                 totals.tex_persist_invalid_ms;
                         fprintf(stderr,
                                 "[render-timing] texture %.2f ms/submit [rtt=%.2f/%.1f compute=%.2f/%.1f "
                                 "persist_reuse=%.2f/%.1f persist_hit=%.2f/%.1f "
-                                "persist_miss=%.2f/%.1f local=%.2f/%.1f] other=%+.2f "
+                                "persist_miss=%.2f/%.1f persist_invalid=%.2f/%.1f "
+                                "local=%.2f/%.1f] other=%+.2f "
                                 "unclassified=%.1f  (ms/submit per class, refs/submit after the slash)\n",
                                 totals.texture_ms / nsub,
                                 totals.tex_rtt_ms / nsub, (double)totals.tex_rtt_n / nsub,
@@ -10539,6 +10736,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 totals.tex_persist_reuse_ms / nsub, (double)totals.tex_persist_reuse_n / nsub,
                                 totals.tex_persist_hit_ms / nsub, (double)totals.tex_persist_hit_n / nsub,
                                 totals.tex_persist_miss_ms / nsub, (double)totals.tex_persist_miss_n / nsub,
+                                totals.tex_persist_invalid_ms / nsub, (double)totals.tex_persist_invalid_n / nsub,
                                 totals.tex_local_ms / nsub, (double)totals.tex_local_n / nsub,
                                 tex_other / nsub, (double)totals.tex_other_n / nsub);
                         if (tex_other < -0.05 * nsub)
@@ -10683,11 +10881,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     size_t scratch_bytes = 0;
                     for (const auto& scratch : texstore)
                         scratch_bytes += scratch.capacity();
+                    // The decode INTERMEDIATE pool is retained memory too, and a census that omits
+                    // it under-reports the frontend's footprint by exactly the amount this change
+                    // stopped churning -- which is the number a reader would want to see.
+                    //
+                    // It is THIS THREAD's pool, and the label says so. The pool is thread_local, so
+                    // a process running N decoding threads retains up to N times this; printing a
+                    // per-thread figure under a heading that reads as a process total is the kind
+                    // of number that gets quoted as the whole footprint.
+                    const auto& intermediates = prosper::frontend::decode_scratch_pool();
                     fprintf(stderr,
                             "[render-timing] host_cache rtt=%zu %.1f MiB decode_scratch=%zu %.1f MiB "
-                            "validation=%.1f MiB\n",
+                            "intermediates(this thread)=%zu %.1f MiB validation=%.1f MiB\n",
                             g_rtt.size(), rtt_bytes / (1024.0 * 1024.0),
                             texstore.size(), scratch_bytes / (1024.0 * 1024.0),
+                            intermediates.retained_buffers(),
+                            intermediates.retained_bytes() / (1024.0 * 1024.0),
                             persistent_validation_scratch.capacity() / (1024.0 * 1024.0));
                     const auto write_watch = prosper::host::guest_write_watch_stats();
                     fprintf(stderr,
@@ -10784,11 +10993,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const double tex_other = window.texture_ms - window.tex_rtt_ms -
                                                  window.tex_compute_ms - window.tex_local_ms -
                                                  window.tex_persist_hit_ms - window.tex_persist_reuse_ms -
-                                                 window.tex_persist_miss_ms;
+                                                 window.tex_persist_miss_ms -
+                                                 window.tex_persist_invalid_ms;
                         fprintf(stderr,
                                 "[render-window] texture %.2f ms/submit [rtt=%.2f/%.1f compute=%.2f/%.1f "
                                 "persist_reuse=%.2f/%.1f persist_hit=%.2f/%.1f "
-                                "persist_miss=%.2f/%.1f local=%.2f/%.1f] other=%+.2f "
+                                "persist_miss=%.2f/%.1f persist_invalid=%.2f/%.1f "
+                                "local=%.2f/%.1f] other=%+.2f "
                                 "unclassified=%.1f  (ms/submit per class, refs/submit after the slash)\n",
                                 window.texture_ms / wn,
                                 window.tex_rtt_ms / wn, (double)window.tex_rtt_n / wn,
@@ -10796,6 +11007,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 window.tex_persist_reuse_ms / wn, (double)window.tex_persist_reuse_n / wn,
                                 window.tex_persist_hit_ms / wn, (double)window.tex_persist_hit_n / wn,
                                 window.tex_persist_miss_ms / wn, (double)window.tex_persist_miss_n / wn,
+                                window.tex_persist_invalid_ms / wn, (double)window.tex_persist_invalid_n / wn,
                                 window.tex_local_ms / wn, (double)window.tex_local_n / wn,
                                 tex_other / wn, (double)window.tex_other_n / wn);
                         if (tex_other < -0.05 * wn)

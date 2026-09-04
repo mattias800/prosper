@@ -124,6 +124,51 @@ def _resource_breakdown(renderer):
         "setup_resources": _total(renderer, "setup_resources_ms"),
         "backend_available": have_backend,
     }
+    # The frontend texture leaf's OWN classes. The renderer has recorded these since #2250 and this
+    # report never printed them, so every capture taken since has carried the answer to "which cache
+    # outcome is the texture time in?" and no reader could see it. On Stray's title screen the leaf
+    # is 1110.1 ms and 930.8 of it -- 84% -- is in a single unnamed residual; printing the classes is
+    # what located it. Same rule as the backend leaves: absent must report UNAVAILABLE, never 0.
+    breakdown["tex_classes_available"] = all("frontend_tex_rtt_ms" in r for r in renderer)
+    if breakdown["tex_classes_available"]:
+        for key in ("rtt", "compute", "local", "persist_hit", "persist_reuse", "persist_miss"):
+            breakdown["tex_" + key] = _total(renderer, f"frontend_tex_{key}_ms")
+        # Split out later than the six above; an older capture folds it into the residual, which is
+        # where it was before it had a name.
+        breakdown["tex_invalid_available"] = all(
+            "frontend_tex_persist_invalid_ms" in r for r in renderer)
+        breakdown["tex_persist_invalid"] = (
+            _total(renderer, "frontend_tex_persist_invalid_ms")
+            if breakdown["tex_invalid_available"] else 0.0)
+        # The COUNT of references nothing claimed, paired with the signed millisecond residual
+        # below. `performance_capture.hpp` says these two disagree only if the classification is
+        # wrong -- which is a cross-check nobody could run while the report printed one of them.
+        breakdown["tex_other_n_available"] = all("frontend_tex_other_n" in r for r in renderer)
+        breakdown["tex_other_n"] = (
+            sum(r.get("frontend_tex_other_n", 0) for r in renderer)
+            if breakdown["tex_other_n_available"] else None)
+        breakdown["tex_other"] = breakdown["frontend_texture"] - sum(
+            breakdown["tex_" + key] for key in
+            ("rtt", "compute", "local", "persist_hit", "persist_reuse", "persist_miss",
+             "persist_invalid"))
+        # The slowest single reference that reached none of the named classes, with the identity
+        # needed to explain it. One witness per record; report the worst across the window.
+        witness = max(renderer, key=lambda r: r.get("frontend_tex_other_slowest_ms", 0.0), default=None)
+        if witness and witness.get("frontend_tex_other_slowest_ms", 0.0) > 0.0:
+            breakdown["tex_other_witness"] = {
+                "ms": witness["frontend_tex_other_slowest_ms"],
+                "addr": witness.get("frontend_tex_other_addr", 0),
+                "source_bytes": witness.get("frontend_tex_other_source_bytes", 0),
+                "width": witness.get("frontend_tex_other_width", 0),
+                "height": witness.get("frontend_tex_other_height", 0),
+                "depth": witness.get("frontend_tex_other_depth", 0),
+                "format": witness.get("frontend_tex_other_format", 0),
+                "components": witness.get("frontend_tex_other_components", 0),
+                "tile_mode": witness.get("frontend_tex_other_tile_mode", 0),
+                "compute_candidate": witness.get("frontend_tex_other_compute_candidate", False),
+                "persistent_candidate": witness.get("frontend_tex_other_persistent_candidate", False),
+                "compressed": witness.get("frontend_tex_other_compressed", False),
+            }
     if have_backend:
         breakdown.update({
             "res_texture": _total(renderer, "res_texture_ms"),
@@ -537,6 +582,41 @@ def print_summary(summary):
         print("  build_resources (frontend materializer): "
               f"{breakdown['build_resources']:.1f}ms"
               f"  [texture={breakdown['frontend_texture']:.1f} buffer={breakdown['frontend_buffer']:.1f}]")
+        if breakdown["tex_classes_available"]:
+            invalid = (f"persist_invalid={breakdown['tex_persist_invalid']:.1f}"
+                       if breakdown["tex_invalid_available"] else "persist_invalid=UNAVAILABLE")
+            print("    texture by cache outcome: "
+                  f"rtt={breakdown['tex_rtt']:.1f}"
+                  f" compute={breakdown['tex_compute']:.1f}"
+                  f" local={breakdown['tex_local']:.1f}"
+                  f" persist_hit={breakdown['tex_persist_hit']:.1f}"
+                  f" persist_reuse={breakdown['tex_persist_reuse']:.1f}"
+                  f" persist_miss={breakdown['tex_persist_miss']:.1f}"
+                  f" {invalid}"
+                  f" other={breakdown['tex_other']:+.1f}"
+                  + ("" if breakdown["tex_other_n"] is None
+                     else f"/{breakdown['tex_other_n']}refs"))
+            # Loud, and only when the two residuals disagree. A signed millisecond remainder with
+            # NO unclassified references means the classification is losing time a named class
+            # should hold -- a defect in this instrument, not in the renderer, and the breakdown
+            # above is not trustworthy while it holds.
+            if (breakdown["tex_other_n"] == 0 and abs(breakdown["tex_other"]) > 1.0):
+                print(f"    *** {breakdown['tex_other']:+.1f}ms is unattributed with ZERO "
+                      "unclassified references — the texture classification is losing time, "
+                      "which is an instrument defect rather than a renderer one")
+            witness = breakdown.get("tex_other_witness")
+            if witness:
+                # The identity of the slowest unclassified reference. Without it `other` is a number
+                # with nothing to act on; with it the surface can be looked up directly.
+                print(f"    slowest unclassified reference: {witness['ms']:.1f}ms"
+                      f" addr=0x{witness['addr']:x}"
+                      f" {witness['width']}x{witness['height']}x{witness['depth']}"
+                      f" fmt={witness['format']}/{witness['components']}c"
+                      f" tile={witness['tile_mode']}"
+                      f" src={witness['source_bytes'] / (1024 * 1024):.1f}MiB"
+                      f" compute_cand={int(witness['compute_candidate'])}"
+                      f" persist_cand={int(witness['persistent_candidate'])}"
+                      f" dcc={int(witness['compressed'])}")
         if breakdown["backend_available"]:
             print("  setup_resources (backend binding):       "
                   f"{breakdown['setup_resources']:.1f}ms"

@@ -399,6 +399,11 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"frontend_tex_persist_hit_ms\":" << record.frontend_tex_persist_hit_ms
                 << ",\"frontend_tex_persist_reuse_ms\":" << record.frontend_tex_persist_reuse_ms
                 << ",\"frontend_tex_persist_miss_ms\":" << record.frontend_tex_persist_miss_ms
+                << ",\"frontend_tex_persist_invalid_ms\":"
+                << record.frontend_tex_persist_invalid_ms
+                << ",\"frontend_tex_persist_invalid_n\":"
+                << record.frontend_tex_persist_invalid_n
+                << ",\"frontend_tex_other_n\":" << record.frontend_tex_other_n
                 << ",\"frontend_tex_other_slowest_ms\":"
                 << record.frontend_tex_other_slowest_ms
                 << ",\"frontend_tex_other_addr\":" << record.frontend_tex_other_addr

@@ -63,6 +63,127 @@ One compute program, `0x3011300000`, accounts for ~605 ms of that at roughly 32 
 3840×2160. So the cost is on the host side of the boundary, and pointing a GPU profiler at this title
 answers a question it does not have. Detail on [#3126](https://github.com/mattias800/prosper/issues/3126).
 
+### Inside the texture leaf (2026-09-04, `fc21d46ca`, 5.02 s at the title screen)
+
+The 1110 ms above is **one class of reference and two surfaces**. Read from the same `.prperf` with
+the frontend cache-outcome classes the report now prints:
+
+| class | ms | note |
+| --- | --- | --- |
+| rtt | 77.3 | |
+| compute | 59.9 | |
+| persist_hit | 25.0 | |
+| local | 17.1 | |
+| persist_reuse / persist_miss | 0.0 / 0.0 | |
+| **unclassified** | **930.8** | **84% of the leaf** |
+
+The slowest single unclassified reference is 59.6 ms, and its identity is the whole story:
+**3840×2160 RGBA16F, 63.8 MiB of tiled source, DCC on, a compute *and* a persistent candidate**, at
+one of exactly **two alternating addresses** (`0x30784e0000` / `0x30d10f0000`) — a double-buffered 4K
+HDR intermediate, re-decoded on every callback that samples it.
+
+**Which cache state that is, derived rather than guessed.** The capture predates the
+`persist_invalid` bucket, so the class is established by elimination from the witness's own fields
+plus the code — and the next capture will confirm or refute it directly, which is why the bucket
+exists:
+
+| step | from | conclusion |
+| --- | --- | --- |
+| `persist_cand=1` | `texture_decode_cache_candidate` | no live colour or depth target, no captured host data, `cls == Texture`, format supported |
+| `class=2` | the witness | `fr.is_storage_image` is `cls == StorageImage`, so false |
+| `compute_cand=1` with `dcc=1` | `compute_image_candidate` requires `!compression_enabled \|\| persistent_dcc_uncompressed` | the DCC plane is all-`0xff`, so `compression_supported` holds |
+| default launch | — | the cache is not disabled and its budget is non-zero |
+| ⟹ | `persistent_texture_decode_cache_eligible` | **eligible** — the lookup really does run |
+| `persist_miss = 0.00` over the whole window | the capture | not a miss, so the entry was FOUND |
+| `persist_hit = 25.0` total, and this reference is unclassified | the capture | not a hit |
+
+Eligible, found, and neither hit nor miss leaves exactly one state: **`resource_persistent_invalidation`**
+— the entry exists and its guest bytes changed. The cache is not broken; the content genuinely is
+new every frame, because a compute dispatch rewrites the surface. So no amount of cache tuning
+removes this decode. Only not making the round trip does.
+
+**Two thirds of that decode was the allocator and the kernel, not the decode.** Each reference built
+two fresh value-initialised `std::vector<uint8_t>` intermediates — 66,846,720 tiled bytes and
+66,355,200 linear — both past glibc's 32 MiB mmap threshold, so each was an `mmap`, 16,000 page
+faults, a memset and a `munmap`, per reference. Measured standalone at this exact shape:
+
+| | ms |
+| --- | --- |
+| fresh `traw`+`hlin`, copy + detile-equivalent traffic | 26.00 |
+| **the two fresh zero-initialised allocations alone** | **17.84** |
+| pooled `traw`+`hlin`, same copy and traffic | 6.00 |
+| pooled linear only, tiled source read in place | 2.83 |
+
+This is the same cost [#3149](https://github.com/mattias800/prosper/issues/3149) saw from outside as
+`__memmove_avx512` at 14.5% self and `clear_highpages_kasan_tagged` / `map_anon_folio_pte_nopf` /
+`zap_present_ptes` / `__free_one_page` under a 22.2% `do_syscall_64` — and attributed to the compute
+path, because that is where it looked. It is the graphics frontend materializer.
+
+Two more allocations of the same family sit on the same reference. The persistent cache re-stored a
+fresh 63.8 MiB `source_prefix` on every invalidation (13.00 ms at this shape) — it now inherits the
+allocation from the entry it replaces. The remaining one is **not** addressed:
+`cached.pixels = std::move(texture_pixels)` steals the pooled `texstore` slot, so the next decode
+allocates its 33 MiB output buffer fresh (~4.4 ms) — [#3310](https://github.com/mattias800/prosper/issues/3310).
+Fixing it needs a decision about buffer ownership between `texstore` and the persistent cache, which
+hands its buffer out as a `shared_ptr<const std::vector>` that never comes back.
+
+### Measured on the fix, live, 2026-09-04 (#3309)
+
+Same route and same F8 window, three arms on one binary. **The prediction was 660 ms and the
+measurement is 497.7.**
+
+| | baseline `fc21d46ca` | with #3309 | lever arm |
+| --- | --- | --- | --- |
+| rendered | 9.76 /s | **11.55 /s** | 10.15 /s |
+| `build_resources` texture | 1110.1 ms | **497.7 ms** | 918.2 ms |
+| ...of which `persist_invalid` | (no bucket yet) | 221.3 | 631.9 |
+| ...of which unclassified `other` | +930.8 | +144.3 | — |
+| renderer-resource | 1895.5 ms | 1384.1 ms | — |
+
+The 63.8 MiB RGBA16F witness is **gone from the top**: the slowest unclassified reference is now
+7.3 ms on a different, tiny surface (`0x30a0ac0000`, `fmt=7/1c`, `persist_cand=0`).
+
+**The derivation above survives in direction and rank, not in magnitude, and the magnitudes are not
+quotable.** It predicted `other` ≈ 0 with `persist_invalid` ≈ 900. What happened is `other` fell
+930.8 → 144.3 and `persist_invalid` is the largest single class — but at 221.3, because the same
+change that gave the residual a name also removed most of the cost the name was going to hold. A
+prediction whose own fix invalidates its arithmetic is confirmed about *which* state, not about
+*how much*.
+
+**The lever arm's gap has a known cause, and how much of it that cause accounts for is NOT
+established.** The arm returns the leaf to 918.2 rather than 1110.1. What is established, by reading
+the code rather than by inference, is that at the time it ran **one of the four changes had no
+off-switch** — the `source_prefix` inheritance — so it was necessarily still active in the "off"
+arm, and *some* of the 191.9 ms gap is therefore it. What is **not** established is that all of it
+is: the standalone figure predicts ~133 ms (13.00 ms per invalidation over ~14 references), the two
+captures are separate runs, and `setup_resources` buffer copy also moved between them (512.6 → 596),
+so run-to-run variance here is not zero. `PROSPER_NO_TEXTURE_PREFIX_INHERIT` exists to settle it in
+one arm. Until that arm is run, the 918.2 is known to under-report #3309 by an unquantified amount —
+which is a weaker and more useful statement than a number.
+
+The disarmed arm, to be pasted rather than typed — `PROSPER_DECODE_SCRATCH_MB` is a budget, so a
+malformed value keeps its 512 MiB default and leaves the pool **armed** while the run looks disarmed:
+
+```
+PROSPER_NO_DIRECT_TEXTURE_SOURCE=1 PROSPER_DECODE_SCRATCH_MB=0 PROSPER_NO_TEXTURE_PREFIX_INHERIT=1
+```
+
+**Compute rose 1981.5 → 2351.4 ms in the same window, and that is not a regression** — the window
+is fixed at 5.02 s, so a pipeline that renders 18% more frames also issues more dispatches into it.
+The bucket total is throughput, not cost. The discriminating pair is mean-ms-per-dispatch and
+dispatch count, both of which the report already prints per program.
+
+### The lever that is worth more than all of this
+
+The witness says `compute_cand=1`: the surface is a **compute image candidate whose import misses
+every frame**. `import_live_compute_storage_image` finds nothing under its key, so graphics falls
+through to the guest-byte decode. If that import hit, the 63.8 MiB writeback → detile → convert
+disappears **on both sides of the boundary** — the graphics decode and the compute writeback that
+feeds it. That is a bigger lever than every allocation above put together, and it lives in the
+compute cache's admission, not in the materializer. Both halves of that round trip are read
+together in [#3307](https://github.com/mattias800/prosper/issues/3307): the compute side's re-tile
+into guest memory, and the graphics side's read of those same bytes back out.
+
 ## The unresolved image ops — established on CALIBRATION
 
 > **The five-op census below was read on the calibration screen**, like every other live census above

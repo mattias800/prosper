@@ -361,6 +361,17 @@ static const Site kSites[] = {
     {"live_compute.cpp PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB",
      "PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB", mib_cap_size_new<8>, mib_cap_old<8>,
      "eight", 8ull * kMiB, "32", 32ull * kMiB},
+    // #3309's pooled decode intermediates. The safe sentinel here is 0 ("retain nothing", i.e. the
+    // pre-pool allocation pattern), so a malformed value that parsed to 0 would silently REMOVE the
+    // optimisation rather than enable a more aggressive one -- the mild direction of this family's
+    // hazard, and still a measurement attributed to the wrong setting.
+    //
+    // The malformed input is "64mb", not "512mb", and the difference is the arm's whole value: the
+    // legacy `strtoull` answer for "512mb" is 512, which IS this knob's default, so that spelling
+    // made the "...and the old spelling did NOT" leg unprovable and the arm vacuous. The suite
+    // caught it. Pick a malformed value whose legacy parse differs from the fallback.
+    {"decode_scratch.hpp PROSPER_DECODE_SCRATCH_MB", "PROSPER_DECODE_SCRATCH_MB",
+     mib_cap_size_new<512>, mib_cap_old<512>, "64mb", 512ull * kMiB, "64", 64ull * kMiB},
     {"live_compute.cpp PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB",
      "PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB", mib_cap_size_new<16>, mib_cap_old<16>,
      "64 MB", 16ull * kMiB, "64", 64ull * kMiB},
