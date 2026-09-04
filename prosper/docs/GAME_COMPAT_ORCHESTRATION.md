@@ -17,7 +17,7 @@ this document is the map that helps the next orchestrator find and interpret tha
 ## Current checkpoint
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
-- Remote branch: `master`.
+- Remote branch: `main`.
 - Documentation refresh base: `5e7ff0ab` (2026-08-10).
 - **Game dumps live at `<DUMP_ROOT>/<TITLE_ID>-app0`, and `<DUMP_ROOT>` is whatever
   `$PROSPER_GAME_ROOT` points at** (gitignored, and deliberately not written down here — the
@@ -105,7 +105,7 @@ Several cost hours; one cost two sessions. This is the single highest-value page
 *Maintenance:* **append, never renumber** — an existing number may already be cited from an issue, a
 commit message, another document or a source comment — **118 references on 110 lines in 46 files
 do**, naming 63 distinct rows, and **50 of those references are `.cpp`/`.hpp`/`.py` comments**
-rather than prose (measured on `origin/master` `8c4c0f09`, 2026-08-17; re-derive rather than
+rather than prose (measured on `origin/main` `8c4c0f09`, 2026-08-17; re-derive rather than
 trusting a restated figure). Deliberately
 no total is stated here: a restated count goes stale the moment a lane appends, and it already had
 (the header read "Fourteen" against a 17-row table). The last row's number is the **high-water
@@ -113,7 +113,7 @@ mark**, which is what you want for allocating; it is not the row count, because 
 
 *Allocating a number under concurrency:* run
 `python3 tools/docs/trap_number.py` before you write the row. It reports the highest number on
-`origin/master` **and in every open PR**, names the claimant of each, and prints the next free
+`origin/main` **and in every open PR**, names the claimant of each, and prints the next free
 number. Reading master alone is what produced the #2574/#2581 collision on 2026-08-17 — both lanes
 read 181, both wrote 182 — and it is what #1729 was filed for. The tool is an **advisor, not a
 gate**: two lanes running it in the same minute still both see the same free number. It shrinks the
@@ -793,7 +793,7 @@ some output.
 The orchestrator owns integration and scheduling, not every line of investigation. It should:
 
 1. Read `CLAUDE.md`, this document, the title status document, and the active issue before assigning work.
-2. Fetch `origin/master` and give every subagent a private worktree and a fresh branch from the exact remote head.
+2. Fetch `origin/main` and give every subagent a private worktree and a fresh branch from the exact remote head.
 3. Assign one title or one precisely bounded shared-infrastructure question per subagent.
 4. Prevent duplicated hypotheses by requiring agents to read the current issue evidence before running anything.
 5. Keep each agent on an evidence ladder: retained offline artifact first, bounded live capture only when the artifact
@@ -805,7 +805,7 @@ The orchestrator owns integration and scheduling, not every line of investigatio
    an ordinary PR, then merge when authorized.
 9. Keep issues and PR descriptions self-contained. Post exact commands, hashes, conclusions, and falsified hypotheses.
 10. Update compatibility docs and representative screenshots when a title reaches a new visible checkpoint.
-11. Rebase or restart long-lived investigation branches from current master before they drift.
+11. Rebase or restart long-lived investigation branches from current `main` before they drift.
 12. Stop stale processes and keep evidence off the repository and off RAM-backed `/tmp`.
 
 The current user explicitly authorized the orchestrator/subagent arrangement as pair programming and allowed the
@@ -818,7 +818,7 @@ authorization: if a future user has not granted it, follow the independent-revie
 Every game subagent should receive and follow this contract:
 
 - Work only in the assigned private worktree and worktree-local build directory.
-- Start from the exact remote master SHA supplied by the orchestrator; report branch, head, merge-base, and status.
+- Start from the exact remote `main` SHA supplied by the orchestrator; report branch, head, merge-base, and status.
 - Read the title issue and status docs before running a new experiment.
 - State one falsifiable question before each run and the outcome that would distinguish the competing explanations.
 - Prefer immutable F9/timeline/capsule evidence and offline `gpu_replay` over repeated game boots.
@@ -839,9 +839,9 @@ Every game subagent should receive and follow this contract:
 Never build or edit in the shared checkout. A typical assignment begins with:
 
 ```bash
-git fetch origin master
+git fetch origin main
 git worktree add .claude/worktrees/<agent-title> \
-  -b investigate/<title-question> origin/master
+  -b investigate/<title-question> origin/main
 cd .claude/worktrees/<agent-title>
 git status --short --branch
 git rev-parse HEAD
@@ -857,7 +857,7 @@ TMPDIR="$PWD/prosper/build-linux/tmpdir" \
   cmake --build prosper/build-linux -j6
 ```
 
-Before publishing, fetch master, inspect divergence, synchronize when needed, rerun the relevant checks on the exact
+Before publishing, fetch `main`, inspect divergence, synchronize when needed, rerun the relevant checks on the exact
 head, and report:
 
 ```text
@@ -1155,7 +1155,7 @@ Practical consequences for any routed run on a developer's desktop:
 
 ## Recently merged foundation
 
-These changes are already on current master and should not be reimplemented:
+These changes are already on current `main` and should not be reimplemented:
 
 | PR | Merge commit | Result |
 |---|---|---|
@@ -1976,7 +1976,7 @@ titles beyond the lane that found it.
 
 ## Ready-to-send subagent prompts
 
-Give every agent: its worktree path, its branch, the exact `origin/master` SHA, the dump root, the **distrobox**
+Give every agent: its worktree path, its branch, the exact `origin/main` SHA, the dump root, the **distrobox**
 build command, and the instruction to keep evidence under `~/` and out of `/tmp`, the repo, and public text.
 
 ### Astro Bot
@@ -2054,7 +2054,7 @@ A useful cadence is:
 3. Keep one integration step active at a time: inspect diff, verify exact head, publish PR, watch CI, merge.
 4. Let the other agents continue evidence gathering while CI runs, provided they are not modifying the same files or
    depending on the unmerged result.
-5. After every merge, fetch master and restart dependent branches from the new exact head.
+5. After every merge, fetch `main` and restart dependent branches from the new exact head.
 6. Report to the user in plain language: what became visible/correct, what was ruled out, what is running, and whether
    the GPU is shared or exclusive. Performance numbers are ballpark unless the GPU was isolated.
 
@@ -2065,7 +2065,7 @@ When an agent appears frozen, distinguish a real long computation from a helper 
 
 After a material event:
 
-- replace the exact master SHA;
+- replace the exact `main` SHA;
 - move merged work into the foundation table;
 - update the lane's “proven,” “falsified,” and “next” sections;
 - link the new issue comment/PR;
