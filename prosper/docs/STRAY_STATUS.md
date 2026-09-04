@@ -934,10 +934,16 @@ stages build their own descriptor at runtime — `s_load_dwordx4 s[4:7], s[12:13
 key and the SRSRC range is rewritten by the shader itself. See § *Ruled out* for the full
 disassembly and why the direct-SGPR fallbacks are correctly suppressed.
 
-**Why this is the thing to work on, in one number:** `shader-recompile` discards **~3800 of 8192** on
-the title screen against **7 of 1024** on calibration. That is not a difference of degree between the
-two screens; it is the difference between them, and the census table above is measured at the same
-cumulative total in both arms.
+**Why this is the thing to work on, with its denominators stated:** `shader-recompile` discards
+**~3800 of 8192** discarded draws on the title screen against **7 of 1024** on calibration — roughly
+**46%** against **0.7%**. That is not a difference of degree between the two screens; it is the
+difference between them.
+
+Note the two arms are read at **different** cumulative totals, 8192 and 1024, as the table's own first
+row shows. An earlier draft claimed they were "measured at the same cumulative total in both arms":
+this section's same-total rule governs the title-screen `PROSPER_NULL_PAGE=1` arms among themselves,
+and calibration is a separate earlier reference. The contrast survives being stated honestly — it did
+not need the false justification.
 
 ### What #3133 is worth here
 
@@ -1413,16 +1419,34 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   program=0x300ba70000 executed=15103 skipped=1 groups=640x1x1 local=64x1 threads=40960x1
   ```
 
-  One skip in 15,104. Nothing is being systematically dropped. The dispatch shape settles it twice
-  over: `640x1x1` groups of `64x1` is a **1-D** launch of 40,960 threads, not the ~`480x270` a
-  full-screen 4K pass would take, so this program is not a scene writer whatever its skip rate.
+  One skip in 15,104. Nothing is being systematically dropped. The dispatch shape points the same way
+  — `640x1x1` groups of `64x1` is a **1-D** launch of 40,960 threads, not the ~`480x270` a
+  full-screen 4K pass would take — but treat it as corroboration rather than a second proof: the
+  census stores the shape with `if (gx) { entry.gx = gx; … }`, which **overwrites**, so the printed
+  grid is the program's *last observed* launch and not necessarily the skipped one. The 1-in-15,104
+  ratio carries the row on its own.
 
-  **The cross-check is the strongest part, and it was free.** Read at the same cumulative total the
-  calibration arm used (32,768 decisions — the methodology § *The title screen's REAL numbers*
-  requires), the two screens report **`executed=7455 skipped=2`** (calibration) against
-  **`executed=7455 skipped=1`** (title). Identical to the dispatch. So compute behaviour does not
-  distinguish the screen that renders correctly from the one that is black, and no fix aimed at
-  compute skipping can explain the difference. Two independent runs agreed. #3126, #2932.
+  **A draft of this row called the following a free cross-check and leaned on it. It is withdrawn as
+  an argument and kept only as an observation, because it proves something much weaker than it
+  appears to.** At 32,768 decisions the title run reports `executed=7455 skipped=1` against the
+  calibration figure of `executed=7455 skipped=2` — matching **to the digit**. Two different screens
+  running two different workloads do not produce byte-identical per-program counters by coincidence;
+  an exact match means the interval measured is **common to both**, i.e. shared boot code before
+  either screen's behaviour begins. Read that way it is a useful signature — the runs are still in
+  common code at that ordinal — and not evidence about the screens at all.
+
+  Three separate faults in the draft, each enough on its own:
+  - **32,768 is the MIDPOINT of the title run's 65,536**, so it read that arm halfway — trap 257,
+    whose remedy is "take the census from the block printed at exit". The draft cited trap 257
+    approvingly elsewhere in the same change.
+  - **The calibration figure carries no cumulative total in this doc**, so "the same total the
+    calibration arm used" is not in the record. If that figure was calibration's *exit*, the
+    comparison is a whole run against half a run.
+  - **§ *The title screen's REAL numbers* governs the DRAWS-DISCARDED census, not compute decisions**,
+    so invoking its same-total methodology here is a cross-census substitution.
+
+  **None of this touches the falsification**, which rests on the title run's own exit block alone:
+  65,536 decisions, 21 programs, one skip in 15,104. #3126, #2932.
 - **MIMG `SRSRC` is not a user-SGPR index.** It names any SGPR, so a scan that treats every SRSRC as
   a user-data slot reports mostly false positives — scratch registers the shader loaded a descriptor
   into. An earlier list of "bases missing from the table" derived that way is discarded. #3126.
