@@ -1427,6 +1427,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_event_drain PRIVATE prosper_core)
   add_test(NAME savedata_event_drain_code COMMAND test_savedata_event_drain)
 
+  # libScePsml must report failure rather than the dispatcher's default SCE_OK: the guest reads an
+  # out-struct prosper never wrote and allocates from it (PPSA20447). Pure, no dump, no device.
+  add_executable(test_psml_unimplemented tests/hle/service/test_psml_unimplemented.cpp)
+  target_link_libraries(test_psml_unimplemented PRIVATE prosper_core)
+  add_test(NAME psml_unimplemented COMMAND test_psml_unimplemented)
+
   add_executable(test_translate_sandbox tests/hle/test_translate_sandbox.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_translate_sandbox PRIVATE tests)
