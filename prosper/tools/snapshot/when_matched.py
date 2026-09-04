@@ -41,7 +41,15 @@ def decode_luma(value):
 
 
 def structural_similarity(left, right):
-    """SSIM over two equally sized luminance signatures -- the checker's own formula."""
+    """SSIM over two equally sized luminance signatures -- the checker's own formula.
+
+    Kept byte-for-byte equivalent to `snapshot.py`'s `structural_similarity`, INCLUDING its clamp to
+    [-1, 1]. The clamp is defensive rather than load-bearing (SSIM cannot leave that interval
+    mathematically), but this tool's entire value is that it cannot disagree with the checker about
+    what "matching" means, and a scorer that agrees only up to a clamp is a second oracle waiting to
+    produce an unresolvable disagreement. Note `snaps.py` carries a copy WITHOUT the clamp; if these
+    three ever need to diverge, they should stop being copies instead.
+    """
     if len(left) != len(right) or not left:
         raise ValueError("SSIM inputs must have the same non-zero length")
     count = len(left)
@@ -55,7 +63,8 @@ def structural_similarity(left, right):
     denominator = (mean_left ** 2 + mean_right ** 2 + c1) * (var_left + var_right + c2)
     if denominator == 0:
         return 1.0
-    return ((2 * mean_left * mean_right + c1) * (2 * covariance + c2)) / denominator
+    return max(-1.0, min(1.0,
+        ((2 * mean_left * mean_right + c1) * (2 * covariance + c2)) / denominator))
 
 
 def coverage(record):

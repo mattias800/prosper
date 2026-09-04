@@ -42,6 +42,41 @@ Neither entry means the guarded title is broken, and neither should be "fixed" b
 threshold — that trades a false alarm for a guard that asserts less. Both need a re-profiled window
 against the current boot, which is its own reviewed baseline change.
 
+### A wall-clock-anchored guard measures a TIMELINE as much as a picture
+
+`terminator-boot` above is the recorded instance, but it is not a special case, and reading it as one
+costs the next lane a session. Every guard here anchors its evidence window on **wall-clock seconds**
+from launch, and its route drives input on wall-clock seconds too. So the window does not ask "is the
+title drawing the reviewed scene?" — it asks "is the title drawing the reviewed scene **at second
+N**?", and those come apart the moment anything changes how long the boot takes.
+
+**The trap is the direction.** The change that moves a boot's duration is very often a *fix*. On
+2026-09-05 (#2899) `sceAvPlayerJumpToTime` began publishing the seek-completion notification it had
+never sent, so *Space Adventure Cobra*'s opening movies **played** instead of timing out after 15 s
+each — strictly more correct, and it moved everything downstream of them. A guard that reddens
+because the emulator got better is a guard somebody will eventually silence for the wrong reason.
+
+**What this looks like from the outside**, and why the counters cannot tell you: the frames are a
+**real rendered state of the game** that is simply not the guarded one. On the same day
+`messenger-scene` failed with `non-black coverage matches 0` and `SSIM ≈ -0.007` against a 0.43
+floor — which reads as a collapse, and was a **dialogue screen**: two portraits in bordered boxes
+with text beside them, on black, i.e. mostly black *by design*. `320/320 source-distinct,
+pixel-distinct=163, guest=running` says the same thing from the other side.
+"the route is somewhere else" and "the renderer died" produce indistinguishable counters and demand
+opposite responses.
+
+So, before treating any structure- or coverage-only failure as a regression:
+
+1. **Open the retained PNGs.** Ask what state the game is in, not whether the number is low.
+2. **Run `when_matched.py`** (below) over a full-timeline capture. It answers whether the run reaches
+   the reviewed state at *any* second, which is the question the windowed verdict cannot ask.
+3. **Only then** decide. A high score outside the window is a timeline shift and the ROUTE is what
+   drifted; nothing above the floor anywhere is not a timeline shift, whatever the frames look like.
+
+And the fix for a drifted guard is to **re-anchor the route on flips**, not to re-capture the
+references: flip-anchored routes survive a timing change, wall-clock ones do not, and re-capturing
+keeps the guard red-free while quietly deleting the state it was built to protect.
+
 ## When a guard fails on STRUCTURE only: `when_matched.py`
 
 `FAIL — structural matches 0 < 21` is the one verdict that does not say what happened. The title
@@ -330,3 +365,25 @@ follow the order above rather than the obvious one.
 - `PROSPER_BOOT_TRACE`: `boot_trace` path; defaults to `build-linux/boot_trace`.
 - `PROSPER_SCREENSHOT`: presented-capture frontend; defaults to
   `build-linux/screenshot`.
+
+**A guard inherits the shell that launched it.** `snapshot.py` builds the child environment as
+`env = dict(os.environ)` and *then* applies the guard's own overrides, so **every `PROSPER_*` you
+have exported goes into the run** — the guard only controls the handful of variables it sets itself.
+That is useful (it is how a single behavioural line can be A/B-ed through a temporary gate without
+maintaining two builds) and it is a foot-gun in exactly the same breath: with several lanes on one
+machine, one agent's exported diagnostic can redden another agent's gate with no trace in either
+one's notes. `PROSPER_AVPLOG` in a shell that then runs a guard adds per-call logging to the hot path
+of a timing-sensitive capture; `PROSPER_NULL_PAGE`, `PROSPER_HWBP` and the render-scale knobs change
+the run outright.
+
+**Two commands, before quoting any guard result:**
+
+```bash
+env | grep '^PROSPER'                                   # your shell, before you start
+tr '\0' '\n' < /proc/<capture-pid>/environ | grep '^PROSPER'   # what the run actually got
+```
+
+Record the second beside the result. Recorded as a **near miss** rather than a scar: on 2026-09-05
+(#2899) a lane checked this on a live 320 s arm it had already protected with whole-box exclusivity
+and found it clean — but it had been setting `PROSPER_AVPLOG` all evening, in per-command `env`
+prefixes rather than exports, and nothing but that habit stood between it and a contaminated arm.
