@@ -204,6 +204,54 @@ int main() {
         0xbf810000u,                            // pc7: s_endpgm
     };
 
+    // ARM F (#3308) — a regression pin for the LOWER bound, and READ THE LIMIT BEFORE TRUSTING IT.
+    //
+    // A save into s0, then a value-less write to the same register on every path
+    // (`s_and_b64 s[0:1], exec, exec` is the B64 mask logical family: it publishes `sreg_bool` and
+    // ERASES `sreg`), then a read of s0 two blocks later. The emitter's token survives a value-less
+    // write — its only erase is `rdna2_emit_alu.cpp:1354`, a SOP1 generic-path write — so the read
+    // must still be refused, and this arm pins that it is.
+    //
+    // WHAT IT DOES NOT DO, measured rather than assumed: **it does not discriminate a KILL.**
+    // Re-introducing a `for_each_scalar_write` KILL into the entry-M0 dataflow leaves this arm
+    // GREEN. The refusal then comes from the B64 mask domain instead — `operand_bits`' mask-base
+    // guard refuses the same read for its own reason — so the arm cannot tell the token from the
+    // mask. Three placements were tried and all three fail to discriminate, for three different
+    // reasons worth recording:
+    //
+    //   write and read in ONE block   -> the block-entry set is never consulted; the emitter's own
+    //                                    within-block state decides. Green under the KILL.
+    //   write behind one arm of an if -> the UNION join restores the token from the branch-around
+    //                                    edge. Green under the KILL.
+    //   write unconditional, read in a later block (this one)
+    //                                 -> the KILL does drop the token, and the mask domain refuses
+    //                                    the read anyway. Green under the KILL.
+    //   `s_getpc_b64` instead, to get a value-less write that is NOT a mask
+    //                                 -> the shell refuses `op=0x1f` at the write itself (pc=6), so
+    //                                    the read is never reached.
+    //
+    // That is not a licence to add a KILL. It means the hazard a KILL creates — `load_state` gives
+    // every referenced scalar a Function-variable value, `save_state` stores ZERO for a written
+    // register with no `state.sreg` entry, and `operand_bits` consults `rs.sreg` first, so a dropped
+    // token reads back as 0 with `ok` TRUE — is reachable only through the GAP in the mask domain's
+    // MUST/equality join, where a register is a mask on one edge and data on another. Constructing
+    // that gap is a larger fixture than this file wants, and the transform does not need a KILL, so
+    // the dataflow simply has none. See the LOWER-bound paragraph in `rdna2_emit_cfg.cpp`.
+    const uint32_t save_then_valueless_write_then_read[] = {
+        0xBE800385u,                            // pc0:  s_mov_b32 s0, 5
+        0xbf068004u,                            // pc1:  s_cmp_eq_u32 s4, 0
+        0xbf840001u,                            // pc2:  s_cbranch_scc0 -> pc4
+        0xBE80037Cu,                            // pc3:  s_mov_b32 s0, m0      (the save)
+        0xd7600002u, 0x00010100u,               // pc4:  v_readlane_b32 s2, v0, 0
+        0x87807e7eu,                            // pc6:  s_and_b64 s[0:1], exec, exec  (VALUE-LESS,
+                                                //       unconditional: on every path to pc10)
+        0xbf068004u,                            // pc7:  s_cmp_eq_u32 s4, 0
+        0xbf840001u,                            // pc8:  s_cbranch_scc0 -> pc10  (splits pc10 off)
+        0x7e040281u,                            // pc9:  v_mov_b32 v2, 1
+        0x4A020000u,                            // pc10: v_add_nc_u32 v1, s0, v0   (the READ)
+        0xbf810000u,                            // pc11: s_endpgm
+    };
+
     const auto arm = compile(save_then_read_across_edge,
                              std::size(save_then_read_across_edge), 0x32030001ull);
     const auto control_a = compile(ordinary_write_across_edge,
@@ -216,6 +264,8 @@ int main() {
                                std::size(entry_read_before_any_save), 0x32030005ull);
     const auto arm_e = compile(entry_read_then_post_save_read,
                                std::size(entry_read_then_post_save_read), 0x32030006ull);
+    const auto arm_f = compile(save_then_valueless_write_then_read,
+                               std::size(save_then_valueless_write_then_read), 0x32030007ull);
 
     // The controls first: an arm whose controls have not been read is a reject with no denominator.
     CHECK(!control_a.empty(),
@@ -261,6 +311,18 @@ int main() {
           "#3308: arm E refused at the READ PAST THE SAVE, not at the entry-block read at pc=0");
     if (fails) printf("  [info] arm E reject reason: '%s'\n", reason_e.c_str());
 
+    // Arm F (#3308) — the lower bound.
+    CHECK(arm_f.empty(),
+          "#3308: a save followed by a value-less write and a cross-block read is REFUSED (a "
+          "regression pin -- it does NOT discriminate a KILL; see the arm's comment)");
+    const std::string reason_f = last_terminal_reject_reason(0x32030007ull);
+    CHECK(has(reason_f, "cfg-recompile-reject"),
+          "#3308: arm F's refusal came from the CFG dispatcher itself");
+    CHECK(has(reason_f, "pc=10"),
+          "#3308: arm F refused at the READ two blocks past the save, not at the value-less write "
+          "or the region shape -- pinning WHERE, since it cannot pin WHY");
+    if (fails) printf("  [info] arm F reject reason: '%s'\n", reason_f.c_str());
+
     // Measured mutation signatures, so a future reader can tell a real regression from a fixture
     // that drifted. Every one built cleanly (rc=0) before being believed.
     //
@@ -276,7 +338,13 @@ int main() {
     //                                             ahead of it. The four #3203 arms and all five
     //                                             controls stay green, which is why #3203 alone
     //                                             could not see this.
-    //   stamp NO tokens at any block entry    -> 7 fails (rc=1): every #3203 arm plus arm E. Arm D
+    //   add a KILL on `for_each_scalar_write` -> ALL ARMS STAY GREEN, including arm F. Recorded
+    //   (the shape an earlier revision of #3308     because it is the opposite of what it looks like:
+    //   shipped, removed in review)                 no arm here discriminates that KILL, and arm F's
+    //                                               own comment says why for four placements. The KILL
+    //                                               is excluded by the LOWER-bound argument in
+    //                                               `rdna2_emit_cfg.cpp`, not by this file.
+    //   stamp NO tokens at any block entry    -> 8 fails (rc=1): every #3203 arm plus arms E and F. Arm D
     //                                             passes, correctly -- nothing rejects when the
     //                                             token is gone. The two signatures are disjoint in
     //                                             both directions, so neither arm is vacuous and

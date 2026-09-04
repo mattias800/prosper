@@ -1934,18 +1934,45 @@ bool emit_cfg_state_machine(
     // background it belongs to is #3126). It saves M0 into s14 at pc157 and pc274 -- and s14 is ALSO
     // the compute stage's workgroup-id X, so `v_lshl_add_u32 v11, s14, 3, v0` at pc4, the shader's
     // own global-thread-index computation four dwords into the program, read a token for a save 153
-    // dwords AHEAD of it and the whole dispatch was skipped.
+    // dwords AHEAD of it and the whole dispatch was skipped. Grand Theft Auto V and The Plucky
+    // Squire each have a kernel with the byte-identical defect.
     //
     // Narrow it to an entry-rooted forward MAY dataflow over the same CFG the mask analyses below
-    // walk. GEN is #3133's own save shape; KILL is any other scalar write to the word, applied in
-    // instruction order so a save and a later overwrite inside one block end the lifetime the save
-    // started. The join is a UNION and deliberately not the MUST/equality join the mask analyses
-    // use: the token is a MAY property whose whole purpose is to reject, so a register holding it on
-    // one edge and data on another must keep rejecting.
+    // walk: GEN on #3133's own save shape, a UNION join, and DELIBERATELY NO KILL. The two bounds
+    // that makes true are what the transform rests on, and both are unconditional:
+    //
+    //   UPPER  entry_m0_in[B] is a subset of `entry_m0_may_hold`, because the only insertion below
+    //          is GEN and GEN's predicate is the one that builds that set. So this can only REMOVE
+    //          tokens relative to #3133, and a removed token can never turn an accepted program into
+    //          a rejected one.
+    //   LOWER  entry_m0_in[B] contains every register whose token the EMITTER could hold live on
+    //          entry to B. The emitter creates a token only at a save (`rdna2_emit_alu.cpp:1337`)
+    //          and erases one in only one place (`:1354`); it never creates one anywhere else. A
+    //          union over every path from every save is therefore a superset of whatever the emitter
+    //          can be carrying, whichever path it arrived by.
+    //
+    // The LOWER bound is why there is no KILL, and it is not an oversight. Dropping a token that the
+    // emitter would keep is NOT the safe direction: `load_state` gives every referenced scalar a
+    // Function-variable value below, `save_state` stores ZERO for a written register with no
+    // `state.sreg` entry, and `operand_bits` consults `rs.sreg` first -- so a dropped token reads
+    // back as 0 with `ok` still true. That converts a loud reject into a silent fabricated word,
+    // which is the exact outcome `join_entry_m0` exists to prevent. A KILL would have to fire only
+    // on writes that provably PUBLISH a scalar value, and the emitter has no such predicate: its
+    // token survives every value-less write (a VOPC SGPR destination, the B32 mask logical family at
+    // `rdna2_emit_alu.cpp:1703-1707`, `s_getpc_b64`), staying live and rejecting. Killing on
+    // `for_each_scalar_write` would fire on all of those. #3133 chose that over-rejection knowingly
+    // -- "over-rejects rather than fabricates ... left as the safe direction" -- and without a KILL
+    // this dispatcher path now agrees with the emitter instead of being more permissive than it.
+    // A precise KILL wants a value-publishing predicate shared with `emit_alu`, so that the two
+    // cannot drift; that is follow-up work, not a thing to approximate here.
     std::vector<std::set<int>> entry_m0_in(starts.size());
     std::vector<bool> entry_m0_reachable(starts.size(), false);
     if (!entry_m0_may_hold.empty() && !starts.empty()) {
-        entry_m0_reachable.front() = true;   // the entry block's in-set stays EMPTY by construction
+        // Block 0 is the program entry, as it is for the mask analyses below. Its in-set starts
+        // empty and STAYS empty unless a back edge reaches it -- which is legal, and then the union
+        // below correctly puts the token back. The guarantee is "no save has executed on entry",
+        // not "this set is empty", and only the first is true by construction.
+        entry_m0_reachable.front() = true;
         std::vector<uint32_t> pending{0};
         while (!pending.empty()) {
             const uint32_t block = pending.back();
@@ -1954,13 +1981,13 @@ bool emit_cfg_state_machine(
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
-                if (in.pc < lo || in.pc >= hi || in.is_end) continue;
-                // Kill before gen, so the save's own destination write does not erase the token it
-                // is about to create.
-                for_each_scalar_write(in, [&](int base, uint32_t width) {
-                    for (uint32_t word = 0; word < width; ++word)
-                        tokens.erase(base + static_cast<int>(word));
-                }, proven_wave32_masks);
+                if (in.pc < lo || in.pc >= hi) continue;
+                // `is_end` is skipped rather than treated as a terminator, where the whole-stream
+                // scan at the MAY set above stops at the first one. That makes this set no smaller
+                // than it would otherwise be past an early `s_endpgm`, which is the direction the
+                // UPPER bound needs, so the two disagreeing here is safe in the one direction that
+                // matters.
+                if (in.is_end) continue;
                 if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
                     in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
                     in.dst.value <= 105)
@@ -3708,14 +3735,18 @@ bool emit_cfg_state_machine(
         else if (const auto terminal = block_for_pc.find(end_pc);
                  terminal != block_for_pc.end())
             entry_block = terminal->second;
-        // #3133's token, narrowed to the saves that can actually REACH this block entry. A block the
-        // walk never reached -- and the terminal call when `end_pc` maps to no block -- falls back
-        // to the whole-stream set, so the unknown case keeps #3133's conservative behaviour instead
-        // of silently dropping the token.
+        // #3133's token, narrowed to the saves that can actually REACH this block entry.
+        //
+        // The TERMINAL call (`dispatch == UINT32_MAX`) deliberately does not narrow. `end_pc` is
+        // inserted into `start_set` above, so its block lookup always succeeds and a `block_for_pc`
+        // fallback here would be dead code -- but the terminal case is not entered only from that
+        // block's CFG predecessors: waves reach it through `s_trap` and `proven_exit_target` edges
+        // this walk does not model. Use the whole-stream set there, which is #3133's behaviour and
+        // covers every one of them.
+        const bool narrow = dispatch != UINT32_MAX &&
+            entry_block != UINT32_MAX && entry_m0_reachable[entry_block];
         const std::set<int>& entry_m0_here =
-            (entry_block != UINT32_MAX && entry_m0_reachable[entry_block])
-                ? entry_m0_in[entry_block]
-                : entry_m0_may_hold;
+            narrow ? entry_m0_in[entry_block] : entry_m0_may_hold;
         for (int reg : entry_m0_here) {
             state.sreg.erase(reg);
             state.sreg_entry_m0.insert(reg);
