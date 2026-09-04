@@ -524,3 +524,36 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   may unblock some OTHER draw that shares it but addresses a genuinely single-mip resource; it does
   **not** close #3134 on its own. Full detail: `docs/RECOMPILER_REMAINING.md` § Ruled out. #3134,
   #2818.
+- **"The scanout buffer and the render targets are two virtual mappings of ONE physical allocation,
+  so the VA-keyed present match is the whole defect."** Falsified by direct resolution
+  (`PROSPER_TARGET_PHYS=1` plus the unconditional `[rtt] GUEST SCANOUT #N phys:` probe, both landed
+  with this row). This was the most attractive hypothesis available, because it would have made a
+  measured fact — prosper renders into `0x30…` while the guest flips `0x9fc0000000`, ~450 GiB apart
+  in VA — into a *bookkeeping* error with a fix prosper already had the machinery for. It is not:
+
+  | buffer | guest VA | physical |
+  | --- | --- | --- |
+  | flipped scanout | `0x9fc0000000` | **`0x230000`** (2.3 MB) |
+  | lowest render target | `0x30…` | `0x1e980000` (511 MB) |
+  | highest render target | `0x30…` | `0x79f20000` (2.0 GB) |
+
+  80,511 target resolutions, **0 unresolved** — so the census saw the whole population rather than a
+  sample that happened to miss the alias. The scanout sits ~509 MB *below* every render target. They
+  are separate physical allocations and nothing is aliased.
+
+  **What this leaves is narrower and better posed.** The guest composites into its own allocation and
+  moves it to scanout by a route prosper does not model, so the open question is *which packet does
+  that*, not how the present path matches addresses. Two further facts bound it: `select_present_source`
+  returns `None` (`px_front=none px_vo=none px_last=none`, `fresh=0 retained=0`), and
+  `videoout_buffer_authored_locked` reports `authored=0` for the flipped buffer — its bytes are
+  unchanged since registration. That second one is the load-bearing constraint, because the digest test
+  reads guest memory directly: **a GPU copy landing in guest memory would flip `authored` on its own.**
+  So the copy is not happening, not landing there, or not being executed by prosper at all.
+
+  **Two cautions for whoever picks this up.** Stray registers **two** scanout buffers,
+  `0x9fc0000000` and `0x9fc2000000` — a rotating set, which is the shape behind *Bendy and the Ink
+  Machine*'s black flicker (see the retained-frame comment in `present_extent.hpp`); only the first has
+  been probed, so "nothing ever writes scanout" is not yet safe to claim. And
+  `guest_write_watch_va_to_phys` returns the FIRST range containing the address without checking that
+  range is large enough for the access — fine for a probe, not for anything load-bearing.
+  #2932, #3126.
