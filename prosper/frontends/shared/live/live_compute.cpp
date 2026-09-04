@@ -384,17 +384,28 @@ void report_write_watch_census() {
 // than the one a status doc guessed at.
 prosper::frontend::ComputeImageBorrowCensus g_image_borrow_census;
 
+// The census stores both query results as bare ordinals so its header can stay free of every
+// dependency these two enums drag in. Pin the mapping where both are visible: a renumbering
+// upstream would otherwise silently re-label every authority bucket without touching a line here.
+static_assert(static_cast<uint8_t>(prosper::gpu::GuestGpuWriteQuery::Unchanged) == 0);
+static_assert(static_cast<uint8_t>(prosper::gpu::GuestGpuWriteQuery::Overlap) == 1);
+static_assert(static_cast<uint8_t>(prosper::gpu::GuestGpuWriteQuery::Unknown) == 2);
+static_assert(static_cast<uint8_t>(prosper::host::GuestWriteWatchQuery::Unchanged) == 0);
+static_assert(static_cast<uint8_t>(prosper::host::GuestWriteWatchQuery::Dirty) == 1);
+static_assert(static_cast<uint8_t>(prosper::host::GuestWriteWatchQuery::Unknown) == 2);
+
 bool image_borrow_census_report_enabled() {
     static const bool on = std::getenv("PROSPER_COMPUTE_BORROW_CENSUS") != nullptr;
     return on;
 }
 
 void report_image_borrow_census() {
-    // 2 KiB: four lines carrying eleven decline buckets, six outcome buckets, seven publish buckets
-    // and up to twenty-three key-field names. Truncation drops whole trailing lines, and the last
-    // line is the producer partition -- the half that separates "the key differs" from "nothing was
-    // ever published".
-    char line[2048];
+    // Sized by the header against a saturated census rather than by estimate: 2 KiB was thinner
+    // than its own comment implied -- four lines with every bucket and every key field non-zero
+    // reach roughly 1.7 KiB at seven-digit counters and exceed 2 KiB at nine, which would drop the
+    // producer partition exactly when the run had enough traffic to be worth reading. The formatter
+    // also announces truncation now, so a short report cannot read as an absent line.
+    char line[prosper::frontend::compute_image_borrow_census_report_bytes];
     const size_t used = prosper::frontend::format_compute_image_borrow_census(
         g_image_borrow_census.snapshot(), line, sizeof line);
     if (used) std::fwrite(line, 1, used, stderr);
@@ -2450,7 +2461,8 @@ struct VulkanComputeContext {
     // its own cost. #3307.
     bool borrow_cached_image_for_graphics(
         const ComputeImageCacheKey& key, VkImage& image, uint64_t& producer_command_order,
-        prosper::frontend::ComputeImageBorrowObservation* observation = nullptr) {
+        prosper::frontend::ComputeImageBorrowObservation* observation = nullptr,
+        bool scan_near_miss = false) {
         using Outcome = prosper::frontend::ComputeImageBorrowOutcome;
         const auto set_outcome = [&](Outcome outcome) {
             if (observation) observation->outcome = outcome;
@@ -2458,7 +2470,7 @@ struct VulkanComputeContext {
         const auto found = image_cache.find(key);
         if (found == image_cache.end()) {
             set_outcome(Outcome::NoCacheEntry);
-            if (observation && image_borrow_census_report_enabled())
+            if (scan_near_miss && observation && image_borrow_census_report_enabled())
                 scan_image_cache_for_near_miss(key, *observation);
             return false;
         }
@@ -2492,6 +2504,8 @@ struct VulkanComputeContext {
                 observation->submit_query = static_cast<uint8_t>(submit_query);
                 observation->watch_present = watch_consulted;
                 observation->watch_query = static_cast<uint8_t>(watch_query);
+                observation->export_snapshot_unjournaled =
+                    cached.graphics_export_snapshot.submit_serial == 0;
 #if defined(_WIN32)
                 observation->exact_mirror_supported = true;
 #endif
@@ -2515,6 +2529,13 @@ struct VulkanComputeContext {
     // only under PROSPER_COMPUTE_BORROW_CENSUS. The NEAREST entry wins: an address holding several
     // retained descriptors would otherwise report the union of their differences as if one entry
     // disagreed on everything.
+    //
+    // It takes no lock, and inherits the caller's discipline rather than establishing its own:
+    // `borrow_cached_image_for_graphics` already does an unlocked `find` and unlocked writes to the
+    // entry it returns. This is the only whole-container traversal on that path, so it is a longer
+    // window against a concurrent rehash than anything else there -- which is a second reason, on
+    // top of its cost, that it is reached only under PROSPER_COMPUTE_BORROW_CENSUS and never on a
+    // default launch.
     void scan_image_cache_for_near_miss(
         const ComputeImageCacheKey& key,
         prosper::frontend::ComputeImageBorrowObservation& observation) const {
@@ -10923,7 +10944,16 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     uint64_t producer_command_order = 0;
     prosper::frontend::ComputeImageBorrowObservation observation;
     bool borrowed = context->borrow_cached_image_for_graphics(
-        key, image, producer_command_order, &observation);
+        key, image, producer_command_order, &observation, /*scan_near_miss=*/true);
+    // Recorded HERE, against the exact key, and not from the final observation. The alias retry
+    // below rewrites `format` and `vk_format` by construction, so its field mask would report those
+    // two as differing on every miss whether or not they are the reason -- and the obvious response
+    // to that mask is to normalise the two fields the alias comment immediately below forbids
+    // normalising. The retry therefore asks for no scan at all, and `exact_key_scans` counts scans
+    // performed rather than misses observed. #3307 review.
+    if (observation.no_entry_scanned)
+        g_image_borrow_census.record_no_entry_scan(observation.no_entry_same_addr,
+                                                    observation.no_entry_field_diff_mask);
     // GTA V writes several full-resolution transition surfaces through integer storage images, then
     // samples the same bits through normalized, Float32, or packed R11 graphics views. The geometry
     // and allocation are identical; only the view's numeric interpretation differs. Retry the exact
@@ -10961,17 +10991,14 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
                 ? 1u : components);
         key = storage_image_cache_key(
             storage_identity, static_cast<uint32_t>(guest_bytes), producer_format);
-        // A fresh observation: the retry is a different key, and carrying the exact key's near-miss
-        // scan into it would attribute one lookup's field differences to the other's.
+        // A fresh observation: the OUTCOME must describe the attempt that actually decided the
+        // import. The near-miss scan is deliberately not requested for this key -- see above.
         observation = {};
         g_image_borrow_census.record_alias_retry();
         borrowed = context->borrow_cached_image_for_graphics(
-            key, image, producer_command_order, &observation);
+            key, image, producer_command_order, &observation, /*scan_near_miss=*/false);
     }
     g_image_borrow_census.record_outcome(observation, guest_bytes);
-    if (observation.no_entry_scanned)
-        g_image_borrow_census.record_no_entry_scan(observation.no_entry_same_addr,
-                                                    observation.no_entry_field_diff_mask);
     if (!borrowed) return false;
     try {
         auto lease = std::make_shared<BorrowedComputeImageLease>();

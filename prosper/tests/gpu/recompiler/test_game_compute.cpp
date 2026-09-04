@@ -2170,6 +2170,8 @@ int main() {
                 constexpr size_t kAuthorized = static_cast<size_t>(Publish::Authorized);
                 constexpr size_t kTileMode = static_cast<size_t>(Field::TileMode);
                 constexpr size_t kWidth = static_cast<size_t>(Field::Width);
+                constexpr size_t kFormat = static_cast<size_t>(Field::Format);
+                constexpr size_t kVkFormat = static_cast<size_t>(Field::VkFormat);
                 CHECK(census_after_hit.outcomes[kHit] == census_before.outcomes[kHit] + 1,
                       "the borrow census records the same-submit lease as a hit");
                 CHECK(census_after_hit.publishes[kAuthorized] >
@@ -2179,8 +2181,8 @@ int main() {
                           census_after_hit.outcomes[kNoEntry] + 1,
                       "a one-field key difference is recorded as a cache-entry miss");
                 // Float32x1 aliases to R32_UINT, so the importer retries under the producer
-                // identity before giving up. Pin that: the recorded observation is the RETRY's,
-                // and reading it as the exact key's would misattribute the format fields.
+                // identity before giving up. The retry is counted, and its key is deliberately NOT
+                // scanned.
                 CHECK(census_after_miss.alias_retries == census_after_hit.alias_retries + 1,
                       "the format-alias retry is counted separately from the outcome");
                 CHECK(census_after_miss.no_entry_same_addr ==
@@ -2193,6 +2195,85 @@ int main() {
                 CHECK(census_after_miss.key_field_diffs[kWidth] ==
                           census_after_hit.key_field_diffs[kWidth],
                       "the near-miss scan does not attribute a field that matched");
+                // The arm that pins WHICH key the mask describes, and the reason it exists: the
+                // alias retry rewrites `format` and `vk_format`, so recording the retry's mask
+                // instead of the exact key's would report those two as differing on a miss whose
+                // only real difference is `tile_mode`. Only the exact key is scanned, so both must
+                // be untouched. Without this pair the tile_mode/width arms above hold identically
+                // for either key and say nothing about attribution.
+                CHECK(census_after_miss.key_field_diffs[kFormat] ==
+                          census_after_hit.key_field_diffs[kFormat] &&
+                      census_after_miss.key_field_diffs[kVkFormat] ==
+                          census_after_hit.key_field_diffs[kVkFormat],
+                      "the near-miss mask is the exact key's, not the format-alias retry's");
+                // A scan is recorded per scan PERFORMED. The retry missed too and was not scanned,
+                // so exactly one scan is recorded against two NoCacheEntry outcomes' worth of
+                // lookups -- the distinction the counter's name now carries.
+                CHECK(census_after_miss.exact_key_scans == census_after_hit.exact_key_scans + 1,
+                      "one scan is recorded per exact-key lookup, not per miss observed");
+            }
+            {
+                // The classifier's eleven terms are proven equivalent to the chain they replaced by
+                // a 2048-case sweep in `test_compute_image_borrow_census` -- but that sweep operates
+                // on the abstract booleans. The ten hand-written `gates.* = <descriptor field>`
+                // assignments that PRODUCE those booleans are where a lost `!` would actually live,
+                // and nothing covered them. Drive nine of them from the real path, one field at a
+                // time off a descriptor that is otherwise known to import cleanly.
+                using Decline = prosper::frontend::ComputeImageImportDecline;
+                ShaderResource base = output;
+                base.cls = ResourceClass::Texture;
+                uint8_t host_bytes[4] = {};
+                struct WiringCase {
+                    const char* what;
+                    Decline want;
+                    void (*mutate)(ShaderResource&, uint64_t&, uint8_t*);
+                };
+                static const WiringCase wiring[] = {
+                    {"gpu_addr", Decline::NoGuestAddress,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) { r.gpu_addr = 0; }},
+                    {"class", Decline::NotTextureClass,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) {
+                         r.cls = ResourceClass::StorageImage; }},
+                    {"host_data", Decline::HostBackedData,
+                     [](ShaderResource& r, uint64_t&, uint8_t* host) { r.host_data = host; }},
+                    {"guest_bytes", Decline::GuestByteRange,
+                     [](ShaderResource&, uint64_t& bytes, uint8_t*) { bytes = 0; }},
+                    {"guest_bytes_wide", Decline::GuestByteRange,
+                     [](ShaderResource&, uint64_t& bytes, uint8_t*) {
+                         bytes = uint64_t(UINT32_MAX) + 1; }},
+                    {"shape", Decline::Shape,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) { r.img_dim = 4; }},
+                    {"mip_levels", Decline::MipLevels,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) { r.declared_mip_levels = 2; }},
+                    {"mip_tail", Decline::MipTail,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) { r.in_mip_tail = true; }},
+                    {"srgb", Decline::Srgb,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) { r.srgb = true; }},
+                    {"depth_compare", Decline::DepthCompare,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) { r.depth_compare = true; }},
+                    {"native_format", Decline::NativeFormat,
+                     [](ShaderResource& r, uint64_t&, uint8_t*) {
+                         r.format = DataFormat::Unorm8; r.num_components = 3; }},
+                };
+                for (const WiringCase& c : wiring) {
+                    ShaderResource probe = base;
+                    uint64_t bytes = probe.size;
+                    c.mutate(probe, bytes, host_bytes);
+                    const auto before = prosper::frontend::live_compute_image_borrow_census();
+                    prosper::frontend::LiveComputeImageImport unused_import;
+                    const bool imported_probe =
+                        prosper::frontend::import_live_compute_storage_image(
+                            probe, bytes, unused_import);
+                    const auto after = prosper::frontend::live_compute_image_borrow_census();
+                    const size_t want = static_cast<size_t>(c.want);
+                    const size_t accepted_bucket = static_cast<size_t>(Decline::None);
+                    if (imported_probe || after.declines[want] != before.declines[want] + 1 ||
+                        after.declines[accepted_bucket] != before.declines[accepted_bucket]) {
+                        std::printf("FAIL: import gate wiring for %s\n", c.what);
+                        ++fails;
+                    }
+                    ++checks;
+                }
             }
         }
     }

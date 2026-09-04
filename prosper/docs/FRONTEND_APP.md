@@ -492,9 +492,20 @@ watch said), and the producer's publish gate partitioned the same way. A zero bu
 Two of its fields answer questions nothing else can. On a lookup miss the variable additionally
 enables an O(cache) scan for an entry at the same guest address, which turns "nothing is cached
 under this key" into "an entry here disagrees on `tile_mode`" — the twenty-three-field cache key
-otherwise makes those indistinguishable. And `journal_unarmed` versus `journal_cross_submit` splits
-the `Unknown` that `guest_gpu_writes_since` returns for two structurally different reasons, which
-its own header warns cannot be told apart by a caller.
+otherwise makes those indistinguishable. **That field list belongs to the EXACT key only.** When the
+exact key misses, the importer retries under a format-*aliased* key, and that key rewrites `format`
+and `vk_format` by construction — so scanning it would report those two as differing on every miss
+whether or not they were the reason, and would point a reader at exactly the normalisation the alias
+arm forbids. The retry is therefore not scanned, which is also why `exact_key_scans` (scans
+performed) and `no_cache_entry` (final outcomes) are different numbers: read the field list against
+the former. And the `Unknown` that `guest_gpu_writes_since` returns —
+which its own header warns a caller cannot decompose — is split into the three parts that ARE
+separable from the borrow site: `journal_unarmed` (not armed on the consuming thread),
+`journal_unjournaled` (the producer's publish carried no submit serial, so it was stamped while the
+journal was inactive or already overflowed), and `journal_undecided` (armed, serial present — a
+different submit, or this submit's journal has since overflowed). The last name is deliberately
+vague, because it covers two causes this instrument cannot tell apart and a narrower name would be
+a claim rather than a count.
 
 Proven-full write-only storage targets at least 16 MiB do not copy their first successful result into
 an immediately redundant CPU source baseline. The submit journal remains the initial source authority;

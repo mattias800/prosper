@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace prosper::frontend {
 
@@ -165,11 +166,22 @@ struct ComputeImageBorrowObservation {
     bool watch_present = false;    // the entry carries an armed page watch
     uint8_t watch_query = 0;       // prosper::host::GuestWriteWatchQuery ordinal; watch_present only
     bool exact_mirror_supported = false; // the byte-mirror fallback exists (Windows only)
+    // The export snapshot carries submit serial 0, i.e. the PRODUCER's publish was not journaled
+    // at all -- the journal was inactive on the producing thread, or had already overflowed when
+    // it stamped. Distinct from "the serial differs", and it points at the producer rather than at
+    // the distance between the two.
+    bool export_snapshot_unjournaled = false;
 
-    // Filled only when the lookup found nothing AND the report is enabled: the cache was scanned
-    // for an entry at the same guest address, and `no_entry_field_diff_mask` names the fields the
-    // nearest such entry disagreed on. The importer tries two keys, so the caller records this once
-    // from the FINAL observation rather than per call.
+    // Filled only when the caller asked for a scan, the lookup found nothing, and the report is
+    // enabled: the cache was scanned for an entry at the same guest address, and
+    // `no_entry_field_diff_mask` names the fields the nearest such entry disagreed on.
+    //
+    // **The mask belongs to whichever key was passed in, and only the EXACT key's is recorded.**
+    // The importer tries a second, format-ALIASED key when the first misses, and that key rewrites
+    // `format` and `vk_format` by construction -- so its mask reports those two as differing on
+    // every miss whether or not they are the reason. A field list that names the probe rather than
+    // the descriptor is worse than none, because the obvious response to it is to normalise the two
+    // fields the alias arm's own comment forbids normalising. So the retry is not scanned at all.
     bool no_entry_scanned = false;
     bool no_entry_same_addr = false;
     uint32_t no_entry_field_diff_mask = 0;
@@ -305,16 +317,24 @@ struct ComputeImageBorrowCensusSnapshot {
     uint64_t hit_bytes = 0;        // guest bytes NOT decoded, because the borrow hit
     uint64_t miss_bytes = 0;       // guest bytes the graphics decode had to read instead
 
-    // (2), refined: of the misses that found no entry, how many had an entry at the same guest
-    // address under a different key. `no_entry_same_addr == 0` means the producer is absent, not
-    // that the key disagrees -- which is the whole distinction `STRAY_STATUS.md` guessed at.
-    uint64_t no_entry_scans = 0;
+    // (2), refined: of the EXACT-key lookups that found no entry, how many had an entry at the same
+    // guest address under a different key. `no_entry_same_addr == 0` means the producer is absent,
+    // not that the key disagrees -- which is the whole distinction `STRAY_STATUS.md` guessed at.
+    //
+    // `exact_key_scans` counts scans actually performed, and `key_field_diffs` is read against it,
+    // never against `outcomes[NoCacheEntry]`: the alias retry can miss without being scanned, so
+    // the two denominators are different numbers and only this one belongs to the field list.
+    uint64_t exact_key_scans = 0;
     uint64_t no_entry_same_addr = 0;
 
     // (4), refined.
-    uint64_t authority_journal_overlap = 0;      // a real guest write covered the range
-    uint64_t authority_journal_unarmed = 0;      // the journal is not armed on the consuming thread
-    uint64_t authority_journal_cross_submit = 0; // armed, but the export is from an earlier submit
+    // `guest_gpu_writes_since` answers Unknown while armed for more than one reason and its own
+    // header says the caller cannot tell them apart. These four are what CAN be told apart from
+    // the borrow site, named for exactly what each covers and no more.
+    uint64_t authority_journal_overlap = 0;      // Overlap: a real write covered the range
+    uint64_t authority_journal_unarmed = 0;      // the journal is not armed on the CONSUMING thread
+    uint64_t authority_journal_unjournaled = 0;  // the PRODUCER's publish carried no submit serial
+    uint64_t authority_journal_undecided = 0;    // armed, serial present: another submit, or overflow
     uint64_t authority_watch_absent = 0;
     uint64_t authority_watch_dirty = 0;
     uint64_t authority_watch_unknown = 0;
@@ -347,14 +367,17 @@ public:
         // the hit), so the partition below is over Overlap and Unknown only.
         if (observation.submit_query == 1) bump(authority_journal_overlap_);
         else if (!observation.journal_armed) bump(authority_journal_unarmed_);
-        else bump(authority_journal_cross_submit_);
+        else if (observation.export_snapshot_unjournaled) bump(authority_journal_unjournaled_);
+        else bump(authority_journal_undecided_);
         if (!observation.watch_present) bump(authority_watch_absent_);
         else if (observation.watch_query == 1) bump(authority_watch_dirty_);
         else bump(authority_watch_unknown_);
     }
 
+    // Call once per scan PERFORMED, at the point the scan is taken -- never from a later
+    // observation, which is how the exact key's result got replaced by the alias retry's.
     void record_no_entry_scan(bool same_address_entry, uint32_t field_diff_mask) {
-        bump(no_entry_scans_);
+        bump(exact_key_scans_);
         if (!same_address_entry) return;
         bump(no_entry_same_addr_);
         for (size_t i = 0; i < static_cast<size_t>(ComputeImageKeyField::Count); ++i)
@@ -385,11 +408,12 @@ public:
         out.lease_failures = get(lease_failures_);
         out.hit_bytes = get(hit_bytes_);
         out.miss_bytes = get(miss_bytes_);
-        out.no_entry_scans = get(no_entry_scans_);
+        out.exact_key_scans = get(exact_key_scans_);
         out.no_entry_same_addr = get(no_entry_same_addr_);
         out.authority_journal_overlap = get(authority_journal_overlap_);
         out.authority_journal_unarmed = get(authority_journal_unarmed_);
-        out.authority_journal_cross_submit = get(authority_journal_cross_submit_);
+        out.authority_journal_unjournaled = get(authority_journal_unjournaled_);
+        out.authority_journal_undecided = get(authority_journal_undecided_);
         out.authority_watch_absent = get(authority_watch_absent_);
         out.authority_watch_dirty = get(authority_watch_dirty_);
         out.authority_watch_unknown = get(authority_watch_unknown_);
@@ -400,6 +424,11 @@ public:
     }
 
 private:
+    // Relaxed, deliberately: these are counters, not a protocol. The consequence is that a
+    // `snapshot()` taken WHILE another thread is recording can observe a torn partition -- an
+    // outcome bumped before its authority sub-counter. Both readers here (the periodic report at a
+    // submit boundary, and the tests) are quiescent with respect to recording, and the partition
+    // sums are asserted only in that state. Do not turn a sum into a runtime invariant.
     static void bump(std::atomic<uint64_t>& counter) {
         counter.fetch_add(1, std::memory_order_relaxed);
     }
@@ -419,11 +448,12 @@ private:
     std::atomic<uint64_t> lease_failures_{0};
     std::atomic<uint64_t> hit_bytes_{0};
     std::atomic<uint64_t> miss_bytes_{0};
-    std::atomic<uint64_t> no_entry_scans_{0};
+    std::atomic<uint64_t> exact_key_scans_{0};
     std::atomic<uint64_t> no_entry_same_addr_{0};
     std::atomic<uint64_t> authority_journal_overlap_{0};
     std::atomic<uint64_t> authority_journal_unarmed_{0};
-    std::atomic<uint64_t> authority_journal_cross_submit_{0};
+    std::atomic<uint64_t> authority_journal_unjournaled_{0};
+    std::atomic<uint64_t> authority_journal_undecided_{0};
     std::atomic<uint64_t> authority_watch_absent_{0};
     std::atomic<uint64_t> authority_watch_dirty_{0};
     std::atomic<uint64_t> authority_watch_unknown_{0};
@@ -438,6 +468,19 @@ private:
 // never reached it look identical otherwise, and this project has already lost a night to exactly
 // that ambiguity -- a healthy zero on `[render-timing]`'s mprotect FAILURE counter, read as the
 // activity counter whose name shares its prefix further along the same line (#3307).
+//
+// The same rule applies to the report as a whole, which is why truncation is ANNOUNCED rather than
+// silent: a report cut short at the third line drops the producer partition, and the producer
+// partition is the half that separates "the consumer's key differs" from "nothing was ever
+// published". `compute_image_borrow_census_report_bytes` is sized for the worst case (every bucket
+// and every key field non-zero at twenty digits) and `test_compute_image_borrow_census` pins that
+// a saturated census fits, so the marker should never fire -- but a marker that never fires is
+// cheap and a missing line that reads as a zero is not.
+// Worst case, measured by the saturation arm in the test rather than estimated: eleven decline
+// buckets, six outcome buckets, seven publish buckets, twenty-three key-field names and twenty-two
+// scalars, every one of them a twenty-digit u64. 4 KiB clears it with room to spare.
+inline constexpr size_t compute_image_borrow_census_report_bytes = 4096;
+
 inline size_t format_compute_image_borrow_census(
     const ComputeImageBorrowCensusSnapshot& census, char* output, size_t capacity) {
     if (!output || !capacity) return 0;
@@ -487,16 +530,18 @@ inline size_t format_compute_image_borrow_census(
     const uint64_t authority =
         census.outcomes[static_cast<size_t>(ComputeImageBorrowOutcome::AuthorityChanged)];
     emit("[compute-borrow-census] running totals -- authority_changed=%llu journal_overlap=%llu "
-         "journal_unarmed=%llu journal_cross_submit=%llu watch_absent=%llu watch_dirty=%llu "
-         "watch_unknown=%llu | no_entry_scans=%llu same_addr=%llu",
+         "journal_unarmed=%llu journal_unjournaled=%llu journal_undecided=%llu "
+         "watch_absent=%llu watch_dirty=%llu "
+         "watch_unknown=%llu | exact_key_scans=%llu same_addr=%llu exact_key_fields:",
          (unsigned long long)authority,
          (unsigned long long)census.authority_journal_overlap,
          (unsigned long long)census.authority_journal_unarmed,
-         (unsigned long long)census.authority_journal_cross_submit,
+         (unsigned long long)census.authority_journal_unjournaled,
+         (unsigned long long)census.authority_journal_undecided,
          (unsigned long long)census.authority_watch_absent,
          (unsigned long long)census.authority_watch_dirty,
          (unsigned long long)census.authority_watch_unknown,
-         (unsigned long long)census.no_entry_scans,
+         (unsigned long long)census.exact_key_scans,
          (unsigned long long)census.no_entry_same_addr);
     for (size_t i = 0; i < static_cast<size_t>(ComputeImageKeyField::Count); ++i)
         if (census.key_field_diffs[i])
@@ -514,6 +559,19 @@ inline size_t format_compute_image_borrow_census(
     emit(" | renderer_accepted=%llu renderer_rejected=%llu\n",
          (unsigned long long)census.renderer_accepted,
          (unsigned long long)census.renderer_rejected);
+    // Announce truncation in the buffer itself. `used == capacity - 1` is exactly the saturated
+    // state, and a reader who sees a report end without the publish partition must be told the
+    // difference between "that line is absent" and "that line did not fit".
+    if (used == capacity - 1) {
+        constexpr char marker[] = "[compute-borrow-census] TRUNCATED\n";
+        constexpr size_t marker_bytes = sizeof marker - 1;
+        if (capacity > marker_bytes) {
+            std::memcpy(output + capacity - 1 - marker_bytes, marker, marker_bytes);
+        } else {
+            output[0] = '\0';
+            used = 0;
+        }
+    }
     return used;
 }
 

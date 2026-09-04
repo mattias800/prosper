@@ -181,29 +181,41 @@ int main() {
         unarmed.journal_armed = false;
         census.record_outcome(unarmed, 2048);
 
-        ComputeImageBorrowObservation cross;
-        cross.outcome = ComputeImageBorrowOutcome::AuthorityChanged;
-        cross.submit_query = 2;            // Unknown, but armed: the export is from another submit
-        cross.journal_armed = true;
-        cross.watch_present = true;
-        cross.watch_query = 1;             // Dirty
-        census.record_outcome(cross, 4096);
+        ComputeImageBorrowObservation undecided;
+        undecided.outcome = ComputeImageBorrowOutcome::AuthorityChanged;
+        undecided.submit_query = 2;        // Unknown, armed, and the export carries a serial
+        undecided.journal_armed = true;
+        undecided.watch_present = true;
+        undecided.watch_query = 1;         // Dirty
+        census.record_outcome(undecided, 4096);
+
+        // Armed, Unknown, and the export snapshot carries NO serial: the producer's publish was
+        // never journaled. Separate bucket, because it points at the producer rather than at the
+        // distance between producer and consumer, and those have different fixes.
+        ComputeImageBorrowObservation unjournaled;
+        unjournaled.outcome = ComputeImageBorrowOutcome::AuthorityChanged;
+        unjournaled.submit_query = 2;
+        unjournaled.journal_armed = true;
+        unjournaled.export_snapshot_unjournaled = true;
+        census.record_outcome(unjournaled, 8192);
 
         const auto snapshot = census.snapshot();
         CHECK(snapshot.authority_journal_overlap == 1);
         CHECK(snapshot.authority_journal_unarmed == 1);
-        CHECK(snapshot.authority_journal_cross_submit == 1);
-        CHECK(snapshot.authority_watch_absent == 2);
+        CHECK(snapshot.authority_journal_undecided == 1);
+        CHECK(snapshot.authority_journal_unjournaled == 1);
+        CHECK(snapshot.authority_watch_absent == 3);
         CHECK(snapshot.authority_watch_dirty == 1);
         CHECK(snapshot.authority_watch_unknown == 0);
-        CHECK(snapshot.miss_bytes == 1024 + 2048 + 4096);
+        CHECK(snapshot.miss_bytes == 1024 + 2048 + 4096 + 8192);
         CHECK(snapshot.hit_bytes == 0);
         // The journal partition and the watch partition each sum to the denominator, independently.
         const uint64_t authority =
             snapshot.outcomes[static_cast<size_t>(ComputeImageBorrowOutcome::AuthorityChanged)];
-        CHECK(authority == 3);
+        CHECK(authority == 4);
         CHECK(snapshot.authority_journal_overlap + snapshot.authority_journal_unarmed +
-              snapshot.authority_journal_cross_submit == authority);
+              snapshot.authority_journal_unjournaled +
+              snapshot.authority_journal_undecided == authority);
         CHECK(snapshot.authority_watch_absent + snapshot.authority_watch_dirty +
               snapshot.authority_watch_unknown == authority);
     }
@@ -225,20 +237,21 @@ int main() {
         // partition stops being one.
         CHECK(snapshot.authority_journal_overlap == 0);
         CHECK(snapshot.authority_journal_unarmed == 0);
-        CHECK(snapshot.authority_journal_cross_submit == 0);
+        CHECK(snapshot.authority_journal_undecided == 0);
+        CHECK(snapshot.authority_journal_unjournaled == 0);
         CHECK(snapshot.authority_watch_absent == 0);
     }
 
     // ---- 6. The near-miss key scan ---------------------------------------------------------
     {
         ComputeImageBorrowCensus census;
-        census.record_no_entry_scan(false, 0);   // nothing at this address at all
+        census.record_no_entry_scan(false, 0);   // scanned; nothing at this address at all
         const uint32_t tile_and_pitch =
             (1u << static_cast<uint32_t>(ComputeImageKeyField::TileMode)) |
             (1u << static_cast<uint32_t>(ComputeImageKeyField::LinearRowPitch));
         census.record_no_entry_scan(true, tile_and_pitch);
         const auto snapshot = census.snapshot();
-        CHECK(snapshot.no_entry_scans == 2);
+        CHECK(snapshot.exact_key_scans == 2);
         CHECK(snapshot.no_entry_same_addr == 1);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::TileMode)] == 1);
         CHECK(snapshot.key_field_diffs[static_cast<size_t>(ComputeImageKeyField::LinearRowPitch)] == 1);
@@ -274,12 +287,54 @@ int main() {
         CHECK(text.find("hit=0 (0.0%)") != std::string::npos);
         CHECK(text.find("authority_changed=1 (100.0%)") != std::string::npos);
         CHECK(text.find("journal_unarmed=1") != std::string::npos);
+        CHECK(text.find("journal_unjournaled=0") != std::string::npos);
+        CHECK(text.find("journal_undecided=0") != std::string::npos);
         CHECK(text.find("alias_retry=1") != std::string::npos);
         CHECK(text.find("publish_evaluated=1") != std::string::npos);
         CHECK(text.find("no_sampled_usage=1 (100.0%)") != std::string::npos);
         CHECK(text.find("renderer_rejected=1") != std::string::npos);
         // Four lines, one report.
         CHECK(std::count(text.begin(), text.end(), '\n') == 4);
+    }
+
+    // ---- 7b. A saturated census fits the production buffer, and truncation is ANNOUNCED ----
+    // The production report writes into a fixed `char[compute_image_borrow_census_report_bytes]`.
+    // Sizing it by estimate is how the previous 2 KiB buffer came to be thinner than its own
+    // comment claimed, so pin the worst case instead: every counter at its maximum, which makes
+    // every bucket and every key-field name print at twenty digits.
+    {
+        prosper::frontend::ComputeImageBorrowCensusSnapshot saturated;
+        constexpr uint64_t big = UINT64_MAX;
+        for (auto& value : saturated.declines) value = big;
+        for (auto& value : saturated.outcomes) value = big;
+        for (auto& value : saturated.publishes) value = big;
+        for (auto& value : saturated.key_field_diffs) value = big;
+        saturated.imports = big; saturated.alias_retries = big; saturated.lease_failures = big;
+        saturated.hit_bytes = big; saturated.miss_bytes = big;
+        saturated.exact_key_scans = big; saturated.no_entry_same_addr = big;
+        saturated.authority_journal_overlap = big; saturated.authority_journal_unarmed = big;
+        saturated.authority_journal_unjournaled = big; saturated.authority_journal_undecided = big;
+        saturated.authority_watch_absent = big; saturated.authority_watch_dirty = big;
+        saturated.authority_watch_unknown = big;
+        saturated.renderer_accepted = big; saturated.renderer_rejected = big;
+        saturated.publish_evaluated = big;
+
+        char full[prosper::frontend::compute_image_borrow_census_report_bytes];
+        const size_t used = format_compute_image_borrow_census(saturated, full, sizeof full);
+        const std::string text(full, used);
+        CHECK(used < sizeof full - 1);
+        CHECK(std::count(text.begin(), text.end(), '\n') == 4);
+        CHECK(text.find("TRUNCATED") == std::string::npos);
+        // ...and the marker is not decorative: force the same report into a buffer that cannot
+        // hold it and the reader must be told, rather than reading a dropped producer partition as
+        // an absent one.
+        char cramped[600];
+        const size_t cramped_used =
+            format_compute_image_borrow_census(saturated, cramped, sizeof cramped);
+        const std::string cramped_text(cramped, cramped_used);
+        CHECK(cramped_used == sizeof cramped - 1);
+        CHECK(cramped_text.find("TRUNCATED") != std::string::npos);
+        CHECK(cramped[cramped_used] == '\0');
     }
 
     // ---- 8. Truncation is bounded, not corrupting ------------------------------------------
