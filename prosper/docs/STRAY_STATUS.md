@@ -1159,7 +1159,14 @@ the same guest state across runs.
     shows the whole chain hanging off `s_load_dwordx4 s[16:19], s[14:15]`, whose base reads
     `0x0004dfac00000001` — `addr … unreadable` — after which every scalar is `ok=0` and the fetch is
     "left unresolved (not folded to 0)".
-  - **This is #305, on a third title.** `PROSPER_UDPROV=1` shows the draw's own bind writing twelve
+  - **This is #305, on a third title — and note WHICH sites, because this file also withdraws a #305
+    attribution a few rows below.** That withdrawal covers the **five unresolved IMAGE ops** (read at
+    user-data dword 0 of a declared `[0,20)` window, `[udcand]` reporting `FITS-BLOCK`, so the
+    larger-block-than-window condition is absent there). This row covers the **VERTEX stages**, whose
+    window is `USER_SGPR = 8`. Both cite the same `0x0004dfac` constant family, so the two are easy to
+    confuse and the verdicts do not transfer in either direction: do not use the image withdrawal to
+    dismiss this row, and do not use this row to revive the image attribution.
+    `PROSPER_UDPROV=1` shows the draw's own bind writing twelve
     contiguous user dwords in one direct `SET_SH_REG`, while `RSRC2_GS.USER_SGPR = 8` equals the
     shader's `user_data_range_end = 8`. The two mapped 64-bit pointers the shader wants sit at dwords
     8 and 10, outside that window; dwords 6:7 hold the `num_records`/`dword3` tail of the preceding
@@ -1445,8 +1452,14 @@ evidence nor falsifications for it. Re-run each with `PROSPER_NULL_PAGE=1` and a
   - **§ *The title screen's REAL numbers* governs the DRAWS-DISCARDED census, not compute decisions**,
     so invoking its same-total methodology here is a cross-census substitution.
 
-  **None of this touches the falsification**, which rests on the title run's own exit block alone:
-  65,536 decisions, 21 programs, one skip in 15,104. #3126, #2932.
+  **None of this touches the falsification**, which rests on the title run's own **last census block**
+  alone: 65,536 decisions, 21 programs, one skip in 15,104. Note "last block", not "exit block" —
+  a draft said the latter and **there is no exit block**: the census emits only at powers of two
+  (no `atexit`, no separate report), so decisions after 65,536 are unreported. The ratio is far too
+  extreme for an unmeasured tail to threaten, but the instrument does not have the property the
+  phrase claimed. Giving this census an at-exit flush is the natural follow-up, and it is also the
+  other half of trap 257's own remedy — *"take the census from the block printed at exit"* — which is
+  currently **not available for this instrument**. #3126, #2932.
 - **MIMG `SRSRC` is not a user-SGPR index.** It names any SGPR, so a scan that treats every SRSRC as
   a user-data slot reports mostly false positives — scratch registers the shader loaded a descriptor
   into. An earlier list of "bases missing from the table" derived that way is discarded. #3126.
