@@ -19,6 +19,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-04
+
+### Stray's missing world is not an address-matching bug, and now we can prove it
+
+No picture with this one — it is a dead end worth recording. Stray's main menu draws a full 3D scene
+into prosper's own render targets and then presents only the UI bar over black, and the tempting
+explanation was that the buffer the game flips to the screen and the buffers we render into are two
+names for the same memory, which we were simply failing to connect. They are not: measured directly,
+they sit half a gigabyte apart in physical memory, across 80,511 resolutions with nothing left
+unresolved. So the game really is copying its finished frame somewhere else, by a route we do not yet
+follow — which is a narrower question than the one we started with.
+
 ## 2026-09-02
 
 ### Astro Bot's world map is lit, and no longer takes the GPU down with it
