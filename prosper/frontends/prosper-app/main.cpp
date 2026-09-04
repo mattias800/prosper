@@ -2039,10 +2039,15 @@ int main(int argc, char** argv) {
     const uint64_t renderdocMaxItersParsed =
         prosper::frontend::parse_capture_frame(getenv("PROSPER_RENDERDOC_MAX_ITERS"));
     const uint64_t renderdocMaxIterations = renderdocMaxItersParsed ? renderdocMaxItersParsed : 2000;
-    if (getenv("PROSPER_RENDERDOC_MAX_ITERS") && !renderdocMaxItersParsed)
-        std::fprintf(stderr, "[renderdoc] PROSPER_RENDERDOC_MAX_ITERS is not a usable count; using "
-                             "the default cap of %llu iterations\n",
-                     (unsigned long long)renderdocMaxIterations);
+    if (const char* mi = getenv("PROSPER_RENDERDOC_MAX_ITERS"); mi && !renderdocMaxItersParsed)
+        // Echo the offending value and the accepted shape, matching PROSPER_CAPTURE_BUNDLE_MAX_MB
+        // at main.cpp:1750 -- the repo's existing convention for a malformed BOUND, as opposed to a
+        // malformed trigger. "not usable" without the value leaves the author guessing which of
+        // their variables was wrong.
+        std::fprintf(stderr, "[renderdoc] ignoring malformed PROSPER_RENDERDOC_MAX_ITERS=\"%s\" "
+                             "(expected a positive iteration count); using the default cap of "
+                             "%llu\n",
+                     mi, (unsigned long long)renderdocMaxIterations);
     const bool renderdocWanted = scheduledRdocFrame != 0 || automaticRdocAfter.delay_ns() != 0;
     if (renderdocWanted) {
         auto& rdoc = prosper::frontend::RenderDocCapture::instance();
@@ -2288,13 +2293,27 @@ int main(int argc, char** argv) {
                                  "[renderdoc] capture ABANDONED after %llu iterations (closed by "
                                  "%s) -- RenderDoc recorded no API work in the span\n",
                                  (unsigned long long)renderdocOpenIterations, closedBy);
-                else
+                else {
+                    char note[512];
+                    std::snprintf(note, sizeof note,
+                                  "prosper capture. Closed by %s after %llu app-loop iteration(s) "
+                                  "and %llu guest present(s). Aimed at %s.%s",
+                                  closedBy, (unsigned long long)renderdocOpenIterations,
+                                  (unsigned long long)(guestNow - renderdocOpenedAtGuestPresent),
+                                  renderdocDevicePointer ? "the live renderer's Vulkan device"
+                                                         : "whichever device RenderDoc chose",
+                                  guestPresented ? ""
+                                                 : "  WARNING: closed by the iteration cap, not by "
+                                                   "a guest present -- this may hold only part of "
+                                                   "a frame, or no guest frame at all.");
+                    prosper::frontend::RenderDocCapture::instance().set_comments(rdocPath, note);
                     std::fprintf(stderr,
                                  "[renderdoc] capture written: %s (spanned %llu app-loop iterations "
                                  "and %llu guest presents, closed by %s)\n",
                                  rdocPath.c_str(), (unsigned long long)renderdocOpenIterations,
                                  (unsigned long long)(guestNow - renderdocOpenedAtGuestPresent),
                                  closedBy);
+                }
             }
         }
         // F8's only always-on work is this 4 Hz sample. `sample_due` is one atomic read, so the
@@ -3087,6 +3106,14 @@ int main(int argc, char** argv) {
     // an armed capture open and the artifact was lost with no line saying so. That is precisely the
     // silent-instrument failure this trigger exists to prevent, so it is closed here too.
     //
+    // KNOWN LIMIT, not covered here (#3324): the guest can leave the process without ever returning
+    // to this line. hle_kernel_time.cpp's k_exit (guest _exit) and k_debug_raise_release (UE4's
+    // shipping check()) call _Exit from the GUEST thread while main is still inside the loop, and
+    // _Exit is exit_group -- so no atexit hook would help either. A capture armed on a title that
+    // dies that way is still lost silently. Both sites already flush diagnostics before their
+    // deliberate _Exit, so a registered flush list is the natural home; that is a cross-layer seam
+    // which does not exist yet and is deliberately not invented here.
+    //
     // Unlike its F8 sibling below, this CLOSES rather than cancels. RenderDoc decides for itself
     // whether the span held anything: a span containing real work is written and worth having even
     // though it ended at shutdown rather than on a guest present, and one containing nothing returns
@@ -3099,11 +3126,24 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[renderdoc] capture ABANDONED at shutdown after %llu app-loop "
                                  "iteration(s) -- RenderDoc recorded no API work in the span\n",
                          (unsigned long long)renderdocOpenIterations);
-        else
+        else {
+            // The warning goes IN THE FILE, not only in stderr (#3322 re-review). A truncated
+            // capture opens perfectly and reads as a whole frame with draws missing -- the same
+            // shape as the wrong-device capture this trigger exists to prevent -- and the stderr
+            // line does not travel with the artifact.
+            char note[512];
+            std::snprintf(note, sizeof note,
+                          "prosper capture -- TRUNCATED. Closed by application SHUTDOWN after %llu "
+                          "app-loop iteration(s), NOT by a guest present. It may hold only part of "
+                          "a frame, so missing draws are expected and are NOT evidence that the "
+                          "guest failed to submit them.",
+                          (unsigned long long)renderdocOpenIterations);
+            prosper::frontend::RenderDocCapture::instance().set_comments(rdocPath, note);
             std::fprintf(stderr, "[renderdoc] capture written: %s (closed by SHUTDOWN after %llu "
                                  "app-loop iteration(s), NOT by a guest present -- it may hold only "
-                                 "part of a frame)\n",
+                                 "part of a frame; the file itself is stamped with that warning)\n",
                          rdocPath.c_str(), (unsigned long long)renderdocOpenIterations);
+        }
     }
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary

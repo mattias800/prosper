@@ -62,6 +62,19 @@ public:
 
     bool capturing() const { return api_ && api_->IsFrameCapturing() != 0; }
 
+    // Stamp provenance INTO the capture file. RenderDoc displays these comments when the file is
+    // opened, which is the only place a warning about the artifact survives: a reader opening a
+    // .rdc weeks later never sees the stderr line that described how it was made.
+    //
+    // This matters most for a shutdown-truncated capture, which is the same hazard as the
+    // wrong-device one this whole header exists for -- it opens perfectly, reads as a whole frame,
+    // and is simply missing the draws that had not happened yet. A warning in stderr does not
+    // travel with the file; this does.
+    void set_comments(const std::string& path, const std::string& comments) {
+        if (!api_ || path.empty()) return;
+        api_->SetCaptureFileComments(path.c_str(), comments.c_str());
+    }
+
     // WHICH DEVICE. This is the whole game, and getting it wrong produces a capture that looks
     // perfectly valid and contains no draws -- measured on The Messenger before this parameter
     // existed (#3321): 56 chunks, every one of them presentation.
