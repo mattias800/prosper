@@ -138,6 +138,28 @@ bool cb_mode_is_unmodeled_operation(uint32_t mode) {
 
 std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK + 1u];
 
+// Print the EXACT per-mode totals once at exit, so the powers-of-two report below stops being the
+// only number a run produces. #1706's central quantity is per-title exposure to unmodeled
+// colour-block modes; `unmodeled_cb_color_mode_count` has always answered it exactly and had NO
+// production caller, which is why three independent lanes quoted powers-of-two LOWER BOUNDS on the
+// same night. Registered on the FIRST unmodeled draw, so a title that decodes none prints nothing
+// and stays usable as a control -- The Messenger's zero on its guard route is currently the only
+// such control #1706 has.
+//
+// KNOWN GAPS, stated rather than discovered later. An atexit report is lost on THREE paths, and the
+// eight pre-existing atexit censuses in this codebase all inherit the same three (#3353):
+//
+//   1. `prosper-app` and `boot_trace` call `_Exit`, which does not run atexit handlers.
+//   2. The GUEST's own exit path calls `_Exit` (`src/hle/kernel/hle_kernel_time.cpp`), so a run that
+//      ends because the title exited loses the report even on a frontend that would have flushed it.
+//   3. SIGTERM's default action skips atexit entirely -- which is how a `timeout`-wrapped or
+//      operator-interrupted run ends. `live_compute.cpp:1954` records this as the path that actually
+//      bites, because bounded runs are where this project's evidence mostly comes from.
+//
+// `tools/screenshot` returns from main and calls no `_Exit`, so its own `--count`/`--timeout` bound
+// DOES flush this line; a `timeout(1)` wrapper around it does not. A missing line is therefore the
+// harness, not a zero -- and `PROSPER_COLORSTATETRACE` reports the same per-mode population a second
+// way, from the draw records themselves, for anyone who needs a number a signal cannot take away.
 void report_unmodeled_cb_color_mode(uint32_t mode) {
     static const bool exit_dump_registered = [] {
         std::atexit([] {
