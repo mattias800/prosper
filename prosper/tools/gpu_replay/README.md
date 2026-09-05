@@ -152,6 +152,30 @@ silent, because silence there is indistinguishable from a clean verified run. Al
 strictly (decimal or `0x` hex); a malformed one disarms the control loudly rather than aiming it
 somewhere unintended.
 
+## What the GPU will FETCH for an indexed draw — `PROSPER_INDEX_ECHO`
+
+`PROSPER_INDEX_ECHO=1` prints, per indexed draw and immediately before `vkCmdBindIndexBuffer`, the index
+bytes read back from the host-visible memory at exactly the `(buffer, offset)` pair about to be bound,
+compared against the indices prosper decoded for that draw:
+
+```
+[index-echo] draw=28 icount=9 vcount=5 voff=0 inst=1 arena=1 ibuf=0x1b83a880 ioff=179804
+             want_n=9 want_max=4 got_max=4 mismatched=0 got[0..7]=2,3,4,1,2,4,0,1
+```
+
+It answers one question the other buffer diagnostics structurally cannot: **is the draw about to fetch
+vertices out of its own range?** `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` both look at STORAGE buffers,
+so a wrong index slice, a stale index arena offset or a `vertexOffset` that pushes `gl_VertexIndex` past
+the bound vertex range is invisible to both — and an out-of-range storage read is `robustBufferAccess`,
+not a Vulkan error, so validation is silent on it too. Without this instrument "prosper bound the wrong
+indices" and "the driver fetched the wrong indices" produce identical evidence and point at different
+files (#3374).
+
+`want_max` is the largest index prosper decoded and `got_max` the largest the GPU will read; both must be
+`< vcount`. `mismatched` counts positions where the two disagree. A dedicated (non-arena) index buffer
+unmaps its memory, so it prints `got=<dedicated buffer, unmapped>` rather than a silent zero — the
+readback is only reported when there is something to read. Inert and byte-identical when unset.
+
 ## Draw-time resource provenance
 
 Set `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE=DRAW:vs|ps:BINDING` while taking a capsule with

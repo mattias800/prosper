@@ -1402,6 +1402,66 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   whether prosper is clean. #2945.
 
 
+### A DETERMINISTIC RADV reproduction, with a lavapipe positive control — and the five titles it explains (2026-09-05) — #3374
+
+The row above closes with *"the failing regime cannot be reproduced on this box at all"*. It can, on a
+different subject, and this one does not need a regime: **one captured frame, replayed offline, is
+wrong on RADV every single time and right on lavapipe every single time.**
+
+```bash
+# Capture (headless, no keyboard): the guard's own route, native scale, trigger the grab at t=90 s.
+PROSPER_RENDER=1 PROSPER_RENDER_SCALE=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_PAD_SCRIPT=@prosper/scripts/joe-mac/reach-gameplay.pad \
+PROSPER_CAPTURE_BUNDLE=<work>/frame.prgbundle \
+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=<work>/capture.ready \
+    screenshot <DUMP_ROOT>/PPSA02801-app0 --seconds 5 --count 25   # touch the trigger at t=90 s
+
+gpu_replay --bundle <work>/frame.prgbundle --bundle-extract-submit <N> <work>/submit.prgcap
+
+# THE A/B. Same binary, same capsule, same 88 operations. Only the ICD differs.
+gpu_replay <work>/submit.prgcap out_radv.bmp                          # sheared
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+gpu_replay <work>/submit.prgcap out_lvp.bmp                           # the level, correct
+```
+
+**Measured on `d38e892cc`, Linux / AMD Radeon 8060S (RADV STRIX_HALO), Mesa 26.1.4.** *New Joe & Mac*
+(`PPSA02801`): **25 of 25** RADV replays byte-identical to each other (`0ab3cfbe25…`), taken across
+both a heavily loaded window and a quiet one after a two-minute cool-down, and the lavapipe replay of
+the same capsule renders level 1 complete — twin palms, volcano, flower bank, Joe, the HUD with its
+score, health bar and lives counter. Reproduced the same way on *Asterix & Obelix: Slap Them All!*
+(`PPSA08576`) and *Rugrats: Adventure in Gameland* (`PPSA23396`).
+
+**What that settles for #3374.** The five rung-6 Unity titles whose scene art arrives through large
+sheared triangles are **one defect, not five**, and none of it is prosper's: the identical capsule
+carrying the identical decoded draws, indices, descriptors, uploads and recompiled SPIR-V produces
+the correct scene when a different Vulkan implementation executes it. Every prosper-side stage was
+independently checked on the RADV run and is clean — `PROSPER_BUFLOG` source words, `PROSPER_BUFVERIFY`
+(346 buffers, 0 mismatched), `PROSPER_BUFFER_ECHO` descriptor set/offset/range, and
+`PROSPER_INDEX_ECHO` (below) — and a full replay under `VK_LAYER_KHRONOS_validation`, proved loaded
+with `VK_LOADER_DEBUG=layer`, reports zero findings.
+
+**It is deterministic, which is why it is filed HERE and not as more of #2945.** #2945 is stochastic
+and load-triggered; this is 25 of 25 in both regimes, and no lever moves it: `PROSPER_NO_BACKEND_BUFFER_ARENA`,
+`PROSPER_NO_BACKEND_BUFFER_POOL` (together and separately), `PROSPER_NO_BACKEND_RESOURCE_SHARE`,
+`PROSPER_NO_BACKEND_PIPELINE_CACHE`, `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE`, `PROSPER_NO_MEMORY_POOL`,
+`PROSPER_BACKEND_BUFFER_ARENA_KB=262144`, and `RADV_DEBUG=syncshaders | zerovram | nocache | nongg |
+nonggc | llvm`, `RADV_PERFTEST=nosam` all return the byte-identical broken frame. Its character matches
+#2937 / #3371 — deterministic, indexed-path — rather than #2945's dropout. Whether the three share a
+cause is open; what is now certain is that the titles' visuals are not prosper's to fix.
+
+**`PROSPER_INDEX_ECHO=1`** (new, `tests/fixtures/render_runner.h`) is what retired the index family at
+title scale. It reads the index bytes back from the host-visible memory at exactly the `(buffer, offset)`
+pair about to be bound and compares them against the indices prosper decoded, printing `icount`,
+`vcount`, `vertexOffset`, `instanceCount`, arena/dedicated, `want_max` and `got_max`. On the Joe & Mac
+frame: 85 indexed draws, `mismatched=0` on every one, `got_max < vcount` on every one, `voff=0`,
+`inst=1`. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` look at STORAGE buffers and cannot see this, and an
+out-of-range storage read is `robustBufferAccess` rather than a validation error, so without it
+"prosper bound the wrong indices" and "the driver fetched the wrong indices" produce identical evidence.
+
+**Do not use `PROSPER_GEOM_PROBE` on these capsules.** Its per-draw verdicts contradict the pixels —
+see instrument trap 266. The `--draw-steps` per-operation contribution is the instrument that held.
+
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct

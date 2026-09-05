@@ -21,6 +21,32 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
+### The five sheared Unity titles already render correctly — the shear is the graphics driver, not prosper
+
+*New Joe & Mac*, *Asterix & Obelix: Slap Them All!* and *Rugrats: Adventure in Gameland* all draw their
+scene art through huge sheared triangles on this machine's AMD driver. We captured one frame of each and
+replayed it offline through a different Vulkan implementation, with no change to prosper and no change to
+the captured frame — and all three come out correct. So the geometry prosper builds, the indices it
+decodes, the buffers it uploads and the shaders it recompiles were right all along; what mangles them is
+in the driver, on the indexed-draw path already tracked as #2945 / #3371. Filed on #3374 with the
+reproduction, which is deterministic: 25 replays of the Joe & Mac capsule are byte-identical.
+
+These pictures are **offline replays of a captured frame, not live runs** — the software Vulkan device
+is far too slow to play on, so this is diagnosis rather than a rung change.
+
+![New Joe & Mac level 1 on this machine's AMD driver: the art is all there, smeared into triangular shards](assets/screenshots/joe-mac-shear-radv.webp)
+
+![The same captured frame replayed on a software Vulkan device: twin palms, volcano, flower bank, Joe, and the full HUD](assets/screenshots/joe-mac-correct-lavapipe.webp)
+
+![Asterix's forest level on the AMD driver: Asterix stretched into a band across the top of the screen](assets/screenshots/asterix-shear-radv.webp)
+
+![The same frame on the software device: Asterix on the path, both portraits with their health and rage gauges, the score and TOP score](assets/screenshots/asterix-correct-lavapipe.webp)
+
+![Rugrats' nursery on the AMD driver: Tommy shredded into vertical streaks](assets/screenshots/rugrats-shear-radv.webp)
+
+![The same frame on the software device: Tommy at the playpen gate, complete](assets/screenshots/rugrats-correct-lavapipe.webp)
+
+
 ### Khazan stops dying eight seconds in, and starts drawing the wrong thing instead
 
 The First Berserker: Khazan aborted at 8.6 seconds of every boot with "PS5 Out of Memory". It was not
