@@ -29,16 +29,33 @@ this document is the map that helps the next orchestrator find and interpret tha
   your worktree, where no dump lives, and you get instrument trap 126: a smaller test suite, silently,
   still reporting `100% tests passed`.
 - The 2026-08-04 rung-0 wave below is complete: every listed title produced either a visible milestone
-  or a relocated, evidence-backed blocker. Current activity is centered on GTA V's post-lift compute CFG
-  frontier (#2412/#2481/#2429) and Dragon Quest VII's Windows progression/mapping frontier (#2448/#2450).
-  This sentence is a handoff, not a lock: live `in-progress` labels, claim comments and remote fix branches
-  are authoritative for ownership.
+  or a relocated, evidence-backed blocker. The GTA V compute-CFG frontier (#2412/#2481/#2429) and
+  Dragon Quest VII's Windows progression frontier (#2448/#2450) are the previous centres of activity
+  and neither is closed.
+  **Overnight 2026-09-04/05 ran four concurrent lanes on mid-tier titles**, and their frontiers are
+  where a reader should start today:
+  *Space Adventure Cobra* `PPSA17337` — the `sceAvPlayerJumpToTime` seek notification (#3348, open);
+  *The First Berserker: Khazan* `PPSA20447` — `libScePsml` fixed and **merged** (#3347), rung still 0,
+  next arm is `PROSPER_CB_EFC_NO_COLOR=1` on a MODE=2-exclusive title;
+  *Syberia: Remastered* `PPSA30140` — the per-dispatch re-upload loop, now the best-evidenced
+  performance frontier in the project (#1737, #1811);
+  *Little Nightmares III* `PPSA05143` — the flat-yellow composite narrowed to two pixel-shader
+  programs (#2014, #1706).
+  This paragraph is a handoff, not a lock: live `in-progress` labels, claim comments and remote fix
+  branches are authoritative for ownership.
 - GPU state: sharing is the default; see the scheduling rules below.
 
 ### The standing objective, in the user's words
 
-**Rung 0 titles first, then title screens. Breadth beats depth: "progress on many titles is more
-important than progress in a few."** The user also asked explicitly *not* to spend heavily on Astro
+**2026-09-05, most recent:** *"the goal here is to test games, and get them to title screen with
+correct visuals and at least 50% of full PS5 speed. prioritize mid tier games first, where progress is
+most likely."* — so **speed is now half the bar**, and it is the half that had no owner before that
+night: every title measured so far sits an order of magnitude below it (*Syberia* ~1.9 fps,
+*Blue Prince* ~3.2, *Khazan* 1.2 under the renderer). A title that renders correctly and runs at 5% of
+hardware speed has met one half of the goal, and the milestone text should say which.
+
+**Earlier, and not superseded — it governs which titles to pick:** **Rung 0 titles first, then title
+screens. Breadth beats depth: "progress on many titles is more important than progress in a few."** The user also asked explicitly *not* to spend heavily on Astro
 Bot unless it yields real progress — it is a 149 GB AAA showcase that has produced no shippable title
 fix across several sessions. Every new visible checkpoint gets an **unmodified frontend screenshot**
 committed under `assets/screenshots/` and referenced from **both** the game tracker issue and
