@@ -6,6 +6,8 @@
 // then installs its own frontends (renderer / audio sink / pad backend) and calls run_entry().
 #pragma once
 #include "loader/linker.hpp"   // Program
+#include <cstdio>    // format_guest_module_label
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
@@ -138,6 +140,21 @@ inline bool guest_va_in_module(uint64_t a) {
 // covering the runtime-module aperture the moment it was placed ABOVE the stubs (#639).
 inline bool guest_va_in_module_code(uint64_t a) {
     return guest_va_in_module(a) && !(a >= BOOT_STUB && a < BOOT_STUB_END);
+}
+
+// Render "<module>+0x<rva>" for a guest address into `buf`, using the SAME lookup every other
+// diagnostic uses. This exists so a fault reporter cannot grow its own arithmetic: three fault
+// sites in exec_image_linux.cpp printed a hard-coded "image+0x%llx" computed as `rip - eboot_base`,
+// which labels an address in ANY other module as an eboot offset. On PPSA20447 that rendered a
+// libc.prx address as `image+0x1b0004a20` -- 6.75 GiB past the end of a 250 MiB image -- and the
+// nonsense offset read as a wild jump, which is what produced (and cost a session on) a
+// null-pointer hypothesis for what is really `abort()`'s `int $0x45` trap at libc.prx+0x4a20.
+//
+// Signal-safe: `snprintf` into a caller-owned buffer plus the two pure lookups above. No
+// allocation, no locks, no libc TLS -- callers in fault handlers pair it with raw_write().
+inline void format_guest_module_label(char* buf, size_t n, uint64_t a) {
+    std::snprintf(buf, n, "%s+0x%llx", guest_module_name(a),
+                  (unsigned long long)guest_module_offset(a));
 }
 
 // Boot the title rooted at `dump_root` (the app0 directory): link the fixed module set (dropping any

@@ -2740,31 +2740,76 @@ bool guest_writable(uint64_t a, uint32_t n) {
     return true;
 #else
     // #2387: this is the arm the cache above exists for. Windows and macOS answer with a syscall
-    // per region; only here is the answer a text parse of the process's entire mapping table --
-    // fopen, then fgets + sscanf per line, per call. Uncached, that made guest_writable the
-    // dominant stdio cost on the render thread.
+    // per region; here on Linux the answer is /proc/self/maps. Parsing all writable ranges in one
+    // fast pass and assigning them to the range cache populates the cache for the entire generation,
+    // converting hundreds of stdio opens into nanosecond cache hits.
+    const uint64_t gen = host::guest_mapping_generation();
     ++g_guest_writable_cache.os_probes;
-    FILE* maps = fopen("/proc/self/maps", "re");
-    if (!maps) return false;
-    uint64_t cursor = a;
-    char line[512];
-    while (cursor < end && fgets(line, sizeof line, maps)) {
-        unsigned long long begin = 0, finish = 0;
-        char perms[5] = {};
-        if (sscanf(line, "%llx-%llx %4s", &begin, &finish, perms) != 3 || finish <= cursor)
-            continue;
-        if (begin > cursor || perms[1] != 'w' || finish <= begin) {
-            fclose(maps);
-            return false;
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+
+    std::vector<host::GuestReadableRange> writable_ranges;
+    writable_ranges.reserve(256);
+    char buf[16384];
+    char line[4096];
+    size_t line_len = 0;
+    ssize_t bytes_read = 0;
+
+    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < bytes_read; ++i) {
+            char c = buf[i];
+            if (c == '\n') {
+                line[line_len] = '\0';
+                const char* p = line;
+                uint64_t begin = 0, finish = 0;
+                while (*p && *p != '-') {
+                    char h = *p++;
+                    uint64_t v = (h >= '0' && h <= '9') ? (h - '0') : (h >= 'a' && h <= 'f') ? (h - 'a' + 10) : 0;
+                    begin = (begin << 4) | v;
+                }
+                if (*p == '-') {
+                    ++p;
+                    while (*p && *p != ' ') {
+                        char h = *p++;
+                        uint64_t v = (h >= '0' && h <= '9') ? (h - '0') : (h >= 'a' && h <= 'f') ? (h - 'a' + 10) : 0;
+                        finish = (finish << 4) | v;
+                    }
+                    if (*p == ' ') {
+                        ++p;
+                        if (p[0] && p[1] == 'w' && finish > begin) {
+                            begin = std::max(begin, (uint64_t)0x1000);
+                            if (finish > begin) {
+                                if (!writable_ranges.empty() && writable_ranges.back().end == begin) {
+                                    writable_ranges.back().end = finish;
+                                } else {
+                                    writable_ranges.push_back({begin, finish});
+                                }
+                            }
+                        }
+                    }
+                }
+                line_len = 0;
+            } else {
+                if (line_len < sizeof(line) - 1) {
+                    line[line_len++] = c;
+                }
+            }
         }
-        if (cursor == a) span_lo = std::max((uint64_t)begin, (uint64_t)0x1000);
-        span_hi = finish;
-        cursor = std::min(end, static_cast<uint64_t>(finish));
     }
-    fclose(maps);
-    if (cursor != end) return false;
-    cache_guest_writable_range(span_lo, span_hi);   // #2387
-    return true;
+    close(fd);
+
+    bool found = false;
+    for (const auto& r : writable_ranges) {
+        if (r.begin <= a && end <= r.end) {
+            found = true;
+            break;
+        }
+    }
+
+    if (found && g_guest_writable_cache.enabled) {
+        g_guest_writable_cache.ranges.assign_sorted_ranges(std::move(writable_ranges), gen);
+    }
+    return found;
 #endif
 }
 

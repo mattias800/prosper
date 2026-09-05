@@ -126,6 +126,9 @@ int main() {
     cache_gates.renderer_owned = true;
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
           "renderer ownership blocks storage cache candidate");
+    cache_gates.seed_skip = true;
+    CHECK(compute_storage_cache_gate_candidate(cache_gates),
+          "seed skip overrides renderer ownership for storage cache candidate");
     cache_gates = cache_eligible;
     cache_gates.dcc_cache_safe = false;
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),

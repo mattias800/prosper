@@ -100,6 +100,48 @@ int main() {
               "an Il2Cpp address never renders as eboot+");
     }
 
+    // ---- the FAULT REPORTER's own formatter, and the exact address that misled a session -------
+    // The three fault sites in exec_image_linux.cpp (trap_detail, WORKER-THREAD FAULT, CONCURRENT
+    // WORKER-THREAD FAULT) each computed `rip - eboot_base` and printed a hard-coded "image+0x%llx".
+    // That is correct only for an eboot rip; for any other module it renders a number that lands
+    // nowhere. Measured on PPSA20447 (The First Berserker: Khazan): the guest calls abort(), whose
+    // PS5 implementation is `int $0x45` at libc.prx+0x4a20, and the fault line read
+    //     SIGSEGV at addr=(nil)  rip=0x5c0004a20 (image+0x1b0004a20)
+    // -- 6.75 GiB past the end of a 250 MiB image. The offset read as a wild jump into nothing, and
+    // that appearance is what produced a null-pointer-dereference hypothesis for a deliberate abort.
+    //
+    // These arms drive `format_guest_module_label`, which is the function those sites now call, so a
+    // site that stops calling it is a visible edit rather than a silent arithmetic change.
+    {
+        char line[64];
+        const uint64_t abort_trap = BOOT_LIBC + 0x4a20;      // the real faulting rip
+        format_guest_module_label(line, sizeof line, abort_trap);
+        CHECK(std::strcmp(line, "libc.prx+0x4a20") == 0,
+              "the fault reporter's formatter names libc.prx and offsets from ITS base");
+        // The mutation this arm exists to catch, spelled out: reverting a site to
+        // `snprintf(..., "image+0x%llx", rip - BOOT_EBOOT)` renders exactly this string.
+        char stale[64];
+        std::snprintf(stale, sizeof stale, "image+0x%llx",
+                      (unsigned long long)(abort_trap - BOOT_EBOOT));
+        CHECK(std::strcmp(line, stale) != 0,
+              "it does NOT render the eboot-relative offset the old fault sites printed");
+        // ...and that offset really is outside the image, which is why it looked like a wild jump.
+        constexpr uint64_t kKhazanEbootBytes = 0xf9ae768ull;   // the flattened PPSA20447 eboot
+        CHECK(abort_trap - BOOT_EBOOT > kKhazanEbootBytes &&
+              guest_module_offset(abort_trap) < kKhazanEbootBytes,
+              "the stale offset is past the end of the eboot while the correct one is a real RVA");
+    }
+
+    // A host/unmapped rip must not be dressed up as a module offset either: it reports verbatim.
+    {
+        char line[64];
+        const uint64_t host_rip = 0x7f2a98dfed30ull;
+        format_guest_module_label(line, sizeof line, host_rip);
+        CHECK(std::strncmp(line, "mapped/host+0x", 14) == 0 &&
+              std::strstr(line, "7f2a98dfed30") != nullptr,
+              "a non-guest rip renders as mapped/host+<the address>, not a fabricated RVA");
+    }
+
     std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
     return fails ? 1 : 0;
 }

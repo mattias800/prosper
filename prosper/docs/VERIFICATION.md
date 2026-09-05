@@ -230,14 +230,14 @@ rather than decoration:**
    flagged module twice, once where its exports collide and once where a single export NID differs; a
    guard that skipped every flagged module would pass the first arm exactly as well as a correct one.
 
-## PROGRESS_TRACKER.md regenerates itself on master — it is no longer a gate
+## PROGRESS_TRACKER.md regenerates itself on main — it is no longer a gate
 
 `PROGRESS_TRACKER.md` is **generated** from the `tracker:game` issues. It used to be gated on every
 PR (`gen_progress_tracker.py --check`), and **that gate was removed on 2026-08-27** because one of
 its two triggers was unfixable by the person it failed.
 
-**You no longer have to do anything.** A `progress-tracker` job regenerates the file on every master
-push and commits it if it changed. If your PR closes a cited blocker, master repairs itself.
+**You no longer have to do anything.** A `progress-tracker` job regenerates the file on every `main`
+push and commits it if it changed. If your PR closes a cited blocker, `main` repairs itself.
 
 The reasoning is kept because it is the useful part:
 

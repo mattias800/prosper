@@ -756,6 +756,11 @@ HLE(g_vo_set_flip_rate) {
     if (rate < 0 || rate > 2)
         return (uint64_t)(int64_t)(int32_t)0x80290001;  // SCE_VIDEO_OUT_ERROR_INVALID_VALUE
     std::lock_guard<std::mutex> lk(g_flip_mx);
+    // A title's requested divisor is the only guest-side statement of its intended cadence
+    // (0=60, 1=30, 2=20 Hz). It is set rarely, so log every change: a performance comparison
+    // needs the title's own target, not an assumed 60.
+    if (evlog() && rate != g_flip_rate)
+        fprintf(stderr, "[ev] SetFlipRate rate=%d (target %d Hz)\n", (int)rate, 60 / (rate + 1));
     g_flip_rate = rate;
     return 0;
 }

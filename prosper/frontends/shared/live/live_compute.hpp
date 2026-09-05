@@ -125,6 +125,20 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // Pack tightly-strided RGBA32F channel bits to RGBA16F. Uses a runtime-dispatched F16C path where
 // available and preserves float_to_half's exact NaN payload/rounding contract.
 void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8_t* rgba16f);
+// Narrow a Float32 SAMPLED surface to RGBA16F, synthesising the channels the source does not carry
+// as the hardware's (0,0,0,1). `source_texel_bytes` is the source stride, which is not always
+// `components * 4`, and `components` above four are ignored the way a four-channel destination
+// requires.
+//
+// This exists because the renderer had the same conversion written out as a per-texel, per-channel
+// scalar loop around float_to_half with a 4-byte and a 2-byte memcpy per channel -- 8.3 million
+// conversions and 16.6 million small copies for one 1920x1080 reference, on one thread, while the
+// vectorised sibling above sat beside it. Routing through that sibling picks up both its F16C path
+// and its thread split; the bit-for-bit contract is the same one, and is asserted against the
+// original scalar loop for every component count in test_game_compute.
+void pack_float32_to_rgba16f_range(const uint8_t* source, uint32_t components,
+                                   size_t source_texel_bytes, size_t texels,
+                                   uint8_t* rgba16f);
 
 // Portable storage-image ABI shared by compute and graphics: guest texels are expanded into four
 // raw 32-bit VGPR channel values and bound through an unsigned-integer Vulkan image. The helpers
