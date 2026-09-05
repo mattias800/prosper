@@ -482,17 +482,49 @@ address-taken or indirect path either.
 Two things fall out that are **not** Khazan's to fix:
 
 - **The other two titles carry the same uninitialised read today**, on master, unchanged by this fix.
-  *Yakuza Kiwami* multiplies **two** untouched fields (`out[+0x00] * out[+0x18]`). They survive it,
+  *Yakuza Kiwami* multiplies **two** untouched fields (`out[+0x00] * out[+0x10]`). They survive it,
   which means either the path is not reached during boot — *Little Nightmares III* gates it behind two
   global byte checks before the sysmodule load — or the residue happens to be benign. Neither is a
   guarantee, and both are one stack-layout change away from Khazan's failure.
-- **Do not "improve" this fix by zeroing the out-struct.** It is the obvious next step, since two of
-  the three titles ignore the return code and an error therefore does not protect them — and it would
-  **crash Khazan**. Its struct is at `rbp-0x48` and its stack cookie at `rbp-0x30`; the minimum span
-  covering every field the three titles read (`+0x00`, `+0x10`, `+0x18`) is 0x20 bytes from
-  `rbp-0x48`, which lands on the cookie and trips `__stack_chk_fail`. The layouts are genuinely
-  unknowable, and this is what "guessing at an unknown struct replaces one fabrication with another"
-  looks like in concrete terms.
+- **Do not "improve" this fix by zeroing the out-struct — but NOT for the reason this document first
+  gave, which was arithmetically wrong.** Corrected 2026-09-05 in review of #3347.
+
+  **The retracted claim.** This said the minimum span covering every field the three titles read was
+  **0x20** bytes, that `rbp-0x48 + 0x20` lands on Khazan's stack cookie at `rbp-0x30`, and that
+  zeroing would therefore trip `__stack_chk_fail`. That rested on *Yakuza Kiwami* reading
+  `out[+0x18]`. **It reads `out[+0x10]`**, and this document's own transcription two sections above
+  proves it: base `lea -0xc8(%rbp),%rdi`, second read `imul -0xb8(%rbp)`, and `0xc8 - 0xb8 = 0x10`.
+  The `+0x18` came from measuring to the *second argument's* buffer at `rbp-0xb0` instead of to the
+  second read. The operand and the comment sat on the same line contradicting each other.
+
+  **What is actually true.** The union of read offsets across all three titles is `{+0x00, +0x10}`,
+  so the minimum covering span is **0x18** bytes, and `rbp-0x48 + 0x18 = rbp-0x30` — the write is
+  `[rbp-0x48, rbp-0x30)` and the cookie at `rbp-0x30` is **the first byte NOT written**. It stops
+  exactly short. **The hazard this row asserted does not exist.**
+
+  Two frames further suggest `0x18` is the struct's real size rather than a lucky bound: Khazan
+  places its cookie exactly `0x18` after the struct base with only the `+0x10` field in between, and
+  *Yakuza Kiwami* places its next local (the 32-byte buffer it zeroes itself) exactly `0x18` after
+  its base. A compiler must reserve `sizeof` for a local whose address escapes, so those two are
+  consistent with `sizeof == 0x18`. *Little Nightmares III* leaves `0x28` before its cookie and so
+  bounds it only loosely — two frames pin it, one does not, and that is stated rather than averaged.
+
+  **So the decision not to zero stands on weaker and different grounds, and they are worth less than
+  the ones they replace:**
+  1. Zeroing is not a refusal, it is an **answer** — "the query succeeded and returned zero items".
+     Returning an error refuses; writing zeros manufactures a plausible result for a library prosper
+     does not implement, which is nearer the charter's "do not ship shims that fake output" than an
+     error is.
+  2. `0x18` is inferred from **stack layout**, not from the library. It covers the reads *these three
+     binaries* perform; nothing establishes that a fourth title, or another version, does not read
+     further.
+  3. It buys nothing measurable. The only title that reads the return code is fixed by the error;
+     zeroing would **change behaviour** for the two that ignore it — two titles that currently work
+     at their rungs and do not fail from this — for no observed benefit.
+
+  If a future title with this shape *does* fail because it ignores the return code, zeroing `0x18`
+  bytes is a defensible next step and this row should not be read as forbidding it. What it forbids
+  is doing so on the strength of a hazard that was miscomputed. #3344.
 
 **Sifu (`PPSA03001`) is NOT fixed by this.** It calls `libScePsml` zero times and its identical
 banner has a different cause; see the corrected `## Ruled out` row.
