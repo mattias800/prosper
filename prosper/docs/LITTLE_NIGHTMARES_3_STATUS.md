@@ -200,6 +200,48 @@ mislead: on Plucky the `mode=0` fraction is *higher* while the world renders cor
 is black. The next arm is `PROSPER_SKIP_DRAW_PROGRAM=0x3017370000`, a one-program A/B rather than a
 process-wide lever.
 
+### The flooding draws, named exactly (2026-09-05)
+
+`PROSPER_SKIP_DRAW_PROGRAM=0x3017370000`, 120 s, against the matched control:
+
+| | control | skip `0x3017370000` |
+| --- | --- | --- |
+| uniform retains, **yellow** | **63** of 64 | **0** of 65 |
+| uniform retains, black | 1 | 65 (28 `(0,0,0,0)`, 37 `(0,0,0,255)`) |
+| content samples of 30 | 28 | **29** |
+| full-coverage / non-empty scanout passes | 96.98% | **0.52%** |
+
+**Declining that one pixel shader removes the flat frames entirely and the title still renders.**
+18 `[draw-decline] … reason=skipped-by-selector` lines confirm the selector fired, and its arming
+line is in the log.
+
+Grouping the colour-state records by the **(vertex, pixel) pair and the raw register word** — not by
+the pixel shader alone — identifies the population exactly:
+
+```text
+ 3734  es=0x300e900000  ps=0x3017370000  cb-control=1:00cc0000  mode=0  target-mask=1:00000007
+ 1320  es=0x3016e60000  ps=0x3017370000  cb-control=1:00cc0010  mode=1  target-mask=1:00000007
+```
+
+The guest programs `CB_COLOR_CONTROL = 0x00cc0000` (MODE=DISABLE) **together with a non-zero
+`CB_TARGET_MASK` of `0x7`**, deliberately, 3,734 times, always with that one vertex shader — and the
+two words differ **exactly in bits [6:4]** with no mixing across 5,054 draws. On hardware those draws
+write no colour. Since #1724 prosper derives the write mask from `CB_TARGET_MASK & CB_SHADER_MASK`
+and ignores `MODE`, so it writes them, and what they write floods the scanout.
+
+**The shader does not manufacture a constant.** 782 instructions, 4 `OpImageSampleImplicitLod`, 34
+`OpSelect`, **no branches**, one store of a computed `OpCompositeConstruct`, exported through a
+`PackHalf2x16`/`UnpackHalf2x16` round trip with `±65504` clamps — a genuine tonemap-shaped chain. So
+`(1,1,0)` is a *computed* value: R and G arrive **>=1.0** and saturate in the `UNORM8` target while B
+arrives `<=0`. That is this issue's **original** "red and green forced to maximum" framing, correct at
+the shader level even though the background model that replaced it was falsified at the frame level.
+
+**No change is proposed from this.** #1724 landed on measured cross-title evidence, and #2932
+measured the same suppression taking `PPSA02058` from 3 of 24 content samples to 0 of 24. The narrow
+reading is that `MODE=DISABLE` with a non-zero mask is a real guest idiom that at least one title uses
+at scale, and that treating the mask as the sole authority is wrong for it. Deciding that is #1706's
+question, not this document's.
+
 ### Past the title screen: the EULA, via a checked-in input route
 
 `scripts/little-nightmares-3/reach-gameplay.pad` presses `cross` at the title screen and the title
