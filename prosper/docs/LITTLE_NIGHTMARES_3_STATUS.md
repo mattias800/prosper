@@ -87,6 +87,55 @@ What is and is not bounded:
 
 Open as [#2014](https://github.com/mattias800/prosper/issues/2014).
 
+### 2026-09-05 re-measurement on `c067aeef`: the tint is gone, a flat scanout and a GPU hard recovery are not
+
+Everything in the section above was measured in August. Re-run on `c067aeef` (`tools/screenshot`,
+default route, no input, isolated `PROSPER_SAVE0`/`PROSPER_SAVEDATA_DIR`, 40 samples / 5 s / 200 s),
+the picture is different in three ways.
+
+**The splash sequence renders correctly.** Twenty-seven consecutive samples from t=10 s to t=140 s
+are black-background frames — Bandai Namco, Supermassive Games, Unreal Engine, Wwise — decoded and
+viewed, not inferred from `distinct_rgb_colors`. No tint of any kind.
+
+**The title screen is not reached.** At t=140 s, the last content sample, the frame is still the
+Wwise splash. See #3340; whether that is a regression or a long-standing condition the August
+rung-2 run happened to land in front of is **not established** — the doc's t≈110 s title screen and
+the t≈115 s collapse are five seconds apart, so a marginally slower boot misses it with no change to
+the fault. Treat "regression" as a hypothesis until an arm at `4d7a2ded` says otherwise.
+
+**The run ends in a GPU hard recovery.** `radv: GPUVM fault detected at address 0x80025e677000`,
+`CLIENT_ID: (TCP)`, `PERMISSION_FAULTS: 3` — a shader vector-memory read touching a page it may not.
+Afterwards every graphics submission fails and `fresh` freezes (5,260 at `retained=1`, still 5,260 at
+`retained=2048`). The twelve byte-identical yellow samples that follow are the retained frame being
+re-served; the wall simply froze on a flat one. #3340.
+
+**The flat frames are painted by a draw, and one lever moves them.** `PROSPER_UNIFORMLOG` (extended
+in `f326a5f7`) names the producer as a pass rendering into the guest's own registered VideoOut
+buffers, `0x9fc0000000` / `0x9fc2000000`, 3840x2160 at `VK_FORMAT_B8G8R8A8_UNORM`. `PROSPER_PASS_LOG`
+shows every such pass carries exactly **one** colour-writing draw — a fullscreen composite — so the
+flat frames are ones where that draw's output is uniform. Three 120 s arms, identical route and
+instrumentation, code point `91812f96`:
+
+| arm | full-coverage VO passes | of total VO passes | rate |
+| --- | --- | --- | --- |
+| control | 2,218 | 12,266 | **18.08%** |
+| `PROSPER_LEGACY_CB_DISABLE_MASK=1` | 25 | 4,645 | **0.54%** |
+| `PROSPER_CB_EFC_NO_COLOR=1` | 2,255 | 12,639 | 17.84% |
+
+Read the **rate**, not the count: the lever arm ran 4,645 VO passes against the control's 12,266, so
+it changed how far the run got as well as what it suppressed, and `2,218 -> 25` overstates it (trap
+255).
+
+So draws whose `CB_COLOR_CONTROL.MODE` decodes as DISABLE, executed as ordinary colour draws, flood
+the scanout. Since #1724 the renderer derives the colour write mask from
+`CB_TARGET_MASK & CB_SHADER_MASK` and **ignores `MODE`** by design, so this is not a mishandled mask —
+it is the population that decision created. **The lever is not a candidate fix**: #2932 measured the
+same lever taking `PPSA02058`'s content samples from 3 of 24 to 0 of 24. Which reading is true here
+is open — either these are genuine colour-disabled passes prosper wrongly lets write, or they are
+ordinary composites carrying a stale MODE (#1706), and suppressing the second kind removes real
+content. `tools/colorstate/colorstate_report.py --by-program` is the instrument that separates them
+by naming the shader.
+
 ### Past the title screen: the EULA, via a checked-in input route
 
 `scripts/little-nightmares-3/reach-gameplay.pad` presses `cross` at the title screen and the title
@@ -191,6 +240,8 @@ Read this before forming a hypothesis.
 | The stall before the title is the undelivered-GPU-completion family (#232 / #208 / #210 / #984) as its own defect | **Superseded.** The completion was never generated, because the submit owing it was declined: `PROSPER_EOPLOG=1` censused 2,706 `FIRE`, 1 `SKIP(rejected)`, 0 `OWE`. Same root cause as #1982, fixed by #1987. #1962. |
 | The flat yellow frame is a real guest screen whose text layer is missing (e.g. a health warning) | **Falsified.** It is pure `RGB(255,255,0)` over the whole 4K frame, first composited at `frame_seq=4` with the identical crc — before any title content exists — and the frame the freeze landed on varied between runs. #1962. |
 | The yellow tint is a per-scanout-buffer defect (one flip buffer composited wrong) | **Falsified.** The manifest's `front_index` does not correlate with the tint: 14 tinted / 6 untinted on `front_index=0` and 10 / 6 on `front_index=1` over 36 samples. (Two of the twelve untinted are the blue/magenta noise frames below, not clean content; moving them to either bucket leaves the two columns uncorrelated.) #2014. |
+| This title composites content over a yellow BACKGROUND (`out = a*C + (1-a)*B`, `B = (255,255,0)`) | **Does not reproduce on `c067aeef`.** 27 consecutive samples spanning t=10-140 s are correct black-background splash frames, decoded and viewed rather than inferred from a colour count. The only uniform-yellow samples in a 200 s run are one at t=5 s, before any content exists, and twelve after a GPU hard recovery, all byte-identical. The alpha model was correct when measured in August and is retained above as the record; it is not the current state, and the uniform frame is now known to be a flat *scanout* paint rather than a background under content. #2014, #3340. |
+| The flat scanout paint is an ELIMINATE_FAST_CLEAR pass writing its bound pixel shader over the target (#1588's mechanism) | **Falsified on this title, with a live control.** `PROSPER_CB_EFC_NO_COLOR=1` over a matched 120 s arm gives **17.84%** full-coverage VO passes against an **18.08%** control, and an identical `[uniformlog]` ordinal (#64). Code point `91812f96`. **Scope this null carefully**: it was measured on a title whose MODE=2 population is *small* — `>=4` draws against `>=32,768` MODE=0 draws in a 200 s run — so it says the EFC lever is not this title's mechanism, and says nothing about a title with a large MODE=2 population. The lever that does move it is `PROSPER_LEGACY_CB_DISABLE_MASK`, a different lever acting on a different population. #2014, #1588, #2932. |
 | `PROSPER_CLEARLOG`'s all-zero clear-word census retires the fast-clear hypothesis | **VOID, not negative — the instrument printed a constant.** `extract_render_state` assigned `rs.color0_clear_word0`/`_word1` two lines BELOW the diagnostic that printed them, so it read `RenderState`'s member initializers: every `[clearlog]` line ever printed says `word0=0x00000000 word1=0x00000000`, in every title, for every target. The dedup key used the same unassigned field, so the "33 distinct `(base, format, clear-word)` combinations" were 33 distinct `(base, format)` pairs. The extractor's fields were always correct, which is why every existing assertion on them passed. Fixed and pinned by a mutation-checked arm in `tests/gpu/state/test_render_state.cpp` (#2014). The `PROSPER_CLEAR_DEBUG` blue control from the same session is a different instrument and still stands. |
 | The uniform frame is the DCC fast-clear materialiser's output | **Falsified by construction, not by census.** `gfx10_dcc_fast_clear_rgba8` (`src/gpu/texture/tile.cpp:92`) accepts only 3- or 4-component surfaces and only the embedded `0000/0001/1110/1111` codes, and `materialize_uniform_rtt` maps its bytes to RGBA8 unchanged. Its **entire** reachable set is `(0,0,0,255)`, `(0,0,0,0)`, `(255,255,255,255)`, `(255,255,255,0)`, `(255,0,0,0)` and `(0,255,255,255)`. `(255,255,0,x)` is not in it and cannot be, whatever the run contains. **Qualified the same day, by the author, before anyone relied on it:** that is a statement about the MATERIALISED SURFACE, not about what a consumer sees. `backend_sampled_component_swizzle` (`tests/fixtures/render_runner.h:365`) swaps the R and B selectors when the sampled target's guest format is `B8G8R8A8`, so a uniform **cyan** `(0,255,255,255)` -- which IS in the set, from code `0x80` with `alpha_is_on_msb=false` -- reaches a shader as `(255,255,0,255)`. A composite that samples such a surface and writes RGB only, over a `(0,0,0,0)` clear, produces exactly the observed `(255,255,0,0)`. So the row rules out the materialiser as a DIRECT producer and does **not** rule out the chain through a swizzled consumer; `PROSPER_DCCLOG=1` is the one-run test. Note the converse too: flat **white** IS directly reachable, which makes this path a live lead for #2932's signature (a). |
 | The yellow tint comes from the packed-R11G11B10 compute storage path | **NOT falsified — the arm is inconclusive, and is recorded here so nobody counts it as a negative.** `PROSPER_NO_PACKED_R11_STORAGE=1` over a 360 s arm gives **24 / 36** tinted samples against the default arm's 24 / 36. But the switch only reaches the *compute* path (`gpu_executor.cpp:4719`) and the packed emission is further gated on a 3-component `Float10_11_11` storage image (`rdna2_to_spirv.cpp:9516`); nothing logs whether that path was ever taken, so "the switch moved nothing" cannot be told apart from "the switch was never in circuit". Needs a counter of dispatches compiled with `packed_r11=true` before it means anything. #2014. |
