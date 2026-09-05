@@ -151,6 +151,11 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME profiling_access
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/profiling_access/test_access.py")
+    set_tests_properties(profiling_access PROPERTIES TIMEOUT 30)
+  endif()
   # The human-authored snapshot store. Runs with no dump and no emulator: every arm builds its own
   # BMPs. The arms are chosen around SILENT failure -- a signature that cannot separate two scenes
   # would pass every regression, and an accept() that moved the signature without the reference
