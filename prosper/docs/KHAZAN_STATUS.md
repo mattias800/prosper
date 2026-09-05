@@ -536,23 +536,42 @@ engine, three independent sightings, no mechanism proposed — written down so w
 mechanism can find the sightings.
 
 **Where to go next — and which colour-block lever, because the two are not interchangeable.** Across
-every Khazan run the only colour-block diagnostic is `CB_COLOR_CONTROL.MODE=2 is an unmodeled
-color-block operation -> still executed as an ordinary color draw` — **24 occurrences, `MODE=2`
-exclusively, never `MODE=0`**. `MODE=2` is `ELIMINATE_FAST_CLEAR`, and a fast-clear-eliminate pass
+every Khazan run the only colour-block diagnostic prosper emits is `CB_COLOR_CONTROL.MODE=2 is an
+unmodeled color-block operation -> still executed as an ordinary color draw` — **24 occurrences,
+`MODE=2` exclusively, never `MODE=0`**, as prosper decodes the register. A fast-clear-eliminate pass
 executed as an ordinary colour draw is exactly the shape that lays a flat fill or a gradient over a
 real image.
 
+**Read that census in two halves, because only one of them survives #1706**, which is open and asks
+*"Is 0x202 CB_COLOR_CONTROL and is MODE really [6:4] on Gen5? The mapping is tier-4 vendored and
+unverified"*:
+
+- **"`PROSPER_LEGACY_CB_DISABLE_MASK` does nothing on this title" survives it.** The lever keys off
+  the *same decode* the census reads, so it acts on an empty set **as the code computes it** whether
+  or not the decode is right. The refusal to spend a run on it stands unconditionally.
+- **"Khazan emits ELIMINATE_FAST_CLEAR exclusively and never DISABLE" does NOT survive it.** That is
+  a claim about the **guest**, and it is only as good as a tier-4 vendored bitfield — the weakest
+  rung of this project's evidence hierarchy (*a single secondary implementation as a hypothesis
+  only*). Quote it as "prosper decodes 24 packets as `MODE=2` and none as `MODE=0`", never as
+  "the title emits EFC and not DISABLE".
+
 So the arm to run here is **`PROSPER_CB_EFC_NO_COLOR=1`**, not `PROSPER_LEGACY_CB_DISABLE_MASK`:
 
-- `PROSPER_LEGACY_CB_DISABLE_MASK` targets `MODE=0` (`DISABLE`). This title never emits it, so that
-  arm has **nothing to act on** and would return a clean null — which reads, six weeks later, as
+- `PROSPER_LEGACY_CB_DISABLE_MASK` targets `MODE=0` (`DISABLE`), which prosper never decodes here, so
+  the arm has **nothing to act on** and would return a clean null — which reads, six weeks later, as
   "tried it, no effect" rather than "the lever was aimed at an empty population". Do not run it for
   completeness; the census above is the answer.
-- `PROSPER_CB_EFC_NO_COLOR=1` targets `MODE=2`, which is **100% of this title's population**. Note
-  that this lever measured as a null on `PPSA05143` (17.84% against an 18.08% control) — but that
-  title emits *both* modes, so its EFC arm acted on a small share. That null does not transfer to a
-  title where EFC is the entire population, for the same reason a `MODE=0` result does not transfer
+- `PROSPER_CB_EFC_NO_COLOR=1` targets `MODE=2`, which is **100% of what prosper decodes here**. That
+  lever measured as a null on `PPSA05143` (17.84% against an 18.08% control) — but that title decodes
+  *both* modes, so its EFC arm acted on a small share, and the null does not transfer to a title
+  where EFC is the whole decoded population, for the same reason a `MODE=0` result does not transfer
   here.
+
+**If that arm fires, the result belongs on #1706 as well as here.** Three titles now show three
+different distributions through one unverified bitfield — this one all `MODE=2`, `PPSA05143` both,
+and *Space Adventure Cobra* reading `MODE=0` at ≥16,384 draws. A lever that visibly changes a frame
+is title-side evidence that the decode means what the vendored mapping says, which is exactly what
+that issue lacks.
 
 ## Ruled out
 
