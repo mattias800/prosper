@@ -9,6 +9,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -998,6 +999,42 @@ int main() {
     CHECK(rs.color0_has_clear, "color0_has_clear = true (CLEAR_WORD programmed)");
     CHECK(rs.color0_clear_word0 == 0x11223344u, "color0_clear_word0 preserved");
     {
+        // PROSPER_CLEARLOG must report the words the guest actually programmed.
+        //
+        // This asserts the DIAGNOSTIC's output, not the extractor's fields, because the two can
+        // disagree: the log used to sit ABOVE the two assignments that fill
+        // `color0_clear_word0`/`_word1`, so it read `RenderState`'s member initializers and printed
+        // `word0=0x00000000 word1=0x00000000` for every target in every title, while the fields
+        // themselves were correct and the assertions above passed. A hypothesis on #2014 was
+        // retired on that constant. The mutation this arm exists to catch is exactly that move:
+        // put the `if (clearlog)` block back above the `rs.color0_clear_word0 = ...` assignments
+        // in `extract_render_state` and this CHECK fails while every other CHECK in this file
+        // still passes.
+        //
+        // The dedup set inside the diagnostic is keyed on (base, format, word0) and is a
+        // function-local static, so this must be the first CLEARLOG-armed extraction of this
+        // (base, format, word) triple in the process. Nothing else in this file arms the env.
+#ifdef _WIN32
+        _putenv_s("PROSPER_CLEARLOG", "1");
+#else
+        setenv("PROSPER_CLEARLOG", "1", 1);
+#endif
+        const std::string clear_diag = capture_stderr([&] {
+            (void)extract_render_state(st);
+        });
+#ifdef _WIN32
+        _putenv_s("PROSPER_CLEARLOG", "");
+#else
+        unsetenv("PROSPER_CLEARLOG");
+#endif
+        CHECK(occurrence_count(clear_diag, "[clearlog]") == 1u,
+              "PROSPER_CLEARLOG prints one line for this target");
+        CHECK(clear_diag.find("word0=0x11223344") != std::string::npos,
+              "PROSPER_CLEARLOG reports the programmed CLEAR_WORD0, not the unassigned default");
+        CHECK(clear_diag.find("word0=0x00000000") == std::string::npos,
+              "PROSPER_CLEARLOG does not report a zero word for a programmed fast-clear");
+    }
+    {
         // This target is ALT/BGRA + SRGB, so byte0=B, byte1=G, byte2=R, byte3=A, with RGB linearized.
         ResolvedPipelineState ps = resolve_pipeline_state(rs);
         CHECK(ps.color_write_mask == 0x3u,
@@ -1060,6 +1097,60 @@ int main() {
         ResolvedPipelineState p2 = resolve_pipeline_state(s);
         CHECK(p2.stencil_compare_op[1] != p2.stencil_compare_op[0],
               "BACKFACE_ENABLE=1: back stencil is independent from front (_BF sourced)");
+    }
+
+    {
+        // The EXACT per-mode totals must be reportable, and must name every mode that actually
+        // counted. `report_unmodeled_cb_color_mode` prints at powers of two, so the log alone gives
+        // only a lower bound; three concurrent lanes quoted such bounds on #1706 in one night
+        // because this accessor had no production caller. The atexit dump added with this test is
+        // that caller; this arm covers its formatting without needing a process exit.
+        //
+        // Driven from the counters this file has already incremented above, so the expected values
+        // are read from the same accessor rather than hardcoded -- a hardcoded count would break
+        // whenever an unrelated case is added to this file, which is how a useful arm gets deleted.
+        char summary[256] = {0};
+        const bool any = prosper::gpu::unmodeled_cb_color_mode_summary(summary, sizeof summary);
+        uint64_t counted = 0;
+        for (uint32_t m = 0; m <= 7u; ++m) counted += prosper::gpu::unmodeled_cb_color_mode_count(m);
+        // NOT a discriminating arm on this ordering, and saying so rather than leaving it to look
+        // like one: the cases above have already incremented modes 2/4/5/7, so `counted` cannot be
+        // zero here and the equality cannot fail. It is kept because it pins the direction.
+        //
+        // The two arms below cover the `!out || cap == 0` early return, which is a DIFFERENT false
+        // branch from the `!total` one. `!total` is not reachable from a test in this process at
+        // all: the counters are process-global and already non-zero by the time any arm runs, and
+        // nothing resets them. It is covered by construction (the sum of all eight slots) rather
+        // than by an arm, and this comment says so instead of letting the arms below look like they
+        // reach it.
+        CHECK(any && counted != 0,
+              "unmodeled-mode summary reports content after this file's unmodeled-mode draws");
+        CHECK(!prosper::gpu::unmodeled_cb_color_mode_summary(summary, 0),
+              "unmodeled-mode summary declines a zero-capacity buffer");
+        CHECK(!prosper::gpu::unmodeled_cb_color_mode_summary(nullptr, sizeof summary),
+              "unmodeled-mode summary declines a null buffer");
+        if (any) {
+            bool all_named = true;
+            for (uint32_t m = 0; m <= 7u; ++m) {
+                const uint64_t n = prosper::gpu::unmodeled_cb_color_mode_count(m);
+                if (!n) continue;
+                char want[48];
+                snprintf(want, sizeof want, "mode%u=%llu", m, (unsigned long long)n);
+                if (!strstr(summary, want)) { all_named = false; break; }
+            }
+            CHECK(all_named,
+                  "unmodeled-mode summary names every mode with a non-zero count, at its exact total");
+            // A mode that counted ZERO must not appear: a row of zeroes would make a title that
+            // decodes no unmodeled mode look like one that decodes several, destroying the control.
+            bool no_zero_rows = true;
+            for (uint32_t m = 0; m <= 7u; ++m) {
+                if (prosper::gpu::unmodeled_cb_color_mode_count(m)) continue;
+                char unwanted[48];
+                snprintf(unwanted, sizeof unwanted, "mode%u=0 ", m);
+                if (strstr(summary, unwanted)) { no_zero_rows = false; break; }
+            }
+            CHECK(no_zero_rows, "unmodeled-mode summary omits modes that never counted");
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

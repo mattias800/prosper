@@ -138,7 +138,53 @@ bool cb_mode_is_unmodeled_operation(uint32_t mode) {
 
 std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK + 1u];
 
+// Print the EXACT per-mode totals once at exit, so the powers-of-two report below stops being the
+// only number a run produces. #1706's central quantity is per-title exposure to unmodeled
+// colour-block modes; `unmodeled_cb_color_mode_count` has always answered it exactly and had NO
+// production caller, which is why three independent lanes quoted powers-of-two LOWER BOUNDS on the
+// same night. Registered on the FIRST unmodeled draw, and modes that never counted are omitted from
+// the line -- but NOT for the reason an earlier revision of this comment gave. It claimed that keeps
+// a title which decodes none "usable as a control"; that is wrong, because an absent line is
+// indistinguishable from an atexit lost to one of the four paths below, so absence proves nothing
+// either way. The real reason is sharper than "the absence of a measurement": three of the eight
+// slots are STRUCTURALLY zero forever. `cb_mode_is_unmodeled_operation` excludes NORMAL(1),
+// RESOLVE(3) and DCC_DECOMPRESS(6), so indices 1, 3 and 6 can never be incremented by anything. A
+// row of zeroes would print `mode1=0` on every run of every title -- on PPSA05143 that is 1,320 +
+// 2,533 NORMAL scanout draws reported as a zero. That is not a missing measurement; it is a
+// permanent structural zero wearing the shape of a measured population, which is strictly worse.
+//
+// KNOWN GAPS, stated rather than discovered later. An atexit report is lost on THREE paths, and the
+// eight pre-existing atexit censuses in this codebase all inherit the same three (#3353):
+//
+//   1. `prosper-app` and `boot_trace` call `_Exit`, which does not run atexit handlers.
+//   2. The GUEST's own exit path calls `_Exit` (`src/hle/kernel/hle_kernel_time.cpp`), so a run that
+//      ends because the title exited loses the report even on a frontend that would have flushed it.
+//   3. SIGTERM's default action skips atexit entirely -- which is how a `timeout`-wrapped or
+//      operator-interrupted run ends. `live_compute.cpp:1954` records this as the path that actually
+//      bites, because bounded runs are where this project's evidence mostly comes from.
+//
+//   4. `tools/screenshot` ends in `_exit(verdict.exit_code)` (`screenshot.cpp:1000`) -- lowercase
+//      `_exit`, the POSIX one, which skips atexit exactly as `_Exit` does. So the project's PRIMARY
+//      EVIDENCE FRONTEND loses these reports too. An earlier revision of this comment claimed the
+//      opposite; it was written from a grep for `_Exit(` that a lowercase `_exit(` does not match,
+//      and the first run that could test it printed nothing. The same is true of the worker-fault
+//      path's `_exit(90)`, which `command_processor.cpp:1111` already records.
+//
+// So an atexit hook reaches essentially none of the ways a real run ends here, and this registration
+// is best-effort rather than a reporting mechanism. Use `PROSPER_COLORSTATETRACE`, whose per-draw
+// records carry `mode=` unconditionally, when the number has to survive the exit path -- it also
+// covers `NORMAL`, which this counter never sees. #3353 tracks giving these censuses an explicit
+// flush hook, which is what the frontends already do for several other diagnostics.
 void report_unmodeled_cb_color_mode(uint32_t mode) {
+    static const bool exit_dump_registered = [] {
+        std::atexit([] {
+            char line[256];
+            if (unmodeled_cb_color_mode_summary(line, sizeof line))
+                fprintf(stderr, "%s\n", line);
+        });
+        return true;
+    }();
+    (void)exit_dump_registered;
     const uint64_t count =
         ++g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK];
     // This line used to dedupe on a bitmask of modes already seen, so a whole run emitted exactly
@@ -241,6 +287,24 @@ uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
     return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
 }
 
+bool unmodeled_cb_color_mode_summary(char* out, size_t cap) {
+    if (!out || cap == 0) return false;
+    uint64_t total = 0;
+    for (uint32_t m = 0; m <= P::CB_COLOR_CONTROL_MODE_MASK; ++m)
+        total += unmodeled_cb_color_mode_count(m);
+    if (!total) { out[0] = '\0'; return false; }
+    int at = std::snprintf(out, cap,
+                           "[gpu] CB_COLOR_CONTROL unmodeled-mode totals (EXACT, not the "
+                           "powers-of-two report above):");
+    for (uint32_t m = 0; m <= P::CB_COLOR_CONTROL_MODE_MASK && at > 0 && (size_t)at < cap; ++m) {
+        const uint64_t n = unmodeled_cb_color_mode_count(m);
+        if (!n) continue;
+        at += std::snprintf(out + at, cap - (size_t)at, " mode%u=%llu",
+                            m, (unsigned long long)n);
+    }
+    return true;
+}
+
 RenderState extract_render_state(const GpuState& st) {
     RenderState rs;
 
@@ -299,12 +363,25 @@ RenderState extract_render_state(const GpuState& st) {
     // CB fast-clear color (CB_COLOR0_CLEAR_WORD0/1). Present only when the game programs a fast-clear
     // for MRT 0; the words carry the clear value in the target's pixel format (decoded in resolve).
     rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);
+    rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
+    rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
     // PROSPER_CLEARLOG=1 -- diagnostic only, no behaviour change. `st.cx` is the PERSISTENT context
     // register map, so `count()` answers "has this register ever been written", not "was it written
     // for THIS target". If a title programs a fast-clear once and later binds a different colour
     // target without reprogramming it, the stale value still reaches the render pass as its loadOp
     // clear. This prints what each resolve actually decided, keyed to the target it decided it for,
     // so that hypothesis can be confirmed or killed on a real run before anything is changed (#2014).
+    //
+    // IT MUST STAY BELOW THE TWO ASSIGNMENTS ABOVE. It used to sit above them and read
+    // `rs.color0_clear_word0`/`_word1` while they still held `RenderState`'s member initializer,
+    // so EVERY line this diagnostic has ever printed said `word0=0x00000000 word1=0x00000000` --
+    // in every title, for every target, whatever the guest programmed. That is the worst shape a
+    // diagnostic can take: not silence, which invites suspicion, but a confident constant that
+    // reads as a measurement. On #2014 a whole hypothesis was retired on it ("across a 320 s run
+    // all 33 distinct combinations report word0=0x00000000, so the decode cannot produce this
+    // title's colour"), and the run could not have produced any other number. The dedup key was
+    // built from the same unassigned field, so the "distinct combinations" it counted were really
+    // just distinct (base, format) pairs.
     if (const char* clearlog = std::getenv("PROSPER_CLEARLOG")) {
         if (clearlog[0] == '1' && clearlog[1] == '\0') {
             static std::mutex clear_mutex;
@@ -324,8 +401,6 @@ RenderState extract_render_state(const GpuState& st) {
                         rs.color0_clear_word0, rs.color0_clear_word1);
         }
     }
-    rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
-    rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
 
     // Color MRT 1 uses the same field layouts as MRT0, with the RDNA2 target-block stride encoded by
     // the named register constants in pm4_registers.hpp.

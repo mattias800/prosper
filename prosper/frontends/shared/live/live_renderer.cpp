@@ -10120,15 +10120,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         static std::atomic<uint64_t> uniform_stores{0};
                                         const uint64_t ord =
                                             uniform_stores.fetch_add(1, std::memory_order_relaxed) + 1;
+                                        // WHICH pass handed us the uniform frame. `origin=` only
+                                        // separates a composite from a republished guest scanout; it
+                                        // cannot say which colour target the composite read back, and
+                                        // that is the one fact needed to go from "a uniform frame was
+                                        // retained" to "this surface is uniform" (#2014).
+                                        using prosper::frontend::PresentSourceChoice;
+                                        const uint32_t src_w =
+                                            present_choice == PresentSourceChoice::Front ? px_front_w
+                                          : present_choice == PresentSourceChoice::Vo    ? px_vo_w
+                                          : present_choice == PresentSourceChoice::Last  ? px_last_w : 0u;
+                                        const uint32_t src_h =
+                                            present_choice == PresentSourceChoice::Front ? px_front_h
+                                          : present_choice == PresentSourceChoice::Vo    ? px_vo_h
+                                          : present_choice == PresentSourceChoice::Last  ? px_last_h : 0u;
+                                        const uint64_t src_base =
+                                            present_choice == PresentSourceChoice::Front ? px_front_base
+                                          : present_choice == PresentSourceChoice::Vo    ? px_vo_base
+                                          : present_choice == PresentSourceChoice::Last  ? px_last_base : 0u;
+                                        const uint32_t src_fmt =
+                                            present_choice == PresentSourceChoice::Front ? px_front_fmt
+                                          : present_choice == PresentSourceChoice::Vo    ? px_vo_fmt
+                                          : present_choice == PresentSourceChoice::Last  ? px_last_fmt
+                                                                                        : kNoPassFormat;
+                                        // A VkFormat, not the raw CB_COLOR0_INFO.FORMAT:
+                                        // `ResolvedPipelineState::color0_format` is already
+                                        // `vk_color_format(...)`'s output (render_state.cpp:789).
+                                        // Naming it `cbfmt` cost a wrong reading once -- 44 is
+                                        // VK_FORMAT_B8G8R8A8_UNORM, which is not a CB format value
+                                        // at all.
+                                        char fmt_text[16];
+                                        if (src_fmt == kNoPassFormat) snprintf(fmt_text, sizeof fmt_text, "none");
+                                        else snprintf(fmt_text, sizeof fmt_text, "%u", src_fmt);
                                         if (prosper::diag_should_print(ord))
                                             fprintf(stderr,
                                                     "[uniformlog] #%llu retaining a UNIFORM frame "
-                                                    "rgba=(%u,%u,%u,%u) bytes=%zu origin=%s\n",
+                                                    "rgba=(%u,%u,%u,%u) bytes=%zu origin=%s src=%s "
+                                                    "%ux%u@0x%llx vkfmt=%s\n",
                                                     (unsigned long long)ord,
                                                     px[0], px[1], px[2], px[3], n,
                                                     frame_origin ==
                                                         prosper::gpu::PresentFrameOrigin::GuestScanout
-                                                        ? "GuestScanout" : "Composited");
+                                                        ? "GuestScanout" : "Composited",
+                                                    prosper::frontend::present_source_name(present_choice),
+                                                    src_w, src_h, (unsigned long long)src_base, fmt_text);
                                     }
                                 }
                             }

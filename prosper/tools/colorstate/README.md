@@ -29,6 +29,70 @@ suppressed-percentage series.
 
 `--selftest` runs the parser and reporter against a fixture; it needs no capture.
 
+## `--by-program`: which SHADER writes the presented surface
+
+The mode/mask census answers *with what colour state* the scanout is written. It cannot answer
+*which draw*, and when a scanout goes **flat** that is the question — a single fullscreen program
+covering the whole surface is one row in every other section of this report and is indistinguishable
+there from a thousand small draws sharing its colour state.
+
+```bash
+python3 tools/colorstate/colorstate_report.py run.log --scanout-prefix 0x9fc --by-program
+```
+
+Each row is one pixel-shader program address, with its scanout draw count, how many of those
+actually wrote colour, and its mode / effective-mask distributions. Two programs with identical
+colour state are one row in the census above and two rows here.
+
+The address is the one `PROSPER_SKIP_DRAW_PROGRAM` takes, so a row is directly actionable: a
+**one-program** A/B, instead of a process-wide lever such as `PROSPER_LEGACY_CB_DISABLE_MASK` whose
+blast radius is every title. That distinction matters — the same process-wide lever measured 18.08%
+-> 0.54% of flooded scanout passes on `PPSA05143` (#2014) and, on `PPSA02058`, took content samples
+from 3 of 24 to **0 of 24** (#2932). A lever that rescues one title and destroys another is a
+diagnostic; a named program may be a fix.
+
+The section is opt-in so existing invocations print byte-identical output.
+
+## `--by-pipeline`: the axis `--by-program` cannot express
+
+A per-program breakdown groups on the **pixel shader alone**. If the phenomenon is keyed on the
+*pipeline*, that view cannot express it — and the shape it produces instead is actively misleading:
+one program showing several modes reads as *"the decoded field is unreliable"*.
+
+```bash
+python3 tools/colorstate/colorstate_report.py run.log --scanout-prefix 0x9fc --by-pipeline
+```
+
+Each row is one `(vertex program, pixel program, RAW CB_COLOR_CONTROL word)` combination, followed by
+**one falsifiable verdict and one tripwire**:
+
+```
+    3734  es=0x300e900000  ps=0x3017370000  cb-control=0x00cc0000 mode=0 (DISABLE) effective=07 writes-colour=True
+    1320  es=0x3016e60000  ps=0x3017370000  cb-control=0x00cc0010 mode=1 (NORMAL)  effective=07 writes-colour=True
+  3 distinct raw CB_COLOR_CONTROL word(s) over 12 (vertex, pixel) pair(s); 1 pair(s) carry MORE THAN ONE word
+    SPLIT es=0x300e900000 ps=0x3017370000 words=0x00cc0000,0x00cc0020
+  reported mode agrees with bits [6:4] of the raw word on every row (a tripwire ...)
+```
+
+**The `pair(s) carry MORE THAN ONE word` line is the verdict, and it can come back either way.** A
+guest is free to write different `CB_COLOR_CONTROL` values for the same `(vertex, pixel)` pair; if it
+does, the pipeline is not the key and any per-pipeline conclusion is unsafe. On the run above it
+fired on 1 of 12 pairs — a single `ELIMINATE_FAST_CLEAR` draw under a third word — which is exactly
+the kind of qualification a check that cannot fail would have hidden.
+
+**The `[6:4]` line is a TRIPWIRE, not evidence, and the tool says so where it prints.** `mode` is
+extracted from `cb-control` by a pure function, so on any log prosper produced the two agree **by
+construction** and that line cannot fail. It exists to catch a log whose fields disagree — a
+hand-edited fixture, a future emitter deriving the mode from something else, a log merged from two
+builds. An earlier revision printed *"the decode is faithful to what the guest wrote"* here; that
+sentence was unfalsifiable, and a reviewer's hand-built log in which **every `NORMAL` draw was
+mislabelled `DISABLE`** still produced it.
+
+This flag exists because reading `--by-program` as though it were a pipeline breakdown produced
+precisely the wrong conclusion on #1706 — published, then overturned from the same log by re-keying.
+That is **instrument trap 265**, and `--by-program` now prints a warning pointing here whenever a
+program in its output carries more than one mode.
+
 ## Read the per-minute series, not a single number
 
 **A suppressed-draw count means nothing on its own.** Compare a phase whose output is

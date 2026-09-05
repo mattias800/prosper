@@ -10,6 +10,7 @@
 #pragma once
 #include "gpu/pm4/command_processor.hpp"
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace prosper::gpu {
@@ -409,6 +410,13 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
 // draws — so knowing WHICH titles decode an unmodeled mode, and how often, is a precondition for
 // acting on the value at all.
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode);
+
+// Format the EXACT per-mode totals into `out` as one line, e.g.
+//   [gpu] CB_COLOR_CONTROL unmodeled-mode totals (EXACT, ...): mode0=32768 mode2=4
+// Returns false and writes an empty string when no unmodeled mode has been decoded, so a title that
+// programs none stays a usable control rather than printing a row of zeroes. Split out from the
+// atexit dump that calls it so the formatting is testable without a process exit.
+bool unmodeled_cb_color_mode_summary(char* out, size_t cap);
 
 // #1724 diagnostic-only: true when PROSPER_LEGACY_CB_DISABLE_MASK=1 restores #919's
 // `MODE == DISABLE -> zero every colour write mask` override, for A/B-ing a suspected regression
