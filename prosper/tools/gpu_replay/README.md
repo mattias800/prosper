@@ -99,6 +99,59 @@ guest pitch while retaining their historical tight byte span.
 The `vs=` and `fs=` summaries identify whether each recompiled shader is retained as `owned` or
 `shared`; their size and hash always describe the accessor-selected words the renderer consumes.
 
+## Verifying what reached the GPU — `PROSPER_BUFVERIFY`
+
+`PROSPER_BUFLOG=1` prints the **source** words of every storage-buffer upload, which answers "what did
+prosper believe it was uploading". It cannot answer "did that arrive", because it never looks at the
+destination.
+
+`PROSPER_BUFVERIFY=1` closes that half. Every uploaded storage buffer is recorded and, just before the
+pass's command buffer is closed, re-read from its mapped device-visible allocation and compared byte
+for byte against the words it was built from:
+
+```
+[bufverify] 91 buffer(s) re-read from device memory, 0 mismatched, 0 skipped (no host mapping)
+[bufverify] MISMATCH set=0 binding=7 id=2079b49510 source_bytes=11520 device_bytes=11520
+            first_differing_byte=6528 (vertex 204 at stride 32)
+```
+
+**What a zero from it does and does not retire.** The destination `range` is assigned the same byte
+count the memcpy used, so a *short* upload is structurally inexpressible here — truncation is
+`[buffer-truncated]`'s and BUFLOG's question, not this one. What this detects is the destination being
+**clobbered between the memcpy and submission**: an overlapping arena slice, a stray write, a pooled
+buffer handed out twice. End-of-pass placement is what makes that visible.
+
+A mismatch can also be a false positive: the `#1268` dedup path deliberately tolerates cross-thread
+guest writes to the source words, so a guest that rewrites them after the memcpy trips this without any
+prosper defect being involved.
+
+**`skipped (no host mapping)` is load-bearing.** A transient upload (neither arena nor pool) unmaps its
+memory before returning and cannot be re-read. `PROSPER_NO_BACKEND_BUFFER_POOL=1` sends *every* upload
+down that path, so that arm verifies nothing — and says so, loudly, rather than printing a
+confident-looking zero.
+
+### The control, and aiming it
+
+This check exists to report a zero, and nothing in a normal run exercises its mismatch branch, so it
+ships with a deliberate-corruption control. `PROSPER_BUFVERIFY_MUTATE=N` flips one byte of a device copy
+and the next line must name that offset:
+
+```
+[bufverify] MUTATED device byte 6528 of set=0 binding=7 source_bytes=11520 -- the next line must
+            report a mismatch at exactly that offset
+```
+
+`PROSPER_BUFVERIFY_MUTATE_BINDING` and `PROSPER_BUFVERIFY_MUTATE_MINBYTES` aim it. **Aim it at the
+binding and size class whose zero you intend to quote.** The first version of this control always took
+whichever buffer was recorded first — a 128-byte uniform buffer — and fired perfectly, which proves the
+comparison runs and says nothing about the 7 KiB vertex buffer the null was about. A control drawn from
+a different size class than the null tests the discriminator, not the domain.
+
+If nothing matches the aim, the run prints `CONTROL DID NOT FIRE ... UNVALIDATED` instead of falling
+silent, because silence there is indistinguishable from a clean verified run. All three values parse
+strictly (decimal or `0x` hex); a malformed one disarms the control loudly rather than aiming it
+somewhere unintended.
+
 ## Draw-time resource provenance
 
 Set `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE=DRAW:vs|ps:BINDING` while taking a capsule with
