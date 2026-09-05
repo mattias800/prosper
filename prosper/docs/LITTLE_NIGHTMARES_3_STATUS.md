@@ -152,8 +152,12 @@ fault, no publish wall — which matters for how the numbers below may be read.
 
 Four other programs account for 14 draws between them.
 
-`effective=07` is **RGB written, alpha not written** — which is the observed `(255,255,0,0)` exactly:
-alpha stays at the `(0,0,0,0)` clear while three channels are painted.
+`effective=07` is **RGB written, alpha not written**. Be precise about what that explains: it
+accounts for the **zero alpha** in the observed `(255,255,0,0)` — alpha stays at the `(0,0,0,0)`
+clear because nothing writes it. It does **not** explain the RGB. Blue is *inside* the write mask and
+is being written **as zero by the shader**, so `(255,255,0)` is the program's own export and remains
+unexplained. #2014 is about red and green at maximum, and a mask that only reaches the alpha channel
+cannot close it.
 
 **Exposure to #1724's change**: `mode=0` with a non-zero effective mask is **3,818 of 6,366** scanout
 `mode=0` draws, **60%**. *The Plucky Squire*'s equivalent is **4.79%**
@@ -170,6 +174,24 @@ recorded on #1706.
 
 **Exact, replacing a lower bound:** exactly **1** ELIMINATE_FAST_CLEAR draw among 10,233 scanout
 draws. The EFC null recorded below is therefore a null over a one-draw population.
+
+**The defect-level metric, which is closer to the frame than the pass census above.** Counting the
+*retained uniform frames* by colour across the three 120 s lever arms:
+
+| arm | uniform retains | yellow `(255,255,0,0)` | black `(0,0,0,0)` |
+| --- | --- | --- | --- |
+| control | 64 | **63** | 1 |
+| `PROSPER_LEGACY_CB_DISABLE_MASK=1` | 128 | **4** | 60 (+1 opaque black) |
+| `PROSPER_CB_EFC_NO_COLOR=1` | 64 | **63** | 1 |
+
+Under the lever the uniform frames do not disappear — they turn **black**, i.e. the pass's own
+`(0,0,0,0)` clear showing through where the flooding draw was suppressed. That is a stronger
+statement than the pass-coverage rate: it is measured on the frames prosper actually retained, and it
+identifies the yellow as a *draw's export* rather than a clear or a fallback.
+
+Note also that the pass-coverage rates quoted above are normalised over passes that **produced
+pixels**, and that denominator is stable across the arms (2,287 control, 2,111 lever, 2,326 EFC) —
+so the lever changed what those passes wrote, not how many of them ran.
 
 **What this run cannot say.** The tool's per-guest-minute series is a single `??:??` bucket — the log
 carries no Unreal timestamps to attribute against — so there is no good-phase/bad-phase contrast
