@@ -1402,7 +1402,47 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   whether prosper is clean. #2945.
 
 
-### A DETERMINISTIC cross-implementation split, with a lavapipe positive control — and the four titles it covers (2026-09-05) — #3374
+### WITHDRAWN (2026-09-05, later the same day): #3374 does not reproduce on a fresh build — #3374
+
+**Everything in the two subsections below was measured from ONE long-lived worktree's incremental
+build directory, and none of it reproduces from a clean configure of the same commits.** Read them as
+a record of an instrument failure, not as findings about the renderer. The re-measurement, on
+`c4f57b1de` — two commits after the `d38e892cc` they were taken at, both of them documentation or an
+off-by-default diagnostic, so the rendering code is the same code:
+
+| path | result |
+| --- | --- |
+| live `prosper-app`, *New Joe & Mac* and *Alex Kidd*, played by the project owner | **correct**, no shear, both titles |
+| live `tools/screenshot`, native 1920x1080, the guard's own route, ~150 gameplay frames opened | **correct**, every frame |
+| the same, under concurrent GPU load (`gpu_busy_percent` 18.1% -> 28.2%, three emulator processes) | **correct**, every frame |
+| offline `gpu_replay --bundle` on **RADV** — the exact command below | **correct**: level 1 complete, volcano, twin palms, "Ready?", the 1PL marker, both cavemen, full HUD |
+
+And the "cross-implementation split" itself, re-measured on a capsule captured today, RADV against
+lavapipe: **maximum channel delta 4 of 255, mean 1.01 over the 22.8% of pixels that differ at all,
+and zero pixels differing by more than 32.** That is rounding between two rasterizers. The images are
+visually identical. There is no split to explain.
+
+**What went wrong, and the rule it re-teaches.** The failing measurements all came from
+`.claude/worktrees/lane-fps-rung6`, a worktree reused across branch switches for days. This project
+already records that exact trap — *five phantom Vulkan failures on master from a tree reused across
+branch switches, all five passing on a fresh configure*. The clean runs above are from a worktree
+configured from scratch. **The lane's build directory was destroyed during routine cleanup before
+this was suspected**, so the mechanism is inferred from the pattern rather than demonstrated; that
+loss is itself worth recording, because the build tree is evidence when its output is the finding.
+
+Two claims that outran their evidence and are withdrawn with it: that the five titles' shear is a
+RADV defect (#3375), and that dropped indexed draws are its mechanism (#3377). What survives
+independently is the `tools/vkprobe` measurement that **RADV returns varying output for an unchanged
+indexed draw under load while lavapipe does not** — that was taken with prosper-free, hand-written
+shaders in a separate binary, so a stale prosper build cannot explain it. It is a real observation
+about this driver and grounds for an upstream report. It is **not** an explanation of a picture that
+no longer exists.
+
+**Before believing any renderer defect measured from a long-lived worktree, re-measure it from a
+clean configure.** A stale object file produces a defect that survives every A/B you can run inside
+that tree, because every arm inherits it.
+
+### (WITHDRAWN — see above) A cross-implementation split, with a lavapipe positive control — and the four titles it covered (2026-09-05) — #3374
 
 The row above closes with *"the failing regime cannot be reproduced on this box at all"*. It can, on a
 different subject, and this one does not need a regime: **one captured frame, replayed offline, is
@@ -1516,7 +1556,7 @@ needed.
 see instrument trap 266. The `--draw-steps` per-operation contribution is the instrument that held.
 
 
-### The fork is settled: RADV drops indexed draws on this box, and module UB cannot be the mechanism (2026-09-05) — #3374
+### (WITHDRAWN as an explanation of #3374 — see above) RADV returns varying output for an unchanged indexed draw under load (2026-09-05)
 
 The subsection above left an open fork — a RADV defect against implementation-defined or undefined
 behaviour in prosper's recompiled vertex stage — and named auditing that SPIR-V as the next step. **That

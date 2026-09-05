@@ -21,6 +21,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
+### The sheared Unity titles were never sheared — the build directory was
+
+Five games we had filed as rendering their levels through torn triangles turn out to render
+perfectly. The owner played two of them and said so; every re-measurement since agrees, including the
+one command the original report was built on. What produced the broken pictures was a build directory
+that had been reused across branch switches for days, and every experiment we ran lived inside it, so
+every experiment agreed with every other one. Two conclusions built on top of it have been withdrawn.
+
+The lesson is cheap to state and was expensive to learn: a defect that reproduces perfectly in one
+worktree and has no witness anywhere else is a defect in that worktree.
+
+
 ### Nineteen draws go missing on this machine's graphics driver, and it is the driver's doing
 
 Follow-up to the entry below, and this one has no picture — the result is a pair of counts. On the *New
