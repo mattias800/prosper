@@ -136,6 +136,48 @@ ordinary composites carrying a stale MODE (#1706), and suppressing the second ki
 content. `tools/colorstate/colorstate_report.py --by-program` is the instrument that separates them
 by naming the shader.
 
+### Which draws flood the scanout (2026-09-05, `PROSPER_COLORSTATETRACE`)
+
+160 s default route, `PROSPER_COLORSTATETRACE=3840x2160`, reduced with
+`colorstate_report.py --scanout-prefix 0x9fc --by-program`. 379,160 records, 47,395 draws, 10,233
+writing the registered scanout. **This run was healthy** — 19 of 20 samples carry content, no GPUVM
+fault, no publish wall — which matters for how the numbers below may be read.
+
+**Only two pixel-shader programs write the scanout at all:**
+
+| program | scanout draws | writing colour | modes | effective mask |
+| --- | --- | --- | --- | --- |
+| `0x3017370000` | 5,173 | 5,056 | DISABLE 3,852 / NORMAL 1,320 / EFC 1 | `00`x117, **`07`x5,054**, `0f`x2 |
+| `0x300f0a0000` | 5,046 | 2,616 | DISABLE 2,513 / NORMAL 2,533 | `00`x2,430, `0f`x2,616 |
+
+Four other programs account for 14 draws between them.
+
+`effective=07` is **RGB written, alpha not written** — which is the observed `(255,255,0,0)` exactly:
+alpha stays at the `(0,0,0,0)` clear while three channels are painted.
+
+**Exposure to #1724's change**: `mode=0` with a non-zero effective mask is **3,818 of 6,366** scanout
+`mode=0` draws, **60%**. *The Plucky Squire*'s equivalent is **4.79%**
+(`tools/colorstate/README.md`). An order of magnitude more exposed, which is why the
+`PROSPER_LEGACY_CB_DISABLE_MASK` lever moves this title 33x and is a trade on others.
+
+**The mode does not track shader identity.** Both scanout programs appear under *both* modes, and
+`0x300f0a0000` is nearly 50/50. For `0x3017370000` the write mask holds at `07` across the flip —
+the field moves while the state it is supposed to describe does not. Where `MODE=DISABLE` is real and
+intended, an engine normally zeroes the mask alongside it (Plucky's depth/shadow prepass does exactly
+that, which is why so few of its draws were affected). This is evidence for #1706's stale/latched
+reading, and it is the **opposite** of what an earlier reading of the lever asymmetry suggested;
+recorded on #1706.
+
+**Exact, replacing a lower bound:** exactly **1** ELIMINATE_FAST_CLEAR draw among 10,233 scanout
+draws. The EFC null recorded below is therefore a null over a one-draw population.
+
+**What this run cannot say.** The tool's per-guest-minute series is a single `??:??` bucket — the log
+carries no Unreal timestamps to attribute against — so there is no good-phase/bad-phase contrast
+here, only a population. `tools/colorstate/README.md` is emphatic that a population alone can
+mislead: on Plucky the `mode=0` fraction is *higher* while the world renders correctly than while it
+is black. The next arm is `PROSPER_SKIP_DRAW_PROGRAM=0x3017370000`, a one-program A/B rather than a
+process-wide lever.
+
 ### Past the title screen: the EULA, via a checked-in input route
 
 `scripts/little-nightmares-3/reach-gameplay.pad` presses `cross` at the title screen and the title
