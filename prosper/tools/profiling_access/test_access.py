@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unprivileged policy/IO/installation tests. Real sudo access requires profile.py --verify-access."""
 import io
+import fcntl
 import os
 from pathlib import Path
 import stat
@@ -185,6 +186,86 @@ class StreamTests(unittest.TestCase):
                 self.assertTrue(os.get_blocking(writer))
         finally:
             os.close(reader)
+            os.close(writer)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def full_pipe(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        self.addCleanup(os.close, writer)
+        os.set_blocking(writer, False)
+        try:
+            while True:
+                os.write(writer, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        os.set_blocking(writer, True)
+        return reader, writer
+
+    def invoke_main(self, arguments, *, stderr, stdout=subprocess.PIPE, lock_path=None):
+        # Exercise the actual main/record paths in a separate ordinary-user process. Only
+        # privilege checks, the protected lock location and fixed recorder are substituted.
+        # The outer fake-backend timeout prevents an old helper leaving an orphan on failure.
+        backend = ("import os\ntry: os.write(2, b'backend diagnostic\\n')\n"
+                   "except BlockingIOError: pass\nos.write(1, b'payload\\n')")
+        code = f"""
+import fcntl, os, sys
+sys.path.insert(0, {str(Path(capture.__file__).resolve().parent)!r})
+import capture
+capture.authorize = lambda *args: None
+capture.trusted_path = lambda *args, **kwargs: None
+def acquire():
+    fd = os.open({str(lock_path)!r}, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+capture.acquire_lock = acquire
+capture.command_for = lambda seconds: ['/usr/bin/timeout', '--kill-after=1s', '2',
+                                      sys.executable, '-c', {backend!r}]
+sys.argv = ['capture.py', *{arguments!r}]
+sys.exit(capture.main())
+"""
+        return subprocess.run([sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                              stdout=stdout, stderr=stderr, timeout=4)
+
+    def test_full_stderr_cannot_hold_capture_or_lock(self):
+        _, writer = self.full_pipe()
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            lock_path = Path(directory).resolve() / "lock"
+            result = self.invoke_main(["scheduler", "1"], stderr=writer, lock_path=lock_path)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"payload\n")
+            self.assertTrue(os.get_blocking(writer), "restore the caller's shared FD flags")
+            with lock_path.open("rb") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_full_stderr_does_not_block_refusal(self):
+        _, writer = self.full_pipe()
+        result = self.invoke_main(["scheduler", "61"], stderr=writer)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue(os.get_blocking(writer))
+
+    def test_full_stdout_does_not_block_help(self):
+        _, writer = self.full_pipe()
+        result = self.invoke_main(["--help"], stdout=writer, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.get_blocking(writer))
+
+    def test_notice_is_bounded_and_preserves_flags(self):
+        with tempfile.TemporaryFile(dir=".") as output:
+            capture.notice(output.fileno(), "x" * 10000)
+            output.seek(0)
+            self.assertEqual(len(output.read()), 4096)
+            self.assertTrue(os.get_blocking(output.fileno()))
+
+    def test_broken_diagnostic_pipe_is_disposable(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            capture.notice(writer, "discard this diagnostic")
+            self.assertTrue(os.get_blocking(writer))
+        finally:
             os.close(writer)
 
 

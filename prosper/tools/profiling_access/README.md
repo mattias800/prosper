@@ -83,6 +83,9 @@ other processes' names, addresses and paths; do not publish them.
 - Only switch, wakeup, new-wakeup and migration tracepoints, recorded system-wide with period 1.
 - A nonblocking root-owned lock permits only one helper capture at a time.
 - Output is limited to 256 MiB, buffered in small chunks; blocked consumers have a deadline.
+- Helper and recorder diagnostics are best-effort and nonblocking. A full/closed stderr pipe
+  may lose diagnostics, but cannot keep a completed capture holding its lock. The helper restores
+  inherited descriptor blocking flags on exit; its help output is bounded and best-effort too.
 - An outer timeout bounds the recorder even if the supervising helper dies. Interrupts and
   supervisor failures clean up the recorder's process group. Kernel-uninterruptible tasks can
   still outlive userspace timeouts; this is not a kernel recovery mechanism.

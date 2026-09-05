@@ -145,12 +145,34 @@ def interrupted(signum, frame):
     raise InterruptedError(f"capture interrupted by signal {signum}")
 
 
+def notice(fd, message):
+    """Best-effort, one bounded write: a diagnostic consumer must never hold the lock."""
+    blocking = None
+    try:
+        blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+        os.write(fd, (message + "\n").encode()[:4096])
+    except OSError:
+        pass  # Closed or backpressured diagnostics are deliberately disposable.
+    finally:
+        if blocking is not None:
+            try:
+                os.set_blocking(fd, blocking)
+            except OSError:
+                pass
+
+
 def main():
     if sys.argv[1:] == ["--help"]:
-        print(__doc__)
+        notice(1, __doc__)
         return 0
     lock = None
+    stderr_blocking = None
     try:
+        # perf/timeout inherit stderr too. Make it nonblocking for their entire lifetime,
+        # not only for our final diagnostic, and never use buffered Python stderr writes.
+        stderr_blocking = os.get_blocking(2)
+        os.set_blocking(2, False)
         seconds = seconds_from(sys.argv[1:])
         authorize(os.geteuid(), os.environ.get("SUDO_UID"), ALLOWED_UID)
         if sys.stdout.isatty():
@@ -161,15 +183,19 @@ def main():
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, interrupted)
         size = record(seconds, sys.stdout.fileno())
-        print(f"prosper-perf: completed ({size} bytes); decode and check events before attribution",
-              file=sys.stderr)
+        notice(2, f"prosper-perf: completed ({size} bytes); decode and check events before attribution")
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"prosper-perf: {exc}", file=sys.stderr)
+        notice(2, f"prosper-perf: {exc}")
         return 1
     finally:
         if lock is not None:
             os.close(lock)
+        if stderr_blocking is not None:
+            try:
+                os.set_blocking(2, stderr_blocking)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
