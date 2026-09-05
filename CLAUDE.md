@@ -508,6 +508,31 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   Every new or materially changed baseline requires `snapshot.py verify`,
   inspection of all retained images from both runs, and a factual `review` note. See
   `tools/snapshot/AGENTS.md`.
+  - **A green CI GPU-execution job cannot clear a failure on this machine's driver, because CI has no
+    GPU.** `.github/workflows/ci.yml` says so in its own comment: the runner uses **Mesa's lavapipe
+    software rasteriser**, whose fragment subgroup is **fixed at 8 lanes**, and the workflow already
+    gates `recompiled_shaders_render` assertions that need an exact **64**-lane subgroup. So for
+    GPU-execution tests "CI green" is a statement about a **smaller domain** than a local run on RADV.
+    This is the positive-control rule two sections above — a control drawn from the same source tests
+    the discriminator, not the domain — applied to an entire CI stack.
+    Measured 2026-09-05 (#3355): five GPU-execution tests — `recompiled_shaders_render`,
+    `multidraw_render`, `indexed_render`, `descriptor_array_render`, `gpu_execute` — fail on RADV from
+    **both** a reused and a fresh build directory on a verified-idle box, set-equal across two lanes'
+    different heads, branches and dumps, while the same five pass in CI. Four of the five are
+    indexed-draw or GREEN-quad assertions: draws that render nothing.
+    **Two agents independently read that CI log as proof their change was not implicated, and both had
+    to withdraw it** — CI reads as neutral infrastructure, which is exactly why nobody asks whether it
+    can run the case. The workflow's own instruction is the right one: *"If a GPU test fails here,
+    diagnose it."* The gap is not GPU-only: a change dispatched on a host CPU feature (F16C, for
+    instance) may take a different path on the runner, so a green suite is not evidence the vectorised
+    path ran.
+    **The prior runs the other way, though, and it is in the same comment block:** four tests were
+    once excluded here as "driver-divergent" (#1681) and **none of them were** — every divergence was
+    measured and each time it was prosper's own assertion or fixture that overreached, which is why
+    they are gated rather than excluded today. So a local-only GPU failure is a reason to *diagnose*,
+    not to assume the driver is at fault; the honest open question is whether the assertion or the
+    backend is wrong. Note that history was measured entirely in the lavapipe direction, so it does
+    not transfer unexamined to a failure only 64-lane hardware can reach.
 - **Per-title bring-up ladder — gameplay is always the target.** Every game climbs the same ladder,
   and progress claims name the rung reached:
   1. **Any graphics at all** — real frames from the live renderer (a splash/logo counts; black or
