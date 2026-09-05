@@ -1473,8 +1473,17 @@ reviewed tutorial room. Treat Evergate as **unresolved**, not as excluded.
 and load-triggered; this is 25 of 25 in both regimes, and no lever moves it: `PROSPER_NO_BACKEND_BUFFER_ARENA`,
 `PROSPER_NO_BACKEND_BUFFER_POOL` (together and separately), `PROSPER_NO_BACKEND_RESOURCE_SHARE`,
 `PROSPER_NO_BACKEND_PIPELINE_CACHE`, `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE`, `PROSPER_NO_MEMORY_POOL`,
-`PROSPER_BACKEND_BUFFER_ARENA_KB=262144`, and `RADV_DEBUG=syncshaders | zerovram | nocache | nongg |
-nonggc | llvm`, `RADV_PERFTEST=nosam` all return the byte-identical broken frame. Its character matches
+`PROSPER_BACKEND_BUFFER_ARENA_KB=262144`, and `RADV_DEBUG=syncshaders | zerovram | nocache`,
+`RADV_PERFTEST=nosam` all return the byte-identical broken frame.
+
+**Three RADV arms are VOID rather than negative, and this qualifies #2945's row too.** `RADV_DEBUG=llvm`,
+`nongg` and `nonggc` also return the byte-identical frame, but they change nothing to return it: with
+`shaderstats,nocache` forcing a fresh compile in both arms, the SGPR / VGPR / code-size lines are
+**md5-identical** to the default, and the driver's own output contains **zero** `ngg` tokens — so there
+is no NGG to disable and this Mesa (26.1.4 / 26.2.1) does not select an LLVM backend. #2945's list reads
+*"`RADV_DEBUG=llvm` failing rules out ACO; `nongg` failing rules out NGG"*; on this Mesa neither
+inference holds, because neither lever moves. Pair any RADV compile lever with `shaderstats,nocache` and
+show the stats differ before quoting a null from it. Its character matches
 #2937 — deterministic — rather than #2945's stochastic dropout. (#3371's own tests measured **stochastic**
 here, 3-8 failures of 24 runs, which is the opposite of what that issue's title says and of what the #2937
 row above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
