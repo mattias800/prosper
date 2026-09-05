@@ -1061,6 +1061,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_module_label PRIVATE prosper_core)
   add_test(NAME guest_module_label COMMAND test_guest_module_label)
 
+  # The frame-pointer walk shared by the fault reporter and PROSPER_HWBP_STACK. It dereferences
+  # guest-controlled pointers inside a signal handler, so every stop condition (cycle, unreadable
+  # frame, depth cap) is a safety property. Header-only; no dump, no device.
+  add_executable(test_rbp_chain tests/host/fault/test_rbp_chain.cpp)
+  target_link_libraries(test_rbp_chain PRIVATE prosper_core)
+  add_test(NAME rbp_chain COMMAND test_rbp_chain)
+
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
   add_executable(test_platform_ui tests/hle/service/test_platform_ui.cpp)
@@ -1419,6 +1426,12 @@ if(TARGET prosper_core)
   add_executable(test_savedata_event_drain tests/hle/service/test_savedata_event_drain.cpp)
   target_link_libraries(test_savedata_event_drain PRIVATE prosper_core)
   add_test(NAME savedata_event_drain_code COMMAND test_savedata_event_drain)
+
+  # libScePsml must report failure rather than the dispatcher's default SCE_OK: the guest reads an
+  # out-struct prosper never wrote and allocates from it (PPSA20447). Pure, no dump, no device.
+  add_executable(test_psml_unimplemented tests/hle/service/test_psml_unimplemented.cpp)
+  target_link_libraries(test_psml_unimplemented PRIVATE prosper_core)
+  add_test(NAME psml_unimplemented COMMAND test_psml_unimplemented)
 
   add_executable(test_translate_sandbox tests/hle/test_translate_sandbox.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.

@@ -17,6 +17,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include "host/platform/posix_shim.hpp"
 #include "host/fault/fault_context.hpp"   // #2018: one fault's own registers, snapshotted from ITS ucontext
+#include "host/fault/rbp_chain.hpp"      // PROSPER_HWBP_STACK: who called this breakpoint
 #include <sys/mman.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -374,6 +375,13 @@ namespace {
     // gets its own perf fd + owns its own SIGTRAP). Lets us observe code that runs off the main thread
     // (e.g. an async-loader worker) which a main-thread-only bp misses. Per-thread fd + stepping state.
     bool                 g_hwbp_allthreads = false;
+    // PROSPER_HWBP_STACK=<N>: at each reported hit, also print the guest caller chain (N frames,
+    // capped) recovered from the rbp chain. The one-level `caller_rbp=` field on the main record
+    // answers "who called the function I am standing in"; it cannot answer "which of this
+    // function's seventeen call sites got here", which is the question a breakpoint on a shared
+    // allocator always raises.
+    int                  g_hwbp_stack = 0;
+    static constexpr int HWBP_STACK_MAX = 24;
     thread_local int     t_hwbp_fd = -1;       // this thread's own bp fd (main thread mirrors g_hwbp_fd)
     std::atomic<GuestExecutionThreadEnterTestHook> g_guest_execution_enter_test_hook{nullptr};
     std::atomic<void*> g_guest_execution_enter_test_opaque{nullptr};
@@ -1788,6 +1796,27 @@ namespace {
                     nm(rd(rbp + 8)), off(rd(rbp + 8)), cur_tid());
                 (void)r15; (void)rdi; (void)rsi;
                 raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
+                // PROSPER_HWBP_STACK=<N>: the guest caller chain at this hit. `caller_rbp=` above is
+                // one level; this is the chain, which is what identifies WHICH call site reached a
+                // shared function. Shares the fault path's walker (host/fault/rbp_chain.hpp) so the
+                // two cannot drift, and passes probe_readable so nothing is dereferenced blind.
+                if (g_hwbp_stack > 0) {
+                    uint64_t frames[HWBP_STACK_MAX];
+                    const int nf = prosper::host::walk_rbp_chain(rbp, frames, g_hwbp_stack,
+                                                                 &probe_readable);
+                    char sb[512];
+                    int sn = snprintf(sb, sizeof sb, "[hwbp-stack] #%d", (int)g_hwbp_count);
+                    for (int i = 0; i < nf && sn > 0 && sn < (int)sizeof sb - 40; i++)
+                        sn += snprintf(sb + sn, sizeof sb - sn, " %s+0x%llx",
+                                       gmod(frames[i]), (unsigned long long)goff(frames[i]));
+                    // Say when the walk ended early rather than letting a short chain read as the
+                    // whole stack: an unreadable or non-increasing frame is a fact about the guest
+                    // stack, and a truncated line looks identical to a shallow one (trap 201).
+                    if (sn > 0 && sn < (int)sizeof sb - 24)
+                        sn += snprintf(sb + sn, sizeof sb - sn, "%s\n",
+                                       nf == g_hwbp_stack ? " ...(depth cap)" : " (chain end)");
+                    raw_write_fmt(2, sb, sizeof sb, sn);
+                }
                 // PROSPER_HWBP_DIVCAP: log the typetree-vector transfer's elemSize/byteSize/count from the
                 // caller frame (rbp-relative), for the ~6 `call *0x88` array reads.
                 if (g_hwbp_divcap) {
@@ -3465,6 +3494,16 @@ void install_trap_handler() {
         g_hwbp_probe = getenv("PROSPER_HWBP_PROBE");               // stable environ string; handler only reads it
         g_hwbp_global = getenv("PROSPER_HWBP_GLOBAL");             // may be null; handler null-checks
         if (getenv("PROSPER_HWBP_ALLTHREADS")) g_hwbp_allthreads = true;
+        if (const char* st = getenv("PROSPER_HWBP_STACK")) {
+            // Every other PROSPER_* switch here is spelled `=1` for "on", so `=1` must mean "on"
+            // rather than "one frame" -- a one-frame chain is exactly what `caller_rbp=` already
+            // prints, so honouring it literally would hand a reader who followed the house idiom a
+            // feature that looks broken. A depth is only meaningful from 2 up; anything at or below
+            // that (including a non-numeric value, which strtol reports as 0) takes the default.
+            long v = strtol(st, nullptr, 0);
+            if (v <= 1) v = 8;
+            g_hwbp_stack = (int)(v > HWBP_STACK_MAX ? HWBP_STACK_MAX : v);
+        }
         ensure_probe_pipe();
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
