@@ -1489,8 +1489,9 @@ show the stats differ before quoting a null from it. Its character matches
 here, 3-8 failures of 24 runs, which matches #3371's own title and is the opposite of what the #2937 row
 above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
 a cause is open — but #3371's own next step, a missing host-upload barrier in prosper, is materially
-undercut by the subsection below: `tools/vkprobe` reproduces the same dropout with no prosper code in the
-process, fence-waiting before it touches mapped memory and reading coverage back through a real
+undercut by the subsection below: `tools/vkprobe` reproduces a dropout of the same signature with no
+prosper code in the process, fence-waiting before it touches mapped memory and reading coverage back
+through a real
 `vkCmdCopyImageToBuffer`. A barrier prosper is missing cannot explain a failure in a program that does not
 contain prosper.
 
@@ -1532,9 +1533,14 @@ rather than evidence against it, and the paragraph above already names those exa
 validation did not cover. The variance below therefore refutes the implementation-defined half on its own;
 what retires the undefined half is an arm, not an argument. `tools/vkprobe`'s `no_ssbo_vs` declares the same
 storage buffer at the same set 0 binding 3 and **never reads it**, deriving position from `gl_VertexIndex`
-alone — and it fails at a *higher* rate than the module that does read it (**142 of 400 runs against 54**,
-`tools/vkprobe/README.md`). A shader that performs no storage-buffer load at all cannot be failing because
-of what a storage-buffer load returned. Interleaved run-by-run, same
+alone — and it fails on this driver anyway, **142 of 400 runs** (`tools/vkprobe/README.md`). Do not read
+that against the 54 of 400 the storage-buffer module scored: those are different campaigns in different
+windows, and that README disclaims the cross-campaign comparison explicitly. The single figure carries the
+argument on its own. And the arm reaches further than a storage-buffer load: `no_ssbo_vs`'s only `OpLoad`
+is of the `VertexIndex` builtin and its only `OpAccessChain` is a constant index into its own output block
+— no function-local variables, no `OpUndef`, no branches, no dynamic indexing, no division, position built
+from `OpSelect` over constants. There is very little undefined behaviour that module is *capable* of, so it
+retires module UB as a class rather than the storage-read subset of it. Interleaved run-by-run, same
 capsule, same draw (`--draw 12`, a four-vertex six-index quad), same binary, under induced GPU load,
 **n = 20 per arm**:
 
@@ -1561,9 +1567,11 @@ varies run to run on one implementation while the other is exact. The UB enumera
 `OpUndef`, no uninitialised variables, no dynamic vector extracts, no division, and the position slice's
 only shift by a constant) stands as a record but is **no longer load-bearing**.
 
-**3. The bridge to the picture, measured rather than assumed.** The titles' shear is these dropouts at
-full-frame scale. Per-operation contribution from `--draw-steps --draw-steps-every 1` on the Joe & Mac
-capsule, both implementations, 86 comparable operations:
+**3. How far the dropouts reach into the picture.** They are present at full-frame scale and they are
+large; whether they *are* the shear is the open part, and the paragraph after the table is the one that
+settles what this measurement does and does not license. Per-operation contribution from
+`--draw-steps --draw-steps-every 1` on the Joe & Mac capsule, both implementations, 86 comparable
+operations:
 
 | | draws contributing pixels |
 | --- | --- |
@@ -1586,14 +1594,15 @@ its own. One further limit on the instrument: `--draw-steps` reports each operat
 prefix before it, so "contributes nothing" is a statement about that draw in that prefix and not an
 independent per-draw measurement of "was dropped".
 
-So: dropped indexed draws are established, and they are a mechanism the shear could be *part of*. Whether
+So: dropped indexed draws are established, and they may be *part of* what produces the shear. Whether
 they account for the picture is open, and the cheap way to close it is already to hand — compare the RADV
 replay frame against the live shear, and check whether the shards coincide with the survivors or with the
 missing set.
 
 **Why the full frame looks deterministic while one draw does not.** The 25-of-25 byte-identical full-frame
 result in the subsection above is real but is a property of the **saturated regime**, not of the mechanism:
-a full frame is its own GPU load, and the same nineteen draws lose on every run measured. Variance falls as the prefix grows — `--draw 12` gives 4 distinct outputs in 10 runs, `--draw 0:12`,
+a full frame is its own GPU load, and the same nineteen draws lose on every run measured. Variance falls
+as the prefix grows — `--draw 12` gives 4 distinct outputs in 10 runs, `--draw 0:12`,
 `--draw 0:30` and `--draw 0:60` give 2 (9 of 10 modal), the full frame gives 1 of 10. **So this is #2945's
 family after all, seen at saturation** — the earlier reading of "deterministic, therefore not #2945" was
 right about the measurement and wrong about what it implied. Read the two subsections together.

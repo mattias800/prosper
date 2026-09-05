@@ -21,7 +21,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
-### The Unity shear is nineteen draws going missing, and the graphics driver is dropping them
+### Nineteen draws go missing on this machine's graphics driver, and it is the driver's doing
 
 Follow-up to the entry below, and this one has no picture — the result is a pair of counts. On the *New
 Joe & Mac* frame we captured, **nineteen of its eighty-six draws paint nothing at all on this machine's
