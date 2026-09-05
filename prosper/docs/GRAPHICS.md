@@ -1488,7 +1488,11 @@ show the stats differ before quoting a null from it. Its character matches
 #2937 — deterministic — rather than #2945's stochastic dropout. (#3371's own tests measured **stochastic**
 here, 3-8 failures of 24 runs, which matches #3371's own title and is the opposite of what the #2937 row
 above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
-a cause is open.
+a cause is open — but #3371's own next step, a missing host-upload barrier in prosper, is materially
+undercut by the subsection below: `tools/vkprobe` reproduces the same dropout with no prosper code in the
+process, fence-waiting before it touches mapped memory and reading coverage back through a real
+`vkCmdCopyImageToBuffer`. A barrier prosper is missing cannot explain a failure in a program that does not
+contain prosper.
 
 **`PROSPER_INDEX_ECHO=1`** (new, `tests/fixtures/render_runner.h`) is what retired **prosper's half** of
 the index family at title scale. It reads the index bytes back from the host-visible memory at exactly the
@@ -1518,9 +1522,19 @@ behaviour in prosper's recompiled vertex stage — and named auditing that SPIR-
 audit is not the thing that answers it.** Enumerating UB classes can never finish, and two measurements
 refute the whole side of the fork regardless of what an enumeration would have found.
 
-**1. The variance argument. A module cannot be non-deterministic.** Undefined or implementation-defined
-behaviour makes an implementation give a *consistent* wrong answer for a given compilation; it cannot make
-one implementation give several different answers to identical input. Interleaved run-by-run, same
+**1. The variance argument, and what it does and does not reach.** *Implementation-defined* behaviour is a
+choice the compiler makes once, so it yields a consistent wrong answer for a given compilation and cannot
+make one implementation give several different answers to identical input. **That reasoning does NOT extend
+to undefined behaviour**, and this subsection asserted the broader claim until review caught it: reading an
+undefined value, or an out-of-range read where robustness does not resolve it, returns whatever the memory
+held, which varies with unrelated GPU activity — so load-dependent variance is that class's *signature*
+rather than evidence against it, and the paragraph above already names those exact two classes as the ones
+validation did not cover. The variance below therefore refutes the implementation-defined half on its own;
+what retires the undefined half is an arm, not an argument. `tools/vkprobe`'s `no_ssbo_vs` declares the same
+storage buffer at the same set 0 binding 3 and **never reads it**, deriving position from `gl_VertexIndex`
+alone — and it fails at a *higher* rate than the module that does read it (**142 of 400 runs against 54**,
+`tools/vkprobe/README.md`). A shader that performs no storage-buffer load at all cannot be failing because
+of what a storage-buffer load returned. Interleaved run-by-run, same
 capsule, same draw (`--draw 12`, a four-vertex six-index quad), same binary, under induced GPU load,
 **n = 20 per arm**:
 
@@ -1557,13 +1571,29 @@ capsule, both implementations, 86 comparable operations:
 | RADV | **67 of 86** |
 
 **19 draws contribute on lavapipe and nothing whatsoever on RADV** (2,461 to 23,286 pixels each), and the
-set of 19 is **identical across two independent runs**. That is the shear: nineteen sprite and level draws
-deleted from the frame, with the survivors composited over whatever the seed held.
+set of 19 is **identical across two independent runs**. The reverse direction is smaller and was initially
+unremarked: 84 - 19 = 65 draws contribute on both, so **2 draws contribute on RADV and nothing on
+lavapipe**.
 
-**Why the full frame looks deterministic while one draw does not.** The 35-of-35 byte-identical full-frame
+**This establishes that draws are lost, NOT that the loss is the shear** — the stronger claim stood here
+until review rejected it, and the distinction is worth keeping because the two failure pictures are
+different. Deleting a draw leaves a **hole**; #3374's own row for `PPSA02801` describes the opposite, art
+"present and recognisable" with *positive* sheared shards smeared across the frame. If those shards are in
+the RADV replay they are painted by the 67 draws that do contribute, not by the 19 that do not. The
+arithmetic bounds it the same way: 19 draws of at most 23,286 pixels is at most 442,434 of a 2,073,600-pixel
+frame, **under 22%**, against a single full-screen quad in the same capsule that paints 2,013,079 pixels on
+its own. One further limit on the instrument: `--draw-steps` reports each operation's *delta* against the
+prefix before it, so "contributes nothing" is a statement about that draw in that prefix and not an
+independent per-draw measurement of "was dropped".
+
+So: dropped indexed draws are established, and they are a mechanism the shear could be *part of*. Whether
+they account for the picture is open, and the cheap way to close it is already to hand — compare the RADV
+replay frame against the live shear, and check whether the shards coincide with the survivors or with the
+missing set.
+
+**Why the full frame looks deterministic while one draw does not.** The 25-of-25 byte-identical full-frame
 result in the subsection above is real but is a property of the **saturated regime**, not of the mechanism:
-a full frame is its own GPU load, essentially every affected draw loses, and the same nineteen lose every
-time. Variance falls as the prefix grows — `--draw 12` gives 4 distinct outputs in 10 runs, `--draw 0:12`,
+a full frame is its own GPU load, and the same nineteen draws lose on every run measured. Variance falls as the prefix grows — `--draw 12` gives 4 distinct outputs in 10 runs, `--draw 0:12`,
 `--draw 0:30` and `--draw 0:60` give 2 (9 of 10 modal), the full frame gives 1 of 10. **So this is #2945's
 family after all, seen at saturation** — the earlier reading of "deterministic, therefore not #2945" was
 right about the measurement and wrong about what it implied. Read the two subsections together.

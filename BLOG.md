@@ -25,12 +25,12 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 Follow-up to the entry below, and this one has no picture — the result is a pair of counts. On the *New
 Joe & Mac* frame we captured, **nineteen of its eighty-six draws paint nothing at all on this machine's
-AMD driver and paint correctly on a software one**, the same nineteen every run; that absence is what the
-shear is made of. We had left it open whether the fault was the driver's or ours, since both run shaders
-we generate. It is not ours: the same driver returns four different pictures from one unchanged four-vertex
-draw where the software one returns the same picture twenty times, and a shader we did not write fails the
-same way, 28 empty draws in 300 against zero. A shader can be wrong, but it cannot be wrong differently
-each time you run it.
+AMD driver and paint correctly on a software one**, the same nineteen every run. We had left it open
+whether the fault was the driver's or ours, since both run shaders we generate. It is not ours: the same
+driver returns four different pictures from one unchanged four-vertex draw where the software one returns
+the same picture twenty times, and a shader nobody here wrote fails the same way. Whether those missing
+nineteen are the whole of the shear is a separate question, and still open — they are far too few pixels
+to cover the frame.
 
 
 ### Four sheared Unity titles already render correctly — the shear is decided by the graphics driver
