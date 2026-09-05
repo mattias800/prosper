@@ -9,15 +9,16 @@ Read the title/area's **Ruled out** section before starting an investigation.
 
 ```bash
 python3 tools/doctor/doctor.py
-# Active controls touch only their own child processes; output must be a NEW directory.
-python3 tools/doctor/doctor.py --probe perf --probe scheduler --probe debugger \
+# These controls touch only their own children; output must be a NEW directory.
+python3 tools/doctor/doctor.py --probe perf --probe debugger \
     --output build-linux/doctor-first --json
 ```
 
 `INSTALLED` is inventory. `READY` requires the control's expected observation. Exit 1 means a
 requested capability was unavailable; read `report.json` and the command logs, not an empty
-histogram. The perf control requires both user and kernel samples. The scheduler control requires
-both switch and wakeup events from a two-thread handshake. The debugger control attaches only
+histogram. The perf control requires both user and kernel samples. The separate scheduler control
+below requires both switch and wakeup events from an explicitly system-wide recording.
+The debugger control attaches only
 to its own child; it does **not** certify access across a container boundary or to an existing game.
 
 Before attributing a real run, name its exact executable:
@@ -143,11 +144,23 @@ The scheduler probe is a capability test, not a game profiler. To measure schedu
 use system-wide switch/wakeup events and filter the report to the game's threads: wakeups may
 be emitted by a different task, so a recording filtered only to the game's PID can lose the cause.
 
+First verify access with a two-second recording on the **host**, using a new output directory:
+
+```bash
+sudo python3 tools/doctor/doctor.py --probe scheduler --system-wide-scheduler \
+    --output build-doctor/scheduler-first --json
+```
+
+The explicit option acknowledges that the recording includes other host processes. Keep it
+locally. The earlier child-only handshake collected switches but zero wakeups on a working host;
+it was not a reliable test of wakeup availability. A successful system-wide control establishes
+event recording/decoding, not loss-free game attribution.
+
 On a host with a working privileged `perf`, from an administrator shell:
 
 ```bash
 # run_dir must already exist on real disk; capture is bounded to ten seconds.
-sudo perf record -a -e sched:sched_switch -e sched:sched_wakeup \
+sudo perf record -a -c 1 -e sched:sched_switch -e sched:sched_wakeup \
     -e sched:sched_wakeup_new -o "$run_dir/scheduler.data" -- sleep 10
 sudo perf sched timehist -i "$run_dir/scheduler.data" -p "$target_pid"
 ```

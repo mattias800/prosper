@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Inventory debugging tools and prove selected capabilities on bounded child processes.
+"""Inventory debugging tools and prove selected capabilities with bounded recordings.
 
 Usage: doctor.py [--probe perf|scheduler|debugger ... --output NEW_DIRECTORY]
        doctor.py --json
 
+CPU/debugger controls use own children. Scheduler recording requires
+--system-wide-scheduler and includes other host processes for two seconds.
 No probes by default. Exit 0: inventory completed or every requested probe passed.
 Exit 1: at least one requested capability was unavailable/inconclusive. Exit 2: usage.
 """
@@ -30,23 +32,6 @@ CPU_CONTROL = (
     "import os,time; end=time.monotonic()+1.5; fd=os.open('/dev/zero',os.O_RDONLY); "
     "\nwhile time.monotonic()<end: os.read(fd,4096)"
 )
-SCHED_CONTROL = """import threading,time
-ready=threading.Event()
-ack=threading.Event()
-def worker():
-    for _ in range(100):
-        ready.wait()
-        ready.clear()
-        ack.set()
-t=threading.Thread(target=worker)
-t.start()
-for _ in range(100):
-    ready.set()
-    ack.wait()
-    ack.clear()
-    time.sleep(0.005)
-t.join()
-"""
 
 
 def read_setting(path):
@@ -115,26 +100,32 @@ def sample_verdict(record, script, required):
 def perf_probe(directory, scheduler=False):
     if not shutil.which("perf"):
         return {"status": "UNAVAILABLE", "reason": "perf is not on this environment's PATH."}
-    cases = [("scheduler", ["sched:sched_switch", "sched:sched_wakeup"], SCHED_CONTROL)] if scheduler else [
-        ("cpu", ["cpu-clock:u"], CPU_CONTROL),
-        ("kernel", ["cpu-clock:k"], CPU_CONTROL),
+    cases = [("scheduler", ["sched:sched_switch", "sched:sched_wakeup"], ["sleep", "2"])] if scheduler else [
+        ("cpu", ["cpu-clock:u"], [sys.executable, "-c", CPU_CONTROL]),
+        ("kernel", ["cpu-clock:k"], [sys.executable, "-c", CPU_CONTROL]),
     ]
     results = {}
     for name, events, control in cases:
         data = directory / (name + ".data")
         command = ["perf", "record", "-q", "-o", str(data)]
-        if not scheduler:
+        if scheduler:
+            # Wakeups can be emitted outside the target task's recording context.
+            # The child-only handshake recorded switches but zero wakeups on a
+            # working host. main() requires explicit consent for this wider scope.
+            command += ["-a", "-c", "1"]
+        else:
             command += ["-F", "99", "-g"]
         for event in events:
             command += ["-e", event]
-        command += ["--", sys.executable, "-c", control]
+        command += ["--", *control]
         rec = run(command, directory, name + "-record")
         decoded = run(["perf", "script", "-i", str(data), "-F", "event"],
                       directory, name + "-decode")
         results[name] = sample_verdict(rec, decoded, events)
     return {"status": "READY" if all(r["status"] == "READY" for r in results.values())
             else "UNAVAILABLE", "controls": results,
-            "scope": "Child-process recording; not system-wide scheduler attribution." if scheduler
+            "scope": "Two-second system-wide recording, including other processes; "
+                     "capability only, not game attribution." if scheduler
             else "User and kernel samples; guest symbolication is a separate capability."}
 
 
@@ -164,10 +155,15 @@ def main():
     parser.add_argument("--probe", action="append", choices=("perf", "scheduler", "debugger"),
                         default=[])
     parser.add_argument("--output", type=Path, help="new directory on real disk; retained logs")
+    parser.add_argument("--system-wide-scheduler", action="store_true",
+                        help="allow the scheduler probe to record other host processes for two seconds")
     parser.add_argument("--json", action="store_true", help="print machine-readable inventory/report")
     args = parser.parse_args()
     if args.probe and not args.output:
         parser.error("--probe requires --output NEW_DIRECTORY (use disk, not /tmp)")
+    if ("scheduler" in args.probe) != args.system_wide_scheduler:
+        parser.error("--probe scheduler requires --system-wide-scheduler, and vice versa; "
+                     "this records scheduler events from other host processes")
     report = {"schema_version": 1, "inventory": inventory(), "probes": {}}
     if args.output:
         try:

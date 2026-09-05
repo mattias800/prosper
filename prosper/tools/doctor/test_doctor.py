@@ -42,6 +42,61 @@ class SampleVerdictTests(unittest.TestCase):
         self.assertEqual(doctor.events_in("cpu-clock:u:\ncpu-clock:k:\n"),
                          {"cpu-clock:u": 1, "cpu-clock:k": 1})
 
+    def test_recorded_scheduler_populations(self):
+        # Counts/format from the privileged child-only and system-wide controls.
+        self.assertEqual(self.verdict("sched:sched_switch: \n" * 308)["status"], "UNAVAILABLE")
+        result = self.verdict("sched:sched_switch: \n" * 6908 + "sched:sched_wakeup: \n" * 3434)
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["samples"], {"sched:sched_switch": 6908, "sched:sched_wakeup": 3434})
+
+
+class ProbeScopeTests(unittest.TestCase):
+    def test_scheduler_command_is_system_wide_and_bounded(self):
+        response = {"returncode": 0, "stdout": "sched:sched_switch:\nsched:sched_wakeup:\n"}
+        with patch.object(doctor.shutil, "which", return_value="perf"), \
+                patch.object(doctor, "run", return_value=response) as run:
+            result = doctor.perf_probe(Path("evidence"), scheduler=True)
+        self.assertEqual(run.call_args_list[0].args[0], [
+            "perf", "record", "-q", "-o", str(Path("evidence/scheduler.data")),
+            "-a", "-c", "1", "-e", "sched:sched_switch", "-e", "sched:sched_wakeup",
+            "--", "sleep", "2"])
+        self.assertEqual(result["status"], "READY")
+        self.assertIn("including other processes", result["scope"])
+
+    def test_cpu_recording_does_not_expand_scope(self):
+        response = {"returncode": 0, "stdout": "cpu-clock:u:\ncpu-clock:k:\n"}
+        with patch.object(doctor.shutil, "which", return_value="perf"), \
+                patch.object(doctor, "run", return_value=response) as run:
+            result = doctor.perf_probe(Path("evidence"))
+        for call in run.call_args_list[::2]:
+            command = call.args[0]
+            self.assertNotIn("-a", command)
+            self.assertEqual(command[command.index("--") + 1:],
+                             [doctor.sys.executable, "-c", doctor.CPU_CONTROL])
+        self.assertEqual(result["status"], "READY")
+
+    def invoke(self, probes):
+        with tempfile.TemporaryDirectory(dir=".") as temp:
+            output = Path(temp) / "report"
+            argv = ["doctor.py", *probes, "--output", str(output), "--json"]
+            with patch("sys.argv", argv), patch.object(doctor, "inventory", return_value={}), \
+                    patch.object(doctor, "perf_probe", return_value={"status": "READY"}) as probe, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                try:
+                    status = doctor.main()
+                except SystemExit as exc:
+                    status = exc.code
+            return status, probe.call_count, output.exists()
+
+    def test_scheduler_requires_explicit_scope_consent(self):
+        self.assertEqual(self.invoke(["--probe", "scheduler"]), (2, 0, False))
+
+    def test_unused_scope_consent_is_rejected(self):
+        self.assertEqual(self.invoke(["--probe", "perf", "--system-wide-scheduler"]), (2, 0, False))
+
+    def test_scheduler_with_consent_runs(self):
+        self.assertEqual(self.invoke(["--probe", "scheduler", "--system-wide-scheduler"]), (0, 1, True))
+
 
 class ReplayWrapperTests(unittest.TestCase):
     def setUp(self):
