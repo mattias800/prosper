@@ -139,6 +139,15 @@ bool cb_mode_is_unmodeled_operation(uint32_t mode) {
 std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK + 1u];
 
 void report_unmodeled_cb_color_mode(uint32_t mode) {
+    static const bool exit_dump_registered = [] {
+        std::atexit([] {
+            char line[256];
+            if (unmodeled_cb_color_mode_summary(line, sizeof line))
+                fprintf(stderr, "%s\n", line);
+        });
+        return true;
+    }();
+    (void)exit_dump_registered;
     const uint64_t count =
         ++g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK];
     // This line used to dedupe on a bitmask of modes already seen, so a whole run emitted exactly
@@ -239,6 +248,24 @@ bool cb_eliminate_fast_clear_writes_no_color() {
 
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
     return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
+}
+
+bool unmodeled_cb_color_mode_summary(char* out, size_t cap) {
+    if (!out || cap == 0) return false;
+    uint64_t total = 0;
+    for (uint32_t m = 0; m <= P::CB_COLOR_CONTROL_MODE_MASK; ++m)
+        total += unmodeled_cb_color_mode_count(m);
+    if (!total) { out[0] = '\0'; return false; }
+    int at = std::snprintf(out, cap,
+                           "[gpu] CB_COLOR_CONTROL unmodeled-mode totals (EXACT, not the "
+                           "powers-of-two report above):");
+    for (uint32_t m = 0; m <= P::CB_COLOR_CONTROL_MODE_MASK && at > 0 && (size_t)at < cap; ++m) {
+        const uint64_t n = unmodeled_cb_color_mode_count(m);
+        if (!n) continue;
+        at += std::snprintf(out + at, cap - (size_t)at, " mode%u=%llu",
+                            m, (unsigned long long)n);
+    }
+    return true;
 }
 
 RenderState extract_render_state(const GpuState& st) {

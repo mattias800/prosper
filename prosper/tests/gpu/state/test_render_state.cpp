@@ -1099,6 +1099,46 @@ int main() {
               "BACKFACE_ENABLE=1: back stencil is independent from front (_BF sourced)");
     }
 
+    {
+        // The EXACT per-mode totals must be reportable, and must name every mode that actually
+        // counted. `report_unmodeled_cb_color_mode` prints at powers of two, so the log alone gives
+        // only a lower bound; three concurrent lanes quoted such bounds on #1706 in one night
+        // because this accessor had no production caller. The atexit dump added with this test is
+        // that caller; this arm covers its formatting without needing a process exit.
+        //
+        // Driven from the counters this file has already incremented above, so the expected values
+        // are read from the same accessor rather than hardcoded -- a hardcoded count would break
+        // whenever an unrelated case is added to this file, which is how a useful arm gets deleted.
+        char summary[256] = {0};
+        const bool any = prosper::gpu::unmodeled_cb_color_mode_summary(summary, sizeof summary);
+        uint64_t counted = 0;
+        for (uint32_t m = 0; m <= 7u; ++m) counted += prosper::gpu::unmodeled_cb_color_mode_count(m);
+        CHECK(any == (counted != 0),
+              "unmodeled-mode summary reports content exactly when some mode counted");
+        if (any) {
+            bool all_named = true;
+            for (uint32_t m = 0; m <= 7u; ++m) {
+                const uint64_t n = prosper::gpu::unmodeled_cb_color_mode_count(m);
+                if (!n) continue;
+                char want[48];
+                snprintf(want, sizeof want, "mode%u=%llu", m, (unsigned long long)n);
+                if (!strstr(summary, want)) { all_named = false; break; }
+            }
+            CHECK(all_named,
+                  "unmodeled-mode summary names every mode with a non-zero count, at its exact total");
+            // A mode that counted ZERO must not appear: a row of zeroes would make a title that
+            // decodes no unmodeled mode look like one that decodes several, destroying the control.
+            bool no_zero_rows = true;
+            for (uint32_t m = 0; m <= 7u; ++m) {
+                if (prosper::gpu::unmodeled_cb_color_mode_count(m)) continue;
+                char unwanted[48];
+                snprintf(unwanted, sizeof unwanted, "mode%u=0 ", m);
+                if (strstr(summary, unwanted)) { no_zero_rows = false; break; }
+            }
+            CHECK(no_zero_rows, "unmodeled-mode summary omits modes that never counted");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
