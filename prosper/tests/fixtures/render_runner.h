@@ -6228,6 +6228,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
+    const bool buffer_verify_enabled = getenv("PROSPER_BUFVERIFY") != nullptr;
     struct SharedBufferKey {
         const uint32_t* words = nullptr;
         size_t count = 0;
@@ -6272,6 +6273,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool persistent = false;
     };
     std::vector<SharedBufferUpload> shared_buffers;
+    // PROSPER_BUFVERIFY=1 — re-read every uploaded storage buffer from its MAPPED, device-visible
+    // allocation just before the pass is submitted, and compare it byte for byte against the guest
+    // words it was built from. PROSPER_BUFLOG reports only the SOURCE words, so it cannot see the
+    // destination at all; this closes that half.
+    //
+    // Scope, stated narrowly on purpose. The destination `range` is assigned the same byte count the
+    // memcpy used, so a SHORT upload is structurally inexpressible here and a zero from this check
+    // says nothing about truncation — that is `[buffer-truncated]`'s and BUFLOG's question. What it
+    // does detect is the destination being clobbered after the memcpy and before submission: an
+    // overlapping arena slice, a stray write, a pooled buffer handed out twice. End-of-pass placement
+    // is what makes that case visible; verifying at upload time would miss all of it.
+    struct BufferVerifyRecord {
+        const uint32_t* words = nullptr;
+        size_t word_count = 0;
+        uint64_t identity = 0;
+        uint32_t set = 0;
+        uint32_t binding = 0;
+        size_t upload_index = 0;
+    };
+    std::vector<BufferVerifyRecord> buffer_verify_records;
     std::vector<SharedBufferArena> shared_buffer_arenas;
     std::unordered_map<SharedBufferKey, size_t, SharedBufferKeyHash> shared_buffer_indices;
     // Per-call repeat-reference memo (#1268): draws in one pass batch overwhelmingly re-reference
@@ -7290,6 +7311,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                              &res_buffer_index_insert_ms);
                         shared_buffers.push_back(upload);
                         shared_buffer_indices.emplace(buffer_key, buffer_index);
+                        if (buffer_verify_enabled)
+                            buffer_verify_records.push_back(
+                                {words, word_count, identity, set, binding, buffer_index});
                     }
                     ++resource_reuse_stats.unique_buffers;
                     ++backend_hash_stats_totals().unique_buffers;
@@ -9623,6 +9647,126 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     if (timing_enabled && flush_now)
         active_submission.end_gpu_timestamp(cmd);
+    if (buffer_verify_enabled) {
+        // Compare the mapped allocation against the source words. A mismatch names the first
+        // differing BYTE, because what this is used to localize is an offset, not a boolean.
+        //
+        // WHAT IT CAN AND CANNOT SEE, precisely, because the difference decides what a zero from it
+        // is allowed to retire. On the branch this examines, `upload.range` is assigned the same
+        // `bytes` that drove the memcpy and that `word_count` describes, so `source_bytes` and
+        // `device_bytes` are equal BY CONSTRUCTION: a short upload is structurally inexpressible
+        // here and this check can never observe one. What it does observe is the destination range
+        // being CLOBBERED after the memcpy and before the pass is submitted -- an overlapping arena
+        // slice, a stray write, a pooled buffer handed out twice. Truncation is BUFLOG's and
+        // `[buffer-truncated]`'s question; do not quote a zero from here against it.
+        //
+        // The other direction is a false POSITIVE: `#1268` above deliberately tolerates cross-thread
+        // guest writes to the source words, so a guest that rewrites them after the memcpy produces
+        // a MISMATCH that is not a prosper defect. Check the guest before blaming the upload.
+        uint64_t parsed = 0;
+        bool arming_rejected = false;
+        auto strict = [&](const char* name, size_t& out, size_t unset) {
+            const char* text = getenv(name);
+            if (!text || !*text) { out = unset; return; }
+            // The UINT32_MAX bound is not pedantry: `binding` is compared as uint32_t below, so a
+            // value above it would truncate and aim the control at a DIFFERENT binding while still
+            // printing a confident MUTATED line -- the same silent-misaim this strict parse exists
+            // to prevent, one range check further out.
+            if (prosper::diag::parse_u64_auto_base(text, &parsed) && parsed <= UINT32_MAX) {
+                out = (size_t)parsed;
+                return;
+            }
+            std::fprintf(stderr,
+                         "[bufverify] %s=\"%s\" is not a number in [0, 4294967295] (decimal or 0x "
+                         "hex); the control is DISARMED rather than aimed somewhere unintended\n",
+                         name, text);
+            arming_rejected = true;
+            out = unset;
+        };
+        size_t mutate_offset = SIZE_MAX, mutate_min_bytes = 0, mutate_binding = SIZE_MAX;
+        strict("PROSPER_BUFVERIFY_MUTATE", mutate_offset, SIZE_MAX);
+        strict("PROSPER_BUFVERIFY_MUTATE_BINDING", mutate_binding, SIZE_MAX);
+        strict("PROSPER_BUFVERIFY_MUTATE_MINBYTES", mutate_min_bytes, 0);
+        if (arming_rejected) mutate_offset = SIZE_MAX;
+
+        // The control. A clean zero from the comparison is worth exactly what its ability to report a
+        // dirty one is worth, and nothing in the normal path ever exercises the mismatch branch.
+        // PROSPER_BUFVERIFY_MUTATE corrupts one byte of a device copy so the very next line must name
+        // that offset. It is AIMABLE because a control on a 128-byte uniform buffer says nothing
+        // about a 7 KiB vertex buffer: a control drawn from a different size class than the null
+        // tests the discriminator, not the domain.
+        const BufferVerifyRecord* mutate_target = nullptr;
+        for (const BufferVerifyRecord& cand : buffer_verify_records) {
+            if (mutate_binding != SIZE_MAX && cand.binding != (uint32_t)mutate_binding) continue;
+            if (cand.word_count * sizeof(uint32_t) < mutate_min_bytes) continue;
+            if (cand.upload_index >= shared_buffers.size()) continue;
+            if (!shared_buffers[cand.upload_index].mapped) continue;
+            if (mutate_offset >= (size_t)shared_buffers[cand.upload_index].range) continue;
+            mutate_target = &cand;
+            break;
+        }
+        if (mutate_offset != SIZE_MAX && mutate_target) {
+            const SharedBufferUpload& up = shared_buffers[mutate_target->upload_index];
+            uint8_t* device = static_cast<uint8_t*>(up.mapped) + (size_t)up.offset;
+            device[mutate_offset] = (uint8_t)(device[mutate_offset] ^ 0xFF);
+            std::fprintf(stderr,
+                         "[bufverify] MUTATED device byte %zu of set=%u binding=%u source_bytes=%zu "
+                         "-- the next line must report a mismatch at exactly that offset\n",
+                         mutate_offset, mutate_target->set, mutate_target->binding,
+                         mutate_target->word_count * sizeof(uint32_t));
+        } else if (mutate_offset != SIZE_MAX) {
+            // Silence here is indistinguishable from a clean run, which is the whole failure this
+            // control exists to prevent. Say so.
+            std::fprintf(stderr,
+                         "[bufverify] CONTROL DID NOT FIRE: no recorded buffer matched "
+                         "binding=%s minbytes=%zu with a host mapping and offset %zu in range. "
+                         "The \"0 mismatched\" below is UNVALIDATED\n",
+                         mutate_binding == SIZE_MAX ? "any" : std::to_string(mutate_binding).c_str(),
+                         mutate_min_bytes, mutate_offset);
+        }
+
+        size_t checked = 0, mismatched = 0, skipped_unmapped = 0;
+        for (const BufferVerifyRecord& rec : buffer_verify_records) {
+            if (rec.upload_index >= shared_buffers.size()) { ++skipped_unmapped; continue; }
+            const SharedBufferUpload& up = shared_buffers[rec.upload_index];
+            // A transient (non-arena, non-pooled) upload unmaps its memory before returning, so it
+            // has no host mapping to re-read and is skipped. That is a WHOLE CLASS, not an oddity:
+            // PROSPER_NO_BACKEND_BUFFER_POOL sends every upload down that path, and without the
+            // count below such a run would print an authoritative-looking "0 mismatched" having
+            // verified nothing at all.
+            if (!up.mapped || !rec.words || !rec.word_count) { ++skipped_unmapped; continue; }
+            const size_t source_bytes = rec.word_count * sizeof(uint32_t);
+            const size_t device_bytes = (size_t)up.range;
+            const uint8_t* device = static_cast<const uint8_t*>(up.mapped) + (size_t)up.offset;
+            const uint8_t* source = reinterpret_cast<const uint8_t*>(rec.words);
+            ++checked;
+            const size_t common = source_bytes < device_bytes ? source_bytes : device_bytes;
+            if (std::memcmp(device, source, common) == 0 && source_bytes == device_bytes) continue;
+            size_t first_bad = SIZE_MAX;
+            for (size_t b = 0; b < common; ++b)
+                if (device[b] != source[b]) { first_bad = b; break; }
+            ++mismatched;
+            if (mismatched <= 32)
+                std::fprintf(stderr,
+                             "[bufverify] MISMATCH set=%u binding=%u id=%llx source_bytes=%zu "
+                             "device_bytes=%zu first_differing_byte=%s (vertex %s at stride 32)\n",
+                             rec.set, rec.binding, (unsigned long long)rec.identity,
+                             source_bytes, device_bytes,
+                             first_bad == SIZE_MAX ? "none (size differs only)"
+                                                   : std::to_string(first_bad).c_str(),
+                             first_bad == SIZE_MAX ? "-" : std::to_string(first_bad / 32).c_str());
+        }
+        if (!checked && !buffer_verify_records.empty())
+            std::fprintf(stderr,
+                         "[bufverify] NOTHING WAS VERIFIED: all %zu recorded buffer(s) lack a host "
+                         "mapping (transient uploads). A zero from this run means the check never "
+                         "ran, not that the uploads are correct\n",
+                         buffer_verify_records.size());
+        std::fprintf(stderr,
+                     "[bufverify] %zu buffer(s) re-read from device memory, %zu mismatched, "
+                     "%zu skipped (no host mapping)\n", checked, mismatched, skipped_unmapped);
+    }
+
     vkEndCommandBuffer(cmd);
 
     // Publish newly uploaded exact-version textures before a later command buffer in the same batch
