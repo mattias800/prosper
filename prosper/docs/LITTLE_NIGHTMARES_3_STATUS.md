@@ -233,7 +233,16 @@ the pixel shader alone — identifies the population exactly:
 
 The guest programs `CB_COLOR_CONTROL = 0x00cc0000` (MODE=DISABLE) **together with a non-zero
 `CB_TARGET_MASK` of `0x7`**, deliberately, 3,734 times, always with that one vertex shader — and the
-two words differ **exactly in bits [6:4]** with no mixing across 5,054 draws. On hardware those draws
+two words differ **exactly in bits [6:4]** with no mixing across 5,054 draws. Those two groups
+*exhaust* that population: 3,734 + 1,320 = 5,054, which is exactly the `effective=07` count from a
+different aggregation, so no third group can exist within it.
+
+**One qualification the whole-population check found, which the per-program view hid.**
+`colorstate_report.py --by-pipeline` reports that **1 of 12 `(vertex, pixel)` pairs carries more than
+one raw word** — this same pair also appears once under `0x00cc0020` (MODE=ELIMINATE_FAST_CLEAR).
+That single draw sits at `effective=0f`, outside the 5,054, so it does not touch the closure above;
+but "the register value is pipeline-determined" is true of 11 of 12 pairs on this run, not of all
+twelve, and it should be stated that way. On hardware those draws
 write no colour. Since #1724 prosper derives the write mask from `CB_TARGET_MASK & CB_SHADER_MASK`
 and ignores `MODE`, so it writes them, and what they write floods the scanout.
 

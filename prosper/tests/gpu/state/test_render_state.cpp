@@ -1115,8 +1115,14 @@ int main() {
         for (uint32_t m = 0; m <= 7u; ++m) counted += prosper::gpu::unmodeled_cb_color_mode_count(m);
         // NOT a discriminating arm on this ordering, and saying so rather than leaving it to look
         // like one: the cases above have already incremented modes 2/4/5/7, so `counted` cannot be
-        // zero here and the equality cannot fail. It is kept because it pins the direction, and the
-        // FALSE branch is covered by the two arms below, which can fail.
+        // zero here and the equality cannot fail. It is kept because it pins the direction.
+        //
+        // The two arms below cover the `!out || cap == 0` early return, which is a DIFFERENT false
+        // branch from the `!total` one. `!total` is not reachable from a test in this process at
+        // all: the counters are process-global and already non-zero by the time any arm runs, and
+        // nothing resets them. It is covered by construction (the sum of all eight slots) rather
+        // than by an arm, and this comment says so instead of letting the arms below look like they
+        // reach it.
         CHECK(any && counted != 0,
               "unmodeled-mode summary reports content after this file's unmodeled-mode draws");
         CHECK(!prosper::gpu::unmodeled_cb_color_mode_summary(summary, 0),

@@ -180,14 +180,46 @@ def report(records, scanout_prefix, top, out=sys.stdout, by_program=False,
             print(f"  {n:>8}  es={es:<14} ps={ps:<14} cb-control=0x{cbc:08x} "
                   f"mode={mode} ({name}) effective={eff:02x} writes-colour={str(writes):5s}", file=out)
         words = {cbc for (_, _, cbc, _, _, _) in per_pipeline}
-        modes_by_word = defaultdict(set)
-        for (_, _, cbc, mode, _, _) in per_pipeline:
-            modes_by_word[cbc].add(mode)
-        ambiguous = {w: m for w, m in modes_by_word.items() if len(m) > 1}
-        print(f"  {len(words)} distinct raw CB_COLOR_CONTROL word(s); "
-              f"{len(ambiguous)} decoding to more than one mode "
-              f"({'a word decoding to several modes would mean the DECODE is unreliable' if ambiguous else 'each word decodes to exactly one mode, so the decode is faithful to what the guest wrote'})",
-              file=out)
+        # THE FALSIFIABLE GENERALISATION: is the raw register word determined by the PIPELINE?
+        # This is the whole-population form of the manual result on #1706, and unlike the two checks
+        # below it can come back either way -- a guest is free to write different CB_COLOR_CONTROL
+        # values for the same (vertex, pixel) pair, and if it does, the pipeline is not the key and
+        # any per-pipeline conclusion is unsafe.
+        words_by_pipeline = defaultdict(set)
+        for (es, ps, cbc, _, _, _) in per_pipeline:
+            words_by_pipeline[(es, ps)].add(cbc)
+        split = {k: v for k, v in words_by_pipeline.items() if len(v) > 1}
+        print(f"  {len(words)} distinct raw CB_COLOR_CONTROL word(s) over "
+              f"{len(words_by_pipeline)} (vertex, pixel) pair(s); "
+              f"{len(split)} pair(s) carry MORE THAN ONE word", file=out)
+        for (es, ps), v in sorted(split.items())[:top]:
+            print(f"    SPLIT es={es} ps={ps} words=" +
+                  ",".join(f"0x{w:08x}" for w in sorted(v)), file=out)
+        if not split:
+            print("    -> every pipeline carries exactly one word, so on THIS run the register "
+                  "value is pipeline-determined. That is a property of the guest's command stream "
+                  "and it is what a per-pipeline reading needs; it says nothing on its own about "
+                  "whether the field is decoded correctly.", file=out)
+        # A TRIPWIRE, NOT EVIDENCE, and labelled as such where it prints. `mode` is extracted from
+        # `cb-control` by a pure function (`render_state.cpp`'s PM4_FIELD), so on any log this
+        # emitter produced these agree BY CONSTRUCTION and this line cannot fail. It is here to catch
+        # a log whose two fields disagree -- a hand-edited fixture, a future emitter that computes
+        # the mode from something else, or a merged log from two builds. Reading agreement here as
+        # evidence about the decode is the void-discriminator error this tool exists to help avoid.
+        mismatched = [(es, ps, cbc, mode) for (es, ps, cbc, mode, _, _) in per_pipeline
+                      if mode != ((cbc >> 4) & 0x7)]
+        if mismatched:
+            print(f"  {len(mismatched)} row(s) whose reported mode DISAGREES with bits [6:4] of "
+                  f"their own raw word -- this log's two fields are inconsistent, so neither can be "
+                  f"trusted:", file=out)
+            for es, ps, cbc, mode in mismatched[:top]:
+                print(f"    MISMATCH es={es} ps={ps} cb-control=0x{cbc:08x} "
+                      f"reported mode={mode} but [6:4]={(cbc >> 4) & 0x7}", file=out)
+        else:
+            print("  reported mode agrees with bits [6:4] of the raw word on every row "
+                  "(a tripwire on the log's own consistency -- these are the same value by "
+                  "construction, so this CANNOT fail on a log prosper produced, and agreement "
+                  "here is not evidence about the decode)", file=out)
     if by_program:
         # Which SHADER writes the presented surface. The mode/mask census above answers "with what
         # colour state"; it cannot answer "which draw", and when a scanout goes flat that is the
@@ -207,8 +239,16 @@ def report(records, scanout_prefix, top, out=sys.stdout, by_program=False,
         # A program showing several modes is the signal to re-key, not a conclusion. Say so where the
         # reader is looking at it, because the tempting reading -- "the decoded field is unreliable"
         # -- is the one that was wrong (trap 265).
-        if any(len(e["modes"]) > 1 for _, e in ranked):
-            print("  NOTE: a program above carries more than one mode. That is NOT evidence the "
+        # Scans per_program, NOT `ranked`: a multi-mode program outside --top would otherwise get
+        # neither a row nor the warning, and the DEFAULT --top is the silent case. --by-pipeline's
+        # verdict already scans the whole population; this now matches it.
+        multi = [ps for ps, e in per_program.items() if len(e["modes"]) > 1]
+        if multi:
+            shown = {ps for ps, _ in ranked}
+            hidden = [ps for ps in multi if ps not in shown]
+            print(f"  NOTE: {len(multi)} program(s) carry more than one mode" +
+                  (f", {len(hidden)} of them BELOW --top and not listed above ({', '.join(hidden[:5])})"
+                   if hidden else "") + ". That is NOT evidence the "
                   "decode is unreliable -- re-key with --by-pipeline before concluding anything, "
                   "since a guest writing two different CB_COLOR_CONTROL words per (vertex, pixel) "
                   "pair looks identical here (instrument trap 265).", file=out)
@@ -273,8 +313,56 @@ def selftest():
     # The verdict line is the point of the flag, and it must key on the RAW WORD: each distinct word
     # here decodes to exactly one mode, so the decode is faithful and "one program, two modes" is a
     # statement about the guest rather than about prosper.
-    assert "0 decoding to more than one mode" in pipe, pipe
-    assert "faithful to what the guest wrote" in pipe, pipe
+    assert "0 pair(s) carry MORE THAN ONE word" in pipe, pipe
+    assert "pipeline-determined" in pipe, pipe
+    assert "agrees with bits [6:4]" in pipe, pipe
+
+    # The two checks above must be able to FAIL, so drive each with a fixture that breaks it.
+    #
+    # (a) A log whose reported mode disagrees with bits [6:4] of its own raw word -- exactly the
+    #     hand-built case that showed the previous verdict was unfalsifiable: two different words
+    #     both reported as mode 0, i.e. every NORMAL draw mislabelled DISABLE. The old check said
+    #     "the decode is faithful"; this one must say MISMATCH.
+    BAD_MODE = SELFTEST.replace(
+        "cb-control=1:00cc0010 mode=1 target-mask=1:0000000f shader-mask=1:0000000f\n"
+        "[color-state]   color0=0x9fc2000000",
+        "cb-control=1:00cc0010 mode=0 target-mask=1:0000000f shader-mask=1:0000000f\n"
+        "[color-state]   color0=0x9fc2000000", 1)
+    buf4 = io.StringIO()
+    report(list(parse(BAD_MODE.splitlines())), "0x9fc", 10, out=buf4, by_pipeline=True)
+    bad = buf4.getvalue()
+    assert "MISMATCH" in bad and "reported mode=0 but [6:4]=1" in bad, bad
+    assert "agrees with bits [6:4] of the raw word on every row" not in bad, bad
+
+    # (b) A log where ONE (vertex, pixel) pair carries two different raw words -- the guest writing
+    #     different colour state for the same pipeline. Then the pipeline is not the key and a
+    #     per-pipeline reading is unsafe, which is the finding this line has to be able to report.
+    SPLIT = SELFTEST + (
+        "[color-state] es=0x5 ps=0x2 cb-control=1:00cc0010 mode=1 "
+        "target-mask=1:00000007 shader-mask=1:0000000f\n"
+        "[color-state]   color0=0x9fc2000000 3840x2160 raw-format=10 resolved-format=44 "
+        "resolved-cwm=7\n")
+    buf5 = io.StringIO()
+    report(list(parse(SPLIT.splitlines())), "0x9fc", 10, out=buf5, by_pipeline=True)
+    sp = buf5.getvalue()
+    assert "1 pair(s) carry MORE THAN ONE word" in sp, sp
+    assert "SPLIT es=0x5 ps=0x2 words=0x00cc0000,0x00cc0010" in sp, sp
+    assert "pipeline-determined" not in sp, sp
+
+    # (c) --by-program's NOTE must scan the whole population, not the --top slice. ps=0x2 carries two
+    #     modes; at --top 1 it is ranked first here, so rank it out by giving another program more
+    #     draws. The NOTE must still fire and must say the program is below --top.
+    MANY = SELFTEST + "".join(
+        "[color-state] es=0x9 ps=0x9 cb-control=1:00cc0010 mode=1 "
+        "target-mask=1:0000000f shader-mask=1:0000000f\n"
+        "[color-state]   color0=0x9fc2000000 3840x2160 raw-format=10 resolved-format=44 "
+        "resolved-cwm=f\n" for _ in range(5))
+    buf6 = io.StringIO()
+    report(list(parse(MANY.splitlines())), "0x9fc", 1, out=buf6, by_program=True)
+    many = buf6.getvalue()
+    assert "ps=0x2" not in many.split("--by-program")[1].split("NOTE")[0], many
+    assert "NOTE: 1 program(s) carry more than one mode" in many, many
+    assert "BELOW --top and not listed above (0x2)" in many, many
     # And the per-program view must WARN rather than invite the wrong reading, since ps=0x2 now
     # carries two modes there.
     assert "instrument trap 265" in prog, prog

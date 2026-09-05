@@ -146,9 +146,12 @@ std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK +
 // the line -- but NOT for the reason an earlier revision of this comment gave. It claimed that keeps
 // a title which decodes none "usable as a control"; that is wrong, because an absent line is
 // indistinguishable from an atexit lost to one of the four paths below, so absence proves nothing
-// either way. The real reason is narrower and still worth it: a row of zeroes is DATA-SHAPED, and a
-// reader who sees `mode0=0 mode2=0 ...` will quote it as a measured zero rather than as the absence
-// of a measurement.
+// either way. The real reason is sharper than "the absence of a measurement": three of the eight
+// slots are STRUCTURALLY zero forever. `cb_mode_is_unmodeled_operation` excludes NORMAL(1),
+// RESOLVE(3) and DCC_DECOMPRESS(6), so indices 1, 3 and 6 can never be incremented by anything. A
+// row of zeroes would print `mode1=0` on every run of every title -- on PPSA05143 that is 1,320 +
+// 2,533 NORMAL scanout draws reported as a zero. That is not a missing measurement; it is a
+// permanent structural zero wearing the shape of a measured population, which is strictly worse.
 //
 // KNOWN GAPS, stated rather than discovered later. An atexit report is lost on THREE paths, and the
 // eight pre-existing atexit censuses in this codebase all inherit the same three (#3353):

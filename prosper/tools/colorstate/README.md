@@ -63,20 +63,30 @@ one program showing several modes reads as *"the decoded field is unreliable"*.
 python3 tools/colorstate/colorstate_report.py run.log --scanout-prefix 0x9fc --by-pipeline
 ```
 
-Each row is one `(vertex program, pixel program, RAW CB_COLOR_CONTROL word)` combination, and the
-section ends with the verdict that only the raw word can give:
+Each row is one `(vertex program, pixel program, RAW CB_COLOR_CONTROL word)` combination, followed by
+**one falsifiable verdict and one tripwire**:
 
 ```
     3734  es=0x300e900000  ps=0x3017370000  cb-control=0x00cc0000 mode=0 (DISABLE) effective=07 writes-colour=True
     1320  es=0x3016e60000  ps=0x3017370000  cb-control=0x00cc0010 mode=1 (NORMAL)  effective=07 writes-colour=True
-  3 distinct raw CB_COLOR_CONTROL word(s); 0 decoding to more than one mode
-    (each word decodes to exactly one mode, so the decode is faithful to what the guest wrote)
+  3 distinct raw CB_COLOR_CONTROL word(s) over 12 (vertex, pixel) pair(s); 1 pair(s) carry MORE THAN ONE word
+    SPLIT es=0x300e900000 ps=0x3017370000 words=0x00cc0000,0x00cc0020
+  reported mode agrees with bits [6:4] of the raw word on every row (a tripwire ...)
 ```
 
-**That last line is the whole point.** A decode disagreeing with itself and a guest writing two
-different words are indistinguishable once the word is dropped. If every distinct word decodes to
-exactly one mode, the decode is faithful and "one program, two modes" is a fact about the *guest*. If
-one word decodes to several, the decode really is unreliable.
+**The `pair(s) carry MORE THAN ONE word` line is the verdict, and it can come back either way.** A
+guest is free to write different `CB_COLOR_CONTROL` values for the same `(vertex, pixel)` pair; if it
+does, the pipeline is not the key and any per-pipeline conclusion is unsafe. On the run above it
+fired on 1 of 12 pairs — a single `ELIMINATE_FAST_CLEAR` draw under a third word — which is exactly
+the kind of qualification a check that cannot fail would have hidden.
+
+**The `[6:4]` line is a TRIPWIRE, not evidence, and the tool says so where it prints.** `mode` is
+extracted from `cb-control` by a pure function, so on any log prosper produced the two agree **by
+construction** and that line cannot fail. It exists to catch a log whose fields disagree — a
+hand-edited fixture, a future emitter deriving the mode from something else, a log merged from two
+builds. An earlier revision printed *"the decode is faithful to what the guest wrote"* here; that
+sentence was unfalsifiable, and a reviewer's hand-built log in which **every `NORMAL` draw was
+mislabelled `DISABLE`** still produced it.
 
 This flag exists because reading `--by-program` as though it were a pipeline breakdown produced
 precisely the wrong conclusion on #1706 — published, then overturned from the same log by re-keying.
