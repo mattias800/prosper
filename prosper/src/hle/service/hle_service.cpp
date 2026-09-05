@@ -2438,6 +2438,24 @@ HLE(s_avp_jumptotime) {
         }
     }
     if (reason) {
+        // A FAILED seek publishes no warning at all, and the reason is NOT that `0x806a0004` would
+        // be a lie -- it is this surface's truthful failure signal, and the guests that listen for
+        // it are entitled to hear it.
+        //
+        // The reason is that prosper's failure set above is WIDER than "the seek was refused". It
+        // includes "the source has no host decoder to reposition" -- the #1105 graceful-skip empty
+        // source and any headless or synthetic session -- which are benign states, not errors the
+        // title should latch. And a listener does latch: PPSA25009's event callback
+        // (eboot+0x13e46a0) dispatches three warning codes at +0x13e4a53, and its `0x806a0004` arm
+        // at +0x13e4a77 stores a pointer into the player object and sets a byte beside it, i.e. a
+        // PERSISTENT error state rather than a transient notice. Publishing that code because
+        // prosper had no decoder would permanently mark a player the title was merely skipping an
+        // unplayable movie on.
+        //
+        // Narrowing the failure set so the genuinely-refused case could announce itself is a real
+        // improvement and is deliberately not attempted here; it needs a title that waits on the
+        // failure arm to verify against. (Analysis from review of #3348.)
+        //
         // Loud by design (not gated on PROSPER_AVPLOG): a guest-visible seek failure is exactly the
         // kind of gap that must not read as "handled" in a default run.
         fprintf(stderr, "[avp] sceAvPlayerJumpToTime handle=0x%llx target=%llu ms FAILED: %s\n",
@@ -2448,19 +2466,26 @@ HLE(s_avp_jumptotime) {
     // event callback's warning channel, and until it hears that it is entitled to sit in its own
     // wait. Published outside g_avp_mx, like every other event -- the callback re-enters AvPlayer HLE.
     //
-    // Deliberately synchronous rather than deferred to a worker, and the reason is stronger than
-    // "the guests happen to arm first". They do -- PPSA17337 writes its awaited code at
-    // eboot+0x15400b8, one instruction group before the call at +0x15400c2 -- but that is two titles
-    // observed, not a contract, so it is not what this rests on.
+    // Deliberately synchronous rather than deferred to a worker. Two arguments for that are TRUE
+    // but cover only part of the population, and neither is what this rests on:
     //
-    // What makes an early notification safe is that the join is a COUNTING semaphore, not an edge.
-    // The guest's callback posts with `lock xadd` at eboot+0x153f041, and its waiter decrements the
-    // same counter and only sleeps when the pre-decrement value was <= 0. So a post that lands
-    // before the wait is *stored*: the waiter decrements a positive count and proceeds without
-    // sleeping. Publishing here therefore cannot lose the notification even for a guest that arms
-    // its slot AFTER the call returns, which a deferred worker could not promise. Publishing here
-    // also keeps the notification ordered strictly after the reposition it reports.
-    // (Mechanism identified in review of #3348.)
+    //   * "the guests arm their wait slot before calling" -- PPSA17337 writes its awaited code at
+    //     eboot+0x15400b8, one instruction group before the call at +0x15400c2. Two titles observed.
+    //   * "the join is a COUNTING semaphore, so an early post is stored rather than lost" -- true
+    //     where it applies: that guest's callback posts with `lock xadd` at eboot+0x153f041 and its
+    //     waiter sleeps only when the pre-decrement value was <= 0. But that is ONE binary's
+    //     encoding, and it generalises no further than the first argument did. Measured across the
+    //     corpus: of the 42 dumps importing this NID, the exact arm-and-join encoding appears in
+    //     **11** -- one byte-identical Unity plugin. PPSA25009 is one of the 31 without it.
+    //
+    // What covers all 42 is weaker in form and stronger in reach, and it is a DEGRADATION bound
+    // rather than a safety proof: if a guest's join is an EDGE, an early post is simply lost, and
+    // that guest then waits exactly the timeout it already pays today with no notification at all.
+    // So publishing synchronously is never worse than the status quo for any importer, and is
+    // strictly better for the ones whose join can store it. That is the claim this code makes.
+    //
+    // Publishing here also keeps the notification ordered strictly after the reposition it reports,
+    // which a deferred worker could not guarantee. (Population measured in review of #3348.)
     const uint32_t seek_complete = AVP_WARNING_SEEK_COMPLETE;
     avp_fire_data(ev_obj, ev_cb, AVP_WARNING_ID, 0, &seek_complete);
     if (avp_log()) fprintf(stderr, "[avp] jump-to-time handle=0x%llx target=%llu ms -> ok\n",
