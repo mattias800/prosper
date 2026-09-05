@@ -904,7 +904,18 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     d.ps.db_depth_info, d.ps.db_z_info, d.ps.db_stencil_info,
                     d.ps.db_dfsm_control, d.ps.db_rmi_l2_cache_control);
         if (!d.indices.empty()) {
-            const size_t preview_count = std::min<size_t>(d.indices.size(), 16);
+            // The default 16 answers "is this a quad list?"; a corruption that starts later in the
+            // stream is invisible at that length, so allow the whole list to be printed on request.
+            // Malformed values keep the default rather than silently printing an unintended amount.
+            size_t preview_limit = 16;
+            if (const char* env = std::getenv("PROSPER_REPLAY_INDEX_PREVIEW")) {
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long wanted = std::strtoull(env, &end, 0);
+                if (!errno && end != env && end && !*end && wanted > 0)
+                    preview_limit = static_cast<size_t>(wanted);
+            }
+            const size_t preview_count = std::min<size_t>(d.indices.size(), preview_limit);
             std::printf("  indices first[%zu/%zu]=", preview_count, d.indices.size());
             for (size_t index = 0; index < preview_count; ++index)
                 std::printf("%s%u", index ? "," : "", d.indices[index]);
