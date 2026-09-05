@@ -9668,10 +9668,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         auto strict = [&](const char* name, size_t& out, size_t unset) {
             const char* text = getenv(name);
             if (!text || !*text) { out = unset; return; }
-            if (prosper::diag::parse_u64_auto_base(text, &parsed)) { out = (size_t)parsed; return; }
+            // The UINT32_MAX bound is not pedantry: `binding` is compared as uint32_t below, so a
+            // value above it would truncate and aim the control at a DIFFERENT binding while still
+            // printing a confident MUTATED line -- the same silent-misaim this strict parse exists
+            // to prevent, one range check further out.
+            if (prosper::diag::parse_u64_auto_base(text, &parsed) && parsed <= UINT32_MAX) {
+                out = (size_t)parsed;
+                return;
+            }
             std::fprintf(stderr,
-                         "[bufverify] %s=\"%s\" is not a number (decimal or 0x hex); the control is "
-                         "DISARMED rather than aimed somewhere unintended\n", name, text);
+                         "[bufverify] %s=\"%s\" is not a number in [0, 4294967295] (decimal or 0x "
+                         "hex); the control is DISARMED rather than aimed somewhere unintended\n",
+                         name, text);
             arming_rejected = true;
             out = unset;
         };
