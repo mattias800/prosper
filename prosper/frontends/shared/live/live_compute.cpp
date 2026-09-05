@@ -529,13 +529,38 @@ bool native_storage_image_create_supported(VkPhysicalDevice physical, VkFormat f
         return false;
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra_usage;
-    VkImageFormatProperties properties{};
-    return vkGetPhysicalDeviceImageFormatProperties(
-               physical, format, image_type, VK_IMAGE_TILING_OPTIMAL,
-               usage, 0, &properties) == VK_SUCCESS &&
-           width <= properties.maxExtent.width && height <= properties.maxExtent.height &&
-           depth <= properties.maxExtent.depth &&
-           array_layers <= properties.maxArrayLayers;
+    struct FormatPropKey {
+        VkFormat format;
+        VkImageType image_type;
+        VkImageUsageFlags usage;
+        bool operator==(const FormatPropKey& o) const {
+            return format == o.format && image_type == o.image_type && usage == o.usage;
+        }
+    };
+    struct FormatPropEntry {
+        FormatPropKey key{};
+        VkImageFormatProperties properties{};
+        bool success = false;
+        bool valid = false;
+    };
+    constexpr size_t kCacheSize = 32;
+    thread_local std::array<FormatPropEntry, kCacheSize> cache{};
+    const FormatPropKey key{format, image_type, usage};
+    const size_t slot = (static_cast<size_t>(format) ^ static_cast<size_t>(image_type) ^
+                         static_cast<size_t>(usage)) % kCacheSize;
+    FormatPropEntry& entry = cache[slot];
+    if (!entry.valid || !(entry.key == key)) {
+        entry.key = key;
+        entry.success = vkGetPhysicalDeviceImageFormatProperties(
+            physical, format, image_type, VK_IMAGE_TILING_OPTIMAL,
+            usage, 0, &entry.properties) == VK_SUCCESS;
+        entry.valid = true;
+    }
+    if (!entry.success) return false;
+    return width <= entry.properties.maxExtent.width &&
+           height <= entry.properties.maxExtent.height &&
+           depth <= entry.properties.maxExtent.depth &&
+           array_layers <= entry.properties.maxArrayLayers;
 }
 
 // Storage images use an RGBA32_UINT interchange surface so format conversion remains bit-exact on
@@ -9261,9 +9286,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkAllocateDescriptorSets(ctx.device, &dsai, &descriptor_set),
                    "descriptor-set")) break;
 
-        std::vector<VkDescriptorBufferInfo> buffer_infos(buffers.size());
-        std::vector<VkDescriptorImageInfo> image_infos(images.size());
-        std::vector<VkWriteDescriptorSet> writes(descriptors.size() + images.size());
+        thread_local std::vector<VkDescriptorBufferInfo> buffer_infos;
+        thread_local std::vector<VkDescriptorImageInfo> image_infos;
+        thread_local std::vector<VkWriteDescriptorSet> writes;
+        buffer_infos.resize(buffers.size());
+        image_infos.resize(images.size());
+        writes.resize(descriptors.size() + images.size());
         for (size_t i = 0; i < buffers.size(); i++) {
             buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].bytes};
         }

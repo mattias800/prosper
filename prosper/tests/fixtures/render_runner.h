@@ -96,10 +96,35 @@ struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba;
                  uint32_t max_aniso_ratio = 0; };   // #275: S# anisotropy ratio (0 = isotropic)
 
 inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
-    uint64_t hash = 1469598103934665603ull;
-    for (size_t word = 0; word < count; ++word) {
-        hash ^= words[word];
-        hash *= 1099511628211ull;
+    if (!words || !count) return 0;
+    uint64_t h0 = 1469598103934665603ull;
+    uint64_t h1 = 0xcbf29ce484222325ull;
+    uint64_t h2 = 0x100000001b3ull;
+    uint64_t h3 = 0x9e3779b97f4a7c15ull;
+    constexpr uint64_t prime = 1099511628211ull;
+
+    const size_t qcount = count / 2;
+    size_t i = 0;
+    const uint64_t* qwords = reinterpret_cast<const uint64_t*>(words);
+    for (; i + 4 <= qcount; i += 4) {
+        uint64_t w0, w1, w2, w3;
+        std::memcpy(&w0, &qwords[i + 0], sizeof(uint64_t));
+        std::memcpy(&w1, &qwords[i + 1], sizeof(uint64_t));
+        std::memcpy(&w2, &qwords[i + 2], sizeof(uint64_t));
+        std::memcpy(&w3, &qwords[i + 3], sizeof(uint64_t));
+        h0 = (h0 ^ w0) * prime;
+        h1 = (h1 ^ w1) * prime;
+        h2 = (h2 ^ w2) * prime;
+        h3 = (h3 ^ w3) * prime;
+    }
+    uint64_t hash = h0 ^ (h1 * prime) ^ (h2 * 0x9e3779b97f4a7c15ull) ^ (h3 * 0x517cc1b727220a95ull);
+    for (; i < qcount; ++i) {
+        uint64_t w;
+        std::memcpy(&w, &qwords[i], sizeof(uint64_t));
+        hash = (hash ^ w) * prime;
+    }
+    if (count & 1) {
+        hash = (hash ^ words[count - 1]) * prime;
     }
     return hash;
 }
@@ -619,6 +644,10 @@ struct BackendResourceReuseStats {
     size_t persistent_pipeline_layout_misses = 0;
     size_t persistent_pipeline_layout_entries = 0;
     size_t persistent_pipeline_layout_evictions = 0;
+    size_t persistent_descriptor_set_layout_hits = 0;
+    size_t persistent_descriptor_set_layout_misses = 0;
+    size_t persistent_descriptor_set_layout_entries = 0;
+    size_t persistent_descriptor_set_layout_evictions = 0;
     size_t persistent_texture_binding_hits = 0;
     size_t persistent_texture_binding_misses = 0;
     size_t persistent_texture_binding_entries = 0;
@@ -702,7 +731,7 @@ inline BackendPipelineCacheStats backend_pipeline_cache_stats() {
 }
 
 struct PersistentPipelineKey {
-    static constexpr size_t kInlineWords = 64;
+    static constexpr size_t kInlineWords = 160;
     std::array<uint32_t, kInlineWords> inline_words{};
     std::vector<uint32_t> overflow_words;
     uint32_t word_count = 0;
@@ -711,8 +740,9 @@ struct PersistentPipelineKey {
     bool operator==(const PersistentPipelineKey& other) const {
         if (hash != other.hash || word_count != other.word_count) return false;
         const size_t inline_count = std::min<size_t>(word_count, kInlineWords);
-        return std::equal(inline_words.begin(), inline_words.begin() + inline_count,
-                          other.inline_words.begin()) &&
+        return (inline_count == 0 ||
+                std::memcmp(inline_words.data(), other.inline_words.data(),
+                            inline_count * sizeof(uint32_t)) == 0) &&
                overflow_words == other.overflow_words;
     }
 };
@@ -931,6 +961,37 @@ inline size_t persistent_pipeline_layout_cache_limit() {
         const char* value = getenv("PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES");
         return static_cast<size_t>(prosper::diag::env_u64_or_default_capped(
             "PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES", value, 256ull, SIZE_MAX, "entries"));
+    }();
+    return limit;
+}
+
+struct PersistentBackendDescriptorSetLayout {
+    VkDescriptorSetLayout handle = VK_NULL_HANDLE;
+    uint64_t last_use = 0;
+};
+
+inline std::unordered_map<std::vector<uint64_t>, PersistentBackendDescriptorSetLayout,
+                          BackendWordVectorHash>&
+persistent_backend_descriptor_set_layout_cache() {
+    static std::unordered_map<std::vector<uint64_t>, PersistentBackendDescriptorSetLayout,
+                              BackendWordVectorHash> cache;
+    return cache;
+}
+
+inline uint64_t& persistent_descriptor_set_layout_generation() {
+    static uint64_t generation = 0;
+    return generation;
+}
+
+inline bool persistent_descriptor_set_layout_cache_enabled() {
+    return getenv("PROSPER_NO_BACKEND_DESCRIPTOR_SET_LAYOUT_CACHE") == nullptr;
+}
+
+inline size_t persistent_descriptor_set_layout_cache_limit() {
+    static const size_t limit = [] {
+        const char* value = getenv("PROSPER_DESCRIPTOR_SET_LAYOUT_CACHE_ENTRIES");
+        return static_cast<size_t>(prosper::diag::env_u64_or_default_capped(
+            "PROSPER_DESCRIPTOR_SET_LAYOUT_CACHE_ENTRIES", value, 256ull, SIZE_MAX, "entries"));
     }();
     return limit;
 }
@@ -6285,9 +6346,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return m; };
     // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    constexpr size_t kMaxDescriptorSets = 8;
     struct DV {
         VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
-        std::vector<VkDescriptorSet> dsets;
+        std::array<VkDescriptorSet, kMaxDescriptorSets> dsets{};
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
         // Non-zero when the index data lives in a shared arena slice rather than a dedicated
@@ -6318,6 +6380,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         int32_t vertex_offset = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
     };
+    static_assert(std::is_trivially_destructible_v<DV>,
+                  "DV must remain trivially destructible to avoid per-draw cleanup overhead");
     struct TextureUploadKey {
         const uint8_t* pixels = nullptr;
         uint64_t render_target_id = 0;
@@ -6358,6 +6422,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             for (uint32_t bits : key.uniform_color_bits)
                 h ^= static_cast<size_t>(bits) + 0x9e3779b9u + (h << 6) + (h >> 2);
             return h;
+        }
+    };
+    struct TextureBindingKey {
+        std::array<uint64_t, 22> words{};
+        bool operator==(const TextureBindingKey&) const = default;
+    };
+    struct TextureBindingKeyHash {
+        size_t operator()(const TextureBindingKey& key) const {
+            uint64_t h0 = 1469598103934665603ull;
+            uint64_t h1 = 0xcbf29ce484222325ull;
+            constexpr uint64_t prime = 1099511628211ull;
+            for (size_t i = 0; i < key.words.size(); i += 2) {
+                h0 = (h0 ^ key.words[i + 0]) * prime;
+                h1 = (h1 ^ key.words[i + 1]) * prime;
+            }
+            return static_cast<size_t>(h0 ^ (h1 * prime));
         }
     };
     struct SharedTextureUpload {
@@ -6403,6 +6483,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
         std::vector<std::function<void(const uint8_t*, size_t)>> storage_writebacks;
+        size_t last_binding_index = SIZE_MAX;
+        TextureBindingKey last_binding_key{};
     };
     struct PersistentTextureKey {
         uint64_t id = 0;
@@ -6422,20 +6504,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             mix(key.mip_levels);
             mix(static_cast<uint32_t>(key.format));
             return h;
-        }
-    };
-    struct TextureBindingKey {
-        std::array<uint64_t, 22> words{};
-        bool operator==(const TextureBindingKey&) const = default;
-    };
-    struct TextureBindingKeyHash {
-        size_t operator()(const TextureBindingKey& key) const {
-            uint64_t hash = 1469598103934665603ull;
-            for (uint64_t word : key.words) {
-                hash ^= word;
-                hash *= 1099511628211ull;
-            }
-            return static_cast<size_t>(hash);
         }
     };
     struct PersistentTextureBinding {
@@ -6481,7 +6549,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             return identity == other.identity && hash == other.hash &&
                    unique_tag == other.unique_tag &&
                    count == other.count &&
-                   (!count || std::memcmp(words, other.words, count * sizeof(uint32_t)) == 0);
+                   (words == other.words || !count ||
+                    std::memcmp(words, other.words, count * sizeof(uint32_t)) == 0);
         }
     };
     struct SharedBufferKeyHash {
@@ -6510,11 +6579,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkSampler sampler = VK_NULL_HANDLE;
         bool persistent = false;
     };
+    struct SharedDescriptorSetLayout {
+        VkDescriptorSetLayout handle = VK_NULL_HANDLE;
+        bool persistent = false;
+    };
     struct SharedPipelineLayout {
         VkPipelineLayout handle = VK_NULL_HANDLE;
         bool persistent = false;
     };
+    const size_t estimated_backend_resources = std::min<size_t>(draws.size() * 4, 1024);
     std::vector<SharedBufferUpload> shared_buffers;
+    shared_buffers.reserve(std::min<size_t>(draws.size() * 4, 4096));
     // PROSPER_BUFVERIFY=1 — re-read every uploaded storage buffer from its MAPPED, device-visible
     // allocation just before the pass is submitted, and compare it byte for byte against the guest
     // words it was built from. PROSPER_BUFLOG reports only the SOURCE words, so it cannot see the
@@ -6537,6 +6612,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<BufferVerifyRecord> buffer_verify_records;
     std::vector<SharedBufferArena> shared_buffer_arenas;
     std::unordered_map<SharedBufferKey, size_t, SharedBufferKeyHash> shared_buffer_indices;
+    shared_buffer_indices.reserve(estimated_backend_resources);
     // Per-call repeat-reference memo (#1268): draws in one pass batch overwhelmingly re-reference
     // the same guest ranges (same VB/UB across hundreds of draws), and the SharedBufferKey lookup
     // pays a FULL content hash per reference because the hash is part of the key. Within one call
@@ -6559,13 +6635,66 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     };
     std::unordered_map<BufferRefMemoKey, size_t, BufferRefMemoKeyHash> buffer_ref_memo;
+    buffer_ref_memo.reserve(estimated_backend_resources);
+    struct BufferUploadSlotMemo {
+        uint32_t pass_id0 = 0;
+        uint32_t pass_id1 = 0;
+        BufferRefMemoKey key0{};
+        size_t index0 = SIZE_MAX;
+        BufferRefMemoKey key1{};
+        size_t index1 = SIZE_MAX;
+    };
+    static std::array<std::array<BufferUploadSlotMemo, 64>, 4> buffer_upload_slot_memo;
+    struct TextureUploadSlotMemo {
+        uint32_t pass_id0 = 0;
+        uint32_t pass_id1 = 0;
+        TextureUploadKey key0{};
+        size_t index0 = SIZE_MAX;
+        TextureUploadKey key1{};
+        size_t index1 = SIZE_MAX;
+    };
+    static std::array<std::array<TextureUploadSlotMemo, 64>, 4> texture_upload_slot_memo;
+    struct TextureBindingSlotMemo {
+        uint32_t pass_id0 = 0;
+        uint32_t pass_id1 = 0;
+        TextureBindingKey key0{};
+        size_t index0 = SIZE_MAX;
+        TextureBindingKey key1{};
+        size_t index1 = SIZE_MAX;
+    };
+    static std::array<std::array<TextureBindingSlotMemo, 64>, 4> texture_binding_slot_memo;
+    static uint32_t backend_pass_generation = 0;
+    if (++backend_pass_generation == 0) {
+        backend_pass_generation = 1;
+        buffer_upload_slot_memo = {};
+        texture_upload_slot_memo = {};
+        texture_binding_slot_memo = {};
+    }
+    const uint32_t current_pass_id = backend_pass_generation;
     std::vector<SharedTextureBinding> shared_texture_bindings;
+    shared_texture_bindings.reserve(estimated_backend_resources);
     std::unordered_map<TextureBindingKey, size_t, TextureBindingKeyHash>
         shared_texture_binding_indices;
-    std::unordered_map<std::vector<uint64_t>, VkDescriptorSetLayout, BackendWordVectorHash>
+    shared_texture_binding_indices.reserve(estimated_backend_resources);
+    std::unordered_map<std::vector<uint64_t>, SharedDescriptorSetLayout, BackendWordVectorHash>
         shared_descriptor_set_layouts;
     std::unordered_map<std::vector<uint64_t>, SharedPipelineLayout, BackendWordVectorHash>
         shared_pipeline_layouts;
+    struct LastDescriptorSetMemo {
+        bool valid = false;
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        std::vector<uint64_t> layout_key;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    };
+    std::array<LastDescriptorSetMemo, 4> last_descriptor_set_memo{};
+    struct LastPipelineLayoutMemo {
+        bool valid = false;
+        bool use_desc = false;
+        uint32_t n_sets = 0;
+        std::array<VkDescriptorSetLayout, 4> dsls{};
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+    };
+    LastPipelineLayoutMemo last_pipeline_layout_memo{};
     uint64_t resource_unique_tag = 0;
     const uint32_t zero_buffer_word = 0;
     const VkDeviceSize storage_buffer_alignment = ctx.storage_buffer_alignment;
@@ -6578,6 +6707,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return value <= UINT64_MAX - padding ? value + padding : VkDeviceSize{UINT64_MAX};
     };
     auto acquire_buffer_arena_slice = [&](VkDeviceSize bytes, SharedBufferUpload& upload) {
+        if (!shared_buffer_arenas.empty()) {
+            SharedBufferArena& arena = shared_buffer_arenas.back();
+            const VkDeviceSize offset = align_storage_offset(arena.used);
+            if (offset != UINT64_MAX && offset <= arena.buffer.bytes &&
+                bytes <= arena.buffer.bytes - offset) {
+                upload.buffer = arena.buffer.buffer;
+                upload.mapped = arena.buffer.mapped;
+                upload.offset = offset;
+                upload.arena = true;
+                arena.used = offset + bytes;
+                return true;
+            }
+        }
         for (SharedBufferArena& arena : shared_buffer_arenas) {
             const VkDeviceSize offset = align_storage_offset(arena.used);
             if (offset != UINT64_MAX && offset <= arena.buffer.bytes &&
@@ -6637,7 +6779,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     std::vector<SharedTextureUpload> texture_uploads;
+    texture_uploads.reserve(std::min<size_t>(draws.size() * 2, 1024));
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
+    texture_upload_indices.reserve(std::min<size_t>(draws.size() * 2, 1024));
     const bool share_texture_uploads = getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") == nullptr;
     size_t texture_references = 0;
     size_t persistent_texture_hits = 0;
@@ -6711,6 +6855,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyPipelineLayout(dev, victim->second.handle, nullptr);
         persistent_pipeline_layouts.erase(victim);
         ++resource_reuse_stats.persistent_pipeline_layout_evictions;
+        return true;
+    };
+    const bool descriptor_set_layout_cache_enabled = share_backend_resources &&
+        persistent_descriptor_set_layout_cache_enabled();
+    const size_t descriptor_set_layout_cache_limit = persistent_descriptor_set_layout_cache_limit();
+    const uint64_t descriptor_set_layout_generation = ++persistent_descriptor_set_layout_generation();
+    auto& persistent_descriptor_set_layouts = persistent_backend_descriptor_set_layout_cache();
+    auto evict_persistent_descriptor_set_layout = [&]() {
+        auto victim = persistent_descriptor_set_layouts.end();
+        for (auto it = persistent_descriptor_set_layouts.begin();
+             it != persistent_descriptor_set_layouts.end(); ++it) {
+            if (it->second.last_use == descriptor_set_layout_generation) continue;
+            if (victim == persistent_descriptor_set_layouts.end() ||
+                it->second.last_use < victim->second.last_use) victim = it;
+        }
+        if (victim == persistent_descriptor_set_layouts.end()) return false;
+        vkDestroyDescriptorSetLayout(dev, victim->second.handle, nullptr);
+        persistent_descriptor_set_layouts.erase(victim);
+        ++resource_reuse_stats.persistent_descriptor_set_layout_evictions;
         return true;
     };
     auto evict_pipeline = [&]() {
@@ -6834,6 +6997,42 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     };
     static Wave64Census wave64_stats;
+    std::vector<VkDescriptorSetLayout> draw_dsls;
+    std::vector<const std::vector<uint64_t>*> draw_layout_key_ptrs;
+    std::array<std::vector<uint64_t>, 4> draw_scratch_layout_keys;
+    std::vector<VkDescriptorSetLayoutBinding> draw_lb;
+    std::vector<uint32_t> draw_dbi_offset;
+    std::vector<VkDescriptorBufferInfo> draw_dbi;
+    std::vector<VkDescriptorImageInfo> draw_dii;
+    std::vector<VkWriteDescriptorSet> draw_wr;
+    std::vector<VkDescriptorSetLayoutBinding> draw_slb;
+    std::vector<uint64_t> draw_pipeline_layout_key;
+
+    struct LastPipelineMemo {
+        bool valid = false;
+        PersistentPipelineKey key;
+        PersistentPipeline* entry = nullptr;
+    };
+    LastPipelineMemo last_pipeline_memo;
+
+    uint64_t pass_feedback_bases[prosper::gpu::kColorTargetCount]{};
+    bool pass_feedback_active[prosper::gpu::kColorTargetCount]{};
+    bool pass_has_feedback_targets = false;
+    if (color_target) {
+        pass_feedback_bases[0] = color_target->persistent_id;
+        pass_feedback_active[0] = persistent_color;
+        pass_feedback_bases[1] = color_target->persistent_id1;
+        pass_feedback_active[1] = persistent_color1;
+        pass_has_feedback_targets = (persistent_color && color_target->persistent_id != 0) ||
+                                    (persistent_color1 && color_target->persistent_id1 != 0);
+        for (uint32_t slot = 2; slot < color_count; ++slot) {
+            pass_feedback_bases[slot] = color_target->persistent_id_slots[slot];
+            pass_feedback_active[slot] = cached_extra[slot] != nullptr;
+            if (pass_feedback_active[slot] && pass_feedback_bases[slot] != 0)
+                pass_has_feedback_targets = true;
+        }
+    }
+
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
@@ -7218,10 +7417,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // the null-ps (test) path and any draw that never programs it are byte-identical. PROSPER_NO_CULL
         // forces CULL_NONE back on; PROSPER_FLIP_FRONT_FACE preserves culling and toggles only winding.
         // Together they isolate a cull-mode problem from a front-face translation problem without a rebuild.
-        if (ps) { rs.cullMode  = getenv("PROSPER_NO_CULL") ? VK_CULL_MODE_NONE : (VkCullModeFlags)ps->cull_mode;
-                  rs.frontFace = getenv("PROSPER_FLIP_FRONT_FACE")
+        if (ps) { rs.cullMode  = PROSPER_ENV_ON("PROSPER_NO_CULL") ? VK_CULL_MODE_NONE : (VkCullModeFlags)ps->cull_mode;
+                  rs.frontFace = PROSPER_ENV_ON("PROSPER_FLIP_FRONT_FACE")
                       ? (ps->front_face == VK_FRONT_FACE_CLOCKWISE ? VK_FRONT_FACE_COUNTER_CLOCKWISE
-                                                                  : VK_FRONT_FACE_CLOCKWISE)
+                                                                   : VK_FRONT_FACE_CLOCKWISE)
                       : (VkFrontFace)ps->front_face;
                   rs.polygonMode = (VkPolygonMode)ps->polygon_mode; }
         // Depth bias (#1349): the guest's PA_SU_POLY_OFFSET_* — shadow-map passes need it against
@@ -7250,7 +7449,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (ps) {
             cba[0].colorWriteMask = ps->color_write_mask;
             cba[0].blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
-            if (getenv("PROSPER_NO_BLEND")) cba[0].blendEnable = VK_FALSE;   // diag: isolate blend compositing
+            if (PROSPER_ENV_ON("PROSPER_NO_BLEND")) cba[0].blendEnable = VK_FALSE;   // diag: isolate blend compositing
             cba[0].srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
             cba[0].dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
             cba[0].colorBlendOp        = (VkBlendOp)ps->color_blend_op;
@@ -7262,7 +7461,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             cba[0].alphaBlendOp        = (VkBlendOp)ps->alpha_blend_op;
             cba[1].colorWriteMask = ps->color1_write_mask;
             cba[1].blendEnable = ps->blend1_enable ? VK_TRUE : VK_FALSE;
-            if (getenv("PROSPER_NO_BLEND")) cba[1].blendEnable = VK_FALSE;
+            if (PROSPER_ENV_ON("PROSPER_NO_BLEND")) cba[1].blendEnable = VK_FALSE;
             cba[1].srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor1;
             cba[1].dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor1;
             cba[1].colorBlendOp = (VkBlendOp)ps->color_blend_op1;
@@ -7273,7 +7472,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 const auto& target = ps->color_targets[slot];
                 cba[slot].colorWriteMask = target.write_mask;
                 cba[slot].blendEnable = target.blend_enable ? VK_TRUE : VK_FALSE;
-                if (getenv("PROSPER_NO_BLEND")) cba[slot].blendEnable = VK_FALSE;
+                if (PROSPER_ENV_ON("PROSPER_NO_BLEND")) cba[slot].blendEnable = VK_FALSE;
                 cba[slot].srcColorBlendFactor =
                     static_cast<VkBlendFactor>(target.src_color_blend_factor);
                 cba[slot].dstColorBlendFactor =
@@ -7359,7 +7558,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                      ps->stencil_depth_fail_op[fb] == REPLACE);
                 s.reference   = does_replace ? ps->stencil_op_val[fb] : ps->stencil_ref[fb];
                 if (does_replace && s.compareOp == VK_COMPARE_OP_ALWAYS)
-                    if (const char* v = getenv("PROSPER_STENCIL_REPLACE"))
+                    if (const char* v = PROSPER_ENV_VALUE("PROSPER_STENCIL_REPLACE"))
                         s.reference = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
                 return s;
             };
@@ -7386,28 +7585,33 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const auto& R = *effective_resources[di];
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
-        std::vector<VkDescriptorSetLayout> dsls(v.n_sets, VK_NULL_HANDLE);
-        v.dsets.assign(v.n_sets, VK_NULL_HANDLE);
-        std::vector<std::vector<uint64_t>> descriptor_layout_keys(v.n_sets);
+        if (v.n_sets > v.dsets.size()) {
+            std::fprintf(stderr, "prosper: draw %zu requires %u descriptor sets, max supported is %zu\n",
+                         di, v.n_sets, v.dsets.size());
+            abort();
+        }
+        draw_dsls.assign(v.n_sets, VK_NULL_HANDLE);
+        v.dsets.fill(VK_NULL_HANDLE);
+        draw_layout_key_ptrs.assign(v.n_sets, nullptr);
         if (v.use_desc) {
-            std::vector<VkDescriptorSetLayoutBinding> lb(R.size());
+            draw_lb.resize(R.size());
             // One contiguous run of VkDescriptorBufferInfo per resource, arity entries long. Sized
-            // ONCE, before anything takes an address into it: `wr[].pBufferInfo` points in here and
+            // ONCE, before anything takes an address into it: `draw_wr[].pBufferInfo` points in here and
             // must stay valid until vkUpdateDescriptorSets, so growing this vector while
-            // materialising entries would silently invalidate pointers already stored in `wr` --
+            // materialising entries would silently invalidate pointers already stored in `draw_wr` --
             // which Vulkan reads as garbage descriptors rather than reporting as an error.
-            std::vector<uint32_t> dbi_offset(R.size(), 0);
+            draw_dbi_offset.assign(R.size(), 0);
             {
                 uint32_t running = 0;
                 for (size_t i = 0; i < R.size(); i++) {
-                    dbi_offset[i] = running;
+                    draw_dbi_offset[i] = running;
                     running += R[i].descriptor_arity();
                 }
                 (void)running;
             }
             const size_t dbi_total = R.empty()
-                ? 0 : static_cast<size_t>(dbi_offset.back()) + R.back().descriptor_arity();
-            std::vector<VkDescriptorBufferInfo> dbi(dbi_total);
+                ? 0 : static_cast<size_t>(draw_dbi_offset.back()) + R.back().descriptor_arity();
+            draw_dbi.resize(dbi_total);
                 // Resolve one storage-buffer payload to an index in `shared_buffers` -- the memo lookup,
                 // the size-gated content dedup, and the arena/pool/create upload. Extracted verbatim
                 // from the per-resource site below so it can be called MORE THAN ONCE per resource: an
@@ -7446,10 +7650,31 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 const bool shareable = share_backend_resources && identity != 0;
                 size_t buffer_index = SIZE_MAX;
                 const BufferRefMemoKey memo_key{words, word_count, identity};
-                if (shareable) {
+                const bool can_memo_slot = shareable && set < 4u && binding < 64u;
+                if (can_memo_slot) {
+                    auto& slot = buffer_upload_slot_memo[set][binding];
+                    if (slot.pass_id0 == current_pass_id && slot.key0 == memo_key) {
+                        buffer_index = slot.index0;
+                        ++resource_reuse_stats.buffer_ref_memo_hits;
+                        ++backend_hash_stats_totals().memo_hits;
+                    } else if (slot.pass_id1 == current_pass_id && slot.key1 == memo_key) {
+                        buffer_index = slot.index1;
+                        std::swap(slot.pass_id0, slot.pass_id1);
+                        std::swap(slot.key0, slot.key1);
+                        std::swap(slot.index0, slot.index1);
+                        ++resource_reuse_stats.buffer_ref_memo_hits;
+                        ++backend_hash_stats_totals().memo_hits;
+                    }
+                }
+                if (buffer_index == SIZE_MAX && shareable) {
                     auto memo_found = buffer_ref_memo.find(memo_key);
                     if (memo_found != buffer_ref_memo.end()) {
                         buffer_index = memo_found->second;
+                        if (can_memo_slot) {
+                            auto& slot = buffer_upload_slot_memo[set][binding];
+                            slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                            slot.pass_id0 = current_pass_id; slot.key0 = memo_key; slot.index0 = buffer_index;
+                        }
                         ++resource_reuse_stats.buffer_ref_memo_hits;
                         ++backend_hash_stats_totals().memo_hits;
                     }
@@ -7490,14 +7715,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     ++resource_reuse_stats.buffer_hash_skipped_unique;
                     ++backend_hash_stats_totals().skipped_unique;
                 }
-                SharedBufferKey buffer_key{
-                    words, word_count, identity, content_hash,
-                    hash_dedup ? 0 : ++resource_unique_tag};
+                SharedBufferKey buffer_key{};
                 auto buffer_found = shared_buffer_indices.end();
-                {
+                if (hash_dedup) {
+                    buffer_key = SharedBufferKey{
+                        words, word_count, identity, content_hash, 0};
                     const ResourcePhaseTimer phase_index(timing_enabled,
                                                          &res_buffer_index_find_ms);
-                    buffer_found = shared_buffer_indices.find(buffer_key);
+                    if (!shared_buffer_indices.empty()) {
+                        buffer_found = shared_buffer_indices.find(buffer_key);
+                    }
                 }
                 if (buffer_found != shared_buffer_indices.end()) {
                     buffer_index = buffer_found->second;
@@ -7570,7 +7797,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         const ResourcePhaseTimer phase_index(timing_enabled,
                                                              &res_buffer_index_insert_ms);
                         shared_buffers.push_back(upload);
-                        shared_buffer_indices.emplace(buffer_key, buffer_index);
+                        if (hash_dedup) {
+                            shared_buffer_indices.emplace(buffer_key, buffer_index);
+                        }
                         if (buffer_verify_enabled)
                             buffer_verify_records.push_back(
                                 {words, word_count, identity, set, binding, buffer_index});
@@ -7582,23 +7811,28 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     const ResourcePhaseTimer phase_index(timing_enabled,
                                                          &res_buffer_index_find_ms);
                     buffer_ref_memo.emplace(memo_key, buffer_index);
+                    if (can_memo_slot) {
+                        auto& slot = buffer_upload_slot_memo[set][binding];
+                        slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                        slot.pass_id0 = current_pass_id; slot.key0 = memo_key; slot.index0 = buffer_index;
+                    }
                 }
                 }
                 buffer_index_out = buffer_index;
                 return true;
                 };
 
-            std::vector<VkDescriptorImageInfo> dii(R.size());
-            std::vector<VkWriteDescriptorSet> wr(R.size());
+            draw_dii.resize(R.size());
+            draw_wr.resize(R.size());
             bool buffer_resources_ready = true;
             for (size_t i = 0; i < R.size(); i++) {
                 const FrameResource& r = R[i];
-                lb[i] = {}; lb[i].binding = r.binding;
+                draw_lb[i] = {}; draw_lb[i].binding = r.binding;
                 // What the WRITE will supply, not what the resource declares (#2477). See
                 // `written_descriptor_count()`. Loud once if a producer ever asks for an array on a
                 // class whose write path cannot build one -- silently declaring 1 would drop the
                 // extra entries and read as handled.
-                lb[i].descriptorCount = r.written_descriptor_count();
+                draw_lb[i].descriptorCount = r.written_descriptor_count();
                 if (r.descriptor_arity() != r.written_descriptor_count()) {
                     static std::once_flag warned;
                     std::call_once(warned, [&] {
@@ -7615,7 +7849,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
                 if (r.is_texture()) {
                     const ResourcePhaseTimer phase_texture(timing_enabled, &res_texture_ms);
-                    lb[i].descriptorType = r.is_storage_image
+                    draw_lb[i].descriptorType = r.is_storage_image
                         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                         : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                     // A set-0 texture belongs to the VERTEX shader (build_R tags VS resources into set 0,
@@ -7623,7 +7857,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // vertex texture fetch (displacement/heightmap, GPU vertex animation) needs
                     // VERTEX_BIT — a fragment-only hardcode made set-0 textures invisible to the VS,
                     // yielding undefined samples / a validation error (#376). Match the storage-buffer path.
-                    lb[i].stageFlags = (r.set == 0)
+                    draw_lb[i].stageFlags = (r.set == 0)
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     texture_references++;
@@ -7633,19 +7867,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     auto target_is_feedback = [&](uint64_t target_id,
                                                   uint32_t target_w,
                                                   uint32_t target_h) {
-                        if (!color_target || !target_id) return false;
-                        uint64_t bases[prosper::gpu::kColorTargetCount]{};
-                        bool active[prosper::gpu::kColorTargetCount]{};
-                        bases[0] = color_target->persistent_id;
-                        active[0] = persistent_color;
-                        bases[1] = color_target->persistent_id1;
-                        active[1] = persistent_color1;
-                        for (uint32_t slot = 2; slot < color_count; ++slot) {
-                            bases[slot] = color_target->persistent_id_slots[slot];
-                            active[slot] = cached_extra[slot] != nullptr;
-                        }
+                        if (!pass_has_feedback_targets || !target_id) return false;
                         return prosper::frontend::mrt_target_view_feedback(
-                            bases, active, color_count, target_id,
+                            pass_feedback_bases, pass_feedback_active, color_count, target_id,
                             target_w, target_h, W, H);
                     };
                     const bool target_feedback = target_is_feedback(
@@ -7682,22 +7906,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     bool generated_mip_format_supported =
                         sampled_format == VK_FORMAT_R8G8B8A8_UNORM;
                     if (sampled_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
-                        VkFormatProperties properties{};
-                        vkGetPhysicalDeviceFormatProperties(phys, sampled_format, &properties);
-                        constexpr VkFormatFeatureFlags required =
-                            VK_FORMAT_FEATURE_BLIT_SRC_BIT |
-                            VK_FORMAT_FEATURE_BLIT_DST_BIT |
-                            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-                        generated_mip_format_supported =
-                            (properties.optimalTilingFeatures & required) == required;
+                        static const bool b10g11r11_generated_mip_supported = [phys]() {
+                            VkFormatProperties properties{};
+                            vkGetPhysicalDeviceFormatProperties(phys, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &properties);
+                            constexpr VkFormatFeatureFlags required =
+                                VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+                            return (properties.optimalTilingFeatures & required) == required;
+                        }();
+                        generated_mip_format_supported = b10g11r11_generated_mip_supported;
                     }
-                    std::array<VkImage, 16> renderer_mip_images{};
-                    std::array<VkImageLayout, 16> renderer_mip_layouts{};
-                    uint32_t renderer_mip_sources = 0;
+                    std::array<VkImage, 16> renderer_mip_images;
+                    std::array<VkImageLayout, 16> renderer_mip_layouts;
+                    bool assemble_renderer_mips = false;
                     if (!r.is_storage_image && !target_mip_feedback && r.img_dim == 1u &&
                         r.td == 1u && r.sample_count == 1u && generated_mip_format_supported &&
                         requested_target_mips > 1u &&
                         requested_target_mips == r.declared_mip_levels) {
+                        renderer_mip_images.fill(VK_NULL_HANDLE);
+                        renderer_mip_layouts.fill(VK_IMAGE_LAYOUT_UNDEFINED);
+                        uint32_t renderer_mip_sources = 0;
                         for (uint32_t level = 0; level < requested_target_mips; ++level) {
                             const uint64_t id = r.persistent_render_target_mip_ids[level];
                             if (!id) continue;
@@ -7712,9 +7941,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             renderer_mip_layouts[level] = target->layout;
                             ++renderer_mip_sources;
                         }
+                        assemble_renderer_mips = renderer_mip_sources > 1u &&
+                            renderer_mip_images[0] != VK_NULL_HANDLE;
                     }
-                    const bool assemble_renderer_mips = renderer_mip_sources > 1u &&
-                        renderer_mip_images[0] != VK_NULL_HANDLE;
                     if (!r.is_storage_image && r.img_dim == 1 && r.td == 1 &&
                         ((!r.persistent_render_target_id && r.tex_rgba) ||
                          assemble_renderer_mips) &&
@@ -7745,9 +7974,30 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image,
                         uniform_color_bits, r.gpu_detile.get()};
                     size_t upload_index = SIZE_MAX;
-                    if (share_texture_uploads) {
-                        auto found = texture_upload_indices.find(texture_key);
-                        if (found != texture_upload_indices.end()) upload_index = found->second;
+                    const bool can_memo_slot = share_texture_uploads && r.set < 4u && r.binding < 64u;
+                    if (can_memo_slot) {
+                        auto& slot = texture_upload_slot_memo[r.set][r.binding];
+                        if (slot.pass_id0 == current_pass_id && slot.key0 == texture_key) {
+                            upload_index = slot.index0;
+                        } else if (slot.pass_id1 == current_pass_id && slot.key1 == texture_key) {
+                            upload_index = slot.index1;
+                            std::swap(slot.pass_id0, slot.pass_id1);
+                            std::swap(slot.key0, slot.key1);
+                            std::swap(slot.index0, slot.index1);
+                        }
+                    }
+                    if (upload_index == SIZE_MAX && share_texture_uploads) {
+                        if (!texture_upload_indices.empty()) {
+                            auto found = texture_upload_indices.find(texture_key);
+                            if (found != texture_upload_indices.end()) {
+                                upload_index = found->second;
+                                if (can_memo_slot) {
+                                    auto& slot = texture_upload_slot_memo[r.set][r.binding];
+                                    slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                                    slot.pass_id0 = current_pass_id; slot.key0 = texture_key; slot.index0 = upload_index;
+                                }
+                            }
+                        }
                     }
                     if (upload_index == SIZE_MAX) {
                         const ResourcePhaseTimer phase_upload(timing_enabled,
@@ -8038,11 +8288,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             }
                         }
                     }
+                    if (can_memo_slot) {
+                        auto& slot = texture_upload_slot_memo[r.set][r.binding];
+                        slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                        slot.pass_id0 = current_pass_id; slot.key0 = texture_key; slot.index0 = upload_index;
+                    }
                     if (r.is_storage_image && r.storage_image_writeback &&
                         texture_uploads[upload_index].storage_writebacks.empty())
                         texture_uploads[upload_index].storage_writebacks.push_back(
                             r.storage_image_writeback);
-                    const SharedTextureUpload& upload = texture_uploads[upload_index];
+                    SharedTextureUpload& upload = texture_uploads[upload_index];
                     VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                     // NOTE(#263): r.srgb carries whether the T# is a gamma-encoded (sRGB) surface, but we
                     // deliberately keep the view UNORM. This whole renderer works in gamma/sRGB space
@@ -8058,13 +8313,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // Retained color samples carry reflected arrayedness (#3415); ordinary texture
                     // uploads share the recompiler's array predicate (#325). A one-layer ARRAY view
                     // is legal, but img_dim=5 alone also occurs with non-arrayed base-slice shaders.
-                    tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D
+                    const VkImageViewType view_type = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D
                         : (r.guest_array || r.sample_count > 1u) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                                  : VK_IMAGE_VIEW_TYPE_2D;
-                    tvci.format = backend_color_format(r.texture_format);
-                    // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
-                    // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
-                    // forces identity for A/B testing against the pre-swizzle behavior.
+                    const VkFormat view_format = upload.borrowed_ds
+                        ? upload.ds_format
+                        : backend_color_format(r.texture_format);
                     auto vkswz = [](uint32_t s) -> VkComponentSwizzle {
                         switch (s) {
                             case 0:  return VK_COMPONENT_SWIZZLE_ZERO;
@@ -8076,34 +8330,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             default: return VK_COMPONENT_SWIZZLE_IDENTITY;
                         }
                     };
-                    // Vulkan component mappings do not apply to storage-image accesses.
-                    if (!r.is_storage_image && !getenv("PROSPER_NO_SWIZZLE")) {
+                    VkComponentMapping components{
+                        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+                    if (!r.is_storage_image && !PROSPER_ENV_ON("PROSPER_NO_SWIZZLE")) {
                         const auto swizzle = backend_sampled_component_swizzle(r);
-                        tvci.components = {vkswz(swizzle[0]), vkswz(swizzle[1]),
-                                           vkswz(swizzle[2]), vkswz(swizzle[3])};
+                        components = {vkswz(swizzle[0]), vkswz(swizzle[1]),
+                                      vkswz(swizzle[2]), vkswz(swizzle[3])};
                     }
-                    tvci.subresourceRange =
-                        {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
-                         0, r.sample_count};
-                    // Sampled depth bridge (#1275): a borrowed DS image is viewed through its own
-                    // depth format's DEPTH aspect (one level — DS surfaces have no mip chains here);
-                    // the sampled value arrives in R. The T# swizzle above still applies.
-                    if (upload.borrowed_ds) {
-                        // The view format stays the image's combined DS format -- a depth/stencil
-                        // image admits no format reinterpretation -- and the aspect mask alone
-                        // selects the plane. Exactly one aspect, as a sampled view of a combined
-                        // format requires (VUID-VkDescriptorImageInfo-imageView-01976).
-                        tvci.format = upload.ds_format;
-                        tvci.subresourceRange = {
-                            upload.borrowed_ds_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
-                                                       : VK_IMAGE_ASPECT_DEPTH_BIT,
-                            0, 1, 0, 1};
-                    }
-                    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-                    // Honor the game's decoded S# (r.mag/min/mip_filter, r.addr_uvw) instead of a fixed
-                    // LINEAR/clamp sampler — point-sampled art (pixel-art titles) no longer gets a blurred
-                    // per-texel outline, and real wrap modes work. Gen5 CLAMP enum -> Vk address mode.
-                    auto vkflt  = [](uint32_t f){ return f ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; };
+                    auto vkflt = [](uint32_t f) { return f ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; };
                     auto vkaddr = [](uint32_t c) -> VkSamplerAddressMode {
                         switch (c) {
                             case 0:  return VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -8112,79 +8347,124 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   // 2,3,4,5: clamp-ish
                         }
                     };
-                    sci.magFilter = vkflt(r.mag_filter); sci.minFilter = vkflt(r.min_filter);
-                    sci.mipmapMode = r.mip_filter ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-                    // Sampled depth bridge (#1275): LINEAR filtering of depth formats is an OPTIONAL
-                    // Vulkan format feature, and the manual-compare lowering takes single taps
-                    // anyway (filter-then-compare would differ from hardware's compare-then-filter
-                    // PCF regardless). Force NEAREST for borrowed depth views.
-                    if (upload.borrowed_ds) {
-                        sci.magFilter = VK_FILTER_NEAREST;
-                        sci.minFilter = VK_FILTER_NEAREST;
-                        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-                    }
-                    sci.addressModeU = vkaddr(r.addr_uvw[0]);
-                    sci.addressModeV = vkaddr(r.addr_uvw[1]);
-                    sci.addressModeW = vkaddr(r.addr_uvw[2]);
-                    // Remaining S# fields (#262), applied where valid on this color combined-image-sampler.
-                    // Defaults (border 0 / LOD 0,0 / bias 0) reproduce the previous fixed sampler exactly.
-                    //   border color: only bites with CLAMP_TO_BORDER wrap. 3 = register/custom (needs
-                    //     VK_EXT_custom_border_color); fall back to opaque-black.
-                    //   LOD min/max/bias: honored; harmless with our single uploaded mip.
-                    // Anisotropy (#275): applied when the S# requests a ratio, the device feature is
-                    // enabled, and filtering is linear (Vulkan requires anisotropyEnable only with linear
-                    // mag/min filters). maxAnisotropy = 1<<ratio, clamped to the device ceiling. ratio 0
-                    // (isotropic) leaves anisotropyEnable false -> the sampler is unchanged.
+                    const VkFilter mag_filter = upload.borrowed_ds ? VK_FILTER_NEAREST : vkflt(r.mag_filter);
+                    const VkFilter min_filter = upload.borrowed_ds ? VK_FILTER_NEAREST : vkflt(r.min_filter);
+                    const VkSamplerMipmapMode mipmap_mode = upload.borrowed_ds
+                        ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                        : (r.mip_filter ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST);
+                    const VkSamplerAddressMode addr_u = vkaddr(r.addr_uvw[0]);
+                    const VkSamplerAddressMode addr_v = vkaddr(r.addr_uvw[1]);
+                    const VkSamplerAddressMode addr_w = vkaddr(r.addr_uvw[2]);
+                    VkBool32 aniso_enable = VK_FALSE;
+                    float max_aniso = 0.0f;
                     if (r.max_aniso_ratio > 0 && aniso_enabled &&
-                        sci.magFilter == VK_FILTER_LINEAR && sci.minFilter == VK_FILTER_LINEAR) {
-                        sci.anisotropyEnable = VK_TRUE;
-                        float want = (float)(1u << r.max_aniso_ratio);
-                        sci.maxAnisotropy = want < max_aniso_limit ? want : max_aniso_limit;
+                        mag_filter == VK_FILTER_LINEAR && min_filter == VK_FILTER_LINEAR) {
+                        aniso_enable = VK_TRUE;
+                        const float want = static_cast<float>(1u << r.max_aniso_ratio);
+                        max_aniso = want < max_aniso_limit ? want : max_aniso_limit;
                     }
-                    // NOT applied here (need machinery the current path lacks — decoded under GFXLOG only):
-                    //   depth_compare_func (needs a depth/shadow sampler over a depth image).
-                    // FORCE_UNNORMALIZED is handled in the recompiler by scaling only the spatial
-                    // sample coordinates; keeping this sampler normalized preserves wrap and LOD.
+                    VkBorderColor border_color;
                     switch (r.border_color_type) {
-                        case 1:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
-                        case 2:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
-                        case 3:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;   // custom unsupported
-                        default: sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
+                        case 1:  border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
+                        case 2:  border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
+                        case 3:  border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;   // custom unsupported
+                        default: border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
                     }
-                    sci.minLod = r.min_lod; sci.maxLod = r.max_lod; sci.mipLodBias = r.lod_bias;
                     TextureBindingKey binding_key;
                     binding_key.words = {
-                        handle_bits(upload.image), static_cast<uint64_t>(tvci.viewType),
-                        static_cast<uint64_t>(tvci.format),
-                        static_cast<uint64_t>(tvci.components.r),
-                        static_cast<uint64_t>(tvci.components.g),
-                        static_cast<uint64_t>(tvci.components.b),
-                        static_cast<uint64_t>(tvci.components.a),
+                        handle_bits(upload.image), static_cast<uint64_t>(view_type),
+                        static_cast<uint64_t>(view_format),
+                        static_cast<uint64_t>(components.r),
+                        static_cast<uint64_t>(components.g),
+                        static_cast<uint64_t>(components.b),
+                        static_cast<uint64_t>(components.a),
                         static_cast<uint64_t>(r.is_storage_image),
-                        static_cast<uint64_t>(sci.magFilter),
-                        static_cast<uint64_t>(sci.minFilter),
-                        static_cast<uint64_t>(sci.mipmapMode),
-                        static_cast<uint64_t>(sci.addressModeU),
-                        static_cast<uint64_t>(sci.addressModeV),
-                        static_cast<uint64_t>(sci.addressModeW),
-                        static_cast<uint64_t>(sci.borderColor),
-                        static_cast<uint64_t>(float_bits(sci.minLod)),
-                        static_cast<uint64_t>(float_bits(sci.maxLod)),
-                        static_cast<uint64_t>(float_bits(sci.mipLodBias)),
-                        static_cast<uint64_t>(sci.anisotropyEnable),
-                        static_cast<uint64_t>(float_bits(sci.maxAnisotropy)),
+                        static_cast<uint64_t>(mag_filter),
+                        static_cast<uint64_t>(min_filter),
+                        static_cast<uint64_t>(mipmap_mode),
+                        static_cast<uint64_t>(addr_u),
+                        static_cast<uint64_t>(addr_v),
+                        static_cast<uint64_t>(addr_w),
+                        static_cast<uint64_t>(border_color),
+                        static_cast<uint64_t>(float_bits(r.min_lod)),
+                        static_cast<uint64_t>(float_bits(r.max_lod)),
+                        static_cast<uint64_t>(float_bits(r.lod_bias)),
+                        static_cast<uint64_t>(aniso_enable),
+                        static_cast<uint64_t>(float_bits(max_aniso)),
                         static_cast<uint64_t>(r.sample_count),
                         share_backend_resources ? 0 : ++resource_unique_tag,
                     };
                     ++resource_reuse_stats.texture_binding_references;
                     size_t binding_index = SIZE_MAX;
-                    auto binding_found = shared_texture_binding_indices.find(binding_key);
-                    if (binding_found != shared_texture_binding_indices.end()) {
-                        binding_index = binding_found->second;
-                    } else {
+                    const bool can_memo_binding_slot = share_backend_resources && r.set < 4u && r.binding < 64u;
+                    if (can_memo_binding_slot) {
+                        auto& slot = texture_binding_slot_memo[r.set][r.binding];
+                        if (slot.pass_id0 == current_pass_id && slot.key0 == binding_key) {
+                            binding_index = slot.index0;
+                        } else if (slot.pass_id1 == current_pass_id && slot.key1 == binding_key) {
+                            binding_index = slot.index1;
+                            std::swap(slot.pass_id0, slot.pass_id1);
+                            std::swap(slot.key0, slot.key1);
+                            std::swap(slot.index0, slot.index1);
+                        }
+                    }
+                    if (binding_index == SIZE_MAX && share_backend_resources && upload.last_binding_index != SIZE_MAX &&
+                        upload.last_binding_key == binding_key) {
+                        binding_index = upload.last_binding_index;
+                        if (can_memo_binding_slot) {
+                            auto& slot = texture_binding_slot_memo[r.set][r.binding];
+                            slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                            slot.pass_id0 = current_pass_id; slot.key0 = binding_key; slot.index0 = binding_index;
+                        }
+                    } else if (binding_index == SIZE_MAX) {
+                        auto binding_found = shared_texture_binding_indices.empty()
+                            ? shared_texture_binding_indices.end()
+                            : shared_texture_binding_indices.find(binding_key);
+                        if (binding_found != shared_texture_binding_indices.end()) {
+                            binding_index = binding_found->second;
+                            if (can_memo_binding_slot) {
+                                auto& slot = texture_binding_slot_memo[r.set][r.binding];
+                                slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                                slot.pass_id0 = current_pass_id; slot.key0 = binding_key; slot.index0 = binding_index;
+                            }
+                        } else {
                         const ResourcePhaseTimer phase_bind(timing_enabled, &res_texture_bind_ms);
                         binding_index = shared_texture_bindings.size();
                         SharedTextureBinding binding;
+                        auto make_image_view_ci = [&]() {
+                            VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                            tvci.image = upload.image;
+                            tvci.viewType = view_type;
+                            tvci.format = view_format;
+                            tvci.components = components;
+                            if (upload.borrowed_ds) {
+                                tvci.subresourceRange = {
+                                    upload.borrowed_ds_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                               : VK_IMAGE_ASPECT_DEPTH_BIT,
+                                    0, 1, 0, 1};
+                            } else {
+                                tvci.subresourceRange = {
+                                    VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                                    0, r.sample_count};
+                            }
+                            return tvci;
+                        };
+                        auto make_sampler_ci = [&]() {
+                            VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+                            sci.magFilter = mag_filter;
+                            sci.minFilter = min_filter;
+                            sci.mipmapMode = mipmap_mode;
+                            sci.addressModeU = addr_u;
+                            sci.addressModeV = addr_v;
+                            sci.addressModeW = addr_w;
+                            sci.anisotropyEnable = aniso_enable;
+                            sci.maxAnisotropy = max_aniso;
+                            sci.borderColor = border_color;
+                            sci.minLod = r.min_lod;
+                            sci.maxLod = r.max_lod;
+                            sci.mipLodBias = r.lod_bias;
+                            return sci;
+                        };
                         const bool persistent_bindings_enabled = share_backend_resources &&
                             persistent_textures_enabled &&
                             !PROSPER_ENV_ON("PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS");
@@ -8239,6 +8519,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 // same key. Skipping the draw before the emplace is what keeps
                                 // the map free of nulls, which is why the cache-hit path above
                                 // needs no guard of its own.
+                                const VkImageViewCreateInfo tvci = make_image_view_ci();
+                                const VkSamplerCreateInfo sci = make_sampler_ci();
                                 const bool persistent_binding_ready =
                                     create_render_image_view_checked(
                                         dev, tvci, RenderVkObjectCreateSite::TextureViewPersistent,
@@ -8275,6 +8557,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             // ignores it), so only the view is unconditionally required here --
                             // treating a null sampler as a failure would drop every storage-image
                             // draw. Skip the draw the way #3045's upload failure does.
+                            const VkImageViewCreateInfo tvci = make_image_view_ci();
+                            const VkSamplerCreateInfo sci = r.is_storage_image ? VkSamplerCreateInfo{} : make_sampler_ci();
                             const bool binding_ready =
                                 create_render_image_view_checked(
                                     dev, tvci, RenderVkObjectCreateSite::TextureView,
@@ -8296,26 +8580,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         shared_texture_binding_indices.emplace(binding_key, binding_index);
                         ++resource_reuse_stats.unique_texture_bindings;
                     }
+                    if (share_backend_resources) {
+                        upload.last_binding_key = binding_key;
+                        upload.last_binding_index = binding_index;
+                        if (can_memo_binding_slot) {
+                            auto& slot = texture_binding_slot_memo[r.set][r.binding];
+                            slot.pass_id1 = slot.pass_id0; slot.key1 = slot.key0; slot.index1 = slot.index0;
+                            slot.pass_id0 = current_pass_id; slot.key0 = binding_key; slot.index0 = binding_index;
+                        }
+                    }
+                }
                     const SharedTextureUpload& descriptor_upload = texture_uploads[upload_index];
                     const VkImageLayout image_layout = r.is_storage_image
                         ? VK_IMAGE_LAYOUT_GENERAL
                         : descriptor_upload.borrowed_ds_feedback
                             ? self_depth_layout
                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                    dii[i] = {shared_texture_bindings[binding_index].sampler,
+                    draw_dii[i] = {shared_texture_bindings[binding_index].sampler,
                               shared_texture_bindings[binding_index].view, image_layout};
-                    wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
-                    wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
+                    draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; draw_wr[i].dstBinding = r.binding; draw_wr[i].descriptorCount = 1;
+                    draw_wr[i].descriptorType = draw_lb[i].descriptorType; draw_wr[i].pImageInfo = &draw_dii[i];
                 } else {
                     const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
-                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                    draw_lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; draw_lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
-                        dbi[i] = {gds.buffer, 0, 64u * 1024u};
-                        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                        wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
-                        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                        wr[i].pBufferInfo = &dbi[i];
+                        draw_dbi[i] = {gds.buffer, 0, 64u * 1024u};
+                        draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        draw_wr[i].dstBinding = r.binding; draw_wr[i].descriptorCount = 1;
+                        draw_wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        draw_wr[i].pBufferInfo = &draw_dbi[i];
                         continue;
                     }
                     // One upload per descriptor this binding occupies. Uniform over entries on
@@ -8354,54 +8648,103 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             entries_ready = false;
                             break;
                         }
-                        dbi[dbi_offset[i] + e] = {shared_buffers[entry_index].buffer,
+                        draw_dbi[draw_dbi_offset[i] + e] = {shared_buffers[entry_index].buffer,
                                                   shared_buffers[entry_index].offset,
                                                   shared_buffers[entry_index].range};
                     }
                     if (!entries_ready) { buffer_resources_ready = false; break; }
-                    wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding;
-                    wr[i].descriptorCount = arity;
-                    wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    wr[i].pBufferInfo = &dbi[dbi_offset[i]];
+                    draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; draw_wr[i].dstBinding = r.binding;
+                    draw_wr[i].descriptorCount = arity;
+                    draw_wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    draw_wr[i].pBufferInfo = &draw_dbi[draw_dbi_offset[i]];
                 }
             }
             if (!buffer_resources_ready) continue;
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
             for (uint32_t s = 0; s < v.n_sets; s++) {
-                std::vector<VkDescriptorSetLayoutBinding> slb;
-                for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
-                std::sort(slb.begin(), slb.end(), [](const auto& left, const auto& right) {
+                draw_slb.clear();
+                for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) draw_slb.push_back(draw_lb[i]);
+                std::sort(draw_slb.begin(), draw_slb.end(), [](const auto& left, const auto& right) {
                     return left.binding < right.binding;
                 });
-                std::vector<uint64_t> layout_key;
-                layout_key.reserve(1 + slb.size() * 4);
-                layout_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
-                for (const auto& binding : slb) {
-                    layout_key.push_back(binding.binding);
-                    layout_key.push_back(binding.descriptorType);
-                    layout_key.push_back(binding.descriptorCount);
-                    layout_key.push_back(binding.stageFlags);
-                }
-                descriptor_layout_keys[s] = layout_key;
-                ++resource_reuse_stats.descriptor_set_layout_references;
-                auto layout_found = shared_descriptor_set_layouts.find(layout_key);
-                if (layout_found != shared_descriptor_set_layouts.end()) {
-                    dsls[s] = layout_found->second;
+                const bool can_memo_set = share_backend_resources && s < last_descriptor_set_memo.size();
+                if (can_memo_set && last_descriptor_set_memo[s].valid &&
+                    draw_slb.size() == last_descriptor_set_memo[s].bindings.size() &&
+                    std::memcmp(draw_slb.data(), last_descriptor_set_memo[s].bindings.data(),
+                                draw_slb.size() * sizeof(VkDescriptorSetLayoutBinding)) == 0) {
+                    draw_dsls[s] = last_descriptor_set_memo[s].layout;
+                    draw_layout_key_ptrs[s] = &last_descriptor_set_memo[s].layout_key;
+                    ++resource_reuse_stats.descriptor_set_layout_references;
                 } else {
-                    VkDescriptorSetLayoutCreateInfo layout_info{
-                        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-                    layout_info.bindingCount = static_cast<uint32_t>(slb.size());
-                    layout_info.pBindings = slb.data();
-                    vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &dsls[s]);
-                    shared_descriptor_set_layouts.emplace(std::move(layout_key), dsls[s]);
-                    ++resource_reuse_stats.unique_descriptor_set_layouts;
+                    auto& scratch_key = (s < draw_scratch_layout_keys.size())
+                        ? draw_scratch_layout_keys[s]
+                        : draw_pipeline_layout_key;
+                    scratch_key.clear();
+                    scratch_key.reserve(1 + draw_slb.size() * 4);
+                    scratch_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
+                    for (const auto& binding : draw_slb) {
+                        scratch_key.push_back(binding.binding);
+                        scratch_key.push_back(binding.descriptorType);
+                        scratch_key.push_back(binding.descriptorCount);
+                        scratch_key.push_back(binding.stageFlags);
+                    }
+                    ++resource_reuse_stats.descriptor_set_layout_references;
+                    auto layout_found = shared_descriptor_set_layouts.find(scratch_key);
+                    if (layout_found != shared_descriptor_set_layouts.end()) {
+                        draw_dsls[s] = layout_found->second.handle;
+                    } else {
+                        SharedDescriptorSetLayout shared_layout;
+                        const bool can_persist_dsl = descriptor_set_layout_cache_enabled &&
+                            descriptor_set_layout_cache_limit;
+                        auto persistent_layout = can_persist_dsl
+                            ? persistent_descriptor_set_layouts.find(scratch_key)
+                            : persistent_descriptor_set_layouts.end();
+                        if (persistent_layout != persistent_descriptor_set_layouts.end()) {
+                            persistent_layout->second.last_use = descriptor_set_layout_generation;
+                            shared_layout.handle = persistent_layout->second.handle;
+                            shared_layout.persistent = true;
+                            ++resource_reuse_stats.persistent_descriptor_set_layout_hits;
+                        } else {
+                            VkDescriptorSetLayoutCreateInfo layout_info{
+                                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+                            layout_info.bindingCount = static_cast<uint32_t>(draw_slb.size());
+                            layout_info.pBindings = draw_slb.data();
+                            vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &shared_layout.handle);
+                            if (can_persist_dsl) {
+                                ++resource_reuse_stats.persistent_descriptor_set_layout_misses;
+                                while (!avoid_cache_eviction &&
+                                       persistent_descriptor_set_layouts.size() >= descriptor_set_layout_cache_limit &&
+                                       evict_persistent_descriptor_set_layout()) {}
+                                if (shared_layout.handle &&
+                                    persistent_descriptor_set_layouts.size() < descriptor_set_layout_cache_limit) {
+                                    persistent_descriptor_set_layouts.emplace(
+                                        scratch_key,
+                                        PersistentBackendDescriptorSetLayout{
+                                            shared_layout.handle, descriptor_set_layout_generation});
+                                    shared_layout.persistent = true;
+                                }
+                            }
+                        }
+                        draw_dsls[s] = shared_layout.handle;
+                        shared_descriptor_set_layouts.emplace(scratch_key, shared_layout);
+                        ++resource_reuse_stats.unique_descriptor_set_layouts;
+                    }
+                    if (can_memo_set) {
+                        last_descriptor_set_memo[s].valid = true;
+                        last_descriptor_set_memo[s].bindings = draw_slb;
+                        last_descriptor_set_memo[s].layout_key = scratch_key;
+                        last_descriptor_set_memo[s].layout = draw_dsls[s];
+                        draw_layout_key_ptrs[s] = &last_descriptor_set_memo[s].layout_key;
+                    } else {
+                        draw_layout_key_ptrs[s] = &scratch_key;
+                    }
                 }
             }
             VkDescriptorSetAllocateInfo allocate_info{
                 VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             allocate_info.descriptorPool = shared_descriptor_pool;
             allocate_info.descriptorSetCount = v.n_sets;
-            allocate_info.pSetLayouts = dsls.data();
+            allocate_info.pSetLayouts = draw_dsls.data();
             const VkResult descriptor_alloc = vkAllocateDescriptorSets(dev, &allocate_info,
                                                                        v.dsets.data());
             // Read once, not per draw: getenv takes a process-wide lock on Windows and this is the
@@ -8414,78 +8757,109 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     std::fprintf(stderr, " set%u=%p", s, (void*)v.dsets[s]);
                 for (size_t i = 0; i < R.size(); i++)
                     std::fprintf(stderr, " [b%u type=%d cnt=%u buf=%p off=%llu range=%llu]",
-                                 R[i].binding, (int)wr[i].descriptorType, wr[i].descriptorCount,
-                                 wr[i].pBufferInfo ? (void*)wr[i].pBufferInfo->buffer : nullptr,
-                                 wr[i].pBufferInfo
-                                     ? (unsigned long long)wr[i].pBufferInfo->offset : 0ull,
-                                 wr[i].pBufferInfo
-                                     ? (unsigned long long)wr[i].pBufferInfo->range : 0ull);
+                                 R[i].binding, (int)draw_wr[i].descriptorType, draw_wr[i].descriptorCount,
+                                 draw_wr[i].pBufferInfo ? (void*)draw_wr[i].pBufferInfo->buffer : nullptr,
+                                 draw_wr[i].pBufferInfo
+                                     ? (unsigned long long)draw_wr[i].pBufferInfo->offset : 0ull,
+                                 draw_wr[i].pBufferInfo
+                                     ? (unsigned long long)draw_wr[i].pBufferInfo->range : 0ull);
                 std::fprintf(stderr, "\n");
             }
             for (size_t i = 0; i < R.size(); i++)
-                wr[i].dstSet = v.dsets[R[i].set];
-            vkUpdateDescriptorSets(dev, static_cast<uint32_t>(wr.size()), wr.data(), 0, nullptr);
+                draw_wr[i].dstSet = v.dsets[R[i].set];
+            vkUpdateDescriptorSets(dev, static_cast<uint32_t>(draw_wr.size()), draw_wr.data(), 0, nullptr);
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
-        std::vector<uint64_t> pipeline_layout_key;
-        size_t pipeline_layout_key_words = 1;
-        if (v.use_desc) {
-            for (const auto& descriptor_layout_key : descriptor_layout_keys)
-                pipeline_layout_key_words += 1 + descriptor_layout_key.size();
-        }
-        pipeline_layout_key.reserve(pipeline_layout_key_words);
-        pipeline_layout_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
-        if (v.use_desc) {
-            for (const auto& descriptor_layout_key : descriptor_layout_keys) {
-                pipeline_layout_key.push_back(descriptor_layout_key.size());
-                pipeline_layout_key.insert(pipeline_layout_key.end(),
-                                           descriptor_layout_key.begin(),
-                                           descriptor_layout_key.end());
+        const bool can_memo_pipeline = share_backend_resources && v.n_sets <= 4;
+        bool pipeline_layout_matched = false;
+        if (can_memo_pipeline && last_pipeline_layout_memo.valid &&
+            last_pipeline_layout_memo.use_desc == v.use_desc &&
+            last_pipeline_layout_memo.n_sets == v.n_sets) {
+            pipeline_layout_matched = true;
+            for (uint32_t s = 0; s < v.n_sets; s++) {
+                if (draw_dsls[s] != last_pipeline_layout_memo.dsls[s]) {
+                    pipeline_layout_matched = false;
+                    break;
+                }
             }
         }
-        ++resource_reuse_stats.pipeline_layout_references;
-        auto pipeline_layout_found = shared_pipeline_layouts.find(pipeline_layout_key);
-        if (pipeline_layout_found != shared_pipeline_layouts.end()) {
-            v.layout = pipeline_layout_found->second.handle;
+        if (pipeline_layout_matched) {
+            v.layout = last_pipeline_layout_memo.layout;
+            ++resource_reuse_stats.pipeline_layout_references;
         } else {
-            SharedPipelineLayout shared_layout;
-            const bool can_persist_pipeline_layout = pipeline_layout_cache_enabled &&
-                pipeline_layout_cache_limit;
-            auto persistent_layout = can_persist_pipeline_layout
-                ? persistent_pipeline_layouts.find(pipeline_layout_key)
-                : persistent_pipeline_layouts.end();
-            if (persistent_layout != persistent_pipeline_layouts.end()) {
-                persistent_layout->second.last_use = pipeline_layout_generation;
-                shared_layout.handle = persistent_layout->second.handle;
-                shared_layout.persistent = true;
-                ++resource_reuse_stats.persistent_pipeline_layout_hits;
-            } else {
-                VkPipelineLayoutCreateInfo layout_info{
-                    VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-                if (v.use_desc) {
-                    layout_info.setLayoutCount = v.n_sets;
-                    layout_info.pSetLayouts = dsls.data();
+            draw_pipeline_layout_key.clear();
+            size_t pipeline_layout_key_words = 1;
+            if (v.use_desc) {
+                for (uint32_t s = 0; s < v.n_sets; s++) {
+                    if (draw_layout_key_ptrs[s])
+                        pipeline_layout_key_words += 1 + draw_layout_key_ptrs[s]->size();
                 }
-                vkCreatePipelineLayout(dev, &layout_info, nullptr, &shared_layout.handle);
-                if (can_persist_pipeline_layout) {
-                    ++resource_reuse_stats.persistent_pipeline_layout_misses;
-                    while (!avoid_cache_eviction &&
-                           persistent_pipeline_layouts.size() >= pipeline_layout_cache_limit &&
-                           evict_persistent_pipeline_layout()) {}
-                    if (shared_layout.handle &&
-                        persistent_pipeline_layouts.size() < pipeline_layout_cache_limit) {
-                        persistent_pipeline_layouts.emplace(
-                            pipeline_layout_key,
-                            PersistentBackendPipelineLayout{
-                                shared_layout.handle, pipeline_layout_generation});
-                        shared_layout.persistent = true;
+            }
+            draw_pipeline_layout_key.reserve(pipeline_layout_key_words);
+            draw_pipeline_layout_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
+            if (v.use_desc) {
+                for (uint32_t s = 0; s < v.n_sets; s++) {
+                    if (draw_layout_key_ptrs[s]) {
+                        const auto& key = *draw_layout_key_ptrs[s];
+                        draw_pipeline_layout_key.push_back(key.size());
+                        draw_pipeline_layout_key.insert(draw_pipeline_layout_key.end(),
+                                                        key.begin(), key.end());
                     }
                 }
             }
-            v.layout = shared_layout.handle;
-            shared_pipeline_layouts.emplace(std::move(pipeline_layout_key), shared_layout);
-            ++resource_reuse_stats.unique_pipeline_layouts;
+            ++resource_reuse_stats.pipeline_layout_references;
+            auto pipeline_layout_found = shared_pipeline_layouts.find(draw_pipeline_layout_key);
+            if (pipeline_layout_found != shared_pipeline_layouts.end()) {
+                v.layout = pipeline_layout_found->second.handle;
+            } else {
+                SharedPipelineLayout shared_layout;
+                const bool can_persist_pipeline_layout = pipeline_layout_cache_enabled &&
+                    pipeline_layout_cache_limit;
+                auto persistent_layout = can_persist_pipeline_layout
+                    ? persistent_pipeline_layouts.find(draw_pipeline_layout_key)
+                    : persistent_pipeline_layouts.end();
+                if (persistent_layout != persistent_pipeline_layouts.end()) {
+                    persistent_layout->second.last_use = pipeline_layout_generation;
+                    shared_layout.handle = persistent_layout->second.handle;
+                    shared_layout.persistent = true;
+                    ++resource_reuse_stats.persistent_pipeline_layout_hits;
+                } else {
+                    VkPipelineLayoutCreateInfo layout_info{
+                        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                    if (v.use_desc) {
+                        layout_info.setLayoutCount = v.n_sets;
+                        layout_info.pSetLayouts = draw_dsls.data();
+                    }
+                    vkCreatePipelineLayout(dev, &layout_info, nullptr, &shared_layout.handle);
+                    if (can_persist_pipeline_layout) {
+                        ++resource_reuse_stats.persistent_pipeline_layout_misses;
+                        while (!avoid_cache_eviction &&
+                               persistent_pipeline_layouts.size() >= pipeline_layout_cache_limit &&
+                               evict_persistent_pipeline_layout()) {}
+                        if (shared_layout.handle &&
+                            persistent_pipeline_layouts.size() < pipeline_layout_cache_limit) {
+                            persistent_pipeline_layouts.emplace(
+                                draw_pipeline_layout_key,
+                                PersistentBackendPipelineLayout{
+                                    shared_layout.handle, pipeline_layout_generation});
+                            shared_layout.persistent = true;
+                        }
+                    }
+                }
+                v.layout = shared_layout.handle;
+                shared_pipeline_layouts.emplace(draw_pipeline_layout_key, shared_layout);
+                ++resource_reuse_stats.unique_pipeline_layouts;
+            }
+            if (can_memo_pipeline) {
+                last_pipeline_layout_memo.valid = true;
+                last_pipeline_layout_memo.use_desc = v.use_desc;
+                last_pipeline_layout_memo.n_sets = v.n_sets;
+                for (uint32_t s = 0; s < v.n_sets; s++) {
+                    last_pipeline_layout_memo.dsls[s] = draw_dsls[s];
+                }
+                last_pipeline_layout_memo.layout = v.layout;
+            }
         }
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gp.stageCount = bd_gs.empty() ? 2u : 3u; gp.pStages = st;
@@ -8589,16 +8963,29 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 append(dss.depthBoundsTestEnable);
                 append_float(dss.minDepthBounds); append_float(dss.maxDepthBounds);
             }
-            auto found = pipeline_cache.find(pipeline_key);
-            if (found != pipeline_cache.end()) {
-                found->second.last_use = pipeline_generation;
-                v.pipe = found->second.pipeline;
+            if (last_pipeline_memo.valid && pipeline_key == last_pipeline_memo.key) {
+                last_pipeline_memo.entry->last_use = pipeline_generation;
+                v.pipe = last_pipeline_memo.entry->pipeline;
                 v.pipeline_cached = true;
                 v.ok = true;
                 create_pipeline = false;
                 ++pipeline_stats.hits;
             } else {
-                ++pipeline_stats.misses;
+                auto found = pipeline_cache.find(pipeline_key);
+                if (found != pipeline_cache.end()) {
+                    found->second.last_use = pipeline_generation;
+                    v.pipe = found->second.pipeline;
+                    v.pipeline_cached = true;
+                    v.ok = true;
+                    create_pipeline = false;
+                    ++pipeline_stats.hits;
+                    last_pipeline_memo.valid = true;
+                    last_pipeline_memo.key = pipeline_key;
+                    last_pipeline_memo.entry = &found->second;
+                } else {
+                    last_pipeline_memo.valid = false;
+                    ++pipeline_stats.misses;
+                }
             }
             // PROSPER_PIPEKEY_LOG (#2471): pair the graphics-pipeline cache decision with the
             // pipeline LAYOUT it will run under. The two are keyed independently — `pipeline_key`
@@ -8685,13 +9072,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 v.ok = true;
                 bool retain = pipeline_cache_enabled && pipeline_cache_limit;
                 while (retain && !avoid_cache_eviction &&
-                       pipeline_cache.size() >= pipeline_cache_limit)
+                       pipeline_cache.size() >= pipeline_cache_limit) {
+                    last_pipeline_memo.valid = false;
                     if (!evict_pipeline()) retain = false;
+                }
                 if (retain && pipeline_cache.size() >= pipeline_cache_limit) retain = false;
                 if (retain) {
-                    pipeline_cache.emplace(std::move(pipeline_key),
-                                           PersistentPipeline{v.pipe, pipeline_generation});
+                    auto inserted = pipeline_cache.emplace(
+                        std::move(pipeline_key),
+                        PersistentPipeline{v.pipe, pipeline_generation});
                     v.pipeline_cached = true;
+                    last_pipeline_memo.valid = true;
+                    last_pipeline_memo.key = inserted.first->first;
+                    last_pipeline_memo.entry = &inserted.first->second;
                 }
             }
         }
@@ -10651,6 +11044,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     color_target_stats.cached_entries = persistent_color_target_cache().size();
     resource_reuse_stats.persistent_pipeline_layout_entries =
         persistent_pipeline_layouts.size();
+    resource_reuse_stats.persistent_descriptor_set_layout_entries =
+        persistent_descriptor_set_layouts.size();
     const bool transient_color = cached_color == nullptr;
     const bool transient_color1 = use_color1 && cached_color1 == nullptr;
     // Per-slot twin of the two flags above, so the teardown lambda can tell a retained slot from a
@@ -10700,7 +11095,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (layout.handle && !layout.persistent)
                     vkDestroyPipelineLayout(dev, layout.handle, nullptr);
             for (const auto& [key, layout] : shared_descriptor_set_layouts)
-                if (layout) vkDestroyDescriptorSetLayout(dev, layout, nullptr);
+                if (layout.handle && !layout.persistent) vkDestroyDescriptorSetLayout(dev, layout.handle, nullptr);
             for (const SharedTextureBinding& binding : shared_texture_bindings) {
                 if (!binding.persistent) {
                     if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
@@ -11191,6 +11586,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(persistent_pipeline_layout_hits);
         PROSPER_SUM_RESOURCE_STAT(persistent_pipeline_layout_misses);
         PROSPER_SUM_RESOURCE_STAT(persistent_pipeline_layout_evictions);
+        PROSPER_SUM_RESOURCE_STAT(persistent_descriptor_set_layout_hits);
+        PROSPER_SUM_RESOURCE_STAT(persistent_descriptor_set_layout_misses);
+        PROSPER_SUM_RESOURCE_STAT(persistent_descriptor_set_layout_evictions);
         PROSPER_SUM_RESOURCE_STAT(persistent_texture_binding_hits);
         PROSPER_SUM_RESOURCE_STAT(persistent_texture_binding_misses);
         PROSPER_SUM_RESOURCE_STAT(persistent_texture_binding_evictions);
@@ -11204,6 +11602,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 #undef PROSPER_SUM_RESOURCE_STAT
         aggregate_resources.persistent_pipeline_layout_entries =
             resources.persistent_pipeline_layout_entries;
+        aggregate_resources.persistent_descriptor_set_layout_entries =
+            resources.persistent_descriptor_set_layout_entries;
         aggregate_resources.persistent_texture_binding_entries =
             resources.persistent_texture_binding_entries;
 
