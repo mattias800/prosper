@@ -10,6 +10,26 @@ on:
   pull_request:
 
 jobs:
+  host-sanitizers:
+    name: Host ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ ninja-build
+      - name: Build isolated host checks
+        run: |
+          mkdir -p prosper/build-sanitizers/tmpdir
+          export TMPDIR="$PWD/prosper/build-sanitizers/tmpdir"
+          cmake -S prosper/tools/doctor -B prosper/build-sanitizers -G Ninja \
+            -DPROSPER_SANITIZER=address-undefined
+          cmake --build prosper/build-sanitizers -j2
+      - name: Verify host code and sanitizer positive controls
+        run: ctest --test-dir prosper/build-sanitizers --no-tests=error --output-on-failure
+
   linux:
     name: Linux
     runs-on: ubuntu-latest
