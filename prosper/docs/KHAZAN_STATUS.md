@@ -562,10 +562,16 @@ So the arm to run here is **`PROSPER_CB_EFC_NO_COLOR=1`**, not `PROSPER_LEGACY_C
   "tried it, no effect" rather than "the lever was aimed at an empty population". Do not run it for
   completeness; the census above is the answer.
 - `PROSPER_CB_EFC_NO_COLOR=1` targets `MODE=2`, which is **100% of what prosper decodes here**. That
-  lever measured as a null on `PPSA05143` (17.84% against an 18.08% control) — but that title decodes
-  *both* modes, so its EFC arm acted on a small share, and the null does not transfer to a title
-  where EFC is the whole decoded population, for the same reason a `MODE=0` result does not transfer
-  here.
+  lever measured as a null on `PPSA05143` (17.84% against an 18.08% control), and that null **does
+  not transfer** to a title where EFC is the whole decoded population — but be careful about *why*.
+  `PPSA05143` decodes **both** modes, and **nobody has published its per-mode counts**, so the size
+  of the set its EFC arm acted on is unknown. An earlier version of this line said the arm "acted on
+  a small share"; that was an inference presented as a fact, and it is withdrawn. What licenses the
+  non-transfer is only that the two populations are **different**, which is enough — a null measured
+  on one population says nothing about a lever aimed at another. It would take those counts to say
+  anything stronger, and the same counts would decide whether `PPSA05143`'s
+  one-lever-moves-and-one-does-not asymmetry is evidence about the decode at all (#1706) or merely
+  evidence that one set is bigger.
 
 **If that arm fires, the result belongs on #1706 as well as here.** Three titles now show three
 different distributions through one unverified bitfield — this one all `MODE=2`, `PPSA05143` both,
