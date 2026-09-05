@@ -26,7 +26,7 @@ re-derive these without contradictory new evidence.
 | Syberia's ~1.9 fps is #1748-style AGC command-buffer churn | **Falsified.** Over a 45 s headless boot with `PROSPER_DCBFULL=1` the title builds 311,296 command packets and issues **zero** Dcb buffer-full callbacks — it never asks the guest for more command-buffer space at all. The probe prints an `armed` banner and a running `seen=/full=` tally, so this zero is the probe reporting zero rather than a silent log (it was measured once before *without* that banner, and that earlier reading proved nothing). Note the comparison titles are **not** cleared: Bendy runs at 297 callbacks/s, the same order as Asterix *after* #1748 (368/s), so a high rate is not itself the defect — what mattered on Asterix was that the chunks never came back. | #1756, `docs/AGC_PACKET_SIZES.md` |
 | The dominant save-warning compute program spends its flat ~10.5 ms in repeated pipeline compilation or shader arithmetic | **Falsified.** An exact-revision, stable-hash-selected phase capture on `817385ef` recorded 1,760 successful executions as 160 complete 11-dispatch atlas chains. Pipeline work averaged 0.010 ms (0.1%). The launch shrank from 8,160 workgroups to one while dispatch stayed flat at 1.607–1.671 ms and total stayed 10.394–10.629 ms. Fixed whole-atlas image setup averaged 5.109 ms (48.4%); writeback averaged 3.798 ms (36.0%), including 1.845 ms pack and 1.672 ms retile. Both offline phase checks passed with no dropped records or model warnings. | #1737 |
 | Either native-2D transfer candidate exercised Syberia's save-warning atlas | **Falsified; both live measurements were self-invalidating.** On exact candidate `85d26879`, 45 s arms differing only by `PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER` both rendered 3.79 fps and both left the monotonic transfer counter at zero. Retained live evidence identifies the hot allocation as `img_dim=5`, depth 1, while that candidate and its fixture required `img_dim==1`. Candidate `7454407d` shared the established one-layer/non-arrayed-2D predicate between recompilation and transfer and passed its decisive fixture, but its first clean live ON arm again left the counter at zero; the run stopped before a control as required. Resource `dim=5` does **not** prove the producer or consumer's reflected SPIR-V view is non-arrayed, nor that a retained cache entry reached the borrow gate. No timing from either attempt is performance evidence. | #1737 |
-| The corrected native-2D candidate reaches Syberia's consumer and fails on format, authority, or cache invalidation | **Falsified by an exact-hash gate census on `c5bf9152`.** The clean 140-frame run matched the producer 140 times and the consumer 1,540 times. Every evaluated consumer gate passed 1,540/1,540, but every borrow returned `no-cache`. The first failing gate is upstream: the producer storage binding reflects `Dim2D arrayed=1` over a depth-one `img_dim=5` resource, so the ordinary-2D predicate is false, typed native storage is not emitted (`storage-float=0/140`), and storage cache admission is zero. The consumer independently reflects ordinary non-arrayed 2D and passes candidate, format, extent/dimension, hostless, validation, and native-format gates. The arm exited normally at 3.9–4.0 fps with exact process census 0/1/0 and no device/display error. Evidence: `<ARTIFACT_ROOT>/syberia-1737-transfer-gates-c5bf-NERpg9`. | #1737 |
+| The corrected native-2D candidate reaches Syberia's consumer and fails on format, authority, or cache invalidation | **Falsified by an exact-hash gate census on `c5bf9152`.** The clean 140-frame run matched the producer 140 times and the consumer 1,540 times. Every evaluated consumer gate passed 1,540/1,540, but every borrow returned `no-cache`. The first failing gate is upstream: the producer storage binding reflects `Dim2D arrayed=1` over a depth-one `img_dim=5` resource, so the ordinary-2D predicate is false, typed native storage is not emitted (`storage-float=0/140`), and storage cache admission is zero. The consumer independently reflects ordinary non-arrayed 2D and passes candidate, format, extent/dimension, hostless, validation, and native-format gates. The arm exited normally at 3.9–4.0 fps with exact process census 0/1/0 and no device/display error. Evidence: `<ARTIFACT_ROOT>/syberia-1737-transfer-gates-c5bf-NERpg9`. **STALE AS A DESCRIPTION OF CURRENT MASTER — corrected 2026-09-05, and the correction matters more than the row.** The verdict above still stands *for candidate `c5bf9152`*, but its mechanism does not describe `bdc492857`: a `PROSPER_COMPUTE_STORAGE_GATE_CENSUS=1` run groups the gate decision by geometry and reports the atlas as **`1920x1620 bpe=4 evaluated=17170 renderer_owned=0 dcc_safe=17170 poison_verify=12 exact=17170 seed_skip=0 persistent=17170 CANDIDATE=17158`** — i.e. **99.93% admitted, not zero**. The seed itself is alive too: `gpu_transfer_seeds` reached **4,286** in that windowed run, against the `0` an `SDL_VIDEODRIVER=offscreen` arm reported the same night (that discrepancy is its own hypothesis, #3360). So **the producer side is no longer the blocker and "nothing inserts" is false**; what remains measured is the compute->graphics borrow at `no_cache_entry` **2,902/2,902 (100%)**, and whether the atlas's own sampled binding is among the seeded is **unattributed** — that needs per-binding records this run did not carry. Do not start from the arrayed-producer mechanism; re-derive against the gate census. | #1737, #1811 |
 | The authority census's binding-5 `GuestImage` boundary proves that the save-warning consumer needs the architectural guest mirror | **Falsified as an instrument result.** Retained transfer-gate evidence shows binding 4 takes the one device-local transfer borrow while sampled bindings 5–7 emit reflection records but no independent gate evaluation: they return through exact descriptor-alias folding. That path binds the owner's concrete Vulkan image, view and sampler, but deliberately leaves each alias shell's cache/borrow flags empty. The first live authority census classified binding 4 from its true owner flags and binding 5 from the alias shell's false defaults, manufacturing `GuestImage` for two bindings of the same concrete source. The result cannot establish guest demand; an owner-resolved, behavior-neutral census must expose the next real boundary before any deferral proposal. | #1854 |
 | After owner-resolved alias accounting, the 11-step save-warning atlas reaches a guest-image, raw-buffer, DMA, ordered-memory, capture, or submit-end observer before graphics | **Falsified by the post-#1899 exact consumer census on `b0984a73`.** Across 140 frames, all 1,540 selected outputs were retained: 140 were admitted and 1,400 same-range results replaced them. All 5,600 selected image-source observations were GPU-backed (`guest=0`), including 4,200 aliases. Exactly 140 materializations remained, all at the first draw's deliberately unknown range; guest-image, raw-buffer, DMA, memory-effect, capture, unknown-consumer, and submit-end attribution were each zero. The result proves eleven outputs coalesce to one pending result per frame, but does **not** authorize removing that final writeback: the draw seam still lacks exact pre-realization coverage. | #1737 |
 | The first unknown-range draw after each save-warning atlas chain actually names that atlas as a graphics resource | **Falsified by the post-realization audit on `ff040714`.** The existing pre-draw boundary remained fail-closed, then the realized draw reported exact live VRT/PRT guest ranges using the capture planner's conservative footprints. All 140 probes completed on realized draws: 700 valid ranges were unrelated, zero overlapped the 12.8 MiB atlas, and there were zero invalid, unrealized, superseded, or unfinished probes. Erasing the emitted byte span made exactly the named synthetic atlas canary fail. This proves the current first-draw materialization is collateral to the blanket boundary; it does not yet prove whether a **later** draw in the submit consumes the atlas. | #1737 |
@@ -580,6 +580,65 @@ the region's end.
 **PS5 speed for this title could not be established.** `sceVideoOutSetFlipRate` is not called once in
 382 s of boot, so the guest states no cadence target and none is assumed here. The handler now logs
 every change under `PROSPER_EVLOG`. Note it would report the requested **cap**, not what a PS5 achieves.
+
+### One round trip, billed twice — the compute and graphics costs are the same surface
+
+Measured 2026-09-05 on a quiet-box windowed run (`bdc492857`, real Wayland window, `gpu-present`
+adopted). The two costs this document reports separately are **one defect**.
+
+The dominant compute program's sampled binding and the renderer's `persist_invalid` texture are the
+**same 12,779,520-byte, 1920x1620 allocation** — the save-warning atlas. Addresses differ between runs
+(`0x210c050000` compute-side, `0x2107e50000` graphics-side, same run); the byte count and geometry are
+the identity.
+
+The cycle, per dispatch:
+
+1. the compute program's **sampled** binding re-uploads 12.4 MiB from guest memory;
+2. the dispatch writes its **storage** binding — the same address;
+3. the writeback retiles and republishes 12.4 MiB back to guest memory;
+4. that guest write **invalidates the renderer's persistent texture cache** for the same surface, so
+   the graphics side re-materialises it too;
+5. the next dispatch re-uploads the bytes prosper itself just wrote.
+
+Same address, same dispatch, opposite outcomes on the two bindings:
+
+| binding | class | upload skipped |
+|---|---|---:|
+| storage (the write) | storage | **17,971 / 17,985 (99.9%)** |
+| sampled (the read) | sampled | **11 / 17,985 (0.06%)** |
+
+Over one 303 s run: **428.11 GiB bound, 416.79 GiB staged**, and the program is **66.5% of all compute
+cost** (85,307 of 128,293 ms) at 91% CPU-side (setup 54.6%, writeback 36.4%, **GPU dispatch 8.7%**).
+
+The renderer's side of the same surface, from one detail line:
+
+```
+[render-timing] texture addr=0x2107e50000 1920x1620x1 dim=5 fmt=1 comps=1 tile=27 class=2
+  candidate=1 source=12779520 compute-candidate=0 cache=persistent-invalid id=54
+  validate=exact 0.00ms/0B/12779520B submit=unknown watch=unknown active=0 stable=0 total=16.68 ms
+```
+
+Four fields make this a design finding rather than a tuning one:
+
+- **`validate=exact 0.00ms/0B/12779520B`** — the exact comparison compared **zero of 12,779,520
+  bytes**. The entry was declared changed **without any comparison happening**, because no snapshot was
+  retained to compare against. Read `validate=exact` carefully: it names the *route*, not evidence that
+  bytes were examined.
+- **`submit=unknown` / `watch=unknown` / `active=0` / `stable=0`** — neither cheap proof was available,
+  no write watch is armed, and the promotion ladder is at zero.
+- **`compute-candidate=0`** — this texture cannot borrow the compute result **even in principle**, so
+  making the compute side cheaper does not help the graphics side.
+- **`dim=5`** — the same `img_dim=5` shape recorded in `## Ruled out` as what disqualified an earlier
+  storage→sampled transfer candidate.
+
+The on-GPU path that removes the round trip exists (`g_compute_storage_transfer_seeds`,
+`PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER`) and this document already records it measuring **7.2 vs
+5.8 fps** when it fired. It currently reports **`gpu_transfer_seeds=0`** — it never fires at all. Which
+of the six inputs to `compute_storage_cache_gate_candidate` declines is answerable in one run with
+`PROSPER_COMPUTE_STORAGE_GATE_CENSUS=1`, which groups by geometry.
+
+**Do not read the percentages above as shares of frame wall** — they are shares of summed dispatch
+cost, and this title's dispatch rate varies by an order of magnitude between phases.
 
 ## Reproducing the evidence
 
