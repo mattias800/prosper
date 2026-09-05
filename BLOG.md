@@ -21,6 +21,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
+### Nineteen draws go missing on this machine's graphics driver, and it is the driver's doing
+
+Follow-up to the entry below, and this one has no picture — the result is a pair of counts. On the *New
+Joe & Mac* frame we captured, **nineteen of its eighty-six draws paint nothing at all on this machine's
+AMD driver and paint correctly on a software one**, the same nineteen every run. We had left it open
+whether the fault was the driver's or ours, since both run shaders we generate. It is not ours: the same
+driver returns four different pictures from one unchanged four-vertex draw where the software one returns
+the same picture twenty times, and a shader nobody here wrote fails the same way. Whether those missing
+nineteen are the whole of the shear is a separate question, and still open — they are far too few pixels
+to cover the frame.
+
+
 ### Four sheared Unity titles already render correctly — the shear is decided by the graphics driver
 
 *New Joe & Mac*, *Asterix & Obelix: Slap Them All!*, *Rugrats: Adventure in Gameland* and *Summer Sports
@@ -29,8 +41,8 @@ one frame of each and replayed it offline through a different Vulkan implementat
 prosper and no change to the captured frame — and all four come back recognisable — three of them cleanly, and Summer
 Sports with a grey form still sweeping the upper right that we cannot tell apart from its stadium roof —
 so the geometry, the indices and the textures were right all along and something about how the frame is *executed* takes them apart.
-Which side is at fault is not settled yet: both drivers run shaders we generate, so it may still be ours.
-Filed on #3374; the reproduction is deterministic and takes three seconds.
+Which side is at fault is not settled in this entry; the one above it settles it. Filed on #3374; the
+reproduction takes three seconds.
 
 These pictures are **offline replays of a captured frame, not live runs** — the software Vulkan device
 is far too slow to play on, so this is diagnosis rather than a rung change.
