@@ -26,8 +26,9 @@ from the tracker issues, and still gated, because it is a projection of state ra
 *New Joe & Mac*, *Asterix & Obelix: Slap Them All!*, *Rugrats: Adventure in Gameland* and *Summer Sports
 Games* all draw their scene art through huge sheared triangles on this machine's AMD driver. We captured
 one frame of each and replayed it offline through a different Vulkan implementation, with no change to
-prosper and no change to the captured frame — and all four come out correct, so the geometry, the indices
-and the textures were right all along and something about how the frame is *executed* takes them apart.
+prosper and no change to the captured frame — and all four come back recognisable — three of them cleanly, and Summer
+Sports with a grey form still sweeping the upper right that we cannot tell apart from its stadium roof —
+so the geometry, the indices and the textures were right all along and something about how the frame is *executed* takes them apart.
 Which side is at fault is not settled yet: both drivers run shaders we generate, so it may still be ours.
 Filed on #3374; the reproduction is deterministic and takes three seconds.
 
@@ -48,7 +49,7 @@ is far too slow to play on, so this is diagnosis rather than a rung change.
 
 ![Summer Sports Games' javelin event on the AMD driver: the stands sheared into grey slabs, the hoarding and the takeoff zone gone](assets/screenshots/summer-sports-shear-radv.webp)
 
-![The same frame on the software device: the Summer Sports Games hoarding, the yellow and purple takeoff zone, the throw reticle and the packed stands (downscaled from the native 3840x2160 capture)](assets/screenshots/summer-sports-correct-lavapipe.webp)
+![The same frame on the software device: the Summer Sports Games hoarding, the yellow and purple takeoff zone, the throw reticle and the packed stands. The grey form across the upper right is still there and is probably the stadium roof, but we have not confirmed that. Downscaled from the native 3840x2160 capture](assets/screenshots/summer-sports-correct-lavapipe.webp)
 
 Evergate is the exception, and worth showing for that: its blown-out white frame comes back blown out on
 the software device too, so that half is ours whatever happens to the streaks over it.

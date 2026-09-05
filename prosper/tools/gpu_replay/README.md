@@ -176,8 +176,8 @@ placed the wrong indices"* and says nothing about what the GPU read back. `misma
 against the same vector the `memcpy` sourced from, so it cannot express a wrong **decode** either — only
 a clobber between the copy and recording. The device-side question is `PROSPER_BUFFER_ECHO`'s, which
 copies index slices back through the GPU — but its `echo_count` begins at `min(16, shared_buffers.size())`
-and its index loop runs only while that is under 16, so on any real frame it echoes **zero** index slices
-(#3376). That gap is why this host-side reading was needed.
+and its index loop runs only while that is under 16, so at 16 or more storage uploads — every real frame —
+it echoes **zero** index slices (#3376). That gap is why this host-side reading was needed.
 
 `want_max` is the largest index prosper decoded and `got_max` the largest at the bound offset. The in-range
 condition is `got_max + voff < vcount`, so read `voff` beside them — the printed comparison is the whole

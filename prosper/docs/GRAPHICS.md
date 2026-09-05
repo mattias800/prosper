@@ -1485,19 +1485,26 @@ is no NGG to disable and this Mesa (26.1.4 / 26.2.1) does not select an LLVM bac
 inference holds, because neither lever moves. Pair any RADV compile lever with `shaderstats,nocache` and
 show the stats differ before quoting a null from it. Its character matches
 #2937 — deterministic — rather than #2945's stochastic dropout. (#3371's own tests measured **stochastic**
-here, 3-8 failures of 24 runs, which is the opposite of what that issue's title says and of what the #2937
-row above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
+here, 3-8 failures of 24 runs, which matches #3371's own title and is the opposite of what the #2937 row
+above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
 a cause is open.
 
-**`PROSPER_INDEX_ECHO=1`** (new, `tests/fixtures/render_runner.h`) is what retired the index family at
-title scale. It reads the index bytes back from the host-visible memory at exactly the `(buffer, offset)`
-pair about to be bound and compares them against the indices prosper decoded, printing `icount`,
-`vcount`, `vertexOffset`, `instanceCount`, arena/dedicated, `want_max` and `got_max`. On the Joe & Mac
-frame: 85 indexed draws, `mismatched=0` on every one, `got_max < vcount` on every one, `voff=0`, `inst=1`
-— and the last two matter, because the in-range verdict is `got_max + vertexOffset < vcount` and only
-`voff=0` makes the printed comparison the whole of it. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` look at STORAGE buffers and cannot see this, and an
-out-of-range storage read is `robustBufferAccess` rather than a validation error, so without it
-"prosper bound the wrong indices" and "the driver fetched the wrong indices" produce identical evidence.
+**`PROSPER_INDEX_ECHO=1`** (new, `tests/fixtures/render_runner.h`) is what retired **prosper's half** of
+the index family at title scale. It reads the index bytes back from the host-visible memory at exactly the
+`(buffer, offset)` pair about to be bound and compares them against the indices prosper decoded, printing
+`icount`, `vcount`, `vertexOffset`, `instanceCount`, arena/dedicated, `want_max` and `got_max`. On the
+Joe & Mac frame: 85 indexed draws, `mismatched=0` on every one, `got_max < vcount` on every one, `voff=0`,
+`inst=1` — and the last two matter, because the in-range verdict is `got_max + vertexOffset < vcount` and
+only `voff=0` makes the printed comparison the whole of it. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` look
+at STORAGE buffers and cannot see any of it, and an out-of-range storage read is `robustBufferAccess`
+rather than a validation error.
+**Scope, because the obvious reading is stronger than the instrument.** It reads the **host** mapping, not
+device memory, so a clean result retires *"prosper computed or placed the wrong indices"* and says
+**nothing about what the GPU read back**; `mismatched` compares the arena against the same vector the
+memcpy sourced from, so it cannot express a wrong decode either. The device-side question is
+`PROSPER_BUFFER_ECHO`'s — which copies index slices back through the GPU and never fires, because its
+16-slice budget is spent on storage buffers first (#3376). That gap is why the host-side reading was
+needed.
 
 **Do not use `PROSPER_GEOM_PROBE` on these capsules.** Its per-draw verdicts contradict the pixels —
 see instrument trap 266. The `--draw-steps` per-operation contribution is the instrument that held.

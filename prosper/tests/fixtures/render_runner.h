@@ -9350,8 +9350,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // sourced from, so it cannot express a wrong DECODE either -- only a clobber between the copy
         // and recording. The device-side question belongs to PROSPER_BUFFER_ECHO, which copies index
         // slices back through the GPU; note that its `echo_count` starts at min(16, shared_buffers)
-        // and its index loop runs only while that is below 16, so on any real frame (346 buffers here)
-        // it echoes zero index slices -- which is why this host-side reading was needed at all.
+        // and its index loop runs only while that is below 16, so at >=16 storage uploads -- which is
+        // every real frame; 346 of them here -- it echoes zero index slices (#3376). That gap is why
+        // this host-side reading was needed at all.
         static const bool index_echo = getenv("PROSPER_INDEX_ECHO") != nullptr;
         if (index_echo && v.icount) {
             const std::vector<uint32_t>& want = draws[di].indices;
