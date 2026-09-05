@@ -19,6 +19,26 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-05
+
+### Space Adventure Cobra reaches its menu and its desert level again
+
+We now reach Cobra's main menu and its opening desert level, from a route that until tonight produced
+a single black frame for its whole run.
+
+![Space Adventure Cobra's main menu at 1920x1080: a red planet against a starfield, Cobra standing at the right in his blue suit and teal cape, and the menu list part-way through its animate-in, showing NEW GAME and the beginning of MULTIPLAYER](assets/screenshots/cobra-main-menu.webp)
+
+![The opening desert level: the lit glass walkway across the bottom of the frame, golden dunes and dark rock outcrops behind it, and a character silhouette on the sand. Large translucent blue polygons are smeared across the middle of the frame and there is a dark band along the horizon -- both are real defects, not compression](assets/screenshots/cobra-desert-level.webp)
+
+`sceAvPlayerJumpToTime` — the call a game makes to move a video to another point — was repositioning
+the movie correctly and never telling the game the seek had landed. Cobra waits fifteen seconds for
+that message, gives up, and never asks for another video frame, so its opening movies never played
+and nothing after them was reached. Most of the games here that seek a video wait for the same
+message.
+
+The second picture is the honest one: the level draws, and it draws wrong. Its automatic guard is
+still red. ([#2899](https://github.com/mattias800/prosper/issues/2899))
+
 ## 2026-09-04
 
 ### Stray's world is not going missing on the way to the screen — it arrives, and rounds to black
