@@ -21,6 +21,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
+### Khazan stops dying eight seconds in, and starts drawing the wrong thing instead
+
+The First Berserker: Khazan aborted at 8.6 seconds of every boot with "PS5 Out of Memory". It was not
+short of memory: two functions in a library we do not implement were left unregistered, so prosper
+answered them with *success* and never filled in the answer they asked for — and the game read
+whatever happened to be on its stack as a count, multiplied it by sixteen, and asked its allocator
+for 244 terabytes. Telling it "not implemented" instead keeps the guest alive for the full two
+minutes we gave it. What it draws is not the game yet: a yellow quadrant, then this gradient, which
+it holds.
+
+![Khazan composites a brown gradient where the picture should be](assets/screenshots/khazan-composite-gradient.webp)
+
+![An earlier frame: red and green pinned to maximum over the top-left quarter](assets/screenshots/khazan-composite-yellow-quadrant.webp)
+
 ### Space Adventure Cobra reaches its menu and its desert level again
 
 We now reach Cobra's main menu and its opening desert level, from a route that until tonight produced

@@ -1225,6 +1225,45 @@ HLE(s_sysservice_receiveevent) {
     return 0x80A10004ull;
 }
 HLE(s_ok)             { return 0; }
+
+// libScePsml: NOT IMPLEMENTED, and it must SAY so rather than answering SCE_OK.
+//
+// The dispatcher's default for an unregistered NID is `return 0`, which the guest reads as SCE_OK.
+// For a query with OUT-PARAMETERS that is not a benign no-op, it is a success claim about data
+// prosper never wrote -- so the guest goes on to read whatever the out-parameter's stack slot
+// happened to hold. `CLAUDE.md` records the same shape on Metaphor: ReFantazio, where an
+// unregistered `sceFontRenderCharGlyphImage` answered SCE_OK, wrote neither out-parameter, and the
+// title divided by the resulting zero (#2951).
+//
+// The First Berserker: Khazan (PPSA20447) is the second title to pay for it, and it multiplies
+// instead of dividing. Its `eboot+0xe74b20` does:
+//
+//     e74b51  mov $0x137,%edi ; call <sceSysmoduleLoadModule>
+//     e74b74  call <libScePsml::3WVD91e12ZQ>          ; -> r15d
+//     e74b8e  lea -0x48(%rbp),%rdi                    ; an OUT struct, NOT initialised
+//     e74b9e  call <libScePsml::+2KpvixvL6E>          ; (&out, buf) -> eax
+//     e74ba3  or %r15d,%eax ; jne 0xe74dc2            ; either non-zero -> clean early return
+//     e74bac  mov -0x38(%rbp),%rdi                    ; N := out[+0x10]  (uninitialised stack)
+//     e74bb5  shl $0x4,%rdi                           ; size = N * 16
+//     e74bb9  call <FMemory::Malloc>                  ; ~244 TiB, and the title asserts
+//
+// Two things make returning an error the right answer here rather than a guess, and both were
+// checked rather than assumed -- this project has a recorded trap in the OPPOSITE direction, where
+// an error sentinel returned from a VALUE-returning contract was read as data and produced a 2 GiB
+// allocation:
+//   * The return value is a STATUS, not data: the guest ORs the two results and branches on
+//     non-zero. `CONFIDENCE: HIGH` -- disassembled.
+//   * The non-zero branch at `eboot+0xe74dc2` is a stack-check plus epilogue plus `ret`. The guest's
+//     own code treats this as "the feature is unavailable" and skips it. Nothing is faked and no
+//     output is manufactured; prosper is answering truthfully that it does not implement this
+//     library, through the only channel the guest reads.
+//
+// `CONFIDENCE: LOW` on the specific value. libScePsml is absent from the PS5 3.20 reference set
+// (this dump requires system software 12.70), so its own error space is not derivable and neither
+// are these NIDs' names or signatures. The guest tests only zero versus non-zero, so ENOSYS is a
+// truthful placeholder for "not implemented" and not a claim about Sony's encoding. If the real
+// error space is ever recovered, replace the value -- not the policy.
+HLE(s_psml_unimplemented) { return prosper::hle::kSceKernelErrorENOSYS; }
 // ===== libSceAvPlayer (#324/#705): real playback lifecycle over a host video-decode backend =====
 // The core owns the guest sceAvPlayer contract + per-player state + the guest event callback and
 // pulls decoded frames from a registered VideoBackend (app-side hardware decode). With NO backend
@@ -5724,6 +5763,11 @@ void register_service_hle() {
                      "sceNpGameIntentGetPropertyValueString");
     Hle::register_fn("xddD23+8TfQ", (HleFn)s_npent_addcont_info,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfo");
+    // libScePsml (PPSA20447): unregistered, these answered SCE_OK and left the caller's out-struct
+    // untouched -- see s_psml_unimplemented. Names unknown: libScePsml is not in the 3.20 reference
+    // set, so the raw NIDs are the only identity available and the label says exactly that.
+    Hle::register_fn("3WVD91e12ZQ", (HleFn)s_psml_unimplemented, "libScePsml::3WVD91e12ZQ");
+    Hle::register_fn("+2KpvixvL6E", (HleFn)s_psml_unimplemented, "libScePsml::+2KpvixvL6E");
     #undef R
 }
 

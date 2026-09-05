@@ -231,7 +231,7 @@ The standing warnings that are **not** title-specific:
 
 `docs/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
 `docs/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
-both shader stages recompile and dynamic V#/T#/S# resources resolve on current master, and the
+both shader stages recompile and dynamic V#/T#/S# resources resolve on current `main`, and the
 render-loop frontier is complete. Each carries its own superseded banner — do not start work from
 either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
 
@@ -293,6 +293,27 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   *"Within reason"* is part of the rule: a folder holding a single file, or a leaf whose name already
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
+
+- **The branch is `main`. There is no `master`, and older text that names one is historical.**
+  The repository's history was rewritten around 2026-07-04; `main` carries the rewritten line and is
+  the default branch. The pre-rewrite `master` was left behind, went stale on 2026-09-02, and was
+  **deleted on 2026-09-04** — its tip is preserved as the tag `archive/pre-rewrite-master-2026-09-02`
+  if anyone ever needs it, and nothing unique lives there (same content as `main`, different SHAs).
+  This is worth a line because the failure mode was expensive rather than obvious: a correct branch
+  diffed against the stale `master` reported **3,296 commits of divergence**, and the session-trailer
+  gate below read **582** instead of 0 — so a *clean* branch looked contaminated, and the natural
+  repair (rebuild it onto `master`) moved good work onto the dead line.
+
+  **Which mentions of `master` were repointed and which were left, as a TEST rather than a list** —
+  a list is what let two live references through the first sweep, both of them in categories the list
+  did not name: **a record of what was true keeps `master`; anything a reader would run or follow gets
+  repointed.** So instrument-trap rows, dated A/B arms and past-tense CI commentary keep the old name,
+  while recipes, `git` commands, workflow triggers and present-tense descriptions of how the project
+  works today do not. Do not "correct" a record, and do not run a record's commands verbatim.
+
+  **When sweeping, match the bare word too.** The first pass here searched `origin/master` and missed
+  every reference spelled just `master` — including `git fetch origin master` at the head of the
+  recipe every subagent is told to start from. #3333.
 
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:
@@ -487,6 +508,31 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   Every new or materially changed baseline requires `snapshot.py verify`,
   inspection of all retained images from both runs, and a factual `review` note. See
   `tools/snapshot/AGENTS.md`.
+  - **A green CI GPU-execution job cannot clear a failure on this machine's driver, because CI has no
+    GPU.** `.github/workflows/ci.yml` says so in its own comment: the runner uses **Mesa's lavapipe
+    software rasteriser**, whose fragment subgroup is **fixed at 8 lanes**, and the workflow already
+    gates `recompiled_shaders_render` assertions that need an exact **64**-lane subgroup. So for
+    GPU-execution tests "CI green" is a statement about a **smaller domain** than a local run on RADV.
+    This is the positive-control rule two sections above — a control drawn from the same source tests
+    the discriminator, not the domain — applied to an entire CI stack.
+    Measured 2026-09-05 (#3355): five GPU-execution tests — `recompiled_shaders_render`,
+    `multidraw_render`, `indexed_render`, `descriptor_array_render`, `gpu_execute` — fail on RADV from
+    **both** a reused and a fresh build directory on a verified-idle box, set-equal across two lanes'
+    different heads, branches and dumps, while the same five pass in CI. Four of the five are
+    indexed-draw or GREEN-quad assertions: draws that render nothing.
+    **Two agents independently read that CI log as proof their change was not implicated, and both had
+    to withdraw it** — CI reads as neutral infrastructure, which is exactly why nobody asks whether it
+    can run the case. The workflow's own instruction is the right one: *"If a GPU test fails here,
+    diagnose it."* The gap is not GPU-only: a change dispatched on a host CPU feature (F16C, for
+    instance) may take a different path on the runner, so a green suite is not evidence the vectorised
+    path ran.
+    **The prior runs the other way, though, and it is in the same comment block:** four tests were
+    once excluded here as "driver-divergent" (#1681) and **none of them were** — every divergence was
+    measured and each time it was prosper's own assertion or fixture that overreached, which is why
+    they are gated rather than excluded today. So a local-only GPU failure is a reason to *diagnose*,
+    not to assume the driver is at fault; the honest open question is whether the assertion or the
+    backend is wrong. Note that history was measured entirely in the lavapipe direction, so it does
+    not transfer unexamined to a failure only 64-lane hardware can reach.
 - **Per-title bring-up ladder — gameplay is always the target.** Every game climbs the same ladder,
   and progress claims name the rung reached:
   1. **Any graphics at all** — real frames from the live renderer (a splash/logo counts; black or
@@ -750,30 +796,30 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     ```bash
     F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
     B=$(mktemp)                    # mktemp, not a fixed name: several agents run this concurrently
-    git fetch origin -q && git show "origin/master:$F" > "$B"
+    git fetch origin -q && git show "origin/main:$F" > "$B"
     python3 prosper/tools/docs/check_numbered_table.py --ordered \
         --table-header Instrument --baseline "$B" "$F"
     git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py
     ```
     This matters most for `GAME_COMPAT_ORCHESTRATION.md`'s numbered tables. The gate requires rows to be
     unique and ascending, and requires that **no row present in the base is missing** (`--baseline`).
-    Note the local baseline is `origin/master`, while **CI passes `HEAD^1`** — the base *as of when the
-    event fired*. `origin/master` is the fresher and therefore stricter of the two, which is why it is
+    Note the local baseline is `origin/main`, while **CI passes `HEAD^1`** — the base *as of when the
+    event fired*. `origin/main` is the fresher and therefore stricter of the two, which is why it is
     the right one to check by hand; the gap between them is the subject of instrument trap 189.
     **Gaps are legal** — `--sequential` and its gapless rule were removed on 2026-08-17 (#2089) because a
     gap is usually another lane's unmerged number, which no edit of *your* branch can supply, so the check
     served only to serialize independent lanes; the flag now errors and names its replacement. So if you
     lose a collision, renumber to any number above the current highest and merge — you no longer have to
     wait for the number below yours. Before writing a row, allocate with
-    `python3 prosper/tools/docs/trap_number.py`, which scans master **and every open PR** (#1729);
-    reading master alone is what produced the #2574/#2581 collision.
+    `python3 prosper/tools/docs/trap_number.py`, which scans `main` **and every open PR** (#1729);
+    reading the base branch alone is what produced the #2574/#2581 collision.
     **On a PR that touches a numbered table, run the gate against the MERGE RESULT immediately before
     merging** — `python3 prosper/tools/docs/check_merge_result.py` fetches, merges into
-    `origin/master` in the object database (no checkout, no index), and runs the gate on the result.
+    `origin/main` in the object database (no checkout, no index), and runs the gate on the result.
     A green `Docs` job is a statement about a merge that may no longer exist, and unlike a red one
     nobody re-derives it (#2211, instrument trap 189); this is the only check that sees a concurrent
     append, and it is stale the moment another lane lands, so run it last and merge promptly.
-    Confirm the diff really is `.md`-only — `git diff --name-only origin/master...HEAD | grep -v '\.md$'`
+    Confirm the diff really is `.md`-only — `git diff --name-only origin/main...HEAD | grep -v '\.md$'`
     should be empty. The exception is about the *diff*, not the intent; one stray file makes it an
     ordinary PR again.
     **This waives the CI wait only.** It does not waive independent review where review is warranted — a
@@ -939,10 +985,10 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     ```bash
     # Gate before pushing — answers "any?", expect 0. `grep -c` exits 1 on zero matches, so never
     # put it in an `&&` chain.
-    git log origin/master..HEAD --format=%B | grep -c '^Claude-Session:'
+    git log origin/main..HEAD --format=%B | grep -c '^Claude-Session:'
 
     # How many COMMITS carry one — a different question, and the one to quote as a statistic.
-    git log origin/master -100 --format=%H | while read h; do
+    git log origin/main -100 --format=%H | while read h; do
         git log -1 --format=%B "$h" | grep -q '^Claude-Session:' && echo "$h"; done | wc -l
     ```
     **The two commands disagree, systematically and always in the same direction.** Over the same
@@ -966,8 +1012,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   move — `git checkout <old-branch> -- <file>` — reverts that file to its old state wherever ANOTHER
   lane has since edited it, with no conflict, no failing check, and a diff that reads as your own edit.
   It cost #1701 ten lines of documentation this way, caught only because `--stat` showed deletions in a
-  file believed touched once. Re-apply your own hunks onto master's version instead; when you do take a
-  file whole, **diff it against `master` and read the `-` lines**. The `Docs` CI gate does not cover
+  file believed touched once. Re-apply your own hunks onto `main`'s version instead; when you do take a
+  file whole, **diff it against `origin/main` and read the `-` lines**. The `Docs` CI gate does not cover
   this: it validates table structure and numbering, never prose. See instrument-trap 41.
 - **A pipeline's exit status is its LAST stage's.** `cmd | tail`, `cmd | head` and `cmd | grep` all
   discard `cmd`'s failure, so `build && test | tail -3 && commit` commits through a red test. Capture
@@ -997,7 +1043,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     doc, or your head is a bug that gets rediscovered the hard way.
   - **Before starting non-trivial work, check the tracker** (`gh issue list --label bug-hunt`,
     or by area) — the fix may already be specified, or an issue may conflict with what you're
-    about to change. Before fixing an issue, **re-verify it still exists on current master**
+    about to change. Before fixing an issue, **re-verify it still exists on current `main`**
     (another PR may have fixed it independently).
   - **One issue → one focused PR** where feasible; reference the issue in the PR body
     (`Fixes #NN`) so the merge closes it. When a fix lands that partially addresses an issue,

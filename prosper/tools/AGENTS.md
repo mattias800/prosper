@@ -255,7 +255,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   On 2026-08-06 that nearly turned "#2121 does not move Sonic Frontiers" into a false negative on a
   title that gates on the exact NID #2121 fixed.
   ```bash
-  python3 tools/revision/check_build_revision.py build-linux          # vs origin/master
+  python3 tools/revision/check_build_revision.py build-linux          # vs origin/main
   python3 tools/revision/check_build_revision.py build-linux --binary build-linux/screenshot
   python3 tools/revision/check_build_revision.py --manifest ~/work/manifest.json
   ```
@@ -527,7 +527,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   cannot be made to fire by another lane's timing. **Gaps are now legal**, so a collision is repaired
   by bumping to any higher number and merging.
   **`--baseline` takes a FILE PATH, not a git ref** — materialise one with
-  `B=$(mktemp); git show "origin/master:<file>" > "$B"` (CI uses `git show HEAD^1:<file>`). Handed a
+  `B=$(mktemp); git show "origin/main:<file>" > "$B"` (CI uses `git show HEAD^1:<file>`). Handed a
   ref it used to fail with a bare `cannot read`, which reads as a problem with the document rather
   than with the invocation; it now names the contract (#2675).
   **Every failure is announced on stdout as well**, because this gate is quoted as a copy-pasteable
@@ -571,7 +571,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   unlike a red one, nobody re-derives it (instrument trap 189). Uses `git merge-tree --write-tree`,
   so it touches neither your working tree nor the index and cannot collide with another agent in the
   same repository. Reports a textual conflict as a conflict rather than as a table defect, and a
-  checker failure as a checker failure. **`--base` defaults to `origin/master`, which is wrong for a
+  checker failure as a checker failure. **`--base` defaults to `origin/main`, which is wrong for a
   stacked PR** — pass the branch it will actually merge into, or the green run describes a merge that
   will never happen.
   **Measured boundary, so its value is not overstated:** for two same-numbered rows inserted at a row
@@ -583,7 +583,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **not** close, and this tool does, is the artifact a *human* produces: resolving that separation-0
   conflict by keeping both rows gives a duplicate on master while **both heads were green**, which is
   how `33, 34, 35, 32` reached master in #1696. `ctest -R doc_merge_result_checker` covers it.
-- **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/master`
+- **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/main`
   **and every open PR** (#1729). Prints each claimant so you can see whether you are in a race, not
   just a bare number. An **advisor, not a gate**: two lanes running it in the same minute both see the
   same free number, so it shrinks the collision window and cannot close it — merge order does that,
