@@ -1278,6 +1278,33 @@ using AvpEventCb = void (PROSPER_SYSV_ABI *)(void*, uint32_t, int32_t, void*);
 using AvpAllocateCb = void* (PROSPER_SYSV_ABI *)(void*, uint32_t, uint32_t);
 using AvpDeallocateCb = void (PROSPER_SYSV_ABI *)(void*, void*);
 enum : uint32_t { AVP_STOP = 0x01, AVP_READY = 0x02, AVP_PLAY = 0x03, AVP_PAUSE = 0x04, AVP_BUFFERING = 0x05 };
+// The WARNING channel of the same callback. Unlike the state events above it carries a payload: the
+// fourth callback argument points at a uint32_t notification code, and a guest that is waiting for a
+// particular one compares against THAT, not against the event id.
+//
+// AVP_WARNING_SEEK_COMPLETE is the code sceAvPlayerJumpToTime must publish once the source has
+// actually been repositioned. #1974 implemented the seek itself and left this half out, so every
+// guest that waits for it burns its own timeout on a seek that already succeeded.
+//
+// EVIDENCE, in the project's own order of preference:
+//   (1) The guest's code. Space Adventure Cobra (PPSA17337) writes 0x806a00a3 into its
+//       wait-slot at eboot+0x15400b8, immediately BEFORE calling sceAvPlayerJumpToTime at
+//       eboot+0x15400c2, and afterwards blocks in its 15,000 ms event wait at eboot+0x153ce5d
+//       (`esi=0x3a98`). Its event callback (eboot+0x153ef30) posts that wait only when the event id
+//       is 0x20 AND the payload word equals the awaited code -- for a warning it compares the
+//       PAYLOAD, having replaced the id with `*(uint32_t*)eventData` at eboot+0x153ef5c. The
+//       matching failure code the same callback special-cases is 0x806a0004.
+//   (2) Directly measured: with nothing published, that wait times out at exactly its 15,000 ms
+//       budget (15,003 ms between the post-seek frame and sceAvPlayerResume, PROSPER_AVPLOG).
+//   (3) Cross-title: of the 42 dumps in the local corpus that import sceAvPlayerJumpToTime
+//       (`XC9wM+xULz8`), 40 contain 0x806a00a3 as an immediate and 33 also contain 0x806a0004 --
+//       against roughly 0.008 expected occurrences per 32 MB eboot by chance. It is an SDK
+//       constant shared across engines, not one title's private token.
+// CONFIDENCE: HIGH on the behaviour (read off the guest and measured in both directions).
+// CONFIDENCE: MED on the name -- Sony's own symbol for 0x806a00a3 is not in any source available
+// here, so the name describes the contract rather than quoting a header.
+enum : uint32_t { AVP_WARNING_ID = 0x20 };
+enum : uint32_t { AVP_WARNING_SEEK_COMPLETE = 0x806a00a3u };
 
 struct AvpMemAllocator {
     void* obj;
@@ -1883,21 +1910,27 @@ void avp_log_file_replacement(const char* entry, const AvpFileReplace& file) {
 }
 
 // Fire the guest event callback. Caller MUST NOT hold g_avp_mx (the callback re-enters AvPlayer HLE).
-void avp_fire(void* obj, AvpEventCb cb, uint32_t ev) {
+// `data` is the callback's fourth argument: null for the state events, and a pointer to the
+// notification code for the warning channel (see AVP_WARNING_ID). The guest dereferences it during
+// the call, so it may live on this frame -- but it must not outlive the call, and nothing here keeps
+// it.
+void avp_fire_data(void* obj, AvpEventCb cb, uint32_t ev, int32_t source_id, const void* data) {
     if (!cb) return;
     if (svclog() || avp_log()) fprintf(stderr, "[avp] -> event 0x%02x\n", ev);
 #if defined(_WIN32)
-    prosper_call_guest_sysv4((uint64_t)(uintptr_t)cb, (uint64_t)(uintptr_t)obj, ev, 0, 0);
+    prosper_call_guest_sysv4((uint64_t)(uintptr_t)cb, (uint64_t)(uintptr_t)obj, ev,
+                             (uint64_t)(uint32_t)source_id, (uint64_t)(uintptr_t)data);
 #elif defined(__linux__)
     {
         AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
-        cb(obj, ev, 0, nullptr);
+        cb(obj, ev, source_id, const_cast<void*>(data));
     }
 #else
-    cb(obj, ev, 0, nullptr);
+    cb(obj, ev, source_id, const_cast<void*>(data));
 #endif
     if (avp_log()) fprintf(stderr, "[avp] <- event 0x%02x\n", ev);
 }
+void avp_fire(void* obj, AvpEventCb cb, uint32_t ev) { avp_fire_data(obj, cb, ev, 0, nullptr); }
 } // namespace
 
 HLE(s_avplayer_init) {   // AvPlayerHandle sceAvPlayerInit(AvPlayerInitData*)
@@ -2401,6 +2434,7 @@ HLE(s_avp_jumptotime) {
     svc_log("sceAvPlayerJumpToTime", a0,a1,a2,a3,a4,a5);
     const uint64_t target_ms = a1;
     const char* reason = nullptr;
+    void* ev_obj = nullptr; AvpEventCb ev_cb = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
@@ -2438,16 +2472,75 @@ HLE(s_avp_jumptotime) {
                 // The source was just repositioned: the media clock measures the remainder from the
                 // new position, starting now.
                 p.video_request_at = std::chrono::steady_clock::now();
+                ev_obj = p.ev_obj; ev_cb = p.ev_cb;
             }
         }
     }
     if (reason) {
+        // A FAILED seek publishes no warning at all, and the reason is NOT that `0x806a0004` would
+        // be a lie -- it is this surface's truthful failure signal, and the guests that listen for
+        // it are entitled to hear it.
+        //
+        // The reason is that prosper's failure set above is WIDER than "the seek was refused". It
+        // includes "the source has no host decoder to reposition" -- the #1105 graceful-skip empty
+        // source and any headless or synthetic session -- which are benign states, not errors the
+        // title should latch. And a listener does latch: PPSA25009's event callback
+        // (eboot+0x13e46a0) dispatches three warning codes at +0x13e4a53, and its `0x806a0004` arm
+        // at +0x13e4a77 stores a pointer into the player object and sets a byte beside it, i.e. a
+        // PERSISTENT error state rather than a transient notice. Publishing that code because
+        // prosper had no decoder would permanently mark a player the title was merely skipping an
+        // unplayable movie on.
+        //
+        // Narrowing the failure set so the genuinely-refused case could announce itself is a real
+        // improvement and is deliberately not attempted here; it needs a title that waits on the
+        // failure arm to verify against. (Analysis from review of #3348.)
+        //
         // Loud by design (not gated on PROSPER_AVPLOG): a guest-visible seek failure is exactly the
         // kind of gap that must not read as "handled" in a default run.
         fprintf(stderr, "[avp] sceAvPlayerJumpToTime handle=0x%llx target=%llu ms FAILED: %s\n",
                 (unsigned long long)a0, (unsigned long long)target_ms, reason);
         return 0x806a0001ull;   // SCE_AVPLAYER_ERROR_INVALID_PARAMS, as used across this surface
     }
+    // Repositioning is only half of the contract: the guest is told the seek LANDED through the
+    // event callback's warning channel, and until it hears that it is entitled to sit in its own
+    // wait. Published outside g_avp_mx, like every other event -- the callback re-enters AvPlayer HLE.
+    //
+    // Deliberately synchronous rather than deferred to a worker. Two arguments for that are TRUE
+    // but cover only part of the population, and neither is what this rests on:
+    //
+    //   * "the guests arm their wait slot before calling" -- PPSA17337 writes its awaited code at
+    //     eboot+0x15400b8, one instruction group before the call at +0x15400c2. Two titles observed.
+    //   * "the join is a COUNTING semaphore, so an early post is stored rather than lost" -- true
+    //     where it applies: that guest's callback posts with `lock xadd` at eboot+0x153f041 and its
+    //     waiter sleeps only when the pre-decrement value was <= 0. But that is ONE binary's
+    //     encoding, and it generalises no further than the first argument did. Measured across the
+    //     corpus: of the 42 dumps importing this NID, the exact arm-and-join encoding appears in
+    //     **11** -- one byte-identical Unity plugin. PPSA25009 is one of the 31 without it.
+    //
+    // What covers all 42 is weaker in form and stronger in reach, and it is a DEGRADATION bound
+    // rather than a safety proof: if a guest's join is an EDGE, an early post is simply lost, and
+    // that guest then waits exactly the timeout it already pays today with no notification at all.
+    // So publishing synchronously is never worse than the status quo for any importer, and is
+    // strictly better for the ones whose join can store it. That is the claim this code makes.
+    //
+    // SCOPE THE BOUND PRECISELY, because it is narrower than it first reads: it is about the WAIT.
+    // An edge-triggered join loses the wake, and the guest then waits out the timeout it already
+    // pays today -- but losing the wake does NOT stop the callback BODY from running, and that body
+    // is demonstrably not inert. PPSA25009's handler dispatches three warning codes at
+    // eboot+0x13e4a53 and its 0x806a00a3 arm at +0x13e4b5e walks a per-stream table doing real work.
+    // So side effects inside an edge-triggered guest's callback are OUTSIDE this bound and remain
+    // the open residual, which is the same one the PR body records: nobody can say from prosper's
+    // code what any of the other importers' handlers do with a notification they have never had.
+    //
+    // Re-entrancy is outside the bound too, and separately covered rather than overlooked: prosper
+    // has always fired guest callbacks synchronously from HLE entry points (see :2360 and :2378,
+    // sceAvPlayerPause and sceAvPlayerResume), and PPSA17337's own pause -> jump -> resume sequence
+    // already re-enters twice per seek on the pre-existing paths.
+    //
+    // Publishing here also keeps the notification ordered strictly after the reposition it reports,
+    // which a deferred worker could not guarantee. (Population measured in review of #3348.)
+    const uint32_t seek_complete = AVP_WARNING_SEEK_COMPLETE;
+    avp_fire_data(ev_obj, ev_cb, AVP_WARNING_ID, 0, &seek_complete);
     if (avp_log()) fprintf(stderr, "[avp] jump-to-time handle=0x%llx target=%llu ms -> ok\n",
                            (unsigned long long)a0, (unsigned long long)target_ms);
     return 0;
@@ -2660,11 +2753,17 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
         AvpAudio details{(uint16_t)af.channels, {}, af.sample_rate,
                          (uint32_t)(af.samples * af.channels * sizeof(int16_t)), {}};
         memcpy(&fi->d0, &details, sizeof(details));
-        if (avp_log())
+        if (avp_log()) {
+            // A real counter: this field was a literal 0, so every line read "#0" and the one thing
+            // the field exists to answer -- how much audio has actually been handed over -- could
+            // only be recovered by counting log lines.
+            static std::atomic<uint64_t> audio_delivered{0};
             fprintf(stderr, "[avp] audio-deliver handle=0x%llx #%llu t=%llums pts=%llums samples=%u\n",
                     (unsigned long long)a0,
-                    (unsigned long long)0, (unsigned long long)avp_ms(),
+                    (unsigned long long)audio_delivered.fetch_add(1) + 1,
+                    (unsigned long long)avp_ms(),
                     (unsigned long long)fi->timestamp, af.samples);
+        }
         return 1;
     }
     if (!p.synthetic || p.audio_poll >= avp_synth_frames()) return 0;

@@ -30,7 +30,7 @@ Last updated: 2026-08-28
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ First playable room | [#1867](https://github.com/mattias800/prosper/issues/1867) |
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
-| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat **on the reviewed revision; black on current master** ([#2899](https://github.com/mattias800/prosper/issues/2899)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
+| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat on the reviewed revision. The black-frame regression is **fixed**: the route that produced one uniformly black frame now produces 26 of 26 pixel-distinct composited frames. The `cobra-gameplay` guard is **still red** on structure alone, and the scene draws **without its HUD and with a seam in the sky** ([#2899](https://github.com/mattias800/prosper/issues/2899)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🚧 4K title screen on a one-button route; a default launch stops at the game's own auto-save notice, which waits for Cross | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay in the guest, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
@@ -212,11 +212,25 @@ The opening fall leads into native 1920×1080 gameplay with scripted input and a
 
 The route reaches the native 1920×1080 desert tutorial combat scene with audio. See the [tracker](https://github.com/mattias800/prosper/issues/1870).
 
-**Regressed on current master ([#2899](https://github.com/mattias800/prosper/issues/2899)).** The
-`cobra-gameplay` guard now renders one uniformly black frame for the whole 199.6 s route. Bisected to
-`ea299e97` (#1974, `sceAvPlayerJumpToTime`): with the seek implemented, Unity's `PS5VideoMedia`
-prepare *succeeds* instead of timing out, and the title then stops driving the player. The two
-screenshots above are the reviewed pre-regression state, not a capture of master.
+**The #2899 black-out is fixed (2026-09-05), and `cobra-gameplay` is still red for a different
+reason.** `sceAvPlayerJumpToTime` repositioned the source correctly and never published the
+seek-completion notification the guest waits for, so Cobra sat out a **15,000 ms** timeout after
+every seek — measured at 15,003 ms — and then stopped asking for video frames. With the notification
+published, the same guard route goes from **1 of 26 pixel-distinct samples to 26 of 26** and reaches
+the desert level. The guard still fails, now on `structural matches` **alone**. The two screenshots
+above are the reviewed rung-6 state from before the regression;
+[`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) carries the mechanism, and
+everything below that section's 2026-09-05 banner describes the pre-fix state and is superseded by
+it.
+
+<p align="center"><img src="assets/screenshots/cobra-desert-level.webp" alt="Space Adventure Cobra — the opening desert level after the #2899 fix, with the translucent-polygon smear and the dark horizon band that the black screen had been hiding"></p>
+
+*Direct, unmodified `tools/screenshot` capture — native 1920×1080, `PROSPER_RENDER_SCALE=1` with no
+snapshot acceleration, route `prosper/scripts/cobra/reach-title-or-gameplay.pad`, every sample
+reporting `capture_source=composited`. The level is recognisable and it draws wrong: translucent blue
+polygons smear across the middle of the frame and a dark band runs along the horizon. Those are real
+defects that the black screen was hiding, not compression artefacts — and this is deliberately the
+degraded capture, not progression evidence for a rung.*
 
 ## Sonic Origins — `PPSA05325`
 
