@@ -581,6 +581,65 @@ the region's end.
 382 s of boot, so the guest states no cadence target and none is assumed here. The handler now logs
 every change under `PROSPER_EVLOG`. Note it would report the requested **cap**, not what a PS5 achieves.
 
+### One round trip, billed twice — the compute and graphics costs are the same surface
+
+Measured 2026-09-05 on a quiet-box windowed run (`bdc492857`, real Wayland window, `gpu-present`
+adopted). The two costs this document reports separately are **one defect**.
+
+The dominant compute program's sampled binding and the renderer's `persist_invalid` texture are the
+**same 12,779,520-byte, 1920x1620 allocation** — the save-warning atlas. Addresses differ between runs
+(`0x210c050000` compute-side, `0x2107e50000` graphics-side, same run); the byte count and geometry are
+the identity.
+
+The cycle, per dispatch:
+
+1. the compute program's **sampled** binding re-uploads 12.4 MiB from guest memory;
+2. the dispatch writes its **storage** binding — the same address;
+3. the writeback retiles and republishes 12.4 MiB back to guest memory;
+4. that guest write **invalidates the renderer's persistent texture cache** for the same surface, so
+   the graphics side re-materialises it too;
+5. the next dispatch re-uploads the bytes prosper itself just wrote.
+
+Same address, same dispatch, opposite outcomes on the two bindings:
+
+| binding | class | upload skipped |
+|---|---|---:|
+| storage (the write) | storage | **17,971 / 17,985 (99.9%)** |
+| sampled (the read) | sampled | **11 / 17,985 (0.06%)** |
+
+Over one 303 s run: **428.11 GiB bound, 416.79 GiB staged**, and the program is **66.5% of all compute
+cost** (85,307 of 128,293 ms) at 91% CPU-side (setup 54.6%, writeback 36.4%, **GPU dispatch 8.7%**).
+
+The renderer's side of the same surface, from one detail line:
+
+```
+[render-timing] texture addr=0x2107e50000 1920x1620x1 dim=5 fmt=1 comps=1 tile=27 class=2
+  candidate=1 source=12779520 compute-candidate=0 cache=persistent-invalid id=54
+  validate=exact 0.00ms/0B/12779520B submit=unknown watch=unknown active=0 stable=0 total=16.68 ms
+```
+
+Four fields make this a design finding rather than a tuning one:
+
+- **`validate=exact 0.00ms/0B/12779520B`** — the exact comparison compared **zero of 12,779,520
+  bytes**. The entry was declared changed **without any comparison happening**, because no snapshot was
+  retained to compare against. Read `validate=exact` carefully: it names the *route*, not evidence that
+  bytes were examined.
+- **`submit=unknown` / `watch=unknown` / `active=0` / `stable=0`** — neither cheap proof was available,
+  no write watch is armed, and the promotion ladder is at zero.
+- **`compute-candidate=0`** — this texture cannot borrow the compute result **even in principle**, so
+  making the compute side cheaper does not help the graphics side.
+- **`dim=5`** — the same `img_dim=5` shape recorded in `## Ruled out` as what disqualified an earlier
+  storage→sampled transfer candidate.
+
+The on-GPU path that removes the round trip exists (`g_compute_storage_transfer_seeds`,
+`PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER`) and this document already records it measuring **7.2 vs
+5.8 fps** when it fired. It currently reports **`gpu_transfer_seeds=0`** — it never fires at all. Which
+of the six inputs to `compute_storage_cache_gate_candidate` declines is answerable in one run with
+`PROSPER_COMPUTE_STORAGE_GATE_CENSUS=1`, which groups by geometry.
+
+**Do not read the percentages above as shares of frame wall** — they are shares of summed dispatch
+cost, and this title's dispatch rate varies by an order of magnitude between phases.
+
 ## Reproducing the evidence
 
 ```bash
