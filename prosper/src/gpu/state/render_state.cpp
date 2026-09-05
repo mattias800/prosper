@@ -156,10 +156,18 @@ std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK +
 //      operator-interrupted run ends. `live_compute.cpp:1954` records this as the path that actually
 //      bites, because bounded runs are where this project's evidence mostly comes from.
 //
-// `tools/screenshot` returns from main and calls no `_Exit`, so its own `--count`/`--timeout` bound
-// DOES flush this line; a `timeout(1)` wrapper around it does not. A missing line is therefore the
-// harness, not a zero -- and `PROSPER_COLORSTATETRACE` reports the same per-mode population a second
-// way, from the draw records themselves, for anyone who needs a number a signal cannot take away.
+//   4. `tools/screenshot` ends in `_exit(verdict.exit_code)` (`screenshot.cpp:1000`) -- lowercase
+//      `_exit`, the POSIX one, which skips atexit exactly as `_Exit` does. So the project's PRIMARY
+//      EVIDENCE FRONTEND loses these reports too. An earlier revision of this comment claimed the
+//      opposite; it was written from a grep for `_Exit(` that a lowercase `_exit(` does not match,
+//      and the first run that could test it printed nothing. The same is true of the worker-fault
+//      path's `_exit(90)`, which `command_processor.cpp:1111` already records.
+//
+// So an atexit hook reaches essentially none of the ways a real run ends here, and this registration
+// is best-effort rather than a reporting mechanism. Use `PROSPER_COLORSTATETRACE`, whose per-draw
+// records carry `mode=` unconditionally, when the number has to survive the exit path -- it also
+// covers `NORMAL`, which this counter never sees. #3353 tracks giving these censuses an explicit
+// flush hook, which is what the frontends already do for several other diagnostics.
 void report_unmodeled_cb_color_mode(uint32_t mode) {
     static const bool exit_dump_registered = [] {
         std::atexit([] {
