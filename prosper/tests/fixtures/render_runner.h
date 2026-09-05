@@ -9336,13 +9336,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             p_bindxfb(cmd, 0, 1, &geom_buf, &off, &sz);
             p_beginxfb(cmd, 0, 0, nullptr, nullptr);
         }
-        // PROSPER_INDEX_ECHO=1 (investigation instrument, #3374): what the GPU will actually FETCH
-        // for this indexed draw, read back from the host-visible memory at exactly the (buffer,
-        // offset) pair about to be bound -- against the indices prosper decoded for it. A draw whose
-        // vertex fetch reads out of range because it consumed another draw's index slice, or whose
-        // vertexOffset pushes gl_VertexIndex past the bound vertex range, is invisible to
-        // PROSPER_BUFLOG/PROSPER_BUFVERIFY (both look at STORAGE buffers) and produces no Vulkan
-        // validation message (an out-of-range storage read is robustBufferAccess, not an error).
+        // PROSPER_INDEX_ECHO=1 (investigation instrument, #3374): the index bytes at exactly the
+        // (buffer, offset) pair about to be bound, against the indices prosper decoded for this draw,
+        // plus the draw parameters that decide the fetched range. It answers "is this draw about to
+        // ask for vertices outside its own vertex buffer" -- a draw that consumed another draw's index
+        // slice, or whose vertexOffset pushes gl_VertexIndex past the bound range, makes every vertex
+        // load return 0 under robustness, which is indistinguishable at the pixel from wrong vertex
+        // data and produces no Vulkan validation message either.
+        //
+        // SCOPE, stated narrowly. This reads the HOST mapping of the slice, not device memory, so a
+        // clean result retires "prosper computed or placed the wrong indices" and says nothing about
+        // what the GPU read back. `mismatched` compares the arena against the same vector the memcpy
+        // sourced from, so it cannot express a wrong DECODE either -- only a clobber between the copy
+        // and recording. The device-side question belongs to PROSPER_BUFFER_ECHO, which copies index
+        // slices back through the GPU; note that its `echo_count` starts at min(16, shared_buffers)
+        // and its index loop runs only while that is below 16, so on any real frame (346 buffers here)
+        // it echoes zero index slices -- which is why this host-side reading was needed at all.
         static const bool index_echo = getenv("PROSPER_INDEX_ECHO") != nullptr;
         if (index_echo && v.icount) {
             const std::vector<uint32_t>& want = draws[di].indices;

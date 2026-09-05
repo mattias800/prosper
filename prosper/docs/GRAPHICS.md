@@ -1402,7 +1402,7 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   whether prosper is clean. #2945.
 
 
-### A DETERMINISTIC RADV reproduction, with a lavapipe positive control — and the five titles it explains (2026-09-05) — #3374
+### A DETERMINISTIC cross-implementation split, with a lavapipe positive control — and the four titles it covers (2026-09-05) — #3374
 
 The row above closes with *"the failing regime cannot be reproduced on this box at all"*. It can, on a
 different subject, and this one does not need a regime: **one captured frame, replayed offline, is
@@ -1429,16 +1429,45 @@ gpu_replay <work>/submit.prgcap out_lvp.bmp                           # the leve
 both a heavily loaded window and a quiet one after a two-minute cool-down, and the lavapipe replay of
 the same capsule renders level 1 complete — twin palms, volcano, flower bank, Joe, the HUD with its
 score, health bar and lives counter. Reproduced the same way on *Asterix & Obelix: Slap Them All!*
-(`PPSA08576`) and *Rugrats: Adventure in Gameland* (`PPSA23396`).
+(`PPSA08576`), *Rugrats: Adventure in Gameland* (`PPSA23396`) and — a 3D scene at native 3840x2160,
+174 operations — *Summer Sports Games* (`PPSA03416`), whose javelin event comes back with its hoarding,
+takeoff zone, throw reticle and packed stands intact.
 
-**What that settles for #3374.** The five rung-6 Unity titles whose scene art arrives through large
-sheared triangles are **one defect, not five**, and none of it is prosper's: the identical capsule
-carrying the identical decoded draws, indices, descriptors, uploads and recompiled SPIR-V produces
-the correct scene when a different Vulkan implementation executes it. Every prosper-side stage was
+**The RADV result does not move across driver versions.** The container runs Mesa **26.1.4** and the host
+Mesa **26.2.1**; the same binary on the same capsule returns the **byte-identical** broken frame on both
+(`0ab3cfbe25…`, 3 of 3 on the host). So a Mesa upgrade does not fix it, and — more usefully — a
+byte-identical result across two driver versions argues against a race and for something stable that both
+RADV versions resolve the same way.
+
+**What that settles for #3374, and what it deliberately does NOT.** Four of the five rung-6 Unity titles
+whose scene art arrives through large sheared triangles are **one defect rather than four separate
+ones**: the identical capsule
+carrying the identical decoded draws, indices, descriptors, uploads and recompiled SPIR-V produces the
+correct scene when a different Vulkan implementation executes it. Every prosper-side stage was
 independently checked on the RADV run and is clean — `PROSPER_BUFLOG` source words, `PROSPER_BUFVERIFY`
-(346 buffers, 0 mismatched), `PROSPER_BUFFER_ECHO` descriptor set/offset/range, and
-`PROSPER_INDEX_ECHO` (below) — and a full replay under `VK_LAYER_KHRONOS_validation`, proved loaded
-with `VK_LOADER_DEBUG=layer`, reports zero findings.
+(346 buffers, 0 mismatched), `PROSPER_BUFFER_ECHO` descriptor set/offset/range, and `PROSPER_INDEX_ECHO`
+(below) — and a full replay under `VK_LAYER_KHRONOS_validation`, proved loaded with `VK_LOADER_DEBUG=layer`,
+reports zero findings.
+
+**It does not assign the fault, and an earlier revision of this section did — read instrument trap 38.**
+A cross-implementation split *localises the disagreement*; it does not say who is wrong, and trap 38's own
+worked example is a lavapipe-versus-RADV split that turned out to be prosper's undefined behaviour. Both
+implementations execute **prosper's own recompiled SPIR-V**, so an implementation-defined or undefined
+construct in it produces exactly this picture, and the byte-identical agreement of two RADV versions is
+consistent with that reading as much as with a driver defect. What IS established is narrower and still
+worth a lot: the guest data, the PM4/index decode, resource realization, descriptors and uploads are not
+the cause, because they are the same bytes in the run that renders correctly. **The open fork is a RADV
+defect versus UB in the recompiled vertex stage, and the named next step is to audit that SPIR-V for
+implementation-defined constructs** — not to file upstream on the strength of the split alone. Note also
+that validation's zero findings cover neither synchronization hazards (not enabled on that run) nor an
+out-of-range read that robustness resolves.
+
+**The fifth title, *Evergate* (`PPSA01885`), is NOT covered by this** — which is why the heading says four.
+Its dominant symptom, a blown-out white/orange frame, **reproduces on lavapipe too**, so that part is
+prosper's; thin diagonal streaks over it are absent on lavapipe and do look like this defect, so it may
+carry both. Caveat on even that: its guard accelerates the opening (`PROSPER_RENDER_EVERY=500` for 90 s)
+and a native re-aim drops that, moving the timeline, so the captured frame is not confirmed to be the
+reviewed tutorial room. Treat Evergate as **unresolved**, not as excluded.
 
 **It is deterministic, which is why it is filed HERE and not as more of #2945.** #2945 is stochastic
 and load-triggered; this is 25 of 25 in both regimes, and no lever moves it: `PROSPER_NO_BACKEND_BUFFER_ARENA`,
@@ -1446,15 +1475,18 @@ and load-triggered; this is 25 of 25 in both regimes, and no lever moves it: `PR
 `PROSPER_NO_BACKEND_PIPELINE_CACHE`, `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE`, `PROSPER_NO_MEMORY_POOL`,
 `PROSPER_BACKEND_BUFFER_ARENA_KB=262144`, and `RADV_DEBUG=syncshaders | zerovram | nocache | nongg |
 nonggc | llvm`, `RADV_PERFTEST=nosam` all return the byte-identical broken frame. Its character matches
-#2937 / #3371 — deterministic, indexed-path — rather than #2945's dropout. Whether the three share a
-cause is open; what is now certain is that the titles' visuals are not prosper's to fix.
+#2937 — deterministic — rather than #2945's stochastic dropout. (#3371's own tests measured **stochastic**
+here, 3-8 failures of 24 runs, which is the opposite of what that issue's title says and of what the #2937
+row above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
+a cause is open.
 
 **`PROSPER_INDEX_ECHO=1`** (new, `tests/fixtures/render_runner.h`) is what retired the index family at
 title scale. It reads the index bytes back from the host-visible memory at exactly the `(buffer, offset)`
 pair about to be bound and compares them against the indices prosper decoded, printing `icount`,
 `vcount`, `vertexOffset`, `instanceCount`, arena/dedicated, `want_max` and `got_max`. On the Joe & Mac
-frame: 85 indexed draws, `mismatched=0` on every one, `got_max < vcount` on every one, `voff=0`,
-`inst=1`. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` look at STORAGE buffers and cannot see this, and an
+frame: 85 indexed draws, `mismatched=0` on every one, `got_max < vcount` on every one, `voff=0`, `inst=1`
+— and the last two matter, because the in-range verdict is `got_max + vertexOffset < vcount` and only
+`voff=0` makes the printed comparison the whole of it. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` look at STORAGE buffers and cannot see this, and an
 out-of-range storage read is `robustBufferAccess` rather than a validation error, so without it
 "prosper bound the wrong indices" and "the driver fetched the wrong indices" produce identical evidence.
 

@@ -21,15 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
-### The five sheared Unity titles already render correctly — the shear is the graphics driver, not prosper
+### Four sheared Unity titles already render correctly — the shear is decided by the graphics driver
 
-*New Joe & Mac*, *Asterix & Obelix: Slap Them All!* and *Rugrats: Adventure in Gameland* all draw their
-scene art through huge sheared triangles on this machine's AMD driver. We captured one frame of each and
-replayed it offline through a different Vulkan implementation, with no change to prosper and no change to
-the captured frame — and all three come out correct. So the geometry prosper builds, the indices it
-decodes, the buffers it uploads and the shaders it recompiles were right all along; what mangles them is
-in the driver, on the indexed-draw path already tracked as #2945 / #3371. Filed on #3374 with the
-reproduction, which is deterministic: 25 replays of the Joe & Mac capsule are byte-identical.
+*New Joe & Mac*, *Asterix & Obelix: Slap Them All!*, *Rugrats: Adventure in Gameland* and *Summer Sports
+Games* all draw their scene art through huge sheared triangles on this machine's AMD driver. We captured
+one frame of each and replayed it offline through a different Vulkan implementation, with no change to
+prosper and no change to the captured frame — and all four come out correct, so the geometry, the indices
+and the textures were right all along and something about how the frame is *executed* takes them apart.
+Which side is at fault is not settled yet: both drivers run shaders we generate, so it may still be ours.
+Filed on #3374; the reproduction is deterministic and takes three seconds.
 
 These pictures are **offline replays of a captured frame, not live runs** — the software Vulkan device
 is far too slow to play on, so this is diagnosis rather than a rung change.
@@ -45,6 +45,17 @@ is far too slow to play on, so this is diagnosis rather than a rung change.
 ![Rugrats' nursery on the AMD driver: Tommy shredded into vertical streaks](assets/screenshots/rugrats-shear-radv.webp)
 
 ![The same frame on the software device: Tommy at the playpen gate, complete](assets/screenshots/rugrats-correct-lavapipe.webp)
+
+![Summer Sports Games' javelin event on the AMD driver: the stands sheared into grey slabs, the hoarding and the takeoff zone gone](assets/screenshots/summer-sports-shear-radv.webp)
+
+![The same frame on the software device: the Summer Sports Games hoarding, the yellow and purple takeoff zone, the throw reticle and the packed stands (downscaled from the native 3840x2160 capture)](assets/screenshots/summer-sports-correct-lavapipe.webp)
+
+Evergate is the exception, and worth showing for that: its blown-out white frame comes back blown out on
+the software device too, so that half is ours whatever happens to the streaks over it.
+
+![Evergate on the AMD driver: a blown-out white and orange frame with diagonal streaks across it](assets/screenshots/evergate-shear-radv.webp)
+
+![The same frame on the software device: the streaks are gone and the blow-out is not](assets/screenshots/evergate-still-blown-out-lavapipe.webp)
 
 
 ### Khazan stops dying eight seconds in, and starts drawing the wrong thing instead
