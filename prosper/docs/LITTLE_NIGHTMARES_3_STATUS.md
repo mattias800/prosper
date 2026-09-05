@@ -116,15 +116,23 @@ shows every such pass carries exactly **one** colour-writing draw — a fullscre
 flat frames are ones where that draw's output is uniform. Three 120 s arms, identical route and
 instrumentation, code point `91812f96`:
 
-| arm | full-coverage VO passes | of total VO passes | rate |
+| arm | full-coverage VO passes | of scanout passes that **produced pixels** | rate |
 | --- | --- | --- | --- |
-| control | 2,218 | 12,266 | **18.08%** |
-| `PROSPER_LEGACY_CB_DISABLE_MASK=1` | 25 | 4,645 | **0.54%** |
-| `PROSPER_CB_EFC_NO_COLOR=1` | 2,255 | 12,639 | 17.84% |
+| control | 2,218 | 2,287 | **96.98%** |
+| `PROSPER_LEGACY_CB_DISABLE_MASK=1` | 25 | 2,111 | **1.18%** |
+| `PROSPER_CB_EFC_NO_COLOR=1` | 2,255 | 2,326 | 96.95% |
 
-Read the **rate**, not the count: the lever arm ran 4,645 VO passes against the control's 12,266, so
-it changed how far the run got as well as what it suppressed, and `2,218 -> 25` overstates it (trap
-255).
+> **Superseded denominator, kept visible rather than swapped out.** These rates were first published
+> over the arms' **total** VideoOut pass counts (12,266 / 4,645 / 12,639), giving
+> **18.08% / 0.54% / 17.84%**. That denominator includes deferred passes that render nothing, so it
+> measured how many passes ran as much as what they wrote. No conclusion moves — the direction and
+> the ~80x separation are identical on either normalisation — but the pair a reader quotes does, so
+> the old numbers are named here and are not used anywhere else in this document.
+
+Read the **rate**, not the count. Note what the corrected denominator settles: passes that produced
+pixels are **2,287 / 2,111 / 2,326** across the three arms, within 8% — so the lever changed **what
+those passes wrote**, not how many of them ran. That retires the trap-255 caveat the original
+denominator required.
 
 So draws whose `CB_COLOR_CONTROL.MODE` decodes as DISABLE, executed as ordinary colour draws, flood
 the scanout. Since #1724 the renderer derives the colour write mask from
@@ -189,9 +197,9 @@ Under the lever the uniform frames do not disappear — they turn **black**, i.e
 statement than the pass-coverage rate: it is measured on the frames prosper actually retained, and it
 identifies the yellow as a *draw's export* rather than a clear or a fallback.
 
-Note also that the pass-coverage rates quoted above are normalised over passes that **produced
-pixels**, and that denominator is stable across the arms (2,287 control, 2,111 lever, 2,326 EFC) —
-so the lever changed what those passes wrote, not how many of them ran.
+The pass-coverage rates in the section above are normalised over passes that **produced pixels**, and
+that denominator is stable across the arms — see the table there for the figures and for the
+superseded denominator they replaced.
 
 **What this run cannot say.** The tool's per-guest-minute series is a single `??:??` bucket — the log
 carries no Unreal timestamps to attribute against — so there is no good-phase/bad-phase contrast
@@ -232,8 +240,14 @@ and ignores `MODE`, so it writes them, and what they write floods the scanout.
 **The shader does not manufacture a constant.** 782 instructions, 4 `OpImageSampleImplicitLod`, 34
 `OpSelect`, **no branches**, one store of a computed `OpCompositeConstruct`, exported through a
 `PackHalf2x16`/`UnpackHalf2x16` round trip with `±65504` clamps — a genuine tonemap-shaped chain. So
-`(1,1,0)` is a *computed* value: R and G arrive **>=1.0** and saturate in the `UNORM8` target while B
-arrives `<=0`. That is this issue's **original** "red and green forced to maximum" framing, correct at
+`(1,1,0)` is a *computed* value rather than a constant this shader holds.
+
+**"R and G arrive `>=1.0`" is a RE-DESCRIPTION of the observed `UNORM8` pixel, not a second
+measurement.** `(255,255,0)` in an 8-bit unorm target is exactly what any value `>=1.0` becomes, so
+the statement adds an interpretation and no evidence; nothing here has read the shader's output
+before the colour block. It must not be cited as independent confirmation. What *is* measured is the
+module's structure — computed, not constant — and that is the part that excludes a manufactured
+value. That is this issue's **original** "red and green forced to maximum" framing, correct at
 the shader level even though the background model that replaced it was falsified at the frame level.
 
 **No change is proposed from this.** #1724 landed on measured cross-title evidence, and #2932
@@ -347,7 +361,7 @@ Read this before forming a hypothesis.
 | The flat yellow frame is a real guest screen whose text layer is missing (e.g. a health warning) | **Falsified.** It is pure `RGB(255,255,0)` over the whole 4K frame, first composited at `frame_seq=4` with the identical crc — before any title content exists — and the frame the freeze landed on varied between runs. #1962. |
 | The yellow tint is a per-scanout-buffer defect (one flip buffer composited wrong) | **Falsified.** The manifest's `front_index` does not correlate with the tint: 14 tinted / 6 untinted on `front_index=0` and 10 / 6 on `front_index=1` over 36 samples. (Two of the twelve untinted are the blue/magenta noise frames below, not clean content; moving them to either bucket leaves the two columns uncorrelated.) #2014. |
 | This title composites content over a yellow BACKGROUND (`out = a*C + (1-a)*B`, `B = (255,255,0)`) | **Does not reproduce on `c067aeef`.** 27 consecutive samples spanning t=10-140 s are correct black-background splash frames, decoded and viewed rather than inferred from a colour count. The only uniform-yellow samples in a 200 s run are one at t=5 s, before any content exists, and twelve after a GPU hard recovery, all byte-identical. The alpha model was correct when measured in August and is retained above as the record; it is not the current state, and the uniform frame is now known to be a flat *scanout* paint rather than a background under content. #2014, #3340. |
-| The flat scanout paint is an ELIMINATE_FAST_CLEAR pass writing its bound pixel shader over the target (#1588's mechanism) | **Falsified on this title, with a live control.** `PROSPER_CB_EFC_NO_COLOR=1` over a matched 120 s arm gives **17.84%** full-coverage VO passes against an **18.08%** control, and an identical `[uniformlog]` ordinal (#64). Code point `91812f96`. **Scope this null carefully**: it was measured on a title whose MODE=2 population is *small* — `>=4` draws against `>=32,768` MODE=0 draws in a 200 s run — so it says the EFC lever is not this title's mechanism, and says nothing about a title with a large MODE=2 population. The lever that does move it is `PROSPER_LEGACY_CB_DISABLE_MASK`, a different lever acting on a different population. #2014, #1588, #2932. |
+| The flat scanout paint is an ELIMINATE_FAST_CLEAR pass writing its bound pixel shader over the target (#1588's mechanism) | **Falsified on this title, with a live control.** `PROSPER_CB_EFC_NO_COLOR=1` over a matched 120 s arm gives **96.95%** full-coverage scanout passes against a **96.98%** control — normalised over passes that produced pixels — and an identical `[uniformlog]` ordinal (#64). (An earlier revision of this row quoted `17.84%` against `18.08%`, the same counts over the arms' total pass counts; the null is identical either way.) Code point `91812f96`. **Scope this null carefully**: it was measured on a title whose MODE=2 population is *small* — `>=4` draws against `>=32,768` MODE=0 draws in a 200 s run — so it says the EFC lever is not this title's mechanism, and says nothing about a title with a large MODE=2 population. The lever that does move it is `PROSPER_LEGACY_CB_DISABLE_MASK`, a different lever acting on a different population. #2014, #1588, #2932. |
 | The uniform colour comes from prosper's substitute texture for an invalid descriptor binding (the 2x2 magenta/cyan checkerboard at `live_renderer.cpp:7278`), turned yellow by the `B8G8R8A8` R/B swizzle | **Falsified by construction — the substitute is not armed.** That `poison_tex` is reachable only under `PROSPER_DESCRIPTOR_VALIDATE=poison` (`live_renderer.cpp:7274`, `if (!mode \|\| strcmp(mode, "poison")) return;`), which no arm on this title has ever set. The swizzle arithmetic also does not work: texel (0,0) of that pattern is magenta `(255,0,255)`, and an R/B swap leaves magenta unchanged. Recorded because it is an attractive story — the run does emit `[mimg-unresolved]` lines — and because the arithmetic half is the part that is easy to get wrong in one's head. |
 | `PROSPER_CLEARLOG`'s all-zero clear-word census retires the fast-clear hypothesis | **VOID, not negative — the instrument printed a constant.** `extract_render_state` assigned `rs.color0_clear_word0`/`_word1` two lines BELOW the diagnostic that printed them, so it read `RenderState`'s member initializers: every `[clearlog]` line ever printed says `word0=0x00000000 word1=0x00000000`, in every title, for every target. The dedup key used the same unassigned field, so the "33 distinct `(base, format, clear-word)` combinations" were 33 distinct `(base, format)` pairs. The extractor's fields were always correct, which is why every existing assertion on them passed. Fixed and pinned by a mutation-checked arm in `tests/gpu/state/test_render_state.cpp` (#2014). The `PROSPER_CLEAR_DEBUG` blue control from the same session is a different instrument and still stands. |
 | The uniform frame is the DCC fast-clear materialiser's output | **Falsified by construction, not by census.** `gfx10_dcc_fast_clear_rgba8` (`src/gpu/texture/tile.cpp:92`) accepts only 3- or 4-component surfaces and only the embedded `0000/0001/1110/1111` codes, and `materialize_uniform_rtt` maps its bytes to RGBA8 unchanged. Its **entire** reachable set is `(0,0,0,255)`, `(0,0,0,0)`, `(255,255,255,255)`, `(255,255,255,0)`, `(255,0,0,0)` and `(0,255,255,255)`. `(255,255,0,x)` is not in it and cannot be, whatever the run contains. **Qualified the same day, by the author, before anyone relied on it:** that is a statement about the MATERIALISED SURFACE, not about what a consumer sees. `backend_sampled_component_swizzle` (`tests/fixtures/render_runner.h:365`) swaps the R and B selectors when the sampled target's guest format is `B8G8R8A8`, so a uniform **cyan** `(0,255,255,255)` -- which IS in the set, from code `0x80` with `alpha_is_on_msb=false` -- reaches a shader as `(255,255,0,255)`. A composite that samples such a surface and writes RGB only, over a `(0,0,0,0)` clear, produces exactly the observed `(255,255,0,0)`. So the row rules out the materialiser as a DIRECT producer and does **not** rule out the chain through a swizzled consumer; `PROSPER_DCCLOG=1` is the one-run test. Note the converse too: flat **white** IS directly reachable, which makes this path a live lead for #2932's signature (a). |
