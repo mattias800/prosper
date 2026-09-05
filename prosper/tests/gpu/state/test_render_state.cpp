@@ -1113,8 +1113,16 @@ int main() {
         const bool any = prosper::gpu::unmodeled_cb_color_mode_summary(summary, sizeof summary);
         uint64_t counted = 0;
         for (uint32_t m = 0; m <= 7u; ++m) counted += prosper::gpu::unmodeled_cb_color_mode_count(m);
-        CHECK(any == (counted != 0),
-              "unmodeled-mode summary reports content exactly when some mode counted");
+        // NOT a discriminating arm on this ordering, and saying so rather than leaving it to look
+        // like one: the cases above have already incremented modes 2/4/5/7, so `counted` cannot be
+        // zero here and the equality cannot fail. It is kept because it pins the direction, and the
+        // FALSE branch is covered by the two arms below, which can fail.
+        CHECK(any && counted != 0,
+              "unmodeled-mode summary reports content after this file's unmodeled-mode draws");
+        CHECK(!prosper::gpu::unmodeled_cb_color_mode_summary(summary, 0),
+              "unmodeled-mode summary declines a zero-capacity buffer");
+        CHECK(!prosper::gpu::unmodeled_cb_color_mode_summary(nullptr, sizeof summary),
+              "unmodeled-mode summary declines a null buffer");
         if (any) {
             bool all_named = true;
             for (uint32_t m = 0; m <= 7u; ++m) {

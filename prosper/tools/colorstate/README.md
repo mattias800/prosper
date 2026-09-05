@@ -53,6 +53,36 @@ diagnostic; a named program may be a fix.
 
 The section is opt-in so existing invocations print byte-identical output.
 
+## `--by-pipeline`: the axis `--by-program` cannot express
+
+A per-program breakdown groups on the **pixel shader alone**. If the phenomenon is keyed on the
+*pipeline*, that view cannot express it — and the shape it produces instead is actively misleading:
+one program showing several modes reads as *"the decoded field is unreliable"*.
+
+```bash
+python3 tools/colorstate/colorstate_report.py run.log --scanout-prefix 0x9fc --by-pipeline
+```
+
+Each row is one `(vertex program, pixel program, RAW CB_COLOR_CONTROL word)` combination, and the
+section ends with the verdict that only the raw word can give:
+
+```
+    3734  es=0x300e900000  ps=0x3017370000  cb-control=0x00cc0000 mode=0 (DISABLE) effective=07 writes-colour=True
+    1320  es=0x3016e60000  ps=0x3017370000  cb-control=0x00cc0010 mode=1 (NORMAL)  effective=07 writes-colour=True
+  3 distinct raw CB_COLOR_CONTROL word(s); 0 decoding to more than one mode
+    (each word decodes to exactly one mode, so the decode is faithful to what the guest wrote)
+```
+
+**That last line is the whole point.** A decode disagreeing with itself and a guest writing two
+different words are indistinguishable once the word is dropped. If every distinct word decodes to
+exactly one mode, the decode is faithful and "one program, two modes" is a fact about the *guest*. If
+one word decodes to several, the decode really is unreliable.
+
+This flag exists because reading `--by-program` as though it were a pipeline breakdown produced
+precisely the wrong conclusion on #1706 — published, then overturned from the same log by re-keying.
+That is **instrument trap 265**, and `--by-program` now prints a warning pointing here whenever a
+program in its output carries more than one mode.
+
 ## Read the per-minute series, not a single number
 
 **A suppressed-draw count means nothing on its own.** Compare a phase whose output is

@@ -142,9 +142,13 @@ std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK +
 // only number a run produces. #1706's central quantity is per-title exposure to unmodeled
 // colour-block modes; `unmodeled_cb_color_mode_count` has always answered it exactly and had NO
 // production caller, which is why three independent lanes quoted powers-of-two LOWER BOUNDS on the
-// same night. Registered on the FIRST unmodeled draw, so a title that decodes none prints nothing
-// and stays usable as a control -- The Messenger's zero on its guard route is currently the only
-// such control #1706 has.
+// same night. Registered on the FIRST unmodeled draw, and modes that never counted are omitted from
+// the line -- but NOT for the reason an earlier revision of this comment gave. It claimed that keeps
+// a title which decodes none "usable as a control"; that is wrong, because an absent line is
+// indistinguishable from an atexit lost to one of the four paths below, so absence proves nothing
+// either way. The real reason is narrower and still worth it: a row of zeroes is DATA-SHAPED, and a
+// reader who sees `mode0=0 mode2=0 ...` will quote it as a measured zero rather than as the absence
+// of a measurement.
 //
 // KNOWN GAPS, stated rather than discovered later. An atexit report is lost on THREE paths, and the
 // eight pre-existing atexit censuses in this codebase all inherit the same three (#3353):
