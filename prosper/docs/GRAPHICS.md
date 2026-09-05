@@ -1457,8 +1457,9 @@ construct in it produces exactly this picture, and the byte-identical agreement 
 consistent with that reading as much as with a driver defect. What IS established is narrower and still
 worth a lot: the guest data, the PM4/index decode, resource realization, descriptors and uploads are not
 the cause, because they are the same bytes in the run that renders correctly. **The open fork is a RADV
-defect versus UB in the recompiled vertex stage, and the named next step is to audit that SPIR-V for
-implementation-defined constructs** — not to file upstream on the strength of the split alone. Note also
+defect versus UB in the recompiled vertex stage** — **and the subsection below settles it: the UB side is
+refuted, and not by enumeration.** What follows here is the state of the evidence before that was
+measured; read it for the falsification list, not for the verdict. Note also
 that validation's zero findings cover neither synchronization hazards (not enabled on that run) nor an
 out-of-range read that robustness resolves.
 
@@ -1508,6 +1509,71 @@ needed.
 
 **Do not use `PROSPER_GEOM_PROBE` on these capsules.** Its per-draw verdicts contradict the pixels —
 see instrument trap 266. The `--draw-steps` per-operation contribution is the instrument that held.
+
+
+### The fork is settled: RADV drops indexed draws on this box, and module UB cannot be the mechanism (2026-09-05) — #3374
+
+The subsection above left an open fork — a RADV defect against implementation-defined or undefined
+behaviour in prosper's recompiled vertex stage — and named auditing that SPIR-V as the next step. **That
+audit is not the thing that answers it.** Enumerating UB classes can never finish, and two measurements
+refute the whole side of the fork regardless of what an enumeration would have found.
+
+**1. The variance argument. A module cannot be non-deterministic.** Undefined or implementation-defined
+behaviour makes an implementation give a *consistent* wrong answer for a given compilation; it cannot make
+one implementation give several different answers to identical input. Interleaved run-by-run, same
+capsule, same draw (`--draw 12`, a four-vertex six-index quad), same binary, under induced GPU load,
+**n = 20 per arm**:
+
+| implementation | distinct outputs in 20 runs |
+| --- | --- |
+| RADV | **4** — including the untouched RTT-seed hash (the draw contributed *nothing*) **10 times** |
+| lavapipe | **1** |
+
+Arms alternate run by run because this box's failure rate drifts machine-wide over minutes (trap 223);
+measured as arm-A-then-arm-B the same comparison is void. Quiet-window controls show why: the identical
+RADV command measured 4 distinct outputs in one window and 1 in 10 runs in another.
+
+**2. The prosper-free control. The failure does not need prosper's SPIR-V.** `tools/vkprobe` driving the
+hand-written `minimal_ssbo_vs` + `minimal_green_fs` — no prosper code and no prosper-generated module in
+the process — 12 processes x 25 iterations per arm, interleaved process-by-process, under the same load:
+
+| implementation | indexed-arm iterations that drew nothing |
+| --- | --- |
+| RADV | **28 / 300** |
+| lavapipe | **0 / 300** |
+
+Together these retire the UB side: a module prosper did not write fails the same way, and the failure
+varies run to run on one implementation while the other is exact. The UB enumeration on #3374 (no
+`OpUndef`, no uninitialised variables, no dynamic vector extracts, no division, and the position slice's
+only shift by a constant) stands as a record but is **no longer load-bearing**.
+
+**3. The bridge to the picture, measured rather than assumed.** The titles' shear is these dropouts at
+full-frame scale. Per-operation contribution from `--draw-steps --draw-steps-every 1` on the Joe & Mac
+capsule, both implementations, 86 comparable operations:
+
+| | draws contributing pixels |
+| --- | --- |
+| lavapipe | **84 of 86** |
+| RADV | **67 of 86** |
+
+**19 draws contribute on lavapipe and nothing whatsoever on RADV** (2,461 to 23,286 pixels each), and the
+set of 19 is **identical across two independent runs**. That is the shear: nineteen sprite and level draws
+deleted from the frame, with the survivors composited over whatever the seed held.
+
+**Why the full frame looks deterministic while one draw does not.** The 35-of-35 byte-identical full-frame
+result in the subsection above is real but is a property of the **saturated regime**, not of the mechanism:
+a full frame is its own GPU load, essentially every affected draw loses, and the same nineteen lose every
+time. Variance falls as the prefix grows — `--draw 12` gives 4 distinct outputs in 10 runs, `--draw 0:12`,
+`--draw 0:30` and `--draw 0:60` give 2 (9 of 10 modal), the full frame gives 1 of 10. **So this is #2945's
+family after all, seen at saturation** — the earlier reading of "deterministic, therefore not #2945" was
+right about the measurement and wrong about what it implied. Read the two subsections together.
+
+**What is still NOT claimed.** That RADV is non-conformant in its *rendering* of these draws is not
+established by any of this; what is established is that it is non-deterministic on deterministic input and
+that prosper's SPIR-V is not required for that. Those are the grounds for an upstream report — a
+reproduction that varies run to run, on a module the reporter did not generate, against a second
+implementation that does not vary — and they are stronger than the cross-implementation split alone,
+which trap 38 correctly refuses to accept as an attribution.
 
 
 ## Recommended implementation order
