@@ -21,6 +21,44 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-05
 
+### Four sheared Unity titles already render correctly — the shear is decided by the graphics driver
+
+*New Joe & Mac*, *Asterix & Obelix: Slap Them All!*, *Rugrats: Adventure in Gameland* and *Summer Sports
+Games* all draw their scene art through huge sheared triangles on this machine's AMD driver. We captured
+one frame of each and replayed it offline through a different Vulkan implementation, with no change to
+prosper and no change to the captured frame — and all four come back recognisable — three of them cleanly, and Summer
+Sports with a grey form still sweeping the upper right that we cannot tell apart from its stadium roof —
+so the geometry, the indices and the textures were right all along and something about how the frame is *executed* takes them apart.
+Which side is at fault is not settled yet: both drivers run shaders we generate, so it may still be ours.
+Filed on #3374; the reproduction is deterministic and takes three seconds.
+
+These pictures are **offline replays of a captured frame, not live runs** — the software Vulkan device
+is far too slow to play on, so this is diagnosis rather than a rung change.
+
+![New Joe & Mac level 1 on this machine's AMD driver: the art is all there, smeared into triangular shards](assets/screenshots/joe-mac-shear-radv.webp)
+
+![The same captured frame replayed on a software Vulkan device: twin palms, volcano, flower bank, Joe, and the full HUD](assets/screenshots/joe-mac-correct-lavapipe.webp)
+
+![Asterix's forest level on the AMD driver: Asterix stretched into a band across the top of the screen](assets/screenshots/asterix-shear-radv.webp)
+
+![The same frame on the software device: Asterix on the path, both portraits with their health and rage gauges, the score and TOP score](assets/screenshots/asterix-correct-lavapipe.webp)
+
+![Rugrats' nursery on the AMD driver: Tommy shredded into vertical streaks](assets/screenshots/rugrats-shear-radv.webp)
+
+![The same frame on the software device: Tommy at the playpen gate, complete](assets/screenshots/rugrats-correct-lavapipe.webp)
+
+![Summer Sports Games' javelin event on the AMD driver: the stands sheared into grey slabs, the hoarding and the takeoff zone gone](assets/screenshots/summer-sports-shear-radv.webp)
+
+![The same frame on the software device: the Summer Sports Games hoarding, the yellow and purple takeoff zone, the throw reticle and the packed stands. The grey form across the upper right is still there and is probably the stadium roof, but we have not confirmed that. Downscaled from the native 3840x2160 capture](assets/screenshots/summer-sports-correct-lavapipe.webp)
+
+Evergate is the exception, and worth showing for that: its blown-out white frame comes back blown out on
+the software device too, so that half is ours whatever happens to the streaks over it.
+
+![Evergate on the AMD driver: a blown-out white and orange frame with diagonal streaks across it](assets/screenshots/evergate-shear-radv.webp)
+
+![The same frame on the software device: the streaks are gone and the blow-out is not](assets/screenshots/evergate-still-blown-out-lavapipe.webp)
+
+
 ### Khazan stops dying eight seconds in, and starts drawing the wrong thing instead
 
 The First Berserker: Khazan aborted at 8.6 seconds of every boot with "PS5 Out of Memory". It was not

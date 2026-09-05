@@ -152,6 +152,39 @@ silent, because silence there is indistinguishable from a clean verified run. Al
 strictly (decimal or `0x` hex); a malformed one disarms the control loudly rather than aiming it
 somewhere unintended.
 
+## The index bytes an indexed draw is about to bind — `PROSPER_INDEX_ECHO`
+
+`PROSPER_INDEX_ECHO=1` prints, per indexed draw and immediately before `vkCmdBindIndexBuffer`, the index
+bytes read back from the host-visible memory at exactly the `(buffer, offset)` pair about to be bound,
+compared against the indices prosper decoded for that draw:
+
+```
+[index-echo] draw=28 icount=9 vcount=5 voff=0 inst=1 arena=1 ibuf=0x1b83a880 ioff=179804
+             want_n=9 want_max=4 got_max=4 mismatched=0 got[0..7]=2,3,4,1,2,4,0,1
+```
+
+It answers **is this draw about to ask for vertices outside its own vertex buffer?** A wrong index slice,
+a stale index-arena offset or a `vertexOffset` that pushes `gl_VertexIndex` past the bound range makes
+every vertex load return 0 under robustness, which is indistinguishable at the pixel from wrong vertex
+data — and an out-of-range storage read is `robustBufferAccess`, not a Vulkan error, so validation is
+silent on it too. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` both look at STORAGE buffers and cannot see
+any of it (#3374).
+
+**Scope, stated narrowly, because the obvious reading is stronger than the instrument.** This reads the
+**host** mapping of the slice, not device memory. A clean result therefore retires *"prosper computed or
+placed the wrong indices"* and says nothing about what the GPU read back. `mismatched` compares the arena
+against the same vector the `memcpy` sourced from, so it cannot express a wrong **decode** either — only
+a clobber between the copy and recording. The device-side question is `PROSPER_BUFFER_ECHO`'s, which
+copies index slices back through the GPU — but its `echo_count` begins at `min(16, shared_buffers.size())`
+and its index loop runs only while that is under 16, so at 16 or more storage uploads — every real frame —
+it echoes **zero** index slices (#3376). That gap is why this host-side reading was needed.
+
+`want_max` is the largest index prosper decoded and `got_max` the largest at the bound offset. The in-range
+condition is `got_max + voff < vcount`, so read `voff` beside them — the printed comparison is the whole
+story only when `voff` is 0. `mismatched` counts positions where the two disagree. A dedicated (non-arena) index buffer
+unmaps its memory, so it prints `got=<dedicated buffer, unmapped>` rather than a silent zero — the
+readback is only reported when there is something to read. Inert and byte-identical when unset.
+
 ## Draw-time resource provenance
 
 Set `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE=DRAW:vs|ps:BINDING` while taking a capsule with

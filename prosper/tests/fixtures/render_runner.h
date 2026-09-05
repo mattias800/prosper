@@ -6074,6 +6074,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // rather than merely slows (#2253). Mirrors SharedBufferUpload::arena on the storage path.
         VkDeviceSize ioffset = 0;
         bool iarena = false;
+        // PROSPER_INDEX_ECHO diagnostic only: the host-visible address the index bytes were written
+        // to, so the record loop can read back exactly what the GPU will fetch from (v.ibuf,
+        // v.ioffset). Never read outside the diagnostic.
+        const void* imapped = nullptr;
         VkViewport viewport{};
         VkRect2D scissor{};
         float line_width = 1.0f;
@@ -6878,6 +6882,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     v.ibuf = islice.buffer;
                     v.ioffset = islice.offset;
                     v.iarena = true;
+                    v.imapped = static_cast<const uint8_t*>(islice.mapped) + islice.offset;
                     v.icount = (uint32_t)bd.indices.size();
                 }
             }
@@ -9330,6 +9335,49 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VkDeviceSize off = 0, sz = static_cast<VkDeviceSize>(geom_cap) * 16;
             p_bindxfb(cmd, 0, 1, &geom_buf, &off, &sz);
             p_beginxfb(cmd, 0, 0, nullptr, nullptr);
+        }
+        // PROSPER_INDEX_ECHO=1 (investigation instrument, #3374): the index bytes at exactly the
+        // (buffer, offset) pair about to be bound, against the indices prosper decoded for this draw,
+        // plus the draw parameters that decide the fetched range. It answers "is this draw about to
+        // ask for vertices outside its own vertex buffer" -- a draw that consumed another draw's index
+        // slice, or whose vertexOffset pushes gl_VertexIndex past the bound range, makes every vertex
+        // load return 0 under robustness, which is indistinguishable at the pixel from wrong vertex
+        // data and produces no Vulkan validation message either.
+        //
+        // SCOPE, stated narrowly. This reads the HOST mapping of the slice, not device memory, so a
+        // clean result retires "prosper computed or placed the wrong indices" and says nothing about
+        // what the GPU read back. `mismatched` compares the arena against the same vector the memcpy
+        // sourced from, so it cannot express a wrong DECODE either -- only a clobber between the copy
+        // and recording. The device-side question belongs to PROSPER_BUFFER_ECHO, which copies index
+        // slices back through the GPU; note that its `echo_count` starts at min(16, shared_buffers)
+        // and its index loop runs only while that is below 16, so at >=16 storage uploads -- which is
+        // every real frame; 346 of them here -- it echoes zero index slices (#3376). That gap is why
+        // this host-side reading was needed at all.
+        static const bool index_echo = getenv("PROSPER_INDEX_ECHO") != nullptr;
+        if (index_echo && v.icount) {
+            const std::vector<uint32_t>& want = draws[di].indices;
+            uint32_t want_max = 0;
+            for (uint32_t x : want) want_max = std::max(want_max, x);
+            std::fprintf(stderr,
+                         "[index-echo] draw=%zu icount=%u vcount=%u voff=%d inst=%u arena=%d "
+                         "ibuf=%p ioff=%llu want_n=%zu want_max=%u",
+                         di, v.icount, v.vcount, v.vertex_offset, v.instance_count, (int)v.iarena,
+                         (void*)v.ibuf, (unsigned long long)v.ioffset, want.size(), want_max);
+            if (v.imapped) {
+                const uint32_t* got = static_cast<const uint32_t*>(v.imapped);
+                uint32_t got_max = 0, mismatched = 0;
+                for (uint32_t k = 0; k < v.icount; k++) {
+                    got_max = std::max(got_max, got[k]);
+                    if (k < want.size() && got[k] != want[k]) ++mismatched;
+                }
+                std::fprintf(stderr, " got_max=%u mismatched=%u got[0..7]=", got_max, mismatched);
+                for (uint32_t k = 0; k < v.icount && k < 8; k++)
+                    std::fprintf(stderr, "%s%u", k ? "," : "", got[k]);
+            } else {
+                std::fprintf(stderr, " got=<dedicated buffer, unmapped>");
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
         }
         if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);

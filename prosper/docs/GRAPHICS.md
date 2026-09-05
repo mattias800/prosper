@@ -1402,6 +1402,114 @@ picture from run to run. Everything below was measured on master `406ff0fd`, Lin
   whether prosper is clean. #2945.
 
 
+### A DETERMINISTIC cross-implementation split, with a lavapipe positive control — and the four titles it covers (2026-09-05) — #3374
+
+The row above closes with *"the failing regime cannot be reproduced on this box at all"*. It can, on a
+different subject, and this one does not need a regime: **one captured frame, replayed offline, is
+wrong on RADV every single time and right on lavapipe every single time.**
+
+```bash
+# Capture (headless, no keyboard): the guard's own route, native scale, trigger the grab at t=90 s.
+PROSPER_RENDER=1 PROSPER_RENDER_SCALE=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_PAD_SCRIPT=@prosper/scripts/joe-mac/reach-gameplay.pad \
+PROSPER_CAPTURE_BUNDLE=<work>/frame.prgbundle \
+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=<work>/capture.ready \
+    screenshot <DUMP_ROOT>/PPSA02801-app0 --seconds 5 --count 25   # touch the trigger at t=90 s
+
+gpu_replay --bundle <work>/frame.prgbundle --bundle-extract-submit <N> <work>/submit.prgcap
+
+# THE A/B. Same binary, same capsule, same 88 operations. Only the ICD differs.
+gpu_replay <work>/submit.prgcap out_radv.bmp                          # sheared
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+gpu_replay <work>/submit.prgcap out_lvp.bmp                           # the level, correct
+```
+
+**Measured on `d38e892cc`, Linux / AMD Radeon 8060S (RADV STRIX_HALO), Mesa 26.1.4.** *New Joe & Mac*
+(`PPSA02801`): **25 of 25** RADV replays byte-identical to each other (`0ab3cfbe25…`), taken across
+both a heavily loaded window and a quiet one after a two-minute cool-down, and the lavapipe replay of
+the same capsule renders level 1 complete — twin palms, volcano, flower bank, Joe, the HUD with its
+score, health bar and lives counter. Reproduced the same way on *Asterix & Obelix: Slap Them All!*
+(`PPSA08576`), *Rugrats: Adventure in Gameland* (`PPSA23396`) and — a 3D scene at native 3840x2160,
+174 operations — *Summer Sports Games* (`PPSA03416`), whose javelin event comes back with its hoarding,
+takeoff zone, throw reticle and packed stands intact.
+
+**The RADV result does not move across driver versions.** The container runs Mesa **26.1.4** and the host
+Mesa **26.2.1**; the same binary on the same capsule returns the **byte-identical** broken frame on both
+(`0ab3cfbe25…`, 3 of 3 on the host). So a Mesa upgrade does not fix it, and — more usefully — a
+byte-identical result across two driver versions argues against a race and for something stable that both
+RADV versions resolve the same way.
+
+**What that settles for #3374, and what it deliberately does NOT.** Four of the five rung-6 Unity titles
+whose scene art arrives through large sheared triangles are **one defect rather than four separate
+ones**: the identical capsule
+carrying the identical decoded draws, indices, descriptors, uploads and recompiled SPIR-V produces the
+correct scene when a different Vulkan implementation executes it. Every prosper-side stage was
+independently checked on the RADV run and is clean — `PROSPER_BUFLOG` source words, `PROSPER_BUFVERIFY`
+(346 buffers, 0 mismatched), `PROSPER_BUFFER_ECHO` descriptor set/offset/range, and `PROSPER_INDEX_ECHO`
+(below) — and a full replay under `VK_LAYER_KHRONOS_validation`, proved loaded with `VK_LOADER_DEBUG=layer`,
+reports zero findings.
+
+**It does not assign the fault, and an earlier revision of this section did — read instrument trap 38.**
+A cross-implementation split *localises the disagreement*; it does not say who is wrong, and trap 38's own
+worked example is a lavapipe-versus-RADV split that turned out to be prosper's undefined behaviour. Both
+implementations execute **prosper's own recompiled SPIR-V**, so an implementation-defined or undefined
+construct in it produces exactly this picture, and the byte-identical agreement of two RADV versions is
+consistent with that reading as much as with a driver defect. What IS established is narrower and still
+worth a lot: the guest data, the PM4/index decode, resource realization, descriptors and uploads are not
+the cause, because they are the same bytes in the run that renders correctly. **The open fork is a RADV
+defect versus UB in the recompiled vertex stage, and the named next step is to audit that SPIR-V for
+implementation-defined constructs** — not to file upstream on the strength of the split alone. Note also
+that validation's zero findings cover neither synchronization hazards (not enabled on that run) nor an
+out-of-range read that robustness resolves.
+
+**The fifth title, *Evergate* (`PPSA01885`), is NOT covered by this** — which is why the heading says four.
+Its dominant symptom, a blown-out white/orange frame, **reproduces on lavapipe too**, so that part is
+prosper's; thin diagonal streaks over it are absent on lavapipe and do look like this defect, so it may
+carry both. Caveat on even that: its guard accelerates the opening (`PROSPER_RENDER_EVERY=500` for 90 s)
+and a native re-aim drops that, moving the timeline, so the captured frame is not confirmed to be the
+reviewed tutorial room. Treat Evergate as **unresolved**, not as excluded.
+
+**It is deterministic, which is why it is filed HERE and not as more of #2945.** #2945 is stochastic
+and load-triggered; this is 25 of 25 in both regimes, and no lever moves it: `PROSPER_NO_BACKEND_BUFFER_ARENA`,
+`PROSPER_NO_BACKEND_BUFFER_POOL` (together and separately), `PROSPER_NO_BACKEND_RESOURCE_SHARE`,
+`PROSPER_NO_BACKEND_PIPELINE_CACHE`, `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE`, `PROSPER_NO_MEMORY_POOL`,
+`PROSPER_BACKEND_BUFFER_ARENA_KB=262144`, and `RADV_DEBUG=syncshaders | zerovram | nocache`,
+`RADV_PERFTEST=nosam` all return the byte-identical broken frame.
+
+**Three RADV arms are VOID rather than negative, and this qualifies #2945's row too.** `RADV_DEBUG=llvm`,
+`nongg` and `nonggc` also return the byte-identical frame, but they change nothing to return it: with
+`shaderstats,nocache` forcing a fresh compile in both arms, the SGPR / VGPR / code-size lines are
+**md5-identical** to the default, and the driver's own output contains **zero** `ngg` tokens — so there
+is no NGG to disable and this Mesa (26.1.4 / 26.2.1) does not select an LLVM backend. #2945's list reads
+*"`RADV_DEBUG=llvm` failing rules out ACO; `nongg` failing rules out NGG"*; on this Mesa neither
+inference holds, because neither lever moves. Pair any RADV compile lever with `shaderstats,nocache` and
+show the stats differ before quoting a null from it. Its character matches
+#2937 — deterministic — rather than #2945's stochastic dropout. (#3371's own tests measured **stochastic**
+here, 3-8 failures of 24 runs, which matches #3371's own title and is the opposite of what the #2937 row
+above records; the title capsule is the deterministic subject, the tests are not.) Whether these share
+a cause is open.
+
+**`PROSPER_INDEX_ECHO=1`** (new, `tests/fixtures/render_runner.h`) is what retired **prosper's half** of
+the index family at title scale. It reads the index bytes back from the host-visible memory at exactly the
+`(buffer, offset)` pair about to be bound and compares them against the indices prosper decoded, printing
+`icount`, `vcount`, `vertexOffset`, `instanceCount`, arena/dedicated, `want_max` and `got_max`. On the
+Joe & Mac frame: 85 indexed draws, `mismatched=0` on every one, `got_max < vcount` on every one, `voff=0`,
+`inst=1` — and the last two matter, because the in-range verdict is `got_max + vertexOffset < vcount` and
+only `voff=0` makes the printed comparison the whole of it. `PROSPER_BUFLOG` and `PROSPER_BUFVERIFY` look
+at STORAGE buffers and cannot see any of it, and an out-of-range storage read is `robustBufferAccess`
+rather than a validation error.
+**Scope, because the obvious reading is stronger than the instrument.** It reads the **host** mapping, not
+device memory, so a clean result retires *"prosper computed or placed the wrong indices"* and says
+**nothing about what the GPU read back**; `mismatched` compares the arena against the same vector the
+memcpy sourced from, so it cannot express a wrong decode either. The device-side question is
+`PROSPER_BUFFER_ECHO`'s — which copies index slices back through the GPU and never fires, because its
+16-slice budget is spent on storage buffers first (#3376). That gap is why the host-side reading was
+needed.
+
+**Do not use `PROSPER_GEOM_PROBE` on these capsules.** Its per-draw verdicts contradict the pixels —
+see instrument trap 266. The `--draw-steps` per-operation contribution is the instrument that held.
+
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct
