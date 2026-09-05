@@ -2484,6 +2484,20 @@ HLE(s_avp_jumptotime) {
     // So publishing synchronously is never worse than the status quo for any importer, and is
     // strictly better for the ones whose join can store it. That is the claim this code makes.
     //
+    // SCOPE THE BOUND PRECISELY, because it is narrower than it first reads: it is about the WAIT.
+    // An edge-triggered join loses the wake, and the guest then waits out the timeout it already
+    // pays today -- but losing the wake does NOT stop the callback BODY from running, and that body
+    // is demonstrably not inert. PPSA25009's handler dispatches three warning codes at
+    // eboot+0x13e4a53 and its 0x806a00a3 arm at +0x13e4b5e walks a per-stream table doing real work.
+    // So side effects inside an edge-triggered guest's callback are OUTSIDE this bound and remain
+    // the open residual, which is the same one the PR body records: nobody can say from prosper's
+    // code what any of the other importers' handlers do with a notification they have never had.
+    //
+    // Re-entrancy is outside the bound too, and separately covered rather than overlooked: prosper
+    // has always fired guest callbacks synchronously from HLE entry points (see :2360 and :2378,
+    // sceAvPlayerPause and sceAvPlayerResume), and PPSA17337's own pause -> jump -> resume sequence
+    // already re-enters twice per seek on the pre-existing paths.
+    //
     // Publishing here also keeps the notification ordered strictly after the reposition it reports,
     // which a deferred worker could not guarantee. (Population measured in review of #3348.)
     const uint32_t seek_complete = AVP_WARNING_SEEK_COMPLETE;
