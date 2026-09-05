@@ -2448,12 +2448,19 @@ HLE(s_avp_jumptotime) {
     // event callback's warning channel, and until it hears that it is entitled to sit in its own
     // wait. Published outside g_avp_mx, like every other event -- the callback re-enters AvPlayer HLE.
     //
-    // Deliberately synchronous rather than deferred to a worker. The real player's notification is
-    // asynchronous, but the observed guests arm their wait slot BEFORE calling this
-    // (PPSA17337: eboot+0x15400b8, one instruction group before the call at +0x15400c2) and their
-    // wait is a counting semaphore, so a notification that arrives during the call is not lost -- it
-    // is decremented straight through with no sleep. Publishing it here also keeps the notification
-    // ordered strictly after the reposition it reports, which a worker could not guarantee.
+    // Deliberately synchronous rather than deferred to a worker, and the reason is stronger than
+    // "the guests happen to arm first". They do -- PPSA17337 writes its awaited code at
+    // eboot+0x15400b8, one instruction group before the call at +0x15400c2 -- but that is two titles
+    // observed, not a contract, so it is not what this rests on.
+    //
+    // What makes an early notification safe is that the join is a COUNTING semaphore, not an edge.
+    // The guest's callback posts with `lock xadd` at eboot+0x153f041, and its waiter decrements the
+    // same counter and only sleeps when the pre-decrement value was <= 0. So a post that lands
+    // before the wait is *stored*: the waiter decrements a positive count and proceeds without
+    // sleeping. Publishing here therefore cannot lose the notification even for a guest that arms
+    // its slot AFTER the call returns, which a deferred worker could not promise. Publishing here
+    // also keeps the notification ordered strictly after the reposition it reports.
+    // (Mechanism identified in review of #3348.)
     const uint32_t seek_complete = AVP_WARNING_SEEK_COMPLETE;
     avp_fire_data(ev_obj, ev_cb, AVP_WARNING_ID, 0, &seek_complete);
     if (avp_log()) fprintf(stderr, "[avp] jump-to-time handle=0x%llx target=%llu ms -> ok\n",

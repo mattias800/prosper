@@ -44,8 +44,11 @@ against the current boot, which is its own reviewed baseline change.
 
 ### A wall-clock-anchored guard measures a TIMELINE as much as a picture
 
-`terminator-boot` above is the recorded instance, but it is not a special case, and reading it as one
-costs the next lane a session. Every guard here anchors its evidence window on **wall-clock seconds**
+**Measured across the whole matrix in #3350: all 17 guards carry
+`capture_after_seconds`/`capture_before_seconds`, and not one is event-, flip- or content-anchored.**
+So this is not a property of a few entries — the entire release-time regression inventory asks "what
+is on screen between second X and second Y". `terminator-boot` below is the previously recorded
+instance, but it is not a special case, and reading it as one costs the next lane a session. Every guard here anchors its evidence window on **wall-clock seconds**
 from launch, and its route drives input on wall-clock seconds too. So the window does not ask "is the
 title drawing the reviewed scene?" — it asks "is the title drawing the reviewed scene **at second
 N**?", and those come apart the moment anything changes how long the boot takes.
