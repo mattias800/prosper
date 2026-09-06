@@ -2081,6 +2081,34 @@ struct VulkanComputeContext {
         }
     }
 
+    void update_image_source_snapshot_layers(CachedComputeImage& cached,
+                                             const uint8_t* source, size_t bytes,
+                                             uint32_t depth, uint64_t written_layers_mask,
+                                             size_t layer_stride, size_t slice_bytes) {
+        if (!source || !bytes) return;
+        if (cached.source_snapshot.size() != bytes || depth <= 1 || depth > 64 ||
+            written_layers_mask == ~0ULL || layer_stride == 0 || slice_bytes == 0) {
+            remember_image_source_snapshot(
+                cached, source, bytes, true, SnapshotReason::ReadModifyWrite);
+            return;
+        }
+        size_t copied = 0;
+        for (uint32_t layer = 0; layer < depth && layer < 64; ++layer) {
+            if (!(written_layers_mask & (1ULL << layer))) continue;
+            const size_t offset = layer_stride * layer;
+            if (offset + slice_bytes <= bytes) {
+                std::memcpy(cached.source_snapshot.data() + offset, source + offset, slice_bytes);
+                copied += slice_bytes;
+            }
+        }
+        ++image_source_snapshot_copies;
+        image_source_snapshot_bytes += copied;
+        ++storage_result_snapshot_copies;
+        storage_result_snapshot_bytes += copied;
+        ++snapshot_reason_rmw_copies;
+        snapshot_reason_rmw_bytes += copied;
+    }
+
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
@@ -2937,7 +2965,11 @@ struct VulkanComputeContext {
                                       bool result_unchanged = false,
                                       bool source_snapshot_required = true,
                                       bool compute_transfer_watch = false,
-                                      bool retain_export_watch = false) {
+                                      bool retain_export_watch = false,
+                                      uint32_t array_depth = 1,
+                                      uint64_t written_layers_mask = ~0ULL,
+                                      size_t layer_stride = 0,
+                                      size_t slice_bytes = 0) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
@@ -2971,10 +3003,17 @@ struct VulkanComputeContext {
         if (source_snapshot_required) {
             // Read/modify/write and partial storage targets still need the ordinary exact source
             // contract because their prior guest bytes are observable by the next dispatch.
-            if (current_source)
-                remember_image_source_snapshot(
-                    cached, current_source, key.guest_bytes, true,
-                    SnapshotReason::ReadModifyWrite);
+            if (current_source) {
+                if (array_depth > 1 && written_layers_mask != ~0ULL) {
+                    update_image_source_snapshot_layers(
+                        cached, current_source, key.guest_bytes, array_depth,
+                        written_layers_mask, layer_stride, slice_bytes);
+                } else {
+                    remember_image_source_snapshot(
+                        cached, current_source, key.guest_bytes, true,
+                        SnapshotReason::ReadModifyWrite);
+                }
+            }
             if (cached.write_watch && cached.write_watch.rearm()) return;
             cached.write_watch.reset();
             return;
@@ -3500,6 +3539,7 @@ struct BoundImage {
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
     bool near_full_coverage = false;    // >= 99.8% written post-processing target (cutouts like minimap)
+    bool near_full_retained_export = false; // near-full target bypassing seed upload when retained
     uint64_t written_layers_mask = ~0ULL; // bitmask of touched array layers (depth <= 64)
     bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
     bool write_skip = false;            // untouched storage image: unwritten and unread; skip staging, readback, and writeback
@@ -8217,12 +8257,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.dcc_metadata && bi.dcc_metadata_bytes,
                         bi.alias_of == SIZE_MAX,
                     });
+                static const bool skip_export_writeback_enabled =
+                    std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
+                const bool near_full_export_eligible = bi.near_full_coverage &&
+                    skip_export_writeback_enabled && bi.graphics_sampled_usage && !bi.poison_verify &&
+                    !bi.mirror_result_to_imported;
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
+                    const bool source_snapshot_req = (!bi.seed_skip && !near_full_export_eligible) ||
+                        !adaptive_storage_result_validation_enabled();
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped,
-                        !bi.seed_skip || !adaptive_storage_result_validation_enabled());
+                        source_snapshot_req);
                     if (bi.persistent && bi.exact_result_bytes <= max_gpu_compare_image_bytes())
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
@@ -8235,6 +8282,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms = std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
+                bi.near_full_retained_export = bi.persistent && near_full_export_eligible;
                 transfer_gate_census.record_storage_cache(
                     transfer_gate_observation.role, *r, bi.binding,
                     storage_cache_gates,
@@ -8257,8 +8305,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms += std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
-                if (!(bi.persistent && bi.upload_skipped)) {
-                const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
+                if (!(bi.persistent && (bi.upload_skipped || bi.near_full_retained_export))) {
+                const size_t linear_size = (bi.seed_skip || bi.near_full_retained_export || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
                 // Pooled, not freshly allocated: a 4K RGBA16F seed is 63.3 MiB, which is past
                 // glibc's 32 MiB mmap threshold, so a per-dispatch allocation is an mmap, a page
@@ -8284,9 +8332,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      r->tile_mode, static_cast<uint32_t>(guest_texel)));
                 }
                 const uint8_t* unpack_source = nullptr;
-                if (bi.seed_skip) {
-                    // #1122: write-only full-coverage target -- the shader overwrites every texel, so
-                    // the image is created but never seeded, uploaded, or read. Nothing to fill.
+                if (bi.seed_skip || bi.near_full_retained_export) {
+                    // #1122: write-only full-coverage target or near-full retained export --
+                    // the retained GPU image is already valid or will be overwritten.
+                    // No seed upload needed.
                 } else if (bi.seed_from_imported != SIZE_MAX) {
                     // The command buffer copies the renderer's exact native image into this target.
                     // Staging remains allocated because the result still has to be read back below.
@@ -9760,7 +9809,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      nullptr, 2, ready);
                 continue;
             }
-            if (bi.persistent && (bi.upload_skipped || bi.seed_skip)) {
+            if (bi.persistent && (bi.upload_skipped || bi.seed_skip || bi.near_full_retained_export)) {
                 // The previous synchronous dispatch left this read-only sampled image in GENERAL,
                 // and either the guest source is unchanged or the proven-full shader cannot observe
                 // that source. No transfer or layout transition is needed.
@@ -10738,6 +10787,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (bi.resource && bi.resource->gpu_addr) {
                     notify_guest_gpu_write_preserving_bytes(bi.resource->gpu_addr, bi.guest_bytes);
                 }
+                ctx.validate_cached_image_source_from_compute_transfer(bi.cache_key);
                 continue;
             }
             const auto image_writeback_start = ComputeClock::now();
@@ -11223,11 +11273,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Guest bytes now mirror the retained image again. A changing full-overwrite
                     // target needs no source snapshot; the first repeated result retains one exact
                     // baseline, and subsequent identical GPU skips do not recopy it.
+                    const size_t linear_slice = (array_image && r->depth > 1)
+                        ? (static_cast<size_t>(r->width) * r->height * guest_texel) : 0;
+                    const size_t selected_slice = (array_image && r->depth > 1)
+                        ? (r->in_mip_tail
+                               ? r->mip_tail_bytes
+                               : (r->tile_mode
+                                      ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                            static_cast<uint32_t>(guest_texel))
+                                      : (r->layer_stride_bytes
+                                             ? linear_array_surface_bytes(
+                                                   *r, static_cast<uint32_t>(guest_texel))
+                                             : linear_slice)))
+                        : 0;
+                    const size_t layer_stride = (array_image && r->depth > 1)
+                        ? (r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice) : 0;
                     ctx.validate_cached_image_source(
                         bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
                         bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
                             native_3d_transfer_enabled(),
-                        bi.graphics_sampled_usage && bi.exact_storage_bytes());
+                        bi.graphics_sampled_usage && bi.exact_storage_bytes(),
+                        r->depth, bi.written_layers_mask, layer_stride, selected_slice);
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,
