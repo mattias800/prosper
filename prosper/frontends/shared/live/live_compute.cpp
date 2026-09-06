@@ -11961,10 +11961,12 @@ uint64_t live_compute_graphics_import_guest_bytes(
     if (r16_cube_array_alias)
         return prosper::gpu::gpu_capture_resource_footprint(sampled_resource);
     if (decoded_source_bytes) return decoded_source_bytes;
-    if ((components == 1u || components == 2u || components == 4u) &&
-        (sampled_resource.format == DataFormat::Uint16 ||
-         sampled_resource.format == DataFormat::Unorm16 ||
-         sampled_resource.format == DataFormat::Float16))
+    if (live_compute_graphics_import_native_format(sampled_resource.format, components) !=
+            static_cast<uint32_t>(VK_FORMAT_UNDEFINED) ||
+        ((components == 1u || components == 2u || components == 4u) &&
+         (sampled_resource.format == DataFormat::Uint16 ||
+          sampled_resource.format == DataFormat::Unorm16 ||
+          sampled_resource.format == DataFormat::Float16)))
         return prosper::gpu::gpu_capture_resource_footprint(sampled_resource);
     return 0;
 }
