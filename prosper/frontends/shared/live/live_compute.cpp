@@ -3671,40 +3671,52 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
     auto defaults = [&](uint32_t* o) { o[0] = o[1] = o[2] = 0; o[3] = alpha_default; };
     switch (f) {
         case DF::Unorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) { float v = p[c] / 255.0f; std::memcpy(&o[c], &v, 4); }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) { float v = p[c] / 255.0f; std::memcpy(&o[c], &v, 4); }
+                    }
+                });
             return;
         case DF::Unorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t raw = static_cast<uint16_t>(p[c * 2] |
-                        (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
-                    const float v = raw / 65535.0f; std::memcpy(&o[c], &v, 4);
-                }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const uint16_t raw = static_cast<uint16_t>(p[c * 2] |
+                                (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
+                            const float v = raw / 65535.0f; std::memcpy(&o[c], &v, 4);
+                        }
+                    }
+                });
             return;
         case DF::Snorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    const float v = std::max(static_cast<int8_t>(p[c]) / 127.0f, -1.0f);
-                    std::memcpy(&o[c], &v, 4);
-                }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const float v = std::max(static_cast<int8_t>(p[c]) / 127.0f, -1.0f);
+                            std::memcpy(&o[c], &v, 4);
+                        }
+                    }
+                });
             return;
         case DF::Snorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    const int16_t raw = static_cast<int16_t>(p[c * 2] |
-                        (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
-                    const float v = std::max(raw / 32767.0f, -1.0f);
-                    std::memcpy(&o[c], &v, 4);
-                }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const int16_t raw = static_cast<int16_t>(p[c * 2] |
+                                (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
+                            const float v = std::max(raw / 32767.0f, -1.0f);
+                            std::memcpy(&o[c], &v, 4);
+                        }
+                    }
+                });
             return;
         case DF::Float16:
             if (n == 4 && src_stride == 8) {
@@ -3723,43 +3735,93 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
                     }
                 });
             return;
+        case DF::Float10_11_11:
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        uint32_t packed = 0; std::memcpy(&packed, src + t * src_stride, sizeof(packed));
+                        const float values[3] = {
+                            prosper::gpu::f11_to_float(static_cast<uint16_t>(packed)),
+                            prosper::gpu::f11_to_float(static_cast<uint16_t>(packed >> 11)),
+                            prosper::gpu::f10_to_float(static_cast<uint16_t>(packed >> 22))
+                        };
+                        uint32_t* o = out + t * 4;
+                        for (uint32_t c = 0; c < 3; ++c) std::memcpy(&o[c], &values[c], sizeof(values[c]));
+                        o[3] = one_f32;
+                    }
+                });
+            return;
+        case DF::Unorm2_10_10_10:
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        uint32_t packed = 0; std::memcpy(&packed, src + t * src_stride, sizeof(packed));
+                        const float values[4] = {
+                            ((packed >>  0) & 0x3ffu) / 1023.0f,
+                            ((packed >> 10) & 0x3ffu) / 1023.0f,
+                            ((packed >> 20) & 0x3ffu) / 1023.0f,
+                            ((packed >> 30) & 0x3u)   / 3.0f
+                        };
+                        uint32_t* o = out + t * 4;
+                        for (uint32_t c = 0; c < 4; ++c) std::memcpy(&o[c], &values[c], sizeof(values[c]));
+                    }
+                });
+            return;
         case DF::Uint8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) o[c] = p[c];
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) o[c] = p[c];
+                    }
+                });
             return;
         case DF::Sint8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c)
-                    o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(p[c])));
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(p[c])));
+                    }
+                });
             return;
         case DF::Uint16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c)
-                    o[c] = static_cast<uint32_t>(p[c * 2] | (p[c * 2 + 1] << 8));
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = static_cast<uint32_t>(p[c * 2] | (p[c * 2 + 1] << 8));
+                    }
+                });
             return;
         case DF::Sint16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c)
-                    o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
-                        p[c * 2] | (p[c * 2 + 1] << 8))));
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
+                                p[c * 2] | (p[c * 2 + 1] << 8))));
+                    }
+                });
             return;
         case DF::Float32: case DF::Uint32: case DF::Sint32:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) std::memcpy(&o[c], p + c * 4, 4);
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) std::memcpy(&o[c], p + c * 4, 4);
+                    }
+                });
             return;
         default:                                  // packed formats keep the general per-texel path
-            for (size_t t = 0; t < count; ++t)
-                storage_unpack_texel(src + t * src_stride, f, ncomp, out + t * 4);
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t)
+                        storage_unpack_texel(src + t * src_stride, f, ncomp, out + t * 4);
+                });
             return;
     }
 }
@@ -3789,32 +3851,41 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
                 });
             return;
         case DF::Unorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t raw = storage_pack_unorm16(in[c]);
-                    p[c * 2] = static_cast<uint8_t>(raw);
-                    p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
-                }
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const uint16_t raw = storage_pack_unorm16(in[c]);
+                            p[c * 2] = static_cast<uint8_t>(raw);
+                            p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Snorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c)
-                    p[c] = static_cast<uint8_t>(storage_pack_snorm<int8_t>(in[c], 127));
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c)
+                            p[c] = static_cast<uint8_t>(storage_pack_snorm<int8_t>(in[c], 127));
+                    }
+                });
             return;
         case DF::Snorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t raw = static_cast<uint16_t>(
-                        storage_pack_snorm<int16_t>(in[c], 32767));
-                    p[c * 2] = static_cast<uint8_t>(raw);
-                    p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
-                }
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const uint16_t raw = static_cast<uint16_t>(
+                                storage_pack_snorm<int16_t>(in[c], 32767));
+                            p[c * 2] = static_cast<uint8_t>(raw);
+                            p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Float16:
             if (n == 4 && dst_stride == 8) {
@@ -3835,30 +3906,74 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
                     }
                 });
             return;
+        case DF::Float10_11_11:
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4;
+                        float values[3];
+                        for (uint32_t c = 0; c < 3; ++c) std::memcpy(&values[c], &in[c], sizeof(values[c]));
+                        const uint32_t packed = static_cast<uint32_t>(prosper::gpu::float_to_f11(values[0])) |
+                                                (static_cast<uint32_t>(prosper::gpu::float_to_f11(values[1])) << 11) |
+                                                (static_cast<uint32_t>(prosper::gpu::float_to_f10(values[2])) << 22);
+                        std::memcpy(dst + t * dst_stride, &packed, sizeof(packed));
+                    }
+                });
+            return;
+        case DF::Unorm2_10_10_10:
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    auto q = [](const uint32_t bits, float scale) -> uint32_t {
+                        float v; std::memcpy(&v, &bits, 4);
+                        v = !(v > 0.0f) ? 0.0f : (v > 1.0f ? 1.0f : v);
+                        return static_cast<uint32_t>(v * scale + 0.5f);
+                    };
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4;
+                        const uint32_t packed = (q(in[0], 1023.0f) & 0x3ffu)        |
+                                                ((q(in[1], 1023.0f) & 0x3ffu) << 10) |
+                                                ((q(in[2], 1023.0f) & 0x3ffu) << 20) |
+                                                ((q(in[3], 3.0f)    & 0x3u)   << 30);
+                        std::memcpy(dst + t * dst_stride, &packed, sizeof(packed));
+                    }
+                });
+            return;
         case DF::Uint8: case DF::Sint8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
+                    }
+                });
             return;
         case DF::Uint16: case DF::Sint16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    p[c * 2] = static_cast<uint8_t>(in[c]);
-                    p[c * 2 + 1] = static_cast<uint8_t>(in[c] >> 8);
-                }
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            p[c * 2] = static_cast<uint8_t>(in[c]);
+                            p[c * 2 + 1] = static_cast<uint8_t>(in[c] >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Float32: case DF::Uint32: case DF::Sint32:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) std::memcpy(p + c * 4, &in[c], 4);
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) std::memcpy(p + c * 4, &in[c], 4);
+                    }
+                });
             return;
         default:                                  // packed formats keep the general per-texel path
-            for (size_t t = 0; t < count; ++t)
-                storage_pack_texel(channels + t * 4, f, ncomp, dst + t * dst_stride);
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t)
+                        storage_pack_texel(channels + t * 4, f, ncomp, dst + t * dst_stride);
+                });
             return;
     }
 }
@@ -6813,13 +6928,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // emitted as float after the frontend's physical-device feature query.
             bi.native_float_storage = spirv_native_float_storage;
             bi.native_uint_storage = spirv_native_uint_storage;
+            const VkFormat query_storage_format = bi.packed_r11_storage
+                ? VK_FORMAT_R32_UINT : native_storage_format;
             bi.graphics_sampled_usage =
                 (bi.native_float_storage || bi.native_uint_storage ||
                  bi.packed_r11_storage) &&
                 (ordinary_2d_view || ordinary_3d_storage ||
                  (native_2d_storage && image_descriptors[i].image_arrayed)) &&
                 native_storage_image_create_supported(
-                    ctx.physical, native_storage_format, native_storage_type,
+                    ctx.physical, query_storage_format, native_storage_type,
                     r->width, r->height, ordinary_3d_storage ? r->depth : 1u,
                     native_2d_storage && image_descriptors[i].image_arrayed
                         ? r->depth : 1u,
