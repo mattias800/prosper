@@ -22,4 +22,15 @@ std::vector<uint32_t> build_compute_scale_bias(float scale, float bias);
 // component equality, while binding 1 becomes the next exact baseline.
 std::vector<uint32_t> build_compute_compare_uvec4();
 
+// Fused 2D tile27 RGBA16F detiling and exact half_to_unorm8 quantization.
+// Binding 0: width, face height, padded face stride in uints, total texel count,
+// then 16 packed equation words and independent padded faces. Binding 1: one
+// packed RGBA8 uint per output texel. Local size 128; no optional numeric features.
+// The caller must validate nonzero dimensions, count = width*height*face_count,
+// stride covering each complete padded 128x64/64KiB block footprint, and all
+// source/output word indices fitting both their buffer ranges and uint32_t.
+// Input and output must not overlap; input remains immutable until execution
+// completes. Only excess invocations are checked by the shader itself.
+std::vector<uint32_t> build_compute_detile_rgba16f();
+
 } // namespace prosper::gpu

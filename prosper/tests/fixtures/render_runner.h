@@ -8,6 +8,7 @@
 #include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
+#include "gpu_detile_upload.h"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
@@ -125,6 +126,9 @@ struct FrameResource {
     // zero-initialized 64 KiB allocation shared across ordered render calls.
     bool is_internal_gds = false;
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
+    // Immutable tiled snapshot plus conversion resources; the submission retains
+    // this owner through completion. Never interpreted as CPU RGBA pixels.
+    std::shared_ptr<GpuDetileUpload> gpu_detile;
     // Readable byte span behind tex_rgba. Zero preserves the historical single-sample fixture
     // contract; multisample plane uploads require an explicit full span and reject before Vulkan.
     size_t tex_byte_size = 0;
@@ -240,7 +244,7 @@ struct FrameResource {
         return dwords_view && dwords_view_count ? dwords_view_count : dwords.size();
     }
     bool is_texture() const {
-        return tex_rgba != nullptr || has_uniform_color || persistent_render_target_id != 0 ||
+        return tex_rgba != nullptr || gpu_detile || has_uniform_color || persistent_render_target_id != 0 ||
                persistent_depth_target_id != 0 || borrowed_compute_image != nullptr;
     }
     // Per-entry payloads for a RUNTIME-SELECTED descriptor array (#2412 stage 5). Empty -- the only
@@ -463,6 +467,19 @@ inline bool backend_texture_array_span_valid(const FrameResource& resource) {
 }
 
 inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
+    if (resource.gpu_detile) {
+        const auto& upload = *resource.gpu_detile;
+        return !resource.tex_rgba && !resource.is_storage_image &&
+               !resource.has_uniform_color && !resource.persistent_texture_id &&
+               !resource.persistent_render_target_id && !resource.persistent_depth_target_id &&
+               !resource.borrowed_compute_image && resource.img_dim == 3 &&
+               resource.sample_count == 1 && resource.td == 1 &&
+               resource.declared_mip_levels == 1 && upload.faces == 6 &&
+               resource.tw == upload.width && uint64_t(resource.th) == uint64_t(upload.height) * 6 &&
+               resource.texture_format == VK_FORMAT_R8G8B8A8_UNORM &&
+               upload.program && upload.program->pipeline && upload.input && upload.output &&
+               upload.descriptors;
+    }
     if (resource.sample_count == 1u) return true;
     if (resource.img_dim == 5u) return backend_texture_array_span_valid(resource);
     if (resource.sample_count != 4u || resource.img_dim != 6u || resource.td != 1u ||
@@ -559,6 +576,10 @@ struct BackendTextureUploadStats {
     size_t references = 0;
     size_t unique_uploads = 0;
     uint64_t upload_bytes = 0;
+    size_t gpu_detile_dispatches = 0;
+    // Raw bytes consumed by these conversions, separate from final RGBA8 image
+    // copies above. A reused immutable input is not a fresh CPU upload.
+    uint64_t gpu_detile_source_bytes = 0;
     size_t persistent_hits = 0;
     size_t persistent_misses = 0;
     uint64_t persistent_cached_bytes = 0;
@@ -1110,6 +1131,11 @@ struct RenderVkCtx {
     uint32_t max_compute_workgroup_subgroups = 0;
     uint32_t max_compute_workgroup_size_x = 0;
     uint32_t max_compute_workgroup_invocations = 0;
+    VkPhysicalDeviceLimits detile_limits{};
+    bool queue_supports_compute = false;
+    // Same intentional process lifetime as the device; creation is protected by
+    // BackendPersistentResourceGuard, including frontend preflight calls.
+    mutable GpuDetilePipeline* detile_pipeline = nullptr;
     VkShaderStageFlags required_subgroup_size_stages = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
@@ -1363,6 +1389,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
         r.max_compute_workgroup_size_x = phys_props.limits.maxComputeWorkGroupSize[0];
         r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;
+        r.detile_limits = phys_props.limits;
         r.storage_buffer_alignment = std::max<VkDeviceSize>(
             1, phys_props.limits.minStorageBufferOffsetAlignment);
         r.timestamp_period_ns = phys_props.limits.timestampPeriod;
@@ -1579,6 +1606,12 @@ inline const RenderVkCtx& render_vk_ctx() {
         // (#1091). Only the features compute needs are advertised; it declines the shared context if
         // they are missing and creates its own device exactly as before. Graphics and compute run
         // strictly sequentially on one thread, so sharing the queue needs no extra synchronization.
+        uint32_t queue_family_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &queue_family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &queue_family_count, queue_families.data());
+        r.queue_supports_compute = r.qfi < queue_families.size() &&
+            (queue_families[r.qfi].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
         if (!std::getenv("PROSPER_NO_SHARED_VULKAN_DEVICE")) {
             prosper::gpu::SharedVulkanContext shared;
             shared.instance = r.inst;
@@ -1613,13 +1646,7 @@ inline const RenderVkCtx& render_vk_ctx() {
             shared.max_compute_workgroup_size_x = r.max_compute_workgroup_size_x;
             shared.max_compute_workgroup_invocations =
                 r.max_compute_workgroup_invocations;
-            uint32_t queue_family_count = 0;
-            vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &queue_family_count, nullptr);
-            std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
-            vkGetPhysicalDeviceQueueFamilyProperties(
-                r.phys, &queue_family_count, queue_families.data());
-            shared.compute_queue_supported = r.qfi < queue_families.size() &&
-                (queue_families[r.qfi].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+            shared.compute_queue_supported = r.queue_supports_compute;
             const auto add_native_storage_format = [&](prosper::gpu::DataFormat format,
                                                        uint32_t components,
                                                        VkFormat vk_format) {
@@ -1672,6 +1699,23 @@ inline const RenderVkCtx& render_vk_ctx() {
     }();
     published_render_cache_context().store(&c, std::memory_order_release);
     return c;
+}
+
+inline std::shared_ptr<GpuDetileUpload> prepare_render_gpu_detile(
+    uint32_t width, uint32_t height, uint32_t faces, uint64_t guest_base,
+    uint64_t face_stride, uint64_t mip_offset,
+    const std::function<size_t(uint8_t*, uint64_t, size_t)>& copy_source) {
+    BackendPersistentResourceGuard guard;
+    const auto& ctx = render_vk_ctx();
+    if (!ctx.ok || !ctx.queue_supports_compute) return {};
+    if (!ctx.detile_pipeline) {
+        auto program = std::make_unique<GpuDetilePipeline>();
+        if (!program->initialize(ctx.dev)) return {};
+        ctx.detile_pipeline = program.release(); // lifetime matches the retained device
+    }
+    return prepare_gpu_detile_upload(*ctx.detile_pipeline, ctx.phys, ctx.detile_limits,
+                                     width, height, faces, guest_base, face_stride,
+                                     mip_offset, copy_source);
 }
 
 // Explicit snapshot for frontends that use _Exit. Do not initialize a renderer during shutdown
@@ -5376,6 +5420,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const BackendPersistentResourceGuard persistent_resource_guard;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
+    for (const auto& draw : draws)
+        for (const auto& resource : draw.R)
+            if (resource.gpu_detile &&
+                (resource.gpu_detile->device != ctx.dev ||
+                 resource.gpu_detile->program->device != ctx.dev)) return out;
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
@@ -6441,6 +6490,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
         bool storage_image = false;
         std::array<uint32_t, 4> uniform_color_bits{};
+        const GpuDetileUpload* gpu_detile = nullptr;
         bool operator==(const TextureUploadKey& other) const {
             return pixels == other.pixels && render_target_id == other.render_target_id &&
                    borrowed_compute_image == other.borrowed_compute_image &&
@@ -6448,12 +6498,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    img_dim == other.img_dim && sample_count == other.sample_count &&
                    mip_levels == other.mip_levels &&
                    format == other.format && storage_image == other.storage_image &&
-                   uniform_color_bits == other.uniform_color_bits;
+                   uniform_color_bits == other.uniform_color_bits && gpu_detile == other.gpu_detile;
         }
     };
     struct TextureUploadKeyHash {
         size_t operator()(const TextureUploadKey& key) const {
             size_t h = std::hash<const uint8_t*>{}(key.pixels);
+            h ^= std::hash<const GpuDetileUpload*>{}(key.gpu_detile) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= std::hash<uint64_t>{}(key.render_target_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= std::hash<void*>{}(key.borrowed_compute_image) +
                  0x9e3779b9u + (h << 6) + (h >> 2);
@@ -6477,6 +6528,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
         void* staging_mapped = nullptr;   // #3405: retained with the block, never unmapped here
+        std::shared_ptr<GpuDetileUpload> gpu_detile;
         uint64_t persistent_id = 0;
         uint64_t persistent_version = 0;
         VkDeviceSize image_bytes = 0;
@@ -7851,7 +7903,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         r.borrowed_compute_image,
                         r.tw, r.th, r.td, r.img_dim, r.sample_count,
                         tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image,
-                        uniform_color_bits};
+                        uniform_color_bits, r.gpu_detile.get()};
                     size_t upload_index = SIZE_MAX;
                     if (share_texture_uploads) {
                         auto found = texture_upload_indices.find(texture_key);
@@ -8088,7 +8140,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             // copy site). A CPU box filter here was the first implementation and
                             // collapsed titles that re-upload large mip-eligible textures per frame
                             // (Evergate's title froze the publish rate — snapshot-gate catch).
-                            if (r.has_uniform_color) {
+                            if (r.gpu_detile) {
+                                upload.gpu_detile = r.gpu_detile;
+                            } else if (r.has_uniform_color) {
                                 upload.uniform_clear = true;
                                 std::copy(r.uniform_color.begin(), r.uniform_color.end(),
                                           upload.uniform_color.float32);
@@ -8814,10 +8868,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips &&
+        if (!upload.staging && !upload.gpu_detile && !upload.uniform_clear && !upload.assembled_target_mips &&
             !upload.feedback_snapshot)
             continue;
         ++texture_stats.unique_uploads;
+        if (upload.gpu_detile) {
+            ++texture_stats.gpu_detile_dispatches;
+            texture_stats.gpu_detile_source_bytes += upload.gpu_detile->source_bytes;
+        }
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
                                       upload.key.depth * upload.key.sample_count *
                                       backend_color_bytes_per_pixel(upload.key.format);
@@ -9105,9 +9163,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips &&
+        if (!upload.staging && !upload.gpu_detile && !upload.uniform_clear && !upload.assembled_target_mips &&
             !upload.stacked_compute && !upload.feedback_snapshot)
             continue;  // exact-validated persistent image already has shader-read layout
+        if (upload.gpu_detile) upload.gpu_detile->record(cmd);
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = upload.persistent_refresh
             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
@@ -9224,7 +9283,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
                                    upload.key.sample_count};
             tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
-            vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
+            vkCmdCopyBufferToImage(cmd, upload.gpu_detile ? upload.gpu_detile->output : upload.staging, upload.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
         }
         if (upload.assembled_target_mips) {
@@ -11271,6 +11330,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         aggregate_textures.references += textures.references;
         aggregate_textures.unique_uploads += textures.unique_uploads;
         aggregate_textures.upload_bytes += textures.upload_bytes;
+        aggregate_textures.gpu_detile_dispatches += textures.gpu_detile_dispatches;
+        aggregate_textures.gpu_detile_source_bytes += textures.gpu_detile_source_bytes;
         aggregate_textures.persistent_hits += textures.persistent_hits;
         aggregate_textures.persistent_misses += textures.persistent_misses;
         aggregate_textures.persistent_cached_bytes = textures.persistent_cached_bytes;

@@ -772,6 +772,7 @@ struct DecodedTexture {
     // renderer had exactly one assignment to fr.tex_byte_size in the whole file, on the MSAA path.
     // So every array served from cache arrived claiming zero readable bytes and was rejected.
     size_t pixels_bytes = 0;
+    std::shared_ptr<prosper::test::GpuDetileUpload> gpu_detile;
 };
 
 // Always-on identity-scope accounting; see TextureDecodeScopeStats in the header.
@@ -4461,6 +4462,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         } else if (decoded_reuse) {
                             fr.tex_rgba = decoded_reuse->pixels;
                             fr.tex_rgba_owner = decoded_reuse->pixels_owner;
+                            fr.gpu_detile = decoded_reuse->gpu_detile;
                             fr.tw = tw;
                             fr.th = decoded_reuse->output_height;
                             // #325: the layer count travels with the decoded pixels. Without this
@@ -4710,7 +4712,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     fr.tex_rgba_owner,
                                                    fr.texture_format,
                                                    fr.storage_image_contract_valid,
-                                                   fr.sample_count, fr.tex_byte_size});
+                                                   fr.sample_count, fr.tex_byte_size, fr.gpu_detile});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
@@ -4920,6 +4922,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 fflush(stderr);
                             }
                         }
+                        const bool gpu_detile_shape = is_cube && !fr.is_storage_image &&
+                            !r.compression_enabled && !r.in_mip_tail && !r.depth_compare &&
+                            r.format == prosper::gpu::DataFormat::Float16 &&
+                            r.num_components == 4 && sampled_source_bpt == 8 && r.tile_mode == 27 &&
+                            fr.sample_count == 1 && !cpu_rtt_copy_diagnostics &&
+                            !PROSPER_ENV_VALUE("PROSPER_DUMP_RAWTILE") &&
+                            !PROSPER_ENV_VALUE("PROSPER_SLICEMAP") &&
+                            !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
+                            !PROSPER_ENV_ON("PROSPER_NO_HALF_QUANTIZATION") &&
+                            !PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE");
+                        // The intervening materializers can use CPU scratch for RTT or
+                        // retained depth. Defer its allocation only when neither owns this
+                        // address; failed GPU preflight allocates it at the fallback below.
+                        const bool defer_cube_pixels = gpu_detile_shape &&
+                            !resource_compute_depth_hybrid && !resource_compute_image_hit &&
+                            g_rtt.find(sampled_source_addr) == g_rtt.end() &&
+                            !prosper::test::is_retained_ds_plane(r.gpu_addr);
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         fr.texture_format = decoded_texture_format;
                         const uint32_t output_bpp =
@@ -4934,7 +4953,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // is true a retained identity entry must pin `texture_slot`, or the next span
                         // would decode an unrelated texture into the very slot it points at.
                         bool decoded_pixels_in_texstore = false;
-                        if (retain_cpu_live_rtt) texture_pixels.clear();
+                        if (retain_cpu_live_rtt || defer_cube_pixels) texture_pixels.clear();
                         else texture_pixels.resize(nb);
                         auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row,
                                                            uint32_t rows) {
@@ -5583,8 +5602,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cube_done = true;
                             }
                         }
-                        if ((is_cube || is_array) && !rtt_hit && !dcc_fast_clear_done &&
+                        // The existing authority checks above own renderer/compute-produced
+                        // data. Only an ordinary guest-backed FP16 cube reaches this conversion.
+                        // Keep the shader's established vertically stacked RGBA8 representation.
+                        const bool gpu_detile_candidate = gpu_detile_shape && !rtt_hit &&
+                            !dcc_fast_clear_done && !cube_depth_bridged &&
+                            !resource_compute_depth_hybrid;
+                        if (gpu_detile_candidate) {
+                            fr.gpu_detile = prosper::test::prepare_render_gpu_detile(
+                                tw, th, 6, r.gpu_addr, r.layer_stride_bytes,
+                                r.layer_mip_offset_bytes, copy_resource);
+                            if (fr.gpu_detile) {
+                                cube_done = true;
+                                texture_pixels.clear();
+                                fr.persistent_texture_id = 0;
+                                fr.persistent_texture_version = 0;
+                            }
+                        }
+                        if ((is_cube || is_array) && !cube_done && !rtt_hit && !dcc_fast_clear_done &&
                             !cube_depth_bridged) {
+                            if (defer_cube_pixels) texture_pixels.resize(nb);
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
@@ -6547,7 +6584,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (PROSPER_ENV_ON("PROSPER_KILL_RING") && tw == 1024 && th == 1024 &&
                             r.num_components == 1 && r.cls == RC::Texture)
                             std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
-                        if (!fr.tex_rgba) {
+                        if (!fr.tex_rgba && !fr.gpu_detile) {
                             fr.tex_rgba = texture_pixels.data();
                             decoded_pixels_in_texstore = true;
                         }
@@ -6567,7 +6604,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // #1272: see the reuse path — plain 2D guest textures only.
                         if (!is_volume && !cube_done)
                             fr.declared_mip_levels = r.declared_mip_levels;
-                        if (persistent_cache_eligible) {
+                        if (persistent_cache_eligible && !fr.gpu_detile) {
                             size_t source_prefix_size = linear_source_prefix_size;
                             if (!persistent_source_matches_pixels && persistent_source_size) {
                                 persistent_validation_scratch.resize(persistent_source_size);
@@ -6729,7 +6766,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                           cross_span_source_size, pinned_slot,
                                                           fr.tex_rgba_owner, fr.texture_format,
                                                           fr.storage_image_contract_valid,
-                                                          fr.sample_count, fr.tex_byte_size});
+                                                          fr.sample_count, fr.tex_byte_size, fr.gpu_detile});
                         }
                         }
                         if (native_r32ui_storage && writable_storage_image) {
