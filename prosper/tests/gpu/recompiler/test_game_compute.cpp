@@ -335,6 +335,61 @@ int main() {
               true, 27, false, true),
           "the recovery switch restores the copied writeback path");
 
+    // Exercise the range routine used by the renderer-owned RTT upload branches, including
+    // their fixed RGBA16F source stride when the guest requests only RG8. Every channel sees
+    // every binary16 code; unaligned buffers and an odd tail catch stride/alignment shortcuts.
+    {
+        constexpr size_t texels = 65536u + 7u;
+        std::vector<uint8_t> source(texels * 8u + 2u, 0xa5u);
+        for (size_t t = 0; t < texels; ++t)
+            for (uint32_t c = 0; c < 4; ++c) {
+                const uint16_t half = static_cast<uint16_t>(t + c * 9973u);
+                std::memcpy(source.data() + 1u + t * 8u + c * 2u, &half, sizeof(half));
+            }
+        const auto original_source = source;
+        for (const uint32_t components : {2u, 4u}) {
+            std::vector<uint8_t> actual(texels * components + 2u, 0xcdu);
+            prosper::frontend::renderer_float16_to_unorm8_range(
+                source.data() + 1u, components, texels, actual.data() + 1u);
+            bool matches = actual.front() == 0xcdu && actual.back() == 0xcdu;
+            for (size_t t = 0; t < texels && matches; ++t)
+                for (uint32_t c = 0; c < components; ++c) {
+                    uint16_t half = 0;
+                    std::memcpy(&half, source.data() + 1u + t * 8u + c * 2u, sizeof(half));
+                    float value = half_to_float(half);
+                    if (!std::isfinite(value) || value <= 0.0f) value = 0.0f;
+                    else if (value >= 1.0f) value = 1.0f;
+                    const auto expected = static_cast<uint8_t>(std::lround(value * 255.0f));
+                    if (actual[1u + t * components + c] != expected) {
+                        std::printf("Renderer FP16 normalization mismatch components=%u "
+                                    "texel=%zu channel=%u half=0x%04x expected=%u actual=%u\n",
+                                    components, t, c, static_cast<unsigned>(half),
+                                    static_cast<unsigned>(expected),
+                                    static_cast<unsigned>(actual[1u + t * components + c]));
+                        matches = false;
+                        break;
+                    }
+                }
+            CHECK(matches, "renderer RTT FP16 normalization matches all 65536 lround inputs "
+                           "with RGBA16F source stride, packed destination and canaries");
+        }
+        CHECK(source == original_source, "renderer RTT conversion preserves its owned snapshot");
+        std::array<uint8_t, 16> untouched;
+        untouched.fill(0x5au);
+        const auto before = untouched;
+        for (const uint32_t components : {0u, 1u, 3u, 5u})
+            prosper::frontend::renderer_float16_to_unorm8_range(
+                source.data() + 1u, components, 1u, untouched.data());
+        prosper::frontend::renderer_float16_to_unorm8_range(
+            source.data(), 4u, 0u, untouched.data());
+        prosper::frontend::renderer_float16_to_unorm8_range(
+            nullptr, 4u, 1u, untouched.data());
+        prosper::frontend::renderer_float16_to_unorm8_range(
+            source.data(), 4u, SIZE_MAX, untouched.data());
+        CHECK(untouched == before, "renderer RTT conversion refuses unsupported shapes "
+                                   "and overflowing or empty ranges before writing");
+    }
+
     bool half_luts_match = true;
     for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
         const uint16_t half = static_cast<uint16_t>(bits);

@@ -122,6 +122,10 @@ void storage_unpack_float16x4_range(const uint8_t* rgba16f, size_t texels, uint3
 uint8_t sampled_float16_to_unorm8(uint16_t half_bits);
 void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
                                      size_t texels, uint8_t* rgba);
+// Normalize renderer-owned RGBA16F snapshots into tightly packed RG8/RGBA8. Unlike the
+// guest-backed sampled conversion, all nonfinite inputs become zero. Source stride is always 8.
+void renderer_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
+                                      size_t texels, uint8_t* packed);
 // Pack tightly-strided RGBA32F channel bits to RGBA16F. Uses a runtime-dispatched F16C path where
 // available and preserves float_to_half's exact NaN payload/rounding contract.
 void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8_t* rgba16f);

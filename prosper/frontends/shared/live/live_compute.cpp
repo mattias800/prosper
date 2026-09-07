@@ -6481,6 +6481,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             double image_allocation_ms = 0.0;
             double view_ms = 0.0;
             double sampler_ms = 0.0;
+            bool rtt_half_unorm = false;
             const ShaderResource* r = item.resources->by_binding(image_descriptors[i].binding);
             if (!r || !r->width || !r->height) { skip_image(r, "no/degenerate resource"); break; }
             BoundImage& bi = images[i];
@@ -8327,31 +8328,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             });
                     } else if (sampled_unorm8x2) {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        // #3407: per-texel and independent -- every write is upload[t*n+c],
-                        // disjoint across t -- so this is the same shape as the arm below that
-                        // already uses the helper. Leaving it scalar is why a 4K conversion took
-                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
-                        // on bytes touched per texel; the helper uses it only to size the pool.
-                        parallel_compute_texels(
-                            texels, texels * 16u, [&](size_t begin, size_t end) {
-                        for (size_t t = begin; t < end; ++t) {
-                            for (uint32_t c = 0; c < 2; ++c) {
-                                if (source_rg8) {
-                                    upload[t * 2 + c] = pixels[t * 2 + c];
-                                } else if (source_unorm8) {
-                                    upload[t * 2 + c] = pixels[t * 4 + c];
-                                } else {
-                                    uint16_t half = 0;
-                                    std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
-                                    float value = half_to_float(half);
-                                    if (!std::isfinite(value) || value <= 0.0f) value = 0.0f;
-                                    else if (value >= 1.0f) value = 1.0f;
-                                    upload[t * 2 + c] = static_cast<uint8_t>(
-                                        std::lround(value * 255.0f));
-                                }
-                            }
-                        }
+                        if (source_float16) {
+                            renderer_float16_to_unorm8_range(pixels.data(), 2, texels, upload);
+                            rtt_half_unorm = true;
+                        } else {
+                            parallel_compute_texels(
+                                texels, texels * 16u, [&](size_t begin, size_t end) {
+                                for (size_t t = begin; t < end; ++t)
+                                    for (uint32_t c = 0; c < 2; ++c)
+                                        upload[t * 2 + c] = source_rg8
+                                            ? pixels[t * 2 + c] : pixels[t * 4 + c];
                             });
+                        }
                     } else if (sampled_unorm16_native) {
                         const size_t texels = static_cast<size_t>(volume_texels);
                         // #3407: per-texel and independent -- every write is upload[t*n+c],
@@ -8429,26 +8417,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             break;
                         }
                     } else {
-                        const size_t texels = static_cast<size_t>(volume_texels);
-                        // #3407: per-texel and independent -- every write is upload[t*n+c],
-                        // disjoint across t -- so this is the same shape as the arm below that
-                        // already uses the helper. Leaving it scalar is why a 4K conversion took
-                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
-                        // on bytes touched per texel; the helper uses it only to size the pool.
-                        parallel_compute_texels(
-                            texels, texels * 16u, [&](size_t begin, size_t end) {
-                        for (size_t t = begin; t < end; ++t) {
-                            for (uint32_t c = 0; c < 4; ++c) {
-                                uint16_t half = 0;
-                                std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
-                                float value = half_to_float(half);
-                                if (!std::isfinite(value) || value <= 0.0f) value = 0.0f;
-                                else if (value >= 1.0f) value = 1.0f;
-                                upload[t * 4 + c] = static_cast<uint8_t>(
-                                    std::lround(value * 255.0f));
-                            }
-                        }
-                            });
+                        // The layout guard above leaves only an RGBA16F snapshot here. Preserve
+                        // its historical nonfinite-to-zero normalization, distinct from the
+                        // guest-backed sampled fallback (which maps positive infinity to 255).
+                        renderer_float16_to_unorm8_range(
+                            pixels.data(), 4, static_cast<size_t>(volume_texels), upload);
+                        rtt_half_unorm = true;
                     }
                     if (trace) {
                         const uint64_t snapshot_hash = fnv1a(live_target.pixels->data(),
@@ -8836,6 +8810,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "persistent=%u allocation-reused=%u upload-skipped=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
+                             "rtt-format=%s rtt-half-unorm=%u "
                              "query_ms=%.3f import_ms=%.3f cache_ms=%.3f "
                              "staging_ms=%.3f prepare_ms=%.3f allocation_ms=%.3f "
                              "view_ms=%.3f sampler_ms=%.3f ms=%.3f\n",
@@ -8853,6 +8828,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              image_descriptors[i].texel_access ? 1u : 0u,
                              image_descriptors[i].sampled_float ? 1u : 0u,
                              bi.unorm_rtt_value_reuse ? 1u : 0u,
+                             renderer_owned
+                                 ? prosper::frontend::live_target_pixel_format_name(live_target.format)
+                                 : "none",
+                             rtt_half_unorm ? 1u : 0u,
                              query_ms, import_ms, cache_lookup_ms,
                              staging_ms, prepare_upload_ms, image_allocation_ms,
                              view_ms, sampler_ms,
@@ -11738,6 +11717,34 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
                 }
             }
         });
+}
+
+// Only renderer-owned RGBA16F snapshots use this contract: the source stride remains
+// eight bytes even when the guest samples two normalized channels. Its scalar control leaves
+// the graphics layered conversion unchanged, isolating this compute preparation cost.
+void renderer_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
+                                      size_t texels, uint8_t* packed) {
+    if (!source || !packed || (components != 2 && components != 4) ||
+        texels > SIZE_MAX / 16u) return;
+    static const bool old_half_quantization =
+        std::getenv("PROSPER_NO_RTT_HALF_QUANTIZATION") != nullptr;
+    parallel_compute_texels(texels, texels * 16u, [&](size_t begin, size_t end) {
+        for (size_t t = begin; t < end; ++t) {
+            for (uint32_t c = 0; c < components; ++c) {
+                uint16_t half = 0;
+                std::memcpy(&half, source + t * 8 + c * 2, sizeof(half));
+                if (old_half_quantization) {
+                    float value = prosper::gpu::half_to_float(half);
+                    if (!std::isfinite(value) || value <= 0.0f) value = 0.0f;
+                    else if (value >= 1.0f) value = 1.0f;
+                    packed[t * components + c] = static_cast<uint8_t>(
+                        std::lround(value * 255.0f));
+                } else {
+                    packed[t * components + c] = prosper::gpu::half_to_unorm8(half);
+                }
+            }
+        }
+    });
 }
 
 // TripBoundWitnessScope lives in trip_bound_witness.hpp so its save/restore contract can be
