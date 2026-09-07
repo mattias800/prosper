@@ -8959,8 +8959,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const auto* r = bi.resource;
                 if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip ||
                     bi.poison_verify || !bi.exact_storage_bytes() || !r ||
-                    r->depth != 1 || r->img_dim != 1 || r->in_mip_tail ||
+                    r->depth != 1 || (r->img_dim != 1 && r->img_dim != 5) ||
+                    bi.array_layers != 1 || bi.texel_depth != 1 || r->in_mip_tail ||
                     r->layer_mip_offset_bytes || !staging[i]) continue;
+                // One-layer array descriptors use the same physical 2D tiling,
+                // with either an ordinary or a reflected one-layer array view.
                 const uint32_t bpe = r->format == DataFormat::Float10_11_11 ||
                     r->format == DataFormat::Unorm2_10_10_10 ? 4u :
                     data_format_bytes(r->format) * (r->num_components ? r->num_components : 1u);
@@ -11062,7 +11065,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "[compute-image-writeback] code=0x%llx hash=0x%016llx "
                              "binding=%u addr=0x%llx "
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
-                             "poison=%u gpu-retile=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
+                             "poison=%u gpu-retile=%u dim=%u layers=%u texel-depth=%u "
+                             "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
                              "total_ms=%.3f\n",
                              (unsigned long long)item.code_addr,
@@ -11070,6 +11074,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
                              r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
                              bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u, bi.retile_buffer ? 1u : 0u,
+                             r->img_dim, bi.array_layers, bi.texel_depth,
                              image_milliseconds(map_start, map_done),
                              image_milliseconds(map_done, prepare_done),
                              image_milliseconds(prepare_done, watch_done),

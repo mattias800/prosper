@@ -51,7 +51,12 @@ int main(int argc, char** argv) {
         {DataFormat::Unorm8, 4, 4}, {DataFormat::Float16, 4, 8}, {DataFormat::Float32, 4, 16} };
     uint64_t code = 0x34070000;
     for (uint32_t mode : {9u, 24u, 27u}) for (auto format : formats)
-    for (auto [width, height] : {std::pair{257u, 131u}, std::pair{384u, 256u}}) {
+    for (auto [width, height] : {std::pair{257u, 131u}, std::pair{384u, 256u}})
+    for (uint32_t view : {0u, 1u, 2u}) {
+        // A one-layer array descriptor may be consumed through either a plain
+        // 2D instruction or an array instruction retaining its layer coordinate.
+        const uint32_t resource_dim = view ? 5u : 1u;
+        const uint32_t instruction_dim = view == 2 ? 5u : 1u;
         const size_t linear_bytes = size_t(width) * height * format.bpe;
         const size_t tiled_bytes = tiled_surface_bytes(width, height, mode, 0, format.bpe);
         std::vector<uint8_t> source_linear(linear_bytes), expected_linear(linear_bytes);
@@ -91,7 +96,7 @@ int main(int argc, char** argv) {
         }
         for (uint32_t binding : {4u, 5u}) {
             ShaderResource r{}; r.cls = ResourceClass::StorageImage; r.binding = binding;
-            r.sgpr_base = binding == 4 ? 0 : 8; r.img_dim = 1;
+            r.sgpr_base = binding == 4 ? 0 : 8; r.img_dim = resource_dim;
             r.width = width; r.height = height; r.depth = 1;
             r.format = format.format; r.num_components = format.components; r.tile_mode = mode;
             r.size = uint32_t(tiled_bytes);
@@ -107,8 +112,9 @@ int main(int argc, char** argv) {
             const uint32_t shader[]{
                 0x4A0800FFu, first_x, // v_add_nc_u32 v4, first_x, v0
                 0x7E0A02FFu, row, // v5=selected y
-                0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
-                0xF0200F08u, 0x00020004u, 0xBF810000u};
+                0x7E0C0280u, // v6=layer zero for the array instruction
+                0xF0000F00u | (instruction_dim << 3), 0x00000004u, 0xBF8C3F70u,
+                0xF0200F00u | (instruction_dim << 3), 0x00020004u, 0xBF810000u};
             ComputeItem item;
             ComputeShaderConfig config;
             config.user_sgprs.resize(16); config.local_x = 64;
@@ -158,8 +164,8 @@ int main(int argc, char** argv) {
             check(std::all_of(destination.begin() + tiled_bytes, destination.end(),
                              [](uint8_t v) { return v == 0xcc; }), "writeback keeps destination guard bytes");
         }
-        std::printf("mode=%u bpe=%u format=%u extent=%ux%u GPU retile dispatches=%llu\n",
-            mode, format.bpe, unsigned(format.format), width, height,
+        std::printf("mode=%u bpe=%u format=%u extent=%ux%u resource-dim=%u instruction-dim=%u GPU retile dispatches=%llu\n",
+            mode, format.bpe, unsigned(format.format), width, height, resource_dim, instruction_dim,
             static_cast<unsigned long long>(gpu_retile_recordings().load() - before));
         check(cpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + (fault_mode ? 5 : 6),
               cpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
