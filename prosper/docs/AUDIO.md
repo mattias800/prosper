@@ -21,6 +21,28 @@ owned; no grain is replayed to conceal late production. FLOW diagnostics also re
 and pending-grain replacements. These startup measurements establish the clock-related deficit;
 they do not establish that every title or every later gameplay interval is free of underruns.
 
+## SDL consumption measurements (#3432)
+
+`PROSPER_AUDIO_DEMAND=1` installs a bounded per-stream consumption callback. It counts SDL
+requests and requests needing additional input, separately for startup, active playback and
+host pause. First successful PCM publication begins the active phase; a close/reopen starts a
+new generation. Intentional silent PCM counts as supplied data. Output/channel ownership and
+pacing are unchanged. Input format and the device's reported format/quantum are logged at open.
+
+The existing sampler prints cumulative snapshots once per second, outside the audio callback.
+`tools/perf/audio_delivery_report.py LOG` reads the final snapshot of each phase/generation;
+use one process run per log file. Missing diagnostics are unavailable, and a phase with no
+callbacks is unobserved. The final partial second before process exit may not be logged.
+SDL's additional-byte estimate can overestimate demand under resampling; it is neither a
+physical backend XRUN counter nor a measured duration of inserted silence.
+
+`SDL_GetAudioStreamQueued` counts unconverted **input** bytes. An empty input queue can follow
+successful consumption while its audio is still buffered downstream. Delivery and timeline
+reports therefore name input queue gaps and leave downstream continuity unknown. Correlate
+consumption demand with guest FLOW, scheduling and backend measurements before changing pacing.
+Frontend owners must stop guest producers and call `shutdown_sdl3_audio_sink()` before SDL teardown;
+it joins the sampler and destroys streams before their callback state goes away.
+
 ## Layers
 
 | Layer | File | In `prosper_core`? |
@@ -59,8 +81,8 @@ cmake -S prosper -B build -DPROSPER_AUDIO_SDL3=ON   # uses system SDL3 if presen
 ```
 - Uses a system SDL3 (`find_package(SDL3)`) if available, otherwise fetches and builds an
   **audio-only** SDL3 (video/render/joystick/etc. disabled — no X11/Wayland needed).
-- One `SDL_AudioStream` per PS5 port; `output()` pushes PCM and blocks while the device queue is full
-  (matching hardware pacing). Per-channel volumes are mapped to the stream gain.
+- One `SDL_AudioStream` per PS5 port; `output()` pushes PCM and paces the guest by each
+  grain’s wall-clock duration. Per-channel volumes are mapped to the stream gain.
 - When enabled, `boot_trace` calls `install_sdl3_audio_sink()` at startup automatically.
 
 ## AudioOut2 submission ownership (#3411)
@@ -403,6 +425,11 @@ PCM sampling, signal-bearing ports only) and `PROSPER_AUDIO2_CONTROL_PROBE=1` (c
 Note that the first two fall silent in cases 1 **and** 2, which is why `PROSPER_AUDIO_FLOW` exists.
 
 ## Ruled out — do not re-derive these
+
+- **Empty SDL input means a playback underrun.** The real unbound-stream test consumes a complete
+  known grain, checks exact PCM, then observes an empty input queue with zero demand shortfalls.
+  A subsequent read without new PCM produces a shortfall. Bracketing queue zeros with nonzero
+  samples cannot substitute for observing consumption (#3432).
 
 - **"A silent AudioOut2 port might be pushing its PCM through `sceAudioOut2ContextBedWrite`, which
   prosper stubs."** The stub is real — `audio2_ctx_bed_write` in `hle_audio.cpp` validates the
