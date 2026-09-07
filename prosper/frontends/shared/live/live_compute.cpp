@@ -6774,18 +6774,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     r->gpu_addr, import_request, import);
                 import_ms = std::chrono::duration<double, std::milli>(
                     ComputeClock::now() - import_start).count();
-                if (trace)
+                if (trace || image_timing)
                     std::fprintf(stderr,
                                  "[compute]   direct RTT candidate binding=%u addr=0x%llx "
                                  "requested=f%u/c%u dim=%u extent=%ux%u available=%u "
-                                 "imported=%ux%u/%u kind=%s native=%u\n",
+                                 "imported=%ux%u/%u kind=%s native=%u "
+                                 "same-device=%u transfer-src=%u layout=%u "
+                                 "code=0x%llx hash=0x%016llx\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned)r->format, r->num_components, r->img_dim,
                                  r->width, r->height, import_available ? 1u : 0u,
                                  import.width, import.height, (unsigned)import.format,
                                  import.kind == LiveTargetImageImport::Kind::Depth
                                      ? "depth" : "color",
-                                 import.native_format);
+                                 import.native_format,
+                                 import.device == static_cast<void*>(ctx.device) ? 1u : 0u,
+                                 import.transfer_src ? 1u : 0u, import.layout,
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)timing_program_hash);
                 if (import_available) {
                     const bool depth_import =
                         import.kind == LiveTargetImageImport::Kind::Depth;
