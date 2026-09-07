@@ -44,6 +44,12 @@ bool tile_mode_is_tiled(uint32_t tile_mode);
 // are 128x64 texels / 64 KiB; this is not the volume or mip-tail equation.
 std::array<uint32_t, 16> tile27_rgba16f_equation();
 
+// Exact 2D 64 KiB equation used by tile_surface, for word-addressable texels.
+// Rejects other layouts; callers must separately exclude volume/mip-tail views.
+bool tile64_word_equation(uint32_t tile_mode, uint32_t bytes_per_texel,
+                          std::array<uint32_t, 16>& equation,
+                          uint32_t& block_width, uint32_t& block_height);
+
 // libSceVideoOut's own two-value tiling enum, as passed to sceVideoOutSetBufferAttribute(2) and
 // recorded with each registered display buffer. It is NOT a GFX10 swizzle index: it only says
 // whether the scanout surface is stored in the hardware's render-target layout or row-major.

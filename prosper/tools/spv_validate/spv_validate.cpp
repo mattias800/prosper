@@ -760,6 +760,8 @@ int main(int argc, char** argv) {
          "build_compute_compare_uvec4");
     dump(dir, "builder_detile_rgba16f", build_compute_detile_rgba16f(),
          "build_compute_detile_rgba16f");
+    dump(dir, "builder_retile_words", build_compute_retile_words(),
+         "build_compute_retile_words");
     dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
          "build_compute_rgba8_to_packed10");
 

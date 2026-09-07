@@ -27,6 +27,53 @@ aggregate frame metric was used to make the call. Checked-in capture:
 ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
 between that and a gameplay screenshot.
 
+## Compute writeback profile (2026-09-07, #3407)
+
+A fresh run on `1ddde6da386f` used the committed route, F8 at 300 seconds, F9 at 330,
+and capture-gated phase/image timing across all programs. Its completed F8 has 322 renderer
+records, 662 compute records, 20/21 pre/post samples and zero dropped records. All 542 phase
+rows and 284 completed image-writeback rows lie within that capture interval. Compute records
+also include CPU fast paths and early declines; phase rows are not a complete dispatch census.
+
+Image layout took 505.709 ms in completed rows. Four 3840×2160 groups account for 443.212 ms:
+`111503adecbc99bf` binding 7 (Uint8×4, tile 27), `57b6ed05eb1201e0` binding 7
+(Uint32, tile 24), `58b3e5c2529091f0` binding 5 and `e3c2229a45c7807c` binding 9
+(Unorm8×4, tile 27). These are exact 33,177,600-byte linear transfers into 33,423,360-byte
+guest surfaces. The separate buffer program `dd5611041d9f7392` has 96 Vulkan phase rows
+with 655.31 ms buffer setup and 573.74 ms buffer writeback; existing timers do not separate
+its comparison, copying and cache/watch costs.
+
+This is a diagnostic profile, not a quiet baseline or a claimed saving. Concurrent 199 Hz
+`cpu/cycles/P` profiling spans roughly 285–306.5 seconds and records 11,021 samples.
+Whole-record `perf script` loses hot user call chains; decoding the main thread separately
+recovers copy, comparison and compute tiling callers. Those optimized callers do not always
+separate setup from writeback. The subsequent F9 retains the known black world and HUD at
+00:33.23; it is not proof of correct world rendering or replay equivalence.
+
+The subsequent same-binary pair on `4a333768c936` confirms actual GPU retile of the
+one-layer array output, but does **not** establish a meaningful net win. Treatment ran first;
+both arms used fresh state, the committed route, F8 at 300 seconds and F9 at 330. Each has
+31 selected `e3c2229a45c7807c` dispatches and one CPU poison-verification row. The other
+30 treatment writebacks report `gpu-retile=1 dim=5 layers=1 texel-depth=1`.
+CPU-control → GPU-treatment means are 7.414 → 7.698 ms total per selected dispatch,
+4.027 → 3.600 ms writeback, and 0.372 → 0.810 ms in the post-shader GPU interval.
+Across the four measured 4K groups, weighting both arms by the control's group counts gives
+6.385 → 6.344 ms/dispatch (about 0.65% lower), with CPU savings largely offset by GPU/wait/setup.
+Both screenshots retain the known black world and HUD; newly rendered FPS remains unavailable.
+The next iteration removes the separate full-output GPU clear and uses shifts for power-of-two
+addressing.
+
+The revised single-pass pair on `e45e19f7be8f` has 33 CPU-control and 32 GPU-treatment
+selected dispatches, complete GPU timestamps and zero poison rows in both arms. Every treatment
+row confirms GPU retile. With the control's counts weighting the same four 4K groups, total
+cost is 5.859 → 5.700 ms/dispatch (2.71% lower) and writeback is 4.119 → 3.601 ms (12.58% lower).
+Wait rises 1.299 → 1.627 ms and the GPU post-shader interval rises 0.359 → 0.675 ms, so much of
+the CPU saving is offset elsewhere. The selected program's total is 6.606 → 6.492 ms; binding-9
+image writeback is 2.514 → 1.984 ms. This is a modest observed compute gain in one same-binary
+pair, not a stable general speedup or newly rendered-FPS claim. Both screenshots show the known
+black world/HUD at 00:35.18 / 00:37.58. Both main audio streams have zero pre-F9 consumption-demand
+shortfalls, without proving audible continuity or physical hardware XRUN behavior. #3439.
+
 ## Packed render-target GPU conversion (2026-09-07, #3437)
 
 The selected sampled input is now verified against the live imported image: binding 10 of
@@ -703,6 +750,7 @@ to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
+| Enabling the initial #3439 GPU-retile implementation establishes a GPU writeback comparison | **Falsified on `8e02a1963c68`.** The same-binary control recorded 33 selected `e3c2229a45c7807c` binding-9 CPU writebacks; the enabled arm recorded 31, all still `gpu-retile=0`, with no poison-verification rows. The positive-use assertion rejected the treatment, so these runs establish no speedup. Unit coverage had used plain 2D descriptors only; added one-layer array cases fail 240 path-use assertions before the admission correction while retaining exact output bytes. Require actual GPU use alongside byte equivalence. #3407 / #3439. |
 | Still-owned matching detile inputs or varying input shape explain the zero-reuse window observed after #3437 | **Falsified for the diagnostic run on `5cdd7ecb`.** All 175 F8-window uploads use the same device, 12,582,992-byte size and storage-buffer usage. Every acquisition reports zero matching idle/live blocks; every completed input is explicitly discarded for budget. The cache retains 268,423,456 requested bytes against its 268,435,456-byte limit, leaving only 12,000 bytes free. All 39,701 pool events reconcile with independently reconstructed idle/live ownership. Logging under the mutex makes this a structural witness, not a timing comparison or retroactive proof for the earlier uninstrumented arms. #3407. |
 | The packed GPU conversion in #3437 or mapped detile inputs in #3434 first introduced the black title-menu background | **Falsified as first introduction.** Retained user F9 `frame_grab_PPSA03831_20260907-153044-350`, written at guest present 1285 on source `0927f6d3a8a8` (tree-identical to pre-#3434 main `92f0e7368e48`) with `PROSPER_NO_GPU_DETILE=1`, already shows black behind the menu and incorrect TIME UP artwork. New #3437 compositor screenshots after route f1700/f1940 show the same visible failure class at different selections. The earlier run was excluded from the cutscene comparison for capturing a menu; that does not invalidate this menu evidence. This establishes prior occurrence, not unchanged frequency or a shared root cause. #2206 remains open. |
 | The mapped GPU detile input reuse in #3434 introduced the alternating opening-cutscene corruption | **Falsified as an introducing change.** The retained pre-PR main binary (source `0927f6d3a8a8`, tree identical to main `92f0e7368e48`) renders a normal stone-tower frame at guest flip 2810 and green/red UI artwork at 2812 without F9. A same-binary, same-route control with only `PROSPER_NO_GPU_DETILE=1` changed also reaches the cutscene and renders green corruption at 2812. This excludes GPU detiling as necessary for the green flicker; the sampled CPU-detile frames did not reproduce the separate red artwork and do not exonerate that symptom. These are sampled readback snapshots (15 main / 19 CPU-control deliveries), not complete or timing-neutral frame sequences. Root cause remains open in #3436. |

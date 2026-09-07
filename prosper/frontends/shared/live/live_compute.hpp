@@ -367,6 +367,9 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 void live_compute_fail_next_storage_readback_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.
 void live_compute_fail_next_packed_rtt_setup_for_test(bool device_lost);
+// One-shot failure at retile's actual allocation/eager-map driver boundary.
+void live_compute_fail_next_retile_memory_for_test(bool mapping, bool device_lost);
+bool live_compute_retile_memory_fault_pending_for_test();
 
 // Deterministic controls for post-DCC cache-promotion regressions. The first leaves the next
 // writable metadata plane unresolved, exercising the final all-0xff recheck. The second disables
