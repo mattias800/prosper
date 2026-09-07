@@ -4901,10 +4901,140 @@ void maybe_dump_traced_compute_raw(const prosper::gpu::ComputeItem& item, bool t
                  readable_bytes, path, ok ? "written" : "failed");
 }
 
+std::optional<bool> execute_cpu_broadcast_fill(const prosper::gpu::ComputeItem& item) {
+    using namespace prosper::gpu;
+    if (!item.resources || item.user_sgprs.size() != 12 || !item.recompile_config_available ||
+        !item.recompile_config.tgid_x_en || item.recompile_config.tgid_y_en ||
+        item.recompile_config.tgid_z_en || item.recompile_config.tidig_comp_cnt != 0 ||
+        item.recompile_config.local_x != 64 || item.recompile_config.local_y != 1 ||
+        item.recompile_config.local_z != 1 ||
+        item.launch.local_x != 64 || item.launch.local_y != 1 || item.launch.local_z != 1 ||
+        !item.launch.groups_x || item.launch.groups_y != 1 || item.launch.groups_z != 1 ||
+        item.launch.threads_y != 1 || item.launch.threads_z != 1)
+        return std::nullopt;
+
+    // SMEM realization may retain several snapshots of one descriptor. Use each instruction's
+    // actual resource, not the generic SGPR-8 binding (which need not contain captured bytes).
+    const auto* count_resource = item.resources->by_fetch_pc(3);
+    const auto* mask_resource = item.resources->by_fetch_pc(8);
+    const auto* source = item.resources->by_fetch_pc(12);
+    const auto* target = item.resources->by_fetch_pc(15);
+    auto scalar_shape = [](const ShaderResource* r) {
+        return r && !r->table_index_count && r->cls == ResourceClass::ConstantBuffer && r->format == DataFormat::Float32 &&
+            r->num_components == 4 && r->stride == 16;
+    };
+    auto uint_shape = [](const ShaderResource* r, uint32_t sgpr) {
+        return r && !r->table_index_count && r->cls == ResourceClass::ConstantBuffer && r->format == DataFormat::Uint32 &&
+            r->num_components == 1 && r->stride == 4 && r->sgpr_base == sgpr;
+    };
+    if (!scalar_shape(count_resource) || !scalar_shape(mask_resource) ||
+        !uint_shape(source, 0) || !uint_shape(target, 4))
+        return std::nullopt;
+    auto raw_shape = [&](const ShaderResource& r, uint32_t sgpr, bool typed) {
+        const uint32_t* v = item.user_sgprs.data() + sgpr;
+        const uint64_t base = v[0] | (static_cast<uint64_t>(v[1] & 0xffffu) << 32);
+        const uint32_t stride = (v[1] >> 16) & 0x3fffu;
+        const uint64_t size = static_cast<uint64_t>(v[2]) * stride;
+        DataFormat format = DataFormat::Unknown;
+        uint32_t components = 0;
+        rdna2_buffer_format((v[3] >> 12) & 0x7fu, &format, &components);
+        // Normalization drops addressing controls. Prove a linear V# from the actual user SGPRs;
+        // a typed load also needs X=select-X, whereas SMEM consumes raw bytes regardless of DST_SEL.
+        return !(v[1] & 0xc0000000u) && !(v[3] & 0xfff80000u) &&
+            base == r.gpu_addr && stride == r.stride && size == r.size &&
+            (!typed || ((v[3] & 7u) == 4u && format == r.format && components == r.num_components));
+    };
+    if (!raw_shape(*source, 0, true) || !raw_shape(*target, 4, true) ||
+        !raw_shape(*count_resource, 8, false) || !raw_shape(*mask_resource, 8, false))
+        return std::nullopt;
+    auto read_pointer = [](const ShaderResource& r, uint32_t offset) -> const uint8_t* {
+        const uint32_t required = offset + sizeof(uint32_t);
+        if (r.size < required) return nullptr;
+        if (r.host_data)
+            return r.host_data_size >= required ? r.host_data + offset : nullptr;
+        if (!r.gpu_addr || r.gpu_addr > UINT64_MAX - required ||
+            !guest_readable(r.gpu_addr, required)) return nullptr;
+        return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(r.gpu_addr)) + offset;
+    };
+    const uint8_t* count_ptr = read_pointer(*count_resource, 0);
+    const uint8_t* mask_ptr = read_pointer(*mask_resource, 4);
+    const uint8_t* source_ptr = read_pointer(*source, 0);
+    if (!count_ptr || !mask_ptr || !source_ptr) return std::nullopt;
+    uint32_t count = 0, mask = 0, value = 0;
+    std::memcpy(&count, count_ptr, sizeof(count));
+    std::memcpy(&mask, mask_ptr, sizeof(mask));
+    std::memcpy(&value, source_ptr, sizeof(value));
+    if (mask != 0 || count == 0) return std::nullopt;
+    const uint64_t launched = static_cast<uint64_t>(item.launch.groups_x) * 64u;
+    if (launched > UINT32_MAX) return std::nullopt;
+    if ((item.recompile_config.exact_thread_extent &&
+         (!item.launch.threads_x || item.recompile_config.threads_x != item.launch.threads_x ||
+          item.recompile_config.threads_y != 1 || item.recompile_config.threads_z != 1)) ||
+        (!item.recompile_config.exact_thread_extent && item.launch.threads_x &&
+         item.launch.threads_x != launched))
+        return std::nullopt;
+    const uint64_t threads = item.recompile_config.exact_thread_extent
+        ? std::min<uint64_t>(item.launch.threads_x, launched) : launched;
+    const uint64_t records = std::min<uint64_t>(count, threads);
+    const uint64_t bytes = records * sizeof(uint32_t);
+    if (!bytes || bytes > target->size || bytes > SIZE_MAX ||
+        !target->gpu_addr || target->gpu_addr > UINT64_MAX - bytes)
+        return std::nullopt;
+    uint8_t* destination = nullptr;
+    if (target->host_data) {
+        if (target->host_data_size < bytes) return std::nullopt;
+        destination = target->host_data;
+    } else if (bytes <= UINT32_MAX && guest_writable(target->gpu_addr, static_cast<uint32_t>(bytes))) {
+        destination = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(target->gpu_addr));
+    }
+    if (!destination) return std::nullopt;
+    auto overlaps = [](uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
+        if (!a || !b || !n || !m) return false;
+        return a <= b ? b - a < n : a - b < m;
+    };
+    // Readonly inputs may alias each other (a fill value often lives beside count/mask). A source
+    // aliasing the destination would be a different operation, even if all current bytes are zero.
+    const ShaderResource* reads[] = {count_resource, mask_resource, source};
+    const uint8_t* pointers[] = {count_ptr, mask_ptr, source_ptr};
+    const uint32_t offsets[] = {0, 4, 0};
+    for (size_t n = 0; n < 3; ++n) {
+        if ((reads[n]->gpu_addr &&
+             (reads[n]->gpu_addr > UINT64_MAX - offsets[n] ||
+              overlaps(target->gpu_addr, bytes, reads[n]->gpu_addr + offsets[n], 4))) ||
+            overlaps(reinterpret_cast<uintptr_t>(destination), bytes,
+                     reinterpret_cast<uintptr_t>(pointers[n]), 4))
+            return std::nullopt;
+    }
+
+    notify_compute_authority_boundary({ComputeAuthorityBoundaryKind::Compute,
+        item.submit_no, item.command_order, target->gpu_addr, bytes, true});
+    if (!target->host_data)
+        prosper::host::guest_write_watch_notify_host_write(target->gpu_addr, static_cast<size_t>(bytes));
+    if (!value) {
+        std::memset(destination, 0, static_cast<size_t>(bytes));
+    } else {
+        for (size_t offset = 0; offset < bytes; offset += sizeof(value))
+            std::memcpy(destination + offset, &value, sizeof(value));
+    }
+    // This writes logical contents, including a zero-to-zero HTILE clear. Byte equality must not
+    // suppress invalidation of renderer-owned depth written earlier in the same present.
+    const char* previous_origin = guest_gpu_write_origin();
+    set_guest_gpu_write_origin("compute-writeback(cpu-broadcast)");
+    notify_guest_gpu_write(target->gpu_addr, bytes);
+    set_guest_gpu_write_origin(previous_origin);
+    if (!target->host_data && writer_provenance_enabled())
+        record_guest_write(GuestWriterKind::ComputeBuffer, target->gpu_addr, bytes,
+                           item.submit_no, item.dispatch_index, item.command_order, item.code_addr);
+    g_cpu_fill_dispatches.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
     using prosper::gpu::ComputeCpuFastPath;
     using prosper::gpu::ResourceClass;
     if (item.cpu_fast_path == ComputeCpuFastPath::None) return std::nullopt;
+    if (item.cpu_fast_path == ComputeCpuFastPath::BroadcastBufferU32)
+        return execute_cpu_broadcast_fill(item);
     if (item.cpu_fast_path != ComputeCpuFastPath::FillSgprUvec4 ||
         !item.resources || item.resources->resources.size() != 1 ||
         item.user_sgprs.size() != 8 || !item.recompile_config_available ||

@@ -7839,6 +7839,75 @@ ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t d
     if (code && dwords >= std::size(kFillSgprUvec4) &&
         std::equal(std::begin(kFillSgprUvec4), std::end(kFillSgprUvec4), code))
         return ComputeCpuFastPath::FillSgprUvec4;
+
+    // Bounded indexed copy: i=(tgid.x<<6)+tid.x; if (i<count) dst[i]=src[i&mask].
+    // A zero live mask makes this a broadcast fill. It is not an identity update merely because
+    // guest destination bytes already equal the source: detached rendered depth can differ (#3423).
+    // Classify the complete instruction/operand shape here; execution proves the live mask, numeric
+    // formats, dispatch extent, readable snapshots and non-aliasing before taking the CPU path.
+    if (!code || dwords < 18 || code[0] != (0xbf800000u | (0x20u << 16) | 1u))
+        return ComputeCpuFastPath::None;
+    std::vector<Rdna2Inst> ins;
+    if (rdna2_walk(code, 18, ins) != 18 || ins.size() != 13 || !ins.back().is_end)
+        return ComputeCpuFastPath::None;
+    for (const auto& in : ins) {
+        if (in.has_modifier || in.has_sdwa || in.has_dpp || in.clamp || in.omod)
+            return ComputeCpuFastPath::None;
+        for (unsigned n = 0; n < 4; ++n)
+            if (in.src_neg[n] || in.src_abs[n]) return ComputeCpuFastPath::None;
+    }
+    auto operand = [](const Operand& op, OperandKind kind, int value) {
+        return op.kind == kind && op.value == value;
+    };
+    auto shape = [&](size_t index, Rdna2Format fmt, uint32_t op, uint32_t pc, uint32_t len) {
+        const auto& in = ins[index];
+        return in.fmt == fmt && in.opcode == op && in.pc == pc && in.len_dwords == len;
+    };
+    auto scalar_load = [&](size_t index, uint32_t pc, uint32_t offset) {
+        const auto& in = ins[index];
+        return shape(index, Rdna2Format::SMEM, 0x08, pc, 2) &&
+            operand(in.dst, OperandKind::SGPR, 106) &&
+            operand(in.src[0], OperandKind::SGPR, 8) &&
+            operand(in.src[1], OperandKind::Special, 125) && in.literal == offset &&
+            !(in.words[0] & 0x0003e000u) && !(in.words[1] & 0x01e00000u);
+    };
+    auto buffer_access = [&](size_t index, uint32_t pc, uint32_t op, int addr_vgpr, int descriptor) {
+        const auto& in = ins[index];
+        return shape(index, Rdna2Format::MUBUF, op, pc, 2) &&
+            operand(in.dst, OperandKind::VGPR, 1) &&
+            operand(in.src[0], OperandKind::VGPR, addr_vgpr) &&
+            operand(in.src[1], OperandKind::SGPR, descriptor) &&
+            operand(in.src[2], OperandKind::InlineInt, 0) && in.literal == 0x2000u &&
+            !in.mubuf_glc && !in.mubuf_dlc && !in.mubuf_lds && !in.mubuf_tfe &&
+            !(in.words[0] & 0x00020000u) &&
+            !(in.words[1] & 0x00600000u);
+    };
+    const auto& index = ins[1];
+    const auto& compare = ins[4];
+    const auto& mask = ins[8];
+    if (shape(0, Rdna2Format::SOPP, 0x20, 0, 1) &&
+        shape(1, Rdna2Format::VOP3, 0x346, 1, 2) &&
+        operand(index.dst, OperandKind::VGPR, 0) &&
+        operand(index.src[0], OperandKind::SGPR, 12) &&
+        operand(index.src[1], OperandKind::InlineInt, 6) &&
+        operand(index.src[2], OperandKind::VGPR, 0) &&
+        scalar_load(2, 3, 0) && shape(3, Rdna2Format::SOPP, 0x0c, 5, 1) &&
+        static_cast<uint16_t>(ins[3].simm16) == 0xc07fu &&
+        shape(4, Rdna2Format::VOPC, 0xd4, 6, 1) &&
+        operand(compare.src[0], OperandKind::Special, 106) &&
+        operand(compare.src[1], OperandKind::VGPR, 0) &&
+        shape(5, Rdna2Format::SOPP, 0x08, 7, 1) && ins[5].simm16 == 9 &&
+        scalar_load(6, 8, 4) && shape(7, Rdna2Format::SOPP, 0x0c, 10, 1) &&
+        static_cast<uint16_t>(ins[7].simm16) == 0xc07fu &&
+        shape(8, Rdna2Format::VOP2, 0x1b, 11, 1) &&
+        operand(mask.dst, OperandKind::VGPR, 1) &&
+        operand(mask.src[0], OperandKind::Special, 106) &&
+        operand(mask.src[1], OperandKind::VGPR, 0) &&
+        buffer_access(9, 12, 0x00, 1, 0) &&
+        shape(10, Rdna2Format::SOPP, 0x0c, 14, 1) &&
+        static_cast<uint16_t>(ins[10].simm16) == 0x3f70u &&
+        buffer_access(11, 15, 0x04, 0, 4) && shape(12, Rdna2Format::SOPP, 0x01, 17, 1))
+        return ComputeCpuFastPath::BroadcastBufferU32;
     return ComputeCpuFastPath::None;
 }
 

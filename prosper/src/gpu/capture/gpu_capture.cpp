@@ -5396,6 +5396,11 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         if (compute.resources && compute.recompile_config_available &&
             compute.raw_shader_index < c.raw_shader_versions.size()) {
             const auto& raw = c.raw_shader_versions[compute.raw_shader_index].words;
+            // Rebuild this semantic proof from retained guest ISA, never from a serialized enum.
+            // Replay still checks the captured descriptors, launch and owned backing at execution.
+            if (classify_compute_cpu_fast_path(raw.data(), raw.size()) ==
+                    ComputeCpuFastPath::BroadcastBufferU32)
+                compute.cpu_fast_path = ComputeCpuFastPath::BroadcastBufferU32;
             if (has_cf9200_no_backing) {
                 if (!rdna2_gta5_cf9200_no_backing_dispatch(
                         raw.data(), raw.size(), compute.recompile_config,

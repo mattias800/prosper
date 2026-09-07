@@ -3248,6 +3248,13 @@ if(TARGET prosper_core)
   endif()
 endif()
 
+if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  add_executable(test_broadcast_htile_clear tests/gpu/execute/test_broadcast_htile_clear.cpp)
+  target_include_directories(test_broadcast_htile_clear PRIVATE tests frontends)
+  target_link_libraries(test_broadcast_htile_clear PRIVATE prosper_live_renderer Vulkan::Vulkan)
+  add_test(NAME broadcast_htile_clear COMMAND test_broadcast_htile_clear)
+endif()
+
 # Normal sampled-render capture on every host with the live renderer. Unix writes PNG through zlib;
 # Windows uses its built-in WIC PNG encoder so the native tool needs no extra package.
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
