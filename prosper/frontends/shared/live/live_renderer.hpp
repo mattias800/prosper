@@ -19,6 +19,10 @@
 
 namespace prosper::frontend {
 
+// Snapshot the initialized graphics driver cache before an _Exit frontend terminates. A busy
+// renderer skips the save; this never destroys resources or waits for guest compilation.
+bool flush_live_graphics_pipeline_cache();
+
 // The decoded-texture identity map lives for one SUBMIT (#1691). A submit is cut into a new graphics
 // span at every interleaved compute/DMA operation, and that split is exactly what could rewrite guest
 // texture bytes mid-submit, so an entry crossing a span boundary must carry proof that nothing wrote

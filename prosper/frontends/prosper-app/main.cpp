@@ -3231,6 +3231,7 @@ int main(int argc, char** argv) {
         // _Exit skips RuntimeComputeTimingSelector's destructor. Publish its validity verdict here;
         // the report is idempotent so a future cooperative teardown cannot duplicate it.
         prosper::frontend::report_live_compute_timing_selector_summary();
+        prosper::frontend::flush_live_graphics_pipeline_cache();
 #endif
         // The bounded dmem writer trace also has a destructor/atexit fallback, which _Exit skips.
         prosper::host::guest_dmem_write_trace_report();

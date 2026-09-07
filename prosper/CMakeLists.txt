@@ -3172,6 +3172,24 @@ if(TARGET prosper_core)
       target_link_libraries(test_pipeline_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME pipeline_render COMMAND test_pipeline_render)
 
+      add_executable(test_pipeline_cache_file frontends/shared/tests/test_pipeline_cache_file.cpp)
+      target_include_directories(test_pipeline_cache_file PRIVATE frontends)
+      target_link_libraries(test_pipeline_cache_file PRIVATE Vulkan::Vulkan Threads::Threads)
+      if(Python3_Interpreter_FOUND)
+        add_test(NAME pipeline_cache_file COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/frontends/shared/tests/run_pipeline_cache_file.py
+          $<TARGET_FILE:test_pipeline_cache_file>)
+      endif()
+
+      add_executable(test_graphics_cache_persistence tests/gpu/test_graphics_cache_persistence.cpp)
+      target_include_directories(test_graphics_cache_persistence PRIVATE tests frontends)
+      target_link_libraries(test_graphics_cache_persistence PRIVATE prosper_core Vulkan::Vulkan)
+      if(Python3_Interpreter_FOUND)
+        add_test(NAME graphics_cache_persistence COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/test_graphics_cache_persistence.py
+          $<TARGET_FILE:test_graphics_cache_persistence>)
+      endif()
+
       # Full back-half spine: a GpuState -> recompile shaders from their PGM addresses -> resolve
       # pipeline state -> rendered frame (the path a real submitted Dcb will drive).
       add_executable(test_gpustate_render tests/gpu/test_gpustate_render.cpp)
