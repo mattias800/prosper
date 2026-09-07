@@ -81,7 +81,8 @@ inline VkDeviceSize mapped_staging_limit() {
 template <typename PickMemoryType>
 inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize bytes,
                                                  VkBufferUsageFlags usage,
-                                                 PickMemoryType&& pick) {
+                                                 PickMemoryType&& pick, bool* reused = nullptr) {
+    if (reused) *reused = false;
     if (!bytes) return {};
     MappedStagingCache& cache = mapped_staging_cache();
     const std::tuple<VkDevice, VkDeviceSize, uint32_t> key{device, bytes,
@@ -95,6 +96,7 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
             if (found->second.empty()) cache.free_blocks.erase(found);
             cache.cached_bytes -= bytes;
             cache.in_use.emplace(block.memory, key);
+            if (reused) *reused = true;
             return block;                  // mapping intact: no fault-in on the next write
         }
     }
@@ -115,7 +117,11 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
         vkDestroyBuffer(device, block.buffer, nullptr);
         return {};
     }
-    vkBindBufferMemory(device, block.buffer, block.memory, 0);
+    if (vkBindBufferMemory(device, block.buffer, block.memory, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(device, block.buffer, nullptr);
+        vkFreeMemory(device, block.memory, nullptr);
+        return {};
+    }
     if (vkMapMemory(device, block.memory, 0, VK_WHOLE_SIZE, 0, &block.mapped) != VK_SUCCESS ||
         !block.mapped) {
         vkFreeMemory(device, block.memory, nullptr);
@@ -133,15 +139,24 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
 // for a block already back in the free list too, so a duplicate release is a no-op rather than a
 // dangling mapping.
 inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
-                                   void* mapped) {
+                                   void* mapped, bool allow_reuse = true) {
     if (!memory) return false;
     MappedStagingCache& cache = mapped_staging_cache();
     std::lock_guard<std::mutex> lock(cache.mutex);
     if (!cache.owned.count(memory)) return false;          // not ours: caller tears it down
+    auto active = cache.in_use.find(memory);
+    if (active == cache.in_use.end()) { ++cache.double_releases; return true; }
+    const std::tuple<VkDevice, VkDeviceSize, uint32_t> key = active->second;
+    if (std::get<0>(key) != device) {
+        // Keep ownership for a later release through the correct device. Returning
+        // false would invite the caller to free our allocation through the wrong one.
+        ++cache.cross_device_skips;
+        return true;
+    }
     // Bisection seam: with this set the block is destroyed rather than retained, so acquire is
     // exercised exactly as before but nothing is ever reused. It separates "the new allocation
     // path is wrong" from "reusing a block is wrong".
-    if (!mapped_staging_reuse_enabled()) {
+    if (!allow_reuse || !mapped_staging_reuse_enabled()) {
         cache.owned.erase(memory);
         cache.in_use.erase(memory);
         vkUnmapMemory(device, memory);
@@ -149,18 +164,8 @@ inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMem
         vkDestroyBuffer(device, buffer, nullptr);
         return true;
     }
-    auto active = cache.in_use.find(memory);
-    if (active == cache.in_use.end()) { ++cache.double_releases; return true; }
-    const std::tuple<VkDevice, VkDeviceSize, uint32_t> key = active->second;
     const VkDeviceSize key_bytes = std::get<1>(key);
     cache.in_use.erase(active);
-    if (std::get<0>(key) != device) {
-        // The allocation belongs to a different device than the one tearing it down. Do not
-        // retain it and do not touch it with this device; just forget it.
-        ++cache.cross_device_skips;
-        cache.owned.erase(memory);
-        return false;
-    }
     if (cache.cached_bytes + key_bytes > mapped_staging_limit()) {
         cache.owned.erase(memory);
         vkUnmapMemory(device, memory);

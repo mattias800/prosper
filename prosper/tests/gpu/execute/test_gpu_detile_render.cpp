@@ -157,13 +157,18 @@ int main() {
     BackendColorTarget old_target{0x34070001u, false, false};
     const auto deferred = render_draws_rgba({draw}, 16, 16, nullptr, nullptr, false, &old_target,
                                            nullptr, nullptr, nullptr, &batch, false, nullptr, false);
+    const VkBuffer pending_input = upload->input;
+    const VkDeviceMemory pending_memory = upload->input_memory;
+    const void* pending_mapping = upload->input_mapped;
     std::weak_ptr<GpuDetileUpload> old_owner = upload;
     upload.reset(); resource.gpu_detile.reset(); draw.R.clear();
     check(deferred.empty() && batch.pending() && !old_owner.expired(),
           "pending submission retains detile buffers after frontend ownership ends");
     seed(1);
     auto changed = prepare_render_gpu_detile(width, height, faces, base, stride, offset, copy);
-    check(bool(changed), "changed guest bytes acquire a distinct immutable upload");
+    check(changed && changed->input != pending_input && changed->input_mapped != pending_mapping,
+          "overlapping pending and new uploads cannot share input storage or mapping");
+    if (!changed) return 1;
     resource.gpu_detile = changed; draw.R = {resource};
     const auto current = render_draws_rgba({draw}, 16, 16, nullptr, nullptr, false, nullptr,
                                            nullptr, nullptr, nullptr, &batch, true);
@@ -178,6 +183,44 @@ int main() {
     }
     check(center(original) == std::array<uint8_t, 4>{255, 0, 0, 255},
           "guest mutation before flush did not alter the earlier publication");
+
+    auto& staging = mapped_staging_cache();
+    const auto foreign_releases = staging.cross_device_skips;
+    check(release_mapped_staging(VK_NULL_HANDLE, changed->input, changed->input_memory,
+                                changed->input_mapped, false) &&
+              staging.cross_device_skips == foreign_releases + 1 &&
+              staging.in_use.count(changed->input_memory),
+          "wrong-device release cannot destroy or surrender an owned input");
+    if (!PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_INPUT_REUSE") && mapped_staging_reuse_enabled()) {
+        const auto duplicates = staging.double_releases;
+        const bool safe_duplicate = release_mapped_staging(changed->device, pending_input, pending_memory,
+                                      const_cast<void*>(pending_mapping), false) &&
+            staging.double_releases == duplicates + 1 && staging.owned.count(pending_memory);
+        check(safe_duplicate, "duplicate release cannot free a retained mapping even when reuse is disabled");
+        if (!safe_duplicate) return 1; // Do not dereference a freed mapping in the negative control.
+    }
+
+    // Completion returned the old input to the pool. The newer upload remains
+    // owned, so reacquisition can reuse only an idle allocation, never that one.
+    const auto changed_face0 = expected_face(0);
+    seed(2);
+    const size_t before_reuse_reads = reads;
+    auto recycled = prepare_render_gpu_detile(width, height, faces, base, stride, offset, copy);
+    check(recycled && recycled->input_reused && recycled->input == pending_input &&
+              recycled->input_mapped == pending_mapping && recycled->input != changed->input,
+          "final submission owner release permits reuse of the same live input mapping");
+    check(recycled && reads == before_reuse_reads + faces,
+          "reused allocation still snapshots all six changed faces");
+    if (!recycled) return 1;
+    resource.gpu_detile = recycled;
+    for (uint32_t face = 0; face < faces; ++face) {
+        select_face(face); draw.R = {resource};
+        check(center(render_draws_rgba({draw}, 16, 16)) == expected_face(face),
+              "reused mapped input samples fresh pixels on every cube face");
+    }
+    resource.gpu_detile = changed; select_face(0); draw.R = {resource};
+    check(center(render_draws_rgba({draw}, 16, 16)) == changed_face0,
+          "an overlapping upload retains its earlier snapshot after another input is reused");
 
     // Exercise actual frontend admission and refusal with captured guest backing.
     // The missing last byte is unused tile padding, so CPU fallback has the same

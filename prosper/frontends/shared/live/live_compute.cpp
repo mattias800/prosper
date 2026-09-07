@@ -8834,7 +8834,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "[compute-image] code=0x%llx hash=0x%016llx "
                              "binding=%u class=%s imported=%u color-bits-copy=%u addr=0x%llx "
                              "persistent=%u allocation-reused=%u upload-skipped=%u "
-                             "extent=%ux%ux%u guest=%zu staging=%llu "
+                             "extent=%ux%ux%u guest=%zu staging=%llu format=%u components=%u "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
                              "query_ms=%.3f import_ms=%.3f cache_ms=%.3f "
                              "staging_ms=%.3f prepare_ms=%.3f allocation_ms=%.3f "
@@ -8849,6 +8849,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              bi.upload_skipped ? 1u : 0u,
                              r->width, r->height, r->depth, bi.guest_bytes,
                              (unsigned long long)sbytes,
+                             static_cast<unsigned>(r->format), r->num_components,
                              image_descriptors[i].normalized_sampling ? 1u : 0u,
                              image_descriptors[i].texel_access ? 1u : 0u,
                              image_descriptors[i].sampled_float ? 1u : 0u,
