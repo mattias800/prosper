@@ -444,6 +444,7 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatc
 enum class ComputeCpuFastPath : uint8_t {
     None,
     FillSgprUvec4,
+    BroadcastBufferU32,
 };
 
 ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t dwords);

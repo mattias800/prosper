@@ -2927,7 +2927,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::fclose(file);
-        replay.computes[static_cast<size_t>(index)].spirv = std::move(words);
+        auto& overridden = replay.computes[static_cast<size_t>(index)];
+        overridden.spirv = std::move(words);
+        // Guest-ISA shortcuts cannot stand in for an explicitly substituted SPIR-V program.
+        overridden.cpu_fast_path = prosper::gpu::ComputeCpuFastPath::None;
+        overridden.terminator_only_program_validated = false;
         allow_mismatch = true;
         std::fprintf(stderr, "[gpureplay] override compute %ld with %ld bytes from %s\n",
                      index, byte_count, compute_override_path.c_str());

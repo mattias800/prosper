@@ -1,9 +1,9 @@
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
-Last revised: 2026-08-17 (ladder position reconciled against tracker #1808 and the checked-in guard;
-the investigation body below is unchanged and still dated 2026-08-03 — snapshot route/reference
-triage, see Ruled out). Prior history: #1216 (closed — boot/blank-frame era), #1264 (Day One hold
-investigation), #1287 (visuals umbrella, open).
+Last revised: 2026-09-07 (opening FMV regression #3423; see Ruled out). Ladder position was last
+reconciled against tracker #1808 and the checked-in guard on 2026-08-17; the older investigation
+sections retain their own dates. Prior history: #1216 (closed — boot/blank-frame era), #1264
+(Day One hold investigation), #1287 (visuals umbrella, open).
 
 ## Ladder position
 
@@ -430,6 +430,40 @@ not runtime caching — they say nothing about whether prosper re-uploads a text
 reading them that way is a trap.
 
 ## Ruled out (do-not-redo list)
+
+**2026-09-07 — opening FMV foreground geometry (#3423): adjacent-commit live bisect.**
+The exact parent `75f57457f79920c1e8c4cca96695eb183824984d` renders an unobstructed portrait;
+its immediate successor `03caaf19fb5a15d1efa278da066d0e9afdcc79b8` (#3281) puts a tree and
+balustrade in front of the same opening movie. Both used fresh saves, the native app with
+`PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_IME_AUTOKEY=1 PROSPER_RENDER=1`, immediate
+presentation, no pad input, and `PROSPER_GRAB_BUNDLE_AFTER_MS=310000` during a 350-second run.
+This is visual correctness evidence, not a timing comparison; compilation overlapped parts of the
+historical runs. The screenshots, manifests and detailed bisect are linked from #3423.
+
+The current bad capture contains 31 dispatches of one bounded indexed-buffer program across two
+adjacent submits. Every observed mask is zero: the shader broadcasts a separate four-byte source
+value over a destination HTILE range. All destination bytes happen to be zero already, but the
+operation is a logical clear, not an identity copy of the destination. In the strongest sequence,
+a depth-producing draw is followed by the broadcast into that same surface's HTILE, then a
+stencil-only clear draw. Preserving detached depth on the strength of equal guest metadata skips
+the depth reset. The count and mask come from the per-instruction scalar-load resource snapshots;
+the generic SGPR-8 resource is not the captured value source.
+
+The older neutral suppression experiment below measured a different black-frame/coverage claim;
+it does not rule out this visually bisected layering regression. A blanket reversion of #3281 is
+also insufficient: the identity-update preservation serves GTA's G-buffer-to-lighting path.
+The fix must distinguish an independently sourced broadcast from an actual identity update and
+retain the latter's rendered depth.
+
+The bounded broadcast path proves the full decoded instruction shape, runtime zero mask, linear
+UINT32 descriptors, launch extent and non-aliasing readable input ranges before filling the exact
+written range. It emits an ordinary guest-write notification even for zero-to-zero metadata.
+Identity updates keep the Vulkan path and its existing preservation behavior. The
+`broadcast_htile_clear` guard renders nonzero depth, verifies that a Vulkan identity update retains
+it, then sends a broadcast through capture serialization and replay and verifies the formerly
+occluded consumer becomes visible. Replay derives the proof from retained ISA and owns its
+snapshot bytes; an explicit SPIR-V override clears the guest-program shortcuts.
+
 
 **2026-08-29 — the HTILE byte-preserving suppression is NOT what keeps this title rendering.**
 #3093 removed that suppression to fix this title's black frame and recorded a fade-in to ~21% as the
