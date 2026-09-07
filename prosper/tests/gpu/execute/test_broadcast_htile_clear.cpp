@@ -51,10 +51,11 @@ int main() {
               ComputeCpuFastPath::BroadcastBufferU32, "complete bounded broadcast is recognized");
     check(classify_compute_cpu_fast_path(code.data(), code.size() - 1) == ComputeCpuFastPath::None,
           "truncated broadcast is refused");
-    for (const auto [word, bit] : {std::pair{15u, 0u}, {15u, 17u}, {16u, 0u}, {7u, 0u}}) {
+    for (const auto [word, bit] : {std::pair{15u, 0u}, {15u, 17u}, {16u, 0u}, {7u, 0u},
+                                   {5u, 8u}, {10u, 8u}, {14u, 0u}}) {
         auto altered = code; altered[word] ^= 1u << bit;
         check(classify_compute_cpu_fast_path(altered.data(), altered.size()) == ComputeCpuFastPath::None,
-              "changed store offset, address controls, address register or branch is refused");
+              "changed store addressing, branch or memory-completion waits are refused");
     }
 
     constexpr uint64_t cb_address = 0x20000000u, target_address = 0x21000000u;

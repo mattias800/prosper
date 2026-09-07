@@ -7892,17 +7892,20 @@ ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t d
         operand(index.src[1], OperandKind::InlineInt, 6) &&
         operand(index.src[2], OperandKind::VGPR, 0) &&
         scalar_load(2, 3, 0) && shape(3, Rdna2Format::SOPP, 0x0c, 5, 1) &&
+        static_cast<uint16_t>(ins[3].simm16) == 0xc07fu &&
         shape(4, Rdna2Format::VOPC, 0xd4, 6, 1) &&
         operand(compare.src[0], OperandKind::Special, 106) &&
         operand(compare.src[1], OperandKind::VGPR, 0) &&
         shape(5, Rdna2Format::SOPP, 0x08, 7, 1) && ins[5].simm16 == 9 &&
         scalar_load(6, 8, 4) && shape(7, Rdna2Format::SOPP, 0x0c, 10, 1) &&
+        static_cast<uint16_t>(ins[7].simm16) == 0xc07fu &&
         shape(8, Rdna2Format::VOP2, 0x1b, 11, 1) &&
         operand(mask.dst, OperandKind::VGPR, 1) &&
         operand(mask.src[0], OperandKind::Special, 106) &&
         operand(mask.src[1], OperandKind::VGPR, 0) &&
         buffer_access(9, 12, 0x00, 1, 0) &&
         shape(10, Rdna2Format::SOPP, 0x0c, 14, 1) &&
+        static_cast<uint16_t>(ins[10].simm16) == 0x3f70u &&
         buffer_access(11, 15, 0x04, 0, 4) && shape(12, Rdna2Format::SOPP, 0x01, 17, 1))
         return ComputeCpuFastPath::BroadcastBufferU32;
     return ComputeCpuFastPath::None;
