@@ -61,7 +61,18 @@ Across the four measured 4K groups, weighting both arms by the control's group c
 6.385 → 6.344 ms/dispatch (about 0.65% lower), with CPU savings largely offset by GPU/wait/setup.
 Both screenshots retain the known black world and HUD; newly rendered FPS remains unavailable.
 The next iteration removes the separate full-output GPU clear and uses shifts for power-of-two
-addressing. Its benefit still requires a fresh game comparison. #3439.
+addressing.
+
+The revised single-pass pair on `e45e19f7be8f` has 33 CPU-control and 32 GPU-treatment
+selected dispatches, complete GPU timestamps and zero poison rows in both arms. Every treatment
+row confirms GPU retile. With the control's counts weighting the same four 4K groups, total
+cost is 5.859 → 5.700 ms/dispatch (2.71% lower) and writeback is 4.119 → 3.601 ms (12.58% lower).
+Wait rises 1.299 → 1.627 ms and the GPU post-shader interval rises 0.359 → 0.675 ms, so much of
+the CPU saving is offset elsewhere. The selected program's total is 6.606 → 6.492 ms; binding-9
+image writeback is 2.514 → 1.984 ms. This is a modest observed compute gain in one same-binary
+pair, not a stable general speedup or newly rendered-FPS claim. Both screenshots show the known
+black world/HUD at 00:35.18 / 00:37.58. Both main audio streams have zero pre-F9 consumption-demand
+shortfalls, without proving audible continuity or physical hardware XRUN behavior. #3439.
 
 ## Packed render-target GPU conversion (2026-09-07, #3437)
 
