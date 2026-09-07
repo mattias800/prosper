@@ -27,6 +27,29 @@ aggregate frame metric was used to make the call. Checked-in capture:
 ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
 between that and a gameplay screenshot.
 
+## Compute writeback profile (2026-09-07, #3407)
+
+A fresh run on `1ddde6da386f` used the committed route, F8 at 300 seconds, F9 at 330,
+and capture-gated phase/image timing across all programs. Its completed F8 has 322 renderer
+records, 662 compute records, 20/21 pre/post samples and zero dropped records. All 542 phase
+rows and 284 completed image-writeback rows lie within that capture interval. Compute records
+also include CPU fast paths and early declines; phase rows are not a complete dispatch census.
+
+Image layout took 505.709 ms in completed rows. Four 3840×2160 groups account for 443.212 ms:
+`111503adecbc99bf` binding 7 (Uint8×4, tile 27), `57b6ed05eb1201e0` binding 7
+(Uint32, tile 24), `58b3e5c2529091f0` binding 5 and `e3c2229a45c7807c` binding 9
+(Unorm8×4, tile 27). These are exact 33,177,600-byte linear transfers into 33,423,360-byte
+guest surfaces. The separate buffer program `dd5611041d9f7392` has 96 Vulkan phase rows
+with 655.31 ms buffer setup and 573.74 ms buffer writeback; existing timers do not separate
+its comparison, copying and cache/watch costs.
+
+This is a diagnostic profile, not a quiet baseline or a claimed saving. Concurrent 199 Hz
+`cpu/cycles/P` profiling spans roughly 285–306.5 seconds and records 11,021 samples.
+Whole-record `perf script` loses hot user call chains; decoding the main thread separately
+recovers copy, comparison and compute tiling callers. Those optimized callers do not always
+separate setup from writeback. The subsequent F9 retains the known black world and HUD at
+00:33.23; it is not proof of correct world rendering or replay equivalence.
+
 ## Packed render-target GPU conversion (2026-09-07, #3437)
 
 The selected sampled input is now verified against the live imported image: binding 10 of

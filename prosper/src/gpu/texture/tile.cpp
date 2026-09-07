@@ -1251,6 +1251,18 @@ std::array<uint32_t, 16> tile27_rgba16f_equation() {
     return result;
 }
 
+bool tile64_word_equation(uint32_t mode, uint32_t bpe,
+                          std::array<uint32_t, 16>& equation,
+                          uint32_t& block_width, uint32_t& block_height) {
+    if (!is_64kb_mode(mode) || (bpe != 4 && bpe != 8 && bpe != 16)) return false;
+    const auto el = sw64kb_elem_log2(bpe);
+    sw64kb_dims(el, block_width, block_height);
+    const auto* pattern = sw64kb_pattern(mode, el);
+    for (size_t bit = 0; bit < equation.size(); ++bit)
+        equation[bit] = uint32_t(pattern[bit].x) | (uint32_t(pattern[bit].y) << 16);
+    return true;
+}
+
 size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, uint32_t pitch,
                            uint32_t bytes_per_texel) {
     if (!tile_mode_is_tiled(tile_mode)) return (size_t)width * height * bytes_per_texel;

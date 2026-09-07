@@ -14,6 +14,8 @@ found Vulkan.
   pipeline cache, descriptor pools, memory pool and command buffers, and does not include
   `render_runner.h` at all. Reflected storage buffers and storage images are materialized from guest
   memory, dispatched, and written back into guest memory synchronously.
+- `gpu_retile.hpp` — exact 2D storage-image writeback layout conversion in the guest compute
+  submission. Keeps linear comparison baselines separate from the tiled host-read buffer.
 - `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.
   Records transfers and conversion into the guest compute submission; setup failures retain their
   `VkResult` so optional fallback cannot hide device loss.

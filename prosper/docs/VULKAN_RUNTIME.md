@@ -84,3 +84,20 @@ consumption. Adopt synchronization2 with producer/consumer stage knowledge, not 
 renaming `ALL_COMMANDS` barriers. Dynamic rendering can simplify object lifetime, but neither it nor
 the version bump has a measured performance gain here yet. Audio is recognizable after #3411 and
 its production rate improved with #3415; sustained delivery remains below the required sample rate.
+
+## GPU storage-image writeback layout
+
+Exact 2D storage images with 4-, 8-, or 16-byte texels in guest tile modes 9, 24 and 27
+can retile their transfer bytes in the existing compute submission. `gpu_retile.hpp` checks
+storage-buffer ranges, push-constant and workgroup limits before admission. It uses ordinary
+integer storage-buffer operations; no optional numeric feature, host image copy or driver flag
+is required. `PROSPER_NO_GPU_RETILE=1` restores the CPU layout path for comparison.
+
+The original linear staging result remains the exact cache-comparison baseline. A separate
+completion-owned buffer holds tiled pixels and zero padding, with both shader and transfer writes
+made available for host reads. Guest writeback, write-watch notification and cache invalidation
+remain synchronous. Poison-verification, volume, array, mip-tail and non-exact representations
+retain their existing CPU path. Optional setup errors can fall back; device loss remains fatal.
+The GPU post-dispatch timestamp includes retile work, and capture-gated image-writeback rows report
+`gpu-retile=1` when the host consumes the tiled result. Host `pack_ms` then includes mapping that
+result, and `layout_ms` measures its contiguous guest copy.

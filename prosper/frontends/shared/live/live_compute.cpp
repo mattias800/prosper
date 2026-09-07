@@ -8,6 +8,7 @@
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
+#include "shared/live/gpu_retile.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/texture/seed_reprove.hpp"
@@ -425,6 +426,8 @@ std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
 std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
 std::atomic<bool> g_force_next_queue_submit_device_lost_for_test{false};
 std::atomic<VkResult> g_next_packed_rtt_setup_result_for_test{VK_SUCCESS};
+std::atomic<VkResult> g_next_retile_allocation_for_test{VK_SUCCESS};
+std::atomic<VkResult> g_next_retile_mapping_for_test{VK_SUCCESS};
 std::atomic<uint64_t> g_live_compute_queue_submit_attempts{0};
 thread_local uint64_t g_perf_compute_gpu_timestamp_samples = 0;
 thread_local double g_perf_compute_gpu_device_ms = 0.0;
@@ -1411,6 +1414,7 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
+    GpuRetilePipeline retile_pipeline;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -1594,6 +1598,7 @@ struct VulkanComputeContext {
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
         packed_rtt_conversion.destroy();
+        retile_pipeline.destroy();
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -1764,8 +1769,25 @@ struct VulkanComputeContext {
     }
 
     VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type,
-                                   bool persistently_map = false) {
-        if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
+                                   bool persistently_map = false,
+                                   VkResult* setup_status = nullptr) {
+        if (setup_status) *setup_status = VK_SUCCESS;
+        if (memory_type == UINT32_MAX) {
+            if (setup_status) *setup_status = VK_ERROR_FEATURE_NOT_PRESENT;
+            return VK_NULL_HANDLE;
+        }
+        // Fault controls are scoped to the caller requesting exact setup errors
+        // (retile), at the actual driver boundaries rather than after propagation.
+        auto allocate = [&](const VkMemoryAllocateInfo& info, VkDeviceMemory* result) {
+            const auto injected = setup_status ? g_next_retile_allocation_for_test.exchange(
+                VK_SUCCESS, std::memory_order_acq_rel) : VK_SUCCESS;
+            return injected != VK_SUCCESS ? injected : vkAllocateMemory(device, &info, nullptr, result);
+        };
+        auto map = [&](VkDeviceMemory allocation, VkDeviceSize size, void** mapping) {
+            const auto injected = setup_status ? g_next_retile_mapping_for_test.exchange(
+                VK_SUCCESS, std::memory_order_acq_rel) : VK_SUCCESS;
+            return injected != VK_SUCCESS ? injected : vkMapMemory(device, allocation, 0, size, 0, mapping);
+        };
         const ComputeMemoryKey key{bytes, memory_type};
         static const bool best_fit_reuse =
             std::getenv("PROSPER_COMPUTE_MEMORY_POOL_EXACT") == nullptr;
@@ -1805,8 +1827,9 @@ struct VulkanComputeContext {
                     memory_pool.persistent_mappings.find(allocation) ==
                         memory_pool.persistent_mappings.end()) {
                     void* mapping = nullptr;
-                    if (vkMapMemory(device, allocation, 0, allocation_key.bytes, 0, &mapping) ==
-                        VK_SUCCESS)
+                    const auto mapped = map(allocation, allocation_key.bytes, &mapping);
+                    if (setup_status) *setup_status = mapped;
+                    if (mapped == VK_SUCCESS)
                         memory_pool.persistent_mappings.emplace(allocation, mapping);
                 }
                 return allocation;
@@ -1818,8 +1841,9 @@ struct VulkanComputeContext {
         allocation.allocationSize = bytes;
         allocation.memoryTypeIndex = memory_type;
         VkDeviceMemory result = VK_NULL_HANDLE;
-        VkResult allocation_result = vkAllocateMemory(device, &allocation, nullptr, &result);
-        if (allocation_result != VK_SUCCESS && compute_memory_pool_enabled()) {
+        VkResult allocation_result = allocate(allocation, &result);
+        if (allocation_result != VK_SUCCESS && allocation_result != VK_ERROR_DEVICE_LOST &&
+            compute_memory_pool_enabled()) {
             // Cached allocations are expendable. Under real heap pressure, release them before
             // propagating OOM so an enlarged reuse cache can never strand memory needed now.
             const size_t released = release_available_memory();
@@ -1827,16 +1851,19 @@ struct VulkanComputeContext {
                 fprintf(stderr,
                         "[compute] allocation failed (%d); evicted %zu cached allocation(s) and retrying\n",
                         static_cast<int>(allocation_result), released);
-                allocation_result = vkAllocateMemory(device, &allocation, nullptr, &result);
+                allocation_result = allocate(allocation, &result);
             }
         }
+        if (setup_status) *setup_status = allocation_result;
         if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
             memory_pool.active.emplace(result, key);
             if (persistently_map && persistent_mapping_enabled()) {
                 void* mapping = nullptr;
-                if (vkMapMemory(device, result, 0, bytes, 0, &mapping) == VK_SUCCESS)
+                const auto mapped = map(result, bytes, &mapping);
+                if (setup_status) *setup_status = mapped;
+                if (mapped == VK_SUCCESS)
                     memory_pool.persistent_mappings.emplace(result, mapping);
             }
         }
@@ -3264,6 +3291,11 @@ struct ScopedMappedMemory {
 struct BoundImage {
     const prosper::gpu::ShaderResource* resource = nullptr;
     uint32_t binding = 0;
+    VkBuffer retile_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory retile_memory = VK_NULL_HANDLE;
+    VkDescriptorPool retile_pool = VK_NULL_HANDLE;
+    VkDescriptorSet retile_set = VK_NULL_HANDLE;
+    GpuRetileParameters retile_parameters{};
     bool storage = false;               // storage image: read back + pack to guest after the dispatch
     bool native_float_storage = false;  // Vulkan performs exact UNORM/float conversion at native width
     bool native_uint_storage = false;   // exact guest-width integer texels
@@ -6078,6 +6110,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     vkDestroyImage(ctx.device, images[i].image, nullptr);
                 if (images[i].memory) ctx.release_memory(images[i].memory);
             }
+            if (images[i].retile_pool) vkDestroyDescriptorPool(ctx.device, images[i].retile_pool, nullptr);
+            if (images[i].retile_buffer) vkDestroyBuffer(ctx.device, images[i].retile_buffer, nullptr);
+            if (images[i].retile_memory) ctx.release_memory(images[i].retile_memory);
             if (staging[i]) vkDestroyBuffer(ctx.device, staging[i], nullptr);
             if (staging_memory[i]) ctx.release_memory(staging_memory[i]);
         }
@@ -8912,6 +8947,59 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (!images_ready) break;
 
+        // Exact 2D tiling runs after image transfer in this same submission. Keep
+        // the original linear result for cache comparison and publication; the
+        // tiled result has its own allocation owned through completion.
+        static const bool gpu_retile_disabled = std::getenv("PROSPER_NO_GPU_RETILE") != nullptr;
+        if (!gpu_retile_disabled) {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(ctx.physical, &properties);
+            for (size_t i = 0; i < images.size(); ++i) {
+                BoundImage& bi = images[i];
+                const auto* r = bi.resource;
+                if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip ||
+                    bi.poison_verify || !bi.exact_storage_bytes() || !r ||
+                    r->depth != 1 || r->img_dim != 1 || r->in_mip_tail ||
+                    r->layer_mip_offset_bytes || !staging[i]) continue;
+                const uint32_t bpe = r->format == DataFormat::Float10_11_11 ||
+                    r->format == DataFormat::Unorm2_10_10_10 ? 4u :
+                    data_format_bytes(r->format) * (r->num_components ? r->num_components : 1u);
+                if (!bi.retile_parameters.initialize(r->width, r->height, bpe,
+                        r->tile_mode, properties.limits) ||
+                    bi.retile_parameters.tiled_bytes != bi.guest_bytes ||
+                    bi.retile_parameters.linear_bytes != staging_bytes[i]) continue;
+                auto prepare = [&] {
+                    if (!vk_soft_ok(ctx.retile_pipeline.initialize(ctx.device, ctx.pipeline_cache),
+                                    "retile-pipeline")) return false;
+                    VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                    ci.size = bi.retile_parameters.tiled_bytes;
+                    ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                    if (!vk_soft_ok(vkCreateBuffer(ctx.device, &ci, nullptr, &bi.retile_buffer),
+                                    "retile-buffer")) return false;
+                    VkMemoryRequirements requirements{};
+                    vkGetBufferMemoryRequirements(ctx.device, bi.retile_buffer, &requirements);
+                    VkResult allocation_status = VK_SUCCESS;
+                    bi.retile_memory = ctx.allocate_memory(requirements.size,
+                        ctx.host_memory_type(requirements.memoryTypeBits), true, &allocation_status);
+                    if (!vk_soft_ok(allocation_status, "retile-memory") ||
+                        !vk_soft_handle_ok(bi.retile_memory, "retile-memory-handle") ||
+                        !vk_soft_ok(vkBindBufferMemory(ctx.device, bi.retile_buffer,
+                            bi.retile_memory, 0), "retile-bind")) return false;
+                    return vk_soft_ok(ctx.retile_pipeline.bind(staging[i], bi.retile_buffer,
+                        bi.retile_parameters, bi.retile_pool, bi.retile_set), "retile-descriptors");
+                };
+                if (!prepare()) {
+                    if (bi.retile_pool) vkDestroyDescriptorPool(ctx.device, bi.retile_pool, nullptr);
+                    if (bi.retile_buffer) vkDestroyBuffer(ctx.device, bi.retile_buffer, nullptr);
+                    if (bi.retile_memory) ctx.release_memory(bi.retile_memory);
+                    bi.retile_pool = VK_NULL_HANDLE; bi.retile_set = VK_NULL_HANDLE;
+                    bi.retile_buffer = VK_NULL_HANDLE; bi.retile_memory = VK_NULL_HANDLE;
+                    if (ctx.device_lost) { images_ready = false; break; }
+                }
+            }
+        }
+        if (!images_ready) break;
+
         // #1854 shadow census: all bindings are now finalized, including aliases, persistent-cache
         // reuse, and device-local compute-transfer seeds. Observe consumers before the dispatch can
         // execute, but do not change any upload, barrier, wait, readback, or guest writeback. Writable
@@ -9746,6 +9834,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // TRANSFER, not COMPUTE_SHADER: the shader wrote the IMAGE, the copy above wrote this
             // buffer, and the source scope has to name the write that actually produced the bytes.
             prosper::gpu::record_host_read_barrier(command, staging[i]);
+            if (bi.retile_buffer)
+                ctx.retile_pipeline.record(command, staging[i], bi.retile_buffer,
+                                            bi.retile_set, bi.retile_parameters);
             if (bi.mirror_result_to_imported) {
                 const BoundImage& mirror = images[bi.seed_from_imported];
                 VkImageMemoryBarrier mirror_to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -9790,7 +9881,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
         if (perf_gpu_timing)
-            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            // Include the optional compute retile after the image transfer.
+            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 3);
         // Compare retained exact results before replacing their baselines. Guest-buffer shader
         // writes and image transfer writes become comparator reads; one atomic flag per target then
@@ -10468,8 +10560,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // over all `texels`), so no zero is needed.
             prosper::frontend::ScratchBuffer linear;
             uint8_t* packed = destination;
-            if ((r->tile_mode && !tile_mapped_bytes) ||
-                (!r->tile_mode && array_image && r->depth > 1)) {
+            if (!bi.retile_buffer && ((r->tile_mode && !tile_mapped_bytes) ||
+                (!r->tile_mode && array_image && r->depth > 1))) {
                 linear.reset(linear_bytes, /*zero_fill=*/false);
                 packed = linear.get();
             }
@@ -10621,9 +10713,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             bi.nonzero_channels += channels[t * 4 + c] != 0;
                 }
             }
+            ScopedMappedMemory tiled_mapping(ctx);
             const auto pack_start = ComputeClock::now();
             static const bool pack_range_enabled = !std::getenv("PROSPER_NO_PACK_RANGE");
-            if (bi.exact_storage_bytes()) {
+            if (bi.retile_buffer) {
+                // Packing is already complete. Map the exact tiled result here;
+                // keep this map cost out of the guest write-watch timer.
+                tiled_mapping.memory = bi.retile_memory;
+                if (!vk_ok(ctx.map_memory(bi.retile_memory, 0, bi.retile_parameters.tiled_bytes,
+                        &tiled_mapping.data), "retile-readback-map")) {
+                    ctx.unmap_memory(staging_memory[i]); readback_ok = false; break;
+                }
+            } else if (bi.exact_storage_bytes()) {
                 // The typed Vulkan image has already applied the PS5 descriptor's UNORM/float
                 // conversion. Its transfer bytes are the guest's exact row-major texels. A tiled
                 // non-proving write can feed those bytes straight to the tiler, avoiding a second
@@ -10697,7 +10798,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  first_bad);
             }
             const uint8_t* layout_source = tile_mapped_bytes ? native_texels : packed;
-            if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
+            if (bi.retile_buffer) {
+                copy_compute_buffer(destination, tiled_mapping.data, bi.guest_bytes);
+            } else if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
                 if (!tile_volume(destination, bi.guest_bytes, layout_source, r->width, r->height,
                                  r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                     readback_ok = false;
@@ -10959,14 +11062,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "[compute-image-writeback] code=0x%llx hash=0x%016llx "
                              "binding=%u addr=0x%llx "
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
-                             "poison=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
+                             "poison=%u gpu-retile=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
                              "total_ms=%.3f\n",
                              (unsigned long long)item.code_addr,
                              (unsigned long long)timing_program_hash, bi.binding,
                              (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
                              r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
-                             bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u,
+                             bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u, bi.retile_buffer ? 1u : 0u,
                              image_milliseconds(map_start, map_done),
                              image_milliseconds(map_done, prepare_done),
                              image_milliseconds(prepare_done, watch_done),
@@ -11641,6 +11744,17 @@ void live_compute_force_next_image_result_host_fallback_for_test() {
 
 void live_compute_fail_next_image_result_buffer_retain_for_test() {
     g_fail_next_image_result_buffer_retain_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_fail_next_retile_memory_for_test(bool mapping, bool device_lost) {
+    (mapping ? g_next_retile_mapping_for_test : g_next_retile_allocation_for_test).store(
+        device_lost ? VK_ERROR_DEVICE_LOST : mapping ? VK_ERROR_MEMORY_MAP_FAILED :
+        VK_ERROR_OUT_OF_DEVICE_MEMORY, std::memory_order_release);
+}
+
+bool live_compute_retile_memory_fault_pending_for_test() {
+    return g_next_retile_mapping_for_test.load(std::memory_order_acquire) != VK_SUCCESS ||
+           g_next_retile_allocation_for_test.load(std::memory_order_acquire) != VK_SUCCESS;
 }
 
 void live_compute_fail_next_packed_rtt_setup_for_test(bool device_lost) {
