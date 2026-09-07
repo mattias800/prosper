@@ -2,9 +2,9 @@
 //
 // Enabled with -DPROSPER_AUDIO_SDL3=ON. Bridges the headless AudioSink interface (audio.hpp)
 // to SDL3's audio-stream API: one SDL_AudioStream per PS5 audio port, fed the guest's PCM
-// grains. output() blocks while the device's queue is full, reproducing the pacing that
-// sceAudioOutOutput has on real hardware (it blocks until the audio ring has room).
+// grains. output() paces the guest on a wall-clock grid using each grain's duration.
 #include "audio_sdl3.hpp"
+#include "audio_demand.hpp"
 #include "hle/audio/audio.hpp"
 #include "host/platform/lifecycle.hpp"
 #include "host/platform/precise_sleep.hpp"   // the grain pacer must not quantize to the winpthreads tick (#3016)
@@ -57,6 +57,13 @@ bool audio_debug() {
     static const bool on = getenv("PROSPER_AUDIO_DEBUG") != nullptr;
     return on;
 }
+bool audio_demand() {
+    static const bool on = [] {
+        const char* value = getenv("PROSPER_AUDIO_DEMAND");
+        return value && std::string(value) == "1";
+    }();
+    return on;
+}
 bool queue_trace() {
     static const bool on = getenv("PROSPER_AUDIO_QUEUE_TRACE") != nullptr;
     return on;
@@ -75,10 +82,11 @@ bool queue_trace() {
 // the queue is below the target, which is the property under test -- but a reader should know the
 // arm is the property, not the diff.
 //
-// Measured on Blasphemous 2 (PPSA13579), Windows/RTX 4090, 150 s from launch per arm, underrun
+// Measured on Blasphemous 2 (PPSA13579), Windows/RTX 4090, 150 s from launch per arm, input-queue
 // episodes from tools/perf/audio_queue_timeline_report.py (#3070), two runs per arm (#3033).
 //
-// "dry" here means the percentage of 1 ms SAMPLES at which the device queue held ZERO bytes while
+// These historical queue figures do not measure consumption shortfalls or backend XRUNs (#3432).
+// "dry" here means the percentage of 1 ms SAMPLES at which the INPUT queue held ZERO bytes while
 // the port was being fed -- pinned because the word became ambiguous on 2026-08-27: #3046 found
 // audio_delivery_report.py's "below one grain" thresholds were computed in FRAMES, so that tool
 // was reporting "completely empty" under a much weaker label, and a figure from it had already
@@ -231,7 +239,7 @@ public:
             SDL_Log("prosper-audio: SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
             return false;
         }
-        start_queue_timeline();   // no-op unless PROSPER_AUDIO_QUEUE_TIMELINE is set
+        start_queue_timeline();   // no-op unless queue or demand diagnostics are enabled
         return true;
     }
 
@@ -261,6 +269,16 @@ public:
         s.grain_bytes = audio_grain_bytes(info);
         s.freq = info.freq;
         s.put_failed = false;
+        s.demand_started = false;
+        s.demand_enabled = false;
+        ++s.generation;
+        if (audio_demand()) {
+            s.demand.reset(paused_ ? AudioDemandPhase::Paused : AudioDemandPhase::Startup);
+            s.demand_enabled = SDL_SetAudioStreamGetCallback(s.stream, AudioDemandMeter::consume,
+                                                           &s.demand);
+            if (!s.demand_enabled)
+                SDL_Log("[audio-demand-error] port=%d callback unavailable: %s", port, SDL_GetError());
+        }
         s.next = {};   // (re)start the per-grain pacing clock on the first output()
         SDL_SetAudioStreamGain(s.stream, gain_);
         const bool stream_ready = paused_ ? SDL_PauseAudioStreamDevice(s.stream)
@@ -273,6 +291,17 @@ public:
             return false;
         }
         const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s.stream);
+        if (s.demand_enabled) {
+            SDL_AudioSpec device_spec{};
+            int quantum = 0;
+            const bool available = SDL_GetAudioDeviceFormat(device, &device_spec, &quantum);
+            SDL_Log("[audio-demand-open] port=%d generation=%llu input_hz=%d input_channels=%d "
+                    "input_format=%u device_available=%d device_hz=%d device_channels=%d "
+                    "device_format=%u device_quantum_frames=%d",
+                    port, (unsigned long long)s.generation, spec.freq, spec.channels,
+                    unsigned(spec.format), int(available), device_spec.freq, device_spec.channels,
+                    unsigned(device_spec.format), quantum);
+        }
         if (const char* dump = getenv("PROSPER_AUDIO_DUMP_WAV"); dump && *dump) {
             std::string path(dump);
             const auto dot = path.rfind('.');
@@ -355,16 +384,24 @@ public:
             // the lock let close()/open()/quit() destroy it immediately before this call (#855).
             // The pacing sleep remains outside the lock, so lifecycle calls wait only for SDL's
             // synchronous queue copy rather than for an entire audio grain.
-            if (!SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes) && !s.put_failed) {
+            // Publish the first PCM and its phase under the same recursive SDL stream lock.
+            // Otherwise the consumer can pull that grain before Startup changes to Active.
+            const bool transition = s.demand_enabled && !s.demand_started;
+            const bool locked = transition && SDL_LockAudioStream(s.stream);
+            const bool put_ok = SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes);
+            if (!put_ok && !s.put_failed) {
                 SDL_Log("prosper-audio: PutAudioStreamData failed on port %d: %s", port, SDL_GetError());
                 s.put_failed = true;
             }
+            if (put_ok && s.demand_enabled && !s.demand_started) {
+                s.demand_started = true;
+                s.demand.set_phase(paused_ ? AudioDemandPhase::Paused : AudioDemandPhase::Active);
+            }
+            if (locked) SDL_UnlockAudioStream(s.stream);
             s.dump.write(pcm, frames, s.channels, s.f32);
-            // PROSPER_AUDIO_QUEUE_TRACE=1: the device queue depth AT each grain handoff, reported
-            // as a per-second MINIMUM rather than a mean. A mean cannot see this defect -- #3016
-            // averaged 100% of real time while the queue emptied in every gap -- so the minimum is
-            // the whole point, together with the count of handoffs that found less than one grain
-            // buffered, which is the moment a real device would underrun.
+            // PROSPER_AUDIO_QUEUE_TRACE=1: input queue depth after each handoff.
+            // The minimum exposes queue variation hidden by averages, but converted
+            // audio may already be playing downstream. This does not measure XRUNs.
             if (queue_trace()) {
                 const int queued = SDL_GetAudioStreamQueued(s.stream);
                 if (queued >= 0) {
@@ -423,8 +460,8 @@ public:
     // samples AT each grain handoff, so a queue that drains to zero BETWEEN handoffs is
     // invisible to it -- which is why `below-one-grain=0` appeared in both arms of that A/B and
     // could not settle it. Sampling on a clock instead makes the drain slope, the refill bursts
-    // and the zero crossings all directly visible, so an underrun can be established without
-    // an ear in the room.
+    // and sampled zero crossings visible. Only input occupancy is measured: downstream
+    // playback and hardware XRUNs remain unknown. Use demand accounting for consumption.
     //
     // Paced with host::sleep_until_steady_ns on an ABSOLUTE grid, and that is not incidental:
     // as recovered from #2984 this loop used std::this_thread::sleep_for(1ms), which on Windows
@@ -443,7 +480,13 @@ public:
         // queued, not available: SDL_GetAudioStreamAvailable reports DEVICE-format bytes while
         // grain_bytes, the [audio-dbg] field name and the #3016 sibling meter are all guest
         // format. Mixing them is benign on an F32 title by luck and silently 2x out on an S16 one.
-        struct Sample { int port; int queued; int grain; };
+        struct Sample {
+            int port = 0, queued = -1, grain = 0;
+            bool demand_available = false;
+            Sdl3AudioDemandSnapshot demand{};
+        };
+        const bool queue_enabled = queue_timeline_ms() > 0;
+        auto demand_last = t0;
         // Counted and reported, because review could not reconcile the measured median with an
         // exactly-honoured grid and neither could I: on a strict grid the median delta telescopes
         // to the interval, yet =2 measured 2.041 ms -- 41 us high, which would suggest the resync
@@ -458,13 +501,22 @@ public:
         while (timeline_running_.load(std::memory_order_relaxed)) {
             passes++;
             int n = 0;
+            const auto report_now = std::chrono::steady_clock::now();
+            const bool report_demand = audio_demand() && report_now - demand_last >= std::chrono::seconds(1);
+            if (report_demand) demand_last = report_now;
             {
                 std::lock_guard<std::mutex> lk(mx_);
                 for (int i = 0; i < kMaxPorts; i++) {
                     if (!slots_[i].stream) continue;
-                    const int q = SDL_GetAudioStreamQueued(slots_[i].stream);
-                    if (q < 0) continue;          // an errored stream reports -1; do not log it as a level
-                    samples[n++] = { i + 1, q, slots_[i].grain_bytes };
+                    auto& sample = samples[n++];
+                    sample = {};
+                    sample.port = i + 1;
+                    sample.grain = slots_[i].grain_bytes;
+                    if (queue_enabled) sample.queued = SDL_GetAudioStreamQueued(slots_[i].stream);
+                    if (report_demand && slots_[i].demand_enabled) {
+                        sample.demand.generation = slots_[i].generation;
+                        sample.demand_available = slots_[i].demand.snapshot(slots_[i].stream, sample.demand);
+                    }
                 }
             }
             const uint64_t t_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -473,10 +525,25 @@ public:
             // exactly the sampling interval, so a 1 ms sampler could only ever print gaps of
             // 1.000/2.000/3.000 -- the honesty figures quoted for this instrument were partly an
             // artifact of its own format string.
-            for (int i = 0; i < n; i++)
-                SDL_Log("[audio-queue] t_us=%llu port=%d queued=%d grain=%d",
-                        (unsigned long long)t_us, samples[i].port, samples[i].queued,
-                        samples[i].grain);
+            for (int i = 0; i < n; i++) {
+                if (queue_enabled && samples[i].queued >= 0)
+                    SDL_Log("[audio-queue] t_us=%llu port=%d queued=%d grain=%d",
+                            (unsigned long long)t_us, samples[i].port, samples[i].queued, samples[i].grain);
+                if (samples[i].demand_available) {
+                    const char* phases[] = {"startup", "active", "paused"};
+                    for (unsigned phase = 0; phase < 3; ++phase) {
+                        const auto& c = samples[i].demand.phases[phase];
+                        SDL_Log("[audio-demand] t_us=%llu port=%d generation=%llu phase=%s "
+                                "calls=%llu requested_bytes=%llu shortfall_calls=%llu additional_bytes=%llu "
+                                "first_ns=%llu last_ns=%llu",
+                                (unsigned long long)t_us, samples[i].port,
+                                (unsigned long long)samples[i].demand.generation, phases[phase],
+                                (unsigned long long)c.calls, (unsigned long long)c.requested_bytes,
+                                (unsigned long long)c.shortfall_calls, (unsigned long long)c.additional_bytes,
+                                (unsigned long long)c.first_ns, (unsigned long long)c.last_ns);
+                    }
+                }
+            }
             // Advance the grid, but RESYNC if a pass overran it. Without this, one slow pass
             // leaves every subsequent deadline in the past, sleep_until_steady_ns returns
             // immediately by contract, and the loop becomes a busy spin hammering mx_ at full
@@ -503,32 +570,44 @@ public:
     }
 
     void start_queue_timeline() {
-        const int ms = queue_timeline_ms();
+        const int ms = queue_timeline_ms() > 0 ? queue_timeline_ms() : (audio_demand() ? 1000 : 0);
         if (ms <= 0 || timeline_running_.exchange(true)) return;
         timeline_thread_ = std::thread(&Sdl3AudioSink::queue_timeline_loop, this, ms);
-        SDL_Log("prosper-audio: queue-level timeline started at %d ms", ms);
+        SDL_Log("prosper-audio: diagnostic sampler started at %d ms (queue=%d demand=%d)",
+                ms, int(queue_timeline_ms() > 0), int(audio_demand()));
     }
 
-    // JOINED, not detached, and joined from both places that can actually run.
-    //
-    // The first version cleared a flag at the top of quit() and called that sufficient. Review
-    // found the argument was about dead code: shutdown_sdl3_audio_sink() -- the only caller of
-    // quit() -- is invoked ONLY from test_audio_sdl3.cpp. prosper-app and boot_trace install the
-    // sink and never shut it down, so on neither path where this instrument is used did the flag
-    // ever get cleared.
-    //
-    // What that leaves per path: prosper-app ends in std::_Exit, which runs no destructors at all,
-    // so a sampler alive at exit is harmless by construction. boot_trace returns from main and
-    // drops into static destruction of mx_ and slots_ WITH the sampler live -- that one was a real
-    // use-after-free, and the destructor below is what closes it. A detached thread cannot be made
-    // safe here by any flag, because the flag only says "please stop" and static destruction does
-    // not wait to be asked.
+    // Explicit frontend shutdown and static destruction both join the sampler before
+    // releasing its mutex/slots. The app's guest-running _Exit path skips destructors,
+    // so periodic reporting must not rely on a final destructor flush.
     void stop_queue_timeline() {
         timeline_running_.store(false, std::memory_order_relaxed);
         if (timeline_thread_.joinable()) timeline_thread_.join();
     }
 
-    ~Sdl3AudioSink() override { stop_queue_timeline(); }
+    ~Sdl3AudioSink() override {
+        stop_queue_timeline();
+        // Stop SDL callbacks before their per-port userdata is destroyed, including
+        // frontends that return from main without calling shutdown_sdl3_audio_sink.
+        if (SDL_WasInit(SDL_INIT_AUDIO)) {
+            for (int port = 1; port <= kMaxPorts; ++port) close(port);
+        } else {
+            // A sequential external SDL_Quit already destroyed every stream. Never
+            // dereference those stale pointers. Frontends with a running sampler must
+            // explicitly shut down this sink BEFORE SDL_Quit (see audio_sdl3.hpp).
+            for (auto& s : slots_) s.stream = nullptr;
+        }
+    }
+
+    bool demand_snapshot(int port, Sdl3AudioDemandSnapshot& out) {
+        out = {};
+        if (port < 1 || port > kMaxPorts) return false;
+        std::lock_guard<std::mutex> lk(mx_);
+        auto& s = slots_[port - 1];
+        if (!s.stream || !s.demand_enabled) return false;
+        out.generation = s.generation;
+        return s.demand.snapshot(s.stream, out);
+    }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
         if (port < 1 || port > kMaxPorts || !vols) return;
@@ -544,6 +623,7 @@ public:
         std::lock_guard<std::mutex> lk(mx_);
         Slot& s = slots_[port - 1];
         if (s.stream) { SDL_DestroyAudioStream(s.stream); s.stream = nullptr; }
+        s.demand_enabled = false;
         s.frame_bytes = s.grain_bytes = 0;
         s.dump.finalize();   // a closed port's capture is complete
     }
@@ -566,6 +646,9 @@ public:
         for (Slot& s : slots_) {
             if (!s.stream) continue;
             ++active_streams;
+            if (s.demand_enabled)
+                s.demand.set_phase(paused ? AudioDemandPhase::Paused :
+                    (s.demand_started ? AudioDemandPhase::Active : AudioDemandPhase::Startup));
             const bool ok = paused ? SDL_PauseAudioStreamDevice(s.stream)
                                    : SDL_ResumeAudioStreamDevice(s.stream);
             if (!ok)
@@ -579,6 +662,9 @@ public:
 
 private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
+                  AudioDemandMeter demand;
+                  uint64_t generation = 0;
+                  bool demand_enabled = false, demand_started = false;
                   bool put_failed = false;
                   int freq = 0;                                     // port sample rate for pacing
                   std::chrono::steady_clock::time_point next{};     // per-grain pacing deadline
@@ -626,6 +712,10 @@ bool install_sdl3_audio_sink() {
     g_installed = true;
     SDL_Log("prosper-audio: SDL3 audio backend installed");
     return true;
+}
+
+bool sdl3_audio_demand_snapshot(int port, Sdl3AudioDemandSnapshot& snapshot) {
+    return g_sink.demand_snapshot(port, snapshot);
 }
 
 void set_sdl3_audio_gain(float gain) {

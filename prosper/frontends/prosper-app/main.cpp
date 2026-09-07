@@ -3259,6 +3259,9 @@ int main(int argc, char** argv) {
     if (vk.sampleBuf)    vkDestroyBuffer(vk.device, vk.sampleBuf, nullptr);
     if (vk.sampleMem)    vkFreeMemory(vk.device, vk.sampleMem, nullptr);
 
+#ifdef PROSPER_AUDIO_SDL3
+    shutdown_sdl3_audio_sink(); // join diagnostics and destroy streams while SDL is alive
+#endif
     SDL_DestroyWindow(win); SDL_Quit();
     return exitCode;
 }

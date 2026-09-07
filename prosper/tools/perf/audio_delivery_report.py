@@ -1,44 +1,14 @@
 #!/usr/bin/env python3
 """Aggregate `[audio-dbg]` lines into an audio-delivery health report.
 
-WHY THIS EXISTS
----------------
-Audio underrun hunts on Windows dev boxes have been ear-driven: "it stutters like a small
-buffer", then a cycle of pacing changes and listen tests. `PROSPER_AUDIO_DEBUG=1` makes the
-SDL sink log every guest grain delivery (arrival gap, frames, queued bytes); this tool turns
-that log into the numbers that name the failure mode, offline, without listening:
-
-  * delivery cadence -- mean/median/p99/max inter-arrival gap per port, and the fraction of
-    gaps beyond one and two grain periods;
-  * queue health -- mean/min queued bytes, and the share of arrivals that found the queue
-    below one grain and below a quarter grain -- a THIN CUSHION, which for a pacer that hands
-    over one grain at a time is the normal steady state rather than a fault -- plus the share
-    that arrived to a COMPLETELY EMPTY queue, which is the starvation case;
-  * effective delivery rate vs the device rate -- a persistent deficit is a CLOCK DRIFT
-    between the guest's budgeted audio clock and the device crystal; no cushion survives it,
-    and the fix is drift compensation, not deeper buffering;
-  * burst clustering -- the fraction of arrivals whose inter-arrival GAP exceeds two grain
-    periods (#3061: earlier wording here promised a stronger conjunct -- "carries more than
-    one grain of audio" -- that the code has never tested; frames-per-arrival is available in
-    the log but is not examined, so this is gap-only, same as the code). This shape is
-    CONSISTENT WITH a quantized mixer wake, but the cadence alone cannot prove it -- and, being
-    gap-only, it does not distinguish a real multi-grain flush from a producer simply
-    delivering audio below real time, which also arrives in clusters, spaced by production
-    rather than by a wait (#3080 -- the verdict named the wrong cause on a title where a
-    `PROSPER_TIMEDWAIT_CENSUS=1` measurement, in the same log, showed the guest's only timed
-    wait resolving at x1.02, i.e. not quantized at all; the -55% delivery-rate deficit already
-    explained the clustering). So if `[timedwait Ns]` census lines are present in the same
-    input, their ratio for the dominant wait primitive SETTLES which cause applies; if they are
-    absent, the report says so and names the census as the discriminator instead of asserting a
-    mechanism it cannot see.
-
-WHAT THIS TOOL DOES NOT SEE
----------------------------
-`[audio-dbg]` is emitted per accepted `output()` call from the guest. Grains the guest never
-delivers (a mixer that skipped a period) appear only as a longer gap. Content-level defects
-(a mixer that produced silence or repeated samples) are invisible here; the queue level and
-the delivery rate are most of the report's world -- the one exception is the wait-primitive
-census below, read from the SAME log when the run captured both diagnostics together.
+Reports delivery cadence, input queue occupancy and rate relative to --device-hz.
+An empty SDL input queue is not proof of a playback underrun: converted audio may
+already be playing downstream. Rate differences do not identify their own cause.
+Optional PROSPER_AUDIO_DEMAND=1 records measure consumption requests per stream and
+phase. Their additional input bytes are approximate under resampling and are not
+hardware XRUNs or a count of silence inserted. Counters are cumulative per open;
+only the last snapshot is used, never the sum of periodic reports. Use one process
+run per log file. Content correctness and physical backend XRUNs need other evidence.
 
 Usage:
     audio_delivery_report.py [LOG ...] [--port P] [--device-hz H] [--channels C] [--bytes-per-frame N]
@@ -53,26 +23,17 @@ RECORD = re.compile(
     r"\[audio-dbg\] port=(\d+) gap=([0-9.]+)ms frames=(\d+) queued_before=(\d+)"
     r"(?: \(grain=(\d+)\))?")
 
-# `report_timedwait_census()` (src/hle/kernel/timedwait_census.hpp) prints one of these per
-# primitive every 5 s when PROSPER_TIMEDWAIT_CENSUS=1. It is a DIRECT measurement of how coarse
-# a wait primitive actually is -- requested vs actual, as a ratio -- which is exactly the
-# question the burst-clustering verdict below cannot answer from cadence alone. A primitive with
-# no requested interval (an absolute-clock deadline, e.g. cond_timedwait) prints "?" instead of a
-# ratio and is skipped: no ratio, no evidence either way.
+DEMAND = re.compile(
+    r"\[audio-demand\] t_us=(\d+) port=(\d+) generation=(\d+) phase=(startup|active|paused) "
+    r"calls=(\d+) requested_bytes=(\d+) shortfall_calls=(\d+) additional_bytes=(\d+) "
+    r"first_ns=(\d+) last_ns=(\d+)")
+DEMAND_OPEN = re.compile(r"\[audio-demand-open\] port=(\d+) generation=(\d+) (.*)")
+
+# Process-wide wait context; no producer thread/caller identity is present.
 TIMEDWAIT_RECORD = re.compile(
     r"\[timedwait \S+\]\s+(\S+)\s+calls=(\d+)\s+requested=\s*(?:[0-9.]+\s*ms|\?)"
     r"\s+actual=\s*[0-9.]+\s*ms(?:\s+x([0-9.]+))?")
-
-# A ratio comfortably above 1.0 means the wait genuinely overshot what the guest asked for (the
-# "coarse tick" the burst verdict describes); a ratio near 1.0 means the wait resolved close to
-# on time and cannot be the cause of clustered arrivals. #3013 measured ~x2.9 for a primitive that
-# WAS the cause; #3080 measured x1.02 for one that was not, on a title whose clustering was fully
-# explained by a -55% delivery-rate deficit instead. The threshold sits well clear of both.
 QUANTIZED_RATIO_THRESHOLD = 1.3
-
-# The device consumes `device_hz * channels * bytes_per_frame` bytes per second. The guest's
-# delivery rate against THAT number is the clock-drift measurement; a persistent deficit
-# drains any cushion at the deficit rate no matter how deep the buffer is.
 
 
 def parse_streams(paths):
@@ -92,7 +53,26 @@ def analyze(paths, port_filter, device_hz, channels, bytes_per_frame):
     # Weighted by calls (not averaged line-to-line) so a primitive with many more calls in one
     # 5 s window is not diluted by a quiet window reporting the same primitive.
     census = {}
+    demand, formats = {}, {}
     for path, line in parse_streams(paths):
+        dm = DEMAND.search(line)
+        om = DEMAND_OPEN.search(line)
+        if dm:
+            t, port, generation = map(int, dm.groups()[:3])
+            if port_filter is None or port == port_filter:
+                key = (path, port, generation, dm.group(4))
+                values = tuple(map(int, dm.groups()[4:]))
+                prior = demand.get(key)
+                # Reject reset/concatenated runs; otherwise the last row could hide
+                # an earlier shortfall and falsely report a clean run.
+                valid = (not prior or (prior[2] and t >= prior[0] and
+                         all(x >= y for x, y in zip(values[:4], prior[1][:4]))))
+                valid = valid and values[2] <= values[0] and values[5] >= values[4]
+                if prior and prior[1][0]:
+                    valid = valid and values[4] == prior[1][4] and values[5] >= prior[1][5]
+                demand[key] = (t, values, valid)
+        elif om:
+            formats[(path, int(om.group(1)), int(om.group(2)))] = om.group(3)
         m = RECORD.search(line)
         if not m:
             tm = TIMEDWAIT_RECORD.search(line)
@@ -126,18 +106,13 @@ def analyze(paths, port_filter, device_hz, channels, bytes_per_frame):
         slot["gaps"].append(gap_ms)
         slot["frames"].append(frames)
         slot["queued"].append(queued)
-    return per_port, census
+    return per_port, census, demand, formats
 
 
 def dominant_census(census):
-    """The most-called wait primitive's mean overshoot ratio, or None if no census was present.
+    """Most-called process-wide wait primitive and its call-weighted mean ratio.
 
-    Global to the process, not per port -- the census counts every timed wait regardless of which
-    audio port (if any) it paces -- so this is the best available evidence for a burst-clustering
-    verdict on any port, not a per-port measurement. Most-called rather than worst-ratio: on a
-    title that uses exactly one primitive (the common case -- see #3080, where usleep was the
-    ONLY one that ever appeared), that is the same primitive either way, and on a title using
-    several, the one actually driving the pacing is more likely the one called the most.
+    These records do not identify the audio producer or establish its wake cadence.
     """
     if not census:
         return None
@@ -220,13 +195,13 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame, census=None):
         # the fixture added with this change prints 100% of them beside 0% empty. The old wording,
         # "the device starved between deliveries", was true only while the threshold was
         # accidentally testing queued == 0; widening it 256x to a real grain left the words
-        # describing a condition they no longer match. Starvation is the EMPTY row.
+        # describing a condition they no longer match. Even the EMPTY row cannot establish downstream starvation.
         print(f"  arrivals with under 1 grain buffered: {under_one}"
               f" ({100 * under_one / len(queued):.1f}%) -- thin cushion")
         print(f"  arrivals below 1/4 grain:          {under_quarter}"
               f" ({100 * under_quarter / len(queued):.1f}%) -- very thin")
         print(f"  arrivals with an EMPTY queue:         {empty}"
-              f" ({100 * empty / len(queued):.1f}%) -- STARVED: nothing left to play")
+              f" ({100 * empty / len(queued):.1f}%) -- input empty; downstream playback unknown")
 
     if span_s > 0 and device_hz:
         # The emitter logs gap=0.00ms for a port's FIRST arrival -- there is no previous arrival
@@ -259,58 +234,49 @@ def report_port(port, slot, device_hz, channels, bytes_per_frame, census=None):
         print(f"  effective delivery: {delivered_hz:.0f} frames/s vs device {device_hz_total}"
               f" -> drift {drift_pct:+.2f}%")
         if drift_pct < -0.3:
-            print("  VERDICT: the guest's audio clock runs below the device rate -- a clock"
-                  " deficit, not a buffering defect. No cushion survives it; fix the guest"
-                  " audio clock or compensate the drift in the sink.")
+            print("  VERDICT: measured delivery deficit relative to the configured rate;"
+                  " investigate guest production, scheduling and pacing to establish the cause.")
         elif drift_pct > 0.3:
-            print("  VERDICT: the guest's audio clock runs above the device rate -- the"
-                  " cushion grows until the depth cap; drift compensation should slow the"
-                  " delivery.")
+            print("  VERDICT: measured delivery exceeds the configured rate;"
+                  " check the selected rate and production/pacing before changing buffering.")
         else:
-            print("  VERDICT: delivery matches the device rate -- a stutter at this rate is"
-                  " a burst/quantization problem, not a clock deficit. See the cadence and"
-                  " burst rows above.")
+            print("  VERDICT: delivery matches the device rate on average;"
+                  " consumption continuity and audible correctness remain unmeasured by arrivals.")
 
     if grain_ms > 0:
-        # GAP-ONLY, deliberately (#3061): this counts arrivals separated from the previous one by
-        # more than two grain periods, not arrivals that themselves carry more than one grain of
-        # frames -- the emitter logs frames= per record, so that conjunct could be tested, but
-        # doing so would make this gate blind to exactly the case #3080 needed it for: a producer
-        # delivering ordinary single-grain arrivals, delayed by a clock deficit rather than a
-        # quantized wake, which never carries more than a grain per arrival. The three-way verdict
-        # below (present since #3168) already exists to tell that case apart from a real multi-grain
-        # burst using the timedwait census; narrowing the gate here to frames > grain would silence
-        # that verdict for the scenario it was built to diagnose instead.
         bursts = sum(1 for g in gaps if g > 2 * grain_ms)
         if bursts > len(gaps) * 0.2 and mean_gap > 1.5 * grain_ms:
-            # This cadence shape (clustering beyond two grain periods) is what a quantized mixer
-            # wake looks like -- but it is also what a producer simply running below real time
-            # looks like, since its arrivals are spaced by production rather than by a wait. #3080:
-            # this exact code path asserted the wait-primitive cause on a title where the census
-            # measured the opposite (x1.02, i.e. not quantized) and a -55% delivery-rate deficit
-            # already explained the clustering. So the verdict is only as strong as the evidence
-            # available for THIS run: earned when a census is present, a named hypothesis when not.
+            print("  Cadence clusters beyond two grain periods: late production and delayed wakes"
+                  " can both cause this; arrivals cannot tell them apart.")
             if census is not None and census["ratio"] is not None:
-                if census["ratio"] < QUANTIZED_RATIO_THRESHOLD:
-                    print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods,"
-                          f" but the timedwait census RULES OUT a quantized wake -- {census['name']}"
-                          f" resolves at x{census['ratio']:.2f} ({census['calls']} calls), not a"
-                          " coarse tick. The clustering has some other cause -- see the delivery-rate"
-                          " verdict above if it fired -- and the wait primitive is not it.")
-                else:
-                    print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods,"
-                          f" and the timedwait census CONFIRMS a coarse wait -- {census['name']}"
-                          f" resolves at x{census['ratio']:.2f} ({census['calls']} calls) against its"
-                          " requested interval. The mixer's wake is quantized, not a buffering"
-                          " defect. Fix the wait primitive's resolution.")
+                timing = ("near requested duration" if census["ratio"] < QUANTIZED_RATIO_THRESHOLD
+                          else "longer than requested duration")
+                print(f"  Process wait context: {census['name']} x{census['ratio']:.2f}"
+                      f" ({census['calls']} calls), {timing}.")
+                print("  This aggregate does not identify the audio producer's thread/caller;"
+                      " it neither proves nor excludes delayed mixer wakes.")
             else:
-                print("  VERDICT: the inter-arrival cadence clusters beyond two grain periods --"
-                      " consistent with EITHER a quantized mixer wake (a timed wait resolving on a"
-                      " coarse tick) OR a producer delivering audio below real time (which also"
-                      " arrives in clusters). This cadence alone cannot tell them apart. Re-run with"
-                      " PROSPER_TIMEDWAIT_CENSUS=1 captured into the same log and check the dominant"
-                      " wait primitive's ratio: near 1.0 rules out quantization, well above it"
-                      " confirms the wait is the cause.")
+                print("  PROSPER_TIMEDWAIT_CENSUS=1 can add process wait context;"
+                      " correlate producer thread/caller and scheduling before assigning a cause.")
+
+
+def report_demand(demand, formats):
+    if not demand:
+        print("SDL consumption demand: unavailable (run with PROSPER_AUDIO_DEMAND=1)")
+        return
+    print("SDL consumption demand: cumulative input-format requests; not hardware XRUNs")
+    for (path, port, generation, phase), (t, values, valid) in sorted(demand.items()):
+        calls, requested, shortfalls, additional, first, last = values
+        print(f"  source={path} port={port} generation={generation} phase={phase} snapshot_us={t}")
+        print("    " + formats.get((path, port, generation), "input/device format context unavailable"))
+        if not valid:
+            print("    INVALID counter sequence: use one process run per log file")
+        elif not calls:
+            print("    UNOBSERVED: no consumption callbacks in this phase")
+        else:
+            print(f"    calls={calls} requested_bytes={requested} shortfall_calls={shortfalls}"
+                  f" additional_bytes={additional} first_ns={first} last_ns={last}")
+            print("    Additional bytes are approximate under resampling; no silence duration inferred.")
 
 
 def main():
@@ -328,14 +294,17 @@ def main():
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
-    per_port, census = analyze(paths, args.port, args.device_hz, args.channels, args.bytes_per_frame)
+    per_port, census, demand, formats = analyze(paths, args.port, args.device_hz, args.channels, args.bytes_per_frame)
     if not per_port:
         print("no [audio-dbg] records found (run with PROSPER_AUDIO_DEBUG=1)")
-        return 1
+        if not demand:
+            report_demand(demand, formats)
+            return 1
     census_summary = dominant_census(census)
     for port in sorted(per_port):
         report_port(port, per_port[port], args.device_hz, args.channels, args.bytes_per_frame,
                     census_summary)
+    report_demand(demand, formats)
     return 0
 
 

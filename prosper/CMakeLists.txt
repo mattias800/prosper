@@ -3571,6 +3571,17 @@ if(PROSPER_AUDIO_SDL3 AND TARGET SDL3::SDL3)
   target_link_libraries(test_audio_sdl3 PRIVATE prosper_audio_sdl3)
   add_test(NAME audio_sdl3 COMMAND test_audio_sdl3)
   set_tests_properties(audio_sdl3 PROPERTIES ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")
+  add_executable(test_audio_demand frontends/audio_sdl3/test_audio_demand.cpp)
+  target_link_libraries(test_audio_demand PRIVATE prosper_audio_sdl3)
+  add_test(NAME audio_demand COMMAND test_audio_demand)
+  set_tests_properties(audio_demand PROPERTIES ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")
+  add_test(NAME audio_demand_return_open COMMAND test_audio_demand return-open)
+  add_test(NAME audio_demand_ordered_quit COMMAND test_audio_demand ordered-quit)
+  set_tests_properties(audio_demand_return_open audio_demand_ordered_quit PROPERTIES
+    ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;PROSPER_AUDIO_DEMAND=1")
+  add_test(NAME audio_demand_external_quit COMMAND test_audio_demand external-quit)
+  set_tests_properties(audio_demand_external_quit PROPERTIES
+    ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;PROSPER_AUDIO_DEMAND=0;PROSPER_AUDIO_QUEUE_TIMELINE=0")
 
   # Route the live game's audio to the host when the runner is built (guarded by the macro).
   if(TARGET boot_trace)

@@ -4,8 +4,25 @@
 // audio actually plays out of the host's default device. The core HLE (src/hle/audio/hle_audio.cpp)
 // has no knowledge of SDL — this frontend lives outside prosper_core and plugs in at runtime.
 #pragma once
+#include <array>
+#include <cstdint>
 
 namespace prosper {
+
+enum class AudioDemandPhase : unsigned { Startup, Active, Paused };
+struct AudioDemandCounts {
+    uint64_t calls = 0, requested_bytes = 0, shortfall_calls = 0, additional_bytes = 0;
+    uint64_t first_ns = 0, last_ns = 0;
+};
+struct Sdl3AudioDemandSnapshot {
+    uint64_t generation = 0; // changes when this port is reopened
+    std::array<AudioDemandCounts, 3> phases{};
+};
+
+// Optional PROSPER_AUDIO_DEMAND=1 diagnostic. Counts SDL's input-format demand at
+// consumption, not hardware underruns; resampling can overestimate additional bytes.
+// False means unavailable/closed, never a measurement of zero shortfalls.
+bool sdl3_audio_demand_snapshot(int port, Sdl3AudioDemandSnapshot& snapshot);
 
 // Initialise SDL audio and install the SDL3 AudioSink as the active backend. Idempotent.
 // Returns true on success; false (and leaves the default silent sink active) if SDL audio
@@ -26,7 +43,9 @@ void set_sdl3_audio_paused(bool paused);
 // changing the default; see kDefaultVolumePercent in prosper-app/main.cpp.
 void set_sdl3_audio_gain(float gain);
 
-// Uninstall the SDL3 sink (restores the default), closing any open streams and SDL audio.
+// Uninstall the SDL3 sink (restores the default), joining diagnostics and closing streams.
+// Call after guest audio producers stop, BEFORE SDL_Quit/SDL_QuitSubSystem(AUDIO).
+// Concurrent external SDL teardown and quit/reinit with retained streams are unsupported.
 void shutdown_sdl3_audio_sink();
 
 } // namespace prosper

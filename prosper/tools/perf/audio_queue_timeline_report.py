@@ -1,64 +1,19 @@
 #!/usr/bin/env python3
-"""Read a PROSPER_AUDIO_QUEUE_TIMELINE log and report how close each audio port came to dry.
+"""Report SDL input queue occupancy from PROSPER_AUDIO_QUEUE_TIMELINE logs.
 
-The metric this exists for is the ZERO-CROSSING EPISODE, not the mean and not the sample
-percentage. A device queue that empties for 3 ms and refills is the condition an underrun is made
-of, and it is invisible to both of the obvious summaries: the one-second delivery average stays at ~100% of real
-time (that is exactly how #3016 hid), and a percentage-of-samples figure buries a burst of
-contiguous dry samples in a large denominator. So an episode -- a maximal run of consecutive
-samples at zero on one port -- is counted once, and its duration is reported.
+Usage: audio_queue_timeline_report.py LOG [--min-episode-us N] [--active-window-ms N]
 
-  usage: audio_queue_timeline_report.py <log> [--min-episode-us N] [--active-window-ms N]
-         both `--opt N` and `--opt=N` are accepted; an unknown option is an error
+A zero queue means no unconverted input bytes remain. Converted audio can still be
+playing downstream, even when the zero is bracketed by positive queue samples.
+These episodes are INPUT QUEUE GAPS, not measured consumption shortfalls or hardware
+XRUNs. Use PROSPER_AUDIO_DEMAND=1 with audio_delivery_report.py for SDL consumption.
 
-Input lines come from the sampler in audio_sink_sdl3.cpp:
-
-  [audio-queue] t_us=123456 port=17 queued=2048 grain=2048
-
-`queued` and `grain` are both GUEST-format bytes (the sampler uses SDL_GetAudioStreamQueued, not
-Available, for exactly that reason), so grain-relative thresholds here need no format flags.
-
-## An empty queue is not an underrun, and the timeline alone cannot tell the difference
-
-A port that is OPEN but not being fed reads `queued=0` forever, and that is silence, not
-starvation. A discriminator that cannot tell the two apart would decide a pacer A/B on whichever
-arm happened to idle more.
-
-Worth recording precisely, because the first run analysed here is a case where the confound was
-suspected and turned out NOT to be the explanation. That run reported a median queue depth of
-0.00 grains and 53% of samples dry on Blasphemous 2, which looked like exactly this artefact. It
-was not: with the gate in place only **6 samples** out of 588,705 reclassify as idle, so the 53%
-is real underrunning. (The other half of that first reading was mine, not the tool's -- I read the
-longest episode's `40248 us` as 40 seconds. It is 40 ms, which is an underrun, not silence.)
-
-So the gate exists on principle rather than on that evidence, and the evidence it was built to
-explain away survived it. Both halves are stated because a plausible instrument artefact is a very
-comfortable explanation for an inconvenient measurement, and this one would have retired a real
-defect.
-
-So a dry sample counts as an underrun only when the port was actively streaming across it. The
-gate is taken from the sampler's OWN series and needs no second source:
-
-    a dry EPISODE is an UNDERRUN if audio was seen anywhere before it, audio is seen anywhere
-    after it, it is no longer than --active-window-ms, and it does not abut a gap in the
-    sample series. Otherwise it is not counted.
-
-The first two conditions are GLOBAL, not a local window. An earlier version of this line said
-"within --active-window-ms on BOTH sides", which is not what the code does and disagrees with it
-on real input -- the window is a maximum DIP DURATION. Found in review of #3070, and worth the
-space because a docstring that describes a rule the code does not implement is the most citable
-kind of wrong.
-
-Deliberately not cross-correlated with the per-arrival `[audio-dbg]` emitter, which would be the
-obvious richer gate. That emitter logs only the GAP since the previous arrival, so arrival times
-have to be reconstructed by accumulation and their origin is the first arrival, while the
-sampler's `t_us` origin is sink construction. The two clocks cannot be aligned from the log, and a
-gate resting on a mis-aligned clock would be exactly the kind of instrument this tool exists to
-avoid. When [audio-dbg] lines are present they are used only for CONTEXT -- arrival count and
-median cadence -- and are labelled as such.
-
-Both figures are always printed. A tool that silently drops samples reports an improvement that is
-really a filter, so IDLE time is shown next to underrun time rather than subtracted out of sight.
+The historical activity filter retains episodes bracketed by positive samples,
+shorter than --active-window-ms, and not adjacent to a sampling discontinuity.
+It is a heuristic queue filter, not proof of activity or idleness. All excluded
+samples remain visible. Durations estimate one median sampling interval per sample;
+zero between samples is unobserved. Arrival records supply cadence context only:
+their relative gap clock cannot be aligned to the sampler's absolute t_us clock.
 """
 import re
 import sys
@@ -102,31 +57,10 @@ def arrival_context(gaps):
 
 
 def classify_dry_episodes(samples, dry_eps, interval_us, max_dip_us):
-    """Split dry EPISODES into underruns and idleness, using only this port's own series.
+    """Return (bracketed input-queue episodes, excluded sample count).
 
-    A dry episode is an UNDERRUN when all four hold:
-
-      * audio was seen BEFORE it   -- otherwise the port had not started feeding yet;
-      * audio is seen AFTER it     -- otherwise the port stopped, and the tail is silence;
-      * it is no longer than max_dip_us -- otherwise it is silence between two fed stretches,
-        not a dip in a stream. This is the condition that matters, and the reason the first two
-        are not sufficient: a 5000 ms gap between two songs IS bracketed by audio on both sides,
-        so bracketing alone would call it one enormous underrun;
-      * it does not abut a DISCONTINUITY in the sample series. This condition is DEFLATIONARY by
-        design -- a real dip that happens to follow a lost-sample hole is not counted either, and
-        that is the intended trade: the coverage figure in the header is what tells a reader the
-        window was not fully observed, and under-reporting a defect we cannot substantiate is
-        preferable to attributing unobserved time to one. The bracketing samples are then
-        on the far side of an interval nobody observed, so "the port was being fed across this"
-        is exactly what the data cannot say. Counting it would attribute unobserved time to a
-        defect -- and the common case, a port closing and reopening, is idleness.
-
-    Per EPISODE rather than per sample, deliberately. A per-sample version of the same rule
-    silently turns into a pure duration cap -- the samples at the edges of a long silence fail
-    the far-side test and get excluded too -- so the bracketing half of the rule stops meaning
-    anything while still appearing in the code. Measured while writing the tests for it.
-
-    Returns (underrun_episodes, idle_sample_count).
+    Bracketing, duration and continuity are heuristic filters. None establish a
+    consumer shortage or prove that an excluded interval was intentional silence.
     """
     if not dry_eps:
         return [], 0
@@ -252,11 +186,11 @@ def report(ports, gaps=None, min_episode_us=0, active_window_us=200000):
             return sum(e[2] * iv for e in eps)
 
         kept = [e for e in dry if e[2] * iv >= min_episode_us]
-        print(f"  NOT COUNTED (idle, or unobservable): {n_idle} samples,"
+        print(f"  EXCLUDED (outside queue-gap filter): {n_idle} samples,"
               f" {n_idle * iv / 1000.0:.1f} ms"
               f", {100.0 * n_idle / len(samples):.2f}% of samples"
               f"  [excluded below; max dip {active_window_us // 1000} ms]")
-        print(f"  UNDERRUN (dry while streaming): {len(kept)} episodes"
+        print(f"  INPUT QUEUE GAP (bracketed): {len(kept)} episodes"
               + (f" (of {len(dry)}; {len(dry) - len(kept)} shorter than"
                  f" {min_episode_us} us)" if min_episode_us else "")
               + f", {total_us(kept) / 1000:.1f} ms total"
@@ -268,18 +202,8 @@ def report(ports, gaps=None, min_episode_us=0, active_window_us=200000):
               f" {total_us(thin) / 1000:.1f} ms total,"
               f" {100.0 * sum(e[2] for e in thin) / len(samples):.2f}% of samples")
 
-        # The verdict names the UNDERRUN episode count, because that is the quantity an A/B between
-        # two pacers can actually separate; a mean cannot, and this tool exists because of that.
-        if not kept:
-            # Two different facts, and the old wording conflated them: "no underrun found" is
-            # not "the queue never emptied" when dry stretches were excluded by the gate.
-            print("  verdict: the queue never emptied" if not n_idle else
-                  "  verdict: no underrun -- every dry stretch was idle, over the dip bound,\n"
-                  "           or across a gap in sampling (see NOT COUNTED above)")
-        elif len(kept) < 5:
-            print(f"  verdict: {len(kept)} isolated underruns")
-        else:
-            print(f"  verdict: STARVED -- {len(kept)} underruns")
+        print(f"  verdict: {len(kept)} retained input queue gaps; "
+              "SDL consumption shortfalls and hardware XRUNs are unknown")
     return 0
 
 
@@ -317,7 +241,7 @@ def main(argv):
             # detection while still printing a report. That is the one value whose effect a
             # reader would not predict from the name, so it is refused rather than echoed.
             print("error: --active-window-ms 0 would classify every dry stretch as idle, "
-                  "disabling underrun detection entirely", file=sys.stderr)
+                  "disabling queue-gap detection entirely", file=sys.stderr)
             return 2
         if name == "--min-episode-us":
             min_ep = n

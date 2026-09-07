@@ -121,7 +121,7 @@ def main():
     #    name the clock deficit -- this is exactly the Blasphemous 2 signature.
     log = "".join(dbg(gap=15.7, queued=64) for _ in range(300))
     out, _ = run(log)
-    expect(out, "clock deficit", "case 2 verdict")
+    expect(out, "measured delivery deficit", "case 2 verdict")
     # A NUMBER, not the row label. This assertion used to be `expect(out, "the device starved
     # between deliveries")` -- a string printed on every run regardless of the count, so review
     # confirmed that hardwiring under_one = 0 left it green. queued=64 is under one 2048 B grain
@@ -137,7 +137,8 @@ def main():
                   for _ in range(300))
     out, _ = run(log)
     expect(out, "delivery matches the device rate", "case 3 drift verdict")
-    expect(out, "burst/quantization problem", "case 3 burst verdict")
+    expect(out, "consumption continuity and audible correctness remain unmeasured", "case 3 limits")
+    reject(out, "burst/quantization problem", "average rate does not prove a mechanism")
     reject(out, "the guest's audio clock runs below the device rate", "case 3 must not miscall a clock deficit")
 
     # 4. Port filter: records for another port must not leak into the report.
@@ -176,7 +177,7 @@ def main():
     census_low = ("[timedwait 5s] usleep           calls=488       requested= 20.143 ms"
                   "  actual= 20.503 ms  x1.02\n")
     out, _ = run(deficit_log + census_low)
-    expect(out, "RULES OUT a quantized wake", "case 7: census rules out quantization")
+    expect(out, "near requested duration", "case 7: process wait context")
     expect(out, "x1.02", "case 7: reports the measured ratio")
     reject(out, "Fix the wait primitive's resolution",
            "case 7: must not issue the imperative when the census contradicts it")
@@ -187,10 +188,10 @@ def main():
     census_high = ("[timedwait 5s] sem_timedwait    calls=488       requested=  5.330 ms"
                    "  actual= 15.457 ms  x2.90\n")
     out, _ = run(deficit_log + census_high)
-    expect(out, "CONFIRMS a coarse wait", "case 8: census confirms quantization")
+    expect(out, "longer than requested duration", "case 8: process wait context")
     expect(out, "x2.90", "case 8: reports the measured ratio")
-    expect(out, "Fix the wait primitive's resolution",
-           "case 8: the imperative IS earned when the census supports it")
+    reject(out, "Fix the wait primitive's resolution", "aggregate cannot prove the audio cause")
+    expect(out, "neither proves nor excludes delayed mixer wakes", "thread identity remains unknown")
 
     # 9. Drift bias hand-check (#3061). The `[audio-dbg]` emitter logs gap=0.00ms for a port's
     #    FIRST arrival -- no previous arrival to measure from -- so `span_s = sum(gaps)` covers
@@ -224,6 +225,32 @@ def main():
            "case 9: the true rate must read as matching, not as a clock excess")
     reject(out, "runs above the device rate",
            "case 9: the pre-fix +1/(N-1) bias (+10.00% at N=11) must not survive")
+
+    # Cumulative snapshots must not be added; startup and reopen counts must remain separate.
+    def demand(t, generation=1, phase="active", calls=2, shortfalls=1, additional=64):
+        return (f"[audio-demand] t_us={t} port=17 generation={generation} phase={phase} "
+                f"calls={calls} requested_bytes={calls * 64} shortfall_calls={shortfalls} "
+                f"additional_bytes={additional} first_ns=10 last_ns=20\n")
+    log = (demand(100, calls=1, shortfalls=0, additional=0) + demand(200) +
+           demand(200, phase="startup", calls=10, shortfalls=10, additional=640) +
+           demand(300, generation=2, calls=0, shortfalls=0, additional=0))
+    out, rc = run(log)
+    expect(out, "calls=2 requested_bytes=128 shortfall_calls=1 additional_bytes=64", "last cumulative row")
+    reject(out, "calls=3 requested_bytes=192", "never sum snapshots")
+    expect(out, "generation=2", "reopen is independent")
+    expect(out, "UNOBSERVED: no consumption callbacks", "zero callbacks is not healthy playback")
+    expect(out, "phase=startup", "startup remains separately visible")
+    if rc != 0: failures.append("demand-only input should be accepted")
+    out, _ = run(demand(200) + demand(300, calls=1, shortfalls=0, additional=0))
+    expect(out, "INVALID counter sequence", "reject counters reset within the same stream generation")
+    out, _ = run(demand(100) + demand(200).replace("first_ns=10", "first_ns=11"))
+    expect(out, "INVALID counter sequence", "reject timestamp reset even if counts match")
+    out, _ = run(demand(100) + demand(200).replace("last_ns=20", "last_ns=19"))
+    expect(out, "INVALID counter sequence", "reject backwards last callback time")
+    out, _ = run(dbg(queued=0))
+    expect(out, "input empty; downstream playback unknown", "empty input does not prove underrun")
+    expect(out, "SDL consumption demand: unavailable", "missing observer must be visible")
+    reject(out, "STARVED", "arrival-only record cannot prove starvation")
 
     if failures:
         print("FAILURES:")
