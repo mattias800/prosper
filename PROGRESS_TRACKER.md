@@ -135,6 +135,7 @@ of its manifest.
 | Bendy and the Dark Revival | `PPSA27624` | 3 | `123---` | - | - | none | [#1979](https://github.com/mattias800/prosper/issues/1979), [#1955](https://github.com/mattias800/prosper/issues/1955) | [#1897](https://github.com/mattias800/prosper/issues/1897) | - |
 | Bendy and the Ink Machine | `PPSA27616` | 3 | `123---` | - | - | none | [#1178](https://github.com/mattias800/prosper/issues/1178), [#1177](https://github.com/mattias800/prosper/issues/1177) | [#1881](https://github.com/mattias800/prosper/issues/1881) | - |
 | Beneath | `PPSA27640` | 3 | `123---` | - | - | none | [#2813](https://github.com/mattias800/prosper/issues/2813), [#2815](https://github.com/mattias800/prosper/issues/2815) | [#1898](https://github.com/mattias800/prosper/issues/1898) | [`BENEATH_STATUS.md`](prosper/docs/BENEATH_STATUS.md) |
+| Grand Theft Auto V | `PPSA04263` | 3 | `123---` | - | - | none | [#3407](https://github.com/mattias800/prosper/issues/3407), [#2542](https://github.com/mattias800/prosper/issues/2542), [#2690](https://github.com/mattias800/prosper/issues/2690), [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | R-Type Delta: HD Boosted | `PPSA26414` | 3 | `123---` | - | - | none | [#1746](https://github.com/mattias800/prosper/issues/1746), [#1591](https://github.com/mattias800/prosper/issues/1591) | [#1810](https://github.com/mattias800/prosper/issues/1810) | [`R_TYPE_DELTA_STATUS.md`](prosper/docs/R_TYPE_DELTA_STATUS.md) |
 | Syberia: Remastered | `PPSA30140` | 3 | `123---` | - | - | none | [#1790](https://github.com/mattias800/prosper/issues/1790), [#1627](https://github.com/mattias800/prosper/issues/1627), [#1737](https://github.com/mattias800/prosper/issues/1737), [#1628](https://github.com/mattias800/prosper/issues/1628) | [#1811](https://github.com/mattias800/prosper/issues/1811) | [`SYBERIA_STATUS.md`](prosper/docs/SYBERIA_STATUS.md) |
 | Tactics Ogre: Reborn | `PPSA03839` | 3 | `123---` | - | - | none | [#1913](https://github.com/mattias800/prosper/issues/1913), [#1784](https://github.com/mattias800/prosper/issues/1784) | [#1892](https://github.com/mattias800/prosper/issues/1892) | - |
@@ -145,7 +146,6 @@ of its manifest.
 | Crisis Core –Final Fantasy VII– Reunion | `PPSA07809` | 2 | `12----` | - | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#2057](https://github.com/mattias800/prosper/issues/2057), [#2058](https://github.com/mattias800/prosper/issues/2058), [#2027](https://github.com/mattias800/prosper/issues/2027) | [#1894](https://github.com/mattias800/prosper/issues/1894) | [`CRISIS_CORE_STATUS.md`](prosper/docs/CRISIS_CORE_STATUS.md) |
 | Dragon Quest VII Reimagined | `PPSA17942` | 2 | `12----` | - | - | none | [#1486](https://github.com/mattias800/prosper/issues/1486), [#1588](https://github.com/mattias800/prosper/issues/1588), [#1706](https://github.com/mattias800/prosper/issues/1706), [#2778](https://github.com/mattias800/prosper/issues/2778) | [#1874](https://github.com/mattias800/prosper/issues/1874) | [`DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md) |
 | Earthion | `PPSA28061` | 2 | `12----` | - | - | none | - | [#1880](https://github.com/mattias800/prosper/issues/1880) | - |
-| Grand Theft Auto V | `PPSA04263` | 2 | `12----` | - | - | none | [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Hi-Fi RUSH | `PPSA17168` | 2 | `12----` | **0.5** fps · 9% active · 4K · title screen, default launch, no pad · tools/screenshot · 2026-08-21 | - | none | - | [#2891](https://github.com/mattias800/prosper/issues/2891) | - |
 | Little Nightmares III | `PPSA05143` | 2 | `12----` | - | - | none | [#2014](https://github.com/mattias800/prosper/issues/2014), [#2022](https://github.com/mattias800/prosper/issues/2022), [#2028](https://github.com/mattias800/prosper/issues/2028), [#1977](https://github.com/mattias800/prosper/issues/1977) | [#1893](https://github.com/mattias800/prosper/issues/1893) | [`LITTLE_NIGHTMARES_3_STATUS.md`](prosper/docs/LITTLE_NIGHTMARES_3_STATUS.md) |
 | Nikoderiko: The Magical World | `PPSA23760` | 2 | `12----` | - | - | none | [#1607](https://github.com/mattias800/prosper/issues/1607) | [#1885](https://github.com/mattias800/prosper/issues/1885) | [`NIKODERIKO_STATUS.md`](prosper/docs/NIKODERIKO_STATUS.md) |
@@ -177,8 +177,8 @@ of its manifest.
 | --- | --- |
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 2 |
-| 3 -- gameplay with the scene rendering | 9 |
-| 2 -- title screen | 18 |
+| 3 -- gameplay with the scene rendering | 10 |
+| 2 -- title screen | 17 |
 | 1 -- any real graphics | 3 |
 | 0 -- not started | 9 |
 
