@@ -4,6 +4,13 @@
 > starting work. It is gitignored and holds per-computer facts (hardware, paths, installed tools)
 > that must not be written into this committed charter.
 
+**At session start and after changing worktrees**, run `python3 prosper/tools/session_start.py`
+from the checkout root. It compares this checkout and its actual instruction files against
+`origin/main`, including a bounded remote-ref freshness check (#2710). A difference may be an
+intentional local edit; inspect it before trusting the session's loaded charter. An unavailable
+remote is unverified, not current. The check never fetches or switches branches. Claude Code runs
+it through the checked-in SessionStart hook; other agents follow root `AGENTS.md`.
+
 ## What this project is
 
 **prosper is a PS5→PC compatibility layer — "Wine/Proton for PS5."** It runs PS5 games natively on

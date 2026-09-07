@@ -8,6 +8,11 @@ question-to-tool map. `doctor/` validates external instruments with bounded posi
 provides a small standalone sanitizer build of existing host tests, and verifies RenderDoc
 capture/replay without requiring an importable system Python module.
 
+- **`session_start.py`** — read-only checkout/instruction freshness signal for #2710. See
+  [Session startup](../docs/SESSION_START.md). Its hook mode must deliver failures as visible
+  SessionStart context; an unavailable remote must never be reported as current. The regression
+  executes the configured hook argv against both current and stale temporary repositories.
+
 - **`evidence/prerender_check.py`** - **run this before publishing a progression screenshot.** It
   answers whether the frame is the game's own PRE-RENDERED picture rather than something prosper
   rendered: a full-screen loading blit is the most convincing false evidence this project has

@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/prosper/tools/session_start.py",
+              "--repo",
+              "${CLAUDE_PROJECT_DIR}",
+              "--hook"
+            ],
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
