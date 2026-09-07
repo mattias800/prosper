@@ -433,4 +433,83 @@ std::vector<uint32_t> build_compute_detile_rgba16f() {
   return e.assemble();
 }
 
+std::vector<uint32_t> build_compute_rgba8_to_packed10() {
+    Emitter e;
+    const auto void_t = e.id(), fn_t = e.id(), uint_t = e.id(), bool_t = e.id();
+    const auto vec_t = e.id(), input_ptr = e.id(), gid = e.id();
+    const auto array_t = e.id(), block_t = e.id(), block_ptr = e.id(), word_ptr = e.id();
+    const auto words = e.id(), push_t = e.id(), push_ptr = e.id(), push_word = e.id();
+    const auto push = e.id(), main = e.id(), entry = e.id(), body = e.id(), done = e.id();
+    Emitter::put(e.caps, Op_Capability, {Cap_Shader});
+    Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+    std::vector<uint32_t> ep{Exec_GLCompute, main};
+    push_string(ep, "main"); ep.push_back(gid);
+    Emitter::putv(e.entry, Op_EntryPoint, ep);
+    Emitter::put(e.exec, Op_ExecutionMode, {main, EM_LocalSize, 128, 1, 1});
+    Emitter::put(e.deco, Op_Decorate, {gid, Dec_BuiltIn, BI_GlobalInvocationId});
+    Emitter::put(e.deco, Op_Decorate, {array_t, Dec_ArrayStride, 4});
+    for (auto block : {block_t, push_t}) {
+        Emitter::put(e.deco, Op_Decorate, {block, Dec_Block});
+        Emitter::put(e.deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
+    }
+    Emitter::put(e.deco, Op_Decorate, {words, Dec_DescriptorSet, 0});
+    Emitter::put(e.deco, Op_Decorate, {words, Dec_Binding, 0});
+    Emitter::put(e.types, Op_TypeVoid, {void_t});
+    Emitter::put(e.types, Op_TypeFunction, {fn_t, void_t});
+    Emitter::put(e.types, Op_TypeInt, {uint_t, 32, 0});
+    Emitter::put(e.types, Op_TypeBool, {bool_t});
+    Emitter::put(e.types, Op_TypeVector, {vec_t, uint_t, 3});
+    Emitter::put(e.types, Op_TypePointer, {input_ptr, SC_Input, vec_t});
+    Emitter::put(e.types, Op_Variable, {input_ptr, gid, SC_Input});
+    Emitter::put(e.types, Op_TypeRuntimeArray, {array_t, uint_t});
+    Emitter::put(e.types, Op_TypeStruct, {block_t, array_t});
+    Emitter::put(e.types, Op_TypePointer, {block_ptr, SC_StorageBuffer, block_t});
+    Emitter::put(e.types, Op_TypePointer, {word_ptr, SC_StorageBuffer, uint_t});
+    Emitter::put(e.types, Op_Variable, {block_ptr, words, SC_StorageBuffer});
+    Emitter::put(e.types, Op_TypeStruct, {push_t, uint_t});
+    Emitter::put(e.types, Op_TypePointer, {push_ptr, SC_PushConstant, push_t});
+    Emitter::put(e.types, Op_TypePointer, {push_word, SC_PushConstant, uint_t});
+    Emitter::put(e.types, Op_Variable, {push_ptr, push, SC_PushConstant});
+    auto constant = [&](uint32_t value) {
+        auto id = e.id();
+        Emitter::put(e.types, Op_Constant, {uint_t, id, value});
+        return id;
+    };
+    auto binary = [&](uint32_t op, uint32_t a, uint32_t b) {
+        auto id = e.id();
+        Emitter::put(e.code, op, {uint_t, id, a, b});
+        return id;
+    };
+    Emitter::put(e.code, Op_Function, {void_t, main, FC_None, fn_t});
+    Emitter::put(e.code, Op_Label, {entry});
+    const auto xyz = e.id(), index = e.id(), count_ptr = e.id(), count = e.id(), valid = e.id();
+    Emitter::put(e.code, Op_Load, {vec_t, xyz, gid});
+    Emitter::put(e.code, Op_CompositeExtract, {uint_t, index, xyz, 0});
+    Emitter::put(e.code, Op_AccessChain, {push_word, count_ptr, push, constant(0)});
+    Emitter::put(e.code, Op_Load, {uint_t, count, count_ptr});
+    Emitter::put(e.code, Op_ULessThan, {bool_t, valid, index, count});
+    Emitter::put(e.code, Op_SelectionMerge, {done, 0});
+    Emitter::put(e.code, Op_BranchConditional, {valid, body, done});
+    Emitter::put(e.code, Op_Label, {body});
+    const auto texel_ptr = e.id(), rgba = e.id();
+    Emitter::put(e.code, Op_AccessChain, {word_ptr, texel_ptr, words, constant(0), index});
+    Emitter::put(e.code, Op_Load, {uint_t, rgba, texel_ptr});
+    auto packed = constant(0);
+    for (uint32_t c = 0; c < 4; ++c) {
+        const auto byte = binary(Op_BitwiseAnd,
+            binary(Op_ShiftRightLogical, rgba, constant(c * 8)), constant(255));
+        // Nearest integer to byte * scale / 255. The odd denominator has no ties.
+        const auto q = binary(Op_UDiv, binary(Op_IAdd,
+            binary(Op_IMul, byte, constant(c == 3 ? 3 : 1023)), constant(127)), constant(255));
+        packed = binary(Op_BitwiseOr, packed,
+            binary(Op_ShiftLeftLogical, q, constant(c * 10)));
+    }
+    Emitter::put(e.code, Op_Store, {texel_ptr, packed});
+    Emitter::put(e.code, Op_Branch, {done});
+    Emitter::put(e.code, Op_Label, {done});
+    Emitter::put(e.code, Op_Return, {});
+    Emitter::put(e.code, Op_FunctionEnd, {});
+    return e.assemble();
+}
+
 } // namespace prosper::gpu

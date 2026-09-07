@@ -14,6 +14,9 @@ found Vulkan.
   pipeline cache, descriptor pools, memory pool and command buffers, and does not include
   `render_runner.h` at all. Reflected storage buffers and storage images are materialized from guest
   memory, dispatched, and written back into guest memory synchronously.
+- `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.
+  Records transfers and conversion into the guest compute submission; setup failures retain their
+  `VkResult` so optional fallback cannot hide device loss.
 - `live_target_format.hpp` — the guest↔Vulkan pixel-format mapping. Compiled with `-Werror=switch`
   on purpose: a silent RGBA8 fallback has cost two titles a whole render layer.
 - `decode_scratch.hpp` — the pooled full-surface intermediates that both the texture decode branches

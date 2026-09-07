@@ -27,6 +27,35 @@ aggregate frame metric was used to make the call. Checked-in capture:
 ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
 between that and a gameplay screenshot.
 
+## Packed render-target GPU conversion (2026-09-07, #3437)
+
+The selected sampled input is now verified against the live imported image: binding 10 of
+`0x200599c900` / hash `0xe3c2229a45c7807c` requests packed 10-bit UNORM, while 200 selected
+available imports reported a same-device 3840×2160 RGBA8 UNORM color target with transfer-source
+usage. Other declarations occur at the same code address; this is the exact packed-input population.
+The compute backend now copies that authoritative image through an integer quantization shader into
+the requested packed image, within the existing submission. It preserves filtering after 10-bit RGB /
+2-bit alpha quantization, source pins and layouts; incompatible views retain the CPU fallback.
+
+An exploratory same-binary comparison on `a4e3757b5115` used fresh saves/caches, the committed
+route and immediate presentation. Only `PROSPER_NO_GPU_PACKED_RTT=1` differed in the normalized
+launch environment. F8 at 300 seconds recorded 26 CPU-fallback / 27 GPU-converted target dispatches,
+all successful, all with GPU timestamps and complete capture footers. Their mean total cost was
+**14.502 / 6.717 ms per dispatch** (53.7% lower in this pair), including setup, dispatch/wait,
+writeback and cleanup. Setup was 8.923 / 1.059 ms; GPU preparation was 0.500 / 0.693 ms,
+including the new conversion. Writeback still cost 3.836 / 3.616 ms, while cleanup rose from
+0.009 to 0.575 ms. The standalone shader interval excludes the conversion and is not its cost.
+
+Guest presentations were 5.19 / 5.39 per second, host presentations 5.19 / 5.19, and CPU use
+1.91 / 1.61 cores. Newly rendered-frame rates were unavailable; this is not an FPS improvement
+claim. Extra compositor screenshots/focus changes investigated the user-reported menu defect before
+the timing windows (last baseline intervention about 217 seconds). They did not overlap F8, but
+subsequent effects are unproven: the pair is exploratory and whole-prefix audio comparison is excluded.
+The later F9s show the known black Cyber Space world with visible HUD at 00:26.95 / 00:27.33;
+HUD colors/icon poses differ at these different guest instants, so they are not pixel-equivalence proof.
+The blank modal, absent menu clouds and wrong title artwork remain open in #2206; cutscene
+corruption remains in #3436. Independent execution tests cover exact values and filtered precision.
+
 ## Mapped GPU detile inputs (2026-09-07, #3434)
 
 A same-binary native `prosper-app` comparison on `f0fb9f112998` used the committed
@@ -674,6 +703,7 @@ to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
+| The packed GPU conversion in #3437 or mapped detile inputs in #3434 first introduced the black title-menu background | **Falsified as first introduction.** Retained user F9 `frame_grab_PPSA03831_20260907-153044-350`, written at guest present 1285 on source `0927f6d3a8a8` (tree-identical to pre-#3434 main `92f0e7368e48`) with `PROSPER_NO_GPU_DETILE=1`, already shows black behind the menu and incorrect TIME UP artwork. New #3437 compositor screenshots after route f1700/f1940 show the same visible failure class at different selections. The earlier run was excluded from the cutscene comparison for capturing a menu; that does not invalidate this menu evidence. This establishes prior occurrence, not unchanged frequency or a shared root cause. #2206 remains open. |
 | The mapped GPU detile input reuse in #3434 introduced the alternating opening-cutscene corruption | **Falsified as an introducing change.** The retained pre-PR main binary (source `0927f6d3a8a8`, tree identical to main `92f0e7368e48`) renders a normal stone-tower frame at guest flip 2810 and green/red UI artwork at 2812 without F9. A same-binary, same-route control with only `PROSPER_NO_GPU_DETILE=1` changed also reaches the cutscene and renders green corruption at 2812. This excludes GPU detiling as necessary for the green flicker; the sampled CPU-detile frames did not reproduce the separate red artwork and do not exonerate that symptom. These are sampled readback snapshots (15 main / 19 CPU-control deliveries), not complete or timing-neutral frame sequences. Root cause remains open in #3436. |
 | Making `gpu_replay` materialize the declared mip chain needs a new capture-format version, because the placement the reader must know is not in the file | **Falsified.** The placement *is* in the file, and had been since before v57: `collect_intervals` anchors a resource's captured range at an interval whose `begin` may sit below `gpu_addr`, and `assign_blob_range` already serializes `blob_offset = gpu_addr - interval.begin` — which is exactly the count of owned bytes preceding the descriptor's address, because a blob's byte *i* is the guest byte at `blob.guest_addr + i` by construction. Only the *writer* had to change (own the allocation, not the selected level); the reader publishes an existing serialized number as `host_data_prefix_bytes`. Pre-#3202 capsules fail closed on the same number without a version gate. #3202 |
 | All three scene-target-width kernels are blocked by `s_cbranch_execz` — a stronger claim than #2790's census, which records it for two of the three | **Partly falsified — two of the three moved, one never did.** The `V_LSHL_ADD_U32` allowlist entry the census predates has landed, and re-measuring on `33417dca` shows `0x2005717e00` and `0x200571bd00` no longer rejecting on `s_cbranch_execz` at pc=28 but on `image_load_mip` at **pc=81** — "a reject PC names where a fact was consumed, not where it was lost", exactly as that commit predicted. `0x2005714000` did **not** move: the census already recorded it at pc=33 `image_load_mip`, byte-identical. So all three of THESE THREE kernels now stop on the SAME instruction — which narrows this particular group to one unimplemented operation, and is **not** a claim that the title's world needs only that: `image_load_mip` is the first blocker of at least two (see the section above, and #2859 for the `s_getpc_b64` half that has since landed). Their `[mimg-mip]` profiles are identical too — `img_dim=5/1 mips=12 addr=0x2026900000 2048x2048`. Note `image_get_resinfo` at pc=73 belongs to `0x2005a13f00` / `0x2006e24000`, **not** to any of these three; an earlier revision of this row mis-attributed it by pairing separately-collected program and reject lists. #2790, #3048 |

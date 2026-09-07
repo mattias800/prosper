@@ -365,6 +365,8 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
+// Inject an optional conversion-admission result; does not fail an actual driver call.
+void live_compute_fail_next_packed_rtt_setup_for_test(bool device_lost);
 
 // Deterministic controls for post-DCC cache-promotion regressions. The first leaves the next
 // writable metadata plane unresolved, exercising the final all-0xff recheck. The second disables

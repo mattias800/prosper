@@ -33,4 +33,8 @@ std::vector<uint32_t> build_compute_compare_uvec4();
 // completes. Only excess invocations are checked by the shader itself.
 std::vector<uint32_t> build_compute_detile_rgba16f();
 
+// Reconstruct packed R10G10B10A2 UNORM from canonical RGBA8 bytes in place.
+// Binding 0: storage buffer of uint32 texels; push constant: texel count.
+std::vector<uint32_t> build_compute_rgba8_to_packed10();
+
 } // namespace prosper::gpu
