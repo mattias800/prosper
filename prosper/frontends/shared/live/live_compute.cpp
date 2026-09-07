@@ -918,6 +918,12 @@ struct ComputeBufferWriteWatchChunk {
     prosper::host::GuestWriteWatch watch;
 };
 
+enum class ComputeBufferSourceProof {
+    Changed,
+    ExactUnchanged,
+    PublishedUnchanged,
+};
+
 struct CachedComputeBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -940,6 +946,7 @@ struct CachedComputeBuffer {
     VkBuffer result_buffer = VK_NULL_HANDLE;
     VkDeviceMemory result_memory = VK_NULL_HANDLE;
     VkDeviceSize result_bytes = 0;
+    VkDeviceSize result_allocation_bytes = 0;
 };
 
 struct ComputeImageCacheKey {
@@ -2052,22 +2059,46 @@ struct VulkanComputeContext {
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
+        if (buffer_cache_bytes <= limit - bytes) return true;
+        // A refusal must not destroy reusable entries first. Pins cover both the primary buffer
+        // and any result-baseline handle borrowed by an in-flight BoundBuffer.
+        const VkDeviceSize needed = buffer_cache_bytes - (limit - bytes);
+        VkDeviceSize reclaimable = 0;
+        for (const auto& [key, cached] : buffer_cache) {
+            if (cached.pins) continue;
+            reclaimable += cached.allocation_bytes;
+            if (reclaimable >= needed) break;
+        }
+        if (reclaimable < needed) return false;
         while (buffer_cache_bytes > limit - bytes) {
             auto victim = buffer_cache.end();
             for (auto it = buffer_cache.begin(); it != buffer_cache.end(); ++it) {
                 if (it->second.pins) continue;
+                // Optional comparisons must not displace the input/result allocation they exist
+                // to accelerate. Reclaim the oldest unpinned baseline before an entire primary.
+                const bool has_result = it->second.result_buffer != VK_NULL_HANDLE;
                 if (victim == buffer_cache.end() ||
-                    it->second.last_use < victim->second.last_use)
+                    (has_result && !victim->second.result_buffer) ||
+                    (has_result == (victim->second.result_buffer != VK_NULL_HANDLE) &&
+                     it->second.last_use < victim->second.last_use))
                     victim = it;
             }
             if (victim == buffer_cache.end()) return false;
+            if (victim->second.result_buffer) {
+                auto& cached = victim->second;
+                vkDestroyBuffer(device, cached.result_buffer, nullptr);
+                release_memory(cached.result_memory);
+                buffer_cache_bytes -= cached.result_allocation_bytes;
+                cached.allocation_bytes -= cached.result_allocation_bytes;
+                cached.result_buffer = VK_NULL_HANDLE;
+                cached.result_memory = VK_NULL_HANDLE;
+                cached.result_bytes = 0;
+                cached.result_allocation_bytes = 0;
+                continue;
+            }
             victim->second.write_watches.clear();
             if (victim->second.buffer) vkDestroyBuffer(device, victim->second.buffer, nullptr);
             if (victim->second.memory) release_memory(victim->second.memory);
-            if (victim->second.result_buffer)
-                vkDestroyBuffer(device, victim->second.result_buffer, nullptr);
-            if (victim->second.result_memory)
-                release_memory(victim->second.result_memory);
             buffer_cache_bytes -= victim->second.allocation_bytes;
             buffer_cache.erase(victim);
         }
@@ -2184,7 +2215,9 @@ struct VulkanComputeContext {
             cached.content_valid = true;
             if (!key.host_data) {
                 ComputeBufferCostScope cost(timing.enabled, timing.upload_watch_ms);
-                validate_cached_buffer_source(key, upload_skipped, true);
+                validate_cached_buffer_source(key, upload_skipped
+                    ? ComputeBufferSourceProof::ExactUnchanged
+                    : ComputeBufferSourceProof::Changed, true);
             }
         }
         return true;
@@ -2192,6 +2225,7 @@ struct VulkanComputeContext {
 
     bool retain_buffer(const ComputeBufferCacheKey& key, VkBuffer buffer, VkDeviceMemory memory,
                        VkDeviceSize allocation_bytes) {
+        if (buffer_cache.find(key) != buffer_cache.end()) return false;
         if (!make_buffer_cache_room(allocation_bytes)) return false;
         CachedComputeBuffer cached;
         cached.buffer = buffer;
@@ -2240,16 +2274,21 @@ struct VulkanComputeContext {
     }
 
     void validate_cached_buffer_source(const ComputeBufferCacheKey& key,
-                                       bool content_unchanged = false,
+                                       ComputeBufferSourceProof proof,
                                        bool watch_prepared_before_validation = false) {
         auto found = buffer_cache.find(key);
         if (found == buffer_cache.end() || key.host_data) return;
         CachedComputeBuffer& cached = found->second;
         cached.content_valid = true;
         cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
-        cached.write_watch_stable_validations = update_write_watch_stability(
-            cached.write_watch_stable_validations, content_unchanged,
-            compute_write_watch_promotion_validations());
+        // An unchanged publication preserves the proof already earned at acquisition. Counting
+        // it again promotes too early; treating it as changed prevents writable buffers from ever
+        // reaching the normal promotion threshold across submits.
+        if (proof != ComputeBufferSourceProof::PublishedUnchanged)
+            cached.write_watch_stable_validations = update_write_watch_stability(
+                cached.write_watch_stable_validations,
+                proof == ComputeBufferSourceProof::ExactUnchanged,
+                compute_write_watch_promotion_validations());
         if (watch_prepared_before_validation || cached.write_watches.empty()) return;
         for (ComputeBufferWriteWatchChunk& chunk : cached.write_watches) {
             if (chunk.watch && chunk.watch.rearm()) continue;
@@ -2261,7 +2300,10 @@ struct VulkanComputeContext {
 
     void invalidate_cached_buffer_source(const ComputeBufferCacheKey& key) {
         const auto found = buffer_cache.find(key);
-        if (found != buffer_cache.end()) found->second.content_valid = false;
+        if (found != buffer_cache.end()) {
+            found->second.content_valid = false;
+            found->second.write_watch_stable_validations = 0;
+        }
     }
 
     bool cached_buffer_result_buffer(const ComputeBufferCacheKey& key, VkDeviceSize bytes,
@@ -2295,7 +2337,10 @@ struct VulkanComputeContext {
         if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device, buffer, &requirements);
-        if (!make_buffer_cache_room(requirements.size)) {
+        // Baselines use spare residency only. Evicting another primary (or cycling its baseline)
+        // here can turn a fitting primary working set into a miss and full-copy loop.
+        const VkDeviceSize limit = persistent_compute_buffer_limit();
+        if (requirements.size > limit || buffer_cache_bytes > limit - requirements.size) {
             timing.baseline = "budget";
             vkDestroyBuffer(device, buffer, nullptr);
             return false;
@@ -2318,8 +2363,7 @@ struct VulkanComputeContext {
         copy_compute_buffer(mapped, result, key.bytes);
         unmap_memory(memory);
 
-        // make_buffer_cache_room can evict other entries, so reacquire the pinned current entry
-        // before publishing ownership of the allocation.
+        // Publish ownership only after the optional allocation and seed copy succeeded.
         found = buffer_cache.find(key);
         if (found == buffer_cache.end() || found->second.result_buffer) {
             timing.baseline = found == buffer_cache.end() ? "missing-entry" : "already-present";
@@ -2330,6 +2374,7 @@ struct VulkanComputeContext {
         found->second.result_buffer = buffer;
         found->second.result_memory = memory;
         found->second.result_bytes = key.bytes;
+        found->second.result_allocation_bytes = requirements.size;
         found->second.allocation_bytes += requirements.size;
         buffer_cache_bytes += requirements.size;
         timing.baseline = "created";
@@ -10423,7 +10468,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 if (buffer.persistent) {
                     ComputeBufferCostScope cost(timing.enabled, timing.source_validation_ms);
-                    ctx.validate_cached_buffer_source(buffer.cache_key);
+                    ctx.validate_cached_buffer_source(
+                        buffer.cache_key, ComputeBufferSourceProof::PublishedUnchanged);
                 }
                 if (!buffer.resource->host_data && writer_provenance_enabled()) {
                     ComputeBufferCostScope cost(timing.enabled, timing.provenance_ms);
@@ -10616,7 +10662,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (buffer.persistent) {
                 ComputeBufferCostScope cost(timing.enabled, timing.source_validation_ms);
-                ctx.validate_cached_buffer_source(buffer.cache_key);
+                ctx.validate_cached_buffer_source(buffer.cache_key, changed
+                    ? ComputeBufferSourceProof::Changed
+                    : ComputeBufferSourceProof::PublishedUnchanged);
             }
             if (!buffer.resource->host_data && writer_provenance_enabled()) {
                 ComputeBufferCostScope cost(timing.enabled, timing.provenance_ms);
@@ -11414,6 +11462,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (buffer.alias_of != SIZE_MAX) continue;
             const auto& t = buffer.timing;
             const auto& r = buffer_resources[i];
+            const auto cached = ctx.buffer_cache.find(buffer.cache_key);
+            const VkDeviceSize result_charge = cached == ctx.buffer_cache.end()
+                ? 0 : cached->second.result_allocation_bytes;
+            const VkDeviceSize primary_charge = cached == ctx.buffer_cache.end()
+                ? 0 : cached->second.allocation_bytes - result_charge;
             size_t aliases = 0;
             std::string bindings = std::to_string(r.binding);
             for (const auto& other : buffers) {
@@ -11428,6 +11481,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 "host-key=0x%llx semantic=%u logical-bytes=%u bytes=%zu guest-bytes=%zu "
                 "writable=%u atomic=%u "
                 "persistent=%u upload-skipped=%u dirty-watch-chunks=%u total-watch-chunks=%u "
+                "cache-bytes=%llu cache-limit=%llu primary-allocation-bytes=%llu "
+                "result-allocation-bytes=%llu "
                 "cache=%s validation=%s baseline=%s gpu-compare=%s writeback=%s "
                 "compared-bytes=%llu uploaded-bytes=%llu result-compared-bytes=%llu "
                 "guest-copied-bytes=%llu setup_ms=%.6f validation_ms=%.6f "
@@ -11447,6 +11502,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 buffer.writable ? 1u : 0u, buffer.atomic_image ? 1u : 0u,
                 buffer.persistent ? 1u : 0u, buffer.upload_skipped ? 1u : 0u,
                 buffer.dirty_watch_chunks, buffer.total_watch_chunks,
+                (unsigned long long)ctx.buffer_cache_bytes,
+                (unsigned long long)persistent_compute_buffer_limit(),
+                (unsigned long long)primary_charge, (unsigned long long)result_charge,
                 t.cache, t.validation, t.baseline, t.gpu_compare, t.writeback,
                 (unsigned long long)t.compared_bytes, (unsigned long long)t.uploaded_bytes,
                 (unsigned long long)t.result_compared_bytes,

@@ -3086,6 +3086,15 @@ if(TARGET prosper_core)
                          "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_timing_runtime.py"
                          $<TARGET_FILE:test_compute_buffer_timing>)
         set_tests_properties(compute_buffer_timing_runtime PROPERTIES TIMEOUT 180)
+        add_executable(test_compute_buffer_residency tests/gpu/execute/test_compute_buffer_residency.cpp)
+        target_include_directories(test_compute_buffer_residency PRIVATE tests frontends)
+        target_link_libraries(test_compute_buffer_residency PRIVATE
+                             prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME compute_buffer_residency_runtime
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_residency_runtime.py"
+                         $<TARGET_FILE:test_compute_buffer_residency>)
+        set_tests_properties(compute_buffer_residency_runtime PROPERTIES TIMEOUT 180)
       endif()
 
       # #3180: a failed color-target vkCreateImage must name its site and the real VkResult. Same

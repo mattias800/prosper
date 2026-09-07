@@ -114,12 +114,16 @@ struct GuestBuffer {
 int main(int argc, char** argv) {
     if (argc != 3) { std::fprintf(stderr, "usage: fixture MODE CAPTURE_DIRECTORY\n"); return 2; }
     const std::string mode = argv[1];
+    const bool promotion = mode == "promotion" || mode == "promotion-cpu";
+    const bool cpu_result = mode == "promotion-cpu";
     if (mode != "selected" && mode != "wrong-code" && mode != "wrong-hash" &&
-        mode != "disabled" && mode != "capture-idle" && mode != "capture-armed") return 2;
+        mode != "disabled" && mode != "capture-idle" && mode != "capture-armed" &&
+        !promotion) return 2;
     env("PROSPER_COMPUTELOG", nullptr);
     env("PROSPER_COMPUTELOG_CODE", nullptr);
-    env("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
-    env("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS", "1");
+    env("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", cpu_result ? nullptr : "1");
+    env("PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS", cpu_result ? "1" : nullptr);
+    env("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS", promotion ? nullptr : "1");
     env("PROSPER_NO_DISK_PIPELINE_CACHE", "1");
     env("PROSPER_COMPUTE_BUFFER_TIMING", mode == "disabled" ? nullptr : "1");
     env("PROSPER_COMPUTE_TIMING_CAPTURE_ONLY",
@@ -191,6 +195,42 @@ int main(int argc, char** argv) {
         if ((address == first.address() || address == second.address()) && length == bytes)
             ++notifications;
     });
+    if (promotion) {
+        const auto initial_skips = prosper::frontend::live_compute_buffer_gpu_result_skips();
+        for (unsigned index = 1; index <= 9; ++index) {
+            const bool mutation = index == 3 || index == 8;
+            const auto skips_before = prosper::frontend::live_compute_buffer_gpu_result_skips();
+            if (mutation) first.data[0] ^= 0xffffffffu;
+            auto next = dispatch(index);
+            next.submit_no = submit + index;
+            // Every call owns a distinct real submit journal. Reusing the item or incrementing
+            // its submit number inside ONE scope would accidentally test journal skips instead.
+            const auto result = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, index, next.command_order}}, {}, {next}, {},
+                [&](const std::vector<ComputeItem>& items) {
+                    return prosper::frontend::execute_live_compute_items(items);
+                }, 1, 1);
+            check(result.compute_executed && first.correct(),
+                  "promotion dispatch publishes exact result and preserves untouched tail");
+            check(notifications == index,
+                  "promotion dispatch publishes one owner despite aliased bindings");
+            const auto skips_after = prosper::frontend::live_compute_buffer_gpu_result_skips();
+            if (cpu_result || mutation || index == 1)
+                check(skips_after == skips_before,
+                      "cold/changed/CPU-only result cannot use GPU-identical shortcut");
+            else
+                check(skips_after == skips_before + 1,
+                      "unchanged promotion dispatch proves its retained GPU result");
+        }
+        if (cpu_result)
+            check(prosper::frontend::live_compute_buffer_gpu_result_skips() == initial_skips,
+                  "CPU promotion arm never uses retained GPU-result comparison");
+        set_guest_gpu_write_observer({});
+        capture.cancel();
+        if (!failures)
+            std::fprintf(stderr, "[buffer-timing-fixture] success mode=%s\n", mode.c_str());
+        return failures ? 1 : 0;
+    }
     // A real submit scope supplies the journal; each callback still executes the Vulkan backend.
     const auto ordered = execute_ordered_items(
         {{SubmitOperationKind::Dispatch, 1, 10}, {SubmitOperationKind::Dispatch, 2, 20}},

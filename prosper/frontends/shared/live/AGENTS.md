@@ -59,6 +59,14 @@ production backend without a frontend or a game dump.
 
 ## Measuring buffer setup and writeback
 
+The persistent buffer budget charges primary allocations and optional exact-result baselines.
+Primary admission first proves that enough unpinned storage can be reclaimed, then drops unpinned
+baselines before evicting primary entries. Baseline admission uses spare capacity only. One owner
+pin protects both handles through completion; a failed submission without completion proof keeps
+that pin. Reclaiming a baseline preserves the primary's guest-content validation and write watches.
+Unchanged writeback preserves watch-promotion progress already earned by exact source validation;
+it neither resets that progress nor counts it a second time. Changed content resets progress.
+
 `PROSPER_COMPUTE_BUFFER_TIMING=1` emits `[compute-buffer-timing]` records after cleanup. Use
 `PROSPER_COMPUTE_TIMING_CODE` / `PROSPER_COMPUTE_TIMING_HASH` to select a program and
 `PROSPER_COMPUTE_TIMING_CAPTURE_ONLY=1` to bound records to F8; the existing `TRACE_ONLY` selector
@@ -79,6 +87,12 @@ prepared, recorded and a completed changed/unchanged result; `no-result` means c
 but the flag was not read, and `setup-failed` retains the CPU fallback. Check `ok` before treating a
 row as a completed dispatch. `host-key` is the existing cache-key pointer, whereas `host-backed`
 describes effective source selection (a short host mirror falls back to guest memory).
+
+`cache-bytes` and `cache-limit` report end-of-dispatch requested residency. The owner's
+`primary-allocation-bytes` and `result-allocation-bytes` report the surviving cache entry's separate
+charges (zero if absent). These use Vulkan resource memory requirements, as the existing budget
+does; the underlying allocation pool can supply a larger allocation. They are not a physical
+device-memory usage measurement or cap.
 
 Byte counters are lengths passed to comparisons and copies, not actual CPU bytes read by an
 early-exiting comparison. `compared-bytes` includes the initial exact comparison against pooled

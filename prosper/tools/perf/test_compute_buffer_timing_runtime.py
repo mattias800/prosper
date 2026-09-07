@@ -127,6 +127,56 @@ def check_selected(rows, witness):
            baseline="created", writeback="changed", guest_copied_bytes=BYTES)
 
 
+def check_promotion(rows, witness):
+    require(len(rows) == 9, f"expected nine promotion owner records, got {len(rows)}")
+    indexed = {number(row, "dispatch"): row for row in rows}
+    require(set(indexed) == set(range(1, 10)), "duplicate/missing promotion dispatch")
+    cpu_result = witness["mode"] == "promotion-cpu"
+    watched = number(witness, "watch") == 1
+    address = number(indexed[1], "addr")
+    for dispatch, row in indexed.items():
+        expect(row, submit=3407 + dispatch, order=dispatch * 10, ok=1,
+               code=number(witness, "code"), hash=number(witness, "hash"),
+               addr=address, owner=0, owner_index=0, owner_resolved=1,
+               aliases=1, bindings="0,1", host_backed=0, host_key=0, semantic=0,
+               logical_bytes=BYTES, bytes=BYTES, guest_bytes=BYTES,
+               writable=1, atomic=0, persistent=1)
+        for timer in TIMERS:
+            require(math.isfinite(float(row[timer])) and float(row[timer]) >= 0,
+                    f"invalid {timer}: {row[timer]}")
+        changed = dispatch in (1, 3, 8)
+        expect(row, cache="miss" if dispatch == 1 else "hit",
+               upload_skipped=0 if changed else 1,
+               writeback="changed" if changed else "unchanged" if cpu_result else "gpu-unchanged",
+               gpu_compare="ineligible" if changed or cpu_result else "unchanged",
+               result_compared_bytes=BYTES if changed or cpu_result else 0,
+               guest_copied_bytes=BYTES if changed else 0)
+        if cpu_result:
+            expect(row, baseline="disabled")
+        if dispatch == 1:
+            expect(row, validation="pooled-full", compared_bytes=BYTES)
+            if not cpu_result:
+                expect(row, baseline="created")
+            require(number(row, "uploaded-bytes") in (0, BYTES), "invalid cold upload bytes")
+        elif dispatch == 8 and watched:
+            expect(row, validation="dirty-chunks", dirty_watch_chunks=1, total_watch_chunks=2,
+                   compared_bytes=1 << 20, uploaded_bytes=1 << 20)
+        elif dispatch in (7, 9) and watched:
+            expect(row, validation="watch", dirty_watch_chunks=0, total_watch_chunks=2,
+                   compared_bytes=0, uploaded_bytes=0)
+        else:
+            expect(row, validation="full", compared_bytes=BYTES,
+                   uploaded_bytes=BYTES if changed else 0)
+            if watched:
+                # 2: first unchanged validation; 3: mutation resets the ladder. 4 and 5
+                # accumulate two new validations. 6 arms before its third full comparison;
+                # the setup census still saw zero preexisting watches on that acquisition.
+                expect(row, dirty_watch_chunks=0, total_watch_chunks=0)
+    for timer in ("setup_ms", "writeback_ms"):
+        require(sum(float(row[timer]) for row in rows) > 0,
+                f"promotion arm collected no {timer}")
+
+
 def run_fixture(binary, mode, directory):
     # These tests intentionally control diagnostic/cache policy. Preserve driver/validation
     # settings so running the ctest under the validation-layer wrapper still validates Vulkan.
@@ -150,6 +200,8 @@ def run_fixture(binary, mode, directory):
     rows = [fields(line, PREFIX) for line in lines if line.startswith(PREFIX)]
     if mode in ("selected", "capture-armed"):
         check_selected(rows, witnesses[0])
+    elif mode in ("promotion", "promotion-cpu"):
+        check_promotion(rows, witnesses[0])
     else:
         require(not rows, f"{mode}: rejected selector/capture gate emitted buffer records")
     return witnesses[0]
@@ -161,14 +213,20 @@ def main():
     binary = Path(sys.argv[1]).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="compute-buffer-timing-") as scratch:
         witnesses = []
+        errors = []
         for mode in ("selected", "wrong-code", "wrong-hash", "disabled",
-                     "capture-idle", "capture-armed"):
+                     "capture-idle", "capture-armed", "promotion", "promotion-cpu"):
             directory = Path(scratch) / mode
             directory.mkdir()
-            witnesses.append(run_fixture(binary, mode, directory))
+            try:
+                witnesses.append(run_fixture(binary, mode, directory))
+            except AssertionError as error:
+                # Run both promotion implementations even when the first exposes a defect.
+                errors.append(f"{mode}: {error}")
+        require(not errors, "\n".join(errors))
         require(len({row["hash"] for row in witnesses}) == 1,
                 "selector controls did not execute the same compiled guest shader")
-    print("compute buffer runtime: owner decisions and six selector/capture arms passed")
+    print("compute buffer runtime: owner decisions, six selectors and two promotion arms passed")
 
 
 if __name__ == "__main__":
