@@ -56,3 +56,53 @@ can verify:
 `execute_live_compute_items()` is the one entry point exposed for tests, which is how
 `game_compute_exec`, `live_compute_descriptor_array` and `live_compute_host_read_barrier` drive the
 production backend without a frontend or a game dump.
+
+## Measuring buffer setup and writeback
+
+The persistent buffer budget charges primary allocations and optional exact-result baselines.
+Primary admission first proves that enough unpinned storage can be reclaimed, then drops unpinned
+baselines before evicting primary entries. Baseline admission uses spare capacity only. One owner
+pin protects both handles through completion; a failed submission without completion proof keeps
+that pin. Reclaiming a baseline preserves the primary's guest-content validation and write watches.
+Unchanged writeback preserves watch-promotion progress already earned by exact source validation;
+it neither resets that progress nor counts it a second time. Changed content resets progress.
+
+`PROSPER_COMPUTE_BUFFER_TIMING=1` emits `[compute-buffer-timing]` records after cleanup. Use
+`PROSPER_COMPUTE_TIMING_CODE` / `PROSPER_COMPUTE_TIMING_HASH` to select a program and
+`PROSPER_COMPUTE_TIMING_CAPTURE_ONLY=1` to bound records to F8; the existing `TRACE_ONLY` selector
+also applies. No guest-content hashes or extra comparisons are added, and the added timers read no
+clocks when disabled. Keep `PROSPER_COMPUTELOG` off when measuring: its additional scans and output
+are included in enclosing timers.
+
+Each resolved allocation owner gets one row, including read-only owners. `owner-index` identifies
+the flattened descriptor-table entry; `bindings` includes the owner and exact aliases, and `aliases`
+counts only the additional entries. Writability is combined across aliases. On setup failure, later
+descriptors may have `owner-resolved=0`; exclude those placeholders from allocation counts. Join
+records using submit/dispatch/order/program identity. CPU fast paths, proven no-ops and declines
+before materialization produce no buffer rows; these records are not the whole F8 population.
+
+`cache`, `validation`, `baseline`, `gpu-compare` and `writeback` report decisions already made by the
+backend. `unobserved` means the stage was not reached. GPU comparison progresses through eligible,
+prepared, recorded and a completed changed/unchanged result; `no-result` means completion occurred
+but the flag was not read, and `setup-failed` retains the CPU fallback. Check `ok` before treating a
+row as a completed dispatch. `host-key` is the existing cache-key pointer, whereas `host-backed`
+describes effective source selection (a short host mirror falls back to guest memory).
+
+`cache-bytes` and `cache-limit` report end-of-dispatch requested residency. The owner's
+`primary-allocation-bytes` and `result-allocation-bytes` report the surviving cache entry's separate
+charges (zero if absent). These use Vulkan resource memory requirements, as the existing budget
+does; the underlying allocation pool can supply a larger allocation. They are not a physical
+device-memory usage measurement or cap.
+
+Byte counters are lengths passed to comparisons and copies, not actual CPU bytes read by an
+early-exiting comparison. `compared-bytes` includes the initial exact comparison against pooled
+allocation contents. `upload-skipped` is the existing cached-source authority bit: zero upload bytes
+on a cold, already-equal pooled allocation does not set it. Atomic image writeback uses
+`guest_layout_ms`; `guest-copied-bytes` counts only the ordinary contiguous buffer copy.
+
+Timers are nested, not additive: `setup_ms` covers owner materialization after resource/alias checks;
+`validation_ms` includes upload compare/copy/map/watch on cache hits. `writeback_ms` encloses result
+comparison, guest copy/layout, map, host-write-watch notification, baseline creation, architectural
+notification, source validation/watch rearming and provenance. Those last two have separate
+`source_validation_ms` and `provenance_ms` fields. Use the existing dispatch phase totals for the
+remaining setup checks and loop overhead; do not claim the sum of owner timers covers all setup.

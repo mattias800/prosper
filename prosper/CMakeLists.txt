@@ -3076,6 +3076,27 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      if(Python3_Interpreter_FOUND)
+        add_executable(test_compute_buffer_timing tests/gpu/execute/test_compute_buffer_timing.cpp)
+        target_include_directories(test_compute_buffer_timing PRIVATE tests frontends)
+        target_link_libraries(test_compute_buffer_timing PRIVATE
+                             prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME compute_buffer_timing_runtime
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_timing_runtime.py"
+                         $<TARGET_FILE:test_compute_buffer_timing>)
+        set_tests_properties(compute_buffer_timing_runtime PROPERTIES TIMEOUT 180)
+        add_executable(test_compute_buffer_residency tests/gpu/execute/test_compute_buffer_residency.cpp)
+        target_include_directories(test_compute_buffer_residency PRIVATE tests frontends)
+        target_link_libraries(test_compute_buffer_residency PRIVATE
+                             prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME compute_buffer_residency_runtime
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_residency_runtime.py"
+                         $<TARGET_FILE:test_compute_buffer_residency>)
+        set_tests_properties(compute_buffer_residency_runtime PROPERTIES TIMEOUT 180)
+      endif()
+
       # #3180: a failed color-target vkCreateImage must name its site and the real VkResult. Same
       # block as the other render_runner.h tests -- it needs the `tests` and `frontends` include
       # roots and a real Vulkan device.

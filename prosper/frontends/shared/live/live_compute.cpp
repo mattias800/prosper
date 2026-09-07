@@ -3,6 +3,7 @@
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
+#include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
@@ -917,6 +918,12 @@ struct ComputeBufferWriteWatchChunk {
     prosper::host::GuestWriteWatch watch;
 };
 
+enum class ComputeBufferSourceProof {
+    Changed,
+    ExactUnchanged,
+    PublishedUnchanged,
+};
+
 struct CachedComputeBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -939,6 +946,7 @@ struct CachedComputeBuffer {
     VkBuffer result_buffer = VK_NULL_HANDLE;
     VkDeviceMemory result_memory = VK_NULL_HANDLE;
     VkDeviceSize result_bytes = 0;
+    VkDeviceSize result_allocation_bytes = 0;
 };
 
 struct ComputeImageCacheKey {
@@ -2051,22 +2059,46 @@ struct VulkanComputeContext {
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
+        if (buffer_cache_bytes <= limit - bytes) return true;
+        // A refusal must not destroy reusable entries first. Pins cover both the primary buffer
+        // and any result-baseline handle borrowed by an in-flight BoundBuffer.
+        const VkDeviceSize needed = buffer_cache_bytes - (limit - bytes);
+        VkDeviceSize reclaimable = 0;
+        for (const auto& [key, cached] : buffer_cache) {
+            if (cached.pins) continue;
+            reclaimable += cached.allocation_bytes;
+            if (reclaimable >= needed) break;
+        }
+        if (reclaimable < needed) return false;
         while (buffer_cache_bytes > limit - bytes) {
             auto victim = buffer_cache.end();
             for (auto it = buffer_cache.begin(); it != buffer_cache.end(); ++it) {
                 if (it->second.pins) continue;
+                // Optional comparisons must not displace the input/result allocation they exist
+                // to accelerate. Reclaim the oldest unpinned baseline before an entire primary.
+                const bool has_result = it->second.result_buffer != VK_NULL_HANDLE;
                 if (victim == buffer_cache.end() ||
-                    it->second.last_use < victim->second.last_use)
+                    (has_result && !victim->second.result_buffer) ||
+                    (has_result == (victim->second.result_buffer != VK_NULL_HANDLE) &&
+                     it->second.last_use < victim->second.last_use))
                     victim = it;
             }
             if (victim == buffer_cache.end()) return false;
+            if (victim->second.result_buffer) {
+                auto& cached = victim->second;
+                vkDestroyBuffer(device, cached.result_buffer, nullptr);
+                release_memory(cached.result_memory);
+                buffer_cache_bytes -= cached.result_allocation_bytes;
+                cached.allocation_bytes -= cached.result_allocation_bytes;
+                cached.result_buffer = VK_NULL_HANDLE;
+                cached.result_memory = VK_NULL_HANDLE;
+                cached.result_bytes = 0;
+                cached.result_allocation_bytes = 0;
+                continue;
+            }
             victim->second.write_watches.clear();
             if (victim->second.buffer) vkDestroyBuffer(device, victim->second.buffer, nullptr);
             if (victim->second.memory) release_memory(victim->second.memory);
-            if (victim->second.result_buffer)
-                vkDestroyBuffer(device, victim->second.result_buffer, nullptr);
-            if (victim->second.result_memory)
-                release_memory(victim->second.result_memory);
             buffer_cache_bytes -= victim->second.allocation_bytes;
             buffer_cache.erase(victim);
         }
@@ -2075,9 +2107,15 @@ struct VulkanComputeContext {
 
     bool acquire_cached_buffer(const ComputeBufferCacheKey& key, const uint8_t* source,
                                VkBuffer& buffer, VkDeviceMemory& memory, bool& upload_skipped,
-                               uint32_t& dirty_watch_chunks, uint32_t& total_watch_chunks) {
+                               uint32_t& dirty_watch_chunks, uint32_t& total_watch_chunks,
+                               ComputeBufferTiming& timing) {
         auto found = buffer_cache.find(key);
-        if (found == buffer_cache.end()) return false;
+        if (found == buffer_cache.end()) {
+            timing.cache = "miss";
+            return false;
+        }
+        timing.cache = "hit";
+        ComputeBufferCostScope validation_cost(timing.enabled, timing.validation_ms);
         CachedComputeBuffer& cached = found->second;
         cached.last_use = ++buffer_cache_clock;
         ++cached.pins;
@@ -2102,15 +2140,26 @@ struct VulkanComputeContext {
         }
         dirty_watch_chunks = static_cast<uint32_t>(dirty_chunks.size());
         upload_skipped = submit_unchanged || (watches_complete && dirty_chunks.empty());
+        timing.validation = submit_unchanged ? "journal" : upload_skipped ? "watch"
+                            : watches_complete ? "dirty-chunks" : "full";
         if (submit_unchanged) g_write_watch_census.record_journal_skip(key.bytes);
         else if (upload_skipped) g_write_watch_census.record_watch_skip(key.bytes);
         if (!upload_skipped) {
             // Establish the mutation boundary before the authoritative guest-byte comparison.
             // Arming after memcmp would leave a compare-to-arm gap where a concurrent guest CPU
             // write could become permanently invisible to this cache entry.
-            prepare_cached_buffer_write_watches_before_exact(key);
+            {
+                ComputeBufferCostScope cost(timing.enabled, timing.upload_watch_ms);
+                prepare_cached_buffer_write_watches_before_exact(key);
+            }
             void* mapped = nullptr;
-            if (map_memory(cached.memory, 0, key.bytes, &mapped) != VK_SUCCESS) {
+            VkResult map_result;
+            {
+                ComputeBufferCostScope cost(timing.enabled, timing.upload_map_ms);
+                map_result = map_memory(cached.memory, 0, key.bytes, &mapped);
+            }
+            if (map_result != VK_SUCCESS) {
+                timing.cache = "map-failed";
                 --cached.pins;
                 buffer = VK_NULL_HANDLE;
                 memory = VK_NULL_HANDLE;
@@ -2127,30 +2176,56 @@ struct VulkanComputeContext {
                 for (size_t index : dirty_chunks) {
                     const ComputeBufferWriteWatchChunk& chunk = cached.write_watches[index];
                     compared_bytes += chunk.bytes;
-                    if (std::memcmp(destination + chunk.offset, source + chunk.offset,
-                                    chunk.bytes) == 0)
-                        continue;
-                    std::memcpy(destination + chunk.offset, source + chunk.offset, chunk.bytes);
+                    bool equal;
+                    {
+                        ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
+                        equal = std::memcmp(destination + chunk.offset, source + chunk.offset,
+                                            chunk.bytes) == 0;
+                    }
+                    if (equal) continue;
+                    {
+                        ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
+                        std::memcpy(destination + chunk.offset, source + chunk.offset, chunk.bytes);
+                    }
+                    timing.uploaded_bytes += chunk.bytes;
                     changed = true;
                 }
                 g_write_watch_census.record_exact_compare(compared_bytes);
+                timing.compared_bytes += compared_bytes;
                 upload_skipped = !changed;
             } else {
                 g_write_watch_census.record_exact_compare(key.bytes);
-                const bool changed = !compute_buffers_equal(mapped, source, key.bytes);
-                if (changed) copy_compute_buffer(mapped, source, key.bytes);
+                bool changed;
+                {
+                    ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
+                    changed = !compute_buffers_equal(mapped, source, key.bytes);
+                }
+                timing.compared_bytes += key.bytes;
+                if (changed) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
+                    copy_compute_buffer(mapped, source, key.bytes);
+                    timing.uploaded_bytes += key.bytes;
+                }
                 upload_skipped = !changed;
             }
-            unmap_memory(cached.memory);
+            {
+                ComputeBufferCostScope cost(timing.enabled, timing.upload_map_ms);
+                unmap_memory(cached.memory);
+            }
             cached.content_valid = true;
-            if (!key.host_data)
-                validate_cached_buffer_source(key, upload_skipped, true);
+            if (!key.host_data) {
+                ComputeBufferCostScope cost(timing.enabled, timing.upload_watch_ms);
+                validate_cached_buffer_source(key, upload_skipped
+                    ? ComputeBufferSourceProof::ExactUnchanged
+                    : ComputeBufferSourceProof::Changed, true);
+            }
         }
         return true;
     }
 
     bool retain_buffer(const ComputeBufferCacheKey& key, VkBuffer buffer, VkDeviceMemory memory,
                        VkDeviceSize allocation_bytes) {
+        if (buffer_cache.find(key) != buffer_cache.end()) return false;
         if (!make_buffer_cache_room(allocation_bytes)) return false;
         CachedComputeBuffer cached;
         cached.buffer = buffer;
@@ -2199,16 +2274,21 @@ struct VulkanComputeContext {
     }
 
     void validate_cached_buffer_source(const ComputeBufferCacheKey& key,
-                                       bool content_unchanged = false,
+                                       ComputeBufferSourceProof proof,
                                        bool watch_prepared_before_validation = false) {
         auto found = buffer_cache.find(key);
         if (found == buffer_cache.end() || key.host_data) return;
         CachedComputeBuffer& cached = found->second;
         cached.content_valid = true;
         cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
-        cached.write_watch_stable_validations = update_write_watch_stability(
-            cached.write_watch_stable_validations, content_unchanged,
-            compute_write_watch_promotion_validations());
+        // An unchanged publication preserves the proof already earned at acquisition. Counting
+        // it again promotes too early; treating it as changed prevents writable buffers from ever
+        // reaching the normal promotion threshold across submits.
+        if (proof != ComputeBufferSourceProof::PublishedUnchanged)
+            cached.write_watch_stable_validations = update_write_watch_stability(
+                cached.write_watch_stable_validations,
+                proof == ComputeBufferSourceProof::ExactUnchanged,
+                compute_write_watch_promotion_validations());
         if (watch_prepared_before_validation || cached.write_watches.empty()) return;
         for (ComputeBufferWriteWatchChunk& chunk : cached.write_watches) {
             if (chunk.watch && chunk.watch.rearm()) continue;
@@ -2220,7 +2300,10 @@ struct VulkanComputeContext {
 
     void invalidate_cached_buffer_source(const ComputeBufferCacheKey& key) {
         const auto found = buffer_cache.find(key);
-        if (found != buffer_cache.end()) found->second.content_valid = false;
+        if (found != buffer_cache.end()) {
+            found->second.content_valid = false;
+            found->second.write_watch_stable_validations = 0;
+        }
     }
 
     bool cached_buffer_result_buffer(const ComputeBufferCacheKey& key, VkDeviceSize bytes,
@@ -2234,32 +2317,45 @@ struct VulkanComputeContext {
     }
 
     bool retain_cached_buffer_result(const ComputeBufferCacheKey& key,
-                                     const uint8_t* result) {
+                                     const uint8_t* result, ComputeBufferTiming& timing) {
+        ComputeBufferCostScope cost(timing.enabled, timing.baseline_ms);
+        timing.baseline = "disabled";
         if (!persistent_compute_buffer_result_enabled(key.bytes)) return false;
+        timing.baseline = "invalid";
         if (!result || !key.bytes || (key.bytes & 15u)) return false;
         auto found = buffer_cache.find(key);
-        if (found == buffer_cache.end() || found->second.result_buffer) return false;
+        timing.baseline = "missing-entry";
+        if (found == buffer_cache.end()) return false;
+        timing.baseline = "already-present";
+        if (found->second.result_buffer) return false;
 
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = key.bytes;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         VkBuffer buffer = VK_NULL_HANDLE;
+        timing.baseline = "create-failed";
         if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device, buffer, &requirements);
-        if (!make_buffer_cache_room(requirements.size)) {
+        // Baselines use spare residency only. Evicting another primary (or cycling its baseline)
+        // here can turn a fitting primary working set into a miss and full-copy loop.
+        const VkDeviceSize limit = persistent_compute_buffer_limit();
+        if (requirements.size > limit || buffer_cache_bytes > limit - requirements.size) {
+            timing.baseline = "budget";
             vkDestroyBuffer(device, buffer, nullptr);
             return false;
         }
         const uint32_t memory_type = host_memory_type(requirements.memoryTypeBits);
         VkDeviceMemory memory = allocate_memory(requirements.size, memory_type, true);
         if (!memory || vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+            timing.baseline = "memory-failed";
             if (memory) release_memory(memory);
             vkDestroyBuffer(device, buffer, nullptr);
             return false;
         }
         void* mapped = nullptr;
         if (map_memory(memory, 0, key.bytes, &mapped) != VK_SUCCESS) {
+            timing.baseline = "map-failed";
             release_memory(memory);
             vkDestroyBuffer(device, buffer, nullptr);
             return false;
@@ -2267,10 +2363,10 @@ struct VulkanComputeContext {
         copy_compute_buffer(mapped, result, key.bytes);
         unmap_memory(memory);
 
-        // make_buffer_cache_room can evict other entries, so reacquire the pinned current entry
-        // before publishing ownership of the allocation.
+        // Publish ownership only after the optional allocation and seed copy succeeded.
         found = buffer_cache.find(key);
         if (found == buffer_cache.end() || found->second.result_buffer) {
+            timing.baseline = found == buffer_cache.end() ? "missing-entry" : "already-present";
             release_memory(memory);
             vkDestroyBuffer(device, buffer, nullptr);
             return false;
@@ -2278,8 +2374,10 @@ struct VulkanComputeContext {
         found->second.result_buffer = buffer;
         found->second.result_memory = memory;
         found->second.result_bytes = key.bytes;
+        found->second.result_allocation_bytes = requirements.size;
         found->second.allocation_bytes += requirements.size;
         buffer_cache_bytes += requirements.size;
+        timing.baseline = "created";
         return true;
     }
 
@@ -3260,6 +3358,7 @@ struct BoundBuffer {
     bool gpu_result_unchanged = false;
     uint32_t dirty_watch_chunks = 0;
     uint32_t total_watch_chunks = 0;
+    ComputeBufferTiming timing;
     ComputeBufferCacheKey cache_key{};
     std::vector<uint8_t> linear_seed;    // detiled upload for an atomic-image buffer
     uint64_t before_hash = 0, after_hash = 0;
@@ -5827,6 +5926,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr;
     const bool image_timing_requested =
         std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr;
+    const bool buffer_timing_requested =
+        std::getenv("PROSPER_COMPUTE_BUFFER_TIMING") != nullptr;
     const bool timing_capture_only =
         std::getenv("PROSPER_COMPUTE_TIMING_CAPTURE_ONLY") != nullptr;
     // Preserve the cheap timing address pre-filter. The transfer gate census deliberately hashes
@@ -5841,12 +5942,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const bool authority_requested = authority_census.requested();
     const bool timing_address_matches = time_compute_address_matches(item);
     if (transfer_gate_requested || authority_requested ||
-        ((phase_timing_requested || image_timing_requested) && timing_address_matches)) {
+        ((phase_timing_requested || image_timing_requested || buffer_timing_requested) &&
+         timing_address_matches)) {
         timing_program_hash = gpu_capture_hash(
             reinterpret_cast<const uint8_t*>(spirv.data()),
             spirv.size() * sizeof(uint32_t));
     }
-    if ((phase_timing_requested || image_timing_requested) && timing_address_matches) {
+    if ((phase_timing_requested || image_timing_requested || buffer_timing_requested) &&
+        timing_address_matches) {
         timing_item_selected =
             runtime_compute_timing_selector().matches(item, timing_program_hash);
     }
@@ -5864,6 +5967,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::getenv("PROSPER_COMPUTE_TIMING_TRACE_ONLY") != nullptr;
     const bool phase_timing =
         phase_timing_requested && timing_item_selected &&
+        (!timing_capture_only || perf_capture_timing) &&
+        (!timing_trace_only || trace);
+    const bool buffer_timing =
+        buffer_timing_requested && timing_item_selected &&
         (!timing_capture_only || perf_capture_timing) &&
         (!timing_trace_only || trace);
     // Keep timing selection and the transfer/authority censuses above this return so investigations
@@ -5980,8 +6087,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     if (buffer_resources.size() != buffer_plan.total_descriptor_count) return decline("buffer-descriptor-count-mismatch");
 
     std::vector<BoundBuffer> buffers(buffer_plan.total_descriptor_count);
-    for (size_t i = 0; i < buffers.size(); ++i)
+    for (size_t i = 0; i < buffers.size(); ++i) {
         buffers[i].descriptor_index = buffer_descriptor_indices[i];
+        buffers[i].timing.enabled = buffer_timing;
+    }
     std::vector<BoundImage> images(image_descriptors.size());
     // #3157: this dispatch's guest seed sources and writeback targets, collected only when the
     // alias census is armed so a default run pays nothing.
@@ -6229,7 +6338,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 buffers[buffers[i].alias_of].writable |= buffers[i].writable;
                 break;
             }
+            buffers[i].timing.owner_resolved = true;
             if (buffers[i].alias_of == SIZE_MAX) {
+                auto& timing = buffers[i].timing;
+                ComputeBufferCostScope setup_cost(timing.enabled, timing.setup_ms);
                 // #3195: one call, not a ternary. `guest_bytes` already holds the extent each
                 // path needs -- the PHYSICAL padded footprint for an atomic image (assigned
                 // above), the materialization's logical size otherwise -- so both arms of the
@@ -6337,10 +6449,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     compute_buffer_materialization_discriminator(materialization)};
                 const bool cache_candidate = !buffers[i].atomic_image &&
                     persistent_compute_buffer_enabled(static_cast<uint32_t>(buffers[i].bytes));
+                timing.cache = "ineligible";
                 if (cache_candidate && ctx.acquire_cached_buffer(
                         buffers[i].cache_key, source, buffers[i].buffer, buffers[i].memory,
                         buffers[i].upload_skipped, buffers[i].dirty_watch_chunks,
-                        buffers[i].total_watch_chunks)) {
+                        buffers[i].total_watch_chunks, timing)) {
                     buffers[i].persistent = true;
                 } else {
                     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -6372,14 +6485,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                "buffer-bind"))
                         break;
                     void* mapped = nullptr;
-                    if (!vk_ok(ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped),
-                               "buffer-map"))
+                    VkResult map_result;
+                    {
+                        ComputeBufferCostScope cost(timing.enabled, timing.upload_map_ms);
+                        map_result = ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped);
+                    }
+                    if (!vk_ok(map_result, "buffer-map"))
                         break;
                     // Pooled host-visible allocations retain their previous contents. Compare them
                     // with current guest memory before uploading: any mutation takes the exact copy.
-                    if (!compute_buffers_equal(mapped, source, buffers[i].bytes))
+                    bool equal;
+                    timing.validation = "pooled-full";
+                    {
+                        ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
+                        equal = compute_buffers_equal(mapped, source, buffers[i].bytes);
+                    }
+                    timing.compared_bytes += buffers[i].bytes;
+                    if (!equal) {
+                        ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
                         copy_compute_buffer(mapped, source, buffers[i].bytes);
-                    ctx.unmap_memory(buffers[i].memory);
+                        timing.uploaded_bytes += buffers[i].bytes;
+                    }
+                    {
+                        ComputeBufferCostScope cost(timing.enabled, timing.upload_map_ms);
+                        ctx.unmap_memory(buffers[i].memory);
+                    }
                     if (cache_candidate && ctx.retain_buffer(
                             buffers[i].cache_key, buffers[i].buffer, buffers[i].memory,
                             requirements.size))
@@ -6396,11 +6526,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
 
         }
-        for (BoundBuffer& buffer : buffers)
+        for (BoundBuffer& buffer : buffers) {
             if (buffer.alias_of == SIZE_MAX && buffer.persistent && buffer.writable &&
                 !buffer.result_baseline)
                 ctx.cached_buffer_result_buffer(
                     buffer.cache_key, buffer.resource->size, buffer.result_baseline);
+            if (buffer.result_baseline) buffer.timing.baseline = "present";
+        }
         bool buffers_ready = true;
         for (const auto& buffer : buffers) buffers_ready &= buffer.resource && buffer.memory;
         if (!buffers_ready) {
@@ -9259,12 +9391,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         };
         std::vector<CompareTarget> compare_targets;
         for (BoundBuffer& buffer : buffers) {
+            buffer.timing.gpu_compare = "ineligible";
             if (buffer.alias_of == SIZE_MAX && buffer.writable && buffer.persistent &&
                 buffer.upload_skipped && buffer.result_baseline && buffer.resource->size &&
-                !(buffer.resource->size & 15u))
+                !(buffer.resource->size & 15u)) {
+                buffer.timing.gpu_compare = "eligible";
                 compare_targets.push_back({
                     buffer.buffer, buffer.result_baseline, buffer.resource->size,
                     VK_ACCESS_SHADER_WRITE_BIT, &buffer, nullptr});
+            }
         }
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
@@ -9346,7 +9481,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                         write.pBufferInfo = &infos[j][binding];
                     }
-                    if (target.buffer) target.buffer->compare_flag_index = j;
+                    if (target.buffer) {
+                        target.buffer->compare_flag_index = j;
+                        target.buffer->timing.gpu_compare = "prepared";
+                    }
                     if (target.image) target.image->compare_flag_index = j;
                 }
                 vkUpdateDescriptorSets(
@@ -9356,7 +9494,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (!compare_ready) {
             for (CompareTarget& target : compare_targets) {
-                if (target.buffer) target.buffer->compare_flag_index = SIZE_MAX;
+                if (target.buffer) {
+                    target.buffer->compare_flag_index = SIZE_MAX;
+                    target.buffer->timing.gpu_compare = "setup-failed";
+                }
                 if (target.image) target.image->compare_flag_index = SIZE_MAX;
             }
             compare_targets.clear();
@@ -9891,6 +10032,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // writes and image transfer writes become comparator reads; one atomic flag per target then
         // becomes a four-byte host read after the fence.
         if (!compare_targets.empty()) {
+            for (auto& target : compare_targets)
+                if (target.buffer) target.buffer->timing.gpu_compare = "recorded";
             vkCmdFillBuffer(command, compare_flags, 0,
                             compare_targets.size() * ctx.compare_flag_stride(), 0);
             std::vector<VkBufferMemoryBarrier> before_compare;
@@ -10227,6 +10370,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!compare_targets.empty()) {
             void* mapped = nullptr;
             const VkDeviceSize flag_stride = ctx.compare_flag_stride();
+            for (auto& target : compare_targets)
+                if (target.buffer) target.buffer->timing.gpu_compare = "no-result";
             if (ctx.map_memory(compare_flags_memory, 0,
                                compare_targets.size() * flag_stride, &mapped) == VK_SUCCESS) {
                 // Step by the DESCRIPTOR stride, not by sizeof(uint32_t). Indexing a uint32_t* by
@@ -10237,7 +10382,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     CompareTarget& target = compare_targets[j];
                     uint32_t changed = 0;
                     std::memcpy(&changed, flag_bytes + j * flag_stride, sizeof(changed));
-                    if (target.buffer) target.buffer->gpu_result_unchanged = changed == 0;
+                    if (target.buffer) {
+                        target.buffer->gpu_result_unchanged = changed == 0;
+                        target.buffer->timing.gpu_compare = changed ? "changed" : "unchanged";
+                    }
                     if (target.image) target.image->gpu_result_unchanged = changed == 0;
                 }
                 ctx.unmap_memory(compare_flags_memory);
@@ -10292,12 +10440,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         const auto writeback_buffers_start = ComputeClock::now();
         bool readback_ok = true;
         for (auto& buffer : buffers) {
-            if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
+            if (buffer.alias_of != SIZE_MAX) continue;
+            auto& timing = buffer.timing;
+            if (!buffer.writable) {
+                timing.writeback = "readonly";
+                continue;
+            }
+            ComputeBufferCostScope writeback_cost(timing.enabled, timing.writeback_ms);
             // The exact GPU comparator saw the same bytes as the retained baseline, while source
             // validation independently proved that the guest mirror still contains that baseline.
             // Preserve architectural write notification, but avoid mapping and scanning the whole
             // host-visible buffer merely to rediscover equality.
             if (buffer.gpu_result_unchanged) {
+                timing.writeback = "gpu-unchanged";
                 g_buffer_gpu_result_skips.fetch_add(1, std::memory_order_relaxed);
                 if (trace)
                     std::fprintf(stderr,
@@ -10306,20 +10461,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  buffer.resource->binding,
                                  (unsigned long long)buffer.resource->gpu_addr,
                                  buffer.resource->size);
-                if (buffer.resource->gpu_addr)
+                if (buffer.resource->gpu_addr) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                     notify_guest_gpu_write_preserving_bytes(
                         buffer.resource->gpu_addr, buffer.resource->size);
-                if (buffer.persistent)
-                    ctx.validate_cached_buffer_source(buffer.cache_key);
-                if (!buffer.resource->host_data && writer_provenance_enabled())
+                }
+                if (buffer.persistent) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.source_validation_ms);
+                    ctx.validate_cached_buffer_source(
+                        buffer.cache_key, ComputeBufferSourceProof::PublishedUnchanged);
+                }
+                if (!buffer.resource->host_data && writer_provenance_enabled()) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.provenance_ms);
                     record_guest_write(GuestWriterKind::ComputeBuffer,
                                        buffer.resource->gpu_addr, buffer.resource->size,
                                        item.submit_no, item.dispatch_index,
                                        item.command_order, item.code_addr);
+                }
                 continue;
             }
             void* mapped = nullptr;
-            if (ctx.map_memory(buffer.memory, 0, buffer.bytes, &mapped) != VK_SUCCESS) {
+            VkResult map_result;
+            {
+                ComputeBufferCostScope cost(timing.enabled, timing.result_map_ms);
+                map_result = ctx.map_memory(buffer.memory, 0, buffer.bytes, &mapped);
+            }
+            if (map_result != VK_SUCCESS) {
+                timing.writeback = "map-failed";
                 readback_ok = false;
                 break;
             }
@@ -10328,47 +10496,64 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             uint8_t* destination = resource_bytes_for(buffer.resource, buffer.guest_bytes);
             const auto* result = static_cast<const uint8_t*>(mapped);
             if (buffer.atomic_image) {
+                timing.writeback = "atomic";
                 if (trace) {
                     buffer.after_hash = fnv1a(result, buffer.bytes);
                     for (size_t i = 0; i < buffer.bytes; ++i)
                         buffer.changed_bytes += buffer.linear_seed[i] != result[i];
                 }
-                if (!buffer.resource->host_data && buffer.resource->gpu_addr)
+                if (!buffer.resource->host_data && buffer.resource->gpu_addr) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.result_watch_ms);
                     prosper::host::guest_write_watch_notify_host_write(
                         buffer.resource->gpu_addr, buffer.guest_bytes);
+                }
                 // #2265: mirror of the upload -- per-layer 2D retile at the physical slice stride.
                 const size_t layer_linear_bytes =
                     static_cast<size_t>(buffer.resource->width) * buffer.resource->height * 4u;
-                for (uint32_t layer = 0; layer < buffer.atomic_layers; ++layer) {
-                    uint8_t* dst = destination + layer * buffer.atomic_slice_bytes;
-                    const uint8_t* src = result + layer * layer_linear_bytes;
-                    if (buffer.resource->tile_mode) {
-                        tile_surface(dst, src, buffer.resource->width, buffer.resource->height,
-                                     buffer.resource->tile_mode, 0, sizeof(uint32_t));
-                    } else {
-                        const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
-                        const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
-                            ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
-                        for (uint32_t y = 0; y < buffer.resource->height; ++y)
-                            std::memcpy(dst + y * destination_pitch,
-                                        src + y * tight_pitch, tight_pitch);
+                {
+                    ComputeBufferCostScope cost(timing.enabled, timing.guest_layout_ms);
+                    for (uint32_t layer = 0; layer < buffer.atomic_layers; ++layer) {
+                        uint8_t* dst = destination + layer * buffer.atomic_slice_bytes;
+                        const uint8_t* src = result + layer * layer_linear_bytes;
+                        if (buffer.resource->tile_mode) {
+                            tile_surface(dst, src, buffer.resource->width, buffer.resource->height,
+                                         buffer.resource->tile_mode, 0, sizeof(uint32_t));
+                        } else {
+                            const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
+                            const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
+                                ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
+                            for (uint32_t y = 0; y < buffer.resource->height; ++y)
+                                std::memcpy(dst + y * destination_pitch,
+                                            src + y * tight_pitch, tight_pitch);
+                        }
                     }
                 }
-                ctx.unmap_memory(buffer.memory);
+                {
+                    ComputeBufferCostScope cost(timing.enabled, timing.result_map_ms);
+                    ctx.unmap_memory(buffer.memory);
+                }
                 if (buffer.resource->gpu_addr) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                     set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
                     notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
                     set_guest_gpu_write_origin(nullptr);
                 }
-                if (!buffer.resource->host_data && writer_provenance_enabled())
+                if (!buffer.resource->host_data && writer_provenance_enabled()) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.provenance_ms);
                     record_guest_write(GuestWriterKind::ComputeBuffer,
                                        buffer.resource->gpu_addr, buffer.guest_bytes,
                                        item.submit_no, item.dispatch_index,
                                        item.command_order, item.code_addr);
+                }
                 continue;
             }
-            const bool changed = !compute_buffers_equal(
-                destination, result, buffer.bytes);
+            bool changed;
+            {
+                ComputeBufferCostScope cost(timing.enabled, timing.result_compare_ms);
+                changed = !compute_buffers_equal(destination, result, buffer.bytes);
+            }
+            timing.result_compared_bytes = buffer.bytes;
+            timing.writeback = changed ? "changed" : "unchanged";
             if (trace) {
                 buffer.after_hash = fnv1a(result, buffer.bytes);
                 for (size_t i = 0; i < buffer.bytes; i++)
@@ -10441,21 +10626,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // invalidation and writer provenance remain unconditional: renderer-resident state can
             // differ from guest RAM even when consecutive compute readbacks contain identical bytes.
             if (changed) {
-                if (!buffer.resource->host_data && buffer.resource->gpu_addr)
+                if (!buffer.resource->host_data && buffer.resource->gpu_addr) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.result_watch_ms);
                     prosper::host::guest_write_watch_notify_host_write(
                         buffer.resource->gpu_addr, buffer.resource->size);
-                copy_compute_buffer(destination, result, buffer.bytes);
+                }
+                {
+                    ComputeBufferCostScope cost(timing.enabled, timing.guest_copy_ms);
+                    copy_compute_buffer(destination, result, buffer.bytes);
+                }
+                timing.guest_copied_bytes = buffer.bytes;
             }
             if (buffer.persistent && !buffer.result_baseline &&
-                ctx.retain_cached_buffer_result(buffer.cache_key, result) && trace)
+                ctx.retain_cached_buffer_result(buffer.cache_key, result, timing) && trace)
                 std::fprintf(stderr,
                              "[compute]   retained exact GPU buffer result baseline binding=%u "
                              "addr=0x%llx bytes=%u\n",
                              buffer.resource->binding,
                              (unsigned long long)buffer.resource->gpu_addr,
                              buffer.resource->size);
-            ctx.unmap_memory(buffer.memory);
+            {
+                ComputeBufferCostScope cost(timing.enabled, timing.result_map_ms);
+                ctx.unmap_memory(buffer.memory);
+            }
             if (buffer.resource->gpu_addr) {
+                ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                 if (changed) {
                     set_guest_gpu_write_origin("compute-writeback(buffer-full)");
                     notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
@@ -10465,13 +10660,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         buffer.resource->gpu_addr, buffer.resource->size);
                 }
             }
-            if (buffer.persistent)
-                ctx.validate_cached_buffer_source(buffer.cache_key);
-            if (!buffer.resource->host_data && writer_provenance_enabled())
+            if (buffer.persistent) {
+                ComputeBufferCostScope cost(timing.enabled, timing.source_validation_ms);
+                ctx.validate_cached_buffer_source(buffer.cache_key, changed
+                    ? ComputeBufferSourceProof::Changed
+                    : ComputeBufferSourceProof::PublishedUnchanged);
+            }
+            if (!buffer.resource->host_data && writer_provenance_enabled()) {
+                ComputeBufferCostScope cost(timing.enabled, timing.provenance_ms);
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    buffer.resource->gpu_addr, buffer.resource->size,
                                    item.submit_no, item.dispatch_index,
                                    item.command_order, item.code_addr);
+            }
         }
         writeback_buffers_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_buffers_start).count();
@@ -11252,6 +11453,67 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      pack_ms, layout_ms, image_notify_ms, image_cache_ms,
                      phase_milliseconds(phase_writeback, phase_cleanup),
                      phase_milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
+    }
+    // Emit only after timers/cleanup. Resource descriptions belong to buffer_resources, whose
+    // lifetime covers this report even though cleanup has released the device allocations.
+    if (buffer_timing) {
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            const auto& buffer = buffers[i];
+            if (buffer.alias_of != SIZE_MAX) continue;
+            const auto& t = buffer.timing;
+            const auto& r = buffer_resources[i];
+            const auto cached = ctx.buffer_cache.find(buffer.cache_key);
+            const VkDeviceSize result_charge = cached == ctx.buffer_cache.end()
+                ? 0 : cached->second.result_allocation_bytes;
+            const VkDeviceSize primary_charge = cached == ctx.buffer_cache.end()
+                ? 0 : cached->second.allocation_bytes - result_charge;
+            size_t aliases = 0;
+            std::string bindings = std::to_string(r.binding);
+            for (const auto& other : buffers) {
+                if (other.alias_of != i) continue;
+                ++aliases;
+                bindings += "," + std::to_string(other.resource->binding);
+            }
+            std::fprintf(stderr,
+                "[compute-buffer-timing] submit=%llu dispatch=%llu order=%llu "
+                "code=0x%llx hash=0x%016llx ok=%u owner=%u owner-index=%zu "
+                "owner-resolved=%u aliases=%zu bindings=%s addr=0x%llx host-backed=%u "
+                "host-key=0x%llx semantic=%u logical-bytes=%u bytes=%zu guest-bytes=%zu "
+                "writable=%u atomic=%u "
+                "persistent=%u upload-skipped=%u dirty-watch-chunks=%u total-watch-chunks=%u "
+                "cache-bytes=%llu cache-limit=%llu primary-allocation-bytes=%llu "
+                "result-allocation-bytes=%llu "
+                "cache=%s validation=%s baseline=%s gpu-compare=%s writeback=%s "
+                "compared-bytes=%llu uploaded-bytes=%llu result-compared-bytes=%llu "
+                "guest-copied-bytes=%llu setup_ms=%.6f validation_ms=%.6f "
+                "upload_compare_ms=%.6f upload_copy_ms=%.6f upload_map_ms=%.6f "
+                "upload_watch_ms=%.6f writeback_ms=%.6f result_compare_ms=%.6f "
+                "guest_copy_ms=%.6f guest_layout_ms=%.6f result_map_ms=%.6f result_watch_ms=%.6f "
+                "baseline_ms=%.6f notify_ms=%.6f source_validation_ms=%.6f provenance_ms=%.6f\n",
+                (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
+                (unsigned long long)timing_program_hash, ok ? 1u : 0u, r.binding, i,
+                t.owner_resolved ? 1u : 0u, aliases, bindings.c_str(),
+                (unsigned long long)r.gpu_addr,
+                r.host_data && r.host_data_size >= buffer.guest_bytes ? 1u : 0u,
+                (unsigned long long)buffer.cache_key.host_data,
+                static_cast<unsigned>(buffer.cache_key.materialization.semantic),
+                r.size, buffer.bytes, buffer.guest_bytes,
+                buffer.writable ? 1u : 0u, buffer.atomic_image ? 1u : 0u,
+                buffer.persistent ? 1u : 0u, buffer.upload_skipped ? 1u : 0u,
+                buffer.dirty_watch_chunks, buffer.total_watch_chunks,
+                (unsigned long long)ctx.buffer_cache_bytes,
+                (unsigned long long)persistent_compute_buffer_limit(),
+                (unsigned long long)primary_charge, (unsigned long long)result_charge,
+                t.cache, t.validation, t.baseline, t.gpu_compare, t.writeback,
+                (unsigned long long)t.compared_bytes, (unsigned long long)t.uploaded_bytes,
+                (unsigned long long)t.result_compared_bytes,
+                (unsigned long long)t.guest_copied_bytes,
+                t.setup_ms, t.validation_ms, t.upload_compare_ms, t.upload_copy_ms,
+                t.upload_map_ms, t.upload_watch_ms, t.writeback_ms, t.result_compare_ms,
+                t.guest_copy_ms, t.guest_layout_ms, t.result_map_ms, t.result_watch_ms,
+                t.baseline_ms, t.notify_ms, t.source_validation_ms, t.provenance_ms);
+        }
     }
     return ok;
 }
