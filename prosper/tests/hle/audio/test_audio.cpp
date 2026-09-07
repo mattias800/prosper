@@ -501,9 +501,57 @@ static void test_bed_routing_matrix() {
     audio_reset();
 }
 
-int main() {
+// Separate-process diagnostic control: same-port replacement and publication after consumption.
+// The Python driver verifies the actual FLOW log, including its nonzero replacement arm.
+static int test_flow_publication() {
+    audio_reset();
+    CapturingSink sink;
+    audio_set_sink(&sink);
+    uint8_t context_param[0x40]{};
+    CHECK(call("sceAudioOut2ContextResetParam", PTR(context_param)) == 0);
+    *(uint32_t*)(context_param + 0x10) = 64;
+    uint64_t context = 0, port = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(context_param), 0, 0, PTR(&context)) == 0);
+    struct PortParam {
+        uint16_t type, pad;
+        uint32_t format, rate, flags;
+        uint64_t user;
+        uint32_t reserved[10];
+    } param{};
+    param.format = 0x200;
+    param.rate = 48000;
+    CHECK(call("sceAudioOut2PortCreate", context, PTR(&param), PTR(&port)) == 0);
+    CHECK(call("sceAudioOut2ContextAdvance", context) == 0); // anchor the report interval
+    std::this_thread::sleep_for(std::chrono::milliseconds(1010));
+    std::vector<float> pcm(128, 0.25f);
+    uint64_t pointer = PTR(pcm.data());
+    struct Attribute { uint32_t id, reserved; uint64_t value, size; } attr{
+        0, 0, PTR(&pointer), sizeof(pointer)};
+    CHECK(call("sceAudioOut2PortSetAttributes", port, PTR(&attr), 1) == 0);
+    std::fill(pcm.begin(), pcm.end(), 0.5f);
+    CHECK(call("sceAudioOut2PortSetAttributes", port, PTR(&attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", context, 1) == 0);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) CHECK(std::memcmp(sink.outs.back().pcm.data(), pcm.data(), 512) == 0);
+    // The first pending grain was consumed, so this publication must not count as replacement.
+    std::fill(pcm.begin(), pcm.end(), 0.75f);
+    CHECK(call("sceAudioOut2PortSetAttributes", port, PTR(&attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", context, 1) == 0);
+    CHECK(sink.outs.size() == 2);
+    if (sink.outs.size() == 2) CHECK(std::memcmp(sink.outs.back().pcm.data(), pcm.data(), 512) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1010));
+    CHECK(call("sceAudioOut2ContextAdvance", context) == 0);
+    CHECK(call("sceAudioOut2PortDestroy", port) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", context) == 0);
+    audio_reset();
+    return fails ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
     printf("== test_audio ==\n");
     register_builtin_hle();
+    if (argc == 2 && std::strcmp(argv[1], "--flow-publication") == 0)
+        return test_flow_publication();
     test_signal_stats();
     test_stereo_downmix();
     test_stamped_grain_verdicts();

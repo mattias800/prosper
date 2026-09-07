@@ -315,15 +315,17 @@ The complete manual PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
 
 ### Guest time during synchronous GPU work
 
-Prosper currently realizes and executes an AGC submit synchronously on the guest submitter. The
-guest monotonic clock discounts host GPU time beyond the refresh interval represented by that
-submit's completed VideoOut flips. This keeps shader compilation, resource conversion, execution,
-and readback stalls from becoming multi-second frame deltas that skip time-based guest states. Wall
-clock/RTC surfaces remain tied to host time, and monotonic time continues normally outside the
-backend scope, including while media or wait loops prepare the next frame. This is intentionally
-narrower than the opt-in `PROSPER_DET_CLOCK`, which holds monotonic time between every pair of flips.
+Guest process-time counters, TSC and monotonic clocks advance on one real steady timeline,
+including during synchronous shader compilation, resource conversion and GPU waits. GPU EOP
+timestamps use that same timeline. Slowing it globally starved Sonic's clock-paced PCM producer
+while the host audio device continued consuming samples in real time (#3422).
 
-Set `PROSPER_NO_GPU_TIME_COMPENSATION=1` only for a diagnostic A/B against the old behavior.
+The internal PM4 dependency watchdog uses a separate progress clock that discounts excess host
+backend time. A synchronous submit holds the queue mutex, so its queued producer cannot satisfy
+a dependency during that interval; charging it to the watchdog can force a healthy barrier through.
+This compensation never changes guest-visible timestamps. `PROSPER_NO_GPU_TIME_COMPENSATION=1`
+disables only that internal compensation and is a diagnostic control, not an audio setting.
+Explicit `PROSPER_DET_CLOCK` still selects the separate flip-paced diagnostic guest clock.
 
 ### Live renderer performance diagnostics
 

@@ -575,7 +575,7 @@ void a2_dump(const char* tag, uint64_t p, size_t n) {
 void a2_log(const char* name, uint64_t a0, uint64_t a1, uint64_t a2,
             uint64_t a3, uint64_t a4, uint64_t a5, void* ra) {
     if (!audio2log()) return;
-    fprintf(stderr, "[audio2] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) ra=eboot+0x%llx\n",
+    fprintf(stderr, "[audio2] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) ra=%s+0x%llx\n",
             name, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
             (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5,
             prosper::guest_module_name((uint64_t)ra),
@@ -684,6 +684,7 @@ using FlowSignal = AudioSignalStats;
 
 struct FlowPort {
     uint64_t reads = 0, mixed = 0, frames = 0, bytes = 0;
+    uint64_t publications = 0, replacements = 0;
     uint64_t no_pcm = 0, no_grain = 0, skip_fmt = 0, skip_not_main = 0, short_read = 0;
     uint16_t type = 0;
     uint32_t data_format = 0;
@@ -800,7 +801,7 @@ void audio_flow_report(uint32_t slot) {
         fprintf(stderr,
                 "[audio-flow]   port%u type=0x%x fmt=0x%x reads=%llu mixed=%llu frames=%llu bytes=%llu"
                 " peak=%.5f rms=%.5f nonzero=%llu/%llu nan=%llu no-pcm=%llu skip-fmt=%llu"
-                " skip-not-main=%llu short=%llu no-grain=%llu"
+                " skip-not-main=%llu short=%llu no-grain=%llu published=%llu replaced-pending=%llu"
                 " | LIFE: nonzero=%llu/%llu peak=%.5f rms=%.5f nan=%llu\n",
                 i + 1, p.type, p.data_format, (unsigned long long)p.reads,
                 (unsigned long long)p.mixed, (unsigned long long)p.frames,
@@ -810,11 +811,13 @@ void audio_flow_report(uint32_t slot) {
                 (unsigned long long)p.no_pcm, (unsigned long long)p.skip_fmt,
                 (unsigned long long)p.skip_not_main, (unsigned long long)p.short_read,
                 (unsigned long long)p.no_grain,
+                (unsigned long long)p.publications, (unsigned long long)p.replacements,
                 (unsigned long long)p.life.nonzero, (unsigned long long)p.life.samples,
                 p.life.peak, p.life.rms(), (unsigned long long)p.life_nan);
         // Per-interval counters: reset so each line describes the LAST second, not the whole run.
         // The `life:` totals above are deliberately NOT reset.
         p.reads = p.mixed = p.frames = p.bytes = 0;
+        p.publications = p.replacements = 0;
         p.no_pcm = p.no_grain = p.skip_fmt = p.skip_not_main = p.short_read = p.nan_samples = 0;
         p.seen = false;
         p.sig.reset();
@@ -1889,6 +1892,18 @@ HLE(audio2_port_set_attr) {
         if (at.id == 0 && at.vsize == 8) {
             uint64_t pcm = 0;
             if (audio_read_bytes(at.vptr, &pcm, 8)) {
+                if (audio_flow()) {
+                    uint32_t context_slot = 0;
+                    if (audio2_context_locked(port->context, &context_slot)) {
+                        std::lock_guard<std::mutex> flk(g_flow_mx);
+                        FlowPort& fp = g_flow_port[port_slot];
+                        flow_tag_port(fp, context_slot, port->type, port->data_format);
+                        if (pcm) ++fp.publications;
+                        // Count replacement before changing pending state, including a null
+                        // publication discarding a grain. This is an observation, not a FIFO policy.
+                        if (port->pcm_pending) ++fp.replacements;
+                    }
+                }
                 port->pcm_ptr = pcm;
                 port->pcm_frames = 0;
                 port->pcm_pending = pcm != 0;

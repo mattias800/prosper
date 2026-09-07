@@ -56,16 +56,10 @@ namespace {
         return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count();
     }
 
-    // The live GPU backend is synchronous today: the guest submitter performs shader realization,
-    // Vulkan execution, and readback before its HLE call returns. On hardware that work runs on the
-    // GPU after a cheap CPU submission. Without compensation, a one-off host pipeline/resource
-    // warmup is incorrectly exposed as a giant guest frame delta and can skip entire animations.
-    //
-    // During a host-GPU scope, monotonic time advances only through the caller-supplied display
-    // budget, then holds. At scope exit the excess is permanently removed from process-time/TSC.
-    // Ordinary guest execution and all realtime/RTC surfaces keep advancing from the host clocks.
-    // This is deliberately narrower than PROSPER_DET_CLOCK: time-gated media and wait loops can
-    // continue between flips, so a title cannot deadlock waiting to produce its next frame.
+    // Internal GPU dependency-watchdog time excludes excess synchronous host backend work:
+    // while the submit mutex is held, a queued producer cannot make progress. This must NOT
+    // slow guest process-time/TSC/monotonic clocks. Audio producers use those clocks while the
+    // physical sink consumes samples in real time; global compensation starved Sonic's PCM (#3422).
     struct HostGpuClockState {
         std::mutex writer_mutex;
         std::atomic<uint64_t> sequence{0};
@@ -84,7 +78,7 @@ namespace {
     }
 
     uint64_t host_gpu_compensated_ns(uint64_t mono) {
-        // Process-time reads are hot and may come from many guest threads. Writers publish their
+        // Watchdog reads may come from concurrent queue users. Writers publish their
         // handful of atomic fields under a seqlock, giving readers one consistent snapshot without
         // serializing every clock query on the scope-management mutex.
         uint64_t total_excess;
@@ -146,7 +140,7 @@ namespace {
     uint64_t ns_now() {
         static const bool det = getenv("PROSPER_DET_CLOCK") != nullptr;
         uint64_t mono = real_ns();
-        if (!det) return host_gpu_compensated_ns(mono);
+        if (!det) return mono;
         uint64_t flip = prosper_vo_flip_count();
         std::lock_guard<std::mutex> lock(g_det_clock.mutex);
         if (!g_det_clock.anchored) {
@@ -186,6 +180,10 @@ namespace {
     // RTC epoch: SceRtcTick counts microseconds since 0001-01-01 00:00:00 UTC; the unix epoch is
     // 62135596800 s after it (the documented Orbis RTC convention, also shadPS4 UNIX_EPOCH_TICKS).
     constexpr uint64_t kRtcUnixEpochOffsetUs = 62135596800ull * 1000000ull;
+}
+
+uint64_t host_gpu_progress_ns() {
+    return host_gpu_compensated_ns(real_ns());
 }
 
 uint64_t guest_clock_host_gpu_begin(uint64_t budget_ns) {

@@ -1,6 +1,7 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
+#include "hle/kernel/hle_kernel_time.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/execute/mb3_freelist.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
@@ -3450,12 +3451,12 @@ uint64_t defer_now_ms() {
     // The submit path executes shader translation, pipeline creation, dispatches, and rendering
     // synchronously while holding the queue mutex. Real hardware performs that work after returning
     // from submit, so another guest submit cannot deliver a WAIT_REG_MEM producer during this host-
-    // only interval. The shared guest/GPU clock excludes excess HostGpuClockScope time; using raw
+    // only interval. The internal progress clock excludes excess HostGpuClockScope time; using raw
     // steady_clock here aged a healthy barrier past the liveness timeout while its producer was
     // prevented from entering the queue, then deliberately violated ordering as soon as rendering
     // returned (Plucky's first gameplay scene needed 1-2 s of first-use pipeline work). Keep the
-    // timeout on the emulated timeline where the guest and producer can actually make progress.
-    return prosper_guest_tsc_ns() / 1000000ull;
+    // timeout on that internal timeline. Guest clocks and EOP timestamps still advance in real time.
+    return prosper::host_gpu_progress_ns() / 1000000ull;
 }
 struct DeferItem {
     Pm4Command cmd;                    // barrier (WaitRegMem) or effect (ReleaseMem/EventWrite/WriteData/Flip)
