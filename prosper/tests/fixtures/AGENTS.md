@@ -8,7 +8,8 @@ definitions and no translation unit of its own.
 
 Two kinds live here and they are worth telling apart:
 
-- **Harnesses** — `render_runner.h`, `compute_runner.h`, `image_compute_runner.h`, `test_scratch.h`.
+- **Harnesses** — `render_runner.h`, `compute_runner.h`, `image_compute_runner.h`, `test_scratch.h`,
+  `mapped_staging.h` (renderer-owned persistent mappings).
   These *do* things: bring up a device, record commands, read pixels back.
 - **Fixtures proper** — `at9_testvec.h`, `handmade_prx.h`, `synth_prx.h`, `spirv_*.h`, `test_data.h`,
   `gta5_*_fixture.hpp`. These are data, frozen at a known-good state so an assertion has something
