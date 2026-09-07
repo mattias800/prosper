@@ -4,6 +4,7 @@
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -78,6 +79,28 @@ inline VkDeviceSize mapped_staging_limit() {
     return limit;
 }
 
+// Called with cache.mutex held. Opt-in diagnosis; the counts describe the state at
+// this decision, not a claim that an acquisition miss was caused by a budget limit.
+// cached_bytes counts idle requested bytes, excluding live blocks and allocation padding.
+inline void trace_mapped_staging_event(const MappedStagingCache& cache, const char* event,
+        const std::tuple<VkDevice, VkDeviceSize, uint32_t>& key, VkDeviceMemory memory) {
+    static const bool enabled = std::getenv("PROSPER_MAPPED_STAGING_LOG") != nullptr;
+    if (!enabled) return;
+    size_t live_same = 0;
+    for (const auto& entry : cache.in_use) live_same += entry.second == key;
+    const auto free = cache.free_blocks.find(key);
+    const size_t free_same = free == cache.free_blocks.end() ? 0 : free->second.size();
+    std::fprintf(stderr, "[mapped-staging] event=%s device=%p memory=0x%llx "
+        "bytes=%llu usage=0x%x cached_bytes=%llu limit_bytes=%llu "
+        "free_same=%zu live_same=%zu free_keys=%zu\n", event,
+        static_cast<void*>(std::get<0>(key)),
+        (unsigned long long)memory,
+        static_cast<unsigned long long>(std::get<1>(key)), std::get<2>(key),
+        static_cast<unsigned long long>(cache.cached_bytes),
+        static_cast<unsigned long long>(mapped_staging_limit()),
+        free_same, live_same, cache.free_blocks.size());
+}
+
 template <typename PickMemoryType>
 inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize bytes,
                                                  VkBufferUsageFlags usage,
@@ -97,8 +120,10 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
             cache.cached_bytes -= bytes;
             cache.in_use.emplace(block.memory, key);
             if (reused) *reused = true;
+            trace_mapped_staging_event(cache, "acquire-hit", key, block.memory);
             return block;                  // mapping intact: no fault-in on the next write
         }
+        trace_mapped_staging_event(cache, "acquire-miss", key, VK_NULL_HANDLE);
     }
 
     MappedStagingBlock block;
@@ -132,6 +157,7 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
     std::lock_guard<std::mutex> lock(cache.mutex);
     cache.in_use.emplace(block.memory, key);
     cache.owned.emplace(block.memory, key);
+    trace_mapped_staging_event(cache, "acquire-new", key, block.memory);
     return block;
 }
 
@@ -145,12 +171,17 @@ inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMem
     std::lock_guard<std::mutex> lock(cache.mutex);
     if (!cache.owned.count(memory)) return false;          // not ours: caller tears it down
     auto active = cache.in_use.find(memory);
-    if (active == cache.in_use.end()) { ++cache.double_releases; return true; }
+    if (active == cache.in_use.end()) {
+        ++cache.double_releases;
+        trace_mapped_staging_event(cache, "duplicate-release", cache.owned.at(memory), memory);
+        return true;
+    }
     const std::tuple<VkDevice, VkDeviceSize, uint32_t> key = active->second;
     if (std::get<0>(key) != device) {
         // Keep ownership for a later release through the correct device. Returning
         // false would invite the caller to free our allocation through the wrong one.
         ++cache.cross_device_skips;
+        trace_mapped_staging_event(cache, "wrong-device-release", key, memory);
         return true;
     }
     // Bisection seam: with this set the block is destroyed rather than retained, so acquire is
@@ -159,6 +190,8 @@ inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMem
     if (!allow_reuse || !mapped_staging_reuse_enabled()) {
         cache.owned.erase(memory);
         cache.in_use.erase(memory);
+        trace_mapped_staging_event(cache,
+            !allow_reuse ? "discard-caller-disabled" : "discard-pool-disabled", key, memory);
         vkUnmapMemory(device, memory);
         vkFreeMemory(device, memory, nullptr);
         vkDestroyBuffer(device, buffer, nullptr);
@@ -168,6 +201,7 @@ inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMem
     cache.in_use.erase(active);
     if (cache.cached_bytes + key_bytes > mapped_staging_limit()) {
         cache.owned.erase(memory);
+        trace_mapped_staging_event(cache, "discard-budget", key, memory);
         vkUnmapMemory(device, memory);
         vkFreeMemory(device, memory, nullptr);
         vkDestroyBuffer(device, buffer, nullptr);
@@ -175,6 +209,7 @@ inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMem
     }
     cache.free_blocks[key].push_back(MappedStagingBlock{buffer, memory, mapped, device});
     cache.cached_bytes += key_bytes;
+    trace_mapped_staging_event(cache, "retain", key, memory);
     return true;
 }
 
