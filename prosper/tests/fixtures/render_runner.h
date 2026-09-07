@@ -776,6 +776,13 @@ inline std::mutex& backend_persistent_resource_mutex() {
     return mutex;
 }
 
+// Separate from the whole-pass resource domain: saving must not wait on guest rendering or
+// fence waits. Lock order is resource domain -> driver cache; snapshots take only this lock.
+inline std::timed_mutex& graphics_driver_cache_mutex() {
+    static std::timed_mutex mutex;
+    return mutex;
+}
+
 inline std::atomic<int>& backend_persistent_resource_in_flight() {
     static std::atomic<int> in_flight{0};
     return in_flight;
@@ -1071,7 +1078,7 @@ struct RenderVkCtx {
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     // Driver compilation data, distinct from the map retaining prosper's VkPipeline handles.
-    // Retained with this process-lifetime device. All users hold BackendPersistentResourceGuard.
+    // Retained with this process-lifetime device. Access uses graphics_driver_cache_mutex().
     VkPipelineCache driver_pipeline_cache = VK_NULL_HANDLE;
     prosper::frontend::PipelineCacheFile driver_cache_file;
     size_t driver_cache_loaded_bytes = 0;
@@ -1669,16 +1676,18 @@ inline const RenderVkCtx& render_vk_ctx() {
 
 // Explicit snapshot for frontends that use _Exit. Do not initialize a renderer during shutdown
 // or wait for a guest holding its resource lock. The queue drain does not serialize compilation.
-inline bool flush_graphics_pipeline_cache() {
+// Bound lock acquisition if a driver compilation is still in flight during shutdown.
+inline bool flush_graphics_pipeline_cache(
+        std::chrono::milliseconds lock_budget = std::chrono::milliseconds(1000)) {
     const RenderVkCtx* context = published_render_cache_context().load(std::memory_order_acquire);
     if (!context || context->driver_cache_file.path.empty() || !context->driver_pipeline_cache)
         return false;
     try {
         std::vector<uint8_t> blob;
         {
-            std::unique_lock<std::mutex> lock(backend_persistent_resource_mutex(), std::try_to_lock);
-            if (!lock.owns_lock()) {
-                fprintf(stderr, "[render] disk pipeline cache save skipped: renderer busy\n");
+            std::unique_lock<std::timed_mutex> lock(graphics_driver_cache_mutex(), std::defer_lock);
+            if (!lock.try_lock_for(lock_budget)) {
+                fprintf(stderr, "[render] disk pipeline cache save skipped: compilation busy\n");
                 return false;
             }
             size_t bytes = 0;
@@ -8765,8 +8774,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fprintf(stderr, "[backend-trace] draw=%zu create-pipeline begin\n", di);
                 fflush(stderr);
             }
-            const VkResult pipeline_result = vkCreateGraphicsPipelines(
+            VkResult pipeline_result;
+            {
+                std::lock_guard<std::timed_mutex> cache_lock(graphics_driver_cache_mutex());
+                pipeline_result = vkCreateGraphicsPipelines(
                     dev, ctx.driver_pipeline_cache, 1, &gp, nullptr, &v.pipe);
+            }
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-pipeline end result=%d pipeline=%p\n",

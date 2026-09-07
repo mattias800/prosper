@@ -21,8 +21,9 @@ why loading remains opt-in, including on NVIDIA. No experimental Vulkan feature 
 
 `prosper-app` explicitly requests a snapshot before its deliberate `_Exit`. The initialized
 renderer context is published atomically and lives for the process lifetime. The snapshot uses
-the same mutex as graphics pipeline creation; a busy renderer skips the save rather than waiting
-for guest work. Queue draining alone does not serialize pipeline compilation. Disk I/O occurs
+a dedicated mutex shared with graphics pipeline creation, independent of the whole-pass resource
+lock. It waits up to one second to acquire that mutex; a compilation still holding it then skips
+the save. Queue draining alone does not serialize pipeline compilation. Disk I/O occurs
 after the snapshot releases the mutex. Guest-triggered abrupt exits may still bypass this path.
 
 Each writer reserves a unique sibling temporary directory, closes the complete file, then
@@ -34,7 +35,8 @@ The `pipeline_cache_file` test covers identity checks, concurrent writers and fa
 `graphics_cache_persistence` runs separate processes: render/save/`_Exit`, load/render, disabled
 loading, corrupted/truncated data and driver rejection with an empty-cache retry. It observes
 the actual Vulkan creation argument, so a cached file alone cannot make loading pass. It also
-checks that a held renderer mutex causes a save to skip. Both tests require Python for their
+checks that a held renderer mutex permits saving while a held compilation mutex prevents it.
+Both tests require Python for their
 temporary-directory/process orchestration; the Vulkan test additionally requires a device.
 
 Successful persistence proves cross-launch reuse is available. It does not establish that

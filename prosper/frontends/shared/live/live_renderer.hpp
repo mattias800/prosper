@@ -19,8 +19,9 @@
 
 namespace prosper::frontend {
 
-// Snapshot the initialized graphics driver cache before an _Exit frontend terminates. A busy
-// renderer skips the save; this never destroys resources or waits for guest compilation.
+// Snapshot the initialized graphics driver cache before an _Exit frontend terminates.
+// Waits up to one second to acquire the compilation lock; cache extraction and disk I/O
+// are not time-bounded. Never initializes a renderer or destroys resources.
 bool flush_live_graphics_pipeline_cache();
 
 // The decoded-texture identity map lives for one SUBMIT (#1691). A submit is cut into a new graphics
