@@ -572,7 +572,16 @@ descriptors, and their layout/content rules keep their existing per-call lifetim
 together with its CPU **mapping**, because dropping the mapping returns the pages and the next write
 faults all of them back in through amdgpu — ~30% of the frame on a 4K upload (#3405). Its budget is
 `PROSPER_MAPPED_STAGING_MB`, default **256 MiB**, accounted independently of the transient pool
-above, so peak retained host memory is the sum of the two rather than the pool figure alone.
+above. It counts idle requested bytes; active uploads and allocation padding are additional.
+When a completed upload needs space, the cache evicts its oldest idle blocks from the same live
+device. Pending uploads remain owned until completion. Per-acquisition identities prevent stale
+releases from freeing allocations that have since been evicted or reused. Oversized uploads and
+unreclaimable foreign-device occupancy are refused without evicting useful entries.
+`PROSPER_NO_MAPPED_STAGING_EVICTION=1` restores rejection when the budget is full for an A/B control.
+`PROSPER_MAPPED_STAGING_LOG=1` records acquire, retain, discard and eviction decisions with exact
+shape/usage, idle requested bytes and matching active/idle counts. Acquisition misses alone do not
+identify their cause: correlate them with release outcomes. Logging runs under the cache mutex and
+is intended for structural diagnosis, not timing comparisons.
 `PROSPER_NO_MAPPED_STAGING=1` disables reuse while leaving the allocation path identical — the
 A/B seam that isolates it — and `PROSPER_NO_MEMORY_POOL=1` disables this cache as well, so that
 flag still means "no staging is pooled" as it did before this cache existed.

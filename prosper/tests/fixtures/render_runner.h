@@ -6366,7 +6366,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
-        void* staging_mapped = nullptr;   // #3405: retained with the block, never unmapped here
+        void* staging_mapped = nullptr; // retained with the block, never unmapped here
+        uint64_t staging_lease = 0;
         std::shared_ptr<GpuDetileUpload> gpu_detile;
         uint64_t persistent_id = 0;
         uint64_t persistent_version = 0;
@@ -8007,6 +8008,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.staging = staged.buffer;
                                 upload.staging_memory = staged.memory;
                                 upload.staging_mapped = staged.mapped;
+                                upload.staging_lease = staged.lease;
                                 void* sp = staged.mapped;
                                 if (!sp) {
                                     // Never memcpy into a failed mapping. The old code ignored
@@ -10731,7 +10733,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // #3405: the cache owns its blocks and answers true even for a duplicate
                 // release, so the generic teardown can never free an allocation it still maps.
                 if (!release_mapped_staging(dev, upload.staging, upload.staging_memory,
-                                            upload.staging_mapped)) {
+                                            upload.staging_mapped, upload.staging_lease)) {
                     if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
                     if (upload.staging_memory)
                         release_transient_render_memory(dev, upload.staging_memory);
