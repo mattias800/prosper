@@ -85,6 +85,10 @@ extern "C" uint64_t prosper_vo_flip_count();
 
 namespace prosper::frontend {
 
+bool flush_live_graphics_pipeline_cache() {
+    return prosper::test::flush_graphics_pipeline_cache();
+}
+
 // Render-to-texture surface cache (#167): CB_COLOR0_BASE -> the RGBA pixels we last rendered into it.
 // The game renders its scene into a color target then samples that address as a texture in a later
 // composite pass. Guest memory at that address is never populated on our (CPU-read) side, so without

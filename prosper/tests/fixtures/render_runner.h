@@ -19,6 +19,7 @@
 #include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/device/vulkan_device_select.hpp"
+#include "shared/device/pipeline_cache_file.hpp"
 #include "shared/perf/performance_timing_gate.hpp"
 #include "shared/perf/performance_timing_policy.hpp"
 #include "shared/present/readback_policy.hpp"
@@ -775,6 +776,13 @@ inline std::mutex& backend_persistent_resource_mutex() {
     return mutex;
 }
 
+// Separate from the whole-pass resource domain: saving must not wait on guest rendering or
+// fence waits. Lock order is resource domain -> driver cache; snapshots take only this lock.
+inline std::timed_mutex& graphics_driver_cache_mutex() {
+    static std::timed_mutex mutex;
+    return mutex;
+}
+
 inline std::atomic<int>& backend_persistent_resource_in_flight() {
     static std::atomic<int> in_flight{0};
     return in_flight;
@@ -1070,8 +1078,10 @@ struct RenderVkCtx {
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     // Driver compilation data, distinct from the map retaining prosper's VkPipeline handles.
-    // Retained with this process-lifetime device. All users hold BackendPersistentResourceGuard.
+    // Retained with this process-lifetime device. Access uses graphics_driver_cache_mutex().
     VkPipelineCache driver_pipeline_cache = VK_NULL_HANDLE;
+    prosper::frontend::PipelineCacheFile driver_cache_file;
+    size_t driver_cache_loaded_bytes = 0;
     VkDeviceSize storage_buffer_alignment = 1;
     double timestamp_period_ns = 0.0;
     uint32_t timestamp_valid_bits = 0;
@@ -1113,6 +1123,10 @@ struct RenderVkCtx {
     VkQueue present_queue = VK_NULL_HANDLE; // dedicated 2nd queue when the family has >=2, else == queue
     bool present_queue_shared = false;      // present_queue aliases the render queue -> submits need a mutex
 };
+inline std::atomic<const RenderVkCtx*>& published_render_cache_context() {
+    static std::atomic<const RenderVkCtx*> context{nullptr};
+    return context;
+}
 inline const RenderVkCtx& render_vk_ctx() {
     static RenderVkCtx c = [] {
         RenderVkCtx r;
@@ -1517,8 +1531,30 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
         VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        const VkResult cache_result = vkCreatePipelineCache(
+        std::vector<uint8_t> initial_cache;
+        try {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(r.phys, &properties);
+            r.driver_cache_file = prosper::frontend::PipelineCacheFile::graphics(properties);
+            initial_cache = r.driver_cache_file.load();
+        } catch (const std::exception&) {
+            fprintf(stderr, "[render] disk pipeline cache unavailable; starting empty\n");
+        }
+        cache_info.initialDataSize = initial_cache.size();
+        cache_info.pInitialData = initial_cache.empty() ? nullptr : initial_cache.data();
+        VkResult cache_result = vkCreatePipelineCache(
             r.dev, &cache_info, nullptr, &r.driver_pipeline_cache);
+        if (cache_result != VK_SUCCESS && !initial_cache.empty()) {
+            cache_info.initialDataSize = 0;
+            cache_info.pInitialData = nullptr;
+            initial_cache.clear();
+            cache_result = vkCreatePipelineCache(
+                r.dev, &cache_info, nullptr, &r.driver_pipeline_cache);
+        }
+        if (cache_result == VK_SUCCESS) r.driver_cache_loaded_bytes = initial_cache.size();
+        if (!r.driver_cache_file.path.empty())
+            fprintf(stderr, "[render] disk pipeline cache %s (%zu bytes)\n",
+                    r.driver_cache_loaded_bytes ? "loaded" : "cold", r.driver_cache_loaded_bytes);
         if (cache_result != VK_SUCCESS) {
             r.driver_pipeline_cache = VK_NULL_HANDLE;
             fprintf(stderr, "[render] driver pipeline cache unavailable (%d); compiling uncached\n",
@@ -1634,7 +1670,43 @@ inline const RenderVkCtx& render_vk_ctx() {
         }
         return r;
     }();
+    published_render_cache_context().store(&c, std::memory_order_release);
     return c;
+}
+
+// Explicit snapshot for frontends that use _Exit. Do not initialize a renderer during shutdown
+// or wait for a guest holding its resource lock. The queue drain does not serialize compilation.
+// Bound lock acquisition if a driver compilation is still in flight during shutdown.
+inline bool flush_graphics_pipeline_cache(
+        std::chrono::milliseconds lock_budget = std::chrono::milliseconds(1000)) {
+    const RenderVkCtx* context = published_render_cache_context().load(std::memory_order_acquire);
+    if (!context || context->driver_cache_file.path.empty() || !context->driver_pipeline_cache)
+        return false;
+    try {
+        std::vector<uint8_t> blob;
+        {
+            std::unique_lock<std::timed_mutex> lock(graphics_driver_cache_mutex(), std::defer_lock);
+            if (!lock.try_lock_for(lock_budget)) {
+                fprintf(stderr, "[render] disk pipeline cache save skipped: compilation busy\n");
+                return false;
+            }
+            size_t bytes = 0;
+            if (vkGetPipelineCacheData(context->dev, context->driver_pipeline_cache,
+                    &bytes, nullptr) != VK_SUCCESS || !bytes ||
+                bytes > prosper::frontend::PipelineCacheFile::max_bytes) return false;
+            blob.resize(bytes);
+            if (vkGetPipelineCacheData(context->dev, context->driver_pipeline_cache,
+                    &bytes, blob.data()) != VK_SUCCESS) return false;
+            blob.resize(bytes);
+        }
+        const bool saved = context->driver_cache_file.save(blob);
+        fprintf(stderr, "[render] disk pipeline cache %s (%zu bytes)\n",
+                saved ? "saved" : "save failed", blob.size());
+        return saved;
+    } catch (const std::exception&) {
+        fprintf(stderr, "[render] disk pipeline cache save failed\n");
+        return false;
+    }
 }
 
 // Present unification (#1270): serialize a single queue CALL against prosper-app's present submits when
@@ -8702,8 +8774,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fprintf(stderr, "[backend-trace] draw=%zu create-pipeline begin\n", di);
                 fflush(stderr);
             }
-            const VkResult pipeline_result = vkCreateGraphicsPipelines(
+            VkResult pipeline_result;
+            {
+                std::lock_guard<std::timed_mutex> cache_lock(graphics_driver_cache_mutex());
+                pipeline_result = vkCreateGraphicsPipelines(
                     dev, ctx.driver_pipeline_cache, 1, &gp, nullptr, &v.pipe);
+            }
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-pipeline end result=%d pipeline=%p\n",
