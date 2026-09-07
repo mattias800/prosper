@@ -745,6 +745,25 @@ int main() {
             {producer}, W, H, nullptr, nullptr, false, &unbound_target,
             nullptr, nullptr, nullptr, &unbound_batch, false);
         const auto unbound_timing = prosper::test::backend_render_timing_stats();
+
+        // Declining color pixels removes only the readback reason. Standalone calls and an
+        // explicitly closed batch must still complete, even with no persistent color target.
+        const auto discarded_pixels = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, nullptr,
+            nullptr, nullptr, nullptr, nullptr, false, nullptr, false);
+        const auto standalone_timing = prosper::test::backend_render_timing_stats();
+        prosper::test::BackendSubmissionBatch explicit_batch;
+        const auto explicit_pixels = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, nullptr,
+            nullptr, nullptr, nullptr, &explicit_batch, true, nullptr, false);
+        const auto explicit_timing = prosper::test::backend_render_timing_stats();
+        CHECK(discarded_pixels.empty() && standalone_timing.queue_submits == 1 &&
+                  standalone_timing.fence_waits == 1 && standalone_timing.flush_no_batch == 1,
+              "standalone calls still complete when no CPU color pixels are requested");
+        CHECK(explicit_pixels.empty() && !explicit_batch.pending() &&
+                  explicit_timing.queue_submits == 1 && explicit_timing.fence_waits == 1 &&
+                  explicit_timing.flush_explicit == 1 && explicit_timing.flush_readback == 0,
+              "explicit end-of-batch flush is retained without a color consumer");
 #ifdef _WIN32
         _putenv_s("PROSPER_RENDER_TIMING", "");
 #else
@@ -1495,7 +1514,7 @@ int main() {
             const std::vector<uint8_t> storage_only =
                 prosper::test::render_draws_rgba(
                     {draw}, 1, 1, nullptr, nullptr, false, &storage_target,
-                    nullptr, nullptr, nullptr, &storage_batch, false);
+                    nullptr, nullptr, nullptr, &storage_batch, false, nullptr, false);
             const auto storage_stats = prosper::test::backend_color_target_stats();
             printf("  image_atomic_swap storage-only guest=%08x source=%08x\n",
                    guest_word, upload_word);

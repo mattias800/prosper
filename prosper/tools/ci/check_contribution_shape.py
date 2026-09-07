@@ -78,6 +78,10 @@ def top_level(path):
 
 def is_allowed_addition(path):
     """Whether a newly ADDED file may live at `path`."""
+    # #2710: a reviewed project SessionStart hook is shipped metadata. Keep private settings,
+    # agent worktrees and every other .claude path outside this exception.
+    if path == ".claude/settings.json":
+        return True
     head = top_level(path)
     if head in ALLOWED_TOP_LEVEL:
         return True
@@ -144,6 +148,8 @@ def parse_name_status(text):
 def selftest():
     """Both rules, against inputs that must fail and inputs that must not."""
     must_fail = [
+        ("private agent settings", [("A", ".claude/settings.local.json")]),
+        ("agent worktree contents", [("A", ".claude/worktrees/feature/main.cpp")]),
         ("rule 1: header at the repo root (#2507)", [("A", "core/event_bus.hpp")]),
         ("rule 1: plugin dir at the repo root (#2508)", [("A", "plugins/boot_state_machine_plugin.hpp")]),
         ("rule 1: a new top-level directory", [("A", "framework/thing.hpp")]),
@@ -151,6 +157,7 @@ def selftest():
         ("both rules at once", [("A", "core/x.hpp"), ("A", "prosper/src/y.cpp")]),
     ]
     must_pass = [
+        ("project startup hook", [("A", ".claude/settings.json")]),
         ("source plus a test", [("A", "prosper/src/diagnostics/foo.cpp"),
                                 ("A", "prosper/tests/test_foo.cpp")]),
         ("source plus a MODIFIED test", [("A", "prosper/src/foo.cpp"),

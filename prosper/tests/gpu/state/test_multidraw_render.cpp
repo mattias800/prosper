@@ -681,28 +681,73 @@ int main() {
               "persistent guest DS identity LOADs stencil written by an earlier renderer call");
 
         // The same dependency must survive when both calls are recorded before one queue submit.
-        // Give the calls GPU-only color targets so the stencil producer does not force an early CPU
-        // readback; the consumer's requested readback flushes both command buffers behind one fence.
+        // The live depth-only producer has no color target and explicitly declines CPU color
+        // pixels (#2283). Its stencil must survive until the consumer flushes both calls together.
         ResolvedPipelineState batched_writer = writer;
         batched_writer.stencil_read_base = batched_writer.stencil_write_base = 0x99410000;
         ResolvedPipelineState batched_reader = reader;
         batched_reader.stencil_read_base = batched_reader.stencil_write_base = 0x99410000;
         prosper::test::BackendDraw bw = w; bw.ps = &batched_writer;
         prosper::test::BackendDraw br = r; br.ps = &batched_reader;
-        prosper::test::BackendColorTarget batch_write_target{
-            0x9941000000000001ull, false, false};
         prosper::test::BackendColorTarget batch_read_target{
             0x9941000000000002ull, false, true};
         prosper::test::BackendSubmissionBatch ds_batch;
         const std::vector<uint8_t> pending = prosper::test::render_draws_rgba(
-            {bw}, W, H, nullptr, nullptr, true, &batch_write_target,
-            nullptr, nullptr, nullptr, &ds_batch, false);
+            {bw}, W, H, nullptr, nullptr, true, nullptr,
+            nullptr, nullptr, nullptr, &ds_batch, false, nullptr, false);
+        const auto writer_timing = prosper::test::backend_render_timing_stats();
+        CHECK(ds_batch.pending() && writer_timing.queue_submits == 0 &&
+                  writer_timing.fence_waits == 0 && writer_timing.flush_readback == 0,
+              "depth-only pass with no color consumer stays in the pending batch");
         const std::vector<uint8_t> batched_loaded = prosper::test::render_draws_rgba(
             {br}, W, H, nullptr, nullptr, true, &batch_read_target,
             nullptr, nullptr, nullptr, &ds_batch, true);
+        const auto reader_timing = prosper::test::backend_render_timing_stats();
+        CHECK(!ds_batch.pending() && reader_timing.command_buffers == 2 &&
+                  reader_timing.queue_submits == 1 && reader_timing.fence_waits == 1 &&
+                  reader_timing.flush_readback == 1,
+              "the actual color consumer flushes the stencil producer and reader together");
         const uint8_t* blc = center(batched_loaded);
         CHECK(pending.empty() && blc && blc[1] > 0xC0 && blc[0] < 0x40,
               "batched renderer calls publish persistent stencil before a later LOAD");
+
+        // A discarded batch never executed the stencil write. Its speculative validity must
+        // be revoked before a later consumer can LOAD it as if it had completed.
+        batched_writer.stencil_read_base = batched_writer.stencil_write_base = 0x99420000;
+        batched_reader.stencil_read_base = batched_reader.stencil_write_base = 0x99420000;
+        prosper::test::BackendSubmissionBatch discarded_ds_batch;
+        (void)prosper::test::render_draws_rgba(
+            {bw}, W, H, nullptr, nullptr, true, nullptr,
+            nullptr, nullptr, nullptr, &discarded_ds_batch, false, nullptr, false);
+        CHECK(discarded_ds_batch.pending(), "discard control contains an unsubmitted stencil write");
+        auto discarded_state = [&] {
+            prosper::test::BackendPersistentResourceGuard guard;
+            const auto& cache = prosper::test::persistent_ds_cache();
+            const auto entry = std::find_if(cache.begin(), cache.end(), [&](const auto& pair) {
+                return pair.first.sr == batched_writer.stencil_read_base &&
+                       pair.first.w == W && pair.first.h == H;
+            });
+            return std::array<bool, 4>{entry != cache.end(),
+                entry != cache.end() && entry->second.layout_initialized,
+                entry != cache.end() && entry->second.depth_valid,
+                entry != cache.end() && entry->second.stencil_valid};
+        };
+        const auto before_discard = discarded_state();
+        CHECK(before_discard[0] && before_discard[1] && before_discard[3],
+              "discard control first observes published speculative stencil state");
+        discarded_ds_batch.discard();
+        discarded_ds_batch.complete();
+        const auto revoked = discarded_state();
+        const bool invalidated = revoked[0] && !revoked[1] && !revoked[2] && !revoked[3];
+        CHECK(invalidated, "discard revokes cached layout, depth and stencil validity");
+        // Do not ask Vulkan to LOAD an uninitialized image if the invalidation guard failed.
+        if (invalidated) {
+            const auto after_discard = prosper::test::render_draws_rgba(
+                {br}, W, H, nullptr, nullptr, true);
+            const auto* discarded_center = center(after_discard);
+            CHECK(discarded_center && discarded_center[1] < 0x80,
+                  "persistent consumer clears discarded stencil instead of observing its write");
+        }
 
         ResolvedPipelineState fresh = reader;
         fresh.stencil_read_base = fresh.stencil_write_base = 0x22220000;

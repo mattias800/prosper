@@ -8748,17 +8748,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    // Persistent MRT0/MRT1 attachments retain their independent readback contracts. In particular,
-    // merely requesting the complete MRT shape must not materialize either GPU-resident image on the
-    // CPU. Slots 2+ are currently transient backend attachments, so a caller requesting them through
-    // BackendMrtOutputs still needs those planes copied before the images are released.
-    // #2283. Split into two questions that used to be one.
-    //
-    // WOULD a readback be requested -- unchanged, and it is what still drives the flush below. The
-    // scope of this change is the COPY only: `readback_requested` also feeds
-    // `synchronous_results_requested` and therefore `flush_now`, which gates persistent attachment
-    // publication. Removing a flush is a real win (each is a queue submit plus a full CPU-GPU fence
-    // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
+    // Each bound color slot has its own readback contract. The caller can decline all CPU
+    // color results, including the transient color attachment used by a depth-only live pass.
     const bool readback_color0_wanted = prosper::frontend::is_color_target_readback_wanted(
         color_target != nullptr,
         color_target ? color_target->persistent_id : 0,
@@ -8785,13 +8776,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         return false;
     }();
-    const bool readback_requested_for_flush =
-        readback_color0_wanted || readback_color1_wanted || readback_extra_wanted;
-
-    // ...and will one actually be PERFORMED. Blue Prince renders 457 depth-only passes with no
-    // colour base per route; every one reads back a fully black surface that the frontend then
-    // never looks at (`live_renderer.cpp:6082`/`:6118` consume the pixels only under `if (base ...)`,
-    // and there is no else). That is up to 8 MB copied and discarded per pass.
+    // #2283: the copy and its synchronization have the same consumer. When no color result
+    // is wanted, retain commands and resources in the existing submission batch. Persistent
+    // attachment state is published speculatively for later LOAD/sample commands in that batch;
+    // its failure cleanups invalidate the state if submission fails or the batch is discarded.
     const bool readback_color0 = want_color_readback && readback_color0_wanted;
     const bool readback_color1 = want_color_readback && readback_color1_wanted;
     const bool readback_requested = readback_color0 || readback_color1 ||
@@ -8801,10 +8789,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         [](const SharedTextureUpload& upload) {
             return !upload.storage_writebacks.empty();
         });
-    // Deliberately the WOULD-BE value, not the gated one: this change must not alter when the
-    // backend flushes. Verified by the flush-reason counters, which are unchanged in an A/B.
     const bool synchronous_results_requested =
-        readback_requested_for_flush || storage_writeback_requested;
+        readback_requested || storage_writeback_requested;
     const bool flush_now = !submission_batch || synchronous_results_requested ||
                            flush_submission_batch;
     // Attributed in the same order the condition above evaluates, so exactly one bucket is charged
@@ -8813,11 +8799,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     uint64_t flush_reason_storage = 0, flush_reason_explicit = 0;
     if (flush_now) {
         if (!submission_batch) flush_reason_no_batch = 1;
-        // The WOULD-BE value: this bucket answers "why did the backend flush", and the flush is
-        // still caused by a readback being wanted even when #2283 then skips performing it.
-        // Attributing it to `explicit` instead would silently move counts between buckets and make
-        // the flush-reason histogram lie about an unchanged synchronization path.
-        else if (readback_requested_for_flush) flush_reason_readback = 1;
+        else if (readback_requested) flush_reason_readback = 1;
         else if (storage_writeback_requested) flush_reason_storage = 1;
         else flush_reason_explicit = 1;
     }
