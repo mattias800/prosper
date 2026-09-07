@@ -18,11 +18,16 @@ checked-in `scripts/plucky-squire/reach-first-gameplay.pad` route, t = 1080 s.*
 
 **This is not rung 3.** A cutscene is not gameplay.
 
-**The frontier was re-measured on 2026-08-21 (master `f29f46c0`) and it is not what this section
+**Clock update (2026-09-07, #3422):** guest monotonic time now advances in real time even
+through synchronous graphics work. The historical per-flip slowdown below describes the old
+clock policy and no longer predicts current intro duration. The internal GPU dependency watchdog
+still excludes backend stalls. A new live progression measurement is needed for this title.
+
+**The frontier was measured on 2026-08-21 (master `f29f46c0`) and it is not what this section
 originally guessed.** "The route stops driving input at 525 s" is true and irrelevant: the guest reads
 the input it is given and the cutscene is not waiting on a button. The cutscene is not waiting at all —
-it is *advancing about 300x too slowly to finish*, because the guest runs at ~0.19 flips/s once the 3D
-world is up and prosper's guest clock advances in-game time **per flip**. See
+it is *advancing about 300x too slowly to finish*, because the guest ran at ~0.19 flips/s once the 3D
+world is up and prosper's guest clock advanced in-game time **per flip**. See
 [**## The wall is guest THROUGHPUT**](#the-wall-is-guest-throughput-and-the-reason-is-the-guest-clock-2026-08-21-master-f29f46c0)
 below and [#2839](https://github.com/mattias800/prosper/issues/2839); raising the flip rate alone
 carries the guest past the intro to the `Book_MAIN` storybook camera with no other change.
@@ -124,6 +129,9 @@ anchors are invariant to that, and to the sampling cadence — the same file dri
 through to `FinishDeskLevelLoad`.
 
 ## The wall is guest THROUGHPUT, and the reason is the guest clock (2026-08-21, master `f29f46c0`)
+
+Historical measurement: the global guest-clock compensation discussed here was superseded by
+#3422 on 2026-09-07. These observations remain evidence for the old build, not the current clock.
 
 The chapter-one intro cutscene is **not stuck** — it advances, roughly 300x too slowly to finish. What
 makes that fatal rather than merely slow is prosper's own guest-clock contract, so the two have to be

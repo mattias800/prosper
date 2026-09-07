@@ -6,6 +6,21 @@ into a port lifecycle plus interleaved PCM "grains" and forwards them to an inst
 This keeps `prosper_core` dependency-free and unit-testable, and lets any frontend (SDL3, a file
 recorder, a network sink, …) be swapped in at runtime.
 
+## Sonic clock starvation (#3422, 2026-09-07)
+
+A matched startup A–B–A on the same binary identified graphics clock compensation as a cause of
+missing AudioOut2 grains. With fresh saves, no input and 65-second native app runs, the default
+compensated clock produced median MAIN rates of 108 and 108.5 fresh grains/s, versus the sink's
+roughly 188 grains/s. Disabling compensation produced 188 fresh grains/s and zero median
+missing-grain intervals (80 and 79.5 in the two default arms). Earlier publication diagnostics
+showed no unconsumed grain replacements. Commands and measurement limits are recorded in #3422.
+
+Guest monotonic/process-time/TSC clocks now continue through graphics stalls. Only prosper's
+internal GPU dependency watchdog retains compensation. Output/channel buffers remain independently
+owned; no grain is replayed to conceal late production. FLOW diagnostics also report publications
+and pending-grain replacements. These startup measurements establish the clock-related deficit;
+they do not establish that every title or every later gameplay interval is free of underruns.
+
 ## Layers
 
 | Layer | File | In `prosper_core`? |

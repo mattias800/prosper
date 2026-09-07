@@ -1921,9 +1921,9 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // Native-speed semantic capture happens before renderer sampling. PROSPER_RENDER_EVERY and
     // warmup may skip Vulkan work, but must not erase submit/present history from the timeline.
     gpu::record_gpu_timeline_submit(st, submit_no);
-    // Account at most one requested refresh interval per flip while the host performs synchronous
-    // GPU work. A real console returns from submission without charging shader compilation,
-    // resource conversion, execution, or readback latency to the guest's next frame delta.
+    // Account at most one requested refresh interval per flip in the internal dependency-watchdog
+    // clock. The host's synchronous backend holds the queue mutex and prevents other submissions
+    // from satisfying a dependency. This budget does not alter guest clocks or audio pacing.
     static uint64_t accounted_flips = 0;
     const uint64_t flips = prosper_vo_flip_count();
     const uint64_t flip_delta = flips >= accounted_flips ? flips - accounted_flips : flips;

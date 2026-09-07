@@ -241,6 +241,7 @@ int main() {
         run_cb(buf, 15, st);
         flush_deferred_streams();
         const uint64_t guest_before_host_work = prosper_guest_tsc_ns();
+        const uint64_t progress_before_host_work = prosper::host_gpu_progress_ns();
         {
             prosper::HostGpuClockScope host_gpu_work(0);
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -249,12 +250,23 @@ int main() {
         const uint64_t guest_after_host_work = prosper_guest_tsc_ns();
         CHECK(label == 0,
               "host GPU work longer than the timeout does not violate a blocked queue wait");
-        CHECK(guest_after_host_work - guest_before_host_work < 100000000ull,
-              "host GPU work is excluded from the guest queue clock");
+        CHECK(guest_after_host_work - guest_before_host_work >= 1000000000ull,
+              "guest time continues through the long host GPU interval");
+        CHECK(prosper::host_gpu_progress_ns() - progress_before_host_work < 100000000ull,
+              "host GPU work is excluded only from the internal dependency clock");
         cond = 1;
         flush_deferred_streams();
         CHECK(label == 1 && !deferred_pending(),
               "barrier still releases normally after compensated host GPU work");
+        uint64_t timestamp = 0;
+        uint32_t timestamp_cb[7];
+        emit_release(timestamp_cb, (uint64_t)(uintptr_t)&timestamp, 0);
+        timestamp_cb[3] = 3; // GPU timestamp, not an immediate value
+        const uint64_t tsc_before = prosper_guest_tsc_ns();
+        run_cb(timestamp_cb, 7, st);
+        const uint64_t tsc_after = prosper_guest_tsc_ns();
+        CHECK(timestamp >= tsc_before && timestamp <= tsc_after,
+              "EOP timestamps share guest TSC time, not the compensated watchdog epoch");
     }
 
     // 6: liveness backstop — a condition NOBODY ever satisfies releases via the bounded timeout.

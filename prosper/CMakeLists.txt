@@ -860,6 +860,12 @@ if(TARGET prosper_core)
   add_executable(test_audio tests/hle/audio/test_audio.cpp)
   target_link_libraries(test_audio PRIVATE prosper_core)
   add_test(NAME audio_hle COMMAND test_audio)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME audio_flow_publication
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tests/hle/audio/test_audio_flow_publication.py"
+                     $<TARGET_FILE:test_audio>)
+  endif()
 
   # NGS2 waveform-block streaming (#1059/#1060 part 3): a fed block makes the voice Playing and advances
   # num_decoded_samples across renders (the Dead Cells music stream clock). POSIX-gated (needs a fixed
@@ -957,8 +963,8 @@ if(TARGET prosper_core)
   target_link_libraries(test_det_clock PRIVATE prosper_core)
   add_test(NAME det_clock COMMAND test_det_clock)
 
-  # Synchronous host-GPU work must not become a giant guest frame delta. The clock retains one
-  # caller-supplied frame budget, stays monotonic under concurrent reads, and leaves realtime alone.
+  # Guest clocks continue through host GPU stalls; only the internal dependency-watchdog clock
+  # discounts excess backend time, retaining its hold/resume and concurrent-reader guarantees.
   add_executable(test_gpu_time_compensation tests/hle/kernel/test_gpu_time_compensation.cpp)
   target_link_libraries(test_gpu_time_compensation PRIVATE prosper_core)
   add_test(NAME gpu_time_compensation COMMAND test_gpu_time_compensation)
