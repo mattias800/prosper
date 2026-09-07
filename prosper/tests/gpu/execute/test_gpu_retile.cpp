@@ -17,12 +17,36 @@ static void check(bool ok, const char* message) {
     std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message);
     failures += !ok;
 }
+static bool equation_covers_block(uint32_t mode, uint32_t bpe, uint32_t bx,
+                                 uint32_t by, bool broken = false) {
+    std::array<uint32_t, 16> equation{};
+    uint32_t bw = 0, bh = 0;
+    if (!tile64_word_equation(mode, bpe, equation, bw, bh)) return false;
+    if (broken) equation[15] = 0; // deliberately collapse one address bit
+    std::vector<bool> seen(65536 / 4);
+    size_t written = 0;
+    for (uint32_t y = by * bh; y < (by + 1) * bh; ++y)
+    for (uint32_t x = bx * bw; x < (bx + 1) * bw; ++x)
+    for (uint32_t component = 0; component < bpe / 4; ++component) {
+        uint32_t offset = component * 4;
+        for (uint32_t bit = 2; bit < 16; ++bit) {
+            const uint32_t parity = std::popcount(
+                (x & (equation[bit] & 65535)) ^ (y & (equation[bit] >> 16))) & 1u;
+            offset |= parity << bit;
+        }
+        if (offset >= 65536 || (offset & 3) || seen[offset / 4]) return false;
+        seen[offset / 4] = true; ++written;
+    }
+    return written == seen.size();
+}
 int main(int argc, char** argv) {
     const bool cpu = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
+    const bool clean = argc == 2 && std::strcmp(argv[1], "--clean") == 0;
     const bool mapping = argc == 2 && std::strncmp(argv[1], "--map-", 6) == 0;
     const bool allocation = argc == 2 && std::strncmp(argv[1], "--alloc-", 8) == 0;
     const bool fault_mode = mapping || allocation;
     const bool loss = fault_mode && std::strstr(argv[1], "loss");
+    gpu_retile_poison_output_for_test().store(!cpu && !clean);
     VkPhysicalDeviceLimits limits{};
     limits.maxStorageBufferRange = UINT32_MAX;
     limits.maxComputeWorkGroupSize[0] = limits.maxComputeWorkGroupInvocations = 128;
@@ -30,7 +54,8 @@ int main(int argc, char** argv) {
     limits.maxPushConstantsSize = 128;
     GpuRetileParameters params;
     check(params.initialize(3840, 2160, 4, 27, limits) &&
-              params.linear_bytes == 33177600 && params.tiled_bytes == 33423360,
+              params.linear_bytes == 33177600 && params.tiled_bytes == 33423360 &&
+              params.groups_x == 30 && params.groups_y == 2176,
           "measured 4K layout is admitted with exact linear and padded sizes");
     check(!params.initialize(UINT32_MAX, UINT32_MAX, 16, 27, limits) &&
           !params.initialize(0, 2160, 4, 27, limits) &&
@@ -46,6 +71,20 @@ int main(int argc, char** argv) {
         if (field == 4) reduced.maxComputeWorkGroupCount[1] = 1;
         check(!params.initialize(3840, 2160, 4, 27, reduced), "optional device limit declines");
     }
+    auto padded_limits = limits;
+    padded_limits.maxComputeWorkGroupCount[1] = 2160;
+    check(!params.initialize(3840, 2160, 4, 27, padded_limits),
+          "workgroup limit applies to padded height, not just visible rows");
+    padded_limits = limits; padded_limits.maxComputeWorkGroupCount[0] = 3;
+    check(!params.initialize(129, 1, 8, 24, padded_limits),
+          "workgroup limit applies to padded width, not just visible columns");
+    for (uint32_t mode : {9u, 24u, 27u}) for (uint32_t bpe : {4u, 8u, 16u})
+    for (auto [bx, by] : {std::pair{0u, 0u}, std::pair{1u, 1u},
+                          std::pair{3u, 5u}, std::pair{17u, 33u}})
+        check(equation_covers_block(mode, bpe, bx, by),
+              "full block equation writes every output word exactly once, including nonzero block coordinates");
+    check(!equation_covers_block(27, 4, 0, 0, true),
+          "equation coverage guard rejects a manually collapsed address bit");
     struct Format { DataFormat format; uint32_t components, bpe; };
     constexpr Format formats[]{ {DataFormat::Uint32, 1, 4}, {DataFormat::Uint8, 4, 4},
         {DataFormat::Unorm8, 4, 4}, {DataFormat::Float16, 4, 8}, {DataFormat::Float32, 4, 16} };
@@ -124,6 +163,16 @@ int main(int argc, char** argv) {
             item.spirv = recompile_compute(shader, std::size(shader), &resources, config);
             item.resources = std::make_shared<ShaderResourceTable>(resources);
             item.user_sgprs = config.user_sgprs;
+            const auto reflection = validate_spirv_descriptor_interface(
+                item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
+            size_t matching_views = 0;
+            for (const auto& descriptor : reflection.descriptors)
+                if (descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                    (descriptor.binding == 4 || descriptor.binding == 5) &&
+                    descriptor.image_dim == 1 && descriptor.image_arrayed == (view == 2))
+                    ++matching_views;
+            check(reflection.ok() && matching_views == 2,
+                  "both storage views reflect the intended ordinary or array shader type");
             item.launch.threads_x = item.launch.local_x = 64;
             item.launch.local_y = item.launch.local_z = 1;
             item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;

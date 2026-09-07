@@ -38,9 +38,9 @@ std::vector<uint32_t> build_compute_detile_rgba16f();
 std::vector<uint32_t> build_compute_rgba8_to_packed10();
 
 // Exact row-major words (binding 0) -> 2D 64 KiB guest tiles (binding 1).
-// Push words: width, height, words/texel, block width, block height, blocks/row,
-// followed by 16 packed x/y equation masks. Dispatch ceil(width*words/128),height.
-// Caller validates ranges/overflow and clears padded destination bytes first.
+// Push words: width, height, log2(words/texel), log2(block width), log2(block height),
+// blocks/row, followed by 16 packed x/y equation masks. Dispatch the full padded
+// rectangle; out-of-image texels write zero without reading the linear source.
 std::vector<uint32_t> build_compute_retile_words();
 
 } // namespace prosper::gpu

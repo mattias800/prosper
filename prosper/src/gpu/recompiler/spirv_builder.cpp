@@ -18,7 +18,7 @@ enum : uint32_t {
     Op_FMul=133, Op_UDiv=134, Op_UMod=137, Op_Any=154, Op_LogicalAnd=167, Op_Select=169, Op_INotEqual=171,
     Op_ShiftRightLogical=194, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_BitCount=205,
-    Op_ULessThan=176, Op_AtomicExchange=229, Op_SelectionMerge=247, Op_Label=248,
+    Op_ULessThan=176, Op_AtomicExchange=229, Op_Phi=245, Op_SelectionMerge=247, Op_Label=248,
     Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // Enumerants.
@@ -441,6 +441,7 @@ std::vector<uint32_t> build_compute_retile_words() {
     const auto source = e.id(), output = e.id(), push_array = e.id(), push_t = e.id();
     const auto push_ptr = e.id(), push_word = e.id(), push = e.id();
     const auto main = e.id(), entry = e.id(), body = e.id(), done = e.id();
+    const auto read_pixel = e.id(), pixel_done = e.id();
     Emitter::put(e.caps, Op_Capability, {Cap_Shader});
     Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
     std::vector<uint32_t> ep{Exec_GLCompute, main};
@@ -499,19 +500,27 @@ std::vector<uint32_t> build_compute_retile_words() {
     Emitter::put(e.code, Op_Load, {v3_t, id3, gid});
     Emitter::put(e.code, Op_CompositeExtract, {uint_t, word_x, id3, 0});
     Emitter::put(e.code, Op_CompositeExtract, {uint_t, y, id3, 1});
-    const auto row_words = binary(Op_IMul, params[0], params[2]);
+    const auto row_words = binary(Op_ShiftLeftLogical, params[0], params[2]);
+    const auto padded_row_words = binary(Op_ShiftLeftLogical, params[5],
+        binary(Op_IAdd, params[3], params[2]));
+    const auto height_mask = binary(Op_ISub,
+        binary(Op_ShiftLeftLogical, constant(1), params[4]), constant(1));
+    const auto padded_height = binary(Op_ShiftLeftLogical,
+        binary(Op_ShiftRightLogical, binary(Op_IAdd, params[1], height_mask), params[4]), params[4]);
     const auto x_valid = e.id(), y_valid = e.id(), valid = e.id();
-    Emitter::put(e.code, Op_ULessThan, {bool_t, x_valid, word_x, row_words});
-    Emitter::put(e.code, Op_ULessThan, {bool_t, y_valid, y, params[1]});
+    Emitter::put(e.code, Op_ULessThan, {bool_t, x_valid, word_x, padded_row_words});
+    Emitter::put(e.code, Op_ULessThan, {bool_t, y_valid, y, padded_height});
     Emitter::put(e.code, Op_LogicalAnd, {bool_t, valid, x_valid, y_valid});
     Emitter::put(e.code, Op_SelectionMerge, {done, 0});
     Emitter::put(e.code, Op_BranchConditional, {valid, body, done});
     Emitter::put(e.code, Op_Label, {body});
-    const auto x = binary(Op_UDiv, word_x, params[2]);
-    const auto component = binary(Op_UMod, word_x, params[2]);
+    const auto x = binary(Op_ShiftRightLogical, word_x, params[2]);
+    const auto component_mask = binary(Op_ISub,
+        binary(Op_ShiftLeftLogical, constant(1), params[2]), constant(1));
+    const auto component = binary(Op_BitwiseAnd, word_x, component_mask);
     const auto block = binary(Op_IAdd,
-        binary(Op_IMul, binary(Op_UDiv, y, params[4]), params[5]),
-        binary(Op_UDiv, x, params[3]));
+        binary(Op_IMul, binary(Op_ShiftRightLogical, y, params[4]), params[5]),
+        binary(Op_ShiftRightLogical, x, params[3]));
     uint32_t byte_offset = binary(Op_ShiftLeftLogical, component, constant(2));
     for (uint32_t bit = 2; bit < 16; ++bit) {
         const auto equation = load(push, push_word, constant(bit + 6));
@@ -525,8 +534,21 @@ std::vector<uint32_t> build_compute_retile_words() {
     }
     const auto address = binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, constant(14)),
         binary(Op_ShiftRightLogical, byte_offset, constant(2)));
+    // Padding has no source texel. Branch before the load; selecting zero AFTER
+    // an out-of-range read would still violate the source descriptor's bounds.
+    const auto pixel_x = e.id(), pixel_y = e.id(), pixel_valid = e.id();
+    Emitter::put(e.code, Op_ULessThan, {bool_t, pixel_x, word_x, row_words});
+    Emitter::put(e.code, Op_ULessThan, {bool_t, pixel_y, y, params[1]});
+    Emitter::put(e.code, Op_LogicalAnd, {bool_t, pixel_valid, pixel_x, pixel_y});
+    Emitter::put(e.code, Op_SelectionMerge, {pixel_done, 0});
+    Emitter::put(e.code, Op_BranchConditional, {pixel_valid, read_pixel, pixel_done});
+    Emitter::put(e.code, Op_Label, {read_pixel});
     const auto linear = binary(Op_IAdd, binary(Op_IMul, y, row_words), word_x);
-    const auto value = load(source, word_ptr, linear), destination = e.id();
+    const auto loaded = load(source, word_ptr, linear);
+    Emitter::put(e.code, Op_Branch, {pixel_done});
+    Emitter::put(e.code, Op_Label, {pixel_done});
+    const auto value = e.id(), destination = e.id();
+    Emitter::put(e.code, Op_Phi, {uint_t, value, loaded, read_pixel, constant(0), body});
     Emitter::put(e.code, Op_AccessChain, {word_ptr, destination, output, constant(0), address});
     Emitter::put(e.code, Op_Store, {destination, value});
     Emitter::put(e.code, Op_Branch, {done});

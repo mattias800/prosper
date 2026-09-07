@@ -50,6 +50,19 @@ recovers copy, comparison and compute tiling callers. Those optimized callers do
 separate setup from writeback. The subsequent F9 retains the known black world and HUD at
 00:33.23; it is not proof of correct world rendering or replay equivalence.
 
+The subsequent same-binary pair on `4a333768c936` confirms actual GPU retile of the
+one-layer array output, but does **not** establish a meaningful net win. Treatment ran first;
+both arms used fresh state, the committed route, F8 at 300 seconds and F9 at 330. Each has
+31 selected `e3c2229a45c7807c` dispatches and one CPU poison-verification row. The other
+30 treatment writebacks report `gpu-retile=1 dim=5 layers=1 texel-depth=1`.
+CPU-control → GPU-treatment means are 7.414 → 7.698 ms total per selected dispatch,
+4.027 → 3.600 ms writeback, and 0.372 → 0.810 ms in the post-shader GPU interval.
+Across the four measured 4K groups, weighting both arms by the control's group counts gives
+6.385 → 6.344 ms/dispatch (about 0.65% lower), with CPU savings largely offset by GPU/wait/setup.
+Both screenshots retain the known black world and HUD; newly rendered FPS remains unavailable.
+The next iteration removes the separate full-output GPU clear and uses shifts for power-of-two
+addressing. Its benefit still requires a fresh game comparison. #3439.
+
 ## Packed render-target GPU conversion (2026-09-07, #3437)
 
 The selected sampled input is now verified against the live imported image: binding 10 of

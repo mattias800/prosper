@@ -95,8 +95,10 @@ integer storage-buffer operations; no optional numeric feature, host image copy 
 is required. `PROSPER_NO_GPU_RETILE=1` restores the CPU layout path for comparison.
 
 The original linear staging result remains the exact cache-comparison baseline. A separate
-completion-owned buffer holds tiled pixels and zero padding, with both shader and transfer writes
-made available for host reads. Guest writeback, write-watch notification and cache invalidation
+completion-owned buffer holds tiled pixels and zero padding. One shader pass covers its full
+padded rectangle, loading input only for logical texels and writing zero elsewhere; no separate
+full-buffer clear is needed. Power-of-two addressing uses shifts. The entire output is made
+available for host reads after shader writes. Guest writeback, write-watch notification and cache invalidation
 remain synchronous. Poison-verification, volume, multi-layer array, mip-tail and non-exact representations
 retain their existing CPU path. Optional setup errors can fall back; device loss remains fatal.
 The GPU post-dispatch timestamp includes retile work, and capture-gated image-writeback rows report

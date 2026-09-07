@@ -7,12 +7,17 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 
 namespace prosper::frontend {
 inline std::atomic<uint64_t>& gpu_retile_recordings() {
     static std::atomic<uint64_t> count{0};
     return count;
+}
+inline std::atomic<bool>& gpu_retile_poison_output_for_test() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
 }
 
 struct GpuRetileParameters {
@@ -27,6 +32,8 @@ struct GpuRetileParameters {
         uint32_t bw = 0, bh = 0;
         if (!width || !height ||
             !prosper::gpu::tile64_word_equation(mode, bpe, equation, bw, bh)) return false;
+        if (!std::has_single_bit(bw) || !std::has_single_bit(bh) ||
+            !std::has_single_bit(bpe / 4)) return false;
         const uint64_t row_words = uint64_t(width) * (bpe / 4);
         const uint64_t blocks_x = (uint64_t(width) + bw - 1) / bw;
         const uint64_t blocks_y = (uint64_t(height) + bh - 1) / bh;
@@ -35,17 +42,22 @@ struct GpuRetileParameters {
             blocks_x > UINT32_MAX / 65536u / blocks_y) return false;
         linear_bytes = row_words * height * 4;
         tiled_bytes = blocks_x * blocks_y * 65536;
+        const uint64_t padded_row_words = blocks_x * bw * (bpe / 4);
+        const uint64_t padded_height = blocks_y * bh;
         if (linear_bytes > limits.maxStorageBufferRange ||
             tiled_bytes > limits.maxStorageBufferRange ||
             limits.maxComputeWorkGroupSize[0] < 128 ||
             limits.maxComputeWorkGroupInvocations < 128 ||
             limits.maxPushConstantsSize < sizeof(words) ||
-            (row_words + 127) / 128 > limits.maxComputeWorkGroupCount[0] ||
-            height > limits.maxComputeWorkGroupCount[1]) return false;
-        words[0] = width; words[1] = height; words[2] = bpe / 4;
-        words[3] = bw; words[4] = bh; words[5] = uint32_t(blocks_x);
+            (padded_row_words + 127) / 128 > limits.maxComputeWorkGroupCount[0] ||
+            padded_height > limits.maxComputeWorkGroupCount[1]) return false;
+        // Power-of-two widths travel as shifts, avoiding per-word integer division.
+        words[0] = width; words[1] = height; words[2] = std::countr_zero(bpe / 4);
+        words[3] = std::countr_zero(bw); words[4] = std::countr_zero(bh);
+        words[5] = uint32_t(blocks_x);
         std::copy(equation.begin(), equation.end(), words.begin() + 6);
-        groups_x = uint32_t((row_words + 127) / 128); groups_y = height;
+        groups_x = uint32_t((padded_row_words + 127) / 128);
+        groups_y = uint32_t(padded_height);
         return true;
     }
 };
@@ -122,33 +134,35 @@ struct GpuRetilePipeline {
     void record(VkCommandBuffer command, VkBuffer source, VkBuffer output,
                 VkDescriptorSet set, const GpuRetileParameters& p) const {
         // A pooled allocation can have a previous device writer under a different
-        // buffer handle. Cover that alias before clearing the padded destination.
+        // buffer handle. Every output word, including padding, is shader-written.
         VkMemoryBarrier recycled{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         recycled.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        recycled.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &recycled, 0, nullptr, 0, nullptr);
-        vkCmdFillBuffer(command, output, 0, p.tiled_bytes, 0);
-        VkBufferMemoryBarrier before[2]{};
-        for (auto& b : before) {
-            b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.size = VK_WHOLE_SIZE; b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        recycled.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        if (gpu_retile_poison_output_for_test().load(std::memory_order_relaxed)) {
+            // Dirty padding makes a missing shader store fail even on fresh memory.
+            VkMemoryBarrier before_poison = recycled;
+            before_poison.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before_poison, 0, nullptr, 0, nullptr);
+            vkCmdFillBuffer(command, output, 0, p.tiled_bytes, 0xa5a5a5a5u);
         }
-        before[0].buffer = source; before[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        before[1].buffer = output; before[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &recycled, 0, nullptr, 0, nullptr);
+        VkBufferMemoryBarrier before{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        before.srcQueueFamilyIndex = before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.size = VK_WHOLE_SIZE; before.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.buffer = source; before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, before, 0, nullptr);
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &before, 0, nullptr);
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p.words), p.words.data());
         vkCmdDispatch(command, p.groups_x, p.groups_y, 1);
         gpu_retile_recordings().fetch_add(1, std::memory_order_relaxed);
-        // Both the shader-written texels AND transfer-cleared padding are read by
-        // the host, even if exact-result comparison later skips this mapping.
+        // The host reads the entire shader-written allocation, even if exact-result
+        // comparison later skips this mapping.
         prosper::gpu::record_host_read_barrier(command, output,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     }
 };
 } // namespace prosper::frontend
