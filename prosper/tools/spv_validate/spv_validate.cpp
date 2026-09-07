@@ -760,6 +760,8 @@ int main(int argc, char** argv) {
          "build_compute_compare_uvec4");
     dump(dir, "builder_detile_rgba16f", build_compute_detile_rgba16f(),
          "build_compute_detile_rgba16f");
+    dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
+         "build_compute_rgba8_to_packed10");
 
     // --- Recompiler entry points beyond the four main stage functions ---
     // Wave32 fragment lowering (s_wqm_b32 through the low-half EXEC/VCC mask path).

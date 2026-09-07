@@ -7,6 +7,7 @@
 #include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/live_target_format.hpp"
+#include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/texture/seed_reprove.hpp"
@@ -423,6 +424,7 @@ std::atomic<bool> g_zero_next_cold_storage_snapshot_minimum_for_test{false};
 std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
 std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
 std::atomic<bool> g_force_next_queue_submit_device_lost_for_test{false};
+std::atomic<VkResult> g_next_packed_rtt_setup_result_for_test{VK_SUCCESS};
 std::atomic<uint64_t> g_live_compute_queue_submit_attempts{0};
 thread_local uint64_t g_perf_compute_gpu_timestamp_samples = 0;
 thread_local double g_perf_compute_gpu_device_ms = 0.0;
@@ -1408,6 +1410,7 @@ struct VulkanComputeContext {
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
+    PackedRttConversion packed_rtt_conversion;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -1590,6 +1593,7 @@ struct VulkanComputeContext {
         if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
+        packed_rtt_conversion.destroy();
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -3303,6 +3307,9 @@ struct BoundImage {
     uint32_t depth_bits_saved_layout = 0;
     // RGBA8 UNORM -> UINT preserves the CPU snapshot's bytes, but must sample an INTEGER
     // image. Copy into an owned UINT image; no mutable image or mismatched UNORM view is needed.
+    bool packed10_source = false;
+    VkDescriptorPool packed10_pool = VK_NULL_HANDLE;
+    VkDescriptorSet packed10_set = VK_NULL_HANDLE;
     bool color_bits_source = false;
     VkImage color_bits_image = VK_NULL_HANDLE;
     uint32_t color_bits_saved_layout = 0;
@@ -6000,9 +6007,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return decline(stage);
     };
     // NON-declining forms, for setup whose failure disables an OPTIONAL feature and lets the
-    // dispatch run anyway. The GPU result-comparison path is the only such caller: a false
-    // `compare_ready` merely clears `compare_targets` and drops each `compare_flag_index`, after
-    // which the dispatch proceeds and can succeed.
+    // dispatch run anyway. Conversion setup can fall back to a CPU snapshot; a false
+    // `compare_ready` clears `compare_targets` and drops each `compare_flag_index`.
+    // Device loss remains fatal, including in these optional paths.
     //
     // Routing those through the declining form would make `[compute-decline]` fire — with a running
     // count — for a dispatch that then executed, which is precisely the class of misread instrument
@@ -6049,8 +6056,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
-            if (images[i].imported || images[i].depth_bits_source || images[i].color_bits_source)
+            if (images[i].imported || images[i].depth_bits_source || images[i].color_bits_source ||
+                images[i].packed10_source)
                 release_live_render_target_image(images[i].imported_addr);
+            if (images[i].packed10_pool)
+                vkDestroyDescriptorPool(ctx.device, images[i].packed10_pool, nullptr);
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
             if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
@@ -6820,8 +6830,36 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // transfer below copies exact texels and deliberately performs no resampling.
                     const bool depth_bits_extent =
                         import.width == r->width && import.height == r->height;
-                    if (color_bits_copy) {
-                        bi.color_bits_source = true;
+                    bool packed10_copy = ordinary_2d_view && !depth_import &&
+                        compatible_device && import.transfer_src &&
+                        shader_resource_compute_mip_chain_levels(*r) == 1 &&
+                        import.width == r->width && import.height == r->height &&
+                        import.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                        r->format == DataFormat::Unorm2_10_10_10 && r->num_components == 4 &&
+                        image_descriptors[i].sampled_float &&
+                        std::getenv("PROSPER_NO_GPU_PACKED_RTT") == nullptr;
+                    if (packed10_copy) {
+                        std::lock_guard<std::mutex> cache_lock(ctx.pipeline_cache_mutex);
+                        auto& conversion = ctx.packed_rtt_conversion;
+                        const VkResult injected = g_next_packed_rtt_setup_result_for_test.exchange(
+                            VK_SUCCESS, std::memory_order_acq_rel);
+                        packed10_copy = vk_soft_ok(injected != VK_SUCCESS ? injected :
+                            conversion.initialize(ctx.physical, ctx.device, ctx.pipeline_cache),
+                                                   "packed-rtt-pipeline") &&
+                            conversion.fits(uint64_t(r->width) * r->height) &&
+                            vk_soft_ok(conversion.allocate_binding(bi.packed10_pool, bi.packed10_set),
+                                       "packed-rtt-descriptors");
+                        if (ctx.device_lost) {
+                            // Admission owns a pin, but no conversion commands have been recorded.
+                            release_live_render_target_image(r->gpu_addr);
+                            images_ready = false;
+                            decline("packed-rtt-device-lost");
+                            break;
+                        }
+                    }
+                    if (color_bits_copy || packed10_copy) {
+                        bi.color_bits_source = color_bits_copy;
+                        bi.packed10_source = packed10_copy;
                         bi.color_bits_image = static_cast<VkImage>(import.image);
                         bi.color_bits_saved_layout = import.layout;
                         bi.imported_addr = r->gpu_addr;
@@ -6978,7 +7016,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     break;
                 }
             }
-            if (renderer_owned && !bi.imported && !bi.color_bits_source && !bi.seed_skip &&
+            if (renderer_owned && !bi.imported && !bi.color_bits_source &&
+                !bi.packed10_source && !bi.seed_skip &&
                 bi.seed_from_imported == SIZE_MAX) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
@@ -7134,7 +7173,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     prior.imported == bi.imported &&
                     prior.depth_bits_source == bi.depth_bits_source &&
                     prior.color_bits_source == bi.color_bits_source &&
-                    (!bi.color_bits_source || prior.color_bits_image == bi.color_bits_image) &&
+                    prior.packed10_source == bi.packed10_source &&
+                    (!(bi.color_bits_source || bi.packed10_source) ||
+                     prior.color_bits_image == bi.color_bits_image) &&
                     prior.unorm_rtt_value_reuse == bi.unorm_rtt_value_reuse &&
                     (!bi.imported ||
                      (prior.image == bi.image &&
@@ -7399,7 +7440,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::getenv("PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS") != nullptr;
             static const bool sampled_dcc_fast_clear_disabled =
                 std::getenv("PROSPER_NO_COMPUTE_DCC_FAST_CLEAR") != nullptr;
-            if (!bi.depth_bits_source && !bi.color_bits_source &&
+            if (!bi.depth_bits_source && !bi.color_bits_source && !bi.packed10_source &&
                 compute_sampled_guest_prepare_required(
                     bi.storage, renderer_owned, bi.imported,
                     imported_guest_bypass_disabled)) {
@@ -7796,7 +7837,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // directly. The old path first built a heap upload and then memcpy'd the complete result
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
-            const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.color_bits_source ||
+            const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.color_bits_source || bi.packed10_source ||
                                         bi.seed_skip ||
                                         bi.seed_from_imported != SIZE_MAX ||
                                         bi.compute_transfer_seed_borrowed)
@@ -7824,7 +7865,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     images_ready = false; break;
                 }
                 upload_mapping.memory = staging_memory[i];
-                if (!bi.depth_bits_source && !bi.seed_skip &&
+                if (!bi.depth_bits_source && !bi.packed10_source && !bi.seed_skip &&
                     bi.seed_from_imported == SIZE_MAX &&
                     !bi.compute_transfer_seed_borrowed &&
                     !(bi.persistent && bi.upload_skipped) &&
@@ -7840,6 +7881,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (bi.imported) {
                 // The renderer's sampled image is the source, so direct imports need no transfer.
                 bi.guest_bytes = 0;
+            } else if (bi.packed10_source) {
+                bi.guest_bytes = 0;
+                ctx.packed_rtt_conversion.bind_buffer(bi.packed10_set, staging[i], sbytes);
             } else if (bi.color_bits_source) {
                 // The command buffer copies the exact RGBA8 payload into a UINT image. Avoid
                 // both the lazy renderer readback and the CPU per-channel repacking/upload.
@@ -8838,7 +8882,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (image_timing)
                 std::fprintf(stderr,
                              "[compute-image] code=0x%llx hash=0x%016llx "
-                             "binding=%u class=%s imported=%u color-bits-copy=%u addr=0x%llx "
+                             "binding=%u class=%s imported=%u color-bits-copy=%u packed10-copy=%u addr=0x%llx "
                              "persistent=%u allocation-reused=%u upload-skipped=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu format=%u components=%u "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
@@ -8848,7 +8892,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)item.code_addr,
                              (unsigned long long)timing_program_hash, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
-                             bi.color_bits_source ? 1u : 0u,
+                             bi.color_bits_source ? 1u : 0u, bi.packed10_source ? 1u : 0u,
                              (unsigned long long)r->gpu_addr,
                              bi.persistent ? 1u : 0u,
                              bi.forced_seed_allocation_reused ? 1u : 0u,
@@ -9300,10 +9344,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      1, &to_general);
                 continue;
             }
-            if (bi.color_bits_source) {
-                // vkCmdCopyImage preserves bytes between size-compatible color formats. Unlike
-                // a sampled UNORM view, the destination's RGBA8_UINT view returns 0..255 integers,
-                // exactly as the CPU snapshot path does. No host staging allocation participates.
+            if (bi.color_bits_source || bi.packed10_source) {
+                // Preserve GENERAL while an earlier direct borrower owns the source.
                 bool source_already_general = false;
                 for (size_t prior = 0; prior < i; ++prior) {
                     const BoundImage& candidate = images[prior];
@@ -9314,6 +9356,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const VkImageLayout source_saved = source_already_general
                     ? VK_IMAGE_LAYOUT_GENERAL
                     : static_cast<VkImageLayout>(bi.color_bits_saved_layout);
+                if (bi.packed10_source) {
+                    ctx.packed_rtt_conversion.record(command, bi.color_bits_image, source_saved,
+                        bi.image, staging[i], bi.packed10_set, r->width, r->height);
+                    continue;
+                }
+                // The UINT arm preserves bytes between size-compatible color formats;
+                // the packed arm above instead reconstructs normalized numeric values.
                 VkImageMemoryBarrier barriers[2]{};
                 for (auto& barrier : barriers) {
                     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -11592,6 +11641,12 @@ void live_compute_force_next_image_result_host_fallback_for_test() {
 
 void live_compute_fail_next_image_result_buffer_retain_for_test() {
     g_fail_next_image_result_buffer_retain_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_fail_next_packed_rtt_setup_for_test(bool device_lost) {
+    g_next_packed_rtt_setup_result_for_test.store(
+        device_lost ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+        std::memory_order_release);
 }
 
 void live_compute_force_next_queue_submit_device_lost_for_test() {
