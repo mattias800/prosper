@@ -2087,7 +2087,8 @@ struct VulkanComputeContext {
                                              size_t layer_stride, size_t slice_bytes) {
         if (!source || !bytes) return;
         if (cached.source_snapshot.size() != bytes || depth <= 1 || depth > 64 ||
-            written_layers_mask == ~0ULL || layer_stride == 0 || slice_bytes == 0) {
+            written_layers_mask == ~0ULL || layer_stride == 0 || slice_bytes == 0 ||
+            slice_bytes > bytes || layer_stride > (bytes - slice_bytes) / (depth - 1)) {
             remember_image_source_snapshot(
                 cached, source, bytes, true, SnapshotReason::ReadModifyWrite);
             return;

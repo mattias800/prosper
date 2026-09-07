@@ -105,13 +105,12 @@ inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
 
     const size_t qcount = count / 2;
     size_t i = 0;
-    const uint64_t* qwords = reinterpret_cast<const uint64_t*>(words);
     for (; i + 4 <= qcount; i += 4) {
         uint64_t w0, w1, w2, w3;
-        std::memcpy(&w0, &qwords[i + 0], sizeof(uint64_t));
-        std::memcpy(&w1, &qwords[i + 1], sizeof(uint64_t));
-        std::memcpy(&w2, &qwords[i + 2], sizeof(uint64_t));
-        std::memcpy(&w3, &qwords[i + 3], sizeof(uint64_t));
+        std::memcpy(&w0, words + (i + 0) * 2, sizeof(uint64_t));
+        std::memcpy(&w1, words + (i + 1) * 2, sizeof(uint64_t));
+        std::memcpy(&w2, words + (i + 2) * 2, sizeof(uint64_t));
+        std::memcpy(&w3, words + (i + 3) * 2, sizeof(uint64_t));
         h0 = (h0 ^ w0) * prime;
         h1 = (h1 ^ w1) * prime;
         h2 = (h2 ^ w2) * prime;
@@ -120,7 +119,7 @@ inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
     uint64_t hash = h0 ^ (h1 * prime) ^ (h2 * 0x9e3779b97f4a7c15ull) ^ (h3 * 0x517cc1b727220a95ull);
     for (; i < qcount; ++i) {
         uint64_t w;
-        std::memcpy(&w, &qwords[i], sizeof(uint64_t));
+        std::memcpy(&w, words + i * 2, sizeof(uint64_t));
         hash = (hash ^ w) * prime;
     }
     if (count & 1) {
@@ -6686,12 +6685,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         std::vector<uint64_t> layout_key;
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     };
-    std::array<LastDescriptorSetMemo, 4> last_descriptor_set_memo{};
+    std::array<LastDescriptorSetMemo, kMaxDescriptorSets> last_descriptor_set_memo{};
     struct LastPipelineLayoutMemo {
         bool valid = false;
         bool use_desc = false;
         uint32_t n_sets = 0;
-        std::array<VkDescriptorSetLayout, 4> dsls{};
+        std::array<VkDescriptorSetLayout, kMaxDescriptorSets> dsls{};
         VkPipelineLayout layout = VK_NULL_HANDLE;
     };
     LastPipelineLayoutMemo last_pipeline_layout_memo{};
@@ -6999,7 +6998,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     static Wave64Census wave64_stats;
     std::vector<VkDescriptorSetLayout> draw_dsls;
     std::vector<const std::vector<uint64_t>*> draw_layout_key_ptrs;
-    std::array<std::vector<uint64_t>, 4> draw_scratch_layout_keys;
+    std::array<std::vector<uint64_t>, kMaxDescriptorSets> draw_scratch_layout_keys;
     std::vector<VkDescriptorSetLayoutBinding> draw_lb;
     std::vector<uint32_t> draw_dbi_offset;
     std::vector<VkDescriptorBufferInfo> draw_dbi;
@@ -8676,9 +8675,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     draw_layout_key_ptrs[s] = &last_descriptor_set_memo[s].layout_key;
                     ++resource_reuse_stats.descriptor_set_layout_references;
                 } else {
-                    auto& scratch_key = (s < draw_scratch_layout_keys.size())
-                        ? draw_scratch_layout_keys[s]
-                        : draw_pipeline_layout_key;
+                    auto& scratch_key = draw_scratch_layout_keys[s];
                     scratch_key.clear();
                     scratch_key.reserve(1 + draw_slb.size() * 4);
                     scratch_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
@@ -8771,7 +8768,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
-        const bool can_memo_pipeline = share_backend_resources && v.n_sets <= 4;
+        const bool can_memo_pipeline = share_backend_resources && v.n_sets <= kMaxDescriptorSets;
         bool pipeline_layout_matched = false;
         if (can_memo_pipeline && last_pipeline_layout_memo.valid &&
             last_pipeline_layout_memo.use_desc == v.use_desc &&
