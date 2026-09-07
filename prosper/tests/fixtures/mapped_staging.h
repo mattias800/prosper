@@ -24,7 +24,7 @@ namespace prosper::test {
 // memory is unsound, because the block returns to the pool and the next consumer issues its own
 // vkMapMemory on an already-mapped allocation.
 //
-// `owned` is the load-bearing part. The cache must be the ONLY code that can free a block it
+// `owned` and the per-acquisition lease are the load-bearing parts. The cache must be the ONLY code that can free a block it
 // created: a caller that releases the same staging twice would otherwise fall through to the
 // generic teardown, vkFreeMemory the allocation this cache still maps, and leave a dangling
 // mapped pointer for the next acquire to memcpy into.
@@ -33,6 +33,14 @@ struct MappedStagingBlock {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     VkDevice device = VK_NULL_HANDLE;   // #3405: a cached handle is only valid for ITS device
+    uint64_t lease = 0;                // renewed on every acquire, including reuse
+    uint64_t idle_order = 0;
+};
+
+using MappedStagingKey = std::tuple<VkDevice, VkDeviceSize, uint32_t>;
+struct MappedStagingOwner {
+    MappedStagingKey key;
+    MappedStagingBlock block;
 };
 
 struct MappedStagingCache {
@@ -42,8 +50,13 @@ struct MappedStagingCache {
     // block from a destroyed one.
     std::map<std::tuple<VkDevice, VkDeviceSize, uint32_t>,
              std::vector<MappedStagingBlock>> free_blocks;
-    std::unordered_map<VkDeviceMemory, std::tuple<VkDevice, VkDeviceSize, uint32_t>> in_use;
-    std::unordered_map<VkDeviceMemory, std::tuple<VkDevice, VkDeviceSize, uint32_t>> owned;
+    std::unordered_map<uint64_t, MappedStagingKey> in_use;
+    std::unordered_map<uint64_t, MappedStagingOwner> owned;
+    // Shared sequence for acquisition identities and oldest-idle ordering. Zero
+    // means exhausted: never reuse a token, even if Vulkan reuses raw handles.
+    uint64_t next_sequence = 1;
+    uint64_t stale_releases = 0;
+    uint64_t evictions = 0;
     uint64_t cross_device_skips = 0;
     VkDeviceSize cached_bytes = 0;
     uint64_t double_releases = 0;
@@ -110,15 +123,21 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
     MappedStagingCache& cache = mapped_staging_cache();
     const std::tuple<VkDevice, VkDeviceSize, uint32_t> key{device, bytes,
                                                            static_cast<uint32_t>(usage)};
+    uint64_t lease;
     {
         std::lock_guard<std::mutex> lock(cache.mutex);
+        if (!cache.next_sequence) return {};
+        lease = cache.next_sequence++;
         auto found = cache.free_blocks.find(key);
         if (found != cache.free_blocks.end() && !found->second.empty()) {
             MappedStagingBlock block = found->second.back();
             found->second.pop_back();
             if (found->second.empty()) cache.free_blocks.erase(found);
             cache.cached_bytes -= bytes;
-            cache.in_use.emplace(block.memory, key);
+            cache.owned.erase(block.lease);
+            block.lease = lease;
+            cache.owned.emplace(lease, MappedStagingOwner{key, block});
+            cache.in_use.emplace(lease, key);
             if (reused) *reused = true;
             trace_mapped_staging_event(cache, "acquire-hit", key, block.memory);
             return block;                  // mapping intact: no fault-in on the next write
@@ -154,61 +173,104 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
         return {};
     }
     block.device = device;
+    block.lease = lease;
     std::lock_guard<std::mutex> lock(cache.mutex);
-    cache.in_use.emplace(block.memory, key);
-    cache.owned.emplace(block.memory, key);
+    cache.in_use.emplace(lease, key);
+    cache.owned.emplace(lease, MappedStagingOwner{key, block});
     trace_mapped_staging_event(cache, "acquire-new", key, block.memory);
     return block;
 }
 
-// True means "this cache owns the allocation; the caller must not free it". That answer is given
-// for a block already back in the free list too, so a duplicate release is a no-op rather than a
-// dangling mapping.
+// Only same-device idle blocks may be destroyed: their last submission owner
+// already released them, and the caller establishes that this device is live.
+// A foreign raw VkDevice in the cache does not establish its lifetime.
+// The caller holds cache.mutex through selection, accounting and destruction.
+inline bool make_mapped_staging_room(MappedStagingCache& cache, VkDevice device,
+                                     VkDeviceSize bytes) {
+    const VkDeviceSize limit = mapped_staging_limit();
+    if (bytes > limit) return false;
+    if (cache.cached_bytes <= limit - bytes) return true;
+    static const bool evict = std::getenv("PROSPER_NO_MAPPED_STAGING_EVICTION") == nullptr;
+    if (!evict) return false;
+    VkDeviceSize reclaimable = 0;
+    for (const auto& [key, blocks] : cache.free_blocks)
+        if (std::get<0>(key) == device) reclaimable += std::get<1>(key) * blocks.size();
+    // Do not discard useful same-device entries if foreign occupancy still makes
+    // the incoming block impossible to retain.
+    if (cache.cached_bytes - reclaimable > limit - bytes) return false;
+    while (cache.cached_bytes > limit - bytes) {
+        auto victim = cache.free_blocks.end();
+        for (auto it = cache.free_blocks.begin(); it != cache.free_blocks.end(); ++it)
+            if (std::get<0>(it->first) == device && !it->second.empty() &&
+                (victim == cache.free_blocks.end() ||
+                 it->second.front().idle_order < victim->second.front().idle_order)) victim = it;
+        const auto key = victim->first;
+        const auto block = victim->second.front();
+        victim->second.erase(victim->second.begin());
+        if (victim->second.empty()) cache.free_blocks.erase(victim);
+        cache.cached_bytes -= std::get<1>(key);
+        cache.owned.erase(block.lease);
+        ++cache.evictions;
+        trace_mapped_staging_event(cache, "evict-idle", key, block.memory);
+        vkUnmapMemory(device, block.memory);
+        vkDestroyBuffer(device, block.buffer, nullptr);
+        vkFreeMemory(device, block.memory, nullptr);
+    }
+    return true;
+}
+
+// True means the caller must not free this allocation. A nonzero lease proves
+// cache provenance even after eviction. Old leases cannot free a newer upload
+// when the cache or Vulkan has reused the same buffer/memory handles.
 inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
-                                   void* mapped, bool allow_reuse = true) {
+                                   void* mapped, uint64_t lease, bool allow_reuse = true) {
     if (!memory) return false;
     MappedStagingCache& cache = mapped_staging_cache();
     std::lock_guard<std::mutex> lock(cache.mutex);
-    if (!cache.owned.count(memory)) return false;          // not ours: caller tears it down
-    auto active = cache.in_use.find(memory);
-    if (active == cache.in_use.end()) {
-        ++cache.double_releases;
-        trace_mapped_staging_event(cache, "duplicate-release", cache.owned.at(memory), memory);
+    if (!lease) {
+        // Missing provenance must not invite generic teardown of known cache
+        // memory. This path is rare; successful acquisitions always carry a lease.
+        for (const auto& [id, owner] : cache.owned)
+            if (owner.block.memory == memory) return true;
+        return false;
+    }
+    const auto owner = cache.owned.find(lease);
+    if (owner == cache.owned.end()) {
+        ++cache.stale_releases;
         return true;
     }
-    const std::tuple<VkDevice, VkDeviceSize, uint32_t> key = active->second;
-    if (std::get<0>(key) != device) {
-        // Keep ownership for a later release through the correct device. Returning
-        // false would invite the caller to free our allocation through the wrong one.
+    const auto& block = owner->second.block;
+    const auto key = owner->second.key;
+    if (block.device != device) {
         ++cache.cross_device_skips;
         trace_mapped_staging_event(cache, "wrong-device-release", key, memory);
         return true;
     }
-    // Bisection seam: with this set the block is destroyed rather than retained, so acquire is
-    // exercised exactly as before but nothing is ever reused. It separates "the new allocation
-    // path is wrong" from "reusing a block is wrong".
-    if (!allow_reuse || !mapped_staging_reuse_enabled()) {
-        cache.owned.erase(memory);
-        cache.in_use.erase(memory);
-        trace_mapped_staging_event(cache,
-            !allow_reuse ? "discard-caller-disabled" : "discard-pool-disabled", key, memory);
-        vkUnmapMemory(device, memory);
-        vkFreeMemory(device, memory, nullptr);
-        vkDestroyBuffer(device, buffer, nullptr);
+    if (block.memory != memory || block.buffer != buffer || block.mapped != mapped) return true;
+    const auto active = cache.in_use.find(lease);
+    if (active == cache.in_use.end()) {
+        ++cache.double_releases;
+        trace_mapped_staging_event(cache, "duplicate-release", key, memory);
         return true;
     }
-    const VkDeviceSize key_bytes = std::get<1>(key);
     cache.in_use.erase(active);
-    if (cache.cached_bytes + key_bytes > mapped_staging_limit()) {
-        cache.owned.erase(memory);
-        trace_mapped_staging_event(cache, "discard-budget", key, memory);
+    const char* discard = nullptr;
+    if (!allow_reuse) discard = "discard-caller-disabled";
+    else if (!mapped_staging_reuse_enabled()) discard = "discard-pool-disabled";
+    else if (!cache.next_sequence) discard = "discard-sequence-exhausted";
+    else if (!make_mapped_staging_room(cache, device, std::get<1>(key))) discard = "discard-budget";
+    if (discard) {
+        cache.owned.erase(owner);
+        trace_mapped_staging_event(cache, discard, key, memory);
         vkUnmapMemory(device, memory);
-        vkFreeMemory(device, memory, nullptr);
         vkDestroyBuffer(device, buffer, nullptr);
+        vkFreeMemory(device, memory, nullptr);
         return true;
     }
-    cache.free_blocks[key].push_back(MappedStagingBlock{buffer, memory, mapped, device});
-    cache.cached_bytes += key_bytes;
+    auto idle = block;
+    idle.idle_order = cache.next_sequence++;
+    cache.free_blocks[key].push_back(idle);
+    cache.cached_bytes += std::get<1>(key);
     trace_mapped_staging_event(cache, "retain", key, memory);
     return true;
 }

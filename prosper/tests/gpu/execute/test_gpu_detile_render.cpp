@@ -12,7 +12,8 @@ static void check(bool ok, const char* message) {
     failures += !ok;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool pressure = argc == 2 && std::strcmp(argv[1], "--staging-pressure") == 0;
     constexpr uint32_t width = 129, height = 65, faces = 6;
     constexpr uint64_t base = 0x200000000ull, offset = 4096;
     const uint64_t face_bytes = tiled_surface_bytes(width, height, 27, 0, 8);
@@ -159,11 +160,26 @@ int main() {
                                            nullptr, nullptr, nullptr, &batch, false, nullptr, false);
     const VkBuffer pending_input = upload->input;
     const VkDeviceMemory pending_memory = upload->input_memory;
+    const auto pending_lease = upload->input_lease;
     const void* pending_mapping = upload->input_mapped;
     std::weak_ptr<GpuDetileUpload> old_owner = upload;
     upload.reset(); resource.gpu_detile.reset(); draw.R.clear();
     check(deferred.empty() && batch.pending() && !old_owner.expired(),
           "pending submission retains detile buffers after frontend ownership ends");
+    if (pressure) {
+        const auto evictions = mapped_staging_cache().evictions;
+        // Fill the idle budget with other shapes while the first cube is still
+        // owned by the pending GPU submission. Its input is never an eviction candidate.
+        for (VkDeviceSize bytes : {2ull * 1024 * 1024, 2ull * 1024 * 1024 + 16}) {
+            auto filler = acquire_mapped_staging(ctx.dev, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                [&](uint32_t bits) { return render_memory_type(ctx.phys, bits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); });
+            check(filler.mapped && release_mapped_staging(ctx.dev, filler.buffer, filler.memory,
+                      filler.mapped, filler.lease), "pressure allocation is released through the cache");
+        }
+        check(mapped_staging_cache().evictions > evictions && !old_owner.expired() && batch.pending(),
+              "idle eviction occurs while the earlier cube submission remains pending");
+    }
     seed(1);
     auto changed = prepare_render_gpu_detile(width, height, faces, base, stride, offset, copy);
     check(changed && changed->input != pending_input && changed->input_mapped != pending_mapping,
@@ -187,15 +203,15 @@ int main() {
     auto& staging = mapped_staging_cache();
     const auto foreign_releases = staging.cross_device_skips;
     check(release_mapped_staging(VK_NULL_HANDLE, changed->input, changed->input_memory,
-                                changed->input_mapped, false) &&
+                                changed->input_mapped, changed->input_lease, false) &&
               staging.cross_device_skips == foreign_releases + 1 &&
-              staging.in_use.count(changed->input_memory),
+              staging.in_use.count(changed->input_lease),
           "wrong-device release cannot destroy or surrender an owned input");
     if (!PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_INPUT_REUSE") && mapped_staging_reuse_enabled()) {
         const auto duplicates = staging.double_releases;
         const bool safe_duplicate = release_mapped_staging(changed->device, pending_input, pending_memory,
-                                      const_cast<void*>(pending_mapping), false) &&
-            staging.double_releases == duplicates + 1 && staging.owned.count(pending_memory);
+                                      const_cast<void*>(pending_mapping), pending_lease, false) &&
+            staging.double_releases == duplicates + 1 && staging.owned.count(pending_lease);
         check(safe_duplicate, "duplicate release cannot free a retained mapping even when reuse is disabled");
         if (!safe_duplicate) return 1; // Do not dereference a freed mapping in the negative control.
     }

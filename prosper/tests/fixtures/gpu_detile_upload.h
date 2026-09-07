@@ -76,6 +76,7 @@ struct GpuDetileUpload {
     VkDeviceMemory input_memory = VK_NULL_HANDLE, output_memory = VK_NULL_HANDLE;
     void* input_mapped = nullptr;
     bool input_reused = false;
+    uint64_t input_lease = 0;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptors = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0, faces = 0, count = 0;
@@ -84,7 +85,7 @@ struct GpuDetileUpload {
         if (pool) vkDestroyDescriptorPool(device, pool, nullptr);
         // Submission cleanup retains this object until completion is proven. Reuse
         // is safe only here, after the LAST owner releases the immutable snapshot.
-        if (!release_mapped_staging(device, input, input_memory, input_mapped,
+        if (!release_mapped_staging(device, input, input_memory, input_mapped, input_lease,
                 !PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_INPUT_REUSE"))) {
             if (input_mapped) vkUnmapMemory(device, input_memory);
             if (input) vkDestroyBuffer(device, input, nullptr);
@@ -209,6 +210,7 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     upload->input = input.buffer;
     upload->input_memory = input.memory;
     upload->input_mapped = input.mapped;
+    upload->input_lease = input.lease;
     if (!input.mapped || !buffer(upload->output_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, upload->output, upload->output_memory))
