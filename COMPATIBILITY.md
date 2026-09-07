@@ -36,7 +36,7 @@ Last updated: 2026-08-28
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
-| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Story Mode reached in the guest; HUD and radar render over an absent 3D world | [#1873](https://github.com/mattias800/prosper/issues/1873) |
+| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Rung 3 — the prologue bank heist renders in full colour, on a default launch with the game's own **Performance** graphics mode chosen from the landing menu (the default is Fidelity, where the world stays dark — a route property, not a build property) | [#1873](https://github.com/mattias800/prosper/issues/1873) |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Rung 3 — **the field state in Pilchard Bay**: minimap, party block, area banner and the player character, 144 frames over 588 s. Locomotion is measured, not inferred: the minimap changes in **8 of 8** stick windows against **0 of 8** neutral. The blocker was never a control but the route's patience — the opening chapter needs ~450 confirms, and routes giving it ~40 reached the field **zero** times. **Geometry and the 2D/UI path are correct; the lit-material shading is not** — buildings, cliffs and the boat blow to white while the water crushes dark, and 25% (run 3) to 56% (run 4) of field frames render a recognisable scene (#1486 / #1588). Route: `scripts/dragon-quest-vii/reach-field-control.pad` | [#1874](https://github.com/mattias800/prosper/issues/1874) |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First-level gameplay | [#1875](https://github.com/mattias800/prosper/issues/1875) |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Level 1 gameplay | [#1876](https://github.com/mattias800/prosper/issues/1876) |
@@ -84,7 +84,7 @@ Last updated: 2026-08-28
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-twelve of the twenty-five titles that reach gameplay are marked 🚧 rather than ✅, and the fifteen 🔬
+fourteen of the twenty-seven titles that reach gameplay are marked 🚧 rather than ✅, and the fifteen 🔬
 rows sit at three different rungs — four at rung 2, three at rung 1 and eight at rung 0 — with none
 unrun. Counting markers gives a different — and wrong — answer.
 
@@ -94,8 +94,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 26 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 27 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 16 |
 | **Below a title screen** — logo or splash only (rung 1) | 3 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
@@ -124,22 +124,28 @@ folding it into rung 0 would have been wrong in both directions.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
 deliberately loose — a scene a person would recognise as the game — so *degraded* still counts:
 *Syberia: Remastered*'s composite is degraded and *The House of the Dead 2*'s world carries severe
-defects, and both are rung 3. **Absent does not count.** *Grand Theft Auto V* and *Sonic Frontiers*
-each reach the game loop in the guest, with a correct HUD over a world that never draws; both are
-**rung 2**, and their milestone text says what they reached. They have genuinely got further than a
-title stuck at a menu — the text carries that, not the number.
+defects, and both are rung 3. **Absent does not count.** *Sonic Frontiers* reaches the game loop in
+the guest with a correct HUD over a world that never draws, so it is **rung 2**, and its milestone
+text says what it reached. It has genuinely got further than a title stuck at a menu — the text
+carries that, not the number.
+
+*Grand Theft Auto V* was the second title in this paragraph until 2026-08-26, when #2996 made its
+world render; it is now rung 3. The lag is the point. `GTA5_STATUS.md` had been correct for days
+while this file, `CLAUDE.md` and the tracker body all still said the world was absent, and on
+2026-08-29 a user who reported a regression was told from a stale document that it had never
+worked. **A rung claim outside the title's own status doc is the copy most likely to be stale.**
 
 ### Where the titles accumulate
 
-The 17 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+The 16 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
 the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 10 × UE4, 1 × UE5, 1 unversioned | 12 |
-| Hedgehog Engine, Hedgehog Engine 2, RAGE, Custom (Ancient), ASOBI — one each | 5 |
+| Hedgehog Engine, Hedgehog Engine 2, Custom (Ancient), ASOBI — one each | 4 |
 
-**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 17 rung-2
+**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 16 rung-2
 rows are Unreal, against 18 Unreal rows in the table overall — the other six are one at gameplay
 (*Dragon Quest VII Reimagined*, whose world renders), two at rung 1 (*Little Nightmares II* and
 *Beast of Reincarnation*) and three at rung 0 (*The Lord of the Rings: Gollum*, *The First Berserker:
@@ -148,8 +154,8 @@ is not true in either direction: one has passed it and five have not reached it.
 
 The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
 Unity-family, and **no Unity title remains at rung 2 for want of a rendered world.** The rung-2 group
-is twelve Unreal titles plus *Sonic Origins*, *Earthion*, *Astro Bot*, and the two that reach the
-game loop without a world, *Grand Theft Auto V* and *Sonic Frontiers*.
+is twelve Unreal titles plus *Sonic Origins*, *Earthion*, *Astro Bot*, and the one that reaches the
+game loop without a world, *Sonic Frontiers*.
 
 **This is an observation about where titles accumulate, not a claim that the twelve Unreal titles
 share one root cause** — and this is no longer merely an untested hypothesis in either direction.
@@ -356,11 +362,20 @@ The manor entrance hall renders with real 3D gameplay content. See the [tracker]
 
 <p align="center"><img src="assets/screenshots/gta5-title.webp" alt="Grand Theft Auto V — title screen"></p>
 <p align="center"><img src="assets/screenshots/gta5-main-menu.webp" alt="Grand Theft Auto V — main menu"></p>
+<p align="center"><img src="assets/screenshots/gta5-prologue-bank-restored.webp" alt="Grand Theft Auto V — the prologue bank interior in full colour, the masked gunman in a red plaid shirt, water cooler, holiday cards and radar"></p>
 
-The title and STORY/ONLINE main menu render. A checked-in pad route also reaches Story Mode gameplay:
-the HUD, radar and tutorial text are visible, but the 3D world is still black. See the
-[tracker](https://github.com/mattias800/prosper/issues/1873) and the exact compute-failure census in
-[#2481](https://github.com/mattias800/prosper/issues/2481).
+The title and STORY/ONLINE main menu render, and since [#2996](https://github.com/mattias800/prosper/pull/2996)
+(2026-08-26) **so does the world**: the checked-in route reaches the prologue bank heist and it draws in
+full colour, with the HUD and radar over it.
+
+**The world renders only in the game's own Performance graphics mode**, chosen from the landing menu
+before the world loads; the default is Fidelity, where a run started straight into Story shows the HUD
+over a dark scene and looks exactly like a renderer regression. That is a route property, not a build
+property. Framerate is the open frontier, not the picture. See
+[`docs/GTA5_STATUS.md`](prosper/docs/GTA5_STATUS.md), which is authoritative for this title, and the
+[tracker](https://github.com/mattias800/prosper/issues/1873). The compute-failure census in #2481 is
+closed and superseded by [#2542](https://github.com/mattias800/prosper/issues/2542) and
+[#2690](https://github.com/mattias800/prosper/issues/2690).
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 

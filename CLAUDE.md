@@ -89,7 +89,7 @@ For anything title- or subsystem-specific, use the table in the next section rat
 
 ## Where the project stands (2026-08-17)
 
-`COMPATIBILITY.md` is authoritative for the **user-facing per-title milestones** — 49 tracked titles
+`COMPATIBILITY.md` is authoritative for the **user-facing per-title milestones** — 54 tracked titles
 at this refresh. Do not duplicate its rung counts here; read it, then open the one doc named below for
 whatever you are about to touch. This section is a map, not a status report. Long-lived `tracker:game`
 issues and their comments carry each active title's current development rung, route, blockers and
@@ -136,7 +136,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *The House of the Dead 2: Remake* `PPSA24203` | rung 3 — a fresh-save route reaches Training 1 with real GPU draws through the normal full-cadence renderer; severe world-rendering defects remain (#1907) | `docs/HOUSE_OF_THE_DEAD_2_STATUS.md` |
 | *Sonic Frontiers* `PPSA03831` | **rung 2** — a route reaches Cyber Space gameplay in the guest but the world is black behind the HUD (#2790), which is rung 2 under the rendering bar; 4K opening sequence, auto-save notice, title screen and main menu on a default launch. The four-session black-screen wall was one unregistered NID answering `SCE_OK`: `sceSaveDataTransferringMountPs4` (#2023). The menu heading draws the wrong string (#2206) | `docs/SONIC_FRONTIERS_STATUS.md` |
 | *Sonic Racing: CrossWorlds* `PPSA08804` | rung 2 — a pulsed pad route reaches the complete 4K title screen and profile menu; the profile panel is black and the sequence later holds on white (#2013 / #2358 / #2360) | `docs/SONIC_CROSSWORLDS_STATUS.md` |
-| *Grand Theft Auto V* `PPSA04263` | **rung 2** — the guest reaches routed gameplay entry with real GPU draws, but the world does not render, and rung 3 requires the scene to render; the HUD, radar and tutorial text render over an absent 3D world. **The missing world is now one compute program**: `0x413dc6700` hangs the GPU into a RADV hard recovery, which disables live compute process-wide and drops every later indirect draw; skipping it (`PROSPER_COMPUTE_SKIP_PROGRAM`) yields 0 device losses and the first real scene content. The descriptor-array lift is complete, and the recompiler is **not** the frontier — 16 of 20 "unsupported" programs recompile cleanly | `docs/GTA5_STATUS.md` (read its `## Ruled out`, including the *void, not falsified* subsection), tracker #1873, issue #2481 |
+| *Grand Theft Auto V* `PPSA04263` | **rung 3** — the prologue bank heist renders in full colour with the HUD and radar over it, on a default launch. **The world renders only in the game's own Performance graphics mode**, chosen from the landing menu before the world loads; the default is Fidelity, where a run started straight into Story shows the HUD over a dark scene and looks exactly like a renderer regression — a route property, not a build property. Route: `scripts/gta5/reach-performance-story.pad`. **This row said "rung 2, the world does not render" for twelve days after #2996 made it render**, and on 2026-08-29 a user reporting a regression was told from a stale document that it had never worked — read `GTA5_STATUS.md`, which is authoritative for this title, before quoting this row. The frontier is now **framerate**, not the picture. The descriptor-array lift is complete, and the recompiler is **not** the frontier — 16 of 20 "unsupported" programs recompile cleanly | `docs/GTA5_STATUS.md` (read its `## Ruled out`, including the *void, not falsified* subsection), tracker #1873, issues #2542 / #2690 (#2481 is closed and superseded) |
 | *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 6 / rung 6 / rung 1 — GRIS and Cobra are guarded, not merely playable: reviewed `gris-gameplay` / `cobra-gameplay` entries in `tools/snapshot/snapshots.json` (trackers #1869 / #1870). Sonic's black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id); it renders the 4K SEGA logo and then decoded 4K movie frames, with **no title screen observed** — the old "holds on white to the end" reading is falsified since #2571 made videodec2 decode by default. **#1871's issue *body* still says rung 0 — its 2026-08-17 comment corrects that to rung 1; read the comment thread, not the body** | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
 | Concurrent title work | the 2026-07-31 lane allocation is historical; use live issue claims for ownership and the dated checkpoint for the current cross-lane handoff | `docs/GAME_COMPAT_ORCHESTRATION.md` |
 | *Tactics Ogre: Reborn* `PPSA03839` | rung 3 — gameplay reached; HEVC movies render, sprite/HUD composition remains open | `docs/TACTICS_OGRE_STATUS.md` |
@@ -552,8 +552,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
      saying so: it has genuinely got further than a title stuck at a menu, and the *text* is what
      carries that, not the number. The bar is "somewhat correct rendering", deliberately loose:
      a scene a person would recognise as the game. Degraded still counts (*Syberia: Remastered*'s
-     composite, *The House of the Dead 2*'s world defects); absent does not (*Grand Theft Auto V*,
-     *Sonic Frontiers*). Rung 4 remains the stricter "a human confirms it looks right".
+     composite, *The House of the Dead 2*'s world defects); absent does not (*Sonic Frontiers*).
+     Rung 4 remains the stricter "a human confirms it looks right".
   4. **Manual visual verification** — the user plays it and confirms by eye that it looks right.
   5. **Oracle comparison** — reference screenshots from PS5 hardware, compared against routed
      captures for visual correctness.
