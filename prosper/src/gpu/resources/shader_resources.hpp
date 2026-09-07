@@ -182,6 +182,17 @@ constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 25) - 1u;
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
 float half_to_float(uint16_t h);
 
+// The RGBA8 texture fallback's finite, clamped, nearest-value conversion, directly from binary16.
+// Preserve its non-finite policy: even positive infinity maps to zero. Values below exponent 6
+// cannot round up to one UNORM8 step; the remaining finite fraction is (1024+mantissa)*2^(exp-25).
+constexpr uint8_t half_to_unorm8(uint16_t h) {
+    if (h < 0x1800u || h >= 0x7c00u) return 0;
+    if (h >= 0x3c00u) return 255;
+    const uint32_t shift = 25u - (h >> 10);
+    return static_cast<uint8_t>(
+        (((h & 0x3ffu) + 1024u) * 255u + (1u << (shift - 1u))) >> shift);
+}
+
 // IEEE-754 binary32 -> binary16, round-to-nearest-even. This is the inverse conversion needed when
 // a format-free storage-image write targets an R16_FLOAT/R16G16B16A16_FLOAT guest surface.
 uint16_t float_to_half(float f);
