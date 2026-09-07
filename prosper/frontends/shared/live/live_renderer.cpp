@@ -5727,22 +5727,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         slice_short[slice_short_count++] = fface;
                                     if (f16) {
                                         const uint32_t nc = source_bpt / 2;
+                                        // Same-build performance control for the scalar float path.
+                                        static const bool old_half_quantization =
+                                            PROSPER_ENV_ON("PROSPER_NO_HALF_QUANTIZATION");
                                         for (size_t texel = 0; texel < (size_t)tw * th; ++texel) {
                                             uint8_t* pixel = slice + texel * 4;
                                             for (uint32_t c = 0; c < 4; ++c) {
-                                                float value = c == 3 ? 1.0f : 0.0f;
+                                                uint16_t half = c == 3 ? 0x3c00u : 0u;
                                                 if (c < nc) {
-                                                    uint16_t half = 0;
                                                     std::memcpy(
                                                         &half,
                                                         linear.data() + texel * source_bpt + c * 2,
                                                         sizeof(half));
-                                                    value = prosper::gpu::half_to_float(half);
                                                 }
-                                                pixel[c] = !std::isfinite(value) || value <= 0.0f
-                                                    ? 0u : (value >= 1.0f
-                                                        ? 255u
-                                                        : static_cast<uint8_t>(value * 255.0f + 0.5f));
+                                                if (old_half_quantization) {
+                                                    const float value = c < nc
+                                                        ? prosper::gpu::half_to_float(half)
+                                                        : (c == 3 ? 1.0f : 0.0f);
+                                                    pixel[c] = !std::isfinite(value) || value <= 0.0f
+                                                        ? 0u : (value >= 1.0f ? 255u
+                                                            : static_cast<uint8_t>(value * 255.0f + 0.5f));
+                                                } else {
+                                                    pixel[c] = prosper::gpu::half_to_unorm8(half);
+                                                }
                                             }
                                         }
                                     } else if (source_bpt == 4) {

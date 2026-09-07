@@ -6,6 +6,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "shared/live/live_compute.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
@@ -472,6 +473,17 @@ int main() {
     }
     CHECK(unorm16_reversals == 0,
           "UNORM16 -> UNORM8 remains monotonic instead of wrapping at byte boundaries");
+
+    uint32_t half_quantization_mismatches = 0;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const float value = half_to_float(static_cast<uint16_t>(bits));
+        const uint8_t reference = !std::isfinite(value) || value <= 0.0f ? 0u
+            : value >= 1.0f ? 255u : static_cast<uint8_t>(value * 255.0f + 0.5f);
+        if (half_to_unorm8(static_cast<uint16_t>(bits)) != reference)
+            ++half_quantization_mismatches;
+    }
+    CHECK(half_quantization_mismatches == 0,
+          "binary16 -> UNORM8 matches the original float conversion for all 65536 encodings");
 
     // A table as the front-half would build it: a float32×4 constant buffer (descriptor at SRT 0x20)
     // and a unorm8×4 vertex buffer (descriptor at SRT 0x40).
