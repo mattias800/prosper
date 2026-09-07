@@ -155,5 +155,37 @@ class StartupTest(unittest.TestCase):
             run.assert_not_called()
 
 
+    def test_git_path_output_is_never_used_as_a_filesystem_path(self):
+        # An MSYS2/Cygwin git answers path queries in POSIX form (/c/Users/...), which native
+        # Windows Python reads back as the drive-relative \c\Users\... and which that same git
+        # then rejects. A check that round-trips its own root through git's path flavour loses
+        # the repository on exactly the pairing the Windows CI job runs (#3443).
+        #
+        # The poisoned answer is built BY HAND rather than taken from the git on this host,
+        # whose flavour happens to survive the trip: a control drawn from the same source as
+        # the null it validates cannot express the case being tested for.
+        real = PROBE.subprocess.run
+        consulted = []
+
+        def poisoned(argv, **kwargs):
+            if "--show-toplevel" in argv:
+                consulted.append(argv)
+                return subprocess.CompletedProcess(argv, 0, b"/c/nonexistent/checkout\n", b"")
+            return real(argv, **kwargs)
+
+        with patch.object(PROBE.subprocess, "run", side_effect=poisoned):
+            status, report = PROBE.inspect(self.repo)
+        # The damage first, then the contract that prevents it: a check that consults the
+        # poisoned answer reports UNVERIFIED on a checkout that is perfectly current.
+        self.assertEqual(status, 0, report)
+        self.assertIn("OK:", report)
+        self.assertEqual(consulted, [], "the worktree root must not come from git path output")
+
+    def test_root_is_found_from_a_subdirectory(self):
+        # The relative derivation that replaced --show-toplevel still has to climb: this is the
+        # only arm where the cdup is non-empty, so it is what proves the join is right.
+        self.assertIn("OK:", self.check(0, repo=self.repo / "prosper/tools"))
+
+
 if __name__ == "__main__":
     unittest.main()

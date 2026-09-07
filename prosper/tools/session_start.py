@@ -35,8 +35,13 @@ def git(repo: Path, *args: str, allow_missing: bool = False, deadline: float) ->
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Unverified("Git unavailable or timed out while checking " + args[0]) from exc
     if result.returncode and not allow_missing:
-        # Do not echo a remote URL, credential-helper output, or local instruction contents.
-        raise Unverified("Git could not verify " + args[0])
+        # Name the whole subcommand and its exit status, never git's stderr: the arguments are
+        # this file's own literals, while stderr can carry a remote URL, credential-helper
+        # output, or instruction contents. Reporting only args[0] was not enough to act on --
+        # three distinct calls here are "rev-parse", and #3443 cost an investigation to tell
+        # which one had failed.
+        raise Unverified("Git could not verify " + " ".join(args)
+                         + " (exit " + str(result.returncode) + ")")
     return result.stdout if result.returncode == 0 else b""
 
 
@@ -46,7 +51,16 @@ def inspect(repo: Path, offline: bool = False) -> tuple[int, str]:
     def checked(*args, **kwargs):
         return git(*args, deadline=deadline, **kwargs)
     try:
-        root = Path(os.fsdecode(checked(repo, "rev-parse", "--show-toplevel").strip()))
+        # Ask for the root RELATIVELY. Git answers path queries in its own build's path
+        # flavour, and an absolute answer does not survive the trip back: the MSYS2 git the
+        # Windows CI job installs replies to --show-toplevel in POSIX form (/c/Users/...),
+        # which native Python reads as the drive-relative \c\Users\... -- a path neither
+        # Python nor that same git can then resolve, so every later -C missed the repository
+        # and the check reported UNVERIFIED on every platform pairing but its own (#3443).
+        # --show-cdup is relative ("../.." or empty), so the absolute path stays the
+        # caller's and never changes flavour.
+        cdup = os.fsdecode(checked(repo, "rev-parse", "--show-cdup").strip())
+        root = Path(repo, cdup).resolve()
         head = checked(root, "rev-parse", "HEAD").decode().strip()
         branch = checked(root, "symbolic-ref", "--quiet", "--short", "HEAD",
                      allow_missing=True).decode().strip() or "(detached)"
