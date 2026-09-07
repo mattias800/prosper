@@ -3,6 +3,7 @@
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/texture/tile.hpp"
 #include "diagnostics/env_cache.hpp"
+#include "mapped_staging.h"
 #include <vulkan/vulkan.h>
 #include <array>
 #include <atomic>
@@ -73,15 +74,23 @@ struct GpuDetileUpload {
     VkDevice device = VK_NULL_HANDLE;
     VkBuffer input = VK_NULL_HANDLE, output = VK_NULL_HANDLE;
     VkDeviceMemory input_memory = VK_NULL_HANDLE, output_memory = VK_NULL_HANDLE;
+    void* input_mapped = nullptr;
+    bool input_reused = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptors = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0, faces = 0, count = 0;
     VkDeviceSize source_bytes = 0, output_bytes = 0;
     ~GpuDetileUpload() {
         if (pool) vkDestroyDescriptorPool(device, pool, nullptr);
-        if (input) vkDestroyBuffer(device, input, nullptr);
+        // Submission cleanup retains this object until completion is proven. Reuse
+        // is safe only here, after the LAST owner releases the immutable snapshot.
+        if (!release_mapped_staging(device, input, input_memory, input_mapped,
+                !PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_INPUT_REUSE"))) {
+            if (input_mapped) vkUnmapMemory(device, input_memory);
+            if (input) vkDestroyBuffer(device, input, nullptr);
+            if (input_memory) vkFreeMemory(device, input_memory, nullptr);
+        }
         if (output) vkDestroyBuffer(device, output, nullptr);
-        if (input_memory) vkFreeMemory(device, input_memory, nullptr);
         if (output_memory) vkFreeMemory(device, output_memory, nullptr);
     }
     // Re-recording the same immutable snapshot is allowed across ordered render
@@ -127,8 +136,9 @@ struct GpuDetileUpload {
 
 // Called under the backend's resource lock. Validate the entire source layout
 // before allocation or guest reads; snapshot directly into an immutable mapped
-// input buffer, then unmap it before publishing the upload. No guest pointer is
-// retained and every partially constructed resource is reclaimed on failure.
+// input buffer. The mapping stays alive through submission ownership and idle pool
+// reuse, on the retained renderer device. No guest pointer or prior pixel content is
+// reused; failed preparation returns its allocation without publishing an upload.
 inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     const GpuDetilePipeline& program, VkPhysicalDevice phys,
     const VkPhysicalDeviceLimits& limits, uint32_t width, uint32_t height,
@@ -187,16 +197,23 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
         return vkAllocateMemory(program.device, &ai, nullptr, &mem) == VK_SUCCESS &&
                vkBindBufferMemory(program.device, buf, mem, 0) == VK_SUCCESS;
     };
-    if (!buffer(upload->source_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                upload->input, upload->input_memory) ||
-        !buffer(upload->output_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    const auto input = acquire_mapped_staging(program.device, upload->source_bytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, [&](uint32_t bits) {
+            constexpr auto required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            for (uint32_t type = 0; type < memory.memoryTypeCount; ++type)
+                if ((bits & (1u << type)) &&
+                    (memory.memoryTypes[type].propertyFlags & required) == required) return type;
+            return UINT32_MAX;
+        }, &upload->input_reused);
+    upload->input = input.buffer;
+    upload->input_memory = input.memory;
+    upload->input_mapped = input.mapped;
+    if (!input.mapped || !buffer(upload->output_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, upload->output, upload->output_memory))
         return {};
-    void* mapped = nullptr;
-    if (vkMapMemory(program.device, upload->input_memory, 0, upload->source_bytes,
-                    0, &mapped) != VK_SUCCESS) return {};
+    void* mapped = input.mapped;
     const uint32_t header[]{width, height, static_cast<uint32_t>(face_bytes / 4),
                             static_cast<uint32_t>(count)};
     std::memcpy(mapped, header, sizeof(header));
@@ -206,7 +223,6 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     for (uint32_t face = 0; face < faces && copied; ++face)
         copied = copy_source(static_cast<uint8_t*>(mapped) + 80 + face * face_bytes,
                              first + face * face_stride, face_bytes) == face_bytes;
-    vkUnmapMemory(program.device, upload->input_memory);
     if (!copied) return {};
     const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -229,10 +245,10 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     }
     vkUpdateDescriptorSets(program.device, 2, writes, 0, nullptr);
     if (PROSPER_ENV_ON("PROSPER_GPU_DETILE_LOG"))
-        std::fprintf(stderr, "[gpu-detile] prepared extent=%ux%ux%u guest=0x%llx input=%llu output=%llu\n",
+        std::fprintf(stderr, "[gpu-detile] prepared extent=%ux%ux%u guest=0x%llx input=%llu output=%llu input-reused=%d\n",
                      width, height, faces, static_cast<unsigned long long>(guest_base),
                      static_cast<unsigned long long>(upload->source_bytes),
-                     static_cast<unsigned long long>(upload->output_bytes));
+                     static_cast<unsigned long long>(upload->output_bytes), int(upload->input_reused));
     return upload;
 }
 } // namespace prosper::test
