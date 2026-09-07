@@ -7789,8 +7789,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         const ResourcePhaseTimer phase_copy(timing_enabled,
                                                             &res_buffer_copy_ms);
                         resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
-                        std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
-                                    words, static_cast<size_t>(bytes));
+                        parallel_render_memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
+                                               words, static_cast<size_t>(bytes));
                         upload.range = bytes;
                     }
                     {
