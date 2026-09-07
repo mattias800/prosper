@@ -9,6 +9,7 @@
 // Empirically derived (raw-tiled-bytes dump + offline swizzle sweep) and pixel-verified against the game.
 #pragma once
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -36,6 +37,12 @@ size_t linear_sampled_surface_bytes(uint32_t width, uint32_t height, uint32_t by
 
 // True if `tile_mode` denotes a swizzled layout that detile_surface will de-swizzle.
 bool tile_mode_is_tiled(uint32_t tile_mode);
+
+// The existing 2D mode-27 / eight-byte-texel equation, shared with GPU uploads.
+// Each byte-offset bit is parity(x & low16) XOR parity(y & high16). Coordinates
+// are whole-face coordinates, including the high bits used by pipe XOR. Blocks
+// are 128x64 texels / 64 KiB; this is not the volume or mip-tail equation.
+std::array<uint32_t, 16> tile27_rgba16f_equation();
 
 // libSceVideoOut's own two-value tiling enum, as passed to sceVideoOutSetBufferAttribute(2) and
 // recorded with each registered display buffer. It is NOT a GFX10 swizzle index: it only says

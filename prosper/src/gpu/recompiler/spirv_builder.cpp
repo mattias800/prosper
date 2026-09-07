@@ -10,11 +10,14 @@ namespace {
 // SPIR-V opcodes.
 enum : uint32_t {
     Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16, Op_Capability=17,
-    Op_TypeVoid=19, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
+    Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
-    Op_CompositeExtract=81, Op_FAdd=129, Op_FMul=133, Op_Any=154, Op_INotEqual=171,
+    Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_IMul=132,
+    Op_FMul=133, Op_UDiv=134, Op_UMod=137, Op_Any=154, Op_Select=169, Op_INotEqual=171,
+    Op_ShiftRightLogical=194, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
+    Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_BitCount=205,
     Op_ULessThan=176, Op_AtomicExchange=229, Op_SelectionMerge=247, Op_Label=248,
     Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
@@ -270,6 +273,164 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     Emitter::put(e.code, Op_FunctionEnd, {});
 
     return e.assemble();
+}
+
+std::vector<uint32_t> build_compute_detile_rgba16f() {
+  Emitter e;
+  // Integer-only conversion: the source's half bits, including NaNs/subnormals,
+  // are preserved by raw buffer loads rather than native float16 operations.
+  const auto void_t = e.id(), fn_t = e.id(), bool_t = e.id(), uint_t = e.id(),
+             v3_t = e.id();
+  const auto input_ptr = e.id(), gid = e.id(), array_t = e.id(),
+             block_t = e.id();
+  const auto block_ptr = e.id(), word_ptr = e.id(), source = e.id(),
+             output = e.id();
+  const auto main = e.id(), entry = e.id(), body = e.id(), done = e.id();
+  Emitter::put(e.caps, Op_Capability, {Cap_Shader});
+  Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+  std::vector<uint32_t> ep{Exec_GLCompute, main};
+  push_string(ep, "main");
+  ep.push_back(gid);
+  Emitter::putv(e.entry, Op_EntryPoint, ep);
+  Emitter::put(e.exec, Op_ExecutionMode, {main, EM_LocalSize, 128, 1, 1});
+  Emitter::put(e.deco, Op_Decorate, {gid, Dec_BuiltIn, BI_GlobalInvocationId});
+  Emitter::put(e.deco, Op_Decorate, {array_t, Dec_ArrayStride, 4});
+  Emitter::put(e.deco, Op_Decorate, {block_t, Dec_Block});
+  Emitter::put(e.deco, Op_MemberDecorate, {block_t, 0, Dec_Offset, 0});
+  for (auto [variable, binding] :
+       {std::pair{source, 0u}, std::pair{output, 1u}}) {
+    Emitter::put(e.deco, Op_Decorate, {variable, Dec_DescriptorSet, 0});
+    Emitter::put(e.deco, Op_Decorate, {variable, Dec_Binding, binding});
+  }
+  Emitter::put(e.types, Op_TypeVoid, {void_t});
+  Emitter::put(e.types, Op_TypeFunction, {fn_t, void_t});
+  Emitter::put(e.types, Op_TypeBool, {bool_t});
+  Emitter::put(e.types, Op_TypeInt, {uint_t, 32, 0});
+  Emitter::put(e.types, Op_TypeVector, {v3_t, uint_t, 3});
+  Emitter::put(e.types, Op_TypePointer, {input_ptr, SC_Input, v3_t});
+  Emitter::put(e.types, Op_Variable, {input_ptr, gid, SC_Input});
+  Emitter::put(e.types, Op_TypeRuntimeArray, {array_t, uint_t});
+  Emitter::put(e.types, Op_TypeStruct, {block_t, array_t});
+  Emitter::put(e.types, Op_TypePointer, {block_ptr, SC_StorageBuffer, block_t});
+  Emitter::put(e.types, Op_TypePointer, {word_ptr, SC_StorageBuffer, uint_t});
+  Emitter::put(e.types, Op_Variable, {block_ptr, source, SC_StorageBuffer});
+  Emitter::put(e.types, Op_Variable, {block_ptr, output, SC_StorageBuffer});
+  std::vector<std::pair<uint32_t, uint32_t>> constants;
+  auto constant = [&](uint32_t value) {
+    for (auto [v, id] : constants)
+      if (v == value)
+        return id;
+    const auto id = e.id();
+    constants.emplace_back(value, id);
+    Emitter::put(e.types, Op_Constant, {uint_t, id, value});
+    return id;
+  };
+  auto binary = [&](uint32_t op, uint32_t a, uint32_t b) {
+    const auto id = e.id();
+    Emitter::put(e.code, op, {uint_t, id, a, b});
+    return id;
+  };
+  auto less = [&](uint32_t a, uint32_t b) {
+    const auto id = e.id();
+    Emitter::put(e.code, Op_ULessThan, {bool_t, id, a, b});
+    return id;
+  };
+  auto select = [&](uint32_t condition, uint32_t yes, uint32_t no) {
+    const auto id = e.id();
+    Emitter::put(e.code, Op_Select, {uint_t, id, condition, yes, no});
+    return id;
+  };
+  auto load = [&](uint32_t variable, uint32_t index) {
+    const auto pointer = e.id(), value = e.id();
+    Emitter::put(e.code, Op_AccessChain,
+                 {word_ptr, pointer, variable, constant(0), index});
+    Emitter::put(e.code, Op_Load, {uint_t, value, pointer});
+    return value;
+  };
+  Emitter::put(e.code, Op_Function, {void_t, main, FC_None, fn_t});
+  Emitter::put(e.code, Op_Label, {entry});
+  uint32_t parameters[4]{};
+  for (uint32_t i = 0; i < 4; ++i)
+    parameters[i] = load(source, constant(i));
+  const auto id3 = e.id(), index = e.id();
+  Emitter::put(e.code, Op_Load, {v3_t, id3, gid});
+  Emitter::put(e.code, Op_CompositeExtract, {uint_t, index, id3, 0});
+  const auto in_range = less(index, parameters[3]);
+  Emitter::put(e.code, Op_SelectionMerge, {done, 0});
+  Emitter::put(e.code, Op_BranchConditional, {in_range, body, done});
+  Emitter::put(e.code, Op_Label, {body});
+  const auto width = parameters[0], height = parameters[1],
+             face_words = parameters[2];
+  const auto x = binary(Op_UMod, index, width),
+             row = binary(Op_UDiv, index, width);
+  const auto y = binary(Op_UMod, row, height),
+             face = binary(Op_UDiv, row, height);
+  const auto blocks_per_row = binary(
+      Op_ShiftRightLogical, binary(Op_IAdd, width, constant(127)), constant(7));
+  const auto block =
+      binary(Op_IAdd,
+             binary(Op_IMul, binary(Op_ShiftRightLogical, y, constant(6)),
+                    blocks_per_row),
+             binary(Op_ShiftRightLogical, x, constant(7)));
+  uint32_t byte_offset = constant(0);
+  for (uint32_t bit = 3; bit < 16; ++bit) {
+    const auto equation = load(source, constant(bit + 4));
+    const auto xm = binary(Op_BitwiseAnd, equation, constant(65535));
+    const auto ym = binary(Op_ShiftRightLogical, equation, constant(16));
+    // Parity of the XOR is parity(x & mask) XOR parity(y & mask).
+    const auto coordinate = binary(Op_BitwiseXor, binary(Op_BitwiseAnd, x, xm),
+                                   binary(Op_BitwiseAnd, y, ym));
+    const auto population = e.id();
+    Emitter::put(e.code, Op_BitCount, {uint_t, population, coordinate});
+    byte_offset = binary(Op_BitwiseOr, byte_offset,
+                         binary(Op_ShiftLeftLogical,
+                                binary(Op_BitwiseAnd, population, constant(1)),
+                                constant(bit)));
+  }
+  const auto address = binary(
+      Op_IAdd, constant(20),
+      binary(Op_IAdd, binary(Op_IMul, face, face_words),
+             binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, constant(14)),
+                    binary(Op_ShiftRightLogical, byte_offset, constant(2)))));
+  const uint32_t raw[2] = {load(source, address),
+                           load(source, binary(Op_IAdd, address, constant(1)))};
+  uint32_t packed = constant(0);
+  for (uint32_t channel = 0; channel < 4; ++channel) {
+    const auto half = binary(Op_BitwiseAnd,
+                             binary(Op_ShiftRightLogical, raw[channel / 2],
+                                    constant((channel % 2) * 16)),
+                             constant(65535));
+    // All evaluated shifts stay in range, even for values subsequently rejected
+    // by OpSelect. Only exponents 6..14 use the arithmetic result.
+    const auto exponent =
+        binary(Op_BitwiseAnd, binary(Op_ShiftRightLogical, half, constant(10)),
+               constant(15));
+    const auto shift = binary(Op_ISub, constant(25), exponent);
+    const auto numerator = binary(
+        Op_IAdd,
+        binary(Op_IMul,
+               binary(Op_IAdd, binary(Op_BitwiseAnd, half, constant(1023)),
+                      constant(1024)),
+               constant(255)),
+        binary(Op_ShiftLeftLogical, constant(1),
+               binary(Op_ISub, shift, constant(1))));
+    auto value =
+        select(less(half, constant(0x3c00)),
+               binary(Op_ShiftRightLogical, numerator, shift), constant(255));
+    value = select(less(half, constant(0x7c00)), value, constant(0));
+    value = select(less(half, constant(0x1800)), constant(0), value);
+    packed = binary(Op_BitwiseOr, packed,
+                    binary(Op_ShiftLeftLogical, value, constant(channel * 8)));
+  }
+  const auto destination = e.id();
+  Emitter::put(e.code, Op_AccessChain,
+               {word_ptr, destination, output, constant(0), index});
+  Emitter::put(e.code, Op_Store, {destination, packed});
+  Emitter::put(e.code, Op_Branch, {done});
+  Emitter::put(e.code, Op_Label, {done});
+  Emitter::put(e.code, Op_Return, {});
+  Emitter::put(e.code, Op_FunctionEnd, {});
+  return e.assemble();
 }
 
 } // namespace prosper::gpu

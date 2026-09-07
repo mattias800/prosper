@@ -1243,6 +1243,14 @@ bool sw4kb_s3_volume_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
 }
 } // namespace
 
+std::array<uint32_t, 16> tile27_rgba16f_equation() {
+    std::array<uint32_t, 16> result{};
+    const auto* pattern = sw64kb_pattern(static_cast<uint32_t>(TileMode::Sw64KbRX), 3);
+    for (size_t bit = 0; bit < result.size(); ++bit)
+        result[bit] = uint32_t(pattern[bit].x) | (uint32_t(pattern[bit].y) << 16);
+    return result;
+}
+
 size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, uint32_t pitch,
                            uint32_t bytes_per_texel) {
     if (!tile_mode_is_tiled(tile_mode)) return (size_t)width * height * bytes_per_texel;
