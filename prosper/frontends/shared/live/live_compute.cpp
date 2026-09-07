@@ -529,13 +529,38 @@ bool native_storage_image_create_supported(VkPhysicalDevice physical, VkFormat f
         return false;
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra_usage;
-    VkImageFormatProperties properties{};
-    return vkGetPhysicalDeviceImageFormatProperties(
-               physical, format, image_type, VK_IMAGE_TILING_OPTIMAL,
-               usage, 0, &properties) == VK_SUCCESS &&
-           width <= properties.maxExtent.width && height <= properties.maxExtent.height &&
-           depth <= properties.maxExtent.depth &&
-           array_layers <= properties.maxArrayLayers;
+    struct FormatPropKey {
+        VkFormat format;
+        VkImageType image_type;
+        VkImageUsageFlags usage;
+        bool operator==(const FormatPropKey& o) const {
+            return format == o.format && image_type == o.image_type && usage == o.usage;
+        }
+    };
+    struct FormatPropEntry {
+        FormatPropKey key{};
+        VkImageFormatProperties properties{};
+        bool success = false;
+        bool valid = false;
+    };
+    constexpr size_t kCacheSize = 32;
+    thread_local std::array<FormatPropEntry, kCacheSize> cache{};
+    const FormatPropKey key{format, image_type, usage};
+    const size_t slot = (static_cast<size_t>(format) ^ static_cast<size_t>(image_type) ^
+                         static_cast<size_t>(usage)) % kCacheSize;
+    FormatPropEntry& entry = cache[slot];
+    if (!entry.valid || !(entry.key == key)) {
+        entry.key = key;
+        entry.success = vkGetPhysicalDeviceImageFormatProperties(
+            physical, format, image_type, VK_IMAGE_TILING_OPTIMAL,
+            usage, 0, &entry.properties) == VK_SUCCESS;
+        entry.valid = true;
+    }
+    if (!entry.success) return false;
+    return width <= entry.properties.maxExtent.width &&
+           height <= entry.properties.maxExtent.height &&
+           depth <= entry.properties.maxExtent.depth &&
+           array_layers <= entry.properties.maxArrayLayers;
 }
 
 // Storage images use an RGBA32_UINT interchange surface so format conversion remains bit-exact on
@@ -2056,6 +2081,35 @@ struct VulkanComputeContext {
         }
     }
 
+    void update_image_source_snapshot_layers(CachedComputeImage& cached,
+                                             const uint8_t* source, size_t bytes,
+                                             uint32_t depth, uint64_t written_layers_mask,
+                                             size_t layer_stride, size_t slice_bytes) {
+        if (!source || !bytes) return;
+        if (cached.source_snapshot.size() != bytes || depth <= 1 || depth > 64 ||
+            written_layers_mask == ~0ULL || layer_stride == 0 || slice_bytes == 0 ||
+            slice_bytes > bytes || layer_stride > (bytes - slice_bytes) / (depth - 1)) {
+            remember_image_source_snapshot(
+                cached, source, bytes, true, SnapshotReason::ReadModifyWrite);
+            return;
+        }
+        size_t copied = 0;
+        for (uint32_t layer = 0; layer < depth && layer < 64; ++layer) {
+            if (!(written_layers_mask & (1ULL << layer))) continue;
+            const size_t offset = layer_stride * layer;
+            if (offset + slice_bytes <= bytes) {
+                std::memcpy(cached.source_snapshot.data() + offset, source + offset, slice_bytes);
+                copied += slice_bytes;
+            }
+        }
+        ++image_source_snapshot_copies;
+        image_source_snapshot_bytes += copied;
+        ++storage_result_snapshot_copies;
+        storage_result_snapshot_bytes += copied;
+        ++snapshot_reason_rmw_copies;
+        snapshot_reason_rmw_bytes += copied;
+    }
+
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
@@ -2912,7 +2966,11 @@ struct VulkanComputeContext {
                                       bool result_unchanged = false,
                                       bool source_snapshot_required = true,
                                       bool compute_transfer_watch = false,
-                                      bool retain_export_watch = false) {
+                                      bool retain_export_watch = false,
+                                      uint32_t array_depth = 1,
+                                      uint64_t written_layers_mask = ~0ULL,
+                                      size_t layer_stride = 0,
+                                      size_t slice_bytes = 0) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
@@ -2946,10 +3004,17 @@ struct VulkanComputeContext {
         if (source_snapshot_required) {
             // Read/modify/write and partial storage targets still need the ordinary exact source
             // contract because their prior guest bytes are observable by the next dispatch.
-            if (current_source)
-                remember_image_source_snapshot(
-                    cached, current_source, key.guest_bytes, true,
-                    SnapshotReason::ReadModifyWrite);
+            if (current_source) {
+                if (array_depth > 1 && written_layers_mask != ~0ULL) {
+                    update_image_source_snapshot_layers(
+                        cached, current_source, key.guest_bytes, array_depth,
+                        written_layers_mask, layer_stride, slice_bytes);
+                } else {
+                    remember_image_source_snapshot(
+                        cached, current_source, key.guest_bytes, true,
+                        SnapshotReason::ReadModifyWrite);
+                }
+            }
             if (cached.write_watch && cached.write_watch.rearm()) return;
             cached.write_watch.reset();
             return;
@@ -3475,6 +3540,7 @@ struct BoundImage {
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
     bool near_full_coverage = false;    // >= 99.8% written post-processing target (cutouts like minimap)
+    bool near_full_retained_export = false; // near-full target bypassing seed upload when retained
     uint64_t written_layers_mask = ~0ULL; // bitmask of touched array layers (depth <= 64)
     bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
     bool write_skip = false;            // untouched storage image: unwritten and unread; skip staging, readback, and writeback
@@ -3606,40 +3672,52 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
     auto defaults = [&](uint32_t* o) { o[0] = o[1] = o[2] = 0; o[3] = alpha_default; };
     switch (f) {
         case DF::Unorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) { float v = p[c] / 255.0f; std::memcpy(&o[c], &v, 4); }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) { float v = p[c] / 255.0f; std::memcpy(&o[c], &v, 4); }
+                    }
+                });
             return;
         case DF::Unorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t raw = static_cast<uint16_t>(p[c * 2] |
-                        (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
-                    const float v = raw / 65535.0f; std::memcpy(&o[c], &v, 4);
-                }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const uint16_t raw = static_cast<uint16_t>(p[c * 2] |
+                                (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
+                            const float v = raw / 65535.0f; std::memcpy(&o[c], &v, 4);
+                        }
+                    }
+                });
             return;
         case DF::Snorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    const float v = std::max(static_cast<int8_t>(p[c]) / 127.0f, -1.0f);
-                    std::memcpy(&o[c], &v, 4);
-                }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const float v = std::max(static_cast<int8_t>(p[c]) / 127.0f, -1.0f);
+                            std::memcpy(&o[c], &v, 4);
+                        }
+                    }
+                });
             return;
         case DF::Snorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    const int16_t raw = static_cast<int16_t>(p[c * 2] |
-                        (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
-                    const float v = std::max(raw / 32767.0f, -1.0f);
-                    std::memcpy(&o[c], &v, 4);
-                }
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const int16_t raw = static_cast<int16_t>(p[c * 2] |
+                                (static_cast<uint16_t>(p[c * 2 + 1]) << 8));
+                            const float v = std::max(raw / 32767.0f, -1.0f);
+                            std::memcpy(&o[c], &v, 4);
+                        }
+                    }
+                });
             return;
         case DF::Float16:
             if (n == 4 && src_stride == 8) {
@@ -3658,43 +3736,93 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
                     }
                 });
             return;
+        case DF::Float10_11_11:
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        uint32_t packed = 0; std::memcpy(&packed, src + t * src_stride, sizeof(packed));
+                        const float values[3] = {
+                            prosper::gpu::f11_to_float(static_cast<uint16_t>(packed)),
+                            prosper::gpu::f11_to_float(static_cast<uint16_t>(packed >> 11)),
+                            prosper::gpu::f10_to_float(static_cast<uint16_t>(packed >> 22))
+                        };
+                        uint32_t* o = out + t * 4;
+                        for (uint32_t c = 0; c < 3; ++c) std::memcpy(&o[c], &values[c], sizeof(values[c]));
+                        o[3] = one_f32;
+                    }
+                });
+            return;
+        case DF::Unorm2_10_10_10:
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        uint32_t packed = 0; std::memcpy(&packed, src + t * src_stride, sizeof(packed));
+                        const float values[4] = {
+                            ((packed >>  0) & 0x3ffu) / 1023.0f,
+                            ((packed >> 10) & 0x3ffu) / 1023.0f,
+                            ((packed >> 20) & 0x3ffu) / 1023.0f,
+                            ((packed >> 30) & 0x3u)   / 3.0f
+                        };
+                        uint32_t* o = out + t * 4;
+                        for (uint32_t c = 0; c < 4; ++c) std::memcpy(&o[c], &values[c], sizeof(values[c]));
+                    }
+                });
+            return;
         case DF::Uint8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) o[c] = p[c];
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) o[c] = p[c];
+                    }
+                });
             return;
         case DF::Sint8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c)
-                    o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(p[c])));
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(p[c])));
+                    }
+                });
             return;
         case DF::Uint16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c)
-                    o[c] = static_cast<uint32_t>(p[c * 2] | (p[c * 2 + 1] << 8));
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = static_cast<uint32_t>(p[c * 2] | (p[c * 2 + 1] << 8));
+                    }
+                });
             return;
         case DF::Sint16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c)
-                    o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
-                        p[c * 2] | (p[c * 2 + 1] << 8))));
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
+                                p[c * 2] | (p[c * 2 + 1] << 8))));
+                    }
+                });
             return;
         case DF::Float32: case DF::Uint32: case DF::Sint32:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) std::memcpy(&o[c], p + c * 4, 4);
-            }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                        for (uint32_t c = 0; c < n; ++c) std::memcpy(&o[c], p + c * 4, 4);
+                    }
+                });
             return;
         default:                                  // packed formats keep the general per-texel path
-            for (size_t t = 0; t < count; ++t)
-                storage_unpack_texel(src + t * src_stride, f, ncomp, out + t * 4);
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t)
+                        storage_unpack_texel(src + t * src_stride, f, ncomp, out + t * 4);
+                });
             return;
     }
 }
@@ -3724,32 +3852,41 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
                 });
             return;
         case DF::Unorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t raw = storage_pack_unorm16(in[c]);
-                    p[c * 2] = static_cast<uint8_t>(raw);
-                    p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
-                }
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const uint16_t raw = storage_pack_unorm16(in[c]);
+                            p[c * 2] = static_cast<uint8_t>(raw);
+                            p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Snorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c)
-                    p[c] = static_cast<uint8_t>(storage_pack_snorm<int8_t>(in[c], 127));
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c)
+                            p[c] = static_cast<uint8_t>(storage_pack_snorm<int8_t>(in[c], 127));
+                    }
+                });
             return;
         case DF::Snorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t raw = static_cast<uint16_t>(
-                        storage_pack_snorm<int16_t>(in[c], 32767));
-                    p[c * 2] = static_cast<uint8_t>(raw);
-                    p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
-                }
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            const uint16_t raw = static_cast<uint16_t>(
+                                storage_pack_snorm<int16_t>(in[c], 32767));
+                            p[c * 2] = static_cast<uint8_t>(raw);
+                            p[c * 2 + 1] = static_cast<uint8_t>(raw >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Float16:
             if (n == 4 && dst_stride == 8) {
@@ -3770,30 +3907,74 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
                     }
                 });
             return;
+        case DF::Float10_11_11:
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4;
+                        float values[3];
+                        for (uint32_t c = 0; c < 3; ++c) std::memcpy(&values[c], &in[c], sizeof(values[c]));
+                        const uint32_t packed = static_cast<uint32_t>(prosper::gpu::float_to_f11(values[0])) |
+                                                (static_cast<uint32_t>(prosper::gpu::float_to_f11(values[1])) << 11) |
+                                                (static_cast<uint32_t>(prosper::gpu::float_to_f10(values[2])) << 22);
+                        std::memcpy(dst + t * dst_stride, &packed, sizeof(packed));
+                    }
+                });
+            return;
+        case DF::Unorm2_10_10_10:
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    auto q = [](const uint32_t bits, float scale) -> uint32_t {
+                        float v; std::memcpy(&v, &bits, 4);
+                        v = !(v > 0.0f) ? 0.0f : (v > 1.0f ? 1.0f : v);
+                        return static_cast<uint32_t>(v * scale + 0.5f);
+                    };
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4;
+                        const uint32_t packed = (q(in[0], 1023.0f) & 0x3ffu)        |
+                                                ((q(in[1], 1023.0f) & 0x3ffu) << 10) |
+                                                ((q(in[2], 1023.0f) & 0x3ffu) << 20) |
+                                                ((q(in[3], 3.0f)    & 0x3u)   << 30);
+                        std::memcpy(dst + t * dst_stride, &packed, sizeof(packed));
+                    }
+                });
+            return;
         case DF::Uint8: case DF::Sint8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
+                    }
+                });
             return;
         case DF::Uint16: case DF::Sint16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    p[c * 2] = static_cast<uint8_t>(in[c]);
-                    p[c * 2 + 1] = static_cast<uint8_t>(in[c] >> 8);
-                }
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            p[c * 2] = static_cast<uint8_t>(in[c]);
+                            p[c * 2 + 1] = static_cast<uint8_t>(in[c] >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Float32: case DF::Uint32: case DF::Sint32:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) std::memcpy(p + c * 4, &in[c], 4);
-            }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) std::memcpy(p + c * 4, &in[c], 4);
+                    }
+                });
             return;
         default:                                  // packed formats keep the general per-texel path
-            for (size_t t = 0; t < count; ++t)
-                storage_pack_texel(channels + t * 4, f, ncomp, dst + t * dst_stride);
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t)
+                        storage_pack_texel(channels + t * 4, f, ncomp, dst + t * dst_stride);
+                });
             return;
     }
 }
@@ -6748,13 +6929,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // emitted as float after the frontend's physical-device feature query.
             bi.native_float_storage = spirv_native_float_storage;
             bi.native_uint_storage = spirv_native_uint_storage;
+            const VkFormat query_storage_format = bi.packed_r11_storage
+                ? VK_FORMAT_R32_UINT : native_storage_format;
             bi.graphics_sampled_usage =
                 (bi.native_float_storage || bi.native_uint_storage ||
                  bi.packed_r11_storage) &&
                 (ordinary_2d_view || ordinary_3d_storage ||
                  (native_2d_storage && image_descriptors[i].image_arrayed)) &&
                 native_storage_image_create_supported(
-                    ctx.physical, native_storage_format, native_storage_type,
+                    ctx.physical, query_storage_format, native_storage_type,
                     r->width, r->height, ordinary_3d_storage ? r->depth : 1u,
                     native_2d_storage && image_descriptors[i].image_arrayed
                         ? r->depth : 1u,
@@ -8192,12 +8375,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.dcc_metadata && bi.dcc_metadata_bytes,
                         bi.alias_of == SIZE_MAX,
                     });
+                static const bool skip_export_writeback_enabled =
+                    std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
+                const bool near_full_export_eligible = bi.near_full_coverage &&
+                    skip_export_writeback_enabled && bi.graphics_sampled_usage && !bi.poison_verify &&
+                    !bi.mirror_result_to_imported;
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
+                    const bool source_snapshot_req = (!bi.seed_skip && !near_full_export_eligible) ||
+                        !adaptive_storage_result_validation_enabled();
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped,
-                        !bi.seed_skip || !adaptive_storage_result_validation_enabled());
+                        source_snapshot_req);
                     if (bi.persistent && bi.exact_result_bytes <= max_gpu_compare_image_bytes())
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
@@ -8210,6 +8400,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms = std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
+                bi.near_full_retained_export = bi.persistent && near_full_export_eligible;
                 transfer_gate_census.record_storage_cache(
                     transfer_gate_observation.role, *r, bi.binding,
                     storage_cache_gates,
@@ -8232,8 +8423,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms += std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
-                if (!(bi.persistent && bi.upload_skipped)) {
-                const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
+                if (!(bi.persistent && (bi.upload_skipped || bi.near_full_retained_export))) {
+                const size_t linear_size = (bi.seed_skip || bi.near_full_retained_export || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
                 // Pooled, not freshly allocated: a 4K RGBA16F seed is 63.3 MiB, which is past
                 // glibc's 32 MiB mmap threshold, so a per-dispatch allocation is an mmap, a page
@@ -8259,9 +8450,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      r->tile_mode, static_cast<uint32_t>(guest_texel)));
                 }
                 const uint8_t* unpack_source = nullptr;
-                if (bi.seed_skip) {
-                    // #1122: write-only full-coverage target -- the shader overwrites every texel, so
-                    // the image is created but never seeded, uploaded, or read. Nothing to fill.
+                if (bi.seed_skip || bi.near_full_retained_export) {
+                    // #1122: write-only full-coverage target or near-full retained export --
+                    // the retained GPU image is already valid or will be overwritten.
+                    // No seed upload needed.
                 } else if (bi.seed_from_imported != SIZE_MAX) {
                     // The command buffer copies the renderer's exact native image into this target.
                     // Staging remains allocated because the result still has to be read back below.
@@ -9261,9 +9453,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkAllocateDescriptorSets(ctx.device, &dsai, &descriptor_set),
                    "descriptor-set")) break;
 
-        std::vector<VkDescriptorBufferInfo> buffer_infos(buffers.size());
-        std::vector<VkDescriptorImageInfo> image_infos(images.size());
-        std::vector<VkWriteDescriptorSet> writes(descriptors.size() + images.size());
+        thread_local std::vector<VkDescriptorBufferInfo> buffer_infos;
+        thread_local std::vector<VkDescriptorImageInfo> image_infos;
+        thread_local std::vector<VkWriteDescriptorSet> writes;
+        buffer_infos.resize(buffers.size());
+        image_infos.resize(images.size());
+        writes.resize(descriptors.size() + images.size());
         for (size_t i = 0; i < buffers.size(); i++) {
             buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].bytes};
         }
@@ -9732,7 +9927,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      nullptr, 2, ready);
                 continue;
             }
-            if (bi.persistent && (bi.upload_skipped || bi.seed_skip)) {
+            if (bi.persistent && (bi.upload_skipped || bi.seed_skip || bi.near_full_retained_export)) {
                 // The previous synchronous dispatch left this read-only sampled image in GENERAL,
                 // and either the guest source is unchanged or the proven-full shader cannot observe
                 // that source. No transfer or layout transition is needed.
@@ -10710,6 +10905,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (bi.resource && bi.resource->gpu_addr) {
                     notify_guest_gpu_write_preserving_bytes(bi.resource->gpu_addr, bi.guest_bytes);
                 }
+                ctx.validate_cached_image_source_from_compute_transfer(bi.cache_key);
                 continue;
             }
             const auto image_writeback_start = ComputeClock::now();
@@ -11195,11 +11391,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Guest bytes now mirror the retained image again. A changing full-overwrite
                     // target needs no source snapshot; the first repeated result retains one exact
                     // baseline, and subsequent identical GPU skips do not recopy it.
+                    const size_t linear_slice = (array_image && r->depth > 1)
+                        ? (static_cast<size_t>(r->width) * r->height * guest_texel) : 0;
+                    const size_t selected_slice = (array_image && r->depth > 1)
+                        ? (r->in_mip_tail
+                               ? r->mip_tail_bytes
+                               : (r->tile_mode
+                                      ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                            static_cast<uint32_t>(guest_texel))
+                                      : (r->layer_stride_bytes
+                                             ? linear_array_surface_bytes(
+                                                   *r, static_cast<uint32_t>(guest_texel))
+                                             : linear_slice)))
+                        : 0;
+                    const size_t layer_stride = (array_image && r->depth > 1)
+                        ? (r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice) : 0;
                     ctx.validate_cached_image_source(
                         bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
                         bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
                             native_3d_transfer_enabled(),
-                        bi.graphics_sampled_usage && bi.exact_storage_bytes());
+                        bi.graphics_sampled_usage && bi.exact_storage_bytes(),
+                        r->depth, bi.written_layers_mask, layer_stride, selected_slice);
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,
@@ -11750,10 +11962,12 @@ uint64_t live_compute_graphics_import_guest_bytes(
     if (r16_cube_array_alias)
         return prosper::gpu::gpu_capture_resource_footprint(sampled_resource);
     if (decoded_source_bytes) return decoded_source_bytes;
-    if ((components == 1u || components == 2u || components == 4u) &&
-        (sampled_resource.format == DataFormat::Uint16 ||
-         sampled_resource.format == DataFormat::Unorm16 ||
-         sampled_resource.format == DataFormat::Float16))
+    if (live_compute_graphics_import_native_format(sampled_resource.format, components) !=
+            static_cast<uint32_t>(VK_FORMAT_UNDEFINED) ||
+        ((components == 1u || components == 2u || components == 4u) &&
+         (sampled_resource.format == DataFormat::Uint16 ||
+          sampled_resource.format == DataFormat::Unorm16 ||
+          sampled_resource.format == DataFormat::Float16)))
         return prosper::gpu::gpu_capture_resource_footprint(sampled_resource);
     return 0;
 }

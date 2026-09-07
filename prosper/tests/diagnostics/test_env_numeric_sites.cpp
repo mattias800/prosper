@@ -312,6 +312,9 @@ static const Site kSites[] = {
     {"render_runner.h PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES",
      "PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES", layout_entries_new, layout_entries_old,
      "512 entries", 256ull, "512", 512ull},
+    {"render_runner.h PROSPER_DESCRIPTOR_SET_LAYOUT_CACHE_ENTRIES",
+     "PROSPER_DESCRIPTOR_SET_LAYOUT_CACHE_ENTRIES", layout_entries_new, layout_entries_old,
+     "512 entries", 256ull, "512", 512ull},
 
     {"hle_kernel_mem.cpp PROSPER_DMEM_BUDGET_MB", "PROSPER_DMEM_BUDGET_MB",
      dmem_new, dmem_old, "-1", 16ull * kGiB, "8192", 8192ull * kMiB},
