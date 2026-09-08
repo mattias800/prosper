@@ -76,7 +76,14 @@ def discover_submit(gpu_replay, bundle):
     ordinals = sorted({int(m.group(1)) for m in DS_SUBMIT.finditer(text)})
     if not ordinals:
         return None, "no submit ordinal found in --bundle-ds-summary output"
-    if count and int(count.group(1)) != 1:
+    # Fail CLOSED. If the header did not parse we do not know how many submits the bundle
+    # holds, and the whole point of this guard is to stop a fraction of a frame being
+    # reported as the frame. Skipping the check on an unrecognised header would do exactly
+    # that, silently, on the bundles most likely to be unusual.
+    if not count:
+        return None, ("could not read the bundle's submit count from --bundle-ds-summary; "
+                      "pass --submit or --ds-submits explicitly rather than assume one")
+    if int(count.group(1)) != 1:
         return None, ("bundle holds %s submits and the ds-summary ordinals (%s) do not identify "
                       "which to census; pass --submit explicitly"
                       % (count.group(1), ",".join(str(o) for o in ordinals[:8])))
@@ -87,11 +94,16 @@ def discover_submit(gpu_replay, bundle):
 
 
 def ds_submit_ordinals(gpu_replay, bundle):
-    """Every submit ordinal --bundle-ds-summary names, from both first= and last=.
+    """The submit ordinals --bundle-ds-summary names: per identity, its FIRST and its LAST.
 
-    These are the submits that ran a depth-stencil pass. That is a SUBSET of the
-    frame -- a UI or post pass with no DS never appears -- so a census over them is a
-    census of the world-rendering passes, not of the frame, and the caller must say so.
+    NOT "every depth-stencil submit", which is what this looks like and what an earlier
+    version of this docstring claimed. gpu_replay keeps `min`/`max` per identity
+    (gpu_replay.cpp:1266-1267), so an identity live across submits 3..40 contributes {3, 40}
+    and the 37 between are never named. It is a sample of the depth-stencil work, biased
+    toward the ends of each identity's life, and it is also a subset of the frame -- a UI or
+    post pass with no depth-stencil target never appears at all.
+
+    That is why every count this tool prints is labelled a lower bound rather than a total.
     """
     done = run([gpu_replay, "--bundle", bundle, "--bundle-ds-summary"])
     text = done.stdout + done.stderr
@@ -112,7 +124,7 @@ def main() -> int:
     ap.add_argument("--submit", type=int, help="submit index in the bundle (default: discovered)")
     ap.add_argument("--submits", help="comma-separated submit ordinals to census together")
     ap.add_argument("--ds-submits", action="store_true",
-                    help="census every submit named by --bundle-ds-summary (the depth-stencil\n                         passes: world geometry and lighting)")
+                    help="census the submits --bundle-ds-summary names: the FIRST and LAST\n                         submit of each depth-stencil identity. Not every DS submit -- see\n                         ds_submit_ordinals().")
     ap.add_argument("--title", default="",
                     help="title id the capture came from, e.g. PPSA04263. Decides whether the "
                          "native-wave32 allowlist applies; without it, assumed NOT on the "
@@ -162,8 +174,11 @@ def main() -> int:
             one, error = discover_submit(args.gpu_replay, args.bundle)
             if one is None:
                 print("cannot choose a submit: %s" % error, file=sys.stderr)
-                print("(--ds-submits censuses every depth-stencil submit instead)", file=sys.stderr)
+                print("(--ds-submits samples them: first+last submit per depth-stencil identity)",
+                      file=sys.stderr)
                 return 2
+            # discover_submit only returns when it read a count of exactly 1, so this is
+            # a measured 1 rather than an assumed one.
             chosen, bundle_submits = [one], 1
         print("censusing %d submit(s) of %d in the bundle" % (len(chosen), bundle_submits))
         for ordinal in chosen:
@@ -265,8 +280,10 @@ def main() -> int:
               % (len(captures), bundle_submits))
         print("listed above, so every count here is a LOWER bound on the frame.")
         if args.ds_submits:
-            print("--ds-submits covers the depth-stencil passes only: world geometry and lighting,")
-            print("not UI or post passes that run without a depth-stencil target.")
+            print("--ds-submits samples the depth-stencil work: the FIRST and LAST submit of each")
+            print("depth-stencil identity, NOT every submit that had one -- submits in the middle")
+            print("of an identity's life are never named. UI and post passes without a")
+            print("depth-stencil target are outside it entirely.")
     else:
         print("\nSCOPE: one capture. This is what it RAN, not what the title contains.")
     return 0

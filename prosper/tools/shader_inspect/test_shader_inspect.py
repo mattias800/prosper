@@ -271,6 +271,28 @@ def main() -> int:
     code, out = run(binary, [0x07230203, 0x00010300, 0, 1, 0], extra=["--wave-reasons"])
     check("a header-only module is a clean walk, not a truncated one",
           "spirv-walk=ok" in out, "\n" + out)
+    # ---- #3464 re-review: pin the FAILED-recompile honesty contract ------------------------
+    #
+    # A shader needing a resource table cannot be lowered here, and the census must then print
+    # the sentinel with recompiled=0 and NO census row. The row is what a consumer tallies, so
+    # emitting one for a shader that was never read would put it in the population that says
+    # #3464 does not affect it -- the same failure as the unrecompiled column, one layer down.
+    # This was reported as covered in an earlier round and was not; nothing would have reddened.
+    code, out = run(binary, cbuf_load, extra=["--wave-reasons"])
+    check("a table-dependent shader still emits the sentinel",
+          "wave-reasons-end" in out, "\n" + out)
+    check("a failed recompile reports recompiled=0",
+          "recompiled=0" in out, "\n" + out)
+    check("a failed recompile emits NO census row",
+          "required-subgroup-size=" not in out, "\n" + out)
+    check("a failed recompile is not reported as reason-set admissible",
+          "reason-set-admissible=1" not in out, "\n" + out)
+
+    # And the SPIR-V sentinel must say recompiled=n/a -- nothing was recompiled, it was read.
+    # Load-bearing: wave_reason_census.py distinguishes the two on this field.
+    code, out = run(binary, spirv_module(64, 0x2), extra=["--wave-reasons"])
+    check("a SPIR-V input reports recompiled=n/a, never a count",
+          "recompiled=n/a" in out and "recompiled=1" not in out, "\n" + out)
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0
 
