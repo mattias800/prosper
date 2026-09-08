@@ -34,6 +34,74 @@ const char* operand_kind_name(OperandKind kind) {
     return index < std::size(names) ? names[index] : "invalid";
 }
 
+// The fragment wave-reason bits, named. Kept adjacent to the constants they mirror so a bit
+// added to rdna2_to_spirv.hpp without a name here shows up as an `unknown-bitN` token rather
+// than silently vanishing from the census.
+struct WaveReasonName {
+    uint32_t bit;
+    const char* name;
+};
+
+constexpr WaveReasonName kWaveReasonNames[] = {
+    {kFragmentWaveReasonLaneId,       "lane-id"},
+    {kFragmentWaveReasonWaveAny,      "wave-any"},
+    {kFragmentWaveReasonDppRow16,     "dpp-row16"},
+    {kFragmentWaveReasonPermLane32,   "permlane32"},
+    {kFragmentWaveReasonReadLane64,   "readlane64"},
+    {kFragmentWaveReasonShuffle,      "shuffle"},
+    {kFragmentWaveReasonWaveBallot,   "wave-ballot"},
+    {kFragmentWaveReasonScalarReduce, "scalar-reduce"},
+};
+
+// Prints the set bits by name, then any bit this table does not know about. The unknown pass
+// is the point: it makes a header change visible in the census output instead of dropping it.
+void print_wave_reason_names(uint32_t reasons) {
+    uint32_t named = 0;
+    bool first = true;
+    for (const WaveReasonName& entry : kWaveReasonNames) {
+        named |= entry.bit;
+        if (!(reasons & entry.bit)) continue;
+        std::printf("%s%s", first ? "" : ",", entry.name);
+        first = false;
+    }
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+        const uint32_t mask = 1u << bit;
+        if (!(reasons & mask) || (named & mask)) continue;
+        std::printf("%sunknown-bit%u", first ? "" : ",", bit);
+        first = false;
+    }
+    if (first) std::printf("none");
+}
+
+// Whether a SPIR-V module's instruction stream walks cleanly from the 5-word header to the
+// exact end of the buffer.
+//
+// This exists because `required-subgroup-size=0 reasons=absent` is what a genuine wave-free
+// shader reports AND what a truncated one reports. Without a way to tell them apart, a corrupt
+// dump lands in the population that says #3464 does not affect it -- the same failure as
+// tallying an unlowerable shader as `requires nothing`, which is the thing this whole mode
+// exists to avoid.
+//
+// Deliberately structural, not semantic: it validates word counts and nothing else, mirroring
+// exactly the traversal fragment_spirv_required_subgroup_reasons() performs to find its
+// markers. So `ok` means precisely 'the marker search saw the whole module', which is the only
+// claim a census needs. It is not a substitute for spirv-val.
+bool spirv_stream_walks_cleanly(const std::vector<uint32_t>& words) {
+    if (words.size() < 5) return false;
+    size_t offset = 5;
+    while (offset < words.size()) {
+        const uint32_t count = words[offset] >> 16;
+        // A zero count would not advance -- an unguarded walk hangs here rather than failing,
+        // so this is a termination guard as much as a validity test.
+        if (!count || count > words.size() - offset) return false;
+        offset += count;
+    }
+    // Landing exactly on the end, not past it. A header with no instructions walks cleanly:
+    // zero instructions is a complete stream, and calling it corrupt would relabel every
+    // wave-free module as unreadable.
+    return offset == words.size();
+}
+
 bool is_branch(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
            in.opcode != 0x03;
@@ -84,6 +152,7 @@ int main(int argc, char** argv) {
     std::string stage;
     std::string input_path;
     bool mimg_sites = false;
+    bool wave_reasons = false;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
         const std::string arg = argv[i];
@@ -92,6 +161,8 @@ int main(int argc, char** argv) {
             else stage = argv[++i];
         } else if (arg == "--mimg-sites") {
             mimg_sites = true;
+        } else if (arg == "--wave-reasons") {
+            wave_reasons = true;
         } else if (!arg.empty() && arg[0] == '-') {
             bad_usage = true;
         } else if (input_path.empty()) {
@@ -101,15 +172,27 @@ int main(int argc, char** argv) {
         }
     }
     if (input_path.empty() || bad_usage || (mimg_sites && !stage.empty()) ||
+        (wave_reasons && !stage.empty()) || (wave_reasons && mimg_sites) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
+    std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
         std::fprintf(stderr,
             "\n"
             "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
             "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the same\n"
             "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
             "census from a run that died before printing one.\n"
+            "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
+            "wave width the recompiled module requires, why, and whether render_runner.h would\n"
+            "would ADMIT at a host native wave32. `reason-set-admissible` is the module half of\n"
+            "that gate only -- admission also needs a title allowlist and host support, which an\n"
+            "offline tool cannot see, and every line says so. Same sentinel discipline as\n"
+            "--mimg-sites.\n"
+            "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
+            "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
+            "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, which\n"
+            "was compiled with the real resource table.\n"
             "\n"
             "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
             "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
@@ -178,6 +261,107 @@ int main(int argc, char** argv) {
         }
         std::printf("mimg-sites-end dwords=%zu consumed=%zu instructions=%zu sites=%zu endpgm=%d\n",
                     words.size(), consumed, instructions.size(), sites, walk_ended ? 1 : 0);
+        return 0;
+    }
+
+    // --wave-reasons: the fragment wave-width census, and nothing else.
+    //
+    // Motivation (#3464): on any NVIDIA host the entire supported subgroup range is 32..32, so a
+    // fragment module that requires the guest's Wave64 is DROPPED -- on GTA V that removes most
+    // of the world's lighting. Deciding what to do about it needs to start from what the title's
+    // shaders actually require, and a runtime skip log answers that only for whatever the route
+    // happened to reach, once per distinct shader, at whatever scene depth the run stopped.
+    // (Two counts taken that way, 43 and 86, differed by run length alone and read as a
+    // regression.) Over a dump of the title's shader database this is instead a total.
+    //
+    // `reason-set-admissible` is the MODULE half of the renderer's gate and nothing more. That
+    // gate is five conjuncts (render_runner.h:7128-7133) and this equality (:7140) is the
+    // innermost; the decisive one, allow_native_fragment_vote_width, defaults false (:565) and
+    // comes from `title_id == "PPSA04263"` alone (live_renderer.cpp:1216, :7591). An earlier
+    // version of this mode called the equality `native-wave32-admitted` and was wrong in the
+    // only direction that mattered -- it under-reported the loss #3464 exists to size, for
+    // every title but one. The undecidable conjuncts are now named on their own output line.
+    //
+    // A module needing no particular width reports size=0 reasons=absent
+    // reason-set-admissible=0. `reasons=0x0` is NEVER printed: a module either carries the
+    // marker or it does not, and absent is not none.
+    //
+    // `wave-reasons-end` is a completion sentinel, not decoration -- see --mimg-sites above.
+    // A recompile that FAILS prints no census row at all, only the sentinel with recompiled=0:
+    // a raw dump carries no descriptors and most real fragment shaders sample a texture, so
+    // that outcome is the tool's limitation and must never be tallied as `requires nothing`.
+    if (wave_reasons) {
+        // A SPIR-V input is READ, never recompiled. This is what makes the census usable at
+        // all: shader_inspect has no resource table, so a shader that samples a texture cannot
+        // be lowered here -- measured at 99.3% of GTA V's 3,453-shader pixel-shader database,
+        // i.e. the census over a raw dump is blind to precisely the lighting shaders #3464 is
+        // about. gpu_replay HAS the real descriptors and `--dump-shader DRAW:fs` already writes
+        // the recompiled module, so the reasons can come from a real-table compile while this
+        // tool stays the single place that formats them.
+        //
+        // Detected by the SPIR-V magic rather than by a flag or a file extension: the magic is
+        // the file format's own self-identification, so a mislabelled or renamed file cannot be
+        // read as the wrong kind.
+        //
+        // This does NOT rest on 0x07230203 being undecodable as RDNA2 -- it decodes as VOP2
+        // op=0x003 in this tool's own decoder. It rests on no real shader dump beginning with
+        // that exact word: a fragment program's first instruction is a prologue, not a lone
+        // VOP2 with those operands. A dump that did begin with it would be misread, which is
+        // why `input=` is on every sentinel line for a consumer to check.
+        const bool is_spirv = !words.empty() && words[0] == 0x07230203u;
+        const std::vector<uint32_t> spirv =
+            is_spirv ? words : recompile_fragment(words.data(), words.size());
+        const bool recompiled = !spirv.empty();
+        uint32_t table_dependent = 0;
+        // Meaningless for a SPIR-V input -- those fields describe an RDNA2 walk that did not
+        // happen -- so they are left at zero and the sentinel names the input kind.
+        if (!is_spirv)
+            for (const Rdna2Inst& in : instructions)
+                if (needs_resource_table(in.fmt, "fragment")) ++table_dependent;
+        if (recompiled) {
+            const uint32_t size = fragment_spirv_required_subgroup_size(spirv);
+            const uint32_t reasons = fragment_spirv_required_subgroup_reasons(spirv);
+            // UINT32_MAX means the module carries no reason marker at all. Absent is not none,
+            // so it is reported as `absent` and never printed as a mask a consumer would sum.
+            const bool marked = reasons != UINT32_MAX;
+            // NOT an admission verdict, and the name says so. render_invoke's gate is FIVE
+            // conjuncts (render_runner.h:7128-7133) and only this equality (:7140) is a
+            // property of the module. Reporting it as `admitted` was wrong in the one
+            // direction that matters: `allow_native_fragment_vote_width` defaults false
+            // (:565) and is set from `title_id == "PPSA04263"` alone (live_renderer.cpp:1216,
+            // :7591), so for every other title the renderer DROPS these shaders while the
+            // census called them admitted -- an undercount of the loss #3464 is about, in a
+            // field whose whole purpose is to size that loss.
+            const bool reason_set_admissible =
+                marked && reasons == kFragmentWaveReasonWaveAny;
+            // The two conjuncts a module CAN decide, reported rather than assumed to pass.
+            const uint32_t features = fragment_spirv_required_subgroup_features(spirv);
+            const bool internal_gds = fragment_spirv_uses_internal_gds(spirv);
+            std::printf("wave-reasons required-subgroup-size=%u reasons=", size);
+            if (marked) std::printf("0x%x names=", reasons);
+            else std::printf("absent names=");
+            print_wave_reason_names(marked ? reasons : 0u);
+            std::printf(" reason-set-admissible=%d internal-gds=%d subgroup-features=0x%x\n",
+                        reason_set_admissible ? 1 : 0, internal_gds ? 1 : 0, features);
+            // Named explicitly, every time, so no consumer can read the line above as an
+            // admission verdict by omission. These are the conjuncts an OFFLINE tool cannot
+            // evaluate at all -- they are properties of the run, not of the module.
+            std::printf("wave-reasons gate-undecided=title-allowlist,host-subgroup-size-control,"
+                        "host-subgroup-features NOTE: admission additionally requires the title to be"
+                        " on the allowlist (currently PPSA04263 only) and the host to support the"
+                        " width and features; this tool knows none of those.\n");
+        }
+        // `recompiled` is honest only for a raw stream -- a SPIR-V input is READ, not
+        // recompiled -- so it is reported as n/a there rather than as a 1 that would inflate
+        // any tally of how many modules this tool actually compiled.
+        std::printf("wave-reasons-end file=%s input=%s dwords=%zu ",
+                    input_path.c_str(), is_spirv ? "spirv" : "rdna2", words.size());
+        if (is_spirv)
+            std::printf("recompiled=n/a spirv-walk=%s ",
+                        spirv_stream_walks_cleanly(words) ? "ok" : "truncated");
+        else std::printf("recompiled=%d ", recompiled ? 1 : 0);
+        std::printf("table_dependent=%u endpgm=%d\n", table_dependent,
+                    (!is_spirv && !instructions.empty() && instructions.back().is_end) ? 1 : 0);
         return 0;
     }
 
