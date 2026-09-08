@@ -39,29 +39,42 @@ TICK_MS = 15.625
 
 
 def parse_flips(paths):
-    """Return (timestamps, untimed): untimed counts flip lines carrying no readable t=.
+    """Return one (path, timestamps, untimed) timeline PER SOURCE. Never pooled.
 
-    The second value exists so a parse failure cannot be reported as an empty run. A log full
-    of flips the parser cannot read, and a log with no flips, are different facts; this tool
-    printed the same sentence for both until #3452.
+    `untimed` exists so a parse failure cannot be reported as an empty run: a log full of flips
+    the parser cannot read, and a log with no flips, are different facts, and this tool printed
+    the same sentence for both until #3452.
+
+    Timelines are kept separate because the timestamp epoch is PER PROCESS -- every run starts
+    near zero. Pooling and sorting two logs interleaves them into intervals neither run
+    contained: a 60 fps and a 30 fps capture merge into a plausible-looking distribution with a
+    fabricated sub-tick histogram, which this report's own wording then calls work-bound
+    production. Comparing two runs is exactly the A/B this tool is for, so the wrong answer was
+    reachable by its intended use.
     """
-    stamps = []
-    untimed = 0
+    timelines = []
     for path in paths:
+        stamps = []
+        untimed = 0
         opened = None if path == "-" else open(path, encoding="utf-8", errors="replace")
         handle = sys.stdin if opened is None else opened
         try:
             for line in handle:
                 m = FLIP.search(line)
                 if m:
-                    stamps.append(float(m.group(1)))
+                    try:
+                        stamps.append(float(m.group(1)))
+                    except ValueError:
+                        # A malformed number is an unreadable flip, not a missing one.
+                        untimed += 1
                 elif FLIP_TAG.search(line):
                     untimed += 1
         finally:
             if opened is not None:
                 opened.close()
-    stamps.sort()
-    return stamps, untimed
+        stamps.sort()
+        timelines.append((path, stamps, untimed))
+    return timelines
 
 
 def classify(ms, tick):
@@ -74,6 +87,14 @@ def classify(ms, tick):
 
 
 def report(stamps, window_s, tick, untimed=0):
+    # Report the unreadable population WHENEVER it exists, not only when nothing parsed. Two
+    # readable flips among thousands of unreadable ones produced a confident distribution over
+    # 0.06% of the data and said nothing about the rest -- #3452's own failure, one branch lower.
+    if untimed and stamps:
+        share = 100.0 * untimed / (untimed + len(stamps))
+        print(f"WARNING: {untimed} of {untimed + len(stamps)} flip line(s) ({share:.1f}%) carried"
+              f" no readable t= timestamp and are NOT in the figures below."
+              f" Treat this distribution as describing only the {len(stamps)} that parsed.")
     if len(stamps) < 2:
         if untimed:
             # Name the TOOL as the failure. Saying 'nothing to pace' about a log holding
@@ -135,8 +156,16 @@ def main():
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
-    stamps, untimed = parse_flips(paths)
-    report(stamps, args.window_s, args.tick_ms, untimed)
+    timelines = parse_flips(paths)
+    # One report per source. Several logs are several runs, each with its own epoch, so they
+    # are never merged -- see parse_flips. A header only when there is more than one, so the
+    # single-log output a reader already knows is unchanged.
+    for index, (path, stamps, untimed) in enumerate(timelines):
+        if len(timelines) > 1:
+            if index:
+                print("")
+            print(f"=== {path} ===")
+        report(stamps, args.window_s, args.tick_ms, untimed)
     return 0
 
 

@@ -111,6 +111,45 @@ def main():
         elif not any("t=%" in line for line in flip_lines):
             failures.append("case 7: the [ev] GpuFlip emitter writes no t= timestamp, so every real log is unpaceable (#3452): " + flip_lines[0].strip())
 
+    # 8. A PARTIALLY readable log must say so. Reporting only when NOTHING parsed left the
+    #    real hazard open: a handful of timestamped flips among thousands of untimed ones
+    #    produced a confident distribution over a fraction of a percent of the population and
+    #    mentioned nothing. That is the #3452 failure one branch lower down.
+    timed = [1.000, 1.016, 1.032]
+    mixed = "".join(f"[ev] GpuFlip t={t:.3f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0\n"
+                    for t in timed)
+    mixed += "[ev] GpuFlip handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0\n" * 5000
+    out, _ = run(mixed)
+    if "WARNING" not in out or "5000 of 5003" not in out:
+        failures.append(f"case 8: a 99.9% unreadable population went unreported: {out!r}")
+
+    # 9. Two logs are two runs. The timestamp epoch is per process, so pooling them
+    #    interleaves two timelines into intervals neither run contained -- a 60 fps and a
+    #    30 fps capture merged into a plausible ~60 fps with a fabricated sub-tick histogram,
+    #    which this report's own wording then calls work-bound production. Comparing two runs
+    #    is the tool's intended use, so the wrong answer was reachable by using it as designed.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for name, step in (("a", 1.0 / 60.0), ("b", 1.0 / 30.0)):
+            t = 1.0
+            rows = []
+            for _ in range(300):
+                rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+                t += step
+            path = str(Path(tmp) / f"{name}.log")
+            Path(path).write_text("\n".join(rows) + "\n", encoding="utf-8")
+            paths.append(path)
+        proc = subprocess.run([sys.executable, str(TOOL), *paths],
+                              capture_output=True, text=True)
+        merged = proc.stdout + proc.stderr
+    rates = [line for line in merged.splitlines() if "fps average" in line]
+    if len(rates) != 2:
+        failures.append(f"case 9: expected one report per log, got {len(rates)}: {merged!r}")
+    else:
+        if "60.0 fps" not in rates[0] or "30.0 fps" not in rates[1]:
+            failures.append(f"case 9: per-log rates were merged or reordered: {rates!r}")
+
     if failures:
         print("FAILURES:")
         for failure in failures:

@@ -679,7 +679,8 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
 namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
 
 namespace {
-// Seconds since the first evlog event, for the pacing reports. A flip line without a timestamp
+// Seconds since the first FLIP event (this counter's own first call, not the first evlog
+// line of any kind), for the pacing reports. A flip line without a timestamp
 // records THAT a flip happened but not WHEN, so the interval distribution -- the thing that
 // separates a hard pacer from a tick-quantized wait from work-bound production -- cannot be
 // formed at all. flip_pacing_report.py has always read a t= field here and this emitter never
@@ -780,8 +781,8 @@ HLE(g_vo_set_flip_rate) {
 HLE(g_vo_submitflip)  {
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
-    if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
-        (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
+    if (evlog()) fprintf(stderr, "[ev] SubmitFlip t=%.6f handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
+                         evlog_seconds(), (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
     const int32_t buffer_index = (int32_t)a1;
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
