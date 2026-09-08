@@ -201,6 +201,8 @@ int run_case(int argc, char** argv) {
             r.gpu_addr = reinterpret_cast<uint64_t>(binding == 4 ? source.data() : destination.data());
             resources.resources.push_back(r);
         }
+        const uint64_t output_images =
+            std::getenv("PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP") ? 2 : 1;
         const auto before = gpu_retile_recordings().load();
         for (uint32_t round = 0; round < 3; ++round) {
             fill(source_linear, 7 + round * 31);
@@ -234,6 +236,12 @@ int run_case(int argc, char** argv) {
                     ++matching_views;
             check(reflection.ok() && matching_views == 2,
                   "both storage views reflect the intended ordinary or array shader type");
+            const auto* source_access = find_spirv_descriptor_binding(reflection, 0, 4);
+            const auto* destination_access = find_spirv_descriptor_binding(reflection, 0, 5);
+            check(reflection.storage_image_writes_complete && source_access && destination_access &&
+                      source_access->readable && !source_access->writable && !source_access->atomic_access &&
+                      destination_access->writable,
+                  "complete reflection proves one read-only source and one writable destination");
             item.launch.threads_x = item.launch.local_x = 64;
             item.launch.local_y = item.launch.local_z = 1;
             item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
@@ -257,11 +265,11 @@ int run_case(int argc, char** argv) {
                 return failures ? 1 : 0;
             }
             check(executed, "partial guest image copy executes through live Vulkan");
-            check(gpu_retile_recordings().load() - retile_before == (!gpu ? 0 : inject ? 1 : 2),
-                  "both storage images take the selected GPU/CPU path, including the destination");
+            check(gpu_retile_recordings().load() - retile_before == (!gpu ? 0 : output_images - (inject ? 1 : 0)),
+                  "every actual output takes the selected GPU/CPU path");
             if (code == 0x34070000 && round == 0 && !inject)
-                check(backend_host_read_barrier_count().load() - barriers_before == (gpu ? 4 : 2),
-                      "first dispatch records host availability for both linear and both tiled results");
+                check(backend_host_read_barrier_count().load() - barriers_before == output_images * (gpu ? 2 : 1),
+                      "first dispatch records host availability for every linear and tiled output");
             for (uint32_t lane : coordinates) {
                 const uint32_t x = lane + first_x;
                 std::copy_n(source_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe,
@@ -277,7 +285,7 @@ int run_case(int argc, char** argv) {
         std::printf("mode=%u bpe=%u format=%u extent=%ux%u resource-dim=%u instruction-dim=%u GPU retile dispatches=%llu\n",
             mode, format.bpe, unsigned(format.format), width, height, resource_dim, instruction_dim,
             static_cast<unsigned long long>(gpu_retile_recordings().load() - before));
-        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + (fault_mode ? 5 : 6),
+        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + 3 * output_images - (fault_mode ? 1 : 0),
               !gpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
         if (fault_mode) return failures ? 1 : 0;
         code += 16;

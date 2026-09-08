@@ -1089,6 +1089,10 @@ struct DescriptorValidationIssue {
 struct DescriptorValidationReport {
     std::vector<SpirvDescriptorBinding> descriptors;
     std::vector<DescriptorValidationIssue> issues;
+    // Negative-write proof for storage-image output omission, separate from descriptor discovery.
+    // Every image write must resolve to a storage descriptor; texel pointers conservatively veto
+    // the proof because their atomic/pointer provenance is not fully tracked by this reflector.
+    bool storage_image_writes_complete = false;
     bool ok() const;
 };
 

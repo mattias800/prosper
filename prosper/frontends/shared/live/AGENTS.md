@@ -108,6 +108,27 @@ notification, source validation/watch rearming and provenance. Those last two ha
 `source_validation_ms` and `provenance_ms` fields. Use the existing dispatch phase totals for the
 remaining setup checks and loop overhead; do not claim the sum of owner timers covers all setup.
 
+## Read-only storage images
+
+Storage descriptor class does not imply an output. Omit output staging, masks, retile, comparisons,
+writeback and output authority only when the entire exact alias group is readable, non-writable
+and non-atomic, and reflection proves it accounted for every image store in the module. Unknown
+image-write provenance or any image texel pointer keeps the conservative output path.
+`PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP=1` restores that path for comparisons.
+
+A native read-only input may retain validated input content after completion, before other guest
+outputs invalidate it. A changed input must discard both CPU and GPU result baselines from previous
+writers: otherwise writer A, read-only upload B, writer A can incorrectly leave B in guest memory.
+Read-only input retention never publishes a new producer result or resets DCC metadata. The
+`storage_readonly` execution test checks bytes, dependent shader reads, architectural notifications,
+recorded host dependencies, alias writers, unknown write provenance, and both baseline kinds.
+
+`PROSPER_COMPUTE_IMAGE_TIMING=1` enables `compute-storage-access` records; add
+`PROSPER_COMPUTE_TIMING_CAPTURE_ONLY=1` to limit them to F8. They include whole-group access, proof,
+writeback obligation and actual staging bytes for each unique materialized storage owner, including owners whose output
+comparison later finds an identical result. These are preparation records, not completion or timing
+measurements. Join submit/dispatch/order/program identity with completed dispatch records.
+
 ## Untouched storage pixels
 
 A previous dispatch's coverage cannot authorize discarding current inputs. Native images retain

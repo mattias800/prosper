@@ -1030,6 +1030,8 @@ int main() {
               atomic_image_report.descriptors[0].texel_access &&
               !atomic_image_report.descriptors[0].storage_float,
           "image-texel-pointer atomic reflects an exact readable+writable integer storage image");
+    CHECK(!atomic_image_report.storage_image_writes_complete,
+          "image texel pointers conservatively veto storage-image writeback omission");
     CHECK(atomic_image_report.descriptors.size() == 1 &&
               atomic_image_report.descriptors[0].storage_image_format == kSpirvImageFormatR32ui,
           "typed storage-image reflection preserves the exact SPIR-V image format");

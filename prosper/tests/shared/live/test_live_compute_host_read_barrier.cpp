@@ -247,19 +247,22 @@ int main() {
         CHECK(!image_spirv.empty(), "the storage-image fixture recompiles");
         // Derive the expectation instead of hardcoding it. The VALU shell this fixture uses also
         // binds its own writable output buffer, so the dispatch has BOTH producers: one shader
-        // write into a storage buffer and one transfer write into each storage image's staging
-        // buffer. Both storage images are copied back regardless of shader writability, because the
-        // guest writeback maps and reads both.
+        // write into a storage buffer and one transfer write into the writable image's staging
+        // buffer. The separately bound read-only source needs no result transfer or host read.
         const DescriptorValidationReport image_report = validate_spirv_descriptor_interface(
             image_spirv, &table, 0, SpirvShaderStage::Compute, false);
         const uint64_t expected_image_barriers = static_cast<uint64_t>(std::count_if(
             image_report.descriptors.begin(), image_report.descriptors.end(),
             [](const SpirvDescriptorBinding& binding) {
-                return binding.kind == SpirvDescriptorKind::StorageImage ||
-                       (binding.kind == SpirvDescriptorKind::StorageBuffer && binding.writable);
+                return (binding.kind == SpirvDescriptorKind::StorageImage ||
+                        binding.kind == SpirvDescriptorKind::StorageBuffer) && binding.writable;
             }));
-        CHECK(image_report.ok() && expected_image_barriers == 3,
-              "the storage-image fixture reflects two storage images and one writable buffer");
+        const auto* source_binding = find_spirv_descriptor_binding(image_report, 0, 4);
+        CHECK(image_report.ok() && image_report.storage_image_writes_complete &&
+                  source_binding && source_binding->kind == SpirvDescriptorKind::StorageImage &&
+                  source_binding->readable && !source_binding->writable &&
+                  expected_image_barriers == 2,
+              "the fixture proves a read-only image plus writable image and buffer outputs");
         if (!image_spirv.empty()) {
             ComputeItem image_item;
             image_item.spirv = image_spirv;

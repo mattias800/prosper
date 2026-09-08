@@ -3120,6 +3120,19 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      add_executable(test_storage_readonly tests/gpu/execute/test_storage_readonly.cpp)
+      target_include_directories(test_storage_readonly PRIVATE tests frontends)
+      target_link_libraries(test_storage_readonly PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_readonly COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP
+               PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+               $<TARGET_FILE:test_storage_readonly>)
+      add_test(NAME storage_readonly_control COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP=1
+               PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+               $<TARGET_FILE:test_storage_readonly> --control)
+      set_tests_properties(storage_readonly storage_readonly_control PROPERTIES TIMEOUT 60)
+
       add_executable(test_storage_rtt_gpu_seed tests/gpu/execute/test_storage_rtt_gpu_seed.cpp)
       target_include_directories(test_storage_rtt_gpu_seed PRIVATE tests frontends)
       target_link_libraries(test_storage_rtt_gpu_seed PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
@@ -3458,6 +3471,9 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   add_test(NAME gpu_retile_allocation_fallback COMMAND test_gpu_retile --alloc-oom)
   add_test(NAME gpu_retile_mapping_fallback COMMAND test_gpu_retile --map-oom)
   add_test(NAME gpu_retile_mixed COMMAND test_gpu_retile --mixed)
+  add_test(NAME gpu_retile_mixed_writeback_control COMMAND ${CMAKE_COMMAND} -E env
+           PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP=1 $<TARGET_FILE:test_gpu_retile> --mixed)
+  set_tests_properties(gpu_retile_mixed_writeback_control PROPERTIES TIMEOUT 60)
   add_test(NAME gpu_retile_volume COMMAND test_gpu_retile --volume)
   add_test(NAME gpu_retile_volume_cpu COMMAND test_gpu_retile --volume-cpu)
   add_test(NAME gpu_retile_volume_allocation_fallback COMMAND test_gpu_retile --volume-alloc-oom)

@@ -30,6 +30,7 @@ struct StorageImageAliasGroup {
     bool atomic = false;
 
     bool write_only() const { return writable && !readable && !atomic; }
+    bool read_only() const { return readable && !writable && !atomic; }
 };
 
 struct StorageImageAliasPlan {

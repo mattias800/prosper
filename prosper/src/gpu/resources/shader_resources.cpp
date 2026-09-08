@@ -1035,8 +1035,22 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         if (normalized) normalized_sample_vars.insert(origin->second);
         else texel_access_vars.insert(origin->second);
     };
+    report.storage_image_writes_complete = true;
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
+        // A missing writable flag is not proof of no stores: copied/selected/called image objects
+        // can escape image_objects. Preserve normal reflection, but never omit output on that
+        // evidence. Any texel pointer vetoes the optimization, covering all atomic pointer forms.
+        if (in.opcode == OpImageTexelPointer)
+            report.storage_image_writes_complete = false;
+        if (in.opcode == 99u /* OpImageWrite */) {
+            const auto origin = n ? image_objects.find(word(in, 0)) : image_objects.end();
+            const auto descriptor = origin == image_objects.end()
+                ? descriptor_vars.end() : descriptor_vars.find(origin->second);
+            if (descriptor == descriptor_vars.end() ||
+                descriptor->second != SpirvDescriptorKind::StorageImage)
+                report.storage_image_writes_complete = false;
+        }
         if (in.opcode == OpImageTexelPointer && n >= 5) {
             // Unlike OpImageRead/Write, this instruction consumes the storage-image descriptor
             // variable directly and returns a pointer in the Image storage class. Preserve that
