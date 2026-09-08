@@ -65,8 +65,9 @@ ROUTE_GATED = {
 
 # Titles on the renderer's native-wave32 allowlist (live_renderer.cpp:1216 -> render_runner.h:7140).
 # On these, a fragment shader whose reason set is exactly wave-any is ADMITTED and logs the admit
-# line rather than the skip line, so this tool cannot see that class here AT ALL -- not with a longer
-# window and not with a route. Kept in step with capture_wave_census.py's NATIVE_VOTE_ALLOWLIST.
+# line rather than the skip line, so it never appears in the REFUSED column here -- not with a
+# longer window and not with a route. It is counted, in the ADMITTED column. Kept in step with
+# capture_wave_census.py's NATIVE_VOTE_ALLOWLIST and pinned by test_skip_survey.py.
 NATIVE_VOTE_ALLOWLIST = ("PPSA04263",)
 
 # Both patterns are pinned to the emitter's format strings by test_skip_survey.py, which greps the
@@ -202,10 +203,15 @@ def main() -> int:
     print("it renders the thing that would have been refused -- GTA V reported 0 over 5160 frames")
     print("while its world refuses 21 (#3464), because the window reached only its menus. (2) On an")
     print("ALLOWLISTED title a wave-any shader is admitted and logs the admit line instead of a skip")
-    print("line, so that class is invisible here at any route and any window -- and wave-any is the")
-    print("class every hit in this corpus belongs to.")
-    print("Counts are DISTINCT SHADERS, never draws -- the renderer's message is inside a")
-    print("shader-identity dedupe guard and the draw drop is outside it.")
+    print("line, so it is counted in the ADMITTED column and never the refused one, at any route")
+    print("and any window -- and wave-any is the class every hit in this corpus belongs to.")
+    print("Counts are SHADERS, never draws -- the renderer's message is inside a "
+          "shader-identity")
+    print("dedupe guard and the draw drop is outside it. They are UPPER BOUNDS on distinct "
+          "shaders:")
+    print("fs= is a compile-instance key, not a content hash, so one program compiled twice "
+          "counts")
+    print("twice -- and they are in different units from capture_wave_census.py, which keys on content.")
 
     if args.json:
         Path(args.json).write_text(json.dumps(
