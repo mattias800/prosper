@@ -1,12 +1,21 @@
 #include "gpu/capture/gpu_capture_bundle.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace prosper::gpu {
 namespace {
@@ -18,11 +27,33 @@ constexpr uint32_t kMaxChunks = 1u << 20;
 constexpr uint32_t kMaxSubmits = 4096;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 
+// The chunk store already owns the payload. Serialize directly to the temporary file;
+// retaining another whole-file vector would double resident payload and copy it on growth.
 struct Writer {
-    std::vector<uint8_t> data;
-    void raw(const void* p, size_t n) {
-        if (!n) return;
-        const auto* b = static_cast<const uint8_t*>(p); data.insert(data.end(), b, b + n);
+    std::ofstream& file;
+    std::string& error;
+    uint64_t written = 0;
+    uint64_t hash = 1469598103934665603ull; // Preserve the historical bundle checksum basis.
+    bool valid = true;
+
+    bool good() const { return valid; }
+    void raw(const void* p, size_t n, bool trailer = false) {
+        if (!valid || !n) return;
+        const uint64_t limit = kMaxFileBytes - (trailer ? 0 : sizeof(uint64_t));
+        if (written > limit || n > limit - written ||
+            n > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+            error = "bundle exceeds 4 GiB"; valid = false; return;
+        }
+        if (!trailer) {
+            const auto* bytes = static_cast<const uint8_t*>(p);
+            for (size_t i = 0; i < n; ++i) {
+                hash ^= bytes[i];
+                hash *= 1099511628211ull;
+            }
+        }
+        file.write(static_cast<const char*>(p), static_cast<std::streamsize>(n));
+        if (!file) { error = "cannot write bundle temporary file"; valid = false; return; }
+        written += n;
     }
     void u32(uint32_t v) {
         uint8_t b[4]; for (int i = 0; i < 4; ++i) b[i] = static_cast<uint8_t>(v >> (i * 8)); raw(b, 4);
@@ -30,7 +61,17 @@ struct Writer {
     void u64(uint64_t v) {
         uint8_t b[8]; for (int i = 0; i < 8; ++i) b[i] = static_cast<uint8_t>(v >> (i * 8)); raw(b, 8);
     }
-    void bytes(const std::vector<uint8_t>& v) { u32(static_cast<uint32_t>(v.size())); raw(v.data(), v.size()); }
+    void bytes(const std::vector<uint8_t>& v) {
+        if (v.size() > UINT32_MAX) {
+            error = "bundle chunk exceeds length field"; valid = false; return;
+        }
+        u32(static_cast<uint32_t>(v.size())); raw(v.data(), v.size());
+    }
+    void finish() {
+        uint8_t b[8];
+        for (int i = 0; i < 8; ++i) b[i] = static_cast<uint8_t>(hash >> (i * 8));
+        raw(b, sizeof(b), true); // The trailer is excluded from its own checksum.
+    }
 };
 
 struct Reader {
@@ -52,20 +93,64 @@ struct Reader {
     }
 };
 
-bool install_file(const std::string& path, const std::vector<uint8_t>& bytes, std::string& error) {
-    std::filesystem::path target(path), temp = target; temp += ".tmp";
-    std::error_code ec;
-    if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path(), ec);
-    std::ofstream file(temp, std::ios::binary | std::ios::trunc);
-    if (!file || !file.write(reinterpret_cast<const char*>(bytes.data()),
-                             static_cast<std::streamsize>(bytes.size()))) {
-        error = "cannot write bundle temporary file"; return false;
+struct TemporaryBundleFile {
+    std::filesystem::path target;
+    std::filesystem::path directory;
+    std::filesystem::path payload;
+    std::ofstream file;
+
+    explicit TemporaryBundleFile(const std::string& path) : target(path) {}
+    ~TemporaryBundleFile() {
+        if (file.is_open()) file.close();
+        if (!directory.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory, ignored);
+        }
     }
-    file.close(); std::filesystem::rename(temp, target, ec);
-    if (ec) { std::filesystem::remove(target, ec); ec.clear(); std::filesystem::rename(temp, target, ec); }
-    if (ec) { error = "cannot install bundle: " + ec.message(); return false; }
-    return true;
-}
+    bool open(std::string& error) {
+        std::error_code ec;
+        if (target.has_parent_path()) {
+            std::filesystem::create_directories(target.parent_path(), ec);
+            if (ec) { error = "cannot create bundle directory: " + ec.message(); return false; }
+        }
+        // Reserve a private sibling, also across processes. Never truncate another writer's
+        // temporary file, and never remove the existing destination to make replacement succeed.
+        static std::atomic<uint64_t> serial{0};
+        for (unsigned attempt = 0; attempt < 16; ++attempt) {
+            auto candidate = target;
+            candidate += ".tmp-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+                std::to_string(serial.fetch_add(1, std::memory_order_relaxed));
+            if (std::filesystem::create_directory(candidate, ec)) {
+                directory = std::move(candidate);
+                break;
+            }
+            if (ec) { error = "cannot reserve bundle temporary: " + ec.message(); return false; }
+        }
+        if (directory.empty()) { error = "cannot reserve bundle temporary"; return false; }
+        payload = directory / "bundle";
+        file.open(payload, std::ios::binary | std::ios::trunc);
+        if (!file) { error = "cannot open bundle temporary file"; return false; }
+        return true;
+    }
+    bool install(std::string& error) {
+        file.flush();
+        const bool flushed = static_cast<bool>(file);
+        file.close();
+        if (!flushed || !file) { error = "cannot finish bundle temporary file"; return false; }
+#ifdef _WIN32
+        if (!MoveFileExW(payload.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            error = "cannot install bundle: Windows error " + std::to_string(GetLastError());
+            return false;
+        }
+#else
+        std::error_code ec;
+        std::filesystem::rename(payload, target, ec);
+        if (ec) { error = "cannot install bundle: " + ec.message(); return false; }
+#endif
+        return true;
+    }
+};
 
 uint64_t gear_value(uint8_t byte) {
     uint64_t value = static_cast<uint64_t>(byte) + 0x9e3779b97f4a7c15ull;
@@ -549,16 +634,22 @@ bool write_gpu_capture_bundle(const std::string& path, const GpuCaptureBundle& b
         bundle.submits.size() > kMaxSubmits || bundle.version < 1 || bundle.version > kVersion) {
         error = "invalid bundle structure"; return false;
     }
-    Writer writer; writer.raw(kMagic, sizeof(kMagic)); writer.u32(bundle.version); writer.u32(kEndian);
+    TemporaryBundleFile temporary(path);
+    if (!temporary.open(error)) return false;
+    Writer writer{temporary.file, error};
+    writer.raw(kMagic, sizeof(kMagic)); writer.u32(bundle.version); writer.u32(kEndian);
     writer.u32(bundle.chunk_bytes); writer.u64(bundle.logical_bytes);
     writer.u32(static_cast<uint32_t>(bundle.chunks.size()));
+    if (!writer.good()) return false;
     for (size_t i = 0; i < bundle.chunks.size(); ++i) {
         const uint64_t hash = gpu_capture_hash(bundle.chunks[i]);
         if (bundle.chunk_hashes[i] != hash) { error = "bundle chunk hash mismatch"; return false; }
         writer.u64(hash); writer.bytes(bundle.chunks[i]);
+        if (!writer.good()) return false;
     }
     if (bundle.version >= 2) {
         writer.u32(static_cast<uint32_t>(bundle.resources.size()));
+        if (!writer.good()) return false;
         for (const auto& resource : bundle.resources) {
             bool valid = false;
             const uint64_t hash = resource_hash(bundle, resource, valid);
@@ -569,16 +660,19 @@ bool write_gpu_capture_bundle(const std::string& path, const GpuCaptureBundle& b
             writer.u64(hash);
             writer.u64(resource.logical_bytes);
             writer.u32(static_cast<uint32_t>(resource.chunk_indices.size()));
+            if (!writer.good()) return false;
             for (uint32_t index : resource.chunk_indices) {
                 if (index >= bundle.chunks.size()) {
                     error = "bundle resource references an invalid chunk";
                     return false;
                 }
                 writer.u32(index);
+                if (!writer.good()) return false;
             }
         }
     }
     writer.u32(static_cast<uint32_t>(bundle.submits.size()));
+    if (!writer.good()) return false;
     for (const auto& submit : bundle.submits) {
         uint64_t reconstructed_bytes = 0;
         for (uint32_t index : submit.chunk_indices) {
@@ -598,9 +692,11 @@ bool write_gpu_capture_bundle(const std::string& path, const GpuCaptureBundle& b
         writer.u64(submit.submit_index); writer.u64(submit.logical_bytes);
         if (bundle.version >= 2) writer.u64(submit.manifest_bytes);
         writer.u32(static_cast<uint32_t>(submit.chunk_indices.size()));
+        if (!writer.good()) return false;
         for (uint32_t index : submit.chunk_indices) {
             if (index >= bundle.chunks.size()) { error = "bundle references an invalid chunk"; return false; }
             writer.u32(index);
+            if (!writer.good()) return false;
         }
         if (bundle.version >= 2) {
             if (submit.blob_resource_indices.size() != submit.blob_bytes_read.size()) {
@@ -615,6 +711,7 @@ bool write_gpu_capture_bundle(const std::string& path, const GpuCaptureBundle& b
                 }
                 writer.u32(submit.blob_resource_indices[i]);
                 writer.u64(submit.blob_bytes_read[i]);
+                if (!writer.good()) return false;
                 if (reconstructed_bytes > UINT64_MAX -
                         bundle.resources[submit.blob_resource_indices[i]].logical_bytes) {
                     error = "bundle submit logical size overflow";
@@ -624,15 +721,14 @@ bool write_gpu_capture_bundle(const std::string& path, const GpuCaptureBundle& b
                     bundle.resources[submit.blob_resource_indices[i]].logical_bytes;
             }
         }
+        if (!writer.good()) return false;
         if (reconstructed_bytes != submit.logical_bytes) {
             error = "bundle submit logical size mismatch";
             return false;
         }
     }
-    const uint64_t manifest_hash = gpu_capture_hash(writer.data);
-    writer.u64(manifest_hash);
-    if (writer.data.size() > kMaxFileBytes) { error = "bundle exceeds 4 GiB"; return false; }
-    return install_file(path, writer.data, error);
+    writer.finish();
+    return writer.good() && temporary.install(error);
 }
 
 bool read_gpu_capture_bundle(const std::string& path, GpuCaptureBundle& bundle,

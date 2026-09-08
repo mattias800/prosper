@@ -21,3 +21,16 @@ resource's `host_data` at a different buffer must reset that field with it.
 
 **A manifest strips payloads by design.** Validators and consumers must not assume a referenced
 payload is present; several were fixed for dereferencing exactly what the manifest omits.
+
+
+**Bundle serialization keeps only the owned chunk store in memory.** `write_gpu_capture_bundle`
+streams the existing v1/v2 layout into a private temporary file and computes its trailing checksum
+incrementally. Keep the historical checksum basis and exclude the trailer from its own hash. Preserve
+chunk/resource integrity checks and the complete-file size bound; removing a duplicate allocation
+does not authorize raising collection limits.
+
+Install only after successful writes, flush and close. Failed validation or I/O must preserve an
+existing destination and clean only this writer's private temporary. Concurrent writers may replace
+one another with complete valid files; they must never share a truncatable temporary or delete the
+previous destination to recover from a failed rename. The collector retains payload ownership until
+the asynchronous writer completes, including failure and shutdown.
