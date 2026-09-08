@@ -3084,6 +3084,27 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      add_executable(test_near_full_storage_authority
+                     tests/gpu/execute/test_near_full_storage_authority.cpp)
+      target_include_directories(test_near_full_storage_authority PRIVATE tests frontends)
+      target_link_libraries(test_near_full_storage_authority PRIVATE
+                           prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME near_full_storage_authority COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK
+               $<TARGET_FILE:test_near_full_storage_authority>)
+      add_test(NAME near_full_storage_authority_export COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK=1
+               $<TARGET_FILE:test_near_full_storage_authority>)
+      add_test(NAME near_full_storage_full_transition_default COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK
+               $<TARGET_FILE:test_near_full_storage_authority> full-transition)
+      add_test(NAME near_full_storage_full_transition COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK=1
+               $<TARGET_FILE:test_near_full_storage_authority> full-transition)
+      set_tests_properties(near_full_storage_authority near_full_storage_authority_export
+                           near_full_storage_full_transition
+                           near_full_storage_full_transition_default PROPERTIES TIMEOUT 60)
+
       if(Python3_Interpreter_FOUND)
         add_executable(test_compute_buffer_timing tests/gpu/execute/test_compute_buffer_timing.cpp)
         target_include_directories(test_compute_buffer_timing PRIVATE tests frontends)
