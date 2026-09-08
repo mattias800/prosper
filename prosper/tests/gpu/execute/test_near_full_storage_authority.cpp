@@ -44,7 +44,8 @@ ComputeItem item(const std::vector<uint32_t>& code, const ShaderResourceTable& r
 
 int main(int argc, char** argv) {
     const bool full_transition = argc == 2 && std::strcmp(argv[1], "full-transition") == 0;
-    if (argc != 1 && !full_transition) return 2;
+    const bool replacement = argc == 2 && std::strcmp(argv[1], "program-replacement") == 0;
+    if (argc != 1 && !full_transition && !replacement) return 2;
     std::vector<uint32_t> guest(texels), observed(texels, 0xccccccccu);
     for (uint32_t i = 0; i < texels; ++i) guest[i] = 0xabc00000u + i;
     ShaderResource image{};
@@ -110,7 +111,7 @@ int main(int argc, char** argv) {
     check(!producer.spirv.empty() && !consumer.spirv.empty(), "both actual shaders recompile");
     if (producer.spirv.empty() || consumer.spirv.empty()) return 1;
 
-    auto consume = [&] {
+    auto consume = [&](bool require_retained = true) {
         std::fill(observed.begin(), observed.end(), 0xccccccccu);
         unsigned calls = 0;
         bool all_ok = true;
@@ -127,8 +128,9 @@ int main(int argc, char** argv) {
             }, 1, 1);
         check(result.compute_executed && calls == 2 && all_ok,
               "producer and real sampled-to-SSBO consumer execute in order");
-        check(prosper::frontend::live_compute_storage_transfer_seeds() > before,
-              "consumer seeds from the retained GPU image rather than the guest fallback");
+        if (require_retained)
+            check(prosper::frontend::live_compute_storage_transfer_seeds() > before,
+                  "consumer seeds from the retained GPU image rather than the guest fallback");
     };
     auto pixels = [&](uint32_t cutout, const char* message) {
         check(observed[0] == cutout, message);
@@ -136,6 +138,33 @@ int main(int argc, char** argv) {
                           [](uint32_t value) { return value == stored; }),
               "all 1023 written texels reach the independent SSBO consumer");
     };
+    if (replacement) {
+        constexpr uint32_t full_value = 0x31415926u, changed_cutout = 0x2468ace0u;
+        const auto partial = producer;
+        auto full_code = writer;
+        full_code.erase(std::find(full_code.begin(), full_code.end(), 0x7daa0880u));
+        full_code[2] = full_value;
+        producer = item(full_code, producer_resources, partial.code_addr, 1);
+        check(producer.spirv != partial.spirv, "replacement changes the executable module");
+        check(prosper::frontend::execute_live_compute_items({producer}),
+              "full writer proves coverage before any partial writer uses its key");
+        consume();
+        check(std::all_of(observed.begin(), observed.end(),
+                          [](uint32_t value) { return value == full_value; }),
+              "identical full program remains correct on a warm proof");
+        guest[0] = changed_cutout;
+        producer = partial; // Same code address, binding, extent and alias membership.
+        // A fresh partial proof repairs guest bytes and invalidates the poisoned GPU
+        // image. The real GPU reader must see the repair, including via a fresh upload.
+        consume(false);
+        std::printf("program replacement witness: guest=%08x GPU=%08x expected=%08x\n",
+                    guest[0], observed[0], changed_cutout);
+        pixels(changed_cutout, "replacement preserves the newly changed input cutout");
+        check(guest[0] == changed_cutout, "replacement preserves the architectural guest cutout");
+        consume();
+        pixels(changed_cutout, "identical partial program remains correct on a warm proof");
+        return failures ? 1 : 0;
+    }
     // Proving can restore untouched guest texels after a poison run. Warm outside
     // the consumer scope first, then require real GPU transfer on every check.
     for (unsigned warm = 0; warm < 3; ++warm)

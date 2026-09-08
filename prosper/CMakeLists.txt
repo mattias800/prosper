@@ -3101,9 +3101,45 @@ if(TARGET prosper_core)
       add_test(NAME near_full_storage_full_transition COMMAND ${CMAKE_COMMAND} -E env
                PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK=1
                $<TARGET_FILE:test_near_full_storage_authority> full-transition)
+      add_test(NAME storage_seed_program_replacement COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_SKIP_SEED --unset=PROSPER_VERIFY_SEED_SKIP
+               PROSPER_SEED_REPROVE=256
+               $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+      add_test(NAME storage_seed_program_replacement_seeded COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_SKIP_SEED=1
+               $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+      add_executable(test_seed_coverage_dynamic tests/gpu/execute/test_seed_coverage_dynamic.cpp)
+      target_include_directories(test_seed_coverage_dynamic PRIVATE tests frontends)
+      target_link_libraries(test_seed_coverage_dynamic PRIVATE
+                           prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_seed_launch COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_SKIP_SEED --unset=PROSPER_VERIFY_SEED_SKIP
+               PROSPER_SEED_REPROVE=256 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
+      add_test(NAME storage_seed_launch_seeded COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_SKIP_SEED=1 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
+      # The default unchanged-program mask reproducer remains unresolved in #3467.
+      # Register its correct explicit-seed control; never accept corruption as a passing test.
+      add_test(NAME storage_seed_mask_seeded COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_SKIP_SEED=1 $<TARGET_FILE:test_seed_coverage_dynamic> mask)
+      set_tests_properties(storage_seed_launch storage_seed_launch_seeded
+                           storage_seed_mask_seeded PROPERTIES TIMEOUT 60)
+      if(Python3_Interpreter_FOUND)
+        add_test(NAME storage_seed_program_reuse
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
+                         $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+        add_test(NAME storage_seed_launch_reuse
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
+                         $<TARGET_FILE:test_seed_coverage_dynamic> launch)
+        set_tests_properties(storage_seed_program_reuse storage_seed_launch_reuse
+                             PROPERTIES TIMEOUT 60)
+      endif()
       set_tests_properties(near_full_storage_authority near_full_storage_authority_export
                            near_full_storage_full_transition
-                           near_full_storage_full_transition_default PROPERTIES TIMEOUT 60)
+                           near_full_storage_full_transition_default
+                           storage_seed_program_replacement storage_seed_program_replacement_seeded
+                           PROPERTIES TIMEOUT 60)
 
       if(Python3_Interpreter_FOUND)
         add_executable(test_compute_buffer_timing tests/gpu/execute/test_compute_buffer_timing.cpp)

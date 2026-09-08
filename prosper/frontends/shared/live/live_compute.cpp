@@ -5942,8 +5942,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // re-proves (a hard-coded store bound cannot silently under-cover a bigger extent). What this key
     // does NOT catch is a store whose predicate depends on per-frame INPUT (`if (buffer[gid] > k)
     // store`) that is full on the proving frame but partial later; that residual soundness gap is
-    // tracked in #1127 -- no exercised title shader triggers it, and a shader first seen partial is
-    // cached Partial and always seeds (safe).
+    // tracked in #3467. Program and launch identity below prevent replacement from inheriting a
+    // verdict, but do not prove input independence. A shader first seen partial seeds normally.
     using prosper::frontend::SeedCoverage;
     using prosper::frontend::classify_seed_coverage;
     using prosper::frontend::classify_near_full_coverage;
@@ -5960,6 +5960,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         uint32_t skips = 0;
         uint64_t written_layers = ~0ULL;
         bool near_full = false;
+        // The guest code address can be reused or recompiled with different lowering.
+        // Own the effective module: item storage and pipeline-cache entries can expire.
+        // Exact bytes, rather than a hash alone, authorize reuse of every verdict kind.
+        std::vector<uint32_t> program;
+        uint32_t subgroup_size = 0;
+        uint32_t required_subgroup_size = 0;
+        std::array<uint32_t, 3> groups{};
     };
     // Coverage was observed over the shared image, so its writer membership is part of the proof.
     // Splitting a previously full-coverage alias group can leave the owner only partially written.
@@ -7289,7 +7296,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 {
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     auto it = seed_coverage_proof.find(proof_key);
-                    if (it != seed_coverage_proof.end()) {
+                    if (it != seed_coverage_proof.end() &&
+                        it->second.program == spirv &&
+                        it->second.subgroup_size == effective_subgroup &&
+                        it->second.required_subgroup_size == item.required_subgroup_size &&
+                        it->second.groups == std::array<uint32_t, 3>{
+                            dispatch_groups[0], dispatch_groups[1], dispatch_groups[2]}) {
                         known = true;
                         proven_full = it->second.cov == SeedCoverage::Full;
                         proven_none = it->second.cov == SeedCoverage::None;
@@ -11029,7 +11041,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
-                    seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0, written_layers, near_full };
+                    // Replace this logical key's old executable, rather than accumulating an
+                    // entry for every module ever compiled at the same guest address. Launch
+                    // geometry matters even when the total invocation count is unchanged.
+                    seed_coverage_proof[proof_key] = SeedVerdict{
+                        cov, 0, written_layers, near_full, spirv, effective_subgroup,
+                        item.required_subgroup_size,
+                        {dispatch_groups[0], dispatch_groups[1], dispatch_groups[2]}};
                 }
                 if (survived == 0) {
                     std::fprintf(stderr,
