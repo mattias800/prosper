@@ -39,13 +39,15 @@ void check(bool ok, const char *message) {
     }
 }
 ComputeItem item(const std::vector<uint32_t> &code, const ShaderResourceTable &resources,
-                 uint64_t address, uint32_t index) {
+                 uint64_t address, uint32_t index, bool include_rgba16 = false) {
     ComputeShaderConfig config;
     config.user_sgprs.resize(24);
     config.local_x = width;
     config.local_y = config.local_z = 1;
     config.tidig_comp_cnt = 0;
     config.native_storage_format_support = native_storage_format_support_bit(DataFormat::Uint32, 1);
+    if (include_rgba16)
+        config.native_storage_format_support |= native_storage_format_support_bit(DataFormat::Float16, 4);
     ComputeItem result;
     result.spirv = recompile_compute(code.data(), code.size(), &resources, config);
     result.user_sgprs = config.user_sgprs;
@@ -84,6 +86,7 @@ struct Fixture {
     std::vector<uint32_t> guest = std::vector<uint32_t>(texels + 16, 0xccccccccu);
     std::vector<uint32_t> other = std::vector<uint32_t>(texels + 16, 0xeeeeeeeeu);
     std::vector<uint32_t> observed = std::vector<uint32_t>(texels, 0xdeadbeefu);
+    std::vector<uint32_t> observed_b = std::vector<uint32_t>(texels + 16, 0xdeadbeefu);
     ShaderResource a{}, b{};
     bool overlap, alias, hosted;
     uint32_t noise = 0;
@@ -145,12 +148,15 @@ struct Fixture {
         }
         return result;
     }
-    ShaderResource sampled() {
-        auto r = a;
+    ShaderResource sampled(bool late = false) {
+        auto r = late ? b : a;
         r.cls = ResourceClass::Texture;
+        r.binding = 5;
+        r.sgpr_base = 8;
         return r;
     }
-    ComputeItem reader() {
+    ComputeItem reader(bool late = false) {
+        const auto input = sampled(late);
         ShaderResource output{};
         output.cls = ResourceClass::ConstantBuffer;
         output.binding = 2;
@@ -158,12 +164,12 @@ struct Fixture {
         output.format = DataFormat::Uint32;
         output.num_components = 1;
         output.stride = 4;
-        output.size = texels * 4;
-        output.gpu_addr = reinterpret_cast<uint64_t>(observed.data());
+        output.size = input.width * input.height * 4;
+        output.gpu_addr = reinterpret_cast<uint64_t>(late ? observed_b.data() : observed.data());
         ShaderResourceTable table;
-        table.resources = {output, sampled()};
+        table.resources = {output, input};
         std::vector<uint32_t> code{0x7e080300u};
-        for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t y = 0; y < input.height; ++y)
             code.insert(code.end(), {0x7e0a0280u + y, 0xf0000108u, 0x00020804u, 0xbf8c3f70u,
                                      0xe0702000u | (y * width * 4u), 0x80000804u});
         code.push_back(0xbf810000u);
@@ -181,10 +187,11 @@ struct Fixture {
         check(guest_gpu_writes_since(snapshot, a.gpu_addr, a.size) == GuestGpuWriteQuery::Unknown,
               "overflow arm really exhausts journal authority");
     }
-    void check_graphics(bool expected) {
+    void check_graphics(bool expected, bool late = false) {
+        const auto input = sampled(late);
         prosper::frontend::LiveComputeImageImport imported;
         const bool borrowed =
-            prosper::frontend::import_live_compute_storage_image(sampled(), a.size, imported);
+            prosper::frontend::import_live_compute_storage_image(input, input.size, imported);
         check(borrowed == expected && borrowed == imported.valid(),
               "graphics export requires a current exact result and valid lease");
     }
@@ -236,6 +243,51 @@ struct Fixture {
                           [](uint32_t v) { return v == 0xccccccccu; }),
               "output preserves guest backing tail");
     }
+    void check_b_pixels(uint32_t value) {
+        const size_t count = b.width * b.height;
+        check(std::all_of(observed_b.begin(), observed_b.begin() + count,
+                          [&](uint32_t v) { return v == value; }) &&
+                  std::all_of(observed_b.begin() + count, observed_b.end(),
+                              [](uint32_t v) { return v == 0xdeadbeefu; }),
+              "late B sampled GPU consumer reads every current texel and preserves output tail");
+    }
+    void late_output() {
+        // Dedicated identity: no preceding A sampled cache can satisfy this B consumer.
+        for (uint32_t av : {0x13579bdfu, 0x31415926u}) {
+            constexpr uint32_t bv = 0x2468ace0u;
+            std::vector<uint32_t> expected(texels, av);
+            std::fill_n(expected.begin(), b.width * b.height, bv);
+            std::fill(observed_b.begin(), observed_b.end(), 0xdeadbeefu);
+            unsigned calls = 0;
+            bool ok = true;
+            const auto before = prosper::frontend::live_compute_storage_transfer_seeds();
+            execute_sequence({writer(av, bv), reader(true)},
+                             [&](const std::vector<ComputeItem> &items) {
+                                 ++calls;
+                                 const bool executed = prosper::frontend::execute_live_compute_items(items);
+                                 ok &= executed;
+                                 if (calls == 1) {
+                                     check(std::equal(expected.begin(), expected.end(), guest.begin()),
+                                           "last writer B restores the exact final guest composite");
+                                     prepare_borrow();
+                                     check_graphics(false);
+                                     check_graphics(can_retain(journal == Journal::Overflow), true);
+                                 }
+                                 return executed;
+                             });
+            check(ok && calls == 2, "producer and final B consumer execute");
+            check_b_pixels(bv);
+            // The first B consumer has no sampled allocation to reuse: a retained route must
+            // perform a real storage-to-sampled transfer. Warm output remains checked above.
+            if (av == 0x13579bdfu)
+                check((prosper::frontend::live_compute_storage_transfer_seeds() > before) ==
+                          can_retain(journal == Journal::Overflow),
+                      "last conflict-free B retains the real compute transfer path");
+            check(std::all_of(guest.begin() + texels, guest.end(),
+                              [](uint32_t v) { return v == 0xccccccccu; }),
+                  "last-output regression preserves guest tail");
+        }
+    }
     void prewarm_b(bool host_baseline) {
         const auto before = prosper::frontend::live_compute_image_result_snapshot_bytes();
         if (host_baseline)
@@ -268,36 +320,170 @@ struct Fixture {
         }
         std::fill(guest.begin(), guest.end(),
                   0xffffffffu); // valid all-uncompressed initial metadata
-        std::vector<uint32_t> expected(texels, 0x13579bdfu);
-        std::fill_n(expected.begin(), metadata_bytes / 4, 0xffffffffu);
+        for (uint32_t av : {0x13579bdfu, 0x31415926u}) {
+            // Warm round changes only A. B's pixels are identical, but A overwrites B's
+            // metadata before B's turn, so a result-equality skip must not omit its reset.
+            std::vector<uint32_t> expected(texels, av);
+            std::fill_n(expected.begin(), metadata_bytes / 4, 0xffffffffu);
+            std::fill(observed.begin(), observed.end(), 0xdeadbeefu);
+            std::fill(observed_b.begin(), observed_b.end(), 0xdeadbeefu);
+            unsigned calls = 0;
+            bool ok = true;
+            execute_sequence({writer(av, 0x2468ace0u), reader(), reader(true)},
+                             [&](const std::vector<ComputeItem> &items) {
+                                 ++calls;
+                                 const bool executed =
+                                     prosper::frontend::execute_live_compute_items(items);
+                                 ok &= executed;
+                                 if (calls == 1) {
+                                     check(std::equal(expected.begin(), expected.end(), guest.begin()),
+                                           "cold and warm DCC reset complete the final A composite");
+                                     prepare_borrow();
+                                     check_graphics(false);
+                                     check_graphics(can_retain(journal == Journal::Overflow), true);
+                                 }
+                                 return executed;
+                             });
+            check(ok && calls == 3 && observed == expected,
+                  "sampled A observes overlapping DCC metadata reset in both rounds");
+            check_b_pixels(0x2468ace0u);
+            std::vector<uint32_t> linear(width * b.height);
+            detile_surface(reinterpret_cast<uint8_t *>(linear.data()),
+                           reinterpret_cast<const uint8_t *>(other.data()), width, b.height,
+                           b.tile_mode, 0, 4);
+            check(std::all_of(linear.begin(), linear.end(),
+                              [](uint32_t v) { return v == 0x2468ace0u; }),
+                  "separate DCC pixel owner publishes its own exact output");
+            check(std::all_of(other.begin() + tiled_bytes / 4, other.end(),
+                              [](uint32_t v) { return v == 0xeeeeeeeeu; }) &&
+                      std::all_of(guest.begin() + texels, guest.end(),
+                                  [](uint32_t v) { return v == 0xffffffffu; }),
+                  "DCC output and metadata reset preserve both independent tails");
+            check(std::all_of(advertised_metadata.begin(), advertised_metadata.end(),
+                              [](uint8_t v) { return v == 0x97; }),
+                  "hosted DCC preserves advertised metadata backing");
+            check_graphics(false);
+        }
+    }
+    void late_metadata() {
+        // The first image writes ordinary FP16 magenta and resets DCC to all-0xff.
+        // The later independent image writes a valid DCC_CLEAR_0001 plane, without
+        // touching those pixels. Its final interpretation is black with alpha one.
+        a.format = DataFormat::Float16;
+        a.num_components = 4;
+        a.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        a.compression_enabled = a.write_compress_enabled = a.meta_pipe_aligned = true;
+        a.alpha_is_on_msb = true;
+        const size_t tiled_bytes = tiled_surface_bytes(width, height, a.tile_mode, 0, 8);
+        guest.resize(tiled_bytes / 4 + 16, 0xccccccccu);
+        a.gpu_addr = reinterpret_cast<uint64_t>(guest.data());
+        a.size = tiled_bytes;
+        a.metadata_addr = reinterpret_cast<uint64_t>(other.data());
+        const size_t metadata_bytes = gpu_capture_dcc_metadata_footprint(a);
+        check(metadata_bytes && metadata_bytes <= 65536,
+              "late metadata fixture has a bounded real RGBA16F DCC footprint");
+        if (!metadata_bytes || metadata_bytes > 65536) return;
+        // The metadata writer owns whole rows; its declared padding is real backing,
+        // separate from the guard beyond that writer's exact extent.
+        const size_t metadata_writer_bytes = ((metadata_bytes + width * 4 - 1) / (width * 4)) * width * 4;
+        other.resize(metadata_writer_bytes / 4 + 16, 0xeeeeeeeeu);
+        std::fill_n(other.begin(), metadata_writer_bytes / 4, 0xffffffffu);
+        a.metadata_addr = reinterpret_cast<uint64_t>(other.data());
+        a.dcc_metadata_size = metadata_bytes;
+        b.gpu_addr = a.metadata_addr;
+        b.width = width;
+        b.height = metadata_writer_bytes / (width * 4);
+        b.size = metadata_writer_bytes;
+        ShaderResourceTable producer_table;
+        producer_table.resources = {a, b};
+        std::vector<uint32_t> code{
+            0x7e080300u, 0x7e0002ffu, 0x3f800000u, 0x7e020280u,
+            0x7e0402ffu, 0x3f800000u, 0x7e0602ffu, 0x3f800000u};
+        for (uint32_t y = 0; y < height; ++y)
+            code.insert(code.end(), {0x7e0a0280u + y, 0xf0200f08u, 0x00020004u});
+        code.insert(code.end(), {0x7e0002ffu, 0x40404040u});
+        for (uint32_t y = 0; y < b.height; ++y)
+            code.insert(code.end(), {0x7e0a02ffu, y, 0xf0200108u, 0x00040004u});
+        code.push_back(0xbf810000u);
+        const auto producer = item(code, producer_table, 0x34760005u, 1, true);
+        const auto reflection = validate_spirv_descriptor_interface(
+            producer.spirv, &producer_table, 0, SpirvShaderStage::Compute, false);
+        const auto* first = find_spirv_descriptor_binding(reflection, 0, 5);
+        const auto* last = find_spirv_descriptor_binding(reflection, 0, 6);
+        // Native float storage deliberately uses SPIR-V Format=Unknown; the backend selects
+        // RGBA16F from the guest descriptor. The raw interchange fallback has a Uint sampled type.
+        check(reflection.ok() && reflection.storage_image_writes_complete && first && last &&
+                  first->kind == SpirvDescriptorKind::StorageImage && first->writable && !first->readable &&
+                  first->storage_float && first->image_numeric_class == SpirvImageNumericClass::Float &&
+                  first->storage_image_format == 0 && a.format == DataFormat::Float16 && a.num_components == 4 &&
+                  last->kind == SpirvDescriptorKind::StorageImage && last->writable &&
+                  last->storage_image_format == kSpirvImageFormatR32ui,
+              "late metadata producer has native RGBA16F and R32_UINT image outputs");
+        observed.resize(texels * 4 + 16, 0xdeadbeefu);
+        std::fill(observed.begin(), observed.end(), 0xdeadbeefu);
+        ShaderResource output{};
+        output.cls = ResourceClass::ConstantBuffer;
+        output.binding = 2;
+        output.sgpr_base = 0;
+        output.format = DataFormat::Uint32;
+        output.num_components = 1;
+        output.stride = 16;
+        output.size = texels * 16;
+        output.gpu_addr = reinterpret_cast<uint64_t>(observed.data());
+        ShaderResourceTable consumer_table;
+        consumer_table.resources = {output, sampled()};
+        std::vector<uint32_t> reads{0x7e080300u};
+        for (uint32_t y = 0; y < height; ++y) {
+            reads.insert(reads.end(), {0x7e0a0280u + y, 0xf0000f08u, 0x00020804u,
+                                       0xbf8c3f70u, 0xbe9803ffu, y * width * 16u});
+            for (uint32_t c = 0; c < 4; ++c)
+                reads.insert(reads.end(), {0xe0702000u | (c * 4u),
+                                           0x18000004u | ((8u + c) << 8)});
+        }
+        reads.push_back(0xbf810000u);
+        const auto consumer = item(reads, consumer_table, 0x34760006u, 2);
         unsigned calls = 0;
         bool ok = true;
-        execute_sequence({writer(0x13579bdfu, 0x2468ace0u), reader()},
-                         [&](const std::vector<ComputeItem> &items) {
-                             ++calls;
-                             const bool executed =
-                                 prosper::frontend::execute_live_compute_items(items);
-                             ok &= executed;
-                             if (calls == 1) {
-                                 check(std::equal(expected.begin(), expected.end(), guest.begin()),
-                                       "DCC reset is part of final A composite");
-                                 prepare_borrow();
-                                 check_graphics(false);
-                             }
-                             return executed;
-                         });
-        check(ok && calls == 2 && observed == expected,
-              "sampled A observes overlapping DCC metadata reset");
-        std::vector<uint32_t> linear(width * b.height);
-        detile_surface(reinterpret_cast<uint8_t *>(linear.data()),
-                       reinterpret_cast<const uint8_t *>(other.data()), width, b.height,
-                       b.tile_mode, 0, 4);
-        check(
-            std::all_of(linear.begin(), linear.end(), [](uint32_t v) { return v == 0x2468ace0u; }),
-            "separate DCC pixel owner publishes its own exact output");
-        check(std::all_of(advertised_metadata.begin(), advertised_metadata.end(),
-                          [](uint8_t v) { return v == 0x97; }),
-              "hosted DCC preserves advertised metadata backing");
+        execute_sequence({producer, consumer}, [&](const std::vector<ComputeItem>& items) {
+            ++calls;
+            const bool executed = prosper::frontend::execute_live_compute_items(items);
+            ok &= executed;
+            if (calls == 1) {
+                check(std::all_of(other.begin(), other.begin() + metadata_writer_bytes / 4,
+                                  [](uint32_t v) { return v == 0x40404040u; }),
+                      "last image writes the complete valid DCC clear plane");
+                std::vector<uint16_t> linear(texels * 4);
+                detile_surface(reinterpret_cast<uint8_t*>(linear.data()),
+                               reinterpret_cast<const uint8_t*>(guest.data()),
+                               width, height, a.tile_mode, 0, 8);
+                bool magenta = true;
+                for (size_t i = 0; i < linear.size(); ++i)
+                    magenta &= linear[i] == (i % 4 == 1 ? 0u : 0x3c00u);
+                check(magenta, "metadata-only last writer leaves first image base exactly FP16 magenta");
+                uint8_t clear[4]{}, clear_code = 0;
+                check(prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                          sampled(), true, false, false, clear, 1,
+                          reinterpret_cast<const uint8_t*>(other.data()), metadata_bytes, &clear_code) &&
+                          clear_code == 0x40 && clear[0] == 0 && clear[1] == 0 &&
+                          clear[2] == 0 && clear[3] == 255,
+                      "final metadata has established black/alpha-one semantics");
+                prepare_borrow();
+                check_graphics(false);
+            }
+            return executed;
+        });
+        bool black_alpha_one = true;
+        for (size_t i = 0; i < texels * 4; ++i)
+            black_alpha_one &= observed[i] == (i % 4 == 3 ? 0x3f800000u : 0u);
+        check(ok && calls == 2 && black_alpha_one,
+              "real sampled consumer observes final clear semantics rather than stale magenta");
+        check(std::all_of(observed.begin() + texels * 4, observed.end(),
+                          [](uint32_t v) { return v == 0xdeadbeefu; }) &&
+                  std::all_of(guest.begin() + tiled_bytes / 4, guest.end(),
+                              [](uint32_t v) { return v == 0xccccccccu; }) &&
+                  std::all_of(other.begin() + metadata_writer_bytes / 4, other.end(),
+                              [](uint32_t v) { return v == 0xeeeeeeeeu; }),
+              "late metadata case preserves pixel, metadata and SSBO tails");
         check_graphics(false);
     }
     std::vector<uint8_t> advertised_metadata = std::vector<uint8_t>(65536, 0x97);
@@ -418,7 +604,7 @@ struct Fixture {
                 }
                 if (calls == 2) {
                     prepare_borrow();
-                    check_graphics(false);
+                    check_graphics(can_retain(journal == Journal::Overflow));
                 }
                 return executed;
             });
@@ -654,6 +840,8 @@ int main(int argc, char **argv) {
         f->run(0x13579bdfu, 0x2468ace0u);
         f->run(0x31415926u, 0x2468ace0u); // Changed early A, unchanged overlapping late B.
     }
+    Fixture late(true, false);
+    late.late_output();
     unbound.unbound_hosted();
     Fixture gpu_baseline(true, false), host_baseline(true, false), dcc(false, false),
         hosted_dcc(false, false);
@@ -663,6 +851,8 @@ int main(int argc, char **argv) {
     host_baseline.run(0x13579bdfu, 0x2468ace0u);
     dcc.dcc_overlap(false);
     hosted_dcc.dcc_overlap(true);
+    Fixture late_metadata(false, false);
+    late_metadata.late_metadata();
     Fixture self(true, false), pinned(true, false);
     self.self_dcc();
     pinned.pinned_overlap();

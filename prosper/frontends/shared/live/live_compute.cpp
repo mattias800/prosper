@@ -3503,7 +3503,8 @@ struct BoundImage {
     GpuRetileParameters retile_parameters{};
     bool storage = false;               // descriptor/representation, independent of access
     bool storage_writeback = false;     // whole-alias output obligation, conservatively proven
-    bool output_conflict = false;       // another effective output can overwrite this guest view
+    bool prior_output_conflict = false; // earlier writeback can invalidate setup-time equality
+    bool final_output_conflict = false; // later writeback or self metadata changes final interpretation
     bool native_float_storage = false;  // Vulkan performs exact UNORM/float conversion at native width
     bool native_uint_storage = false;   // exact guest-width integer texels
     bool packed_r11_storage = false;    // shader packs exact R11G11B10 words into typed R32_UINT
@@ -3531,6 +3532,8 @@ struct BoundImage {
     size_t alias_of = SIZE_MAX;         // exact sampled/storage binding sharing an earlier image/view
     uint8_t* dcc_metadata = nullptr;    // DCC control bytes to mark uncompressed after writeback
     size_t dcc_metadata_bytes = 0;
+    const uint8_t* sampled_metadata = nullptr; // input dependency, never a reset obligation
+    size_t sampled_metadata_bytes = 0;
     // Borrowed renderer-owned image bound in place (#1095). `image` is then owned by the live
     // renderer: it must not be destroyed here, its layout must be restored, and the pin taken at
     // import time must be released.
@@ -8048,6 +8051,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         }
                     }
                 }
+                bi.sampled_metadata = sampled_dcc_metadata;
+                bi.sampled_metadata_bytes = sampled_dcc_metadata_bytes;
                 uint8_t sampled_dcc_clear_pixel[4]{};
                 uint8_t sampled_dcc_clear_code = 0;
                 sampled_dcc_fast_clear = compute_sampled_dcc_fast_clear_rgba8(
@@ -9420,10 +9425,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
 
-        // Distinct Vulkan owners can write overlapping architectural bytes. Setup-time input
-        // validation then cannot authorize a later identical-result skip, and final publication
-        // must not rearm a watch or move a journal snapshot over those intervening writes. Include
-        // sampled/read-only inputs and effective replay backing, not just advertised guest ranges.
+        // Guest writeback is ordered: all unique buffers, then each unique image's pixels
+        // and DCC reset. Earlier writes veto setup-time equality; later writes veto final
+        // authority. The last writer can restore its complete result and retain it normally.
         const auto ranges_conflict = [](uint64_t a, uint64_t an, uint64_t b, uint64_t bn) {
             if (!an || !bn) return false;
             if (!a || !b || an > UINT64_MAX - a || bn > UINT64_MAX - b) return true;
@@ -9436,7 +9440,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint64_t effective = reinterpret_cast<uintptr_t>(
                 resource_bytes_for(buffer.resource, buffer.guest_bytes));
             for (const auto& other : buffers) {
-                if (&other == &buffer || !other.writable || other.alias_of != SIZE_MAX ||
+                if (&other == &buffer) break;
+                if (!other.writable || other.alias_of != SIZE_MAX ||
                     !other.resource || !other.resource->gpu_addr) continue;
                 const uint64_t other_effective = reinterpret_cast<uintptr_t>(
                     resource_bytes_for(other.resource, other.guest_bytes));
@@ -9449,54 +9454,74 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
         }
-        for (auto& image : images) {
+        for (size_t i = 0; i < images.size(); ++i) {
+            auto& image = images[i];
             if (image.alias_of != SIZE_MAX || !image.resource) continue;
             const uint64_t guest = image.resource->gpu_addr;
             const uint64_t effective = reinterpret_cast<uintptr_t>(
                 resource_bytes_for(image.resource, image.guest_bytes));
-            const auto conflicts = [&](uint64_t address, uint64_t bytes) {
+            const auto pixel_conflict = [&](uint64_t address, uint64_t bytes) {
                 return ranges_conflict(guest, image.guest_bytes, address, bytes) ||
                        ranges_conflict(effective, image.guest_bytes, address, bytes);
             };
-            for (const auto& other : images) {
+            const uint64_t metadata_bytes = image.storage
+                ? image.dcc_metadata_bytes : image.sampled_metadata_bytes;
+            const uint64_t metadata_effective = reinterpret_cast<uintptr_t>(image.storage
+                ? image.dcc_metadata : image.sampled_metadata);
+            const auto conflicts = [&](uint64_t address, uint64_t bytes) {
+                // Inputs are retained before guest writeback. Pixel notifications invalidate
+                // their old snapshots naturally, but pixel-only watches cannot see metadata.
+                return (image.storage_writeback && pixel_conflict(address, bytes)) ||
+                       ranges_conflict(image.resource->metadata_addr, metadata_bytes, address, bytes) ||
+                       ranges_conflict(metadata_effective, metadata_bytes, address, bytes);
+            };
+            for (size_t j = 0; j < images.size(); ++j) {
+                const auto& other = images[j];
                 if (!other.storage_writeback || other.alias_of != SIZE_MAX || !other.resource) continue;
-                if ((&other != &image &&
-                     (conflicts(other.resource->gpu_addr, other.guest_bytes) ||
-                      conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
-                          other.resource, other.guest_bytes)), other.guest_bytes))) ||
+                if (j == i) {
+                    // A reset overlapping its own pixels changes the completed image's bytes.
+                    image.final_output_conflict |=
+                        pixel_conflict(other.resource->metadata_addr, other.dcc_metadata_bytes) ||
+                        pixel_conflict(reinterpret_cast<uintptr_t>(other.dcc_metadata), other.dcc_metadata_bytes);
+                    continue;
+                }
+                if (conflicts(other.resource->gpu_addr, other.guest_bytes) ||
+                    conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
+                        other.resource, other.guest_bytes)), other.guest_bytes) ||
                     conflicts(other.resource->metadata_addr, other.dcc_metadata_bytes) ||
                     conflicts(reinterpret_cast<uintptr_t>(other.dcc_metadata), other.dcc_metadata_bytes)) {
-                    image.output_conflict = true;
-                    break;
+                    if (image.storage_writeback && j < i) image.prior_output_conflict = true;
+                    else image.final_output_conflict = true;
                 }
             }
             for (const auto& buffer : buffers) {
                 if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource ||
-                !buffer.resource->gpu_addr) continue;
+                    !buffer.resource->gpu_addr) continue;
                 if (conflicts(buffer.resource->gpu_addr, buffer.guest_bytes) ||
                     conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
                         buffer.resource, buffer.guest_bytes)), buffer.guest_bytes)) {
-                    image.output_conflict = true;
-                    break;
+                    if (image.storage_writeback) image.prior_output_conflict = true;
+                    else image.final_output_conflict = true;
                 }
             }
-            if (image.output_conflict) {
-                // Revoke before recording: resource cleanup is deliberately skipped when GPU
-                // completion is unproven, but graphics must not borrow conflicted authority then.
-                // These calls preserve every allocation, comparison handle and outstanding pin.
+            if (image.final_output_conflict) {
+                // Revoke before recording: unproven completion deliberately skips cleanup.
+                // Keep handles and pins. Earlier-only writers use the ordinary pre-submit
+                // export revocation and may restore source authority after successful writeback.
                 ctx.invalidate_cached_image_source(image.cache_key);
                 if (image.compute_transfer_seed_borrowed)
                     ctx.invalidate_cached_image_source(image.compute_transfer_seed_key);
                 image.renderer_seeded_result_candidate = false;
                 image.post_writeback_promotion_candidate = false;
-                if (image_timing)
-                    std::fprintf(stderr,
-                        "[compute-output-conflict] submit=%llu dispatch=%llu order=%llu "
-                        "binding=%u storage=%u writeback=%u bytes=%zu\n",
-                        (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
-                        (unsigned long long)item.command_order, image.binding,
-                        image.storage ? 1u : 0u, image.storage_writeback ? 1u : 0u, image.guest_bytes);
             }
+            if (image_timing && (image.prior_output_conflict || image.final_output_conflict))
+                std::fprintf(stderr,
+                    "[compute-output-conflict] submit=%llu dispatch=%llu order=%llu "
+                    "binding=%u storage=%u writeback=%u bytes=%zu prior=%u final=%u\n",
+                    (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                    (unsigned long long)item.command_order, image.binding,
+                    image.storage ? 1u : 0u, image.storage_writeback ? 1u : 0u, image.guest_bytes,
+                    image.prior_output_conflict ? 1u : 0u, image.final_output_conflict ? 1u : 0u);
         }
 
         // Exact 2D and standard 3D tiling runs after image transfer in this same submission. Keep
@@ -9834,7 +9859,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
-            if (image.storage_writeback && !image.output_conflict &&
+            if (image.storage_writeback && !image.prior_output_conflict &&
                 image.cache_candidate && image.persistent && image.upload_skipped &&
                 image.result_baseline && image.exact_result_bytes &&
                 image.exact_result_bytes <= max_gpu_compare_image_bytes() &&
@@ -10826,7 +10851,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // New entries become cache-owned only here, so an earlier Vulkan failure cannot retain an
         // uninitialized image. A dirty hit rearms its source watch after the refreshed upload.
         for (BoundImage& image : images) {
-            if (image.storage_writeback || image.output_conflict || image.imported ||
+            if (image.storage_writeback || image.final_output_conflict || image.imported ||
                 image.alias_of != SIZE_MAX || !image.cache_candidate)
                 continue;
             // When this dispatch samples and writes the same guest view through distinct bindings,
@@ -11131,7 +11156,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // GPU comparison is an exact word-for-word equality reduction and acquire_cached_image
             // independently proved that the guest mirror still contains that baseline. This path
             // therefore needs neither a large staging mapping nor a CPU memory pass.
-            if (!bi.output_conflict && bi.gpu_result_unchanged && bi.upload_skipped) {
+            if (!bi.prior_output_conflict && bi.gpu_result_unchanged && bi.upload_skipped) {
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   skipped GPU-identical storage writeback binding=%u "
@@ -11180,7 +11205,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
             // that guest memory still contains the prior result, and this dispatch reproduced the
             // same row-major bytes. If either comparison fails, take the ordinary writeback below.
-            const bool repeated_output = !bi.output_conflict && bi.cache_candidate && bi.persistent &&
+            const bool repeated_output = !bi.prior_output_conflict && bi.cache_candidate && bi.persistent &&
                 bi.upload_skipped && bi.exact_storage_bytes() &&
                 ctx.cached_image_result_matches(bi.cache_key, native_texels, linear_bytes);
             const auto prepare_done = ComputeClock::now();
@@ -11463,7 +11488,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (bi.forced_seed_allocation_reused && !final_dcc_cache_safe)
                 ctx.invalidate_cached_image_source(bi.cache_key);
-            if (bi.cache_candidate && !bi.output_conflict) {
+            if (bi.cache_candidate && !bi.final_output_conflict) {
                 if (bi.persistent && !promoted_after_writeback) {
                     // Successful writeback establishes the new packed-input authority. A missing
                     // optional source snapshot is safe: the next acquisition must either validate
@@ -11590,7 +11615,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
         // also be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
-            if (!image.storage_writeback || image.output_conflict) continue;
+            if (!image.storage_writeback || image.final_output_conflict) continue;
             const bool unique = image.alias_of == SIZE_MAX;
             const bool native_exact_storage = image.native_float_storage ||
                 image.native_uint_storage || image.packed_r11_storage;
