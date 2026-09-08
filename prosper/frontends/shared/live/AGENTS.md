@@ -123,8 +123,9 @@ Read-only input retention never publishes a new producer result or resets DCC me
 `storage_readonly` execution test checks bytes, dependent shader reads, architectural notifications,
 recorded host dependencies, alias writers, unknown write provenance, and both baseline kinds.
 
-F8-gated `compute-storage-access` records include whole-group access, proof, writeback obligation and
-actual staging bytes for each unique materialized storage owner, including owners whose output
+`PROSPER_COMPUTE_IMAGE_TIMING=1` enables `compute-storage-access` records; add
+`PROSPER_COMPUTE_TIMING_CAPTURE_ONLY=1` to limit them to F8. They include whole-group access, proof,
+writeback obligation and actual staging bytes for each unique materialized storage owner, including owners whose output
 comparison later finds an identical result. These are preparation records, not completion or timing
 measurements. Join submit/dispatch/order/program identity with completed dispatch records.
 
