@@ -3110,6 +3110,15 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      add_executable(test_storage_rtt_gpu_seed tests/gpu/execute/test_storage_rtt_gpu_seed.cpp)
+      target_include_directories(test_storage_rtt_gpu_seed PRIVATE tests frontends)
+      target_link_libraries(test_storage_rtt_gpu_seed PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_rtt_gpu_seed COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_STANDALONE_RTT_SEED $<TARGET_FILE:test_storage_rtt_gpu_seed>)
+      add_test(NAME storage_rtt_cpu_seed COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_STANDALONE_RTT_SEED=1 $<TARGET_FILE:test_storage_rtt_gpu_seed> --cpu)
+      set_tests_properties(storage_rtt_gpu_seed storage_rtt_cpu_seed PROPERTIES TIMEOUT 60)
+
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)
       target_include_directories(test_near_full_storage_authority PRIVATE tests frontends)

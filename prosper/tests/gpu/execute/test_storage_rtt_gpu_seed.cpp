@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
                       address, width, height, VK_FORMAT_R8G8B8A8_UNORM),
                   "each imported source pin has one matching release");
         });
-    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes) {
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes, const char*) {
         if (addr != address || bytes != guest.size()) return;
         ++publications;
         if (miss == Miss::None && !cpu_control) {
