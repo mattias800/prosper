@@ -151,6 +151,12 @@ completion and host-read synchronization. Binary16 and F11/F10 need no such mask
 and public storage-ABI tests cover every encoding, including NaN payloads, in separate scalar/F16C
 unpack and pack combinations.
 
+Preserving current renderer-owned inputs does not require a CPU snapshot when an exact native
+RGBA8 source can be pinned on the same Vulkan device with transfer-source usage. Storage-only
+dispatches copy that source into a private writable image, restore its layout, and retain ordinary
+guest writeback. Missing or incompatible imports fall back to current snapshots; neither a matching
+address nor matching texel width alone authorizes this copy (#3407).
+
 ### Write-watch alias protection
 
 Storage-result and texture caches may reuse a physical-page watch while other registrations still

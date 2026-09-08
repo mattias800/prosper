@@ -121,3 +121,11 @@ those buffers follow the same upload, completion, host-read-barrier and writebac
 buffers. Their completed masks select which original linear guest texels survive packing. Such
 repaired raw images cannot advertise ordinary retained packed-content authority. Descriptor binding
 allocation includes unreferenced resource-table entries and unused SPIR-V globals.
+
+Exact native RGBA8 storage can seed from a separately pinned renderer image when no earlier sampled
+binding supplies one. Admission requires actual Vulkan format, extent, device and transfer-source
+usage to match; incompatible views retain CPU snapshots. The borrowed image stays read-only and
+returns to its incoming layout (or an earlier sampled borrower's GENERAL layout); the private
+destination still writes back guest bytes. Release every acquired pin, including folded aliases,
+only after completion is established. `PROSPER_NO_STANDALONE_RTT_SEED` selects the CPU control;
+F8-gated `compute-rtt-seed` rows distinguish admission from recorded copies.

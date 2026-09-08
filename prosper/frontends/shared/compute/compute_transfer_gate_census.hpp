@@ -199,12 +199,9 @@ inline bool claim_compute_transfer_gate_selector_summary(
 //     the metadata range, not `gpu_addr`).
 //   * OVER-counts: `compute_transfer_seed_borrowed` bindings are scored as guest seeds, but they
 //     read a retained GPU image rather than guest memory.
-//   * ASYMMETRIC: `SpirvDescriptorBinding::readable` marks a write-only output that need not be
-//     seeded. The image path consults it; `BoundBuffer` copies `writable` but never `readable`,
-//     so write-only IMAGES are excluded from seeds while write-only BUFFERS are included. That
-//     matches what prosper's buffer upload actually does today -- it does not consult `readable`
-//     either, so those bytes really are read -- but the two paths do not agree, and if the upload
-//     ever starts honouring `readable` this census must change with it.
+//   * OVER-counts: retained storage and buffer sources can validate without uploading. Their
+//     guest ranges are still scored as seeds here; this is a dependency census, not transferred
+//     byte accounting. Write-only storage also preserves current inputs for untouched texels.
 //   * DEPTH-1 ONLY: overlap is measured against the immediately preceding dispatch, so the rate
 //     is a lower bound for any ring depth greater than one.
 struct ComputeGuestRange {
