@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""The baseline comparison must FAIL when it cannot compare, not pass.
+
+#3464 W6. `skip_survey.py --baseline` locks in today's refused-shader counts per title and reddens
+when one goes up. The subtlety is entirely in the non-obvious verdicts, and both directions of getting
+them wrong are silent:
+
+**A run that could not be judged must FAIL, not pass.** This is the opposite stance from the survey's
+own reporting, and deliberately so. A survey reports "I could not tell"; a GUARD that cannot tell has
+not established the thing it exists to establish, and passing would mean a title that stopped booting
+reads as a title with no dropped shaders. Trap 273 is this family exactly.
+
+**A different GPU must refuse to compare at all.** The counts are host-dependent in the extreme: on an
+AMD host wave64 is native, nothing is refused, and every count is legitimately 0. Comparing a
+Windows/NVIDIA baseline against a Linux/AMD run would report "31 shaders fixed" and go green -- the
+most encouraging possible output for a comparison that measured nothing.
+
+Run: python test_skip_baseline.py
+"""
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve()
+sys.path.insert(0, str(HERE.parent))
+
+import skip_survey  # noqa: E402
+
+failures = []
+
+
+def check(name, ok, detail=""):
+    if ok:
+        print("ok   - %s" % name)
+    else:
+        failures.append(name)
+        print("FAIL - %s %s" % (name, detail))
+
+
+NVIDIA = "NVIDIA GeForce RTX 4090 (discrete GPU)"
+AMD = "AMD Radeon Graphics (RADV) (integrated GPU)"
+
+
+def row(title, refused, frames=3000, device=NVIDIA, exited_early=False, admitted=0):
+    return {"title": title, "refused_shaders": refused, "admitted_shaders": admitted,
+            "frames": frames, "device": device, "exited_early": exited_early,
+            "elapsed": 150.0, "returncode": None, "reasons": {"0x2 wave-any": refused},
+            "widths": [64] if refused else [], "log": ""}
+
+
+def main() -> int:
+    base = {"device": NVIDIA, "titles": {"PPSA13579": 8, "PPSA02664": 4, "PPSA24651": 0}}
+
+    # ---- the ordinary verdicts ------------------------------------------------------------------
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 8), row("PPSA02664", 4), row("PPSA24651", 0)], base)
+    check("an unchanged corpus passes", ok, why)
+
+    # A complete row set: only the count under test differs, so the verdict cannot come from
+    # a title being absent. An earlier draft passed one row and went green for that reason.
+    ok, why = skip_survey.compare_to_baseline([row("PPSA13579", 9), row("PPSA02664", 4), row("PPSA24651", 0)], base)
+    check("a title that refuses MORE fails", not ok, why)
+    check("...and the message names the title and both counts",
+          "PPSA13579" in why and "8" in why and "9" in why, why)
+
+    ok, why = skip_survey.compare_to_baseline([row("PPSA13579", 3), row("PPSA02664", 4), row("PPSA24651", 0)], base)
+    check("a title that refuses FEWER passes", ok, why)
+    check("...and says so, so the baseline gets tightened rather than drifting",
+          "3" in why and "8" in why, why)
+
+    # A title going from clean to non-clean is the regression this exists for.
+    ok, why = skip_survey.compare_to_baseline([row("PPSA13579", 8), row("PPSA02664", 4), row("PPSA24651", 1)], base)
+    check("a title regressing from 0 to 1 fails", not ok, why)
+
+    # ---- the verdicts that must not silently pass -------------------------------------------------
+    # A run that never got going has established nothing. Passing it would let a title that stopped
+    # booting read as a title with no dropped shaders.
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 0, frames=0), row("PPSA02664", 4), row("PPSA24651", 0)], base)
+    check("a run that presented no frames FAILS rather than reading as an improvement", not ok, why)
+    check("...and says it could not be judged, not that it improved",
+          "judge" in why.lower() or "uncomparable" in why.lower(), why)
+
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 0, exited_early=True), row("PPSA02664", 4),
+         row("PPSA24651", 0)], base)
+    check("a run that exited early FAILS rather than reading as an improvement", not ok, why)
+
+    # A title in the baseline that was not surveyed at all is not evidence of anything.
+    ok, why = skip_survey.compare_to_baseline([row("PPSA13579", 8)], base)
+    check("a baseline title missing from the run FAILS", not ok, why)
+    check("...and names the missing titles", "PPSA02664" in why, why)
+
+    # ---- the host guard, which is the one that would go GREEN while measuring nothing --------------
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 0, device=AMD), row("PPSA02664", 0, device=AMD),
+         row("PPSA24651", 0, device=AMD)], base)
+    check("a different GPU REFUSES to compare rather than reporting 12 shaders fixed", not ok, why)
+    check("...and names both devices so the reason is obvious",
+          "NVIDIA" in why and "AMD" in why, why)
+
+    # An unknown device is not a matching device.
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 8, device=""), row("PPSA02664", 4, device=""),
+         row("PPSA24651", 0, device="")], base)
+    check("an unrecorded device refuses to compare", not ok, why)
+
+    # ---- round-trip ------------------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "baseline.json"
+        rows = [row("PPSA13579", 8), row("PPSA02664", 4)]
+        skip_survey.write_baseline(rows, path)
+        loaded = json.loads(path.read_text())
+        check("a written baseline records the device", loaded.get("device") == NVIDIA, str(loaded))
+        check("a written baseline records each title's count",
+              loaded.get("titles") == {"PPSA13579": 8, "PPSA02664": 4}, str(loaded))
+        ok, why = skip_survey.compare_to_baseline(rows, loaded)
+        check("a freshly written baseline compares clean against its own run", ok, why)
+
+    print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
