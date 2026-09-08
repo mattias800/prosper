@@ -72,8 +72,14 @@ def parse_flips(paths):
         finally:
             if opened is not None:
                 opened.close()
+        # Detect concatenated runs BEFORE sorting. The per-source split cannot see them --
+        # `cat a.log b.log | tool` is one stream -- and sorting is what destroys the evidence:
+        # the epoch is per process, so a second run restarts near zero and steps BACKWARDS in
+        # file order. Sorted, that is indistinguishable from one slow run, which is the
+        # fabricated distribution this tool must never produce.
+        restarts = sum(1 for a, b in zip(stamps, stamps[1:]) if b < a)
         stamps.sort()
-        timelines.append((path, stamps, untimed))
+        timelines.append((path, stamps, untimed, restarts))
     return timelines
 
 
@@ -86,10 +92,14 @@ def classify(ms, tick):
     return "between ticks"
 
 
-def report(stamps, window_s, tick, untimed=0):
+def report(stamps, window_s, tick, untimed=0, restarts=0):
     # Report the unreadable population WHENEVER it exists, not only when nothing parsed. Two
     # readable flips among thousands of unreadable ones produced a confident distribution over
     # 0.06% of the data and said nothing about the rest -- #3452's own failure, one branch lower.
+    if restarts:
+        print(f"WARNING: the timestamps step backwards {restarts} time(s), so this input holds"
+              f" more than one run (the epoch is per process). Intervals across a restart are not"
+              f" real. Pass each run as its own argument instead of concatenating them.")
     if untimed and stamps:
         share = 100.0 * untimed / (untimed + len(stamps))
         print(f"WARNING: {untimed} of {untimed + len(stamps)} flip line(s) ({share:.1f}%) carried"
@@ -160,12 +170,12 @@ def main():
     # One report per source. Several logs are several runs, each with its own epoch, so they
     # are never merged -- see parse_flips. A header only when there is more than one, so the
     # single-log output a reader already knows is unchanged.
-    for index, (path, stamps, untimed) in enumerate(timelines):
+    for index, (path, stamps, untimed, restarts) in enumerate(timelines):
         if len(timelines) > 1:
             if index:
                 print("")
             print(f"=== {path} ===")
-        report(stamps, args.window_s, args.tick_ms, untimed)
+        report(stamps, args.window_s, args.tick_ms, untimed, restarts)
     return 0
 
 

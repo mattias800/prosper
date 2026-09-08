@@ -150,6 +150,30 @@ def main():
         if "60.0 fps" not in rates[0] or "30.0 fps" not in rates[1]:
             failures.append(f"case 9: per-log rates were merged or reordered: {rates!r}")
 
+    # 10. The residual half of case 9: two runs CONCATENATED into one stream. The per-source
+    #     split cannot see this -- it is one source -- and stamps.sort() then destroys the
+    #     backwards step that betrays it, leaving a fabricated distribution indistinguishable
+    #     from one slow run. Detected before sorting.
+    joined = []
+    for step in (1.0 / 60.0, 1.0 / 30.0):
+        t = 1.0
+        for _ in range(200):
+            joined.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+            t += step
+    out, _ = run("\n".join(joined) + "\n")
+    if "step backwards" not in out:
+        failures.append(f"case 10: concatenated runs went undetected: {out!r}")
+
+    # ...and a single clean run must stay silent, or the warning becomes noise nobody reads.
+    single = []
+    t = 1.0
+    for _ in range(200):
+        single.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        t += 1.0 / 60.0
+    out, _ = run("\n".join(single) + "\n")
+    if "step backwards" in out:
+        failures.append(f"case 10: a single monotonic run was flagged as concatenated: {out!r}")
+
     if failures:
         print("FAILURES:")
         for failure in failures:
