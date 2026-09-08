@@ -2136,6 +2136,19 @@ if(TARGET prosper_core)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_skip_baseline.py")
   endif()
 
+  # Whether a fragment module's wave vote can reach a colour output -- the property the wave32
+  # allowance actually needs, and NOT the one the shipping classifier tests (it tests the reason
+  # set, whose taint has known escapes). Its fixtures are hand-assembled SPIR-V, so the positive
+  # cases exist independently of the emitter: the analyser reported a clean zero over 19 real
+  # modules, and a zero is only worth having once the thing producing it has been shown able to
+  # report a one. Includes a branch-only negative control, so an analyser that flagged
+  # everything would fail rather than look perfect.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME vote_reaches_output_detects_the_class
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_vote_reaches_output.py")
+  endif()
+
   # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —
   # a strict-validation gate (the render tests only prove llvmpipe accepts them; llvmpipe is
   # lenient). No Vulkan needed, but spirv-val (spirv-tools) IS required: it used to report PASS when

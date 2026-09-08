@@ -7162,7 +7162,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // queue, not a wall. Counts and the reasoning live on #3464 rather than here, because a
             // survey total depends on how far each run got and a number restated in a comment goes
             // stale silently.
-            if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny) {
+            // Per MODULE, not per title. The reason set says how the vote was PRODUCED; what
+            // matters is whether its value can reach a pixel. Measured across four titles, 8 of 49
+            // modules reporting exactly WaveAny let a vote reach a colour output -- Blue Prince
+            // alone 7 of 22, while 15 of its modules were safe and being refused. A title-wide
+            // answer is wrong in both directions, so the width decision is taken per module.
+            //
+            // Both conditions are required. The reason set still gates out lane identity, ballots,
+            // shuffles and scalar reductions, which are width-dependent however they are consumed;
+            // reachability then rejects the WaveAny modules whose vote can change a pixel.
+            if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny &&
+                !prosper::gpu::fragment_spirv_vote_reaches_output(bd_fs)) {
                 const uint64_t shader_key = bd.fs_identity
                     ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
                 static std::mutex native_width_log_mutex;

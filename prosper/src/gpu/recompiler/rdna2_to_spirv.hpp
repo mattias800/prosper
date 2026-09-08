@@ -550,6 +550,24 @@ inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.
+// Whether a wave vote's VALUE can reach a colour output in this fragment module.
+//
+// This is the property the native-wave32 allowance actually needs, and it is not what the reason
+// bits describe. A vote that cannot reach an output is safe to evaluate at a narrower width however
+// it is consumed internally, because nothing it influences leaves the shader; a vote that can reach
+// one is unsafe however it was produced, because two 32-lane halves can answer differently and the
+// difference lands in a pixel.
+//
+// Measured need (#3464): across four titles, 8 of 49 modules reporting `reasons == WaveAny` -- the
+// set the shipping classifier admits -- let a vote reach an output. Blue Prince alone had 7 of 22,
+// while 15 of its modules were safe and being refused. Neither a title-wide yes nor no is right.
+//
+// The closure is forward and deliberately OVER-approximate: SSA operand edges plus store/load
+// through Function-storage locals. The error direction is chosen: a false positive costs a draw its
+// native-width fast path, a false negative would ship a wrong pixel. A module that cannot be parsed
+// answers true for the same reason.
+bool fragment_spirv_vote_reaches_output(const std::vector<uint32_t>& spirv);
+
 uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv);
 
 inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;

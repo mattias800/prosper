@@ -1238,11 +1238,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     //                                      separate, unrelated defect -- #3479)
     //   PPSA04263 Grand Theft Auto V      the original reviewed bank route
     //
-    // NOT on this list, deliberately: PPSA21564 (6 measured refusals, no after-arm yet), and
-    // PPSA13579 / PPSA25009, whose refusals reach 0 but whose admitted modules have neither a
-    // module-level check nor a visual confirmation. They are a survey run away.
+    // PPSA13579 and PPSA25009 are on the list even though 1 of 8 and 7 of 22 of their modules let a
+    // vote reach a colour output. That is safe BECAUSE the decision is now per module: those eight
+    // are refused individually and the other 41 run at native width. Admitting a title no longer
+    // means trusting all of its shaders, which is what made a title the wrong unit before.
+    //
+    // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
+    // run away, and with the per-module check the run is confirmation rather than a gamble.
     static const char* const kNativeFragmentVoteTitles[] = {
-        "PPSA01885", "PPSA02664", "PPSA04263",
+        "PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009",
     };
     // The opt-out exists so the A/B stays reproducible, following PROSPER_NO_GUEST_FS: a default-on
     // behaviour whose disable switch is for bisection, not for routine use.

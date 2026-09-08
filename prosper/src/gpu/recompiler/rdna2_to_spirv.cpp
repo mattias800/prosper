@@ -3248,6 +3248,83 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv) {
     return required;
 }
 
+bool fragment_spirv_vote_reaches_output(const std::vector<uint32_t>& spirv) {
+    // Unparseable is unsafe: a module we cannot read has not been shown to keep its vote away from a
+    // pixel, and the whole point of this predicate is that its negative answer is load-bearing.
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return true;
+
+    struct Inst { uint32_t op; size_t at; uint32_t len; };
+    std::vector<Inst> insts;
+    for (size_t off = 5; off < spirv.size();) {
+        const uint32_t len = spirv[off] >> 16;
+        const uint32_t op = spirv[off] & 0xffffu;
+        if (!len || len > spirv.size() - off) return true;   // truncated: unsafe, see above
+        insts.push_back({op, off, len});
+        off += len;
+    }
+
+    std::unordered_set<uint32_t> outputs, locals, tainted, tainted_ptrs;
+    for (const Inst& in : insts) {
+        if (in.op != Op_Variable || in.len < 4) continue;
+        const uint32_t storage = spirv[in.at + 3];
+        if (storage == SC_Output) outputs.insert(spirv[in.at + 2]);
+        else if (storage == SC_Function) locals.insert(spirv[in.at + 2]);
+    }
+    // An access chain into an output is itself an output pointer.
+    for (const Inst& in : insts)
+        if (in.op == Op_AccessChain && in.len >= 4 && outputs.count(spirv[in.at + 3]))
+            outputs.insert(spirv[in.at + 2]);
+
+    for (const Inst& in : insts)
+        if ((in.op == Op_GroupNonUniformAny || in.op == Op_GroupNonUniformBallot) && in.len >= 3)
+            tainted.insert(spirv[in.at + 2]);
+    if (tainted.empty()) return false;                        // no vote at all
+
+    // Instructions with no result id. Treating a branch's target as a result would taint an
+    // unrelated label and turn every voting module into a positive.
+    const auto has_result = [](uint32_t op) {
+        switch (op) {
+            case Op_Store: case Op_Branch: case Op_BranchConditional:
+            case Op_SelectionMerge: case Op_LoopMerge: case Op_Return: case Op_Kill:
+                return false;
+            default: return true;
+        }
+    };
+
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const Inst& in : insts) {
+            if (in.op == Op_Store && in.len >= 3) {
+                const uint32_t ptr = spirv[in.at + 1], val = spirv[in.at + 2];
+                if (tainted.count(val) && locals.count(ptr) && tainted_ptrs.insert(ptr).second)
+                    changed = true;
+                continue;
+            }
+            if (in.op == Op_Load && in.len >= 4) {
+                if (tainted_ptrs.count(spirv[in.at + 3]) &&
+                    tainted.insert(spirv[in.at + 2]).second)
+                    changed = true;
+                continue;
+            }
+            if (!has_result(in.op) || in.len < 3) continue;
+            const uint32_t result = spirv[in.at + 2];
+            if (tainted.count(result)) continue;
+            for (uint32_t i = 3; i < in.len; ++i) {
+                if (!tainted.count(spirv[in.at + i])) continue;
+                tainted.insert(result);
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    for (const Inst& in : insts)
+        if (in.op == Op_Store && in.len >= 3 &&
+            outputs.count(spirv[in.at + 1]) && tainted.count(spirv[in.at + 2]))
+            return true;
+    return false;
+}
+
 uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv) {
     if (spirv.size() < 5 || spirv[0] != 0x07230203u) return UINT32_MAX;
     constexpr char prefix[] = "Prosper.FragmentSubgroupWhy=";

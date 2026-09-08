@@ -341,8 +341,14 @@ int main(int argc, char** argv) {
             if (marked) std::printf("0x%x names=", reasons);
             else std::printf("absent names=");
             print_wave_reason_names(marked ? reasons : 0u);
-            std::printf(" reason-set-admissible=%d internal-gds=%d subgroup-features=0x%x\n",
-                        reason_set_admissible ? 1 : 0, internal_gds ? 1 : 0, features);
+            // The property the allowance actually needs, independent of the reason bits:
+            // measured across four titles, 8 of 49 modules reporting reasons==WaveAny let a
+            // vote reach a colour output, so the reason set alone would mis-admit them.
+            const bool reaches = fragment_spirv_vote_reaches_output(spirv);
+            std::printf(" reason-set-admissible=%d internal-gds=%d subgroup-features=0x%x"
+                        " vote-reaches-output=%d\n",
+                        reason_set_admissible ? 1 : 0, internal_gds ? 1 : 0, features,
+                        reaches ? 1 : 0);
             // Named explicitly, every time, so no consumer can read the line above as an
             // admission verdict by omission. These are the conjuncts an OFFLINE tool cannot
             // evaluate at all -- they are properties of the run, not of the module.

@@ -72,7 +72,7 @@ ROUTE_GATED = {
 # Pinned by test_skip_survey.py against the renderer's own list, in whatever form it takes. It has
 # been a single id, then absent, then this array; a pin anchored to any one of those shapes missed
 # the change to the next.
-NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263")
+NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009")
 
 # Both patterns are pinned to the emitter's format strings by test_skip_survey.py, which greps the
 # producing source. A regex that silently stops matching would make every title report zero -- the
