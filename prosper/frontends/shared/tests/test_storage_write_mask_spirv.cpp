@@ -213,6 +213,39 @@ int main(int argc, char** argv) {
             file.write(reinterpret_cast<const char*>(mixed_result.words.data()), mixed_result.words.size() * 4);
         }
     }
+    // A narrowed execution mask and a merge phi make moving the generated atomic
+    // outside the actual store block observable structurally and to spirv-val.
+    auto guarded = fixture(1, false, {1, 1, 0});
+    size_t function_at = 0;
+    for (size_t p = 5; p < guarded.words.size(); p += guarded.words[p] >> 16)
+        if ((guarded.words[p] & 0xffffu) == 54) { function_at = p; break; }
+    guarded.words.resize(function_at);
+    put(guarded.words, 20, {60}); put(guarded.words, 41, {60, 61});
+    put(guarded.words, 54, {1, 40, 0, 2}); put(guarded.words, 248, {41});
+    put(guarded.words, 61, {10, 42, 12});
+    put(guarded.words, 247, {50, 0}); put(guarded.words, 250, {61, 51, 50});
+    put(guarded.words, 248, {51}); put(guarded.words, 99, {42, 25, 15});
+    put(guarded.words, 249, {50}); put(guarded.words, 248, {50});
+    put(guarded.words, 245, {3, 52, 14, 41, 14, 51});
+    put(guarded.words, 253, {}); put(guarded.words, 56, {});
+    const auto guarded_result = instrument_storage_image_writes(guarded.words, std::span(&guarded.target, 1));
+    check(bool(guarded_result), "execution-mask branch and merge phi instrument");
+    if (guarded_result) {
+        for (uint32_t op : {245u, 247u, 248u, 249u, 250u})
+            check(instructions(guarded.words, op) == instructions(guarded_result.words, op),
+                  "actual conditional-store control flow and phi predecessors remain identical");
+        uint32_t block = 0;
+        for (size_t p = 5; p < guarded_result.words.size(); p += guarded_result.words[p] >> 16) {
+            const uint32_t op = guarded_result.words[p] & 0xffffu;
+            if (op == 248) block = guarded_result.words[p + 1];
+            if (op == 241 || op == 99)
+                check(block == 51, "atomic and original store share the execution-masked block");
+        }
+        if (!output.empty()) {
+            std::ofstream file(output / "guarded-phi.spv", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(guarded_result.words.data()), guarded_result.words.size() * 4);
+        }
+    }
     auto f = fixture(1, false, {1, 1, 0}, true, false, false);
     auto none = instrument_storage_image_writes(f.words, std::span(&f.target, 1));
     check(bool(none) && none.instrumented_writes == 0 && evaluate(none.words).empty(),
