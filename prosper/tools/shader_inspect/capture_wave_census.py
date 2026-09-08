@@ -86,6 +86,23 @@ def discover_submit(gpu_replay, bundle):
     return ordinals[0], None
 
 
+def ds_submit_ordinals(gpu_replay, bundle):
+    """Every submit ordinal --bundle-ds-summary names, from both first= and last=.
+
+    These are the submits that ran a depth-stencil pass. That is a SUBSET of the
+    frame -- a UI or post pass with no DS never appears -- so a census over them is a
+    census of the world-rendering passes, not of the frame, and the caller must say so.
+    """
+    done = run([gpu_replay, "--bundle", bundle, "--bundle-ds-summary"])
+    text = done.stdout + done.stderr
+    found = set()
+    for m in DS_SUBMIT.finditer(text):
+        found.add(int(m.group(1)))
+        found.add(int(m.group(2)))
+    count = BUNDLE_SUBMITS.search(text)
+    return sorted(found), (int(count.group(1)) if count else 0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu-replay", required=True)
@@ -93,6 +110,9 @@ def main() -> int:
     ap.add_argument("--capture", help="a .prgcap (one submit)")
     ap.add_argument("--bundle", help="a .prgbundle; one submit is extracted from it")
     ap.add_argument("--submit", type=int, help="submit index in the bundle (default: discovered)")
+    ap.add_argument("--submits", help="comma-separated submit ordinals to census together")
+    ap.add_argument("--ds-submits", action="store_true",
+                    help="census every submit named by --bundle-ds-summary (the depth-stencil\n                         passes: world geometry and lighting)")
     ap.add_argument("--title", default="",
                     help="title id the capture came from, e.g. PPSA04263. Decides whether the "
                          "native-wave32 allowlist applies; without it, assumed NOT on the "
@@ -121,27 +141,48 @@ def main() -> int:
         tmp = tempfile.TemporaryDirectory()
         work = Path(tmp.name)
 
-    capture = args.capture
-    if args.bundle:
-        submit = args.submit
-        if submit is None:
-            submit, error = discover_submit(args.gpu_replay, args.bundle)
-            if submit is None:
-                print("cannot choose a submit: %s" % error, file=sys.stderr)
+    # Each entry is (capture path, label). One for a .prgcap; one per selected submit otherwise.
+    captures = []
+    bundle_submits = 0
+    if args.capture:
+        captures.append((args.capture, "capture"))
+    else:
+        if args.submits:
+            chosen = [int(s) for s in args.submits.split(",") if s.strip()]
+            _, bundle_submits = ds_submit_ordinals(args.gpu_replay, args.bundle)
+        elif args.ds_submits:
+            chosen, bundle_submits = ds_submit_ordinals(args.gpu_replay, args.bundle)
+            if not chosen:
+                print("--bundle-ds-summary named no submits", file=sys.stderr)
                 return 2
-        capture = work / "submit.prgcap"
-        done = run([args.gpu_replay, "--bundle", args.bundle,
-                    "--bundle-extract-submit", submit, capture])
-        if not Path(capture).exists():
-            print("extract failed:\n" + done.stdout + done.stderr, file=sys.stderr)
-            return 2
-        print("extracted submit %d" % submit)
+        elif args.submit is not None:
+            chosen = [args.submit]
+            _, bundle_submits = ds_submit_ordinals(args.gpu_replay, args.bundle)
+        else:
+            one, error = discover_submit(args.gpu_replay, args.bundle)
+            if one is None:
+                print("cannot choose a submit: %s" % error, file=sys.stderr)
+                print("(--ds-submits censuses every depth-stencil submit instead)", file=sys.stderr)
+                return 2
+            chosen, bundle_submits = [one], 1
+        print("censusing %d submit(s) of %d in the bundle" % (len(chosen), bundle_submits))
+        for ordinal in chosen:
+            out_path = work / ("submit_%d.prgcap" % ordinal)
+            if not out_path.exists():
+                run([args.gpu_replay, "--bundle", args.bundle,
+                     "--bundle-extract-submit", ordinal, out_path])
+            if out_path.exists():
+                captures.append((str(out_path), "submit %d" % ordinal))
+            else:
+                print("  submit %d: extract failed, SKIPPED (not counted either way)" % ordinal)
 
-    done = run([args.gpu_replay, "--inspect-only", capture])
-    draws = DRAW.findall(done.stdout + done.stderr)
+    draws = []
+    for capture, label in captures:
+        done = run([args.gpu_replay, "--inspect-only", capture])
+        found = DRAW.findall(done.stdout + done.stderr)
+        draws.extend((capture, d[0], d[1], d[2]) for d in found)
     if not draws:
-        print("no draws found in %s" % capture, file=sys.stderr)
-        print((done.stdout + done.stderr)[-2000:], file=sys.stderr)
+        print("no draws found in %d capture(s)" % len(captures), file=sys.stderr)
         return 2
 
     # One dump per DISTINCT fragment shader. The `fs=<dwords>/<hash>/` identity on each draw line is
@@ -149,12 +190,12 @@ def main() -> int:
     # one shader 400 times must not read as 400 blocked shaders.
     first_draw = {}
     draw_count = collections.Counter()
-    for draw_id, dwords, fs_hash in draws:
+    for capture, draw_id, dwords, fs_hash in draws:
         draw_count[fs_hash] += 1
-        first_draw.setdefault(fs_hash, (draw_id, int(dwords)))
+        first_draw.setdefault(fs_hash, (capture, draw_id, int(dwords)))
 
     results = {}
-    for fs_hash, (draw_id, dwords) in sorted(first_draw.items()):
+    for fs_hash, (capture, draw_id, dwords) in sorted(first_draw.items()):
         spv = work / ("fs_%s.spv" % fs_hash)
         # --inspect-only alongside --dump-shader: the module is written from the same realization
         # either way (byte-identical output, verified), but the frame is not REPLAYED. That matters
@@ -219,8 +260,15 @@ def main() -> int:
     if admitted:
         print("\nNOTE: 'possibly admitted' is an UPPER bound. Admission also needs the host to "
               "support\nthe width and the module's subgroup features, which this tool cannot see.")
-    print("\nSCOPE: one frame%s. This is what it RAN, not what the title contains."
-          % (" (one submit of it)" if args.bundle else ""))
+    if args.bundle:
+        print("\nSCOPE: %d of the bundle's %d submits. Submits not censused may run shaders not"
+              % (len(captures), bundle_submits))
+        print("listed above, so every count here is a LOWER bound on the frame.")
+        if args.ds_submits:
+            print("--ds-submits covers the depth-stencil passes only: world geometry and lighting,")
+            print("not UI or post passes that run without a depth-stencil target.")
+    else:
+        print("\nSCOPE: one capture. This is what it RAN, not what the title contains.")
     return 0
 
 
