@@ -107,3 +107,17 @@ comparison, guest copy/layout, map, host-write-watch notification, baseline crea
 notification, source validation/watch rearming and provenance. Those last two have separate
 `source_validation_ms` and `provenance_ms` fields. Use the existing dispatch phase totals for the
 remaining setup checks and loop overhead; do not claim the sum of owner timers covers all setup.
+
+## Untouched storage pixels
+
+A previous dispatch's coverage cannot authorize discarding current inputs. Native images retain
+exact texels; raw images may retain extra channel precision only for wholly write-only alias groups
+whose packed result still matches validated current guest bytes. A source-validation miss requires
+an upload. Readable/atomic raw groups need canonical inputs instead.
+
+Raw formats whose seed conversion is non-injective need exact per-store masks. The SPIR-V helper
+in `shared/compute/storage_write_mask_spirv.hpp` adds ordinary host-backed storage-buffer bindings;
+those buffers follow the same upload, completion, host-read-barrier and writeback contract as guest
+buffers. Their completed masks select which original linear guest texels survive packing. Such
+repaired raw images cannot advertise ordinary retained packed-content authority. Descriptor binding
+allocation includes unreferenced resource-table entries and unused SPIR-V globals.

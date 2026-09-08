@@ -10,7 +10,6 @@
 #include "gpu/texture/tile.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "shared/live/live_compute.hpp"
-#include "shared/texture/seed_reprove.hpp"
 #include "fixtures/gta5_cf9200_fixture.hpp"
 #include "fixtures/test_scratch.h"
 
@@ -717,181 +716,6 @@ int main() {
         CHECK(!prosper::frontend::pack_live_target_r11g11b10(
                   snapshot16, packed16.data(), packed16.size()),
               "R11G11B10 reconstruction rejects a malformed renderer snapshot");
-    }
-
-    // #1127: the seed-skip re-prove counter (seed_reprove.hpp). interval 0 disables (old prove-once);
-    // interval N fires on the Nth fast-skip and resets, so a Full-cached data-dependent shader is
-    // re-proven within N fast-skips instead of trusting a stale "covers every texel" verdict forever.
-    {
-        using prosper::frontend::seed_reprove_due;
-        using prosper::frontend::dispatch_has_enough_threads_for_texels;
-        CHECK(dispatch_has_enough_threads_for_texels(15360, 135, 1, 1920, 1080, 1),
-              "vectorized/swizzled dispatch with one invocation per texel can prove coverage");
-        CHECK(!dispatch_has_enough_threads_for_texels(1919, 1080, 1, 1920, 1080, 1),
-              "dispatch with fewer total invocations than texels cannot prove coverage");
-        CHECK(!dispatch_has_enough_threads_for_texels(0, 1080, 1, 1920, 1080, 1),
-              "degenerate dispatch cannot prove coverage");
-        uint32_t s = 0;
-        CHECK(!seed_reprove_due(s, 0) && !seed_reprove_due(s, 0) && s == 0,
-              "interval 0 never re-proves and leaves the counter untouched (prove-once)");
-        s = 0;
-        bool a = seed_reprove_due(s, 3), b = seed_reprove_due(s, 3), c = seed_reprove_due(s, 3);
-        CHECK(!a && !b && c && s == 0, "interval 3 fires on the 3rd fast-skip and resets the counter");
-        CHECK(!seed_reprove_due(s, 3) && !seed_reprove_due(s, 3) && seed_reprove_due(s, 3),
-              "the re-prove cycle repeats after a reset");
-        s = 0;
-        CHECK(seed_reprove_due(s, 1) && seed_reprove_due(s, 1),
-              "interval 1 re-proves every fast-skip (maximum soundness)");
-
-        // #1127: the interval env-parse must fail SAFE -- garbage/overflow keeps the default rather
-        // than silently disabling the safety (which an atol-style parse would, returning 0 = off).
-        using prosper::frontend::seed_reprove_interval_from_env;
-        CHECK(seed_reprove_interval_from_env(nullptr, 256) == 256, "unset env -> default");
-        CHECK(seed_reprove_interval_from_env("", 256) == 256, "empty env -> default");
-        CHECK(seed_reprove_interval_from_env("foo", 256) == 256, "non-numeric env -> default (fail-safe, not 0)");
-        CHECK(seed_reprove_interval_from_env("256x", 256) == 256, "trailing junk -> default");
-        CHECK(seed_reprove_interval_from_env("-4", 256) == 256, "negative -> default");
-        CHECK(seed_reprove_interval_from_env("4294967296", 256) == 256, "overflow (2^32) -> default, not truncated to 0");
-        CHECK(seed_reprove_interval_from_env("0", 256) == 0, "explicit 0 honored (intentionally disables re-proving)");
-        CHECK(seed_reprove_interval_from_env("64", 256) == 64, "exact in-range value overrides default");
-        CHECK(seed_reprove_interval_from_env("4294967295", 256) == 4294967295u, "max uint32 accepted");
-
-        // #3285: untouched storage coverage classification. When 100% of poison survived (survived == texels),
-        // zero texels were stored by the shader; it is classified as SeedCoverage::None to avoid redundant
-        // seeding and writeback on every dispatch.
-        using prosper::frontend::SeedCoverage;
-        using prosper::frontend::classify_seed_coverage;
-        using prosper::frontend::seed_coverage_name;
-        CHECK(classify_seed_coverage(0, 8294400) == SeedCoverage::Full,
-              "zero survivors proves Full coverage");
-        CHECK(classify_seed_coverage(8294400, 8294400) == SeedCoverage::None,
-              "100% survivors proves None (untouched) coverage (#3285)");
-        CHECK(classify_seed_coverage(8294401, 8294400) == SeedCoverage::None,
-              "clamped/overflow survivors classifies as None coverage");
-        CHECK(classify_seed_coverage(1, 8294400) == SeedCoverage::Partial,
-              "one survivor classifies as Partial coverage");
-        CHECK(classify_seed_coverage(8294399, 8294400) == SeedCoverage::Partial,
-              "all but one survivor classifies as Partial coverage");
-        CHECK(std::string(seed_coverage_name(SeedCoverage::Full)).find("full-coverage") != std::string::npos,
-              "Full coverage name contains full-coverage");
-        CHECK(std::string(seed_coverage_name(SeedCoverage::None)).find("NONE-COVERAGE") != std::string::npos,
-              "None coverage name contains NONE-COVERAGE");
-        CHECK(std::string(seed_coverage_name(SeedCoverage::Partial)).find("PARTIAL-COVERAGE") != std::string::npos,
-              "Partial coverage name contains PARTIAL-COVERAGE");
-
-        // #3328 B1/N2/N3: near-full coverage classification and reprove eligibility.
-        using prosper::frontend::classify_near_full_coverage;
-        using prosper::frontend::seed_verdict_reprove_eligible;
-
-        // classify_near_full_coverage:
-        CHECK(classify_near_full_coverage(0, 8294400),
-              "zero survivors classifies as near-full coverage");
-        CHECK(classify_near_full_coverage(0, 100),
-              "zero survivors on small target classifies as near-full coverage");
-        // Target < 1000 texels cannot be near-full unless 0 survived
-        CHECK(!classify_near_full_coverage(1, 999),
-              "sub-1000 texel target with 1 survivor is not near-full");
-        // 1000 texel target: 0.2% threshold is 2 texels (2 * 500 <= 1000)
-        CHECK(classify_near_full_coverage(2, 1000),
-              "1000 texels with 2 survivors clears 0.2% near-full bound");
-        CHECK(!classify_near_full_coverage(3, 1000),
-              "1000 texels with 3 survivors exceeds 0.2% near-full bound");
-        // 4K target (3840x2160 = 8,294,400 texels): minimap/cutout tolerance
-        CHECK(classify_near_full_coverage(16000, 8294400),
-              "4K target with 16000 unwritten texels (minimap cutout ~0.19%) classifies as near-full");
-        CHECK(!classify_near_full_coverage(17000, 8294400),
-              "4K target with 17000 unwritten texels (>0.2%) rejects near-full");
-
-        // seed_verdict_reprove_eligible (#3328 B1/N2):
-        // Full and None verdicts are always eligible for periodic re-proving
-        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Full, ~0ULL, false),
-              "Full coverage verdict is reprove-eligible");
-        CHECK(seed_verdict_reprove_eligible(SeedCoverage::None, ~0ULL, false),
-              "None coverage verdict is reprove-eligible");
-        // Default Partial verdict (untouched, no active optimization) seeds every time, no re-proving needed
-        CHECK(!seed_verdict_reprove_eligible(SeedCoverage::Partial, ~0ULL, false),
-              "unoptimized Partial verdict does not re-prove (always seeds)");
-        // Partial verdict with active layer mask optimization MUST periodically re-prove (B1)
-        constexpr uint64_t kLayer0Only = 0x1ULL;
-        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, false),
-              "Partial verdict with layer mask is reprove-eligible (B1 bounds staleness)");
-        // Partial verdict with active near-full coverage bypass MUST periodically re-prove (N2)
-        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, ~0ULL, true),
-              "Partial verdict with near-full coverage is reprove-eligible (N2 bounds staleness)");
-        CHECK(seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, true),
-              "Partial verdict with both layer mask and near-full is reprove-eligible");
-
-        // B1 cycle verification: Partial with layer mask fires on interval and resets
-        {
-            uint32_t partial_skips = 0;
-            const bool eligible = seed_verdict_reprove_eligible(SeedCoverage::Partial, kLayer0Only, false);
-            CHECK(eligible, "layer-masked partial is eligible");
-            bool fired = false;
-            for (uint32_t i = 0; i < 3; ++i) {
-                if (eligible && seed_reprove_due(partial_skips, 3)) fired = true;
-            }
-            CHECK(fired && partial_skips == 0,
-                  "reprove_eligible Partial verdict fires re-proving at interval and resets counter");
-        }
-
-        // #3328 B2: the >64-layer array mask. Each arm below FAILS on the previous revision, which
-        // set `written_layers = (survived < texels) ? 1 : 0` for these resources -- bit 0 as a
-        // boolean. That is not a conservative approximation: the retile/pack consumers read bit
-        // `layer`, so layers 1..63 were skipped as untouched while layers >= 64 fell through the
-        // `layer < 64` guard and were written from non-zero-filled scratch.
-        {
-            using prosper::frontend::classify_array_layer_coverage;
-            using prosper::frontend::array_all_layers_written;
-
-            // A fully-written 100-layer array. Old code: written_layers == 1 (bit 0 only).
-            std::vector<size_t> none_survived(100, 0);
-            const auto deep_full = classify_array_layer_coverage(100, none_survived.data(), 64,
-                                                                 /*survived=*/0, /*texels=*/6400);
-            CHECK(deep_full.written_layers == ~0ULL,
-                  "depth>64 publishes the no-masking sentinel, never a bit-0 boolean");
-            CHECK(!deep_full.exact, "depth>64 mask is marked inexact");
-            CHECK(!array_all_layers_written(100, deep_full.written_layers, deep_full.exact),
-                  "an inexact sentinel mask must not promote coverage to Full");
-
-            // The dangerous direction: NOTHING written on a >64-layer array. A sentinel that were
-            // trusted would compare all-ones and promote an untouched surface to Full.
-            std::vector<size_t> all_survived(100, 64);
-            const auto deep_none = classify_array_layer_coverage(100, all_survived.data(), 64,
-                                                                 /*survived=*/6400, /*texels=*/6400);
-            CHECK(!array_all_layers_written(100, deep_none.written_layers, deep_none.exact),
-                  "untouched depth>64 array is never promoted to Full");
-            CHECK(!deep_none.any_written_partial, "untouched array reports no partial write");
-
-            // No per-layer counts (layer_texels == 0) had the identical defect at ANY depth.
-            const auto no_counts = classify_array_layer_coverage(8, nullptr, 0, 10, 100);
-            CHECK(no_counts.written_layers == ~0ULL && !no_counts.exact,
-                  "missing per-layer counts disable masking rather than approximate it");
-
-            // Exactly 64 layers still works and must not use the UB `1ULL << 64`.
-            std::vector<size_t> s64(64, 0);
-            const auto d64 = classify_array_layer_coverage(64, s64.data(), 16, 0, 1024);
-            CHECK(d64.exact && d64.written_layers == ~0ULL,
-                  "depth==64 computes a real all-ones mask");
-            CHECK(array_all_layers_written(64, d64.written_layers, d64.exact),
-                  "depth==64 fully written is promoted");
-
-            // Ordinary masked case still behaves: layers 0 and 2 of 4 written.
-            std::vector<size_t> mixed{0, 16, 0, 16};
-            const auto part = classify_array_layer_coverage(4, mixed.data(), 16, 32, 64);
-            CHECK(part.exact && part.written_layers == 0b0101ULL,
-                  "per-layer mask is exact below 64 layers");
-            CHECK(!array_all_layers_written(4, part.written_layers, part.exact),
-                  "partially written array is not promoted");
-
-            // The ONE input where `exact` decides the answer. Below 64 the comparison is against
-            // (1<<depth)-1, which ~0ULL fails anyway; above 64 the depth guard returns first. So
-            // depth==64 with no per-layer counts is the only case that can catch a future edit
-            // deleting the `!exact ||` guard -- and without this arm, deleting it passes everything.
-            const auto d64_nocounts = classify_array_layer_coverage(64, nullptr, 0,
-                                                                    /*survived=*/10, /*texels=*/1024);
-            CHECK(!array_all_layers_written(64, d64_nocounts.written_layers, d64_nocounts.exact),
-                  "a depth-64 sentinel mask must not promote an unmeasured surface to Full");
-        }
     }
 
     // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is
@@ -3923,23 +3747,22 @@ int main() {
     dcc_item.launch.groups_y = dcc_item.launch.groups_z = 1;
     dcc_item.code_addr = 0x719dcc;
     if (dcc_shape_ok) {
-        // The first sighting of a write-only storage kernel is deliberately a poison proving
-        // frame.  Promotion must stay fail-closed until that execution proves full coverage; then
-        // restore a compressed metadata state and require the proven seed-skip execution to publish
-        // the exact post-writeback image.
+        // Exact current inputs are preserved on the first dispatch too. Completed writeback can
+        // immediately promote its exact image; compressed metadata on the next dispatch still
+        // forces a fresh seed before re-publishing authority.
         const uint64_t promotions_before =
             prosper::frontend::live_compute_dcc_post_writeback_promotions();
         CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
-              "live backend proves coverage while writing the tiled DCC storage image");
-        CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
-                  promotions_before,
-              "poison-proving DCC writeback publishes no cache authority");
-        std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
-        CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
-              "proven full-coverage backend rewrites the tiled DCC storage image");
+              "live backend preserves inputs while writing the tiled DCC storage image");
         CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
                   promotions_before + 1,
-              "successful exact DCC writeback promotes its transient storage image");
+              "first completed exact DCC writeback publishes cache authority");
+        std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+        CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
+              "backend refreshes current inputs and rewrites the tiled DCC storage image");
+        CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
+                  promotions_before + 2,
+              "successful exact DCC writeback re-publishes its forcibly seeded image");
         std::vector<uint8_t> dcc_linear(W * 4, 0);
         detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
         CHECK(dcc_linear == img_src,
@@ -5123,11 +4946,6 @@ int main() {
     // coverage, so an alias must not repeatedly request a snapshot for its never-published proof.
     auto check_write_only_rtt_alias = [&](uint32_t height, uint64_t code_addr) {
         const bool full = height == 2;
-        const bool allow_warm_seed_skip =
-            std::getenv("PROSPER_NO_SKIP_SEED") == nullptr &&
-            std::getenv("PROSPER_VERIFY_SEED_SKIP") == nullptr &&
-            prosper::frontend::seed_reprove_interval_from_env(
-                std::getenv("PROSPER_SEED_REPROVE"), 256u) != 1;
         static const uint32_t alias_rows[] = {
             0x7E080300u,              // v4 = x from the local ID
             0x7E0A0280u,              // v5 = 0: owner writes row zero
@@ -5216,14 +5034,13 @@ int main() {
             if (written_addr == address && bytes == destination.size()) ++notifications;
         });
         for (uint32_t run = 0; run < 2; ++run) {
-            const bool unused_reader = full && run != 0 && allow_warm_seed_skip;
             queries = reads = notifications = 0;
             // A fresh guest mirror must not satisfy the result oracle without actual writeback.
             std::fill(destination.begin(), destination.end(), 0xC7);
             if (run) {
                 for (uint8_t& byte : *snapshot_bytes) byte ^= 0x6D;
             }
-            fail_reader = unused_reader;
+            fail_reader = false;
             std::vector<uint8_t> expected = *snapshot_bytes;
             for (uint32_t x = 0; x < W; ++x) {
                 const size_t first = static_cast<size_t>(x) * 4;
@@ -5234,15 +5051,11 @@ int main() {
                 expected[second + 1] = expected[second + 3] = 255;
             }
             const bool executed = prosper::frontend::execute_live_compute_items({item});
-            CHECK(executed, unused_reader
-                  ? "warm full RTT aliases execute even when an unused snapshot reader would fail"
-                  : "RTT aliases execute with the required canonical snapshot seed");
+            CHECK(executed, "RTT aliases execute with the required canonical snapshot seed");
             CHECK(destination == expected, full
                   ? "both write-only aliases contribute their exact distinct output rows"
                   : "partial write-only aliases preserve the untouched row from the current RTT seed");
-            CHECK(reads == (unused_reader ? 0u : 1u), unused_reader
-                  ? "warm full RTT aliases request no discarded CPU snapshot"
-                  : "RTT alias proving or partial run requests exactly one owner snapshot");
+            CHECK(reads == 1u, "RTT alias dispatch requests exactly one current owner snapshot");
             CHECK(queries == 2,
                   "both RTT storage bindings retain their ownership query and pending-write drain");
             CHECK(notifications == 1,

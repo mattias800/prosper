@@ -1,4 +1,5 @@
 #include "shared/live/live_compute.hpp"
+#include "shared/compute/storage_write_mask_spirv.hpp"
 #include "shared/diagnostics/trip_bound_witness.hpp"
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
@@ -12,7 +13,6 @@
 #include "shared/live/gpu_retile.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
-#include "shared/texture/seed_reprove.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/texture/write_watch_census.hpp"
 #include "shared/texture/write_watch_policy.hpp"
@@ -1111,7 +1111,7 @@ struct CachedComputeImage {
     // its CPU pack/retile/writeback. This is deliberately not a hash: a collision must never turn a
     // changed GPU result into a missed guest write or cache invalidation.
     std::vector<uint8_t> result_snapshot;
-    // Exact GPU-side result baseline for native storage targets and proven-full raw write-only
+    // Exact GPU-side result baseline for native storage targets and validated raw write-only
     // targets. The next dispatch compares its transfer buffer to this one word-for-word and returns
     // a four-byte changed flag to the CPU.
     // Keeping the baseline as a buffer avoids rereading 30-70 MiB of host-visible staging memory
@@ -2535,11 +2535,12 @@ struct VulkanComputeContext {
                     cached.write_watch_stable_validations, true,
                     compute_write_watch_promotion_validations());
             }
-        } else if (!upload_skipped && source && source_snapshot_required) {
+        } else if (!upload_skipped) {
             cached.write_watch_stable_validations = 0;
-            remember_image_source_snapshot(
-                cached, source, key.guest_bytes, key.storage,
-                SnapshotReason::ContentChanged);
+            if (source && source_snapshot_required)
+                remember_image_source_snapshot(
+                    cached, source, key.guest_bytes, key.storage,
+                    SnapshotReason::ContentChanged);
             // Do not trust the new mirror until the corresponding transfer completes. A failed
             // submit leaves this false, so the next use refreshes instead of skipping stale pixels.
             cached.content_valid = false;
@@ -3528,8 +3529,8 @@ struct BoundImage {
     VkDeviceSize staging_allocation_bytes = 0;
     // Exact bytes copied from the Vulkan image into staging. Native typed storage already has the
     // guest's row-major byte width; the raw-uvec4 fallback has four uint32_t channels per texel.
-    // The latter is safe to retain/compare only for proven-full write-only outputs, whose previous
-    // raw image contents cannot be observed by the guest shader.
+    // Raw results may retain noncanonical channel precision only for write-only alias groups;
+    // current-source validation still proves their packed bytes match the required guest input.
     VkDeviceSize exact_result_bytes = 0;
     VkBuffer result_baseline = VK_NULL_HANDLE;
     size_t compare_flag_index = SIZE_MAX;
@@ -3542,14 +3543,11 @@ struct BoundImage {
     ComputeImageCacheKey compute_transfer_seed_key{};
     bool compute_transfer_seed_borrowed = false;
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
-    bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
-    uint64_t written_layers_mask = ~0ULL; // bitmask of touched array layers (depth <= 64)
-    bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
-    bool write_skip = false;            // untouched storage image: unwritten and unread; skip staging, readback, and writeback
     size_t seed_from_imported = SIZE_MAX; // renderer image copied on-device into this partial-write target
     bool mirror_result_to_imported = false;
-    std::vector<uint8_t> seed_linear;   // #1122: detiled guest seed, kept on a proving frame so any
-                                        // texel the write leaves untouched is restored (not corrupted)
+    bool storage_write_only = false; // access union of every descriptor sharing this image
+    const std::vector<uint32_t>* storage_write_mask = nullptr;
+    std::vector<uint8_t> untouched_seed; // exact linear guest bytes for non-injective raw conversions
     uint64_t imported_addr = 0;
     uint32_t imported_width = 0, imported_height = 0; // actual renderer VkImage extent
     uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
@@ -4062,7 +4060,7 @@ void dump_storage_gate_census() {
         const auto& c = kv.second;
         std::fprintf(stderr,
                      "  %ux%u bpe=%u evaluated=%llu renderer_owned=%llu dcc_safe=%llu "
-                     "poison_verify=%llu exact=%llu seed_skip=%llu persistent=%llu "
+                     "poison_verify=%llu exact=%llu write_only=%llu persistent=%llu "
                      "CANDIDATE=%llu\n",
                      std::get<0>(kv.first), std::get<1>(kv.first), std::get<2>(kv.first),
                      (unsigned long long)c[0], (unsigned long long)c[1],
@@ -4236,7 +4234,7 @@ struct ComputeTransferGateStats {
     uint64_t storage_dcc_cache_safe = 0;
     uint64_t storage_poison_verify = 0;
     uint64_t storage_exact = 0;
-    uint64_t storage_seed_skip = 0;
+    uint64_t storage_write_only = 0;
     uint64_t storage_persistent_enabled = 0;
     uint64_t storage_cache_candidate = 0;
     uint64_t storage_persistent_setup = 0;
@@ -4435,7 +4433,7 @@ public:
         increment_gate_counter(stats.storage_dcc_cache_safe, inputs.dcc_cache_safe);
         increment_gate_counter(stats.storage_poison_verify, inputs.poison_verify);
         increment_gate_counter(stats.storage_exact, inputs.exact_storage);
-        increment_gate_counter(stats.storage_seed_skip, inputs.seed_skip);
+        increment_gate_counter(stats.storage_write_only, inputs.write_only);
         increment_gate_counter(stats.storage_persistent_enabled,
                                inputs.persistent_enabled);
         increment_gate_counter(stats.storage_cache_candidate, cache_candidate);
@@ -4444,7 +4442,7 @@ public:
             std::fprintf(stderr,
                          "[compute-transfer-gates] detail role=%s stage=storage-cache "
                          "binding=%u addr=0x%llx renderer-owned=%u dcc-cache-safe=%u "
-                         "poison-verify=%u exact-storage=%u seed-skip=%u "
+                         "poison-verify=%u exact-storage=%u write-only=%u "
                          "persistent-enabled=%u cache-candidate=%u persistent=%u\n",
                          compute_transfer_gate_role_name(role), binding,
                          static_cast<unsigned long long>(resource.gpu_addr),
@@ -4452,7 +4450,7 @@ public:
                          inputs.dcc_cache_safe ? 1u : 0u,
                          inputs.poison_verify ? 1u : 0u,
                          inputs.exact_storage ? 1u : 0u,
-                         inputs.seed_skip ? 1u : 0u,
+                         inputs.write_only ? 1u : 0u,
                          inputs.persistent_enabled ? 1u : 0u,
                          cache_candidate ? 1u : 0u, persistent_setup ? 1u : 0u);
         }
@@ -4513,7 +4511,7 @@ private:
                      "storage-float=%llu native-semantic=%llu native-device=%llu "
                      "storage-cache-eval=%llu renderer-owned=%llu "
                      "dcc-cache-safe=%llu poison-verify=%llu exact-storage=%llu "
-                     "seed-skip=%llu persistent-enabled=%llu storage-candidate=%llu "
+                     "write-only=%llu persistent-enabled=%llu storage-candidate=%llu "
                      "storage-persistent-setup=%llu publish-eval=%llu publish-native=%llu "
                      "publish-unique=%llu publish-candidate=%llu publish-persistent=%llu "
                      "publish-authorized=%llu\n",
@@ -4533,7 +4531,7 @@ private:
                      static_cast<unsigned long long>(s.storage_dcc_cache_safe),
                      static_cast<unsigned long long>(s.storage_poison_verify),
                      static_cast<unsigned long long>(s.storage_exact),
-                     static_cast<unsigned long long>(s.storage_seed_skip),
+                     static_cast<unsigned long long>(s.storage_write_only),
                      static_cast<unsigned long long>(s.storage_persistent_enabled),
                      static_cast<unsigned long long>(s.storage_cache_candidate),
                      static_cast<unsigned long long>(s.storage_persistent_setup),
@@ -5740,6 +5738,119 @@ void upload_guest_mip_chain_levels(const prosper::gpu::MipChainPlan& plan,
     }
 }
 
+// Raw SNORM conversions collapse distinct guest encodings. A real store
+// must canonicalize its result, whereas an untouched texel must retain its original guest bits.
+// An explicit GPU write mask distinguishes those cases without relying on poison or value equality.
+bool raw_storage_needs_write_mask(prosper::gpu::DataFormat format) {
+    using DF = prosper::gpu::DataFormat;
+    // Exhaustive storage_float_roundtrip tests prove binary16 and F11/F10 preserve every encoding.
+    return format == DF::Snorm8 || format == DF::Snorm16;
+}
+struct RawStorageWriteMask {
+    std::vector<uint32_t> bindings;
+    std::vector<uint32_t> written;
+};
+struct PreparedStorageWriteMasks {
+    std::shared_ptr<prosper::gpu::ShaderResourceTable> resources;
+    std::vector<uint32_t> words;
+    std::vector<RawStorageWriteMask> masks;
+    std::string error;
+};
+PreparedStorageWriteMasks prepare_storage_write_masks(
+    const std::vector<uint32_t>& words,
+    const std::shared_ptr<prosper::gpu::ShaderResourceTable>& resources) {
+    using namespace prosper::gpu;
+    PreparedStorageWriteMasks out;
+    out.resources = resources;
+    if (!resources || std::none_of(resources->resources.begin(), resources->resources.end(),
+            [](const ShaderResource& r) { return raw_storage_needs_write_mask(r.format); }))
+        return out;
+    const auto report = validate_spirv_descriptor_interface(
+        words, resources.get(), 0, SpirvShaderStage::Compute, false);
+    if (!report.ok()) { out.error = "write-mask-descriptor-interface"; return out; }
+    std::vector<SpirvDescriptorBinding> images;
+    std::set<uint32_t> occupied_bindings;
+    for (const auto& resource : resources->resources)
+        occupied_bindings.insert(resource.binding);
+    // Reflection omits unused globals, but Vulkan still reserves their declared bindings.
+    // Include every Binding decoration as well as unreferenced entries in the guest table.
+    for (size_t at = 5; at < words.size();) {
+        const uint32_t count = words[at] >> 16;
+        if (!count || count > words.size() - at) {
+            out.error = "write-mask-malformed-module"; return out;
+        }
+        if ((words[at] & 0xffffu) == 71u && count == 4u && words[at + 2] == 33u)
+            occupied_bindings.insert(words[at + 3]);
+        at += count;
+    }
+    uint32_t next_binding = 0;
+    for (const auto& descriptor : report.descriptors) {
+        occupied_bindings.insert(descriptor.binding);
+        if (descriptor.kind == SpirvDescriptorKind::StorageImage ||
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            images.push_back(descriptor);
+    }
+    const auto aliases = prosper::frontend::plan_storage_image_aliases(images, *resources);
+    if (!aliases.valid) { out.error = "write-mask-alias-resource"; return out; }
+    out.masks.reserve(aliases.groups.size());
+    std::vector<StorageWriteMaskTarget> targets;
+    for (const auto& group : aliases.groups) {
+        std::vector<uint32_t> bindings;
+        const ShaderResource* shape = nullptr;
+        bool arrayed = false;
+        for (const auto& image : images) {
+            if (std::find(group.bindings.begin(), group.bindings.end(), image.binding) ==
+                group.bindings.end()) continue;
+            const auto* resource = resources->by_binding(image.binding);
+            if (image.kind != SpirvDescriptorKind::StorageImage || !resource ||
+                image.storage_image_format != 0 ||
+                image.image_numeric_class != SpirvImageNumericClass::Uint ||
+                !raw_storage_needs_write_mask(resource->format)) continue;
+            shape = resource;
+            arrayed = image.image_arrayed;
+            bindings.push_back(image.binding);
+        }
+        if (bindings.empty()) continue;
+        // The late materializer can fold reflection variants of the same guest view. Every
+        // member's stores must contribute to one mask, including a typed writable sibling.
+        bindings = group.bindings;
+        while (next_binding != UINT32_MAX && occupied_bindings.count(next_binding))
+            ++next_binding;
+        if (!shape->width || !shape->height || !shape->depth ||
+            uint64_t(shape->width) * shape->height > UINT32_MAX / 4u / shape->depth ||
+            next_binding == UINT32_MAX) {
+            out.error = "write-mask-size-overflow"; return out;
+        }
+        const uint32_t texels = shape->width * shape->height * shape->depth;
+        if (texels > kMaxComputeImageBytes / 16u) {
+            out.error = "write-mask-image-byte-limit"; return out;
+        }
+        occupied_bindings.insert(next_binding);
+        out.masks.push_back({bindings, std::vector<uint32_t>(texels, 0)});
+        auto& mask = out.masks.back();
+        for (uint32_t binding : bindings)
+            targets.push_back({0, binding, next_binding, shape->width, shape->height,
+                               shape->depth, arrayed});
+        if (out.resources == resources)
+            out.resources = std::make_shared<ShaderResourceTable>(*resources);
+        ShaderResource buffer{};
+        buffer.cls = ResourceClass::ConstantBuffer;
+        buffer.binding = next_binding++;
+        buffer.format = DataFormat::Uint32;
+        buffer.num_components = 1;
+        buffer.stride = sizeof(uint32_t);
+        buffer.size = texels * sizeof(uint32_t);
+        buffer.host_data = reinterpret_cast<uint8_t*>(mask.written.data());
+        buffer.host_data_size = buffer.size;
+        out.resources->resources.push_back(buffer);
+    }
+    if (targets.empty()) return out;
+    auto instrumented = instrument_storage_image_writes(words, targets);
+    if (!instrumented) { out.error = instrumented.error; return out; }
+    out.words = std::move(instrumented.words);
+    return out;
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -5837,7 +5948,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const bool override_applies =
         !spirv_override.words.empty() &&
         (!spirv_override.targeted || spirv_override.code_addr == item.code_addr);
-    const std::vector<uint32_t>& spirv = override_applies ? spirv_override.words : item.spirv;
+    const auto& source_spirv = override_applies ? spirv_override.words : item.spirv;
+    auto write_masks = prepare_storage_write_masks(source_spirv, item.resources);
+    if (!write_masks.error.empty()) {
+        static std::atomic<uint32_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 24)
+            std::fprintf(stderr, "[compute] storage write-mask preparation: %s\n",
+                         write_masks.error.c_str());
+        // The decline census retains literal pointers, never dynamically owned strings.
+        return decline("storage-write-mask-preparation");
+    }
+    const auto& resources = write_masks.resources;
+    const auto& spirv = write_masks.words.empty() ? source_spirv : write_masks.words;
     const bool trace = trace_compute_item(item);
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();
@@ -5847,12 +5969,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // to the instruction that wrote it is guesswork. Printing the table closes that gap, and it is
     // the table AS REALIZED for this dispatch -- which matters here, because the same program address
     // realizes materially different tables from one dispatch to the next (buffers 1..43 observed).
-    if (trace && std::getenv("PROSPER_COMPUTELOG_RESOURCES") && item.resources) {
+    if (trace && std::getenv("PROSPER_COMPUTELOG_RESOURCES") && resources) {
         std::fprintf(stderr, "[compute]   resource table program=0x%llx dispatch=%llu count=%zu\n",
                      static_cast<unsigned long long>(item.code_addr),
                      static_cast<unsigned long long>(item.dispatch_index),
-                     item.resources->resources.size());
-        for (const auto& r : item.resources->resources) {
+                     resources->resources.size());
+        for (const auto& r : resources->resources) {
             std::fprintf(stderr,
                          "[compute]     program=0x%llx submit=%llu dispatch=%llu binding=%u cls=%u "
                          "fmt=%u comps=%u addr=0x%llx size=%u stride=%u fetch-pc=%u srt=0x%x "
@@ -5927,104 +6049,40 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      effective_subgroup, ctx.subgroup_stages, ctx.subgroup_operations);
         return decline("subgroup-too-narrow");
     }
-    // #1122 review B1: covers_extent (dispatch grid >= image extent) is NECESSARY but NOT SUFFICIENT
-    // for skipping the seed. A write-only shader can store a subset of its grid (a masked composite:
-    // `if (mask) imageStore(...)`, or a scatter store), covering the grid yet leaving untouched texels
-    // undefined. Skipping the seed there would pack reused-pool garbage to the guest -- silent
-    // corruption. So prove full coverage ONCE per (shader, binding, extent): seed the image with
-    // poison, confirm the write overwrites every texel (0 poison survives), cache the verdict, and
-    // only then fast-skip. The proving frame itself stays correct -- untouched texels are restored
-    // from the seed (see the poison_verify writeback path).
-    //
-    // The cached verdict is trusted for a DATA-INDEPENDENT store pattern (unconditional per-gid store,
-    // or a store bounded by gid vs a constant/the image extent) -- the exercised full-screen composites
-    // are exactly this. The extent is part of the key, so the same shader reused for a larger target
-    // re-proves (a hard-coded store bound cannot silently under-cover a bigger extent). What this key
-    // does NOT catch is a store whose predicate depends on per-frame INPUT (`if (buffer[gid] > k)
-    // store`) that is full on the proving frame but partial later; that residual soundness gap is
-    // tracked in #3467. Program and launch identity below prevent replacement from inheriting a
-    // verdict, but do not prove input independence. A shader first seen partial seeds normally.
-    using prosper::frontend::SeedCoverage;
-    using prosper::frontend::classify_seed_coverage;
-    using prosper::frontend::classify_near_full_coverage;
-    using prosper::frontend::seed_coverage_name;
-    using prosper::frontend::seed_verdict_reprove_eligible;
-    // #1127: 'prove once, trust forever' is unsound for a DATA-DEPENDENT store (full on the proving
-    // frame, partial later). Re-prove a Full or None verdict every kSeedReproveInterval fast-skips: a shader
-    // that ever covers partially is then re-cached Partial and always seeds, bounding the corruption
-    // window from unbounded to <= interval fast-skips. A genuinely data-independent writer (the
-    // exercised full-screen composites or untouched bindings) re-proves each time -- no rendered-output change, ~1
-    // extra poison frame per interval. skips counts fast-skips taken since the last (re-)proof.
-    struct SeedVerdict {
-        SeedCoverage cov = SeedCoverage::Partial;
-        uint32_t skips = 0;
-        uint64_t written_layers = ~0ULL;
-        bool near_full = false;
-        uint64_t last_used = 0;
-        // The guest code address can be reused or recompiled with different lowering.
-        // Own the effective module: item storage and pipeline-cache entries can expire.
-        // Exact bytes, rather than a hash alone, authorize reuse of every verdict kind.
-        std::vector<uint32_t> program;
-        uint32_t subgroup_size = 0;
-        uint32_t required_subgroup_size = 0;
-        std::array<uint32_t, 3> groups{};
-    };
-    // Coverage was observed over the shared image, so its writer membership is part of the proof.
-    // Splitting a previously full-coverage alias group can leave the owner only partially written.
-    using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-                                       std::vector<uint32_t>>;
-    static std::mutex seed_coverage_mu;
-    // A guest address can alternate between compiled representations every frame.
-    // Retain a bounded set so those variants do not force each other to re-prove.
-    constexpr size_t kSeedVariantsPerKey = 4;
-    static std::map<SeedCoverageKey, std::vector<SeedVerdict>> seed_coverage_proof;
-    static uint64_t seed_coverage_clock = 0;
-    const auto matches_seed_program = [&](const SeedVerdict& verdict) {
-        return verdict.program == spirv && verdict.subgroup_size == effective_subgroup &&
-               verdict.required_subgroup_size == item.required_subgroup_size &&
-               verdict.groups == std::array<uint32_t, 3>{
-                   dispatch_groups[0], dispatch_groups[1], dispatch_groups[2]};
-    };
-    // PROSPER_SEED_REPROVE=N: re-prove every N fast-skips (default 256; explicit 0 disables = old
-    // prove-once). Parsed fail-safe -- garbage/overflow keeps the 256 default rather than silently
-    // disabling the safety (see seed_reprove_interval_from_env).
-    static const uint32_t kSeedReproveInterval =
-        seed_reprove_interval_from_env(std::getenv("PROSPER_SEED_REPROVE"), 256u);
-    // #1122: a compute post-process that only image_stores an output never reads that output's seed.
-    // Reflection tracks image access per descriptor: a shader may read several input storage images
-    // while binding a distinct write-only output, so the old shader-wide OpImageRead test needlessly
-    // seeded the output (66 MiB/frame for Astro Bot's 4K FP16 post target).
-    const bool seed_skip_enabled = std::getenv("PROSPER_NO_SKIP_SEED") == nullptr;
+    // Coverage observed on a previous dispatch cannot authorize discarding inputs:
+    // runtime predicates, coordinates and loop bounds may change with identical code and launch.
+    // Preserve current input contents instead. Exact cached images can omit the upload only after
+    // their current source is validated; this also keeps partial writes resident on the GPU.
     const auto setup_validate_start = ComputeClock::now();
     auto report = validate_spirv_descriptor_interface(
-        spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
+        spirv, resources.get(), 0, SpirvShaderStage::Compute, false);
     if (!report.ok()) return decline("descriptor-interface-invalid");
-    const bool has_conditional_noop = item.resources &&
-        std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+    const bool has_conditional_noop = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_proven_null_guarded_raw_store);
     // The impossible-stride resource shape is serialized data, not authority. Only the live
     // compiler or replay materializer can mint this non-serialized token after checking raw bytes,
     // pc42 scalar dataflow, and the dispatch's user s2:s3.
     if (has_conditional_noop && !item.null_guarded_raw_store_validated)
         return decline("null-guarded-raw-store-unproven");
-    const bool has_nullable_output = item.resources &&
-        std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+    const bool has_nullable_output = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_nullable_raw_buffer_marker_candidate);
     // This marker retains a mapped/captured source-table witness, but that byte range is still data,
     // not authority. Only realization or replay may mint the family-specific final-proof token.
     if (has_nullable_output &&
         (!item.nullable_output_raw_buffer_validated ||
-         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+         std::any_of(resources->resources.begin(), resources->resources.end(),
                      [](const ShaderResource& resource) {
                          return is_nullable_raw_buffer_marker_candidate(resource) &&
                                 !is_proven_null_nullable_raw_buffer(resource);
                      }))) return decline("nullable-output-raw-buffer-unproven");
-    const bool has_cf9200_no_backing = item.resources &&
-        std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+    const bool has_cf9200_no_backing = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_cf9200_no_backing_marker_candidate);
     if (has_cf9200_no_backing &&
         (!item.gta5_cf9200_no_backing_validated ||
-         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+         std::any_of(resources->resources.begin(), resources->resources.end(),
                      [](const ShaderResource& resource) {
                          return is_gta5_cf9200_no_backing_marker_candidate(resource) &&
                                 !is_proven_gta5_cf9200_no_backing(resource);
@@ -6055,7 +6113,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // mip chain (e.g. aliasing a live render target). This avoids burning dozens of milliseconds
     // allocating staging buffers, mapping host memory, and running CPU de-tiling for doomed dispatches.
     for (const auto& descriptor : image_descriptors) {
-        const ShaderResource* r = item.resources ? item.resources->by_binding(descriptor.binding) : nullptr;
+        const ShaderResource* r = resources ? resources->by_binding(descriptor.binding) : nullptr;
         if (!r || !r->width || !r->height) {
             return decline("no/degenerate resource");
         }
@@ -6095,8 +6153,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // authority boundary and poison later producer ordering even though the guest operation completed
     // architecturally. A merely descriptorless module or an ordinary empty table remains a failure.
     const bool all_proven_no_backing_noop = descriptors.empty() && image_descriptors.empty() &&
-        item.resources && !item.resources->resources.empty() &&
-        std::all_of(item.resources->resources.begin(), item.resources->resources.end(),
+        resources && !resources->resources.empty() &&
+        std::all_of(resources->resources.begin(), resources->resources.end(),
                     [](const ShaderResource& resource) {
                         return is_zero_record_raw_buffer(resource) ||
                                is_proven_null_guarded_raw_store(resource) ||
@@ -6146,8 +6204,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         ((phase_timing_requested || image_timing_requested || buffer_timing_requested) &&
          timing_address_matches)) {
         timing_program_hash = gpu_capture_hash(
-            reinterpret_cast<const uint8_t*>(spirv.data()),
-            spirv.size() * sizeof(uint32_t));
+            reinterpret_cast<const uint8_t*>(source_spirv.data()),
+            source_spirv.size() * sizeof(uint32_t));
     }
     if ((phase_timing_requested || image_timing_requested || buffer_timing_requested) &&
         timing_address_matches) {
@@ -6216,20 +6274,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     std::sort(image_descriptors.begin(), image_descriptors.end(), [](const auto& a, const auto& b) {
         return a.binding < b.binding;
     });
-    const auto image_alias_plan = item.resources
-        ? prosper::frontend::plan_storage_image_aliases(image_descriptors, *item.resources)
+    const auto image_alias_plan = resources
+        ? prosper::frontend::plan_storage_image_aliases(image_descriptors, *resources)
         : prosper::frontend::StorageImageAliasPlan{};
     if (!image_alias_plan.valid) return decline("storage-alias-resource-missing");
-    const auto image_seed_coverage_key = [&](size_t i, const ShaderResource& resource) {
-        return SeedCoverageKey{
-            item.code_addr, image_descriptors[i].binding,
-            resource.width, resource.height, resource.depth,
-            image_alias_plan.groups[image_alias_plan.group_for_image[i]].bindings};
-    };
-
     const LiveComputeBufferDescriptorPlan buffer_plan =
         plan_live_compute_buffer_descriptors(
-            descriptors, item.resources.get(), ctx.descriptor_indexing_support);
+            descriptors, resources.get(), ctx.descriptor_indexing_support);
     if (!buffer_plan.valid) {
         if (trace)
             std::fprintf(stderr,
@@ -6253,7 +6304,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     buffer_descriptor_indices.reserve(buffer_plan.total_descriptor_count);
     for (size_t descriptor_index = 0; descriptor_index < descriptors.size(); ++descriptor_index) {
         const ShaderResource* parent =
-            item.resources->by_binding(descriptors[descriptor_index].binding);
+            resources->by_binding(descriptors[descriptor_index].binding);
         // Validation and the plan above normally make this unreachable.
         if (!parent) return decline("descriptor-binding-has-no-resource");
         if (!parent->table_index_count) {
@@ -6859,7 +6910,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             double image_allocation_ms = 0.0;
             double view_ms = 0.0;
             double sampler_ms = 0.0;
-            const ShaderResource* r = item.resources->by_binding(image_descriptors[i].binding);
+            const ShaderResource* r = resources->by_binding(image_descriptors[i].binding);
             if (!r || !r->width || !r->height) { skip_image(r, "no/degenerate resource"); break; }
             BoundImage& bi = images[i];
             bi.resource = r;
@@ -6947,6 +6998,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // SPIR-V is authoritative here: a raw-uvec4 module must keep the conversion path even
             // if this replay device supports the optional typed format, while a live module is only
             // emitted as float after the frontend's physical-device feature query.
+            for (const auto& mask : write_masks.masks)
+                if (std::find(mask.bindings.begin(), mask.bindings.end(), bi.binding) != mask.bindings.end())
+                    bi.storage_write_mask = &mask.written;
+            bi.storage_write_only = bi.storage &&
+                image_alias_plan.groups[image_alias_plan.group_for_image[i]].write_only();
             bi.native_float_storage = spirv_native_float_storage;
             bi.native_uint_storage = spirv_native_uint_storage;
             const VkFormat query_storage_format = bi.packed_r11_storage
@@ -7058,9 +7114,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             query_ms = std::chrono::duration<double, std::milli>(
                 ComputeClock::now() - query_start).count();
             // Exact write-only storage aliases already have a fully prepared canonical image.
-            // Fold before requesting an RTT snapshot or consulting this binding's coverage proof:
-            // only the owner writes back and publishes a proof, so the duplicate would otherwise
-            // keep requesting a snapshot even after the owner has proved a full overwrite.
+            // Fold before requesting a second RTT snapshot: the owner supplies current inputs
+            // and publishes the combined result, so the duplicate needs no separate preparation.
             // Keep the ownership query above: the live renderer also drains pending guest writes.
             // Sampled/imported representations and mixed-access bindings retain the late path.
             const auto& decl = image_descriptors[i];
@@ -7285,83 +7340,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 }
             }
-            // #1122: skip the seed entirely for a write-only storage image whose dispatch fully
-            // covers the target -- BUT only after proving (once per shader) that the write actually
-            // stores every texel (see the SeedCoverage cache above). Enough total invocations is a
-            // NECESSARY condition (a smaller grid always seeds), but the mapping need not be one
-            // invocation per same-axis texel: vectorized/swizzled kernels are common. The poison
-            // proving frame establishes actual full coverage for this shader/binding/extent.
-            const bool enough_threads = dispatch_has_enough_threads_for_texels(
-                item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
-                r->width, r->height, r->depth, 16);
-            // Diagnostic: force the proving (poison) path on every eligible dispatch, never fast-skip.
-            static const bool force_verify = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
-            // A write-only descriptor can share this image with a readable sibling. Poisoning
-            // would corrupt values consumed during execution even if writeback later restored the
-            // untouched image texels. Decide from the whole group before consulting ANY proof.
-            if (bi.storage && seed_skip_enabled &&
-                image_alias_plan.groups[image_alias_plan.group_for_image[i]].can_discard_seed() &&
-                enough_threads) {
-                const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
-                bool proven_full = false, proven_none = false, known = false, reprove_due = false;
-                {
-                    std::lock_guard<std::mutex> lk(seed_coverage_mu);
-                    auto it = seed_coverage_proof.find(proof_key);
-                    if (it != seed_coverage_proof.end()) {
-                        auto verdict = std::find_if(it->second.begin(), it->second.end(),
-                                                    matches_seed_program);
-                        if (verdict != it->second.end()) {
-                            verdict->last_used = ++seed_coverage_clock;
-                            known = true;
-                            proven_full = verdict->cov == SeedCoverage::Full;
-                            proven_none = verdict->cov == SeedCoverage::None;
-                            bi.written_layers_mask = verdict->written_layers;
-                            // Reproof counters belong to this exact executable/launch variant.
-                            if (seed_verdict_reprove_eligible(
-                                    verdict->cov, verdict->written_layers, verdict->near_full) &&
-                                seed_reprove_due(verdict->skips, kSeedReproveInterval))
-                                reprove_due = true;
-                        }
-                    }
-                }
-                if (force_verify || reprove_due) {
-                    bi.poison_verify = true;    // (re-)prove; the writeback caches the verdict
-                } else if (proven_full) {
-                    bi.seed_skip = true;        // proven: every texel is written, the seed is unobserved
-                    if (trace)
-                        std::fprintf(stderr,
-                                     "[compute]   seed-skip write-only storage binding=%u addr=0x%llx "
-                                     "extent=%ux%u threads=%ux%ux%u renderer_owned=%d\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
-                                     item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
-                                     renderer_owned ? 1 : 0);
-                } else if (proven_none) {
-                    bi.seed_skip = true;        // proven unwritten and unread: skip seeding
-                    bi.write_skip = true;       // proven unwritten: skip GPU readback and guest writeback
-                    if (trace)
-                        std::fprintf(stderr,
-                                     "[compute]   seed-and-write-skip untouched storage binding=%u addr=0x%llx "
-                                     "extent=%ux%u threads=%ux%ux%u\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
-                                     item.launch.threads_x, item.launch.threads_y, item.launch.threads_z);
-                } else if (!known) {
-                    bi.poison_verify = true;    // unknown: prove coverage this frame (still correct)
-                    if (trace)
-                        std::fprintf(stderr,
-                                     "[compute]   seed-skip PROVING coverage binding=%u addr=0x%llx "
-                                     "code=0x%llx extent=%ux%u\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr,
-                                     (unsigned long long)item.code_addr, r->width, r->height);
-                }
-                // Proven Partial: fall through, seed normally every frame.
-            }
             // A partial storage write needs the old target contents, but an exact sampled binding
             // earlier in this dispatch may already have borrowed those pixels directly from the
             // renderer. Seed the private writable image from that Vulkan image below instead of
-            // materializing the complete RTT on the CPU and immediately uploading it again. Keep
-            // proving frames on the CPU poison path: their coverage verdict depends on the seed.
-            if (renderer_owned && bi.storage && bi.native_float_storage &&
-                !bi.seed_skip && !bi.poison_verify) {
+            // materializing the complete RTT on the CPU and immediately uploading it again.
+            if (renderer_owned && bi.storage && bi.native_float_storage && !bi.storage_write_mask) {
                 for (size_t j = 0; j < i; ++j) {
                     const BoundImage& source = images[j];
                     const ShaderResource* p = source.resource;
@@ -7390,7 +7373,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             if (renderer_owned && !bi.imported && !bi.color_bits_source &&
-                !bi.packed10_source && !bi.seed_skip &&
+                !bi.packed10_source &&
                 bi.seed_from_imported == SIZE_MAX) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
@@ -8211,7 +8194,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
             const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.color_bits_source || bi.packed10_source ||
-                                        bi.seed_skip ||
                                         bi.seed_from_imported != SIZE_MAX ||
                                         bi.compute_transfer_seed_borrowed)
                 ? size_t{0} : (size_t)sbytes;
@@ -8219,8 +8201,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // transfer. Only a read-only sampled cache hit can omit staging altogether.
             const auto staging_start = ComputeClock::now();
             if (!bi.imported && !bi.color_bits_source &&
-                ((bi.storage && !bi.write_skip) || (!bi.compute_transfer_seed_borrowed &&
-                                                    !(bi.persistent && bi.upload_skipped)))) {
+                (bi.storage || (!bi.compute_transfer_seed_borrowed &&
+                                !(bi.persistent && bi.upload_skipped)))) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 sci.size = sbytes;
                 sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -8238,7 +8220,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     images_ready = false; break;
                 }
                 upload_mapping.memory = staging_memory[i];
-                if (!bi.depth_bits_source && !bi.packed10_source && !bi.seed_skip &&
+                if (!bi.depth_bits_source && !bi.packed10_source &&
                     bi.seed_from_imported == SIZE_MAX &&
                     !bi.compute_transfer_seed_borrowed &&
                     !(bi.persistent && bi.upload_skipped) &&
@@ -8322,11 +8304,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
-                const uint8_t* src = (renderer_owned || bi.seed_skip)
+                const uint8_t* src = renderer_owned
                     ? nullptr : resource_bytes_for(r, guest_bytes);
                 if (alias_census_enabled() && compute_guest_range_is_real({r->gpu_addr, guest_bytes})) {
-                    // A binding that reads nothing from guest memory cannot alias: `src` is null
-                    // exactly when the seed is skipped or the source is renderer-owned. The
+                    // A renderer-owned input reads no guest seed here. Other storage inputs retain
+                    // their guest-read obligation even when the shader is write-only. The
                     // `r->gpu_addr` guard is the same rule the buffer loop applies -- address 0 is
                     // a synthesized null binding, not a guest range.
                     if (src) alias_seeds.push_back({r->gpu_addr, guest_bytes});
@@ -8342,12 +8324,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                       (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
-                // Exact-width storage targets are byte-identical to guest row-major bytes. A raw-uvec4
-                // target is also safe to retain when seed_skip proves the shader is a full, write-only
-                // producer: the previous raw values are then unobservable, while retaining them lets
-                // the exact GPU comparator recognize a repeated result before CPU pack/retile.
-                // Poison proving deliberately stays transient because a partial proof repairs
-                // untouched texels only in the CPU mirror after readback.
+                // Native images preserve exact guest texels. A raw-uvec4 result can also preserve
+                // inputs for a write-only alias group: packing untouched retained texels reproduces
+                // the validated guest bytes. A readable/atomic group must upload canonical values
+                // instead because unpack(pack(raw)) need not equal raw. Both paths validate current
+                // contents; past shader coverage never authorizes a seed or writeback omission.
                 const bool dcc_cache_safe = !r->compression_enabled ||
                     (bi.dcc_metadata && bi.dcc_metadata_bytes &&
                      std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
@@ -8355,10 +8336,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const ComputeStorageCacheGateInputs storage_cache_gates{
                     renderer_owned,
                     dcc_cache_safe,
-                    bi.poison_verify,
+                    false,
                     bi.exact_storage_bytes(),
-                    bi.seed_skip,
-                    persistent_compute_image_enabled(
+                    bi.storage_write_only,
+                    !bi.storage_write_mask && persistent_compute_image_enabled(
                         sbytes, ComputeImageCacheClass::storage),
                 };
                 // Build the same exact identity used by ordinary admission before choosing either
@@ -8385,7 +8366,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         c[2] += storage_cache_gates.dcc_cache_safe ? 1 : 0;
                         c[3] += storage_cache_gates.poison_verify ? 1 : 0;
                         c[4] += storage_cache_gates.exact_storage ? 1 : 0;
-                        c[5] += storage_cache_gates.seed_skip ? 1 : 0;
+                        c[5] += storage_cache_gates.write_only ? 1 : 0;
                         c[6] += storage_cache_gates.persistent_enabled ? 1 : 0;
                         c[7] += bi.cache_candidate ? 1 : 0;
                         want_dump = (++evaluations % 4096 == 0);
@@ -8400,12 +8381,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     });
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
-                    const bool source_snapshot_req = !bi.seed_skip ||
-                        !adaptive_storage_result_validation_enabled();
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped,
-                        source_snapshot_req);
+                        !bi.storage_write_only || !adaptive_storage_result_validation_enabled());
+                    // Diagnostic control: force a real current-input upload even when the retained
+                    // image is valid. Keep allocation ownership and completed-result tracking.
+                    if (std::getenv("PROSPER_NO_SKIP_SEED")) bi.upload_skipped = false;
                     if (bi.persistent && bi.exact_result_bytes <= max_gpu_compare_image_bytes())
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
@@ -8441,7 +8423,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         ComputeClock::now() - cache_lookup_start).count();
                 }
                 if (!(bi.persistent && bi.upload_skipped)) {
-                const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
+                const size_t linear_size = (bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
                 // Pooled, not freshly allocated: a 4K RGBA16F seed is 63.3 MiB, which is past
                 // glibc's 32 MiB mmap threshold, so a per-dispatch allocation is an mmap, a page
@@ -8467,11 +8449,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      r->tile_mode, static_cast<uint32_t>(guest_texel)));
                 }
                 const uint8_t* unpack_source = nullptr;
-                if (bi.seed_skip) {
-                    // #1122: a proven full writer overwrites every texel. Partial writers
-                    // require current source contents even when an allocation is retained.
-                    // No seed upload needed.
-                } else if (bi.seed_from_imported != SIZE_MAX) {
+                if (bi.seed_from_imported != SIZE_MAX) {
                     // The command buffer copies the renderer's exact native image into this target.
                     // Staging remains allocated because the result still has to be read back below.
                 } else if (renderer_owned) {
@@ -8544,7 +8522,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Decode it in place instead of copying the complete surface to a temporary first.
                     unpack_source = src;
                 }
-                if (!bi.seed_skip && bi.seed_from_imported == SIZE_MAX) {
+                if (bi.seed_from_imported == SIZE_MAX) {
+                    if (bi.storage_write_mask)
+                        bi.untouched_seed.assign(unpack_source, unpack_source + linear_guest_bytes);
                     if (bi.exact_storage_bytes()) {
                         parallel_compute_texels(texels, static_cast<size_t>(linear_guest_bytes) * 2,
                             [&](size_t begin, size_t end) {
@@ -8556,22 +8536,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         storage_unpack_range(unpack_source, guest_texel, r->format, nc, texels,
                                              reinterpret_cast<uint32_t*>(upload));
                 }
-                if (bi.poison_verify) {   // #1122 coverage proof: poison every uvec4 channel
-                    // Keep the clean detiled guest seed: on a partial-coverage proving frame the
-                    // writeback restores every un-stored (still-poison) texel from it, so proving
-                    // never corrupts the guest -- only the GPU `upload` is poisoned, `linear` is not.
-                    bi.seed_linear.assign(unpack_source, unpack_source + linear_size);
-                    if (bi.exact_storage_bytes()) {
-                        // Transfers preserve this finite, non-special native texel pattern exactly.
-                        // A texel that remains all 0x5a after the dispatch was not stored.
-                        std::memset(upload, 0x5a, static_cast<size_t>(sbytes));
-                    } else {
-                        uint32_t* pp = reinterpret_cast<uint32_t*>(upload);
-                        for (size_t t = 0; t < texels * 4; ++t) pp[t] = 0xDEADBEEFu;
-                    }
-                }
                 static const bool verify_unpack =
-                    std::getenv("PROSPER_VERIFY_UNPACK") != nullptr && !bi.seed_skip &&
+                    std::getenv("PROSPER_VERIFY_UNPACK") != nullptr &&
                     !bi.exact_storage_bytes();
                 if (verify_unpack) {
                     // Fail-visible A/B: the specialized range unpack must be bit-identical to the
@@ -9298,8 +9264,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             for (size_t i = 0; i < images.size(); ++i) {
                 BoundImage& bi = images[i];
                 const auto* r = bi.resource;
-                if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip ||
-                    bi.poison_verify || !bi.exact_storage_bytes() || !r ||
+                if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.storage_write_mask ||
+                    !bi.exact_storage_bytes() || !r ||
                     bi.array_layers != 1 || r->in_mip_tail ||
                     r->layer_mip_offset_bytes || !staging[i]) continue;
                 const bool volume = r->img_dim == 2 && r->depth > 1 && bi.texel_depth == r->depth;
@@ -9598,7 +9564,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // Retained writable buffers and storage images can carry an exact prior-result buffer.
         // Compare the current result against it on the GPU, reducing millions of word equalities to
         // one flag. Exact-width image bytes are canonical; raw-uvec4 image bytes enter this path
-        // only for proven-full write-only targets. The optimization is deliberately limited to
+        // only for write-only alias groups. The optimization is deliberately limited to
         // whole uvec4s; unaligned byte counts retain the collision-free CPU comparison below.
         struct CompareTarget {
             VkBuffer current = VK_NULL_HANDLE;
@@ -9623,8 +9589,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
             if (image.storage && image.cache_candidate && image.persistent &&
-                (image.upload_skipped ||
-                 (image.seed_skip && adaptive_storage_result_validation_enabled())) &&
+                image.upload_skipped &&
                 image.result_baseline && image.exact_result_bytes &&
                 image.exact_result_bytes <= max_gpu_compare_image_bytes() &&
                 !(image.exact_result_bytes & 15u) && staging[i])
@@ -9951,28 +9916,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      nullptr, 2, ready);
                 continue;
             }
-            if (bi.persistent && (bi.upload_skipped || bi.seed_skip)) {
+            if (bi.persistent && bi.upload_skipped) {
                 // The previous synchronous dispatch left this read-only sampled image in GENERAL,
-                // and either the guest source is unchanged or the proven-full shader cannot observe
-                // that source. No transfer or layout transition is needed.
-                continue;
-            }
-            if (bi.seed_skip) {
-                // #1122: nothing uploaded -- take the never-seeded image straight to GENERAL for the
-                // write-only shader (which overwrites every texel). The result is read back below.
-                VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                to_general.srcAccessMask = 0;
-                to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-                to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                to_general.srcQueueFamilyIndex = to_general.dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                to_general.image = bi.image;
-                to_general.subresourceRange = {
-                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bi.array_layers};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                                     1, &to_general);
+                // and current source validation authorizes preserving its contents. No upload or
+                // layout transition is needed, including for input-dependent partial writes.
                 continue;
             }
             if (bi.compute_transfer_seed_borrowed) {
@@ -10166,9 +10113,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // detile those identical bytes again on the next pass.
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
-            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip) continue;
-            // Coverage only proves this writer can discard its seed. A future partial
-            // writer or guest reader still needs the completed architectural bytes (#3455).
+            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
+            // Future partial writers and guest readers need completed architectural bytes,
+            // independently of which texels this dispatch happened to store (#3455).
             const ShaderResource* r = bi.resource;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -10899,14 +10846,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size() && readback_ok; i++) {
             BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
-            if (bi.write_skip) {
-                if (trace)
-                    std::fprintf(stderr,
-                                 "[compute]   skipped untouched storage writeback binding=%u "
-                                 "addr=0x%llx\n",
-                                 bi.binding, (unsigned long long)bi.resource->gpu_addr);
-                continue;
-            }
             const auto image_writeback_start = ComputeClock::now();
             const bool image_cache_hit = bi.persistent;
             const ShaderResource* r = bi.resource;
@@ -10952,7 +10891,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             static const bool direct_tiled_writeback_disabled =
                 std::getenv("PROSPER_NO_DIRECT_TILED_WRITEBACK") != nullptr;
             const bool tile_mapped_bytes = storage_writeback_can_tile_mapped_bytes(
-                bi.exact_storage_bytes(), r->tile_mode, bi.poison_verify,
+                bi.exact_storage_bytes(), r->tile_mode, false,
                 direct_tiled_writeback_disabled);
             // Pooled for the same reason as the seed above: this is a full-surface intermediate
             // allocated per writeback. Every fill below covers the whole extent (the pack loops run
@@ -10966,7 +10905,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);
             const uint8_t* native_texels = static_cast<const uint8_t*>(mapped);
-            // A retained, proven-full output can avoid the expensive CPU pack/retile and renderer
+            // A retained output can avoid the expensive CPU pack/retile and renderer
             // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
             // that guest memory still contains the prior result, and this dispatch reproduced the
             // same row-major bytes. If either comparison fails, take the ordinary writeback below.
@@ -10985,124 +10924,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (r->gpu_addr)
                     notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
                 continue;
-            }
-            // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
-            // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
-            // all survivors == the shader wrote zero texels (safe to fast-skip seed and writeback);
-            // intermediate survivors == partial coverage (must always seed). Cache the verdict per (code,binding)
-            // and, for a partial write, restore the un-stored texels from the clean seed after packing.
-            std::vector<uint8_t> poison_texel;   // 1 == this texel survived as poison (untouched)
-            if (bi.poison_verify) {
-                size_t survived = 0;
-                poison_texel.assign(texels, 0);
-                const size_t layer_texels = (r->depth > 1) ? (size_t)r->width * r->height : texels;
-                std::vector<size_t> layer_survived(r->depth > 1 ? r->depth : 1, 0);
-                // Stop at the first non-poison unit. The verdict is "every unit is still
-                // poison", so one mismatch settles the texel -- and that is the overwhelmingly
-                // common case: a covering shader writes every texel, so `poison_survived` is 0 and
-                // the mismatch is usually at the first byte. Without the early exit each texel paid
-                // the full guest_texel (or 4-channel) scan to reach a conclusion it already had.
-                // Measured on Astro Bot: 108.4 M texels scanned across one 70 s run.
-                uint32_t s_min_x = UINT32_MAX, s_max_x = 0, s_min_y = UINT32_MAX, s_max_y = 0;
-                uint32_t w_min_x = UINT32_MAX, w_max_x = 0, w_min_y = UINT32_MAX, w_max_y = 0;
-                for (size_t t = 0; t < texels; ++t) {
-                    bool all = true;
-                    if (bi.exact_storage_bytes()) {
-                        const uint8_t* texel = native_texels + t * guest_texel;
-                        for (size_t b = 0; b < guest_texel; ++b)
-                            if (texel[b] != 0x5a) { all = false; break; }
-                    } else {
-                        for (uint32_t c = 0; c < 4; ++c)
-                            if (channels[t * 4 + c] != 0xDEADBEEFu) { all = false; break; }
-                    }
-                    const uint32_t px = r->width ? static_cast<uint32_t>(t % r->width) : 0;
-                    const uint32_t py = r->width ? static_cast<uint32_t>(t / r->width) : 0;
-                    const uint32_t l = (r->depth > 1 && layer_texels > 0) ? static_cast<uint32_t>(t / layer_texels) : 0u;
-                    if (all) {
-                        ++survived;
-                        poison_texel[t] = 1;
-                        if (l < layer_survived.size()) ++layer_survived[l];
-                        s_min_x = std::min(s_min_x, px);
-                        s_max_x = std::max(s_max_x, px);
-                        s_min_y = std::min(s_min_y, py);
-                        s_max_y = std::max(s_max_y, py);
-                    } else {
-                        w_min_x = std::min(w_min_x, px);
-                        w_max_x = std::max(w_max_x, px);
-                        w_min_y = std::min(w_min_y, py);
-                        w_max_y = std::max(w_max_y, py);
-                    }
-                }
-                // Lifted into seed_reprove.hpp so the >64-layer case is testable in isolation --
-                // it was silently corrupting guest memory here and no test could reach it.
-                const ArrayLayerCoverage layers = classify_array_layer_coverage(
-                    r->depth, layer_survived.data(), layer_texels, survived, texels);
-                const uint64_t written_layers = layers.written_layers;
-                const bool any_written_partial = layers.any_written_partial;
-                SeedCoverage cov = classify_seed_coverage(survived, texels);
-                const bool all_layers_written =
-                    array_all_layers_written(r->depth, written_layers, layers.exact);
-                if (r->depth > 1 && all_layers_written && !any_written_partial) {
-                    cov = SeedCoverage::Full;
-                }
-                const bool near_full = classify_near_full_coverage(survived, texels);
-                bi.written_layers_mask = written_layers;
-                {
-                    const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
-                    std::lock_guard<std::mutex> lk(seed_coverage_mu);
-                    auto& variants = seed_coverage_proof[proof_key];
-                    auto verdict = std::find_if(variants.begin(), variants.end(), matches_seed_program);
-                    if (verdict == variants.end() && variants.size() == kSeedVariantsPerKey)
-                        verdict = std::min_element(variants.begin(), variants.end(),
-                            [](const SeedVerdict& a, const SeedVerdict& b) {
-                                return a.last_used < b.last_used;
-                            });
-                    // Reproof resets this variant's counter. At capacity only the least-recently
-                    // used variant loses its proof; eviction always returns it to Unknown.
-                    SeedVerdict fresh{
-                        cov, 0, written_layers, near_full, ++seed_coverage_clock, spirv,
-                        effective_subgroup, item.required_subgroup_size,
-                        {dispatch_groups[0], dispatch_groups[1], dispatch_groups[2]}};
-                    if (verdict == variants.end()) variants.push_back(std::move(fresh));
-                    else *verdict = std::move(fresh);
-                }
-                if (survived == 0) {
-                    std::fprintf(stderr,
-                                 "[seed-skip-verify] code=0x%llx binding=%u addr=0x%llx extent=%ux%ux%u fmt=%u tile=%u "
-                                 "texels=%zu poison_survived=0 %s\n",
-                                 (unsigned long long)item.code_addr, bi.binding,
-                                 (unsigned long long)r->gpu_addr, r->width, r->height, r->depth,
-                                 (unsigned)r->format, r->tile_mode, texels, seed_coverage_name(cov));
-                } else if (survived >= texels) {
-                    std::fprintf(stderr,
-                                 "[seed-skip-verify] code=0x%llx binding=%u addr=0x%llx extent=%ux%ux%u fmt=%u tile=%u "
-                                 "texels=%zu poison_survived=%zu (all) %s\n",
-                                 (unsigned long long)item.code_addr, bi.binding,
-                                 (unsigned long long)r->gpu_addr, r->width, r->height, r->depth,
-                                 (unsigned)r->format, r->tile_mode, texels, survived, seed_coverage_name(cov));
-                } else {
-                    std::fprintf(stderr,
-                                 "[seed-skip-verify] code=0x%llx binding=%u addr=0x%llx extent=%ux%ux%u fmt=%u tile=%u "
-                                 "texels=%zu poison_survived=%zu survived_box=[%u,%u..%u,%u] written_box=[%u,%u..%u,%u] %s\n",
-                                 (unsigned long long)item.code_addr, bi.binding,
-                                 (unsigned long long)r->gpu_addr, r->width, r->height, r->depth,
-                                 (unsigned)r->format, r->tile_mode, texels, survived,
-                                 s_min_x, s_min_y, s_max_x, s_max_y,
-                                 w_min_x, w_min_y, w_max_x, w_max_y,
-                                 seed_coverage_name(cov));
-                }
-                if (cov == SeedCoverage::None) {
-                    // Untouched storage target: the shader stored zero texels. Guest memory retains its
-                    // clean original contents. Skip guest memory write-watch notification, unpack/pack,
-                    // and CPU tiling writeback entirely.
-                    if (trace)
-                        std::fprintf(stderr,
-                                     "[compute]   proving frame confirmed untouched storage binding=%u "
-                                     "addr=0x%llx: skipping guest writeback\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr);
-                    ctx.unmap_memory(staging_memory[i]);
-                    continue;
-                }
             }
             // Notify page-based dirty trackers only when bytes will actually be written. Doing this
             // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
@@ -11138,7 +10959,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             } else if (bi.exact_storage_bytes()) {
                 // The typed Vulkan image has already applied the PS5 descriptor's UNORM/float
                 // conversion. Its transfer bytes are the guest's exact row-major texels. A tiled
-                // non-proving write can feed those bytes straight to the tiler, avoiding a second
+                // write can feed those bytes straight to the tiler, avoiding a second
                 // full-surface allocation and memcpy (66.8 MiB for Astro Bot's 4K RGBA16F target).
                 if (!tile_mapped_bytes)
                     parallel_compute_texels(texels, linear_bytes * 2,
@@ -11148,39 +10969,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         (end - begin) * guest_texel);
                         });
             } else if (pack_range_enabled) {
-                if (array_image && r->depth > 1 && bi.written_layers_mask != ~0ULL) {
-                    const size_t layer_texels = (size_t)r->width * r->height;
-                    for (uint32_t layer = 0; layer < r->depth && layer < 64; ++layer) {
-                        if (bi.written_layers_mask & (1ULL << layer)) {
-                            storage_pack_range(channels + layer * layer_texels * 4,
-                                               r->format, nc, layer_texels,
-                                               packed + layer * layer_texels * guest_texel,
-                                               guest_texel);
-                        }
-                    }
-                } else {
-                    storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
-                }
+                storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
             } else {
-                for (size_t t = 0; t < texels; t++) {
-                    const uint32_t layer = (array_image && r->depth > 1 && r->width && r->height)
-                        ? static_cast<uint32_t>(t / ((size_t)r->width * r->height)) : 0u;
-                    if (layer < 64 && !(bi.written_layers_mask & (1ULL << layer))) continue;
+                for (size_t t = 0; t < texels; t++)
                     storage_pack_texel(channels + t * 4, r->format, nc,
                                        packed + t * guest_texel);
-                }
             }
-            // #1122: a proving frame that turned out partial-coverage packed poison garbage into the
-            // un-stored texels. Restore each from the clean seed so the guest keeps its real prior
-            // content (exactly a partial write's contract). Full-coverage proving frames have no
-            // survivors, so this is a no-op there. bi.seed_linear shares this row-major texel layout.
-            if (bi.poison_verify && !poison_texel.empty() &&
-                bi.seed_linear.size() == linear_bytes) {
-                for (size_t t = 0; t < texels; ++t) {
-                    if (poison_texel[t])
-                        std::memcpy(packed + t * guest_texel,
-                                    bi.seed_linear.data() + t * guest_texel, guest_texel);
+            if (bi.storage_write_mask) {
+                if (bi.storage_write_mask->size() != texels || bi.untouched_seed.size() != linear_bytes) {
+                    ctx.unmap_memory(staging_memory[i]); readback_ok = false; break;
                 }
+                for (size_t t = 0; t < texels; ++t)
+                    if ((*bi.storage_write_mask)[t] == 0)
+                        std::memcpy(packed + t * guest_texel,
+                                    bi.untouched_seed.data() + t * guest_texel, guest_texel);
             }
             const auto pack_done = ComputeClock::now();
             static const bool verify_pack = std::getenv("PROSPER_VERIFY_PACK") != nullptr;
@@ -11192,6 +10994,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 size_t bad = 0, first_bad = 0;
                 for (size_t t = 0; t < texels; ++t) {
                     std::memset(expect.data(), 0, expect.size());
+                    if (bi.storage_write_mask && (*bi.storage_write_mask)[t] == 0) continue;
                     storage_pack_texel(channels + t * 4, r->format, nc, expect.data());
                     if (std::memcmp(expect.data(), packed + t * guest_texel,
                                     guest_texel) != 0) {
@@ -11232,9 +11035,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const size_t layer_stride = r->layer_stride_bytes
                     ? r->layer_stride_bytes : selected_slice;
                 for (uint32_t layer = 0; layer < r->depth; ++layer) {
-                    if (layer < 64 && !(bi.written_layers_mask & (1ULL << layer))) {
-                        continue;
-                    }
                     uint8_t* layer_base = destination + layer_stride * layer;
                     if (!r->tile_mode) {
                         const size_t row_pitch = r->layer_stride_bytes
@@ -11280,28 +11080,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // emulator is invalidating its own caches. Everything reaching the DS invalidation path
             // used to report the default `gpu`, which cannot distinguish them.
             set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
-            if (array_image && r->depth > 1 && bi.written_layers_mask != ~0ULL) {
-                uint32_t max_written_layer = 0;
-                for (uint32_t layer = 0; layer < r->depth && layer < 64; ++layer) {
-                    if (bi.written_layers_mask & (1ULL << layer)) max_written_layer = layer;
-                }
-                const size_t linear_slice = static_cast<size_t>(r->width) * r->height * guest_texel;
-                const size_t selected_slice = r->in_mip_tail
-                    ? r->mip_tail_bytes
-                    : (r->tile_mode
-                           ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
-                                                 static_cast<uint32_t>(guest_texel))
-                           : (r->layer_stride_bytes
-                                  ? linear_array_surface_bytes(
-                                        *r, static_cast<uint32_t>(guest_texel))
-                                  : linear_slice));
-                const size_t layer_stride = r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice;
-                const uint64_t written_range =
-                    std::min<uint64_t>((uint64_t)(max_written_layer + 1) * layer_stride, bi.guest_bytes);
-                notify_guest_gpu_write(r->gpu_addr, written_range);
-            } else {
-                notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
-            }
+            notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
             set_guest_gpu_write_origin(nullptr);
             if (!r->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
@@ -11362,7 +11141,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint8_t* retained_source =
                     (adaptive_storage_result_validation_enabled() &&
                      cold_storage_result_snapshot_can_defer(
-                         r->host_data != nullptr, bi.seed_skip, bi.guest_bytes,
+                         r->host_data != nullptr, bi.storage_write_only, bi.guest_bytes,
                          cold_storage_result_snapshot_defer_min_bytes()))
                     ? nullptr : destination;
                 if (bi.forced_seed_allocation_reused) {
@@ -11399,9 +11178,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ctx.invalidate_cached_image_source(bi.cache_key);
             if (bi.cache_candidate) {
                 if (bi.persistent && !promoted_after_writeback) {
-                    // Guest bytes now mirror the retained image again. A changing full-overwrite
-                    // target needs no source snapshot; the first repeated result retains one exact
-                    // baseline, and subsequent identical GPU skips do not recopy it.
+                    // Successful writeback establishes the new packed-input authority. A missing
+                    // optional source snapshot is safe: the next acquisition must either validate
+                    // current bytes by journal/watch or upload them. It never implies full coverage.
                     const size_t linear_slice = (array_image && r->depth > 1)
                         ? (static_cast<size_t>(r->width) * r->height * guest_texel) : 0;
                     const size_t selected_slice = (array_image && r->depth > 1)
@@ -11418,17 +11197,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const size_t layer_stride = (array_image && r->depth > 1)
                         ? (r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice) : 0;
                     ctx.validate_cached_image_source(
-                        bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
-                        bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
+                        bi.cache_key, destination, bi.gpu_result_unchanged, !bi.storage_write_only,
+                        bi.storage_write_only && bi.native_float_storage && r->img_dim == 2 &&
                             native_3d_transfer_enabled(),
                         bi.graphics_sampled_usage && bi.exact_storage_bytes(),
-                        r->depth, bi.written_layers_mask, layer_stride, selected_slice);
+                        r->depth, ~0ULL, layer_stride, selected_slice);
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,
                                             (adaptive_storage_result_validation_enabled() &&
                                              cold_storage_result_snapshot_can_defer(
-                                                 r->host_data != nullptr, bi.seed_skip,
+                                                 r->host_data != nullptr, bi.storage_write_only,
                                                  bi.guest_bytes,
                                                  cold_storage_result_snapshot_defer_min_bytes()))
                                                 ? nullptr : destination)) {
@@ -11488,7 +11267,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::fprintf(stderr,
                              "[compute-image-writeback] code=0x%llx hash=0x%016llx "
                              "binding=%u addr=0x%llx "
-                             "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
+                             "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
                              "poison=%u gpu-retile=%u dim=%u layers=%u texel-depth=%u "
                              "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
@@ -11497,7 +11276,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)timing_program_hash, bi.binding,
                              (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
                              r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
-                             bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u, bi.retile_buffer ? 1u : 0u,
+                             bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u,
                              r->img_dim, bi.array_layers, bi.texel_depth,
                              image_milliseconds(map_start, map_done),
                              image_milliseconds(map_done, prepare_done),

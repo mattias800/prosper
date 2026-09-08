@@ -134,6 +134,10 @@ enable_testing()
 # Pure selection/accounting policy behind the stable compute-timing hash filter. This must remain
 # runnable without prosper_core, a game dump, or Vulkan so a broken diagnostic cannot hide behind a
 # skipped execution test on a host without graphics support.
+add_executable(test_storage_write_mask_spirv frontends/shared/tests/test_storage_write_mask_spirv.cpp)
+target_include_directories(test_storage_write_mask_spirv PRIVATE frontends)
+add_test(NAME storage_write_mask_spirv COMMAND test_storage_write_mask_spirv)
+
 add_executable(test_compute_timing_selector tests/shared/compute/test_compute_timing_selector.cpp)
 target_include_directories(test_compute_timing_selector PRIVATE frontends)
 add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
@@ -2127,6 +2131,14 @@ if(TARGET prosper_core)
   # silent skip is how instrument trap 126 reads a smaller suite as a green one.
   find_program(SPIRV_AS_EXECUTABLE NAMES spirv-as)
   find_program(SPIRV_VAL_EXECUTABLE NAMES spirv-val)
+  if(Python3_Interpreter_FOUND AND SPIRV_VAL_EXECUTABLE)
+    add_test(NAME storage_write_mask_spirv_validate
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/frontends/shared/tests/test_storage_write_mask_spirv.py"
+                     $<TARGET_FILE:test_storage_write_mask_spirv> "${SPIRV_VAL_EXECUTABLE}")
+  else()
+    message(STATUS "storage_write_mask_spirv_validate NOT registered: Python3 or spirv-val missing")
+  endif()
   if(Python3_Interpreter_FOUND AND SPIRV_AS_EXECUTABLE AND SPIRV_VAL_EXECUTABLE)
     add_test(NAME vkprobe_hand_written_controls
              COMMAND "${Python3_EXECUTABLE}"
@@ -3102,40 +3114,78 @@ if(TARGET prosper_core)
                PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK=1
                $<TARGET_FILE:test_near_full_storage_authority> full-transition)
       add_test(NAME storage_seed_program_replacement COMMAND ${CMAKE_COMMAND} -E env
-               --unset=PROSPER_NO_SKIP_SEED --unset=PROSPER_VERIFY_SEED_SKIP
-               PROSPER_SEED_REPROVE=256
+               --unset=PROSPER_NO_SKIP_SEED
                $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
       add_test(NAME storage_seed_program_replacement_seeded COMMAND ${CMAKE_COMMAND} -E env
                PROSPER_NO_SKIP_SEED=1
                $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+      add_executable(test_storage_float_roundtrip tests/shared/live/test_storage_float_roundtrip.cpp)
+      target_include_directories(test_storage_float_roundtrip PRIVATE frontends)
+      target_link_libraries(test_storage_float_roundtrip PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      foreach(unpack 0 1)
+        foreach(pack 0 1)
+          set(unpack_env --unset=PROSPER_NO_F16C_STORAGE_UNPACK)
+          set(pack_env --unset=PROSPER_NO_F16C_STORAGE_PACK)
+          if(unpack)
+            set(unpack_env PROSPER_NO_F16C_STORAGE_UNPACK=1)
+          endif()
+          if(pack)
+            set(pack_env PROSPER_NO_F16C_STORAGE_PACK=1)
+          endif()
+          add_test(NAME storage_float_roundtrip_${unpack}_${pack} COMMAND ${CMAKE_COMMAND} -E env
+                   ${unpack_env} ${pack_env}
+                   $<TARGET_FILE:test_storage_float_roundtrip>)
+        endforeach()
+      endforeach()
+      add_executable(test_storage_raw_residency tests/gpu/execute/test_storage_raw_residency.cpp)
+      target_include_directories(test_storage_raw_residency PRIVATE tests frontends)
+      target_link_libraries(test_storage_raw_residency PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_raw_residency_seeded COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_SKIP_SEED=1 $<TARGET_FILE:test_storage_raw_residency>)
+      if(Python3_Interpreter_FOUND)
+        add_test(NAME storage_raw_residency COMMAND "${Python3_EXECUTABLE}"
+                 "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_raw_residency.py"
+                 $<TARGET_FILE:test_storage_raw_residency>)
+      endif()
+      add_executable(test_storage_snorm_untouched tests/gpu/execute/test_storage_snorm_untouched.cpp)
+      target_include_directories(test_storage_snorm_untouched PRIVATE tests frontends)
+      target_link_libraries(test_storage_snorm_untouched PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      foreach(bits 8 16)
+        foreach(mode none partial full)
+          add_test(NAME storage_snorm_${bits}_${mode} COMMAND test_storage_snorm_untouched ${bits} ${mode})
+          set_tests_properties(storage_snorm_${bits}_${mode} PROPERTIES TIMEOUT 60)
+        endforeach()
+      endforeach()
       add_executable(test_seed_coverage_dynamic tests/gpu/execute/test_seed_coverage_dynamic.cpp)
       target_include_directories(test_seed_coverage_dynamic PRIVATE tests frontends)
       target_link_libraries(test_seed_coverage_dynamic PRIVATE
                            prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME storage_seed_launch COMMAND ${CMAKE_COMMAND} -E env
-               --unset=PROSPER_NO_SKIP_SEED --unset=PROSPER_VERIFY_SEED_SKIP
-               PROSPER_SEED_REPROVE=256 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
+               --unset=PROSPER_NO_SKIP_SEED $<TARGET_FILE:test_seed_coverage_dynamic> launch)
       add_test(NAME storage_seed_launch_seeded COMMAND ${CMAKE_COMMAND} -E env
                PROSPER_NO_SKIP_SEED=1 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
-      # The default unchanged-program mask reproducer remains unresolved in #3467.
-      # Register its correct explicit-seed control; never accept corruption as a passing test.
-      add_test(NAME storage_seed_mask_seeded COMMAND ${CMAKE_COMMAND} -E env
-               PROSPER_NO_SKIP_SEED=1 $<TARGET_FILE:test_seed_coverage_dynamic> mask)
+      foreach(mode mask coordinates layers)
+        add_test(NAME storage_seed_${mode} COMMAND ${CMAKE_COMMAND} -E env
+                 --unset=PROSPER_NO_SKIP_SEED $<TARGET_FILE:test_seed_coverage_dynamic> ${mode})
+        add_test(NAME storage_seed_${mode}_seeded COMMAND ${CMAKE_COMMAND} -E env
+                 PROSPER_NO_SKIP_SEED=1 $<TARGET_FILE:test_seed_coverage_dynamic> ${mode})
+        set_tests_properties(storage_seed_${mode} storage_seed_${mode}_seeded PROPERTIES TIMEOUT 60)
+      endforeach()
       set_tests_properties(storage_seed_launch storage_seed_launch_seeded
                            storage_seed_mask_seeded PROPERTIES TIMEOUT 60)
       if(Python3_Interpreter_FOUND)
         add_test(NAME storage_seed_program_reuse
                  COMMAND "${Python3_EXECUTABLE}"
                          "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
-                         2 2 $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+                         2 $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
         add_test(NAME storage_seed_variant_eviction
                  COMMAND "${Python3_EXECUTABLE}"
                          "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
-                         6 4 $<TARGET_FILE:test_near_full_storage_authority> variant-eviction)
+                         4 $<TARGET_FILE:test_near_full_storage_authority> variant-eviction)
         add_test(NAME storage_seed_launch_reuse
                  COMMAND "${Python3_EXECUTABLE}"
                          "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
-                         2 1 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
+                         1 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
         set_tests_properties(storage_seed_program_reuse storage_seed_launch_reuse
                              storage_seed_variant_eviction
                              PROPERTIES TIMEOUT 60)

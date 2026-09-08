@@ -126,9 +126,9 @@ int main() {
     cache_gates.renderer_owned = true;
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
           "renderer ownership blocks storage cache candidate");
-    cache_gates.seed_skip = true;
-    CHECK(compute_storage_cache_gate_candidate(cache_gates),
-          "seed skip overrides renderer ownership for storage cache candidate");
+    cache_gates.write_only = true;
+    CHECK(!compute_storage_cache_gate_candidate(cache_gates),
+          "write-only access cannot override renderer source authority");
     cache_gates = cache_eligible;
     cache_gates.dcc_cache_safe = false;
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
@@ -140,10 +140,10 @@ int main() {
     cache_gates = cache_eligible;
     cache_gates.exact_storage = false;
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
-          "neither exact storage nor seed skip blocks storage cache candidate");
-    cache_gates.seed_skip = true;
+          "neither exact storage nor write-only access blocks storage cache candidate");
+    cache_gates.write_only = true;
     CHECK(compute_storage_cache_gate_candidate(cache_gates),
-          "seed skip satisfies the storage representation gate");
+          "write-only access satisfies the storage representation gate");
     cache_gates = cache_eligible;
     cache_gates.persistent_enabled = false;
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
@@ -210,9 +210,9 @@ int main() {
     promotion_gates.pre_dispatch.exact_storage = false;
     CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
           "nonexact storage blocks post-writeback promotion");
-    promotion_gates.pre_dispatch.seed_skip = true;
+    promotion_gates.pre_dispatch.write_only = true;
     CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
-          "seed skip cannot make a nonexact storage representation exportable");
+          "write-only access cannot make a nonexact storage representation exportable");
     promotion_gates = promotion_eligible;
     promotion_gates.pre_dispatch.persistent_enabled = false;
     CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),

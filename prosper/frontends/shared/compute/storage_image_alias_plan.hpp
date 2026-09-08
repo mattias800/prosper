@@ -29,7 +29,7 @@ struct StorageImageAliasGroup {
     bool writable = false;
     bool atomic = false;
 
-    bool can_discard_seed() const { return writable && !readable && !atomic; }
+    bool write_only() const { return writable && !readable && !atomic; }
 };
 
 struct StorageImageAliasPlan {
@@ -40,7 +40,7 @@ struct StorageImageAliasPlan {
 };
 
 // Seeding must account for EVERY descriptor that will share the canonical image, before that
-// image is uploaded or poisoned. This follows the existing late storage-alias identity, not the
+// image is uploaded or its raw result is reused. This follows the existing late storage-alias identity, not the
 // narrower early-fold optimization: storage never imports renderer/depth/value-reuse images, so
 // its late same_backing_representation is true. Reflection-format differences must not hide a
 // reader here when the late path can still fold it. This plan does not change actual folding.
@@ -79,8 +79,7 @@ inline StorageImageAliasPlan plan_storage_image_aliases(
         group.writable |= descriptor.writable;
         group.atomic |= descriptor.atomic_access;
     }
-    // Coverage is a property of this member set, not of transient guest addresses. Removing a
-    // writer can turn Full into Partial/None, and adding a writer can invalidate a None verdict.
+    // Keep a stable member list for whole-group access decisions and exact per-store tracking.
     for (auto& group : plan.groups) std::sort(group.bindings.begin(), group.bindings.end());
     return plan;
 }

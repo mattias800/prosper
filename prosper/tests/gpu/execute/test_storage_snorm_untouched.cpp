@@ -1,5 +1,6 @@
 // #3467: an unwritten SNORM minimum encoding is not an explicit store of -1.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/execute/host_read_barrier.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "shared/live/live_compute.hpp"
 
@@ -120,6 +121,7 @@ int main(int argc, char** argv) {
     const auto consumer = compile(reader, reader_table, 0x34674002u);
     if (failures) return 1;
 
+    bool first_dispatch = true;
     auto run = [&](const char* phase) {
         // Reset architectural bytes before every dispatch. Code, launch, SGPRs,
         // addresses and descriptors remain identical; only runtime mask data changes.
@@ -128,7 +130,12 @@ int main(int argc, char** argv) {
             if (wide) guest[i * bytes + 1] = static_cast<uint8_t>(minimum >> 8);
             expected[i] = mask[i % width] ? stored : minimum;
         }
+        const uint64_t barriers_before = backend_host_read_barrier_count().load();
         check(prosper::frontend::execute_live_compute_items({producer}), "SNORM producer executes");
+        if (first_dispatch)
+            check(backend_host_read_barrier_count().load() - barriers_before == 2,
+                  "first raw result and write-mask readback each record a host availability barrier");
+        first_dispatch = false;
         check(std::all_of(unused.begin(), unused.end(),
                           [](uint32_t value) { return value == unused_sentinel; }),
               "injected write mask never touches an occupied unreferenced resource binding");

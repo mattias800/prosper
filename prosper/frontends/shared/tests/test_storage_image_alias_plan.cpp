@@ -56,7 +56,7 @@ static void group(const StorageImageAliasPlan& plan, size_t index, size_t owner,
     CHECK(g.readable == read);
     CHECK(g.writable == write);
     CHECK(g.atomic == atomic);
-    CHECK(g.can_discard_seed() == discard);
+    CHECK(g.write_only() == discard);
 }
 
 static ShaderResourceTable pair_resources() {
