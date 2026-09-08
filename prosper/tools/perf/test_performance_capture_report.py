@@ -494,14 +494,24 @@ class ComputeDecompositionTests(unittest.TestCase):
         self.assertAlmostEqual(sum(values), 300.0, places=1)
 
     def test_negative_remainder_is_shown_signed_on_both_surfaces(self):
-        # A record whose named phases exceed its own total. Reachable from the producer: a
-        # dispatch that breaks out before phase_pipeline leaves that interval unrecorded while
-        # total_ms still spans the batch, so the remainder goes negative.
+        # A record whose named phases exceed its own total. NO CURRENT PRODUCER PATH BUILDS ONE,
+        # and the reason is worth stating so nobody re-derives it: the five CPU phases are
+        # consecutive differences over start->setup->pipeline->dispatch->writeback->cleanup
+        # (live_compute.cpp:11639-11643), and phase_milliseconds (:11635) is a plain signed
+        # difference with no clamping, so they telescope to cleanup-start for ANY ordering of the
+        # markers -- degenerate ones included. A break leaves a marker behind and yields a
+        # negative PHASE offset by a compensating positive one; the SUM is unchanged. Since
+        # total_ms spans at least that window, the remainder cannot go negative today.
         #
-        # It must be PRINTED, not hidden by a one-sided threshold: a negative remainder means
-        # the phases do not partition the total, which is a producer defect worth seeing. This
-        # is the file's convention for every other remainder, and it was the one line in the
-        # change that no arm pinned.
+        # An earlier version of this comment claimed a break before phase_pipeline produced one.
+        # It does not, and the claim reached here from a review citation that skipped the
+        # telescoping step -- which is why it is corrected rather than quietly dropped.
+        #
+        # The arm stays because the THRESHOLD is what is under test, not that mechanism: a
+        # one-sided threshold would silently hide a negative remainder if the telescoping ever
+        # broke (a clamp, or a phase measured outside the start..cleanup window), and a
+        # remainder that does not partition its total is precisely what this report exists to
+        # surface. It also matches the signed convention used for every other remainder here.
         over = [dict(HIDDEN_COST_COMPUTE[0])]
         over[0]["total_ms"] = 290.0          # named CPU phases sum to 296.0
         _, text = self._render(over)
