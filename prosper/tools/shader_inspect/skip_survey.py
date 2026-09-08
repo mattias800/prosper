@@ -150,15 +150,40 @@ def survey(app, dump, seconds, out_dir):
     }
 
 
-def write_baseline(rows, path):
-    """Record each title's refused count, plus the device that produced them."""
+def baseline_from(rows):
+    """The baseline a run would record, or (None, why) if the run cannot support one.
+
+    Applies the same cannot-be-judged rule the comparison does. Without it a title that presented no
+    frames was recorded as `0`, quietly baking "this title refuses nothing" into the file every later
+    run is measured against -- which would then redden honestly on the next good run and be read as a
+    regression. The failure direction is benign; the confusion is not.
+    """
     devices = {r["device"] for r in rows if r["device"]}
-    data = {
-        "device": sorted(devices)[0] if len(devices) == 1 else "",
+    unjudged = sorted(r["title"] for r in rows if r["exited_early"] or not r["frames"])
+    if unjudged:
+        return None, ("cannot record a baseline: %s could not be judged (no frames, or exited "
+                      "early). Recording 0 for a title that never ran would bake a false clean "
+                      "state into the file." % ", ".join(unjudged))
+    if len(devices) != 1:
+        return None, ("cannot record a baseline: this run reports %d distinct Vulkan devices, so "
+                      "nothing later compared against it could be trusted." % len(devices))
+    return {
+        "device": sorted(devices)[0],
         "titles": {r["title"]: r["refused_shaders"] for r in rows},
-    }
+    }, ""
+
+
+def write_baseline(rows, path):
+    """Validate FIRST, then write. Returns (data, why).
+
+    The previous version wrote the file and then reported that it had refused, so a bad run
+    clobbered the committed baseline while printing "REFUSING to write".
+    """
+    data, why = baseline_from(rows)
+    if data is None:
+        return None, why
     Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return data
+    return data, ""
 
 
 def compare_to_baseline(rows, baseline):
@@ -178,7 +203,13 @@ def compare_to_baseline(rows, baseline):
     """
     expected = baseline.get("titles", {})
     want_device = baseline.get("device", "")
-    lines = []
+
+    # A baseline with no titles compared clean against every possible run, reporting
+    # "unchanged: 0 title(s)". Vacuous truth is the purest form of this guard's only real failure --
+    # passing while establishing nothing -- so an empty baseline is unusable, not satisfied.
+    if not expected:
+        return False, ("the baseline lists no titles, so it cannot establish anything -- every run "
+                       "would match it. Re-record it with --write-baseline.")
 
     seen_devices = {r["device"] for r in rows}
     if not want_device:
@@ -219,13 +250,24 @@ def compare_to_baseline(rows, baseline):
         elif got < want:
             better.append("%s refuses %d, baseline %d" % (title, got, want))
 
+    # A surveyed title the baseline has never heard of is not a regression -- there is nothing to
+    # regress from -- but dropping it silently let a title refusing 99 shaders read as
+    # "unchanged: 3 title(s)". It is reported on every verdict, with its count, so the summary can
+    # never be more reassuring than the run.
+    unknown = sorted(set(by_title) - set(expected))
+    extra = ""
+    if unknown:
+        extra = (" NOT IN BASELINE (no verdict possible, add with --write-baseline): %s."
+                 % "; ".join("%s refuses %d" % (u, by_title[u]["refused_shaders"])
+                             for u in unknown))
+
     if worse:
-        return False, ("REGRESSION: %s.%s" % ("; ".join(worse),
-                       " (also improved: %s)" % "; ".join(better) if better else ""))
+        return False, ("REGRESSION: %s.%s%s" % ("; ".join(worse),
+                       " (also improved: %s)" % "; ".join(better) if better else "", extra))
     if better:
-        return True, ("improved: %s -- re-record with --write-baseline so the gain is locked in"
-                      % "; ".join(better))
-    return True, "unchanged: %d title(s) match the baseline exactly" % len(expected)
+        return True, ("improved: %s -- re-record with --write-baseline so the gain is locked in.%s"
+                      % ("; ".join(better), extra))
+    return True, ("unchanged: %d title(s) match the baseline exactly.%s" % (len(expected), extra))
 
 
 def main() -> int:
@@ -307,10 +349,9 @@ def main() -> int:
               for k, v in r.items()} for r in results], indent=2), encoding="utf-8")
         print("\nwrote %s" % args.json)
     if args.write_baseline:
-        data = write_baseline(results, args.write_baseline)
-        if not data["device"]:
-            print("REFUSING to write a baseline: this run reports no single Vulkan device, "
-                  "so nothing later compared against it could be trusted.", file=sys.stderr)
+        data, why = write_baseline(results, args.write_baseline)
+        if data is None:
+            print("REFUSING to write a baseline: %s" % why, file=sys.stderr)
             return 2
         print("wrote baseline %s (device %s, %d titles)"
               % (args.write_baseline, data["device"], len(data["titles"])))

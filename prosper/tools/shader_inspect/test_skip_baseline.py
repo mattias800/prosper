@@ -106,11 +106,42 @@ def main() -> int:
          row("PPSA24651", 0, device="")], base)
     check("an unrecorded device refuses to compare", not ok, why)
 
+    # ---- review findings: passes that establish nothing -----------------------------------------
+    #
+    # A guard's only interesting failure is passing while measuring nothing, and each of these did.
+
+    # F1. An empty baseline matched everything it knew about, which was nothing.
+    ok, why = skip_survey.compare_to_baseline([row("PPSA13579", 99)], {"device": NVIDIA,
+                                                                       "titles": {}})
+    check("an empty baseline FAILS instead of vacuously passing", not ok, why)
+    ok, why = skip_survey.compare_to_baseline([row("PPSA13579", 99)], {"device": NVIDIA})
+    check("a baseline with no titles key FAILS", not ok, why)
+
+    # F2. The "baseline records no device" branch had NO coverage: the arm that appeared to test it
+    # landed on the GPU-mismatch branch instead, and deleting the branch left a SILENT PASS, since
+    # {""} != {""} is False. Both sides unrecorded is the case that reaches it.
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 8, device="")], {"device": "", "titles": {"PPSA13579": 8}})
+    check("a baseline with no recorded device FAILS even when the run also has none", not ok, why)
+    check("...and says the BASELINE is the unusable side",
+          "baseline" in why.lower(), why)
+
+    # F5. A surveyed title absent from the baseline was dropped silently, so a title refusing 99
+    # could read as "unchanged".
+    ok, why = skip_survey.compare_to_baseline(
+        [row("PPSA13579", 8), row("PPSA99999", 99)], {"device": NVIDIA,
+                                                      "titles": {"PPSA13579": 8}})
+    check("a surveyed title missing from the baseline is REPORTED, not dropped",
+          "PPSA99999" in why, why)
+    check("...and its refusal count is named so 99 cannot hide behind 'unchanged'",
+          "99" in why, why)
+
     # ---- round-trip ------------------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "baseline.json"
         rows = [row("PPSA13579", 8), row("PPSA02664", 4)]
-        skip_survey.write_baseline(rows, path)
+        data, why = skip_survey.write_baseline(rows, path)
+        check("a good run writes a baseline", data is not None, why)
         loaded = json.loads(path.read_text())
         check("a written baseline records the device", loaded.get("device") == NVIDIA, str(loaded))
         check("a written baseline records each title's count",
