@@ -63,16 +63,16 @@ ROUTE_GATED = {
     "PPSA04263": "world is behind the Story/Performance menu route; a default boot surveys menus",
 }
 
-# There is no longer a per-title allowlist (#3464 W5). A fragment shader whose reason set is exactly
-# wave-any is ADMITTED on EVERY title: the renderer logs the admit line instead of the skip line, so
-# that class never appears in the REFUSED column for anyone -- not with a longer window, not with a
-# route. It is counted, in the ADMITTED column.
+# Titles the renderer admits the wave-any class on (live_renderer.cpp's kNativeFragmentVoteTitles).
+# On these, a fragment shader whose reason set is exactly wave-any is ADMITTED rather than skipped:
+# the renderer logs the admit line instead of the skip line, so that class never appears in the
+# REFUSED column for them -- not with a longer window, not with a route. It is counted, in the
+# ADMITTED column. On every OTHER title the same shader is still refused.
 #
-# This was `("PPSA04263",)` while the allowance was scoped to one title. The scope is gone, so the
-# tuple is empty rather than deleted: `test_skip_survey.py` asserts it stays in step with the
-# renderer, and an empty tuple is the assertion "no title is treated specially" rather than the
-# absence of one.
-NATIVE_VOTE_ALLOWLIST = ()
+# Pinned by test_skip_survey.py against the renderer's own list, in whatever form it takes. It has
+# been a single id, then absent, then this array; a pin anchored to any one of those shapes missed
+# the change to the next.
+NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263")
 
 # Both patterns are pinned to the emitter's format strings by test_skip_survey.py, which greps the
 # producing source. A regex that silently stops matching would make every title report zero -- the
@@ -397,11 +397,14 @@ def main() -> int:
             # Never "clean". A zero is scoped to the window AND, on an allowlisted title, to a class
             # this tool structurally cannot see.
             notes.append("none in window")
-        # Universal since W5: no title is special, so this is stated once for every row that has
-        # admissions rather than for a list of titles.
+        # Per-title again since PR #3480, so the note must name WHICH titles rather than claim all
+        # of them. Saying "every title" while the renderer admits three would hide refusals on the
+        # rest behind a reassuring sentence.
         if r["admitted_shaders"]:
-            notes.append("wave-any is ADMITTED (not skipped) on every title -- those %d are in the "
-                         "admitted column, never the refused one" % r["admitted_shaders"])
+            notes.append("ALLOWLISTED: wave-any is ADMITTED here (not skipped) -- those %d are in "
+                         "the admitted column, never the refused one" % r["admitted_shaders"])
+        elif r["title"] in NATIVE_VOTE_ALLOWLIST:
+            notes.append("allowlisted for wave-any, but none was admitted in this window")
         if r["title"] in ROUTE_GATED:
             notes.append(ROUTE_GATED[r["title"]])
         if r["exited_early"]:
@@ -422,9 +425,10 @@ def main() -> int:
     print("A zero is NOT a clean bill of health, for two reasons. (1) A title refuses nothing until")
     print("it renders the thing that would have been refused -- GTA V reported 0 over 5160 frames")
     print("while its world refuses 21 (#3464), because the window reached only its menus. (2) Since")
-    print("W5 a wave-any shader is ADMITTED on every title and logs the admit line instead of a skip")
-    print("line, so that class is counted in the ADMITTED column and never the refused one -- and")
-    print("wave-any was the class every hit in this corpus belonged to before W5.")
+    print("PR #3480 a wave-any shader is ADMITTED on ALLOWLISTED TITLES ONLY and logs the admit line")
+    print("instead of a skip line, so on those titles that class is counted in the ADMITTED column")
+    print("and never the refused one. On every other title it is still refused -- and wave-any was")
+    print("the class every hit in this corpus belonged to.")
     print("Counts are SHADERS, never draws -- the renderer's message is inside a "
           "shader-identity")
     print("dedupe guard and the draw drop is outside it. They are UPPER BOUNDS on distinct "

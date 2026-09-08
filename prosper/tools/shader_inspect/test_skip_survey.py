@@ -125,15 +125,26 @@ def main() -> int:
     #
     # If a title gate is ever reintroduced, this reddens and the survey's universal caveat has to be
     # narrowed again. That is the point: the tools describe the renderer, not the other way round.
-    ids = set(re.findall(r'native_fragment_vote_width\s*=\s*([^;]+);', live))
-    ids = set(re.findall(r'"([A-Z]{4}\d{5})"', " ".join(ids)))
-    check("skip_survey's allowlist matches live_renderer's (both empty since W5)",
+    # Collected from the whole gate REGION rather than from one syntactic form. This arm has been
+    # anchored on a single `title_id ==`, then on the assignment expression, and each time the thing
+    # moved: to an assignment, then to a `kNativeFragmentVoteTitles` array the assignment merely
+    # references. The array version passed an "is not title-scoped" assertion while the gate was
+    # fully title-scoped, because no PPSA literal appeared in the assignment any more.
+    #
+    # So: find the ids wherever they live between the allowlist declaration and the gate, and assert
+    # the tools EQUAL the renderer. That is the property that matters -- a survey claiming a title is
+    # allowlisted when it is not hides real refusals behind a reassuring note.
+    start = live.find("kNativeFragmentVoteTitles")
+    end = live.find("native_fragment_vote_width", start if start >= 0 else 0)
+    region = live[start:end + 400] if start >= 0 else live
+    ids = set(re.findall(r'"([A-Z]{4}\d{5})"', region))
+    check("skip_survey's allowlist matches the renderer's, exactly",
           ids == set(skip_survey.NATIVE_VOTE_ALLOWLIST),
-          "-- renderer gates on %s, survey has %s" % (sorted(ids) or "no title",
-                                                      sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
-    check("the renderer's fragment-vote allowance is not scoped to a title id",
-          not ids,
-          "-- a per-title gate reappeared: %s" % sorted(ids))
+          "-- renderer admits %s, survey has %s" % (sorted(ids) or "no title",
+                                                    sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
+    check("the renderer's allowlist is non-empty and was actually found",
+          bool(ids),
+          "-- found no title ids near the gate; the pin may be looking at the wrong place again")
 
     # N7: `admitted` is a shader count only because the emitter dedupes on shader identity
     # before printing. Nothing else pins that, so a refactor dropping the guard would turn

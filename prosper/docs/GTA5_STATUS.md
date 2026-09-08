@@ -267,10 +267,12 @@ dispatch was skipped. A zero-width probe silently meaning "unsupported" is a tra
   `DIM=2D_ARRAY`, while the later graphics `T#` names the byte-identical allocation as `DIM=CUBE`, and
   graphics lowers cube sampling to a vertical 2D stack.
 - **#2402** — the YUV composite draw skipped on NVIDIA because its fragment shader requires subgroup
-  size 64 on a 32-wide device. The series runs Wave64 fragment programs at native Wave32 **for this
-  title only**, and only for the narrow class whose sole remaining width reason is a control-flow
-  `WaveAny`; ballots, lane identity and scalar reductions stay exact, and every other title keeps
-  master's fail-visible exact-width contract.
+  size 64 on a 32-wide device. The series runs Wave64 fragment programs at native Wave32 for the
+  narrow class whose sole remaining width reason is a control-flow `WaveAny`; ballots, lane identity
+  and scalar reductions stay exact. **This was "for this title only" until #3480**, which replaced the
+  single title id with an allowlist of titles that have a before/after survey on a reviewed route --
+  the classifier was never the limit, the evidence was. A title not on that list still keeps the
+  fail-visible exact-width contract.
 
 ### Wave-vote exactness — and what it means for the hang investigation
 

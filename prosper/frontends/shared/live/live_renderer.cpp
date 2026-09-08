@@ -1209,26 +1209,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
-    // A fragment program whose ONLY remaining width reason is a control-flow WaveAny may run at the
-    // host's native Wave32. That class is width-agnostic by construction: two 32-lane halves each
-    // answer "did any lane pass" for their own half, and for control flow the union is the Wave64
-    // answer. Ballots, lane identity, shuffles and scalar reductions stay exact -- the classifier in
-    // render_runner.h admits a reason set of EXACTLY WaveAny and nothing else.
+    // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
     //
-    // This was title-scoped to PPSA04263 until #3464 W5, and the classifier was never the reason.
-    // The comment here read "every unreviewed title remains on the strict master path": one route
-    // had been reviewed, so one title was admitted. A corpus survey then measured at least 51
-    // refused fragment shaders across 5 of 9 titles with EVERY ONE at `0x2 wave-any` -- this exact
-    // class -- including three titles at rung 6 whose reviewed snapshot guards stayed green while
-    // the shaders were dropped, because those baselines were recorded on Linux/AMD where wave64 is
-    // native and the loss cannot occur. Scoping a general classifier to one title did not make the
-    // others safe; it made their losses invisible. (51 is a lower bound: counts depend on how far a
-    // run gets, so read #3464 rather than treating it as a total.)
+    // The classifier (render_runner.h) admits a reason set of EXACTLY kFragmentWaveReasonWaveAny --
+    // no lane identity, no ballot, no shuffle, no scalar reduction. What this list controls is which
+    // titles that classifier is trusted on, and it is a list rather than a switch for a measured
+    // reason: every entry has a before/after survey on a reviewed route on this project's hardware,
+    // and joining it is one run (`tools/shader_inspect/skip_survey.py --from-snapshots`).
     //
+    // Why not simply always-on, which is what #3464 W5 first proposed. The surveyed set is NOT a
+    // random sample of the corpus -- it is the titles that have snapshot routes, which biases toward
+    // simple, mature fragment work. That is exactly the population least likely to contain the
+    // shader this classifier still mis-admits, because the "control-flow only" property the safety
+    // argument rests on is NOT what the classifier tests (it tests the reason set, and the vote taint
+    // that would raise ScalarReduce has known escapes: `sel()` drops the taint `bsel()` propagates,
+    // and a vote routed into VCC is read per-lane by v_cndmask_b32 with no marker). Until the
+    // classifier tests the property its safety argument claims, each title is admitted on evidence.
+    //
+    // Keeping it title-keyed also preserves an invariant an always-on switch silently broke: tests
+    // and gpu_replay call register_live_renderer without a title_id (live_renderer.hpp:156 defaults
+    // it to {}), so they match nothing and keep the strict exact-width contract. gpu_replay gates on
+    // expected_output_hash, so admitting there would have moved the project's offline oracle.
+    //
+    // Measured on Windows/NVIDIA, reviewed routes, before -> after refusals (#3464, PR #3480):
+    //   PPSA01885 Evergate        11 -> 0 (title + gameplay routes; title screen's missing 3D
+    //                                      content confirmed restored by eye)
+    //   PPSA02664 Alex Kidd DX     4 -> 0 (title screen confirmed correct by eye; its WORLD has a
+    //                                      separate, unrelated defect -- #3479)
+    //   PPSA04263 Grand Theft Auto V      the original reviewed bank route
+    //
+    // NOT on this list, deliberately: PPSA21564 (6 measured refusals, no after-arm yet), and
+    // PPSA13579 / PPSA25009, whose refusals reach 0 but whose admitted modules have neither a
+    // module-level check nor a visual confirmation. They are a survey run away.
+    static const char* const kNativeFragmentVoteTitles[] = {
+        "PPSA01885", "PPSA02664", "PPSA04263",
+    };
     // The opt-out exists so the A/B stays reproducible, following PROSPER_NO_GUEST_FS: a default-on
     // behaviour whose disable switch is for bisection, not for routine use.
     const bool native_fragment_vote_width =
-        !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH");
+        !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
+        std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
+                    [&](const char* id) { return title_id == id; });
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and

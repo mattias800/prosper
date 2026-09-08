@@ -561,8 +561,12 @@ struct BackendDraw {
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
     // Whether the backend may run a WaveAny-only fragment program at the host's native wave width.
-    // Set by the live renderer; tests and replay leave it false so a fixture's expectations are not
-    // silently changed by a host property.
+    //
+    // Set by the live renderer from a TITLE allowlist (live_renderer.cpp). Tests and gpu_replay call
+    // register_live_renderer without a title_id -- it defaults to {} at live_renderer.hpp:156 -- so
+    // they match no entry and keep the strict exact-width contract. That is load-bearing rather than
+    // incidental: gpu_replay gates on expected_output_hash, and an earlier draft of #3480 keyed this
+    // on an env var instead, which admitted in replay and moved its per-submit hash.
     bool allow_native_fragment_vote_width = false;
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
@@ -7153,10 +7157,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // or scalar-reduction qualifier is admitted. Everything else keeps the fail-visible
             // exact-width contract.
             //
-            // No longer title-scoped (#3464 W5). It was, and the scope protected nothing the
-            // classifier did not already: a survey measured 31 refused fragment shaders across 5 of
-            // 9 titles, every one of them this exact class, three of those titles at rung 6 with
-            // guards that stayed green while the shaders were dropped.
+            // Admitted per TITLE by an allowlist in live_renderer.cpp, not globally (#3464 W5,
+            // PR #3480). Every entry has a before/after survey on a reviewed route; the scope is a
+            // queue, not a wall. Counts and the reasoning live on #3464 rather than here, because a
+            // survey total depends on how far each run got and a number restated in a comment goes
+            // stale silently.
             if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny) {
                 const uint64_t shader_key = bd.fs_identity
                     ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());

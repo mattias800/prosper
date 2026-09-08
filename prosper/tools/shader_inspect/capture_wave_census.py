@@ -40,10 +40,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Empty since #3464 W5: the narrow WaveAny class runs at native wave32 on EVERY title, so no title
-# id is privileged. Kept as a tuple rather than deleted so `--title` still has something to check
-# against and a reintroduced per-title gate has one place to be recorded.
-NATIVE_VOTE_ALLOWLIST = ()
+# The titles the renderer admits the narrow WaveAny class on, mirroring live_renderer.cpp's
+# kNativeFragmentVoteTitles (PR #3480). Every entry has a before/after survey on a reviewed route;
+# joining the list is one run, so this is a queue rather than a wall.
+NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263")
 
 DRAW = re.compile(r"^draw\[(\d+)\].*?\bfs=(\d+)/([0-9a-f]+)/", re.M)
 DS_SUBMIT = re.compile(r"\bfirst=(\d+) last=(\d+)")
