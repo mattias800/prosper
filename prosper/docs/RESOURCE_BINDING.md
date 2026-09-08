@@ -157,6 +157,17 @@ dispatches copy that source into a private writable image, restore its layout, a
 guest writeback. Missing or incompatible imports fall back to current snapshots; neither a matching
 address nor matching texel width alone authorizes this copy (#3407).
 
+After successful ordinary writeback, that private native RGBA8 result can be retained for the
+existing validated storage-to-sampled transfer path. This promotion does not authorize graphics
+exports: in the measured workload, repeated page-watch registration outweighed the conversion saving.
+Linux consumers without ordered-journal authority fall back to guest preparation; Windows retains
+its existing exact guest mirror. This does not
+authorize input reuse by a later renderer-owned producer. Retention refuses overlapping writes from
+independent image owners or any metadata reset, using effective host/guest destinations rather than
+advertised addresses alone. Publication waits for all writebacks, and guest mutation still invalidates
+consumer authority. Existing budget and pin rules apply; failure invalidates retained authority.
+The control `PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` restores transient result ownership.
+
 ### Write-watch alias protection
 
 Storage-result and texture caches may reuse a physical-page watch while other registrations still

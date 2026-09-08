@@ -129,3 +129,16 @@ returns to its incoming layout (or an earlier sampled borrower's GENERAL layout)
 destination still writes back guest bytes. Release every acquired pin, including folded aliases,
 only after completion is established. `PROSPER_NO_STANDALONE_RTT_SEED` selects the CPU control;
 F8-gated `compute-rtt-seed` rows distinguish admission from recorded copies.
+
+A completed private renderer-seeded native RGBA8 image may be retained under the existing image
+budget for validated storage-to-sampled transfers. This new result does not authorize graphics
+export or create its page watch: Linux uses the ordered journal and declines outside its authority;
+Windows retains its exact guest mirror. Ordinary graphics preparation remains the fallback. Input cache
+reuse remains excluded for renderer owners: their next dispatch acquires the current renderer image.
+Retain only after ordinary guest/DCC writeback; publish authority only after every writeback succeeds.
+Refuse a result if another independent storage owner's effective writeback destination or any DCC
+reset overlaps its guest bytes, including host backing and its own metadata. Exact folded aliases
+share one owner. Pinned replacement refusal and failure invalidation retain their existing contracts.
+No separate comparison baseline is created for this consumer source. The control
+`PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` disables this promotion; F8 writeback rows report
+`renderer-result-retained` separately from input cache hits.

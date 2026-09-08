@@ -2,6 +2,9 @@
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/texture/tile.hpp"
 #include "shared/live/live_compute.hpp"
 
 #include <algorithm>
@@ -14,7 +17,7 @@
 
 using namespace prosper::gpu;
 namespace {
-constexpr uint32_t width = 64, height = 4, texels = width * height;
+constexpr uint32_t width = 64, height = 16, texels = width * height;
 constexpr uint32_t guest_bytes = texels * 4;
 int failures = 0;
 void check(bool ok, const char* message) {
@@ -52,8 +55,16 @@ enum class Miss { None, Usage, Extent, PixelFormat, NativeFormat, Device, Layout
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--cpu"))) return 2;
-    const bool cpu_control = argc == 2;
+    if (argc > 2) return 2;
+    const bool cpu_control = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
+    const bool retention_off = argc == 2 && std::strcmp(argv[1], "--retention-off") == 0;
+    const bool retention_test = retention_off ||
+        (argc == 2 && std::strcmp(argv[1], "--retention") == 0);
+    if (argc == 2 && !cpu_control && !retention_test) return 2;
+    if (retention_off && !std::getenv("PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE")) {
+        std::fprintf(stderr, "--retention-off requires PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE\n");
+        return 2;
+    }
     if (cpu_control && !std::getenv("PROSPER_NO_STANDALONE_RTT_SEED")) {
         std::fprintf(stderr, "--cpu requires PROSPER_NO_STANDALONE_RTT_SEED\n");
         return 2;
@@ -63,6 +74,10 @@ int main(int argc, char** argv) {
     // Reserve a real wider backing for the value-equivalent RGBA16 sampled alias.
     // The writable RGBA8 view only owns the first half; the tail is a bounds guard.
     std::vector<uint8_t> guest(texels * 8, 0xc7), expected(guest_bytes);
+    // The final retention arm needs a real complete tiled allocation plus an
+    // independent tail. Reserve it now so its later resize preserves descriptor addresses.
+    if (retention_test) guest.reserve(tiled_surface_bytes(
+        width, height, static_cast<uint32_t>(TileMode::Sw64KbRX), 0, 4) + guest_bytes);
     auto source = std::make_shared<std::vector<uint8_t>>(texels * 4);
     std::vector<uint32_t> mask(width), observed(texels * 4, 0xccccccccu);
     std::vector<uint32_t> sampled_values(texels * 4, 0xccccccccu);
@@ -149,10 +164,11 @@ int main(int argc, char** argv) {
         for (uint32_t y = 0; y < height; ++y) {
             code.push_back(0x7e0a0280u + y);
             if (sampled_sibling) {
-                code.insert(code.end(), {0xf0000f08u, 0x00040c04u, 0xbf8c3f70u});
+                code.insert(code.end(), {0xf0000f08u, 0x00040c04u, 0xbf8c3f70u,
+                                         0xbe9803ffu, y * width * 16u}); // s24 = output row offset
                 for (uint32_t c = 0; c < 4; ++c)
-                    code.insert(code.end(), {0xe0702000u | (y * width * 16u + c * 4u),
-                                            0x80010004u | ((12u + c) << 8)});
+                    code.insert(code.end(), {0xe0702000u | (c * 4u),
+                                            0x18010004u | ((12u + c) << 8)});
             }
             code.insert(code.end(), {0xf0200f08u, 0x00020004u});
         }
@@ -175,10 +191,13 @@ int main(int argc, char** argv) {
     reader_table.resources = {buffer(observed.data(), observed.size() * 4, 2, 0, 16), sampled};
     std::vector<uint32_t> reader{0x7e080300u};
     for (uint32_t y = 0; y < height; ++y) {
-        reader.insert(reader.end(), {0x7e0a0280u + y, 0xf0000f08u, 0x00020804u, 0xbf8c3f70u});
+        // A full cache-eligible image exceeds MUBUF's 12-bit immediate range.
+        // Keep only the channel in the immediate and the full row offset in s24.
+        reader.insert(reader.end(), {0x7e0a0280u + y, 0xf0000f08u, 0x00020804u, 0xbf8c3f70u,
+                                     0xbe9803ffu, y * width * 16u});
         for (uint32_t c = 0; c < 4; ++c)
-            reader.insert(reader.end(), {0xe0702000u | (y * width * 16u + c * 4u),
-                                        0x80000004u | ((8u + c) << 8)});
+            reader.insert(reader.end(), {0xe0702000u | (c * 4u),
+                                        0x18000004u | ((8u + c) << 8)});
     }
     reader.push_back(0xbf810000u);
     const auto consumer = compile(reader, reader_table, 0x340746702u);
@@ -207,12 +226,15 @@ int main(int argc, char** argv) {
                   address, width, height, VK_FORMAT_R8G8B8A8_UNORM, pixels, error) && pixels == *source,
               "private storage writes preserve every renderer source byte and its usable layout");
     };
-    auto observe_guest = [&] {
+    auto expected_producer = [&] {
         expected = *source;
         constexpr uint8_t written[4]{255, 0, 255, 255};
         for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x)
             if (mask[x]) for (uint32_t c = 0; c < 4; ++c)
                 expected[(y * width + x) * 4 + c] = written[c];
+    };
+    auto observe_guest = [&] {
+        expected_producer();
         check(std::equal(expected.begin(), expected.end(), guest.begin()),
               "every written and untouched guest channel uses the current renderer seed");
         check(std::all_of(guest.begin() + guest_bytes, guest.end(), [](uint8_t byte) { return byte == 0xc7; }),
@@ -310,6 +332,326 @@ int main(int argc, char** argv) {
         }
         check(sampled_ok, "the sampled sibling observes every original renderer channel");
         observe_guest(); source_preserved();
+    }
+    if (retention_test) {
+        // UINT aliases intentionally use a different sampled format in observe_guest().
+        // This observer instead asks for the exact normalized format of the retained
+        // storage result, and reads every channel independently on the GPU.
+        auto normalized_table = reader_table;
+        normalized_table.resources.back().format = DataFormat::Unorm8;
+        auto normalized_consumer = compile(reader, normalized_table, 0x340746720u);
+        normalized_consumer.dispatch_index = 102;
+        normalized_consumer.command_order = 20;
+        auto ordered_producer = producer;
+        ordered_producer.dispatch_index = 101;
+        ordered_producer.command_order = 10;
+        const auto normalized_report = validate_spirv_descriptor_interface(
+            normalized_consumer.spirv, &normalized_table, 0, SpirvShaderStage::Compute, false);
+        const auto* normalized_binding = find_spirv_descriptor_binding(normalized_report, 0, 5);
+        check(normalized_report.ok() && normalized_binding &&
+                  normalized_binding->image_numeric_class == SpirvImageNumericClass::Float,
+              "retention consumer reflects the producer's exact normalized sampled format");
+        check(prosper::frontend::compute_image_cache_default_eligible(
+                  guest_bytes, prosper::frontend::ComputeImageCacheClass::storage) &&
+                  prosper::frontend::compute_image_cache_default_eligible(
+                      guest_bytes, prosper::frontend::ComputeImageCacheClass::sampled),
+              "retention fixture reaches both real image-cache size thresholds");
+        // Each round replaces the renderer source while preserving the same addresses,
+        // shader identities and launch. A cached completed result must never replace
+        // that fresh source during the next storage setup.
+        for (unsigned round = 0; round < 7; ++round) {
+            refresh(60 + round);
+            for (uint32_t x = 0; x < width; ++x)
+                mask[x] = round == 0 ? 0 : round == 2 ? 1 : uint32_t(x % 3 != 0);
+            expected_producer();
+            const bool guest_mutation = round == 4;
+            const bool readback_failure = round == 5;
+            const auto before_guest = guest;
+            const auto before_reads = reads, before_imports = imports;
+            const auto before_publications = publications;
+            const auto before_transfers = prosper::frontend::live_compute_storage_transfer_seeds();
+            unsigned producers = 0, consumers = 0;
+            std::fill(observed.begin(), observed.end(), 0xccccccccu);
+            if (readback_failure) prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+            const auto result = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, ordered_producer.dispatch_index, 10},
+                 {SubmitOperationKind::Dispatch, normalized_consumer.dispatch_index, 20}},
+                {}, {ordered_producer, normalized_consumer},
+                [](const std::vector<DrawItem>&, uint32_t, uint32_t) { return RenderedFrame{}; },
+                [&](const std::vector<ComputeItem>& items) {
+                    for (const auto& item : items) {
+                        if (item.dispatch_index == ordered_producer.dispatch_index) {
+                            ++producers;
+                            const bool ok = prosper::frontend::execute_live_compute_items({item});
+                            check(ok != readback_failure, "ordered producer reports actual success or injected readback failure");
+                            if (readback_failure) {
+                                check(guest == before_guest && publications == before_publications,
+                                      "failed completed result changes neither guest bytes nor publication");
+                                expected.assign(before_guest.begin(), before_guest.begin() + guest_bytes);
+                            } else {
+                                check(std::equal(expected.begin(), expected.end(), guest.begin()),
+                                      "ordered producer publishes every expected renderer-seeded channel");
+                                {
+                                    // This completed result is for ordered compute transfer only.
+                                    // Even an exact graphics descriptor must not promote it into
+                                    // graphics-export/watch ownership. Release an unexpected lease
+                                    // before the consumer so the negative control keeps running.
+                                    prosper::frontend::LiveComputeImageImport graphics_import;
+                                    const bool exported = prosper::frontend::import_live_compute_storage_image(
+                                        normalized_table.resources.back(), guest_bytes, graphics_import);
+                                    check(!exported && !graphics_import.valid(),
+                                          "renderer-seeded completed result refuses graphics export");
+                                    graphics_import = {};
+                                }
+                                if (guest_mutation) {
+                                    // A real intervening write invalidates the submit journal.
+                                    constexpr size_t changed = 13 * width * 4 + 7;
+                                    guest[changed] ^= 0x5a;
+                                    expected[changed] ^= 0x5a;
+                                    notify_guest_gpu_write(address + changed, 1);
+                                }
+                            }
+                            renderer_visible = false;
+                            // Deliberately continue after this *expected* injected failure to
+                            // inspect whether an invalid result was wrongly published. The
+                            // independently asserted producer return remains the failure oracle.
+                        } else {
+                            ++consumers;
+                            check(prosper::frontend::execute_live_compute_items({item}),
+                                  "ordered normalized GPU consumer executes");
+                        }
+                    }
+                    return true;
+                }, 1, 1);
+            renderer_visible = true;
+            check(result.compute_executed && producers == 1 && consumers == 1,
+                  "ordered regression executes exactly one producer then one consumer");
+            check(reads == before_reads && imports == before_imports + 1 && imports == releases,
+                  "retained output never bypasses fresh renderer seed or leaks its source pin");
+            bool pixels_ok = true;
+            for (size_t i = 0; i < observed.size(); ++i) {
+                const float value = std::bit_cast<float>(observed[i]);
+                pixels_ok &= std::isfinite(value) &&
+                    std::abs(value - expected[i] / 255.0f) <= 0.000001f;
+            }
+            check(pixels_ok && std::equal(expected.begin(), expected.end(), guest.begin()),
+                  "retained transfer or fallback preserves all GPU-observed and guest channels");
+            const auto transfers = prosper::frontend::live_compute_storage_transfer_seeds() - before_transfers;
+            const bool should_transfer = !retention_off && !guest_mutation && !readback_failure;
+            check(transfers == uint64_t(should_transfer),
+                  "only valid completed results take exactly one storage-to-sampled GPU transfer");
+            check(std::all_of(guest.begin() + guest_bytes, guest.end(),
+                              [](uint8_t byte) { return byte == 0xc7; }),
+                  "ordered retained result preserves the independent guest tail");
+            source_preserved();
+        }
+        // No ordered-submit journal survives this boundary. The completed result
+        // must not conceal an unnotified CPU mutation: Linux has no new export
+        // watch here, and the Windows exact mirror must reject changed bytes.
+        check(!guest_gpu_write_tracking_active(), "outside-submit mutation has no active ordered journal");
+        constexpr size_t outside_changed = 11 * width * 4 + 3;
+        guest[outside_changed] ^= 0x63;
+        expected[outside_changed] ^= 0x63;
+        const auto outside_guest = guest;
+        std::fill(observed.begin(), observed.end(), 0xccccccccu);
+        const auto before_outside_transfers = prosper::frontend::live_compute_storage_transfer_seeds();
+        renderer_visible = false;
+        const bool outside_ok = prosper::frontend::execute_live_compute_items({normalized_consumer});
+        renderer_visible = true;
+        bool outside_pixels_ok = true;
+        for (size_t i = 0; i < observed.size(); ++i) {
+            const float value = std::bit_cast<float>(observed[i]);
+            outside_pixels_ok &= std::isfinite(value) &&
+                std::abs(value - expected[i] / 255.0f) <= 0.000001f;
+        }
+        check(outside_ok && outside_pixels_ok && guest == outside_guest &&
+                  std::equal(expected.begin(), expected.end(), guest.begin()),
+              "outside-submit sampled fallback sees unnotified guest mutation on every channel");
+        check(prosper::frontend::live_compute_storage_transfer_seeds() == before_outside_transfers,
+              "unnotified guest mutation refuses completed-result transfer outside ordered submit");
+        source_preserved();
+
+        // These descriptors overlap guest bytes but differ in extent, so they are
+        // independent writable owners rather than one folded alias. A's private
+        // completed image cannot represent the final A+B guest composite.
+        // Hosted aliases keep their advertised range disjoint; writeback still
+        // targets A through host_data. Distinct colors also invalidate a prior sampled result.
+        for (bool hosted_alias : {false, true}) {
+            std::fprintf(stderr, "[rtt-retention] owner-overlap hosted=%u\n", unsigned(hosted_alias));
+            refresh(90 + unsigned(hosted_alias));
+            std::vector<uint8_t> advertised(guest_bytes, 0x69);
+            auto overlap_table = table;
+            auto overlap_b = image;
+            overlap_b.binding = 6; overlap_b.sgpr_base = 16;
+            overlap_b.height = height / 2;
+            overlap_b.size = guest_bytes / 2;
+            if (hosted_alias) {
+                overlap_b.gpu_addr = reinterpret_cast<uint64_t>(advertised.data());
+                overlap_b.host_data = guest.data();
+                overlap_b.host_data_size = overlap_b.size;
+                check(overlap_b.gpu_addr + overlap_b.size <= address ||
+                          address + guest_bytes <= overlap_b.gpu_addr,
+                      "hosted output advertises a real disjoint GPU range");
+            }
+            overlap_table.resources.push_back(overlap_b);
+            std::vector<uint32_t> overlap_words{
+                0x7e080300u, 0x7e0002ffu, 0x3f800000u, 0x7e020280u,
+                0x7e0402ffu, 0x3f800000u, 0x7e0602ffu, 0x3f800000u};
+            for (uint32_t y = 0; y < height; ++y)
+                overlap_words.insert(overlap_words.end(), {0x7e0a0280u + y, 0xf0200f08u, 0x00020004u});
+            overlap_words.push_back(0x7e000280u);
+            if (hosted_alias) overlap_words.push_back(0x7e020280u);
+            else overlap_words.insert(overlap_words.end(), {0x7e0202ffu, 0x3f800000u});
+            for (uint32_t y = 0; y < height / 2; ++y)
+                overlap_words.insert(overlap_words.end(), {0x7e0a0280u + y, 0xf0200f08u, 0x00040004u});
+            overlap_words.push_back(0xbf810000u);
+            auto overlap_producer = compile(overlap_words, overlap_table, 0x340746721u);
+            overlap_producer.dispatch_index = ordered_producer.dispatch_index;
+            overlap_producer.command_order = 10;
+            for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x) {
+                const uint8_t color[4]{uint8_t(y < height / 2 ? 0 : 255),
+                                       uint8_t(y < height / 2 && !hosted_alias ? 255 : 0), 255, 255};
+                for (uint32_t c = 0; c < 4; ++c) expected[(y * width + x) * 4 + c] = color[c];
+            }
+            std::fill(observed.begin(), observed.end(), 0xccccccccu);
+            const auto before_overlap_transfers = prosper::frontend::live_compute_storage_transfer_seeds();
+            unsigned overlap_producers = 0, overlap_consumers = 0;
+            const auto overlap_result = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, overlap_producer.dispatch_index, 10},
+                 {SubmitOperationKind::Dispatch, normalized_consumer.dispatch_index, 20}},
+                {}, {overlap_producer, normalized_consumer},
+                [](const std::vector<DrawItem>&, uint32_t, uint32_t) { return RenderedFrame{}; },
+                [&](const std::vector<ComputeItem>& items) {
+                    for (const auto& item : items) {
+                        const bool is_producer = item.dispatch_index == overlap_producer.dispatch_index;
+                        check(prosper::frontend::execute_live_compute_items({item}),
+                              "independent overlapping output and sampled consumer execute");
+                        if (is_producer) {
+                            ++overlap_producers;
+                            check(std::equal(expected.begin(), expected.end(), guest.begin()),
+                                  "ordinary overlapping writeback publishes B overlap plus A remainder");
+                            renderer_visible = false;
+                        } else ++overlap_consumers;
+                    }
+                    return true;
+                }, 1, 1);
+            renderer_visible = true;
+            bool overlap_pixels_ok = true;
+            for (size_t i = 0; i < observed.size(); ++i) {
+                const float value = std::bit_cast<float>(observed[i]);
+                overlap_pixels_ok &= std::isfinite(value) &&
+                    std::abs(value - expected[i] / 255.0f) <= 0.000001f;
+            }
+            check(overlap_result.compute_executed && overlap_producers == 1 && overlap_consumers == 1 &&
+                      overlap_pixels_ok && std::equal(expected.begin(), expected.end(), guest.begin()),
+                  "GPU sampled observer sees final overlapping composite, never stale private A");
+            check(prosper::frontend::live_compute_storage_transfer_seeds() == before_overlap_transfers,
+                  "independent overlapping storage owner excludes completed-result promotion");
+            check(std::all_of(guest.begin() + guest_bytes, guest.end(),
+                              [](uint8_t byte) { return byte == 0xc7; }),
+                  "overlapping storage views preserve the independent guest tail");
+            check(std::all_of(advertised.begin(), advertised.end(),
+                              [](uint8_t byte) { return byte == 0x69; }),
+                  "hosted write targets the effective backing, never its advertised allocation");
+            source_preserved();
+        }
+
+        // The producer's own metadata reset is another write to guest memory.
+        // With DCC stored inside its base allocation, the private rendered image
+        // represents the pre-reset pixels and must not become a sampled source.
+        for (bool hosted_metadata : {false, true}) {
+            std::fprintf(stderr, "[rtt-retention] metadata-overlap hosted=%u\n", unsigned(hosted_metadata));
+            refresh(93 + unsigned(hosted_metadata));
+            for (uint32_t x = 0; x < width; ++x)
+                mask[x] = !hosted_metadata || x % 3 != 0;
+            expected_producer();
+            auto dcc_table = table;
+            auto& dcc_image = dcc_table.resources.back();
+            dcc_image.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+            const size_t dcc_tiled_bytes = tiled_surface_bytes(
+                width, height, dcc_image.tile_mode, 0, 4);
+            dcc_image.size = static_cast<uint32_t>(dcc_tiled_bytes);
+            dcc_image.compression_enabled = true;
+            dcc_image.write_compress_enabled = true;
+            dcc_image.meta_pipe_aligned = true;
+            std::vector<uint8_t> advertised_metadata(dcc_tiled_bytes, 0x69);
+            dcc_image.metadata_addr = hosted_metadata
+                ? reinterpret_cast<uint64_t>(advertised_metadata.data()) : address;
+            const uint64_t metadata_bytes = gpu_capture_dcc_metadata_footprint(dcc_image);
+            const bool bounded_metadata = metadata_bytes && metadata_bytes <= dcc_tiled_bytes;
+            check(bounded_metadata, "production DCC footprint fits the real aliased base allocation");
+            if (bounded_metadata) {
+                dcc_image.dcc_metadata_size = metadata_bytes;
+                if (hosted_metadata) {
+                    dcc_image.dcc_metadata_host_data = guest.data();
+                    dcc_image.dcc_metadata_host_data_size = metadata_bytes;
+                    check(dcc_image.metadata_addr + metadata_bytes <= address ||
+                              address + dcc_tiled_bytes <= dcc_image.metadata_addr,
+                          "hosted DCC advertises a real disjoint metadata range");
+                }
+                guest.resize(dcc_tiled_bytes + guest_bytes, 0xc7);
+                check(reinterpret_cast<uint64_t>(guest.data()) == address,
+                      "DCC fixture resizing retains all resource and renderer addresses");
+                std::vector<uint8_t> expected_tiled(guest.size(), 0xc7);
+                tile_surface(expected_tiled.data(), expected.data(), width, height,
+                             dcc_image.tile_mode, 0, 4);
+                std::fill_n(expected_tiled.begin(), static_cast<size_t>(metadata_bytes), uint8_t{0xff});
+                std::vector<uint8_t> expected_reset(guest_bytes);
+                detile_surface(expected_reset.data(), expected_tiled.data(), width, height,
+                               dcc_image.tile_mode, 0, 4);
+                check(expected_reset != expected,
+                      "own metadata reset changes visible texels and distinguishes stale private output");
+                auto dcc_producer = compile(writer_words(false), dcc_table, 0x340746722u);
+                dcc_producer.dispatch_index = ordered_producer.dispatch_index;
+                dcc_producer.command_order = 10;
+                auto dcc_reader_table = normalized_table;
+                dcc_reader_table.resources.back().tile_mode = dcc_image.tile_mode;
+                dcc_reader_table.resources.back().size = dcc_image.size;
+                auto dcc_consumer = compile(reader, dcc_reader_table, 0x340746723u);
+                dcc_consumer.dispatch_index = normalized_consumer.dispatch_index;
+                dcc_consumer.command_order = 20;
+                std::fill(observed.begin(), observed.end(), 0xccccccccu);
+                const auto before_dcc_transfers = prosper::frontend::live_compute_storage_transfer_seeds();
+                const auto before_dcc_reads = reads, before_dcc_imports = imports;
+                unsigned dcc_producers = 0, dcc_consumers = 0;
+                const auto dcc_result = execute_ordered_items(
+                    {{SubmitOperationKind::Dispatch, dcc_producer.dispatch_index, 10},
+                     {SubmitOperationKind::Dispatch, dcc_consumer.dispatch_index, 20}},
+                    {}, {dcc_producer, dcc_consumer},
+                    [](const std::vector<DrawItem>&, uint32_t, uint32_t) { return RenderedFrame{}; },
+                    [&](const std::vector<ComputeItem>& items) {
+                        for (const auto& item : items) {
+                            check(prosper::frontend::execute_live_compute_items({item}),
+                                  "own-DCC-overlap producer and sampled observer execute");
+                            if (item.dispatch_index == dcc_producer.dispatch_index) {
+                                ++dcc_producers;
+                                check(guest == expected_tiled,
+                                      "real image writeback then metadata reset preserves every expected tiled byte");
+                                renderer_visible = false;
+                            } else ++dcc_consumers;
+                        }
+                        return true;
+                    }, 1, 1);
+                renderer_visible = true;
+                bool reset_pixels_ok = true;
+                for (size_t i = 0; i < observed.size(); ++i) {
+                    const float value = std::bit_cast<float>(observed[i]);
+                    reset_pixels_ok &= std::isfinite(value) &&
+                        std::abs(value - expected_reset[i] / 255.0f) <= 0.000001f;
+                }
+                check(dcc_result.compute_executed && dcc_producers == 1 && dcc_consumers == 1 &&
+                          reset_pixels_ok && guest == expected_tiled,
+                      "normalized GPU observer sees actual metadata-reset pixels and the complete guest tail");
+                check(reads == before_dcc_reads && imports == before_dcc_imports + 1 && imports == releases,
+                      "DCC overlap case takes exact renderer seeding and releases its real source pin");
+                check(prosper::frontend::live_compute_storage_transfer_seeds() == before_dcc_transfers,
+                      "own overlapping DCC metadata reset excludes completed-result retention");
+                check(std::all_of(advertised_metadata.begin(), advertised_metadata.end(),
+                                  [](uint8_t byte) { return byte == 0x69; }),
+                      "hosted reset targets the effective DCC backing, never its advertised allocation");
+                source_preserved();
+            }
+        }
     }
     set_guest_gpu_write_observer({});
     set_live_target_image_importer({}, {});

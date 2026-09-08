@@ -3127,7 +3127,17 @@ if(TARGET prosper_core)
                --unset=PROSPER_NO_STANDALONE_RTT_SEED $<TARGET_FILE:test_storage_rtt_gpu_seed>)
       add_test(NAME storage_rtt_cpu_seed COMMAND ${CMAKE_COMMAND} -E env
                PROSPER_NO_STANDALONE_RTT_SEED=1 $<TARGET_FILE:test_storage_rtt_gpu_seed> --cpu)
-      set_tests_properties(storage_rtt_gpu_seed storage_rtt_cpu_seed PROPERTIES TIMEOUT 60)
+      add_test(NAME storage_rtt_result_retention COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_STANDALONE_RTT_SEED
+               --unset=PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE
+               $<TARGET_FILE:test_storage_rtt_gpu_seed> --retention)
+      add_test(NAME storage_rtt_result_retention_off COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_STANDALONE_RTT_SEED
+               PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1
+               $<TARGET_FILE:test_storage_rtt_gpu_seed> --retention-off)
+      set_tests_properties(storage_rtt_gpu_seed storage_rtt_cpu_seed
+                           storage_rtt_result_retention storage_rtt_result_retention_off
+                           PROPERTIES TIMEOUT 60)
 
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)
