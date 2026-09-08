@@ -3427,6 +3427,21 @@ struct BorrowedComputeImageLease {
     }
 };
 
+// Hosted/replay resources can write a different live allocation than their advertised range.
+// Both identities matter to renderer aliases and to the ordered journal, including cached views
+// absent from this dispatch. Do not duplicate the normal guest-backed notification.
+void notify_output_write(uint64_t advertised, const void* destination, uint64_t bytes,
+                         bool preserving_bytes = false) {
+    const auto notify = [&](uint64_t address) {
+        if (!address || !bytes) return;
+        if (preserving_bytes) prosper::gpu::notify_guest_gpu_write_preserving_bytes(address, bytes);
+        else prosper::gpu::notify_guest_gpu_write(address, bytes);
+    };
+    notify(advertised);
+    const uint64_t effective = reinterpret_cast<uintptr_t>(destination);
+    if (effective != advertised) notify(effective);
+}
+
 struct BoundBuffer {
     const prosper::gpu::ShaderResource* resource = nullptr;
     size_t descriptor_index = SIZE_MAX; // reflected binding that owns this flattened table entry
@@ -3435,6 +3450,7 @@ struct BoundBuffer {
     size_t alias_of = SIZE_MAX;         // exact guest range sharing an earlier storage buffer
     size_t bytes = 0;                   // Vulkan buffer bytes (may be a detiled image view)
     size_t guest_bytes = 0;             // physical guest backing (may exceed logical image bytes)
+    bool output_conflict = false;       // independent buffer writeback can overwrite this range
     bool writable = false;              // reflected OpStore/writing-atomic reachability
     bool atomic_image = false;           // R32_UINT StorageImage exposed as a linear atomic SSBO
     uint32_t atomic_layers = 1;          // #2265: array layers staged for that view (1 when plain 2D)
@@ -3485,6 +3501,7 @@ struct BoundImage {
     GpuRetileParameters retile_parameters{};
     bool storage = false;               // descriptor/representation, independent of access
     bool storage_writeback = false;     // whole-alias output obligation, conservatively proven
+    bool output_conflict = false;       // another effective output can overwrite this guest view
     bool native_float_storage = false;  // Vulkan performs exact UNORM/float conversion at native width
     bool native_uint_storage = false;   // exact guest-width integer texels
     bool packed_r11_storage = false;    // shader packs exact R11G11B10 words into typed R32_UINT
@@ -5354,8 +5371,8 @@ std::optional<bool> execute_cpu_broadcast_fill(const prosper::gpu::ComputeItem& 
 
     notify_compute_authority_boundary({ComputeAuthorityBoundaryKind::Compute,
         item.submit_no, item.command_order, target->gpu_addr, bytes, true});
-    if (!target->host_data)
-        prosper::host::guest_write_watch_notify_host_write(target->gpu_addr, static_cast<size_t>(bytes));
+    prosper::host::guest_write_watch_notify_host_write(
+        reinterpret_cast<uintptr_t>(destination), static_cast<size_t>(bytes));
     if (!value) {
         std::memset(destination, 0, static_cast<size_t>(bytes));
     } else {
@@ -5366,7 +5383,7 @@ std::optional<bool> execute_cpu_broadcast_fill(const prosper::gpu::ComputeItem& 
     // suppress invalidation of renderer-owned depth written earlier in the same present.
     const char* previous_origin = guest_gpu_write_origin();
     set_guest_gpu_write_origin("compute-writeback(cpu-broadcast)");
-    notify_guest_gpu_write(target->gpu_addr, bytes);
+    notify_output_write(target->gpu_addr, destination, bytes);
     set_guest_gpu_write_origin(previous_origin);
     if (!target->host_data && writer_provenance_enabled())
         record_guest_write(GuestWriterKind::ComputeBuffer, target->gpu_addr, bytes,
@@ -5433,9 +5450,8 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
         item.submit_no, item.command_order, resource->gpu_addr, written_bytes,
         authority_range_known});
 
-    if (!resource->host_data && resource->gpu_addr)
-        prosper::host::guest_write_watch_notify_host_write(
-            resource->gpu_addr, static_cast<size_t>(written_bytes));
+    prosper::host::guest_write_watch_notify_host_write(
+        reinterpret_cast<uintptr_t>(destination), static_cast<size_t>(written_bytes));
     const uint32_t pattern[4] = {
         item.user_sgprs[4], item.user_sgprs[5], item.user_sgprs[6], item.user_sgprs[7]};
     const bool zero_fill = !(pattern[0] | pattern[1] | pattern[2] | pattern[3]);
@@ -5459,9 +5475,14 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     }
     // Match the Vulkan path's conservative invalidation contract: padding beyond the exact launch
     // remains untouched, but every alias of the declared resource must be considered stale.
-    if (resource->gpu_addr) {
+    if (resource->gpu_addr || resource->host_data) {
         prosper::gpu::set_guest_gpu_write_origin("compute-writeback(cpu-fill)");
-        prosper::gpu::notify_guest_gpu_write(resource->gpu_addr, resource->size);
+        if (resource->gpu_addr)
+            prosper::gpu::notify_guest_gpu_write(resource->gpu_addr, resource->size);
+        // Hosted storage can be bounded by the launch rather than the declared descriptor size.
+        if (reinterpret_cast<uintptr_t>(destination) != resource->gpu_addr)
+            prosper::gpu::notify_guest_gpu_write(
+                reinterpret_cast<uintptr_t>(destination), written_bytes);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
     }
     if (!resource->host_data && prosper::gpu::writer_provenance_enabled())
@@ -9397,38 +9418,80 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
 
-        // Final cache publication runs after all image writebacks. A different Vulkan image can
-        // describe overlapping guest bytes without folding into this exact alias owner. Its
-        // writeback (or even our own overlapping DCC metadata reset) would make this private image
-        // stale before publication. Keep this result transient rather than refreshing authority
-        // over somebody else's pixels. Use the completed whole-alias output plan, including
-        // ordinary fallback for modules whose image-write provenance is incomplete.
-        // Compare effective destinations: replay host backing may alias guest pixels even when
-        // the advertised guest addresses differ. This candidate itself is always guest-backed.
-        for (auto& image : images) {
-            if (!image.renderer_seeded_result_candidate) continue;
-            const uint64_t address = image.resource->gpu_addr;
-            if (!address || !image.guest_bytes || image.guest_bytes > UINT64_MAX - address) {
-                image.renderer_seeded_result_candidate = false;
-                continue;
+        // Distinct Vulkan owners can write overlapping architectural bytes. Setup-time input
+        // validation then cannot authorize a later identical-result skip, and final publication
+        // must not rearm a watch or move a journal snapshot over those intervening writes. Include
+        // sampled/read-only inputs and effective replay backing, not just advertised guest ranges.
+        const auto ranges_conflict = [](uint64_t a, uint64_t an, uint64_t b, uint64_t bn) {
+            if (!an || !bn) return false;
+            if (!a || !b || an > UINT64_MAX - a || bn > UINT64_MAX - b) return true;
+            return a < b + bn && b < a + an;
+        };
+        for (auto& buffer : buffers) {
+            if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource) continue;
+            const uint64_t guest = buffer.resource->gpu_addr;
+            const uint64_t effective = reinterpret_cast<uintptr_t>(
+                resource_bytes_for(buffer.resource, buffer.guest_bytes));
+            for (const auto& other : buffers) {
+                if (&other == &buffer || !other.writable || other.alias_of != SIZE_MAX ||
+                    !other.resource) continue;
+                const uint64_t other_effective = reinterpret_cast<uintptr_t>(
+                    resource_bytes_for(other.resource, other.guest_bytes));
+                if (ranges_conflict(guest, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes) ||
+                    ranges_conflict(effective, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes) ||
+                    ranges_conflict(guest, buffer.guest_bytes, other_effective, other.guest_bytes) ||
+                    ranges_conflict(effective, buffer.guest_bytes, other_effective, other.guest_bytes)) {
+                    buffer.output_conflict = true;
+                    break;
+                }
             }
-            const auto overlaps_or_invalid = [&](uint64_t other, uint64_t bytes) {
-                if (!bytes) return false;
-                if (!other || bytes > UINT64_MAX - other) return true;
-                return address < other + bytes && other < address + image.guest_bytes;
+        }
+        for (auto& image : images) {
+            if (image.alias_of != SIZE_MAX || !image.resource) continue;
+            const uint64_t guest = image.resource->gpu_addr;
+            const uint64_t effective = reinterpret_cast<uintptr_t>(
+                resource_bytes_for(image.resource, image.guest_bytes));
+            const auto conflicts = [&](uint64_t address, uint64_t bytes) {
+                return ranges_conflict(guest, image.guest_bytes, address, bytes) ||
+                       ranges_conflict(effective, image.guest_bytes, address, bytes);
             };
             for (const auto& other : images) {
                 if (!other.storage_writeback || other.alias_of != SIZE_MAX || !other.resource) continue;
                 if ((&other != &image &&
-                     (overlaps_or_invalid(other.resource->gpu_addr, other.guest_bytes) ||
-                      overlaps_or_invalid(reinterpret_cast<uintptr_t>(resource_bytes_for(
+                     (conflicts(other.resource->gpu_addr, other.guest_bytes) ||
+                      conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
                           other.resource, other.guest_bytes)), other.guest_bytes))) ||
-                    overlaps_or_invalid(other.resource->metadata_addr, other.dcc_metadata_bytes) ||
-                    overlaps_or_invalid(reinterpret_cast<uintptr_t>(other.dcc_metadata),
-                                        other.dcc_metadata_bytes)) {
-                    image.renderer_seeded_result_candidate = false;
+                    conflicts(other.resource->metadata_addr, other.dcc_metadata_bytes) ||
+                    conflicts(reinterpret_cast<uintptr_t>(other.dcc_metadata), other.dcc_metadata_bytes)) {
+                    image.output_conflict = true;
                     break;
                 }
+            }
+            for (const auto& buffer : buffers) {
+                if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource) continue;
+                if (conflicts(buffer.resource->gpu_addr, buffer.guest_bytes) ||
+                    conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
+                        buffer.resource, buffer.guest_bytes)), buffer.guest_bytes)) {
+                    image.output_conflict = true;
+                    break;
+                }
+            }
+            if (image.output_conflict) {
+                // Revoke before recording: resource cleanup is deliberately skipped when GPU
+                // completion is unproven, but graphics must not borrow conflicted authority then.
+                // These calls preserve every allocation, comparison handle and outstanding pin.
+                ctx.invalidate_cached_image_source(image.cache_key);
+                if (image.compute_transfer_seed_borrowed)
+                    ctx.invalidate_cached_image_source(image.compute_transfer_seed_key);
+                image.renderer_seeded_result_candidate = false;
+                image.post_writeback_promotion_candidate = false;
+                if (image_timing)
+                    std::fprintf(stderr,
+                        "[compute-output-conflict] submit=%llu dispatch=%llu order=%llu "
+                        "binding=%u storage=%u writeback=%u bytes=%zu\n",
+                        (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                        (unsigned long long)item.command_order, image.binding,
+                        image.storage ? 1u : 0u, image.storage_writeback ? 1u : 0u, image.guest_bytes);
             }
         }
 
@@ -9755,7 +9818,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::vector<CompareTarget> compare_targets;
         for (BoundBuffer& buffer : buffers) {
             buffer.timing.gpu_compare = "ineligible";
-            if (buffer.alias_of == SIZE_MAX && buffer.writable && buffer.persistent &&
+            if (buffer.alias_of == SIZE_MAX && buffer.writable && !buffer.output_conflict &&
+                buffer.persistent &&
                 buffer.upload_skipped && buffer.result_baseline && buffer.resource->size &&
                 !(buffer.resource->size & 15u)) {
                 buffer.timing.gpu_compare = "eligible";
@@ -9766,8 +9830,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
-            if (image.storage_writeback && image.cache_candidate && image.persistent &&
-                image.upload_skipped &&
+            if (image.storage_writeback && !image.output_conflict &&
+                image.cache_candidate && image.persistent && image.upload_skipped &&
                 image.result_baseline && image.exact_result_bytes &&
                 image.exact_result_bytes <= max_gpu_compare_image_bytes() &&
                 !(image.exact_result_bytes & 15u) && staging[i])
@@ -10758,8 +10822,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // New entries become cache-owned only here, so an earlier Vulkan failure cannot retain an
         // uninitialized image. A dirty hit rearms its source watch after the refreshed upload.
         for (BoundImage& image : images) {
-            if (image.storage_writeback || image.imported || image.alias_of != SIZE_MAX ||
-                !image.cache_candidate)
+            if (image.storage_writeback || image.output_conflict || image.imported ||
+                image.alias_of != SIZE_MAX || !image.cache_candidate)
                 continue;
             // When this dispatch samples and writes the same guest view through distinct bindings,
             // the post-dispatch storage image is the cache authority. Retaining the sampled seed here
@@ -10814,7 +10878,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // validation independently proved that the guest mirror still contains that baseline.
             // Preserve architectural write notification, but avoid mapping and scanning the whole
             // host-visible buffer merely to rediscover equality.
-            if (buffer.gpu_result_unchanged) {
+            if (!buffer.output_conflict && buffer.gpu_result_unchanged) {
                 timing.writeback = "gpu-unchanged";
                 g_buffer_gpu_result_skips.fetch_add(1, std::memory_order_relaxed);
                 if (trace)
@@ -10824,10 +10888,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  buffer.resource->binding,
                                  (unsigned long long)buffer.resource->gpu_addr,
                                  buffer.resource->size);
-                if (buffer.resource->gpu_addr) {
+                if (buffer.resource->gpu_addr || buffer.resource->host_data) {
                     ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
-                    notify_guest_gpu_write_preserving_bytes(
-                        buffer.resource->gpu_addr, buffer.resource->size);
+                    notify_output_write(buffer.resource->gpu_addr,
+                        resource_bytes_for(buffer.resource, buffer.guest_bytes),
+                        buffer.resource->size, true);
                 }
                 if (buffer.persistent) {
                     ComputeBufferCostScope cost(timing.enabled, timing.source_validation_ms);
@@ -10865,10 +10930,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     for (size_t i = 0; i < buffer.bytes; ++i)
                         buffer.changed_bytes += buffer.linear_seed[i] != result[i];
                 }
-                if (!buffer.resource->host_data && buffer.resource->gpu_addr) {
+                {
                     ComputeBufferCostScope cost(timing.enabled, timing.result_watch_ms);
                     prosper::host::guest_write_watch_notify_host_write(
-                        buffer.resource->gpu_addr, buffer.guest_bytes);
+                        reinterpret_cast<uintptr_t>(destination), buffer.guest_bytes);
                 }
                 // #2265: mirror of the upload -- per-layer 2D retile at the physical slice stride.
                 const size_t layer_linear_bytes =
@@ -10895,10 +10960,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ComputeBufferCostScope cost(timing.enabled, timing.result_map_ms);
                     ctx.unmap_memory(buffer.memory);
                 }
-                if (buffer.resource->gpu_addr) {
+                if (buffer.resource->gpu_addr || buffer.resource->host_data) {
                     ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                     set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
-                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
+                    notify_output_write(buffer.resource->gpu_addr, destination, buffer.guest_bytes);
                     set_guest_gpu_write_origin(nullptr);
                 }
                 if (!buffer.resource->host_data && writer_provenance_enabled()) {
@@ -10989,10 +11054,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // invalidation and writer provenance remain unconditional: renderer-resident state can
             // differ from guest RAM even when consecutive compute readbacks contain identical bytes.
             if (changed) {
-                if (!buffer.resource->host_data && buffer.resource->gpu_addr) {
+                {
                     ComputeBufferCostScope cost(timing.enabled, timing.result_watch_ms);
                     prosper::host::guest_write_watch_notify_host_write(
-                        buffer.resource->gpu_addr, buffer.resource->size);
+                        reinterpret_cast<uintptr_t>(destination), buffer.resource->size);
                 }
                 {
                     ComputeBufferCostScope cost(timing.enabled, timing.guest_copy_ms);
@@ -11012,15 +11077,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ComputeBufferCostScope cost(timing.enabled, timing.result_map_ms);
                 ctx.unmap_memory(buffer.memory);
             }
-            if (buffer.resource->gpu_addr) {
+            if (buffer.resource->gpu_addr || buffer.resource->host_data) {
                 ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                 if (changed) {
                     set_guest_gpu_write_origin("compute-writeback(buffer-full)");
-                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+                    notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size);
                     set_guest_gpu_write_origin(nullptr);
                 } else {
-                    notify_guest_gpu_write_preserving_bytes(
-                        buffer.resource->gpu_addr, buffer.resource->size);
+                    notify_output_write(buffer.resource->gpu_addr,
+                        resource_bytes_for(buffer.resource, buffer.guest_bytes),
+                        buffer.resource->size, true);
                 }
             }
             if (buffer.persistent) {
@@ -11061,15 +11127,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // GPU comparison is an exact word-for-word equality reduction and acquire_cached_image
             // independently proved that the guest mirror still contains that baseline. This path
             // therefore needs neither a large staging mapping nor a CPU memory pass.
-            if (bi.gpu_result_unchanged && bi.upload_skipped) {
+            if (!bi.output_conflict && bi.gpu_result_unchanged && bi.upload_skipped) {
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   skipped GPU-identical storage writeback binding=%u "
                                  "addr=0x%llx bytes=%llu\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned long long)bi.exact_result_bytes);
-                if (r->gpu_addr)
-                    notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
+                if (r->gpu_addr || r->host_data)
+                    notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true);
                 continue;
             }
             void* mapped = nullptr;
@@ -11110,7 +11176,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
             // that guest memory still contains the prior result, and this dispatch reproduced the
             // same row-major bytes. If either comparison fails, take the ordinary writeback below.
-            const bool repeated_output = bi.cache_candidate && bi.persistent &&
+            const bool repeated_output = !bi.output_conflict && bi.cache_candidate && bi.persistent &&
                 bi.upload_skipped && bi.exact_storage_bytes() &&
                 ctx.cached_image_result_matches(bi.cache_key, native_texels, linear_bytes);
             const auto prepare_done = ComputeClock::now();
@@ -11122,16 +11188,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned long long)bi.exact_result_bytes);
                 ctx.unmap_memory(staging_memory[i]);
-                if (r->gpu_addr)
-                    notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
+                if (r->gpu_addr || r->host_data)
+                    notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true);
                 continue;
             }
             // Notify page-based dirty trackers only when bytes will actually be written. Doing this
             // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
             // even on the no-write path, defeating the validation that made that path safe.
-            if (!r->host_data && r->gpu_addr)
-                prosper::host::guest_write_watch_notify_host_write(
-                    r->gpu_addr, bi.guest_bytes);
+            prosper::host::guest_write_watch_notify_host_write(
+                reinterpret_cast<uintptr_t>(destination), bi.guest_bytes);
             const auto watch_done = ComputeClock::now();
             if (trace) {
                 if (bi.exact_storage_bytes()) {
@@ -11281,7 +11346,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // emulator is invalidating its own caches. Everything reaching the DS invalidation path
             // used to report the default `gpu`, which cannot distinguish them.
             set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
-            notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
+            notify_output_write(r->gpu_addr, destination, bi.guest_bytes);
             set_guest_gpu_write_origin(nullptr);
             if (!r->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
@@ -11293,6 +11358,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     g_leave_next_dcc_metadata_compressed_for_test.exchange(
                         false, std::memory_order_acq_rel);
                 if (!leave_compressed_for_test) {
+                    prosper::host::guest_write_watch_notify_host_write(
+                        reinterpret_cast<uintptr_t>(bi.dcc_metadata), bi.dcc_metadata_bytes);
                     std::memset(bi.dcc_metadata, 0xff, bi.dcc_metadata_bytes);
                     // This announcement lands on `metadata_addr`, which for a DEPTH surface is its
                     // HTILE base -- and the DS cache treats an HTILE overlap as "may describe both
@@ -11301,7 +11368,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // appearing as an anonymous `gpu` write; whether it SHOULD invalidate is a
                     // separate question that needs the operation's real HTILE semantics proven.
                     set_guest_gpu_write_origin("compute-writeback(metadata-reset)");
-                    notify_guest_gpu_write(r->metadata_addr, bi.dcc_metadata_bytes);
+                    notify_output_write(r->metadata_addr, bi.dcc_metadata, bi.dcc_metadata_bytes);
                     set_guest_gpu_write_origin(nullptr);
                     if (!r->dcc_metadata_host_data && writer_provenance_enabled())
                         record_guest_write(GuestWriterKind::ComputeBuffer,
@@ -11392,7 +11459,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (bi.forced_seed_allocation_reused && !final_dcc_cache_safe)
                 ctx.invalidate_cached_image_source(bi.cache_key);
-            if (bi.cache_candidate) {
+            if (bi.cache_candidate && !bi.output_conflict) {
                 if (bi.persistent && !promoted_after_writeback) {
                     // Successful writeback establishes the new packed-input authority. A missing
                     // optional source snapshot is safe: the next acquisition must either validate
@@ -11519,7 +11586,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
         // also be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
-            if (!image.storage_writeback) continue;
+            if (!image.storage_writeback || image.output_conflict) continue;
             const bool unique = image.alias_of == SIZE_MAX;
             const bool native_exact_storage = image.native_float_storage ||
                 image.native_uint_storage || image.packed_r11_storage;

@@ -168,6 +168,35 @@ advertised addresses alone. Publication waits for all writebacks, and guest muta
 consumer authority. Existing budget and pin rules apply; failure invalidates retained authority.
 The control `PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` restores transient result ownership.
 
+### Overlapping synchronous outputs
+
+Distinct Vulkan images can describe overlapping guest bytes without being exact aliases. Their
+synchronous writebacks form an ordered composite: a retained private image may therefore be stale
+before final publication. A fresh journal snapshot, rearmed watch or late Windows mirror does not
+prove that the private image contains that composite (#3476).
+
+The completed output plan compares advertised and effective host ranges for independent images,
+writable buffers and DCC resets, including self-overlapping metadata. Conflicting images revoke
+source and consumer authority before recording, keep their allocations and existing pins, and use
+ordinary writeback without result-equality shortcuts or final cache publication. Independent
+conflicting buffers likewise decline GPU result-equality skipping; their CPU fallback compares the
+current destination at its own writeback turn. Exact folded aliases still have one output owner.
+
+Hosted outputs notify both their advertised architectural range and the actual destination. This
+also invalidates views absent from the current dispatch; checking only currently bound owners would
+miss them. Host-write watch preparation precedes mutations, including DCC resets. CPU fill preserves
+the declared architectural notification while bounding the separate hosted notification to the
+actual written extent.
+
+`storage_output_conflicts` drives the production Vulkan backend with full guest-byte and dependent
+sampled-image-to-SSBO oracles. It covers cold and prewarmed CPU/GPU results, distinct and folded
+aliases, effective hosted overlap, DCC metadata against another image and itself, buffer/image and
+buffer/buffer writebacks, and outstanding graphics leases. Companion cases exercise absent and
+overflowed journals, failed submission and Linux registered page watches across submit boundaries.
+Safe heap-backed imports may decline on Linux without journal authority; Windows may validate its
+exact mirror. These fixtures establish the ownership contract, not a diagnosis of a game's pixels
+or a performance improvement.
+
 ### Write-watch alias protection
 
 Storage-result and texture caches may reuse a physical-page watch while other registrations still

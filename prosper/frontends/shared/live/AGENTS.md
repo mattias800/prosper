@@ -129,6 +129,20 @@ writeback obligation and actual staging bytes for each unique materialized stora
 comparison later finds an identical result. These are preparation records, not completion or timing
 measurements. Join submit/dispatch/order/program identity with completed dispatch records.
 
+## Overlapping output authority
+
+An allocation pin proves lifetime, not current guest content. Independent output owners can write
+an overlapping composite, so setup-time validation cannot authorize a later identical-result skip.
+Build the complete output conflict plan before recording. Include effective hosted destinations,
+writable buffers and metadata resets, including self-overlap. Revoke conflicting image source and
+consumer authority without releasing handles or pins; failed completion deliberately skips cleanup.
+Do not refresh that authority during final publication. Buffer GPU comparisons also require disjoint
+independent output owners; their ordinary CPU fallback checks current destination bytes.
+
+Notify actual hosted destinations as well as advertised architectural ranges, including for cached
+views absent from a dispatch. Prepare page watches before every actual mutation. The production
+`storage_output_conflicts` tests and companion journal/failure/watch cases guard this contract.
+
 ## Untouched storage pixels
 
 A previous dispatch's coverage cannot authorize discarding current inputs. Native images retain
