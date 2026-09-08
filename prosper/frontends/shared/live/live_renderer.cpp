@@ -1519,6 +1519,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             import.width = surface.w;
             import.height = surface.h;
             import.format = pixel_format;
+            import.native_format = static_cast<uint32_t>(format);
             import.image = target->image;
             import.device = ctx.dev;
             import.layout = static_cast<uint32_t>(target->layout);

@@ -3544,6 +3544,13 @@ struct BoundImage {
     bool compute_transfer_seed_borrowed = false;
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     size_t seed_from_imported = SIZE_MAX; // renderer image copied on-device into this partial-write target
+    // Standalone source-only pin: no sampled sibling is needed to preserve current RTT inputs.
+    // The private storage image still owns writes and publishes the ordinary guest mirror.
+    prosper::gpu::LiveTargetImageImport standalone_seed{};
+    const char* standalone_seed_decision = "not-requested";
+    bool has_renderer_seed() const {
+        return seed_from_imported != SIZE_MAX || standalone_seed.valid();
+    }
     bool mirror_result_to_imported = false;
     bool storage_write_only = false; // access union of every descriptor sharing this image
     const std::vector<uint32_t>* storage_write_mask = nullptr;
@@ -6449,6 +6456,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
+            if (images[i].standalone_seed.valid())
+                release_live_render_target_image(images[i].resource->gpu_addr);
             if (images[i].imported || images[i].depth_bits_source || images[i].color_bits_source ||
                 images[i].packed10_source)
                 release_live_render_target_image(images[i].imported_addr);
@@ -7372,9 +7381,71 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     break;
                 }
             }
+            // An exact renderer image can also seed a storage-only dispatch. Keep it a read-only
+            // source: direct writable imports would bypass the guest mirror required by aliases.
+            // The sampled-sibling path above remains preferred and owns its own import lifetime.
+            if (renderer_owned && bi.storage && !bi.has_renderer_seed()) {
+                const bool exact_view = bi.native_float_storage && !bi.storage_write_mask &&
+                    r->format == DataFormat::Unorm8 && descriptor_components == 4 &&
+                    native_storage_format == VK_FORMAT_R8G8B8A8_UNORM &&
+                    image_descriptors[i].image_dim == 1 &&
+                    !image_descriptors[i].image_arrayed &&
+                    !image_descriptors[i].image_multisampled &&
+                    !image_descriptors[i].image_depth && r->depth == 1 &&
+                    bi.array_layers == 1 && bi.texel_depth == 1 &&
+                    shader_resource_compute_mip_chain_levels(*r) == 1 &&
+                    !r->mip_chain_base_level && !r->layer_mip_offset_bytes && !r->in_mip_tail;
+                bi.standalone_seed_decision = "view-ineligible";
+                if (exact_view) {
+                    static const bool disabled =
+                        std::getenv("PROSPER_NO_STANDALONE_RTT_SEED") != nullptr;
+                    bi.standalone_seed_decision = "disabled";
+                    if (!disabled) {
+                        LiveTargetImageImport source;
+                        // Integer texel coordinates require exact actual extents. A configured render
+                        // scale does not matter when the imported Vulkan image itself matches.
+                        const LiveTargetImageRequest request{
+                            r->width, r->height, render_scale, false, false};
+                        const bool time_seed = image_timing && perf_capture_timing;
+                        const auto seed_start = time_seed
+                            ? ComputeClock::now() : ComputeClock::time_point{};
+                        const bool available =
+                            import_live_render_target_image(r->gpu_addr, request, source);
+                        if (time_seed)
+                            import_ms += std::chrono::duration<double, std::milli>(
+                                ComputeClock::now() - seed_start).count();
+                        bi.standalone_seed_decision = "import-unavailable";
+                        if (available) {
+                            const char* reason = !source.valid() ? "invalid-import"
+                                : source.kind != LiveTargetImageImport::Kind::Color ? "not-color"
+                                : source.device != static_cast<void*>(ctx.device) ? "device-mismatch"
+                                : source.format != LiveTargetPixelFormat::Rgba8Unorm ||
+                                  source.native_format != VK_FORMAT_R8G8B8A8_UNORM ? "format-mismatch"
+                                : !source.transfer_src ? "no-transfer-src"
+                                : !rtt_gpu_seed_import_extent_compatible(
+                                    r->width, r->height, source.width, source.height) ? "extent-mismatch"
+                                : source.layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+                                  source.layout == VK_IMAGE_LAYOUT_PREINITIALIZED ? "invalid-layout"
+                                : "admitted";
+                            bi.standalone_seed_decision = reason;
+                            if (std::strcmp(reason, "admitted") == 0)
+                                bi.standalone_seed = source;
+                            else
+                                release_live_render_target_image(r->gpu_addr);
+                        }
+                    }
+                }
+                if (trace || (image_timing && perf_capture_timing))
+                    std::fprintf(stderr,
+                        "[compute-rtt-seed] submit=%llu dispatch=%llu code=0x%llx "
+                        "hash=0x%016llx binding=%u addr=0x%llx extent=%ux%u decision=%s\n",
+                        (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                        (unsigned long long)item.code_addr, (unsigned long long)timing_program_hash,
+                        bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
+                        bi.standalone_seed_decision);
+            }
             if (renderer_owned && !bi.imported && !bi.color_bits_source &&
-                !bi.packed10_source &&
-                bi.seed_from_imported == SIZE_MAX) {
+                !bi.packed10_source && !bi.has_renderer_seed()) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
@@ -8194,7 +8265,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
             const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.color_bits_source || bi.packed10_source ||
-                                        bi.seed_from_imported != SIZE_MAX ||
+                                        bi.has_renderer_seed() ||
                                         bi.compute_transfer_seed_borrowed)
                 ? size_t{0} : (size_t)sbytes;
             // A retained storage image still needs a fresh destination for its post-dispatch
@@ -8221,7 +8292,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 upload_mapping.memory = staging_memory[i];
                 if (!bi.depth_bits_source && !bi.packed10_source &&
-                    bi.seed_from_imported == SIZE_MAX &&
+                    !bi.has_renderer_seed() &&
                     !bi.compute_transfer_seed_borrowed &&
                     !(bi.persistent && bi.upload_skipped) &&
                     !vk_ok(ctx.map_memory(staging_memory[i], 0, sbytes,
@@ -8423,7 +8494,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         ComputeClock::now() - cache_lookup_start).count();
                 }
                 if (!(bi.persistent && bi.upload_skipped)) {
-                const size_t linear_size = (bi.seed_from_imported != SIZE_MAX)
+                const size_t linear_size = bi.has_renderer_seed()
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
                 // Pooled, not freshly allocated: a 4K RGBA16F seed is 63.3 MiB, which is past
                 // glibc's 32 MiB mmap threshold, so a per-dispatch allocation is an mmap, a page
@@ -8449,7 +8520,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      r->tile_mode, static_cast<uint32_t>(guest_texel)));
                 }
                 const uint8_t* unpack_source = nullptr;
-                if (bi.seed_from_imported != SIZE_MAX) {
+                if (bi.has_renderer_seed()) {
                     // The command buffer copies the renderer's exact native image into this target.
                     // Staging remains allocated because the result still has to be read back below.
                 } else if (renderer_owned) {
@@ -8522,7 +8593,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Decode it in place instead of copying the complete surface to a temporary first.
                     unpack_source = src;
                 }
-                if (bi.seed_from_imported == SIZE_MAX) {
+                if (!bi.has_renderer_seed()) {
                     if (bi.storage_write_mask)
                         bi.untouched_seed.assign(unpack_source, unpack_source + linear_guest_bytes);
                     if (bi.exact_storage_bytes()) {
@@ -8539,7 +8610,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 static const bool verify_unpack =
                     std::getenv("PROSPER_VERIFY_UNPACK") != nullptr &&
                     !bi.exact_storage_bytes();
-                if (verify_unpack) {
+                if (verify_unpack && !bi.has_renderer_seed()) {
                     // Fail-visible A/B: the specialized range unpack must be bit-identical to the
                     // per-texel path it replaces. Reports the whole divergence (count + first texel)
                     // and identifies the binding, and logs the clean case too so a verified run is
@@ -9985,18 +10056,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      0, nullptr, 2, ready);
                 continue;
             }
-            if (bi.seed_from_imported != SIZE_MAX) {
-                const BoundImage& source = images[bi.seed_from_imported];
+            if (bi.has_renderer_seed()) {
+                const bool standalone = bi.standalone_seed.valid();
+                const VkImage source_image = standalone
+                    ? static_cast<VkImage>(bi.standalone_seed.image)
+                    : images[bi.seed_from_imported].image;
+                VkImageLayout source_layout = standalone
+                    ? static_cast<VkImageLayout>(bi.standalone_seed.layout) : VK_IMAGE_LAYOUT_GENERAL;
+                // Earlier sampled imports already transitioned their shared image. Preserve their
+                // GENERAL ownership; later imports still expect the renderer's original layout.
+                if (standalone)
+                    for (size_t prior = 0; prior < i; ++prior)
+                        if (images[prior].imported && images[prior].alias_of == SIZE_MAX &&
+                            images[prior].image == source_image && imported_barrier_owner(prior))
+                            source_layout = VK_IMAGE_LAYOUT_GENERAL;
                 VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                source_to_copy.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                source_to_copy.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
                 source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                source_to_copy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                source_to_copy.oldLayout = source_layout;
                 source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                 source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
                     VK_QUEUE_FAMILY_IGNORED;
-                source_to_copy.image = source.image;
+                source_to_copy.image = source_image;
                 source_to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &source_to_copy);
 
@@ -10017,15 +10100,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 copy.extent = {r->width, r->height, r->depth};
-                vkCmdCopyImage(command, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vkCmdCopyImage(command, source_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                bi.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
                 VkImageMemoryBarrier ready[2]{};
                 ready[0] = source_to_copy;
                 ready[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                ready[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                ready[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
                 ready[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                ready[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                ready[0].newLayout = source_layout;
                 ready[1] = target_to_copy;
                 ready[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 ready[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
@@ -10033,8 +10116,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ready[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 ready[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                                      nullptr, 2, ready);
+                if (standalone && (trace || (image_timing_requested && timing_item_selected &&
+                                             perf_capture_timing)))
+                    std::fprintf(stderr,
+                        "[compute-rtt-seed] submit=%llu dispatch=%llu code=0x%llx "
+                        "hash=0x%016llx binding=%u recorded=1 bytes=%llu\n",
+                        (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                        (unsigned long long)item.code_addr, (unsigned long long)timing_program_hash,
+                        bi.binding, (unsigned long long)r->width * r->height * 4u);
                 continue;
             }
             VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
