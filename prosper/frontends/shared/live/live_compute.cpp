@@ -3542,8 +3542,6 @@ struct BoundImage {
     bool compute_transfer_seed_borrowed = false;
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
-    bool near_full_coverage = false;    // >= 99.8% written post-processing target (cutouts like minimap)
-    bool near_full_retained_export = false; // near-full target bypassing seed upload when retained
     uint64_t written_layers_mask = ~0ULL; // bitmask of touched array layers (depth <= 64)
     bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
     bool write_skip = false;            // untouched storage image: unwritten and unread; skip staging, readback, and writeback
@@ -7295,7 +7293,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         proven_full = it->second.cov == SeedCoverage::Full;
                         proven_none = it->second.cov == SeedCoverage::None;
                         bi.written_layers_mask = it->second.written_layers;
-                        bi.near_full_coverage = it->second.near_full;
                         // #1127: periodically re-prove a Full, None, or layer-masked/near-full Partial verdict
                         // so a data-dependent store that later changes coverage is caught (#3328 B1/N2). The helper
                         // resets the counter, so concurrent dispatches on this key don't all re-prove at once.
@@ -8378,14 +8375,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.dcc_metadata && bi.dcc_metadata_bytes,
                         bi.alias_of == SIZE_MAX,
                     });
-                static const bool skip_export_writeback_enabled =
-                    std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
-                const bool near_full_export_eligible = bi.near_full_coverage &&
-                    skip_export_writeback_enabled && bi.graphics_sampled_usage && !bi.poison_verify &&
-                    !bi.mirror_result_to_imported;
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
-                    const bool source_snapshot_req = (!bi.seed_skip && !near_full_export_eligible) ||
+                    const bool source_snapshot_req = !bi.seed_skip ||
                         !adaptive_storage_result_validation_enabled();
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
@@ -8403,7 +8395,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms = std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
-                bi.near_full_retained_export = bi.persistent && near_full_export_eligible;
                 transfer_gate_census.record_storage_cache(
                     transfer_gate_observation.role, *r, bi.binding,
                     storage_cache_gates,
@@ -8426,8 +8417,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms += std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
-                if (!(bi.persistent && (bi.upload_skipped || bi.near_full_retained_export))) {
-                const size_t linear_size = (bi.seed_skip || bi.near_full_retained_export || bi.seed_from_imported != SIZE_MAX)
+                if (!(bi.persistent && bi.upload_skipped)) {
+                const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
                 // Pooled, not freshly allocated: a 4K RGBA16F seed is 63.3 MiB, which is past
                 // glibc's 32 MiB mmap threshold, so a per-dispatch allocation is an mmap, a page
@@ -8453,9 +8444,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      r->tile_mode, static_cast<uint32_t>(guest_texel)));
                 }
                 const uint8_t* unpack_source = nullptr;
-                if (bi.seed_skip || bi.near_full_retained_export) {
-                    // #1122: write-only full-coverage target or near-full retained export --
-                    // the retained GPU image is already valid or will be overwritten.
+                if (bi.seed_skip) {
+                    // #1122: a proven full writer overwrites every texel. Partial writers
+                    // require current source contents even when an allocation is retained.
                     // No seed upload needed.
                 } else if (bi.seed_from_imported != SIZE_MAX) {
                     // The command buffer copies the renderer's exact native image into this target.
@@ -9930,7 +9921,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      nullptr, 2, ready);
                 continue;
             }
-            if (bi.persistent && (bi.upload_skipped || bi.seed_skip || bi.near_full_retained_export)) {
+            if (bi.persistent && (bi.upload_skipped || bi.seed_skip)) {
                 // The previous synchronous dispatch left this read-only sampled image in GENERAL,
                 // and either the guest source is unchanged or the proven-full shader cannot observe
                 // that source. No transfer or layout transition is needed.
@@ -10146,13 +10137,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.write_skip) continue;
-            static const bool skip_export_writeback_enabled =
-                std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
-            const bool skip_exported_writeback = skip_export_writeback_enabled &&
-                bi.graphics_sampled_usage && bi.cache_candidate && bi.persistent &&
-                (bi.seed_skip || bi.near_full_coverage) &&
-                !bi.poison_verify && !bi.mirror_result_to_imported;
-            if (skip_exported_writeback) continue;
+            // Coverage only proves this writer can discard its seed. A future partial
+            // writer or guest reader still needs the completed architectural bytes (#3455).
             const ShaderResource* r = bi.resource;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -10890,27 +10876,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)bi.resource->gpu_addr);
                 continue;
             }
-            static const bool skip_export_writeback_enabled =
-                std::getenv("PROSPER_SKIP_EXPORTED_STORAGE_WRITEBACK") != nullptr;
-            const bool skip_exported_writeback = skip_export_writeback_enabled &&
-                bi.graphics_sampled_usage && bi.cache_candidate && bi.persistent &&
-                (bi.seed_skip || bi.near_full_coverage) &&
-                !bi.poison_verify && !bi.mirror_result_to_imported;
-            if (skip_exported_writeback) {
-                if (trace) {
-                    std::fprintf(stderr,
-                        "[compute]   skipped exported storage writeback binding=%u addr=0x%llx\n",
-                        bi.binding, (unsigned long long)bi.resource->gpu_addr);
-                }
-                // Announce write range invalidation without modifying host bytes. Safe because graphics
-                // borrows the device image directly via compute export, and no CPU reader observes these
-                // intermediate post-processing surface bytes.
-                if (bi.resource && bi.resource->gpu_addr) {
-                    notify_guest_gpu_write_preserving_bytes(bi.resource->gpu_addr, bi.guest_bytes);
-                }
-                ctx.validate_cached_image_source_from_compute_transfer(bi.cache_key);
-                continue;
-            }
             const auto image_writeback_start = ComputeClock::now();
             const bool image_cache_hit = bi.persistent;
             const ShaderResource* r = bi.resource;
@@ -11051,7 +11016,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 const bool near_full = classify_near_full_coverage(survived, texels);
                 bi.written_layers_mask = written_layers;
-                bi.near_full_coverage = near_full;
                 {
                     const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
