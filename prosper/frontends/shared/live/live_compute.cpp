@@ -3521,6 +3521,7 @@ struct BoundImage {
     bool persistent = false;            // guest-backed sampled image retained across dispatches
     bool cache_candidate = false;
     bool post_writeback_promotion_candidate = false;
+    bool renderer_seeded_result_candidate = false;
     // Exact cached allocation leased for a DCC-unsafe producer. Source authority was invalidated,
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
@@ -8420,6 +8421,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     *r, static_cast<uint32_t>(guest_bytes), image_format);
                 bi.cache_candidate =
                     compute_storage_cache_gate_candidate(storage_cache_gates);
+                // Renderer ownership still excludes INPUT reuse. Once ordinary writeback has
+                // published this private image's exact result, however, it can become a source
+                // for the existing validated storage-to-sampled transfer path. The next renderer
+                // producer must acquire and seed from its current renderer image again.
+                static const bool renderer_seeded_result_cache_enabled =
+                    std::getenv("PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE") == nullptr;
+                bi.renderer_seeded_result_candidate = renderer_seeded_result_cache_enabled &&
+                    renderer_owned && bi.standalone_seed.valid() && bi.native_float_storage &&
+                    r->format == DataFormat::Unorm8 && descriptor_components == 4 &&
+                    storage_cache_gates.persistent_enabled && !bi.storage_write_mask &&
+                    bi.alias_of == SIZE_MAX && !r->host_data;
                 if (storage_gate_census_enabled()) {
                     // Report periodically as well as at exit: a bounded run ends in SIGTERM, whose
                     // default action skips atexit handlers entirely.
@@ -9324,6 +9336,41 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  ComputeClock::now() - image_start).count());
         }
         if (!images_ready) break;
+
+        // Final cache publication runs after all image writebacks. A different Vulkan image can
+        // describe overlapping guest bytes without folding into this exact alias owner. Its
+        // writeback (or even our own overlapping DCC metadata reset) would make this private image
+        // stale before publication. Keep this result transient rather than refreshing authority
+        // over somebody else's pixels. Check the completed resource plan, not descriptor access
+        // flags: the backend currently writes back read-only StorageImage descriptors too.
+        // Compare effective destinations: replay host backing may alias guest pixels even when
+        // the advertised guest addresses differ. This candidate itself is always guest-backed.
+        for (auto& image : images) {
+            if (!image.renderer_seeded_result_candidate) continue;
+            const uint64_t address = image.resource->gpu_addr;
+            if (!address || !image.guest_bytes || image.guest_bytes > UINT64_MAX - address) {
+                image.renderer_seeded_result_candidate = false;
+                continue;
+            }
+            const auto overlaps_or_invalid = [&](uint64_t other, uint64_t bytes) {
+                if (!bytes) return false;
+                if (!other || bytes > UINT64_MAX - other) return true;
+                return address < other + bytes && other < address + image.guest_bytes;
+            };
+            for (const auto& other : images) {
+                if (!other.storage || other.alias_of != SIZE_MAX || !other.resource) continue;
+                if ((&other != &image &&
+                     (overlaps_or_invalid(other.resource->gpu_addr, other.guest_bytes) ||
+                      overlaps_or_invalid(reinterpret_cast<uintptr_t>(resource_bytes_for(
+                          other.resource, other.guest_bytes)), other.guest_bytes))) ||
+                    overlaps_or_invalid(other.resource->metadata_addr, other.dcc_metadata_bytes) ||
+                    overlaps_or_invalid(reinterpret_cast<uintptr_t>(other.dcc_metadata),
+                                        other.dcc_metadata_bytes)) {
+                    image.renderer_seeded_result_candidate = false;
+                    break;
+                }
+            }
+        }
 
         // Exact 2D and standard 3D tiling runs after image transfer in this same submission. Keep
         // the original linear result for cache comparison and publication; the
@@ -11225,9 +11272,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto notify_done = ComputeClock::now();
             bool retain_gpu_result_baseline = false;
             bool promoted_after_writeback = false;
+            bool renderer_result_retained = false;
             const bool final_dcc_cache_safe = bi.dcc_metadata && bi.dcc_metadata_bytes &&
                 std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                             [](uint8_t value) { return value == 0xff; });
+            if (bi.renderer_seeded_result_candidate &&
+                (!r->compression_enabled || final_dcc_cache_safe) &&
+                bi.image && bi.memory && bi.allocation_bytes &&
+                ctx.replace_or_retain_image(bi.cache_key, bi.image, bi.memory,
+                                            bi.allocation_bytes, nullptr)) {
+                // Publication below still waits for every writeback to succeed. Failure cleanup
+                // invalidates a retained entry, and replacement refuses a pinned prior owner.
+                // Linux validates through the journal/watch; Windows publication installs the
+                // existing exact guest mirror before authorizing a later transfer.
+                bi.cache_candidate = true;
+                bi.persistent = true;
+                promoted_after_writeback = true;
+                renderer_result_retained = true;
+            }
             if (bi.post_writeback_promotion_candidate && final_dcc_cache_safe) {
                 const uint8_t* retained_source =
                     (adaptive_storage_result_validation_enabled() &&
@@ -11293,7 +11355,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             native_3d_transfer_enabled(),
                         bi.graphics_sampled_usage && bi.exact_storage_bytes(),
                         r->depth, ~0ULL, layer_stride, selected_slice);
-                } else if (bi.image && bi.memory && bi.allocation_bytes &&
+                } else if (!bi.persistent && bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,
                                             (adaptive_storage_result_validation_enabled() &&
@@ -11316,16 +11378,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // setup keeps the exact current host fallback; a failed ownership attempt invalidates
                 // any older fallback so the next dispatch takes the ordinary writeback path.
                 const bool force_host_result_fallback =
-                    bi.persistent && !bi.result_baseline && bi.exact_result_bytes &&
+                    !renderer_result_retained && bi.persistent &&
+                    !bi.result_baseline && bi.exact_result_bytes &&
                     !(bi.exact_result_bytes & 15u) &&
                     g_force_next_image_result_host_fallback_for_test.exchange(
                         false, std::memory_order_acq_rel);
-                retain_gpu_result_baseline = bi.persistent && !bi.result_baseline &&
+                retain_gpu_result_baseline = !renderer_result_retained &&
+                    bi.persistent && !bi.result_baseline &&
                     bi.exact_result_bytes &&
                     bi.exact_result_bytes <= max_gpu_compare_image_bytes() &&
                     !(bi.exact_result_bytes & 15u) &&
                     !force_host_result_fallback && ctx.prepare_compare_pipeline();
-                if (bi.persistent && !retain_gpu_result_baseline &&
+                // This result serves later consumers; the next renderer producer still seeds a
+                // private image. A second result baseline would add a full-image copy without
+                // enabling repeated-output comparison on that producer.
+                if (!renderer_result_retained && bi.persistent && !retain_gpu_result_baseline &&
                     (force_host_result_fallback || bi.exact_result_bytes <= max_gpu_compare_image_bytes()))
                     ctx.remember_cached_image_result(
                         bi.cache_key, native_texels,
@@ -11360,6 +11427,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "binding=%u addr=0x%llx "
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
                              "poison=%u gpu-retile=%u dim=%u layers=%u texel-depth=%u "
+                             "renderer-result-retained=%u "
                              "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
                              "total_ms=%.3f\n",
@@ -11369,6 +11437,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
                              bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u,
                              r->img_dim, bi.array_layers, bi.texel_depth,
+                             renderer_result_retained ? 1u : 0u,
                              image_milliseconds(map_start, map_done),
                              image_milliseconds(map_done, prepare_done),
                              image_milliseconds(prepare_done, watch_done),
