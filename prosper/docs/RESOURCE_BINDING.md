@@ -162,11 +162,46 @@ existing validated storage-to-sampled transfer path. This promotion does not aut
 exports: in the measured workload, repeated page-watch registration outweighed the conversion saving.
 Linux consumers without ordered-journal authority fall back to guest preparation; Windows retains
 its existing exact guest mirror. This does not
-authorize input reuse by a later renderer-owned producer. Retention refuses overlapping writes from
-independent image owners or any metadata reset, using effective host/guest destinations rather than
-advertised addresses alone. Publication waits for all writebacks, and guest mutation still invalidates
+authorize input reuse by a later renderer-owned producer. Retention refuses later overlapping writes from
+independent image owners and self-overlapping metadata resets, using effective host/guest destinations
+rather than advertised addresses alone. Publication waits for all writebacks, and guest mutation still invalidates
 consumer authority. Existing budget and pin rules apply; failure invalidates retained authority.
 The control `PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` restores transient result ownership.
+
+### Overlapping synchronous outputs
+
+Distinct Vulkan images can describe overlapping guest bytes without being exact aliases. Their
+synchronous writebacks form an ordered composite: a retained private image may therefore be stale
+before final publication. A fresh journal snapshot, rearmed watch or late Windows mirror does not
+prove that the private image contains that composite (#3476).
+
+The completed output plan compares advertised and effective host ranges in writeback order: all
+unique buffers, then each unique image's pixels and DCC reset. Earlier writes to either pixels or
+metadata disable setup-time result-equality shortcuts. Later writes to either dependency, and a reset
+overlapping its own pixels, revoke image source/consumer authority before recording and prevent final
+retention/publication. Allocations and pins remain intact. A last writer may restore its full result
+and retain it normally. Buffer GPU equality likewise requires no overlapping earlier buffer write;
+its CPU fallback compares the current destination at its own turn. Exact folded aliases have one owner.
+
+Input-only images retain before guest writeback. Subsequent pixel notifications invalidate their
+original snapshots without discarding safe input reuse up front. Metadata-only overlap requires an
+explicit retention veto because pixel watches and snapshots do not cover metadata interpretation.
+
+Hosted guest outputs notify both their advertised architectural range and the actual destination.
+Zero-address internal backing, such as GDS, remains outside guest publication and conflict checks. This
+also invalidates views absent from the current dispatch; checking only currently bound owners would
+miss them. Host-write watch preparation precedes mutations, including DCC resets. CPU fill preserves
+the declared architectural notification while bounding the separate hosted notification to the
+actual written extent.
+
+`storage_output_conflicts` drives the production Vulkan backend with full guest-byte and dependent
+sampled-image-to-SSBO oracles. It covers cold and prewarmed CPU/GPU results, last-writer reuse, warm metadata resets, distinct and folded
+aliases, effective hosted overlap, DCC metadata against another image and itself, buffer/image and
+buffer/buffer writebacks, and outstanding graphics leases. Companion cases exercise absent and
+overflowed journals, failed submission and Linux registered page watches across submit boundaries.
+Safe heap-backed imports may decline on Linux without journal authority; Windows may validate its
+exact mirror. These fixtures establish the ownership contract, not a diagnosis of a game's pixels
+or a performance improvement.
 
 ### Write-watch alias protection
 

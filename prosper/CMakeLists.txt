@@ -3120,6 +3120,27 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      add_executable(test_storage_output_conflicts tests/gpu/execute/test_storage_output_conflicts.cpp)
+      target_include_directories(test_storage_output_conflicts PRIVATE tests frontends)
+      target_link_libraries(test_storage_output_conflicts PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_output_conflicts COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=1 $<TARGET_FILE:test_storage_output_conflicts>)
+      add_test(NAME storage_output_conflicts_unjournaled COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=1 $<TARGET_FILE:test_storage_output_conflicts> --unjournaled)
+      add_test(NAME storage_output_conflicts_overflow COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=1 $<TARGET_FILE:test_storage_output_conflicts> --overflow)
+      add_test(NAME storage_output_conflicts_submit_failure COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+               $<TARGET_FILE:test_storage_output_conflicts> --submit-failure)
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME storage_output_conflicts_watched COMMAND ${CMAKE_COMMAND} -E env
+                 PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+                 $<TARGET_FILE:test_storage_output_conflicts> --watched)
+        set_tests_properties(storage_output_conflicts_watched PROPERTIES TIMEOUT 60)
+      endif()
+      set_tests_properties(storage_output_conflicts storage_output_conflicts_unjournaled
+                           storage_output_conflicts_overflow storage_output_conflicts_submit_failure PROPERTIES TIMEOUT 60)
+
       add_executable(test_storage_readonly tests/gpu/execute/test_storage_readonly.cpp)
       target_include_directories(test_storage_readonly PRIVATE tests frontends)
       target_link_libraries(test_storage_readonly PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)

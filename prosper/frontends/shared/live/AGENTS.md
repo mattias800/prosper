@@ -129,6 +129,28 @@ writeback obligation and actual staging bytes for each unique materialized stora
 comparison later finds an identical result. These are preparation records, not completion or timing
 measurements. Join submit/dispatch/order/program identity with completed dispatch records.
 
+## Overlapping output authority
+
+An allocation pin proves lifetime, not current guest content. Build the complete output plan before
+recording, following actual writeback order: all unique buffers, then each unique image's pixels and
+DCC reset. Earlier pixel or metadata writes veto setup-time equality skips. Later writes to either
+dependency, and a reset overlapping its own pixels, veto final retention/publication and revoke
+source/consumer authority before recording without releasing handles or pins. Failed completion
+skips cleanup. Earlier-only image conflicts keep their source proof; ordinary pre-submit export
+revocation and successful writeback govern their next publication. The final writer may retain its
+complete result. Buffer GPU comparisons require no earlier overlapping buffer; their CPU fallback
+checks current destination bytes.
+
+Input-only retention precedes guest writeback, so later pixel notifications invalidate its original
+snapshots naturally. Metadata-only writes require an explicit retention veto because pixel authority
+does not cover interpretation metadata. Keep sampled metadata dependencies separate from storage
+metadata reset obligations. Include effective hosted and advertised ranges, and fold exact aliases.
+
+Zero-address internal backing (such as GDS) is not an architectural guest output.
+Notify actual hosted guest destinations as well as advertised architectural ranges, including for cached
+views absent from a dispatch. Prepare page watches before every actual mutation. The production
+`storage_output_conflicts` tests and companion journal/failure/watch cases guard this contract.
+
 ## Untouched storage pixels
 
 A previous dispatch's coverage cannot authorize discarding current inputs. Native images retain
@@ -157,8 +179,8 @@ export or create its page watch: Linux uses the ordered journal and declines out
 Windows retains its exact guest mirror. Ordinary graphics preparation remains the fallback. Input cache
 reuse remains excluded for renderer owners: their next dispatch acquires the current renderer image.
 Retain only after ordinary guest/DCC writeback; publish authority only after every writeback succeeds.
-Refuse a result if another independent storage owner's effective writeback destination or any DCC
-reset overlaps its guest bytes, including host backing and its own metadata. Exact folded aliases
+Refuse a result if a later independent output changes its pixels or interpretation metadata, or its
+own metadata reset changes its pixels. Include effective host backing and advertised ranges. Exact folded aliases
 share one owner. Pinned replacement refusal and failure invalidation retain their existing contracts.
 No separate comparison baseline is created for this consumer source. The control
 `PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` disables this promotion; F8 writeback rows report
