@@ -95,6 +95,30 @@ def mod_branch_only():
     return module([1, 2, 3, 4, 5, 6, 7, 8], b)
 
 
+def mod_through_extinst():
+    """vote -> OpExtInst argument -> store. Exercises the opcode whose LITERAL instruction number
+    caused 8 false positives; the fix must still follow its genuine id arguments."""
+    b = (inst(20, 1) + inst(22, 2, 32) + inst(23, 3, 2, 4)
+         + inst(32, 4, 3, 3) + inst(59, 4, 5, 3) + inst(43, 2, 6, 3)
+         + inst(335, 1, 7, 6, 6)
+         + inst(11, 20)                                            # OpExtInstImport -> set id 20
+         + inst(12, 2, 21, 20, 4, 7)                               # OpExtInst set=20 instr=4 arg=vote
+         + inst(62, 5, 21))
+    return module([1, 2, 3, 4, 5, 6, 7, 20, 21], b)
+
+
+def mod_through_composite():
+    """vote -> OpCompositeConstruct -> OpCompositeExtract -> store. Exercises the literal-index
+    opcode; word 3 is a genuine id and must still be followed."""
+    b = (inst(20, 1) + inst(22, 2, 32) + inst(23, 3, 2, 4)
+         + inst(32, 4, 3, 3) + inst(59, 4, 5, 3) + inst(43, 2, 6, 3)
+         + inst(335, 1, 7, 6, 6)
+         + inst(80, 3, 30, 7, 7, 7, 7)                             # OpCompositeConstruct from vote
+         + inst(81, 2, 31, 30, 0)                                  # OpCompositeExtract idx 0
+         + inst(62, 5, 31))
+    return module([1, 2, 3, 4, 5, 6, 7, 30, 31], b)
+
+
 def run(words):
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "m.spv"
@@ -107,7 +131,11 @@ def run(words):
 def main() -> int:
     for name, mod in (("a vote stored straight to a colour output", mod_direct()),
                       ("a vote reaching an output through OpSelect", mod_one_hop()),
-                      ("a vote reaching an output through a local variable", mod_through_memory())):
+                      ("a vote reaching an output through a local variable", mod_through_memory()),
+                      ("a vote reaching an output through an OpExtInst argument",
+                       mod_through_extinst()),
+                      ("a vote reaching an output through composite construct/extract",
+                       mod_through_composite())):
         rc, out = run(mod)
         check("DETECTS %s" % name, rc == 1 and "REACHES OUTPUT" in out, out)
 

@@ -31,6 +31,9 @@ import struct
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spirv_operands import id_operand_indices, result_index  # noqa: E402
+
 MAGIC = 0x07230203
 OP_VARIABLE = 59
 OP_STORE = 62
@@ -100,12 +103,17 @@ def analyse(path):
                     tainted.add(w[2])
                     changed = True
                 continue
-            if op in NO_RESULT or len(w) < 3:
+            # Only genuine ID operands. Following every trailing word treats LITERALS as ids, and
+            # a literal equal to a result id fabricates a dataflow edge: measured, that made a vote
+            # "reach" an output through OpExtInst, whose word 4 is a GLSL instruction NUMBER in the
+            # same numeric range as low result ids. It produced 8 false positives across 49 modules.
+            ri = result_index(op)
+            if ri is None or len(w) <= ri:
                 continue
-            result = w[2]
+            result = w[ri]
             if result in tainted:
                 continue
-            if any(t in tainted for t in w[3:]):
+            if any(w[i] in tainted for i in id_operand_indices(op, len(w)) if i < len(w)):
                 tainted.add(result)
                 changed = True
 

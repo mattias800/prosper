@@ -3286,9 +3286,45 @@ bool fragment_spirv_vote_reaches_output(const std::vector<uint32_t>& spirv) {
         switch (op) {
             case Op_Store: case Op_Branch: case Op_BranchConditional:
             case Op_SelectionMerge: case Op_LoopMerge: case Op_Return: case Op_Kill:
+            case Op_Decorate: case Op_MemberDecorate:
                 return false;
             default: return true;
         }
+    };
+    // Type instructions carry their result at word 1 (they have no type operand).
+    const auto result_word = [](uint32_t op) -> uint32_t {
+        switch (op) {
+            case Op_TypeVoid: case Op_TypeBool: case Op_TypeInt: case Op_TypeFloat:
+            case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage:
+            case 26 /*OpTypeSampler*/:
+            case Op_TypeSampledImage: case Op_TypeArray: case Op_TypeRuntimeArray:
+            case Op_TypeStruct: case Op_TypePointer: case Op_TypeFunction:
+            case Op_ExtInstImport:
+                return 1;
+            default: return 2;
+        }
+    };
+    // Whether word `i` of an instruction is an ID rather than a LITERAL. Following literals as ids
+    // is not a theoretical concern: it produced 8 false positives across 49 modules here, because
+    // OpExtInst's word 4 is a GLSL instruction number in the same numeric range as low result ids.
+    const auto is_id_operand = [](uint32_t op, uint32_t i, uint32_t len) -> bool {
+        switch (op) {
+            case Op_ExtInst:        return i == 3 || i >= 5;          // set id, LITERAL instr, args
+            case Op_Constant:       return false;                     // value words
+            case Op_CompositeExtract: return i == 3;                  // then literal indices
+            case 82 /*OpCompositeInsert*/: return i == 3 || i == 4;
+            case 79 /*OpVectorShuffle*/: return i == 3 || i == 4;     // then literal components
+            case Op_ImageSampleImplicitLod:
+            case Op_ImageSampleExplicitLod:
+            case Op_ImageFetch: case Op_ImageGather:
+                return i == 3 || i == 4 || i >= 6;                    // word 5 is a LITERAL mask
+            case Op_TypeInt: case Op_TypeFloat: return false;
+            case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage: return i == 2;
+            case Op_TypePointer:    return i == 3;                    // word 2 is LITERAL storage
+            case Op_Variable:       return i >= 4;                    // word 3 is LITERAL storage
+            default:                return i >= 3;
+        }
+        (void)len;
     };
 
     for (bool changed = true; changed;) {
@@ -3306,10 +3342,13 @@ bool fragment_spirv_vote_reaches_output(const std::vector<uint32_t>& spirv) {
                     changed = true;
                 continue;
             }
-            if (!has_result(in.op) || in.len < 3) continue;
-            const uint32_t result = spirv[in.at + 2];
+            if (!has_result(in.op)) continue;
+            const uint32_t rw = result_word(in.op);
+            if (in.len <= rw) continue;
+            const uint32_t result = spirv[in.at + rw];
             if (tainted.count(result)) continue;
-            for (uint32_t i = 3; i < in.len; ++i) {
+            for (uint32_t i = 1; i < in.len; ++i) {
+                if (i == rw || !is_id_operand(in.op, i, in.len)) continue;
                 if (!tainted.count(spirv[in.at + i])) continue;
                 tainted.insert(result);
                 changed = true;
