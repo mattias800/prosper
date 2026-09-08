@@ -419,8 +419,11 @@ class ComputeDecompositionTests(unittest.TestCase):
         return lines[0]
 
     def test_every_captured_timer_is_reported(self):
-        # Fails on the old report, which printed setup/writeback/wait/dev/shader and dropped the
-        # rest -- including the two that hold 92% of this dispatch.
+        # COVERAGE arm, deliberately whole-text: it asserts the summary carries every field and
+        # that each name reaches the output SOMEWHERE. It does not distinguish the summary from
+        # the group line -- either satisfies it -- so it survives a mutation of either surface.
+        # The surface-specific pinning is done by the summary arms and the _group_line arms;
+        # this one exists so a newly added timer that reaches neither surface still fails.
         from performance_capture_report import COMPUTE_CPU_PHASES, COMPUTE_GPU_BRACKETS
         summary, text = self._render(HIDDEN_COST_COMPUTE)
         for field in COMPUTE_CPU_PHASES:
@@ -489,6 +492,23 @@ class ComputeDecompositionTests(unittest.TestCase):
         values = [float(part.split("=")[1].removesuffix("ms"))
                   for part in cpu_section.split() if "=" in part]
         self.assertAlmostEqual(sum(values), 300.0, places=1)
+
+    def test_negative_remainder_is_shown_signed_on_both_surfaces(self):
+        # A record whose named phases exceed its own total. Reachable from the producer: a
+        # dispatch that breaks out before phase_pipeline leaves that interval unrecorded while
+        # total_ms still spans the batch, so the remainder goes negative.
+        #
+        # It must be PRINTED, not hidden by a one-sided threshold: a negative remainder means
+        # the phases do not partition the total, which is a producer defect worth seeing. This
+        # is the file's convention for every other remainder, and it was the one line in the
+        # change that no arm pinned.
+        over = [dict(HIDDEN_COST_COMPUTE[0])]
+        over[0]["total_ms"] = 290.0          # named CPU phases sum to 296.0
+        _, text = self._render(over)
+        self.assertIn("unattributed=-6.0ms", self._group_line(text))
+        cpu_summary = next(line for line in text.splitlines()
+                           if line.strip().startswith("CPU phases of"))
+        self.assertIn("unattributed=-6.0ms", cpu_summary)
 
     def test_absent_gpu_timestamps_do_not_invent_a_bracket_table(self):
         from performance_capture_report import COMPUTE_GPU_BRACKETS
