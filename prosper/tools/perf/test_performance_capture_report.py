@@ -2,8 +2,11 @@
 
 import unittest
 
+import contextlib
+import io
+
 from performance_capture_report import (CaptureError, CLASSIFICATION_EVIDENCE_SHARE,
-                                        READBACK_NOTE_MIN_SHARE, summarize,
+                                        READBACK_NOTE_MIN_SHARE, print_summary, summarize,
                                         validate_capture)
 
 
@@ -378,6 +381,79 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         records.pop()
         with self.assertRaisesRegex(CaptureError, "incomplete"):
             validate_capture(records)
+
+
+# The record shape that made #3447 invisible: almost all of the cost is in `pipeline_ms` and
+# `gpu_storage_copy_ms`, both of which the report captured and never printed. The five timers it
+# did print account for 6 ms of a 300 ms dispatch.
+HIDDEN_COST_COMPUTE = [{
+    "program_addr": 0x1000, "program_hash": 0xABCD, "dispatches": 1,
+    "total_ms": 300.0,
+    "setup_ms": 2.0, "pipeline_ms": 220.0, "dispatch_wait_ms": 70.0,
+    "writeback_ms": 3.0, "cleanup_ms": 1.0,
+    "gpu_device_ms": 65.0, "gpu_pre_ms": 1.0, "gpu_shader_ms": 4.0,
+    "gpu_storage_copy_ms": 55.0, "gpu_compare_ms": 5.0, "gpu_restore_ms": 0.0,
+    "gpu_timestamp_samples": 1,
+}]
+
+
+class ComputeDecompositionTests(unittest.TestCase):
+    def _render(self, compute):
+        summary = summarize(capture(SAMPLES, compute=compute))
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            print_summary(summary)
+        return summary, buffer.getvalue()
+
+    def test_every_captured_timer_is_reported(self):
+        # Fails on the old report, which printed setup/writeback/wait/dev/shader and dropped the
+        # rest -- including the two that hold 92% of this dispatch.
+        from performance_capture_report import COMPUTE_CPU_PHASES, COMPUTE_GPU_BRACKETS
+        summary, text = self._render(HIDDEN_COST_COMPUTE)
+        for field in COMPUTE_CPU_PHASES:
+            self.assertIn(field, summary["compute_cpu_phases"], field)
+        for field in COMPUTE_GPU_BRACKETS:
+            self.assertIn(field, summary["compute_gpu_brackets"], field)
+        self.assertEqual(summary["compute_cpu_phases"]["pipeline_ms"], 220.0)
+        self.assertEqual(summary["compute_gpu_brackets"]["gpu_storage_copy_ms"], 55.0)
+        self.assertIn("pipeline=220.0ms", text)
+        self.assertIn("storage-copy=55.0ms", text)
+
+    def test_dominant_timer_reaches_the_printed_output(self):
+        # The point of the fix: the largest cost must be visible without parsing the file by hand.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("(73.3%)", text)   # pipeline_ms, 220 of 300
+        self.assertIn("(84.6%)", text)   # gpu_storage_copy_ms, 55 of 65 device
+
+    def test_remainder_is_named_rather_than_left_to_subtraction(self):
+        # 300 total against 296 of named CPU phases: the 4 ms must be stated, not inferred.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("unattributed=4.0ms", text)
+
+    def test_gpu_brackets_are_scaled_against_device_time_not_total(self):
+        # The brackets sit inside dispatch_wait, so they partition gpu_device_ms. Scaling them
+        # against total_ms would understate the storage copy by 4.6x here and invite summing two
+        # sibling decompositions into one bogus 100%.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("GPU brackets of 65.0ms device", text)
+        self.assertNotIn("storage-copy=55.0ms (18.3%)", text)
+
+    def test_shader_share_of_device_time_is_stated(self):
+        # The headline this whole change exists to surface.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("compute shader is 6.2% of the device time", text)
+
+    def test_absent_gpu_timestamps_do_not_invent_a_bracket_table(self):
+        from performance_capture_report import COMPUTE_GPU_BRACKETS
+        no_gpu = [dict(HIDDEN_COST_COMPUTE[0])]
+        for field in ("gpu_device_ms", *COMPUTE_GPU_BRACKETS):
+            no_gpu[0][field] = 0.0
+        no_gpu[0]["gpu_timestamp_samples"] = 0
+        _, text = self._render(no_gpu)
+        self.assertIn("CPU phases of 300.0ms total", text)
+        self.assertNotIn("GPU brackets of", text)
+        # ...and the header must not advertise a section this capture cannot supply.
+        self.assertNotIn("GPU brackets partition", text)
 
 
 if __name__ == "__main__":
