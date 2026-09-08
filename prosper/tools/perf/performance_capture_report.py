@@ -590,7 +590,12 @@ def _print_phase_line(label, totals, denominator, extra=None):
         return
     parts = []
     for field, value in totals.items():
-        if value < 0.05:
+        # abs(): a negative is a VALUE, not an absence. Suppressing it hid the compensating
+        # term of a signed pair, so the visible parts summed to 183% of their own total while
+        # the remainder -- computed from the full set, hidden term included -- came to exactly
+        # zero and printed no warning. The one mechanism that would flag the inconsistency was
+        # silenced by the value it should have been reporting.
+        if abs(value) < 0.05:
             continue
         name = PHASE_LABELS.get(field, field)
         parts.append(f"{name}={value:.1f}ms ({100.0 * value / denominator:.1f}%)")
@@ -675,11 +680,14 @@ def print_summary(summary):
         # well over the total on the same line and reads as an arithmetic error in the tool.
         cpu_parts = []
         for field in COMPUTE_CPU_PHASES:
-            if group.get(field, 0.0) >= 0.05:
+            # abs() for the same reason as the summary table: see _print_phase_line.
+            if abs(group.get(field, 0.0)) >= 0.05:
                 cpu_parts.append(f"{PHASE_LABELS[field]}={group[field]:.1f}ms")
         # Name the remainder instead of leaving it to subtraction: an unmeasured cost hides here.
-        # Signed, and printed on either side of zero, matching the convention this file uses for
-        # every other remainder -- a negative one is a real producer state, not a rounding artifact.
+        # Signed on either side of zero, matching this file's convention for every remainder.
+        # No current producer path yields a negative remainder -- the five phases telescope to
+        # cleanup-start, so a skipped marker moves cost between phases without changing their
+        # sum (#3461) -- but the threshold must not be the thing that decides.
         cpu_attributed = sum(group.get(field, 0.0) for field in COMPUTE_CPU_PHASES)
         unattributed = group.get("total_ms", 0.0) - cpu_attributed
         if abs(unattributed) >= 0.05:

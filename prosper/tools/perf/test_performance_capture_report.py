@@ -397,6 +397,19 @@ HIDDEN_COST_COMPUTE = [{
 }]
 
 
+
+# A dispatch that broke during setup, in the shape #3461 describes: `phase_writeback` never
+# advanced, so `cleanup_ms` books the whole item and `pipeline_ms` books the compensating
+# negative. The stored values are self-consistent -- they telescope to the item duration --
+# so the capture is right and only the RENDERING can go wrong.
+BROKEN_DISPATCH_COMPUTE = [{
+    "program_addr": 0x2000, "program_hash": 0xBEEF, "dispatches": 1,
+    "total_ms": 12.0,
+    "setup_ms": 10.0, "pipeline_ms": -10.0, "dispatch_wait_ms": 0.0,
+    "writeback_ms": 0.0, "cleanup_ms": 12.0,
+    "gpu_device_ms": 0.0, "gpu_timestamp_samples": 0,
+}]
+
 class ComputeDecompositionTests(unittest.TestCase):
     def _render(self, compute):
         summary = summarize(capture(SAMPLES, compute=compute))
@@ -519,6 +532,23 @@ class ComputeDecompositionTests(unittest.TestCase):
         cpu_summary = next(line for line in text.splitlines()
                            if line.strip().startswith("CPU phases of"))
         self.assertIn("unattributed=-6.0ms", cpu_summary)
+
+    def test_negative_phase_values_are_printed_not_suppressed(self):
+        # A `value < 0.05` threshold treats a negative as an absence. That hid the compensating
+        # term of a signed pair, so the visible parts summed to 183% of their own total, while
+        # the `unattributed` row -- computed from the full set, hidden term included -- came to
+        # exactly zero and printed nothing. The one mechanism that would have flagged the
+        # inconsistency was silenced by the very value it should have reported, which is the
+        # same shape as the defect this whole change exists to fix.
+        _, text = self._render(BROKEN_DISPATCH_COMPUTE)
+        summary = next(line for line in text.splitlines()
+                       if line.strip().startswith("CPU phases of"))
+        self.assertIn("pipeline=-10.0ms", summary)
+        self.assertIn("pipeline=-10.0ms", self._group_line(text))
+        # And with it visible, the printed shares add up to the whole rather than to 183%.
+        shares = [float(part.rsplit("(", 1)[1].removesuffix("%)"))
+                  for part in summary.split() if part.endswith("%)")]
+        self.assertAlmostEqual(sum(shares), 100.0, places=1)
 
     def test_absent_gpu_timestamps_do_not_invent_a_bracket_table(self):
         from performance_capture_report import COMPUTE_GPU_BRACKETS
