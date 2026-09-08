@@ -182,7 +182,8 @@ ordinary writeback without result-equality shortcuts or final cache publication.
 conflicting buffers likewise decline GPU result-equality skipping; their CPU fallback compares the
 current destination at its own writeback turn. Exact folded aliases still have one output owner.
 
-Hosted outputs notify both their advertised architectural range and the actual destination. This
+Hosted guest outputs notify both their advertised architectural range and the actual destination.
+Zero-address internal backing, such as GDS, remains outside guest publication and conflict checks. This
 also invalidates views absent from the current dispatch; checking only currently bound owners would
 miss them. Host-write watch preparation precedes mutations, including DCC resets. CPU fill preserves
 the declared architectural notification while bounding the separate hosted notification to the

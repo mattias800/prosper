@@ -139,7 +139,8 @@ consumer authority without releasing handles or pins; failed completion delibera
 Do not refresh that authority during final publication. Buffer GPU comparisons also require disjoint
 independent output owners; their ordinary CPU fallback checks current destination bytes.
 
-Notify actual hosted destinations as well as advertised architectural ranges, including for cached
+Zero-address internal backing (such as GDS) is not an architectural guest output.
+Notify actual hosted guest destinations as well as advertised architectural ranges, including for cached
 views absent from a dispatch. Prepare page watches before every actual mutation. The production
 `storage_output_conflicts` tests and companion journal/failure/watch cases guard this contract.
 

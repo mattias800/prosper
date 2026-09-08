@@ -3432,6 +3432,8 @@ struct BorrowedComputeImageLease {
 // absent from this dispatch. Do not duplicate the normal guest-backed notification.
 void notify_output_write(uint64_t advertised, const void* destination, uint64_t bytes,
                          bool preserving_bytes = false) {
+    // Zero-address backing is GPU-internal state (for example GDS), not a guest output.
+    if (!advertised) return;
     const auto notify = [&](uint64_t address) {
         if (!address || !bytes) return;
         if (preserving_bytes) prosper::gpu::notify_guest_gpu_write_preserving_bytes(address, bytes);
@@ -5475,7 +5477,7 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     }
     // Match the Vulkan path's conservative invalidation contract: padding beyond the exact launch
     // remains untouched, but every alias of the declared resource must be considered stale.
-    if (resource->gpu_addr || resource->host_data) {
+    if (resource->gpu_addr) {
         prosper::gpu::set_guest_gpu_write_origin("compute-writeback(cpu-fill)");
         if (resource->gpu_addr)
             prosper::gpu::notify_guest_gpu_write(resource->gpu_addr, resource->size);
@@ -9428,13 +9430,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             return a < b + bn && b < a + an;
         };
         for (auto& buffer : buffers) {
-            if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource) continue;
+            if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource ||
+                !buffer.resource->gpu_addr) continue;
             const uint64_t guest = buffer.resource->gpu_addr;
             const uint64_t effective = reinterpret_cast<uintptr_t>(
                 resource_bytes_for(buffer.resource, buffer.guest_bytes));
             for (const auto& other : buffers) {
                 if (&other == &buffer || !other.writable || other.alias_of != SIZE_MAX ||
-                    !other.resource) continue;
+                    !other.resource || !other.resource->gpu_addr) continue;
                 const uint64_t other_effective = reinterpret_cast<uintptr_t>(
                     resource_bytes_for(other.resource, other.guest_bytes));
                 if (ranges_conflict(guest, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes) ||
@@ -9468,7 +9471,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             for (const auto& buffer : buffers) {
-                if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource) continue;
+                if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource ||
+                !buffer.resource->gpu_addr) continue;
                 if (conflicts(buffer.resource->gpu_addr, buffer.guest_bytes) ||
                     conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
                         buffer.resource, buffer.guest_bytes)), buffer.guest_bytes)) {
@@ -10930,7 +10934,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     for (size_t i = 0; i < buffer.bytes; ++i)
                         buffer.changed_bytes += buffer.linear_seed[i] != result[i];
                 }
-                {
+                if (buffer.resource->gpu_addr) {
                     ComputeBufferCostScope cost(timing.enabled, timing.result_watch_ms);
                     prosper::host::guest_write_watch_notify_host_write(
                         reinterpret_cast<uintptr_t>(destination), buffer.guest_bytes);
@@ -11054,7 +11058,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // invalidation and writer provenance remain unconditional: renderer-resident state can
             // differ from guest RAM even when consecutive compute readbacks contain identical bytes.
             if (changed) {
-                {
+                if (buffer.resource->gpu_addr) {
                     ComputeBufferCostScope cost(timing.enabled, timing.result_watch_ms);
                     prosper::host::guest_write_watch_notify_host_write(
                         reinterpret_cast<uintptr_t>(destination), buffer.resource->size);

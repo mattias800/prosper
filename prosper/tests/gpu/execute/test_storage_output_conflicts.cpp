@@ -429,6 +429,41 @@ struct Fixture {
                               [](uint32_t v) { return v == 0x13579bdfu; }),
               "unchanged image must restore bytes overwritten by earlier buffer writeback");
     }
+    void internal_output() {
+        std::vector<uint32_t> internal(texels, 0xccccccccu);
+        auto producer = buffer_writer(true);
+        auto table = std::make_shared<ShaderResourceTable>(*producer.resources);
+        table->resources[0].gpu_addr = 0; // Same convention as GDS and private storage masks.
+        table->resources[0].host_data = reinterpret_cast<uint8_t *>(internal.data());
+        table->resources[0].host_data_size = internal.size() * 4;
+        producer.resources = table;
+        unsigned private_notifications = 0, calls = 0;
+        set_guest_gpu_write_observer([&](uint64_t address, uint64_t, const char *) {
+            if (!address || address == reinterpret_cast<uint64_t>(internal.data()))
+                ++private_notifications;
+        });
+        execute_sequence({producer, reader()}, [&](const std::vector<ComputeItem> &items) {
+            ++calls;
+            const bool ok = prosper::frontend::execute_live_compute_items(items);
+            check(ok, "internal output and unrelated guest image execute");
+            if (calls == 1) {
+                prepare_borrow();
+                check_graphics(can_retain(journal == Journal::Overflow));
+            }
+            return ok;
+        });
+        set_guest_gpu_write_observer({});
+        check(calls == 2 && private_notifications == 0,
+              "internal backing neither announces guest writes nor blocks unrelated publication");
+        check(std::all_of(internal.begin(), internal.begin() + texels / 2,
+                          [](uint32_t v) { return v == 0x2468ace0u; }) &&
+                  std::all_of(internal.begin() + texels / 2, internal.end(),
+                              [](uint32_t v) { return v == 0xccccccccu; }),
+              "internal output writes exact bytes and preserves its tail");
+        check(std::all_of(observed.begin(), observed.end(),
+                          [](uint32_t v) { return v == 0x13579bdfu; }),
+              "unrelated image remains a current sampled result");
+    }
     void submission_failure() {
         unsigned calls = 0;
         execute_sequence(
@@ -477,8 +512,8 @@ struct Fixture {
 #if defined(__linux__)
 void watch_fault(int signal, siginfo_t *info, void *context) {
 #if defined(__x86_64__)
-    const bool write_fault = context &&
-        (static_cast<ucontext_t *>(context)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+    const bool write_fault =
+        context && (static_cast<ucontext_t *>(context)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
 #else
     const bool write_fault = context != nullptr;
 #endif
@@ -636,6 +671,8 @@ int main(int argc, char **argv) {
     buffer_unbound.unbound_hosted(true);
     buffer_gpu.image_after_buffer(false);
     buffer_cpu.image_after_buffer(true);
+    Fixture internal(false, false);
+    internal.internal_output();
     BufferFixture buffers(true);
     buffers.run();
     return failures ? 1 : 0;
