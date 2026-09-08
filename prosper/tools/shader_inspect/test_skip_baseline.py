@@ -123,8 +123,10 @@ def main() -> int:
     ok, why = skip_survey.compare_to_baseline(
         [row("PPSA13579", 8, device="")], {"device": "", "titles": {"PPSA13579": 8}})
     check("a baseline with no recorded device FAILS even when the run also has none", not ok, why)
+    # Not `"baseline" in why` -- that is true of 7 of the 8 verdict messages, so the arm
+    # would survive nearly any mutation. Assert on the phrase only this branch produces.
     check("...and says the BASELINE is the unusable side",
-          "baseline" in why.lower(), why)
+          "lists no titles" in why or "records no device" in why, why)
 
     # F5. A surveyed title absent from the baseline was dropped silently, so a title refusing 99
     # could read as "unchanged".
@@ -135,6 +137,30 @@ def main() -> int:
           "PPSA99999" in why, why)
     check("...and its refusal count is named so 99 cannot hide behind 'unchanged'",
           "99" in why, why)
+
+    # ---- the RECORD side, which the first mutation sweep never reached ---------------------------
+    #
+    # The sweep covered compare_to_baseline and stopped at the function boundary, leaving F3 and F4 --
+    # the previous round's own fixes -- uncovered. Truth is defined on this side: a wrong baseline
+    # makes every later comparison wrong, however well guarded the comparison is.
+
+    # F4's rule, on the record side.
+    data, why = skip_survey.baseline_from([row("PPSA13579", 0, frames=0)])
+    check("a baseline REFUSES a run that presented no frames", data is None, why)
+    check("...and names the title and the reason",
+          "PPSA13579" in why and "no frames" in why, why)
+
+    # The drift: this row is judgeable by frames but has no device, and was recorded as 0 while the
+    # comparison refused it -- so --write-baseline X --baseline X wrote a file then rejected it.
+    mixed = [row("PPSA13579", 8), row("PPSA02664", 0, device="")]
+    data, why = skip_survey.baseline_from(mixed)
+    check("a baseline REFUSES a row whose renderer announced no device", data is None, why)
+    check("...so it can never write a file it would then refuse to compare against",
+          "PPSA02664" in why, why)
+
+    # Two devices in one run cannot produce one attributable baseline.
+    data, why = skip_survey.baseline_from([row("PPSA13579", 8), row("PPSA02664", 4, device=AMD)])
+    check("a baseline REFUSES a run spanning two GPUs", data is None, why)
 
     # ---- round-trip ------------------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:

@@ -150,6 +150,23 @@ def survey(app, dump, seconds, out_dir):
     }
 
 
+def unjudgeable(row):
+    """Why this row cannot support a verdict, or "" if it can.
+
+    ONE definition, used by both the record and compare sides. It was written twice and drifted
+    within a single commit: the record side omitted the unrecorded-device case, so a run mixing a
+    device-less row with a good one recorded that row as 0 and then refused to compare against the
+    file it had just written. A predicate that decides what counts as evidence belongs in one place.
+    """
+    if row["exited_early"]:
+        return "exited early after %.0fs (rc=%s)" % (row["elapsed"], row["returncode"])
+    if not row["frames"]:
+        return "presented no frames"
+    if not row["device"]:
+        return "the renderer announced no Vulkan device, so its counts cannot be attributed to one"
+    return ""
+
+
 def baseline_from(rows):
     """The baseline a run would record, or (None, why) if the run cannot support one.
 
@@ -158,12 +175,13 @@ def baseline_from(rows):
     run is measured against -- which would then redden honestly on the next good run and be read as a
     regression. The failure direction is benign; the confusion is not.
     """
-    devices = {r["device"] for r in rows if r["device"]}
-    unjudged = sorted(r["title"] for r in rows if r["exited_early"] or not r["frames"])
+    unjudged = ["%s %s" % (r["title"], why)
+                for r in rows for why in [unjudgeable(r)] if why]
     if unjudged:
-        return None, ("cannot record a baseline: %s could not be judged (no frames, or exited "
-                      "early). Recording 0 for a title that never ran would bake a false clean "
-                      "state into the file." % ", ".join(unjudged))
+        return None, ("cannot record a baseline: %s. Recording 0 for a title that could not be "
+                      "judged would bake a false clean state into the file every later run is "
+                      "measured against." % "; ".join(sorted(unjudged)))
+    devices = {r["device"] for r in rows}
     if len(devices) != 1:
         return None, ("cannot record a baseline: this run reports %d distinct Vulkan devices, so "
                       "nothing later compared against it could be trusted." % len(devices))
@@ -229,14 +247,9 @@ def compare_to_baseline(rows, baseline):
                        "that did not run is not a title with no dropped shaders."
                        % (len(missing), ", ".join(missing)))
 
-    uncomparable = []
-    for title in sorted(expected):
-        r = by_title[title]
-        if r["exited_early"]:
-            uncomparable.append("%s exited early after %.0fs (rc=%s)"
-                                % (title, r["elapsed"], r["returncode"]))
-        elif not r["frames"]:
-            uncomparable.append("%s presented no frames" % title)
+    uncomparable = ["%s %s" % (title, why)
+                    for title in sorted(expected)
+                    for why in [unjudgeable(by_title[title])] if why]
     if uncomparable:
         return False, ("could not be judged: %s. A run that never got going has established "
                        "nothing, so this is a FAILURE and not an improvement."
