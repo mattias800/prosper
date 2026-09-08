@@ -18,9 +18,9 @@ void check(bool ok, const char* message) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
 }
 ComputeItem compile(const std::vector<uint32_t>& code, const ShaderResourceTable& resources,
-                    uint64_t address) {
+                    uint64_t address, uint32_t user_sgprs = 16) {
     ComputeShaderConfig config;
-    config.user_sgprs.resize(16);
+    config.user_sgprs.resize(user_sgprs);
     config.local_x = width;
     config.local_y = config.local_z = 1;
     config.native_storage_format_support = 0; // Explicitly exercise raw storage.
@@ -51,12 +51,13 @@ ShaderResource buffer(void* data, uint32_t bytes) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3 || (std::strcmp(argv[1], "8") && std::strcmp(argv[1], "16")) ||
+    if ((argc != 3 && argc != 4) || (std::strcmp(argv[1], "8") && std::strcmp(argv[1], "16")) ||
         (std::strcmp(argv[2], "none") && std::strcmp(argv[2], "partial") &&
-         std::strcmp(argv[2], "full"))) {
-        std::fprintf(stderr, "usage: test_storage_snorm_untouched 8|16 none|partial|full\n");
+         std::strcmp(argv[2], "full")) || (argc == 4 && std::strcmp(argv[3], "aliases"))) {
+        std::fprintf(stderr, "usage: test_storage_snorm_untouched 8|16 none|partial|full [aliases]\n");
         return 2;
     }
+    const bool aliases = argc == 4;
     const bool wide = !std::strcmp(argv[1], "16");
     const uint32_t bytes = wide ? 2 : 1;
     const uint32_t minimum = wide ? 0x8000u : 0x80u;
@@ -85,6 +86,12 @@ int main(int argc, char** argv) {
     auto unused_resource = buffer(unused.data(), unused.size() * 4);
     unused_resource.binding = 6;
     producer_table.resources.push_back(unused_resource);
+    if (aliases) {
+        auto sibling = image;
+        sibling.binding = 7;
+        sibling.sgpr_base = 16;
+        producer_table.resources.push_back(sibling);
+    }
     std::vector<uint32_t> writer{
         0x7e080300u,             // v4 = local X
         0xe0302000u, 0x80000804u, // v8 = mask[X]
@@ -92,16 +99,27 @@ int main(int argc, char** argv) {
         0x7daa1080u,             // disable columns whose mask is zero
         0x7e0002ffu, 0xbf800000u, // v0 = float -1 bits
     };
+    // In the alias arm, the first binding writes even rows and the second writes
+    // odd rows of the same image. Both perform explicit -1 stores, so a missing
+    // alias contribution to the shared mask incorrectly restores minimum instead
+    // of stored. In partial mode, column zero remains untouched in every row.
     for (uint32_t y = 0; y < height; ++y)
-        writer.insert(writer.end(), {0x7e0a0280u + y, 0xf0200108u, 0x00020004u});
+        writer.insert(writer.end(), {0x7e0a0280u + y, 0xf0200108u,
+                                    aliases && (y & 1u) ? 0x00040004u : 0x00020004u});
     writer.push_back(0xbf810000u);
-    const auto producer = compile(writer, producer_table, 0x34674001u);
+    const auto producer = compile(writer, producer_table, 0x34674001u, aliases ? 24 : 16);
     const auto report = validate_spirv_descriptor_interface(
         producer.spirv, &producer_table, 0, SpirvShaderStage::Compute, false);
     const auto* descriptor = find_spirv_descriptor_binding(report, 0, 5);
     check(report.ok() && descriptor && descriptor->writable && !descriptor->readable &&
           descriptor->image_numeric_class == SpirvImageNumericClass::Uint,
           "producer uses the raw integer write-only storage representation");
+    if (aliases) {
+        const auto* sibling = find_spirv_descriptor_binding(report, 0, 7);
+        check(sibling && sibling->writable && !sibling->readable &&
+                  sibling->image_numeric_class == SpirvImageNumericClass::Uint,
+              "second exact-backing alias independently performs raw image stores");
+    }
 
     // View the guest encoding as UINT, so the real GPU reader distinguishes the
     // two encodings that an SNORM sample would both report as the same -1 value.
@@ -134,7 +152,7 @@ int main(int argc, char** argv) {
         check(prosper::frontend::execute_live_compute_items({producer}), "SNORM producer executes");
         if (first_dispatch)
             check(backend_host_read_barrier_count().load() - barriers_before == 2,
-                  "first raw result and write-mask readback each record a host availability barrier");
+                  "one canonical raw result and one shared write mask each record a host barrier");
         first_dispatch = false;
         check(std::all_of(unused.begin(), unused.end(),
                           [](uint32_t value) { return value == unused_sentinel; }),
