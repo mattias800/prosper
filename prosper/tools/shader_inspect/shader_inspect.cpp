@@ -157,6 +157,10 @@ int main(int argc, char** argv) {
             "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
             "wave width the recompiled module requires, why, and whether render_runner.h would\n"
             "admit it at a host native wave32 today. Same sentinel discipline as --mimg-sites.\n"
+            "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
+            "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
+            "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, which\n"
+            "was compiled with the real resource table.\n"
             "\n"
             "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
             "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
@@ -252,11 +256,28 @@ int main(int argc, char** argv) {
     // no descriptors and most real fragment shaders sample a texture: that is the tool's
     // limitation and must never be tallied as `requires nothing`.
     if (wave_reasons) {
-        const std::vector<uint32_t> spirv = recompile_fragment(words.data(), words.size());
+        // A SPIR-V input is READ, never recompiled. This is what makes the census usable at
+        // all: shader_inspect has no resource table, so a shader that samples a texture cannot
+        // be lowered here -- measured at 99.3% of GTA V's 3,453-shader pixel-shader database,
+        // i.e. the census over a raw dump is blind to precisely the lighting shaders #3464 is
+        // about. gpu_replay HAS the real descriptors and `--dump-shader DRAW:fs` already writes
+        // the recompiled module, so the reasons can come from a real-table compile while this
+        // tool stays the single place that formats them.
+        //
+        // Detected by the SPIR-V magic rather than by a flag or a file extension: the magic is
+        // the file format's own self-identification, so a mislabelled or renamed file cannot be
+        // read as the wrong kind. A raw RDNA2 stream cannot begin with it -- 0x07230203 decodes
+        // as neither a valid instruction nor a plausible first word.
+        const bool is_spirv = !words.empty() && words[0] == 0x07230203u;
+        const std::vector<uint32_t> spirv =
+            is_spirv ? words : recompile_fragment(words.data(), words.size());
         const bool recompiled = !spirv.empty();
         uint32_t table_dependent = 0;
-        for (const Rdna2Inst& in : instructions)
-            if (needs_resource_table(in.fmt, "fragment")) ++table_dependent;
+        // Meaningless for a SPIR-V input -- those fields describe an RDNA2 walk that did not
+        // happen -- so they are left at zero and the sentinel names the input kind.
+        if (!is_spirv)
+            for (const Rdna2Inst& in : instructions)
+                if (needs_resource_table(in.fmt, "fragment")) ++table_dependent;
         if (recompiled) {
             const uint32_t size = fragment_spirv_required_subgroup_size(spirv);
             const uint32_t reasons = fragment_spirv_required_subgroup_reasons(spirv);
@@ -270,10 +291,11 @@ int main(int argc, char** argv) {
             print_wave_reason_names(marked ? reasons : 0u);
             std::printf(" native-wave32-admitted=%d\n", admitted ? 1 : 0);
         }
-        std::printf("wave-reasons-end file=%s dwords=%zu recompiled=%d "
+        std::printf("wave-reasons-end file=%s input=%s dwords=%zu recompiled=%d "
                     "table_dependent=%u endpgm=%d\n",
-                    input_path.c_str(), words.size(), recompiled ? 1 : 0, table_dependent,
-                    (!instructions.empty() && instructions.back().is_end) ? 1 : 0);
+                    input_path.c_str(), is_spirv ? "spirv" : "rdna2", words.size(),
+                    recompiled ? 1 : 0, table_dependent,
+                    (!is_spirv && !instructions.empty() && instructions.back().is_end) ? 1 : 0);
         return 0;
     }
 

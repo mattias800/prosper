@@ -158,8 +158,25 @@ its numbers. A census that silently equated "could not be analysed" with "needs 
 would have reported that GTA V has essentially no Wave64 problem, which is the opposite of the
 truth.
 
-For a census over shaders that use memory, the reasons must come from a path that HAS the real
-descriptors -- `gpu_replay <capture>.prgcap`, as with every other table-dependent verdict here.
+### The way out: read the module gpu_replay compiled
+
+`--wave-reasons` accepts **either** a raw RDNA2 stream **or** a SPIR-V module, detected by the
+SPIR-V magic rather than by a flag or a file extension -- the magic is the format's own
+self-identification, so a renamed or mislabelled file cannot be read as the wrong kind.
+
+`gpu_replay` has the real resource table, and `--dump-shader DRAW:fs PATH` already writes the
+recompiled module. So the census over memory-using shaders is a two-step pipeline with no new
+analysis in it:
+
+```sh
+gpu_replay --dump-shader 18:fs fs.spv <capture>.prgcap   # real descriptors, real compile
+shader_inspect fs.spv --wave-reasons                     # reads the module's own markers
+```
+
+The reasons then come from a real-table compile while this tool remains the single place that
+formats them. A SPIR-V input reports `input=spirv` in the sentinel and leaves `table_dependent`
+and `endpgm` at zero -- those describe an RDNA2 walk that did not happen.
+
 
 ## `--stage` cannot prove a shader is unsupported (#1571)
 

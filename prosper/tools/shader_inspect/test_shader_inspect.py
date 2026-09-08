@@ -169,6 +169,51 @@ def main() -> int:
     check("a wave-free shader is not counted as gate-admitted",
           "native-wave32-admitted=0" in out, "\n" + out)
 
+    # ---- #3464: the census must read a SPIR-V module too ------------------------------------
+    #
+    # A raw dump carries no descriptors, so a texture-sampling shader cannot be lowered and
+    # contributes no reason data -- 99.3% of GTA V's pixel-shader database. gpu_replay has the
+    # real table and `--dump-shader DRAW:fs` writes the recompiled SPIR-V, so reading a .spv is
+    # what makes this census reach the shaders the issue is actually about.
+    #
+    # Built by hand from the header plus two OpModuleProcessed strings, NOT by recompiling: a
+    # fixture from the recompiler would share its assumptions with the reader under test.
+    def module_processed(text):
+        raw = text.encode("utf-8") + b"\x00"
+        raw += b"\x00" * (-len(raw) % 4)
+        payload = list(struct.unpack("<%dI" % (len(raw) // 4), raw))
+        return [((1 + len(payload)) << 16) | 330] + payload   # Op_ModuleProcessed = 330
+
+    def spirv_module(size, reasons):
+        words = [0x07230203, 0x00010300, 0, 1, 0]   # magic, version, generator, bound, schema
+        words += module_processed("Prosper.FragmentSubgroupSize=%d" % size)
+        words += module_processed("Prosper.FragmentSubgroupWhy=%d" % reasons)
+        return words
+
+    # lane-id + wave-ballot: the reason set that blocks every one of GTA V's skipped shaders.
+    code, out = run(binary, spirv_module(64, 0x41), extra=["--wave-reasons"])
+    check("a SPIR-V module is accepted by the census",
+          "wave-reasons-end" in out and "input=spirv" in out, "\n" + out)
+    check("a SPIR-V module reports its recorded width",
+          "required-subgroup-size=64" in out, "\n" + out)
+    check("a SPIR-V module reports its recorded reasons",
+          "reasons=0x41" in out and "lane-id" in out and "wave-ballot" in out, "\n" + out)
+    # 0x41 is not equal to kFragmentWaveReasonWaveAny, so the shipping gate drops it.
+    check("a SPIR-V module blocked by lane-id is not gate-admitted",
+          "native-wave32-admitted=0" in out, "\n" + out)
+
+    # WaveAny alone IS admitted, so the column cannot be reading a constant.
+    code, out = run(binary, spirv_module(64, 0x2), extra=["--wave-reasons"])
+    check("a wave-any-only SPIR-V module is gate-admitted",
+          "native-wave32-admitted=1" in out, "\n" + out)
+
+    # No marker at all: absent is not none, and must never be printed as a mask.
+    code, out = run(binary, [0x07230203, 0x00010300, 0, 1, 0], extra=["--wave-reasons"])
+    check("an unmarked SPIR-V module reports absent, not 0x0",
+          "reasons=absent" in out and "reasons=0x0" not in out, "\n" + out)
+    check("an unmarked SPIR-V module is not gate-admitted",
+          "native-wave32-admitted=0" in out, "\n" + out)
+
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0
 
