@@ -2108,6 +2108,20 @@ if(TARGET prosper_core)
                      "$<TARGET_FILE:shader_inspect>")
   endif()
 
+  # skip_survey's patterns are pinned to the EMITTER's format strings, and this is the
+  # registration that makes that pinning real. Its worst failure is a pattern that silently
+  # stops matching: every title then reports zero refused shaders, which is indistinguishable
+  # from good news, on numbers already published (#3464). Instrument trap 272 is the same
+  # shape and its own text is "the self-tests were registered; the format match was not" --
+  # this test was the inverse until #3473 review, correct and running nowhere.
+  #
+  # Takes no target: it reads source files, so it needs no build artifact and no GPU.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME skip_survey_patterns_match_emitters
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_skip_survey.py")
+  endif()
+
   # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —
   # a strict-validation gate (the render tests only prove llvmpipe accepts them; llvmpipe is
   # lenient). No Vulkan needed, but spirv-val (spirv-tools) IS required: it used to report PASS when
