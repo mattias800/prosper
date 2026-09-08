@@ -2213,6 +2213,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
   add_test(NAME gpu_capture_bundle_roundtrip COMMAND test_gpu_capture_bundle)
 
+  add_executable(test_gpu_capture_bundle_streaming tests/gpu/capture/test_gpu_capture_bundle_streaming.cpp)
+  target_include_directories(test_gpu_capture_bundle_streaming PRIVATE tests)
+  target_link_libraries(test_gpu_capture_bundle_streaming PRIVATE prosper_core)
+  add_test(NAME gpu_capture_bundle_streaming COMMAND test_gpu_capture_bundle_streaming)
+  set_tests_properties(gpu_capture_bundle_streaming PROPERTIES TIMEOUT 60)
+
   add_executable(test_interactive_capture_writer tests/gpu/capture/test_interactive_capture_writer.cpp)
   target_include_directories(test_interactive_capture_writer PRIVATE tests)
   target_link_libraries(test_interactive_capture_writer PRIVATE prosper_core)
