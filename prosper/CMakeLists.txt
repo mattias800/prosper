@@ -3120,6 +3120,19 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      add_executable(test_storage_readonly tests/gpu/execute/test_storage_readonly.cpp)
+      target_include_directories(test_storage_readonly PRIVATE tests frontends)
+      target_link_libraries(test_storage_readonly PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_readonly COMMAND ${CMAKE_COMMAND} -E env
+               --unset=PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP
+               PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+               $<TARGET_FILE:test_storage_readonly>)
+      add_test(NAME storage_readonly_control COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP=1
+               PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+               $<TARGET_FILE:test_storage_readonly> --control)
+      set_tests_properties(storage_readonly storage_readonly_control PROPERTIES TIMEOUT 60)
+
       add_executable(test_storage_rtt_gpu_seed tests/gpu/execute/test_storage_rtt_gpu_seed.cpp)
       target_include_directories(test_storage_rtt_gpu_seed PRIVATE tests frontends)
       target_link_libraries(test_storage_rtt_gpu_seed PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)

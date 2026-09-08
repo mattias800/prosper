@@ -35,3 +35,10 @@ Turns descriptors into resolved, bindable resources, and answers questions about
 
 The lookup contract is the thing to understand first: most "the descriptor is right but nothing
 binds" investigations end at a resource whose key does not match the key its consumer looks up.
+
+Storage-image access flags are observations, not proof of complete write coverage. Reflection's
+`storage_image_writes_complete` additionally requires every `OpImageWrite` origin to resolve to a
+storage descriptor and vetoes every `OpImageTexelPointer`. Consumers may omit outputs only with
+that module-wide proof plus the whole alias group's read-only access. Copied or otherwise untracked
+image objects must not turn a missed store into read-only authority. Cache the proof with the exact
+module report; do not derive it from descriptor decorations alone.
