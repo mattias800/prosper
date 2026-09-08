@@ -15,6 +15,7 @@
 using namespace prosper::gpu;
 namespace {
 constexpr uint32_t width = 64, height = 4, texels = width * height;
+constexpr uint32_t guest_bytes = texels * 4;
 int failures = 0;
 void check(bool ok, const char* message) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
@@ -59,7 +60,9 @@ int main(int argc, char** argv) {
     }
     const auto& ctx = prosper::test::render_vk_ctx(); // Publish the real renderer device first.
     if (!ctx.ok) return 1;
-    std::vector<uint8_t> guest(texels * 4, 0xc7), expected(texels * 4);
+    // Reserve a real wider backing for the value-equivalent RGBA16 sampled alias.
+    // The writable RGBA8 view only owns the first half; the tail is a bounds guard.
+    std::vector<uint8_t> guest(texels * 8, 0xc7), expected(guest_bytes);
     auto source = std::make_shared<std::vector<uint8_t>>(texels * 4);
     std::vector<uint32_t> mask(width), observed(texels * 4, 0xccccccccu);
     std::vector<uint32_t> sampled_values(texels * 4, 0xccccccccu);
@@ -117,7 +120,7 @@ int main(int argc, char** argv) {
                   "each imported source pin has one matching release");
         });
     set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes, const char*) {
-        if (addr != address || bytes != guest.size()) return;
+        if (addr != address || bytes != guest_bytes) return;
         ++publications;
         if (miss == Miss::None && !cpu_control) {
             prosper::test::BackendPersistentResourceGuard guard;
@@ -132,7 +135,7 @@ int main(int argc, char** argv) {
     image.binding = 5; image.sgpr_base = 8;
     image.img_dim = 1; image.width = width; image.height = height; image.depth = 1;
     image.format = DataFormat::Unorm8; image.num_components = 4;
-    image.gpu_addr = address; image.size = guest.size();
+    image.gpu_addr = address; image.size = guest_bytes;
     for (uint32_t c = 0; c < 4; ++c) image.swizzle[c] = 4 + c;
     ShaderResourceTable table;
     table.resources = {buffer(mask.data(), mask.size() * 4), image};
@@ -185,7 +188,8 @@ int main(int argc, char** argv) {
                   {draw}, width, height, source->data(), nullptr, false, &target) == *source,
               "real renderer image receives the new full-channel source pattern");
         std::fill(guest.begin(), guest.end(), 0xc7);
-        check(guest != *source, "architectural backing is deliberately stale");
+        check(!std::equal(source->begin(), source->end(), guest.begin()),
+              "architectural backing is deliberately stale");
         prosper::test::BackendPersistentResourceGuard guard;
         const auto* retained = prosper::test::find_persistent_color_target(
             address, width, height, VK_FORMAT_R8G8B8A8_UNORM);
@@ -209,7 +213,10 @@ int main(int argc, char** argv) {
         for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x)
             if (mask[x]) for (uint32_t c = 0; c < 4; ++c)
                 expected[(y * width + x) * 4 + c] = written[c];
-        check(guest == expected, "every written and untouched guest channel uses the current renderer seed");
+        check(std::equal(expected.begin(), expected.end(), guest.begin()),
+              "every written and untouched guest channel uses the current renderer seed");
+        check(std::all_of(guest.begin() + guest_bytes, guest.end(), [](uint8_t byte) { return byte == 0xc7; }),
+              "storage writeback never crosses its guest view into the wider alias tail");
         std::fill(observed.begin(), observed.end(), 0xccccccccu);
         renderer_visible = false; // The independent observer must consume guest writeback.
         const bool executed = prosper::frontend::execute_live_compute_items({consumer});
@@ -257,19 +264,28 @@ int main(int argc, char** argv) {
     }
     // Both relative binding orders matter: a sampled borrower can already own GENERAL,
     // or can be materialized after the standalone seed has acquired its own pin.
-    if (!cpu_control) for (uint32_t sampled_binding : {4u, 6u}) {
-        refresh(30 + sampled_binding);
+    if (!cpu_control) for (unsigned arm = 0; arm < 3; ++arm) {
+        const uint32_t sampled_binding = arm == 1 ? 6u : 4u;
+        const bool wider_alias = arm == 2;
+        refresh(30 + arm);
         std::fill(mask.begin(), mask.end(), 1);
         auto paired = table;
         auto sibling = image; sibling.cls = ResourceClass::Texture;
         sibling.binding = sampled_binding; sibling.sgpr_base = 16;
+        if (wider_alias) {
+            // byte*257/65535 == byte/255, so this existing direct sampled borrow
+            // uses the same source image. Its guest format differs from storage:
+            // standalone copy must preserve this prior borrower's GENERAL layout.
+            sibling.format = DataFormat::Unorm16;
+            sibling.size = guest.size();
+        }
         paired.resources.push_back(sibling);
         paired.resources.push_back(buffer(sampled_values.data(), sampled_values.size() * 4, 3, 4, 16));
-        const auto paired_item = compile(writer_words(true), paired, 0x340746710u + sampled_binding);
+        const auto paired_item = compile(writer_words(true), paired, 0x340746710u + arm);
         std::fill(sampled_values.begin(), sampled_values.end(), 0xccccccccu);
         const unsigned before_reads = reads, before_imports = imports;
         check(prosper::frontend::execute_live_compute_items({paired_item}), "storage seed and sampled borrower execute in either binding order");
-        check(reads == before_reads && imports == before_imports + (sampled_binding == 4 ? 1u : 2u) && imports == releases,
+        check(reads == before_reads && imports == before_imports + (arm == 0 ? 1u : 2u) && imports == releases,
               "sampled sibling order avoids snapshots and balances every source pin");
         bool sampled_ok = true;
         for (size_t i = 0; i < sampled_values.size(); ++i) {
