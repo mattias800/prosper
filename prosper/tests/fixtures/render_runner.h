@@ -2643,13 +2643,17 @@ inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
     // Below this the copy is not worth splitting; above it the win is real and bandwidth-bound,
     // which is why the worker count is capped rather than scaled to the core count.
     constexpr size_t kMinParallelBytes = 2u << 20;
-    const unsigned hardware = std::thread::hardware_concurrency();
-    const unsigned wanted = configured ? configured
-                                       : std::min(hardware ? hardware : 4u, 8u);
-    if (bytes < kMinParallelBytes || wanted <= 1) {
+    if (bytes < kMinParallelBytes || configured == 1) {
         std::memcpy(dst, src, bytes);
         return;
     }
+    // hardware_concurrency is only a scheduling hint, and some standard libraries probe sysfs
+    // on every call. Discover it once, only when an automatic parallel copy actually needs it.
+    static const unsigned wanted = [] {
+        if (configured) return configured;
+        const unsigned hardware = std::thread::hardware_concurrency();
+        return std::min(hardware ? hardware : 4u, 8u);
+    }();
     const unsigned threads = static_cast<unsigned>(
         std::min<size_t>(wanted, bytes / (1u << 20)));
     if (threads <= 1) { std::memcpy(dst, src, bytes); return; }
