@@ -177,6 +177,42 @@ int main(int argc, char** argv) {
         const auto bad = instrument_storage_image_writes(alias.words, conflicting);
         check(!bad && !bad.error.empty(), "alias extent disagreement rejects");
     }
+    // Mixed typed/raw aliases still need a single mask: tracking is about stores,
+    // not their payload type. Build a valid native rgba32f second descriptor.
+    auto mixed = fixture(1, false, {2, 1, 0}, true, true);
+    Words float_types;
+    put(float_types, 22, {70, 32});
+    put(float_types, 23, {71, 70, 4});
+    put(float_types, 25, {72, 70, 1, 0, 0, 0, 2, 1}); // rgba32f
+    put(float_types, 32, {73, 0, 72});
+    put(float_types, 43, {70, 74, 0x3f000000u});
+    put(float_types, 44, {71, 75, 74, 74, 74, 74});
+    size_t first_variable = 0;
+    for (size_t p = 5; p < mixed.words.size(); p += mixed.words[p] >> 16) {
+        const uint32_t op = mixed.words[p] & 0xffffu;
+        if (op == 59 && !first_variable) first_variable = p;
+        if (op == 59 && mixed.words[p + 2] == 13) mixed.words[p + 1] = 73;
+        if (op == 61 && mixed.words[p + 2] == 43) mixed.words[p + 1] = 72;
+        if (op == 99 && mixed.words[p + 1] == 43) mixed.words[p + 3] = 75;
+    }
+    mixed.words.insert(mixed.words.begin() + first_variable, float_types.begin(), float_types.end());
+    auto float_target = mixed.target; float_target.image_binding = 6;
+    const std::array mixed_targets{mixed.target, float_target};
+    const auto mixed_result = instrument_storage_image_writes(mixed.words, mixed_targets);
+    check(bool(mixed_result) && mixed_result.instrumented_writes == 2,
+          "both raw uint and typed float aliases instrument");
+    if (mixed_result) {
+        const auto atomics = evaluate(mixed_result.words);
+        check(atomics.size() == 2 && atomics[0].variable == atomics[1].variable &&
+                  atomics[0].index == 9 && atomics[1].index == 9,
+              "mixed numeric views mark the same exact texel in their shared mask");
+        check(instructions(mixed.words, 99) == instructions(mixed_result.words, 99),
+              "typed and raw texel payloads remain unchanged");
+        if (!output.empty()) {
+            std::ofstream file(output / "mixed-raw-float.spv", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(mixed_result.words.data()), mixed_result.words.size() * 4);
+        }
+    }
     auto f = fixture(1, false, {1, 1, 0}, true, false, false);
     auto none = instrument_storage_image_writes(f.words, std::span(&f.target, 1));
     check(bool(none) && none.instrumented_writes == 0 && evaluate(none.words).empty(),

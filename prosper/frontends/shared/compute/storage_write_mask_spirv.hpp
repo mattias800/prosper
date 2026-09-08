@@ -32,7 +32,7 @@ struct StorageWriteMaskSpirvResult {
     explicit operator bool() const { return error.empty() && !words.empty(); }
 };
 
-// Deliberately bounded to the compiler's direct, non-MS raw uint storage-image
+// Deliberately bounded to the compiler's direct, non-MS storage-image
 // loads. This is not a general SPIR-V validator. The original module must already
 // be valid. Unknown store provenance, descriptor arrays, image atomics, and
 // unsupported coordinate types are errors, never permission to omit tracking.
@@ -156,11 +156,13 @@ inline StorageWriteMaskSpirvResult instrument_storage_image_writes(
         if (!image || image->op != 25 || image->count < 9)
             return fail("target is not a non-array descriptor image type");
         const Inst* scalar = get_type(module[image->at + 2]);
-        if (!scalar || scalar->op != 21 || scalar->count != 4 ||
-            module[scalar->at + 2] != 32 || module[scalar->at + 3] != 0 ||
-            module[image->at + 6] != 0 || module[image->at + 7] != 2 ||
-            module[image->at + 8] != 0)
-            return fail("target must be a non-MS raw uint32 storage image");
+        const bool numeric32 = scalar &&
+            ((scalar->op == 21 && scalar->count == 4 && module[scalar->at + 3] <= 1) ||
+             (scalar->op == 22 && scalar->count == 3)) && module[scalar->at + 2] == 32;
+        // Alias members can have typed float or signed views. Tracking depends
+        // only on coordinates, never on the texel's numeric representation.
+        if (!numeric32 || module[image->at + 6] != 0 || module[image->at + 7] != 2)
+            return fail("target must be a non-MS 32-bit numeric storage image");
         const uint32_t dim = module[image->at + 3], arrayed = module[image->at + 5];
         if (dim > 2 || arrayed > 1 || bool(arrayed) != target.arrayed ||
             (dim == 2 && arrayed) || (dim == 0 && target.height != 1) ||
