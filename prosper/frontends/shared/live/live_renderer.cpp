@@ -1209,11 +1209,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
-    // GTA V's reviewed Performance-mode route contains Wave64 fragment programs whose only
-    // remaining width reason is a control-flow WaveAny. The backend may run that narrow class at
-    // NVIDIA's native Wave32 only for this title; every other title keeps master's fail-visible
-    // exact-width contract, and ballots/lane identity/scalar reductions stay exact even here.
-    const bool gta5_native_fragment_vote = title_id == "PPSA04263";
+    // A fragment program whose ONLY remaining width reason is a control-flow WaveAny may run at the
+    // host's native Wave32. That class is width-agnostic by construction: two 32-lane halves each
+    // answer "did any lane pass" for their own half, and for control flow the union is the Wave64
+    // answer. Ballots, lane identity, shuffles and scalar reductions stay exact -- the classifier in
+    // render_runner.h admits a reason set of EXACTLY WaveAny and nothing else.
+    //
+    // This was title-scoped to PPSA04263 until #3464 W5, and the classifier was never the reason.
+    // The comment here read "every unreviewed title remains on the strict master path": one route
+    // had been reviewed, so one title was admitted. A corpus survey then measured at least 51
+    // refused fragment shaders across 5 of 9 titles with EVERY ONE at `0x2 wave-any` -- this exact
+    // class -- including three titles at rung 6 whose reviewed snapshot guards stayed green while
+    // the shaders were dropped, because those baselines were recorded on Linux/AMD where wave64 is
+    // native and the loss cannot occur. Scoping a general classifier to one title did not make the
+    // others safe; it made their losses invisible. (51 is a lower bound: counts depend on how far a
+    // run gets, so read #3464 rather than treating it as a total.)
+    //
+    // The opt-out exists so the A/B stays reproducible, following PROSPER_NO_GUEST_FS: a default-on
+    // behaviour whose disable switch is for bisection, not for routine use.
+    const bool native_fragment_vote_width =
+        !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH");
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -1699,7 +1714,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     if (batch_backend_submits)
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps, invalidate_ds, gta5_native_fragment_vote](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             // #2215 instrument: publish which thread is inside a submit-render callback right
@@ -7590,7 +7605,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.allow_native_fragment_vote_width =
-                        !fs_ov && gta5_native_fragment_vote;
+                        !fs_ov && native_fragment_vote_width;
                     bd.draw_index = it.draw_index;
                     bd.command_order = it.command_order;
                     bd.vcount = refvs ? 3u : it.vertex_count;

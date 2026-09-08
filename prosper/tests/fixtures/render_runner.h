@@ -560,8 +560,9 @@ struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
-    // Live-title authority for GTA V's reviewed WaveAny-only fragment route. Tests, replay and all
-    // other titles leave this false, preserving the strict exact-wave admission contract.
+    // Whether the backend may run a WaveAny-only fragment program at the host's native wave width.
+    // Set by the live renderer; tests and replay leave it false so a fixture's expectations are not
+    // silently changed by a host property.
     bool allow_native_fragment_vote_width = false;
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
@@ -7125,6 +7126,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                  available_fragment_subgroup_features) ||
              (uses_internal_gds && !ctx.fragment_stores_atomics));
         uint32_t subgroup_reasons = UINT32_MAX;
+        // Diagnostic: write the fragment module this gate just ruled on, so the ADMITTED and
+        // SKIPPED populations can be compared offline. Off unless PROSPER_FRAGMENT_WAVE_DUMP names
+        // a directory; one file per distinct shader key per verdict.
+        auto dump_fragment_wave_module = [&](const char* verdict, uint64_t key, uint32_t why) {
+            static const char* dir = std::getenv("PROSPER_FRAGMENT_WAVE_DUMP");
+            if (!dir || !*dir || bd_fs.empty()) return;
+            char path[640];
+            std::snprintf(path, sizeof path, "%s/fragwave_%s_%016llx_why%02x.spv",
+                          dir, verdict, (unsigned long long)key, why);
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(bd_fs.data(), sizeof(uint32_t), bd_fs.size(), f);
+                std::fclose(f);
+            }
+        };
+
         if (fragment_subgroup_skip && bd.allow_native_fragment_vote_width &&
             (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
             prosper::gpu::fragment_subgroup_features_supported(
@@ -7133,22 +7149,28 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             !(uses_internal_gds && !ctx.fragment_stores_atomics)) {
             subgroup_reasons =
                 prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
-            // This is deliberately title-scoped and narrower than PROSPER_WAVE64_APPROX: only a
-            // WaveAny with no lane, ballot, shuffle or scalar-reduction qualifier is admitted.
-            // The source branch's reviewed bank route preserves both world and characters under
-            // this exact classifier; every unreviewed title remains on the strict master path.
+            // Narrower than PROSPER_WAVE64_APPROX: only a WaveAny with no lane, ballot, shuffle
+            // or scalar-reduction qualifier is admitted. Everything else keeps the fail-visible
+            // exact-width contract.
+            //
+            // No longer title-scoped (#3464 W5). It was, and the scope protected nothing the
+            // classifier did not already: a survey measured 31 refused fragment shaders across 5 of
+            // 9 titles, every one of them this exact class, three of those titles at rung 6 with
+            // guards that stayed green while the shaders were dropped.
             if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny) {
                 const uint64_t shader_key = bd.fs_identity
                     ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
                 static std::mutex native_width_log_mutex;
                 static std::unordered_set<uint64_t> native_width_logged;
                 std::lock_guard<std::mutex> lock(native_width_log_mutex);
-                if (native_width_logged.insert(shader_key).second)
+                if (native_width_logged.insert(shader_key).second) {
                     std::fprintf(stderr,
-                                 "[render] GTA V native-width fragment vote: subgroup %u -> %u "
-                                 "(why=0x%x)\n",
+                                 "[render] native-width fragment vote: subgroup %u -> %u "
+                                 "(why=0x%x fs=%016llx)\n",
                                  required_fragment_subgroup_size, ctx.max_subgroup_size,
-                                 subgroup_reasons);
+                                 subgroup_reasons, (unsigned long long)shader_key);
+                    dump_fragment_wave_module("admitted", shader_key, subgroup_reasons);
+                }
                 // Omitting the required-size pNext below selects the device's native fragment
                 // subgroup. On the current NVIDIA host that is 32 lanes.
                 required_fragment_subgroup_size = 0;
@@ -7162,6 +7184,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             static std::unordered_set<uint64_t> logged;
             std::lock_guard<std::mutex> lock(log_mutex);
             if (logged.insert(shader_key).second) {
+                dump_fragment_wave_module("skipped", shader_key,
+                                          subgroup_reasons == UINT32_MAX ? 0xffu
+                                                                         : subgroup_reasons);
                 // WHY the width was required, decoded (#2147). `required-ops` cannot answer it:
                 // those are Vote/Arithmetic/Shuffle/Ballot CAPABILITY bits, and the lane-id path declares
                 // none of them — so a shader needing 64 for lane IDENTITY (which can never run at

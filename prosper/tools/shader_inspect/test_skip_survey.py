@@ -68,8 +68,16 @@ def main() -> int:
 
     # ---- the ADMIT line, which is the whole of finding B1 ---------------------------------------
     check("the native-width admit emitter still exists",
-          '"[render] GTA V native-width fragment vote: subgroup %u -> %u "' in rr,
+          '"[render] native-width fragment vote: subgroup %u -> %u "' in rr,
           "-- an allowlisted title's wave-any shaders would become invisible with no admitted count")
+    # Every field the ADMIT regex depends on, not just the prefix. The prefix arm above stayed green
+    # while the emitter gained an `fs=` field and the regex -- anchored on `(why=...)` -- silently
+    # matched nothing, reporting admitted=0 for a whole corpus. A pin that only checks the start of a
+    # line cannot see a change at the end of it.
+    check("the admit emitter still carries why= and fs= in the order the regex reads them",
+          '"(why=0x%x fs=%016llx)' in rr,
+          "-- the ADMIT regex reads why= then fs=; reordering or dropping either silently zeroes "
+          "the admitted column")
 
     # ---- the fps emitter -------------------------------------------------------------------------
     check("the fps emitter still prints '<n> fps (<m> frames'",
@@ -91,7 +99,10 @@ def main() -> int:
     check("SKIP survives a reason set with no named bits",
           len(skip_survey.SKIP.findall(none_line)) == 1)
 
-    admit_line = "[render] GTA V native-width fragment vote: subgroup 64 -> 32 (why=0x2)"
+    # The emitter's REAL shape, fs= included. Written by hand once and left stale is how
+    # the previous version of this arm passed while the regex matched nothing.
+    admit_line = ("[render] native-width fragment vote: subgroup 64 -> 32 "
+                  "(why=0x2 fs=00000000000000a2)")
     check("ADMIT extracts the widths and reason from a real admit line",
           skip_survey.ADMIT.findall(admit_line) == [("64", "32", "0x2")])
 
@@ -107,16 +118,22 @@ def main() -> int:
     # It is a copy of a title id that lives in live_renderer.cpp; if that gains a title and this does
     # not, the survey reports a structural zero as a real one.
     live = source(REPO / "prosper" / "frontends" / "shared" / "live" / "live_renderer.cpp")
-    # Anchored on the ASSIGNMENT, not on any `title_id ==` in the file. A bare match would
-    # redden on an unrelated per-title switch, and the natural repair -- adding that title
-    # to NATIVE_VOTE_ALLOWLIST -- would make the survey report "wave-any is admitted here"
-    # for a title where it is not.
-    ids = set(re.findall(r'gta5_native_fragment_vote\s*=\s*([^;]+);', live))
+    # W5 removed the per-title gate, so this now asserts its ABSENCE. Anchored on the assignment
+    # rather than on any `title_id ==` in the file: a bare match would redden on an unrelated
+    # per-title switch, and the natural repair -- adding that title to NATIVE_VOTE_ALLOWLIST --
+    # would make the survey claim wave-any is specially handled for a title where it is not.
+    #
+    # If a title gate is ever reintroduced, this reddens and the survey's universal caveat has to be
+    # narrowed again. That is the point: the tools describe the renderer, not the other way round.
+    ids = set(re.findall(r'native_fragment_vote_width\s*=\s*([^;]+);', live))
     ids = set(re.findall(r'"([A-Z]{4}\d{5})"', " ".join(ids)))
-    check("skip_survey's allowlist matches live_renderer's title gate",
+    check("skip_survey's allowlist matches live_renderer's (both empty since W5)",
           ids == set(skip_survey.NATIVE_VOTE_ALLOWLIST),
-          "-- renderer has %s, survey has %s" % (sorted(ids),
-                                                 sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
+          "-- renderer gates on %s, survey has %s" % (sorted(ids) or "no title",
+                                                      sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
+    check("the renderer's fragment-vote allowance is not scoped to a title id",
+          not ids,
+          "-- a per-title gate reappeared: %s" % sorted(ids))
 
     # N7: `admitted` is a shader count only because the emitter dedupes on shader identity
     # before printing. Nothing else pins that, so a refactor dropping the guard would turn
