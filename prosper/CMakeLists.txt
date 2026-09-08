@@ -3127,12 +3127,17 @@ if(TARGET prosper_core)
         add_test(NAME storage_seed_program_reuse
                  COMMAND "${Python3_EXECUTABLE}"
                          "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
-                         $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+                         2 2 $<TARGET_FILE:test_near_full_storage_authority> program-replacement)
+        add_test(NAME storage_seed_variant_eviction
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
+                         6 4 $<TARGET_FILE:test_near_full_storage_authority> variant-eviction)
         add_test(NAME storage_seed_launch_reuse
                  COMMAND "${Python3_EXECUTABLE}"
                          "${CMAKE_SOURCE_DIR}/tests/gpu/execute/test_storage_seed_proof_reuse.py"
-                         $<TARGET_FILE:test_seed_coverage_dynamic> launch)
+                         2 1 $<TARGET_FILE:test_seed_coverage_dynamic> launch)
         set_tests_properties(storage_seed_program_reuse storage_seed_launch_reuse
+                             storage_seed_variant_eviction
                              PROPERTIES TIMEOUT 60)
       endif()
       set_tests_properties(near_full_storage_authority near_full_storage_authority_export

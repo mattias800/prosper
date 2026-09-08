@@ -44,7 +44,9 @@ ComputeItem item(const std::vector<uint32_t>& code, const ShaderResourceTable& r
 
 int main(int argc, char** argv) {
     const bool full_transition = argc == 2 && std::strcmp(argv[1], "full-transition") == 0;
-    const bool replacement = argc == 2 && std::strcmp(argv[1], "program-replacement") == 0;
+    const bool eviction = argc == 2 && std::strcmp(argv[1], "variant-eviction") == 0;
+    const bool replacement = eviction ||
+        (argc == 2 && std::strcmp(argv[1], "program-replacement") == 0);
     if (argc != 1 && !full_transition && !replacement) return 2;
     std::vector<uint32_t> guest(texels), observed(texels, 0xccccccccu);
     for (uint32_t i = 0; i < texels; ++i) guest[i] = 0xabc00000u + i;
@@ -145,6 +147,7 @@ int main(int argc, char** argv) {
         full_code.erase(std::find(full_code.begin(), full_code.end(), 0x7daa0880u));
         full_code[2] = full_value;
         producer = item(full_code, producer_resources, partial.code_addr, 1);
+        const auto full = producer;
         check(producer.spirv != partial.spirv, "replacement changes the executable module");
         check(prosper::frontend::execute_live_compute_items({producer}),
               "full writer proves coverage before any partial writer uses its key");
@@ -163,6 +166,47 @@ int main(int argc, char** argv) {
         check(guest[0] == changed_cutout, "replacement preserves the architectural guest cutout");
         consume();
         pixels(changed_cutout, "identical partial program remains correct on a warm proof");
+        auto full_pixels = [&](uint32_t expected) {
+            check(std::all_of(observed.begin(), observed.end(),
+                              [&](uint32_t value) { return value == expected; }) &&
+                  std::all_of(guest.begin(), guest.end(),
+                              [&](uint32_t value) { return value == expected; }),
+                  "returning full variant writes every GPU and guest texel");
+        };
+        producer = full;
+        consume();
+        full_pixels(full_value);
+        guest[0] = changed_cutout;
+        producer = partial;
+        consume();
+        pixels(changed_cutout, "returning partial variant preserves the changed cutout");
+        check(guest[0] == changed_cutout, "returning partial variant preserves the guest cutout");
+        if (eviction) {
+            // Fill the four-variant budget, touch A, then insert E. B must be evicted,
+            // whereas recently used A remains warm. Log assertions distinguish a
+            // bounded LRU from both an unbounded map and a one-verdict cache.
+            for (uint32_t value : {0x33333333u, 0x44444444u}) {
+                full_code[2] = value;
+                producer = item(full_code, producer_resources, partial.code_addr, 1);
+                consume(false); // A newly proved variant need not retain its image yet.
+                full_pixels(value);
+            }
+            producer = full;
+            consume();
+            full_pixels(full_value);
+            full_code[2] = 0x55555555u;
+            producer = item(full_code, producer_resources, partial.code_addr, 1);
+            consume(false);
+            full_pixels(0x55555555u);
+            producer = full;
+            consume();
+            full_pixels(full_value);
+            guest[0] = changed_cutout;
+            producer = partial;
+            consume(false); // B must safely re-prove after losing its cached identity.
+            pixels(changed_cutout, "evicted partial variant re-proves and repairs the cutout");
+            check(guest[0] == changed_cutout, "eviction preserves the guest cutout");
+        }
         return failures ? 1 : 0;
     }
     // Proving can restore untouched guest texels after a poison run. Warm outside
