@@ -107,3 +107,25 @@ comparison, guest copy/layout, map, host-write-watch notification, baseline crea
 notification, source validation/watch rearming and provenance. Those last two have separate
 `source_validation_ms` and `provenance_ms` fields. Use the existing dispatch phase totals for the
 remaining setup checks and loop overhead; do not claim the sum of owner timers covers all setup.
+
+## Untouched storage pixels
+
+A previous dispatch's coverage cannot authorize discarding current inputs. Native images retain
+exact texels; raw images may retain extra channel precision only for wholly write-only alias groups
+whose packed result still matches validated current guest bytes. A source-validation miss requires
+an upload. Readable/atomic raw groups need canonical inputs instead.
+
+Raw formats whose seed conversion is non-injective need exact per-store masks. The SPIR-V helper
+in `shared/compute/storage_write_mask_spirv.hpp` adds ordinary host-backed storage-buffer bindings;
+those buffers follow the same upload, completion, host-read-barrier and writeback contract as guest
+buffers. Their completed masks select which original linear guest texels survive packing. Such
+repaired raw images cannot advertise ordinary retained packed-content authority. Descriptor binding
+allocation includes unreferenced resource-table entries and unused SPIR-V globals.
+
+Exact native RGBA8 storage can seed from a separately pinned renderer image when no earlier sampled
+binding supplies one. Admission requires actual Vulkan format, extent, device and transfer-source
+usage to match; incompatible views retain CPU snapshots. The borrowed image stays read-only and
+returns to its incoming layout (or an earlier sampled borrower's GENERAL layout); the private
+destination still writes back guest bytes. Release every acquired pin, including folded aliases,
+only after completion is established. `PROSPER_NO_STANDALONE_RTT_SEED` selects the CPU control;
+F8-gated `compute-rtt-seed` rows distinguish admission from recorded copies.

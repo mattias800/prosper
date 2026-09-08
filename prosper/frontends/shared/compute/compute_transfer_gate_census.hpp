@@ -20,14 +20,16 @@ struct ComputeStorageCacheGateInputs {
     bool dcc_cache_safe = false;
     bool poison_verify = false;
     bool exact_storage = false;
-    bool seed_skip = false;
+    // Raw storage can preserve a noncanonical result only when no member reads it. Packing
+    // those retained texels must still reproduce the currently validated guest bytes.
+    bool write_only = false;
     bool persistent_enabled = false;
 };
 
 constexpr bool compute_storage_cache_gate_candidate(
     const ComputeStorageCacheGateInputs& inputs) {
-    return (!inputs.renderer_owned || inputs.seed_skip) && inputs.dcc_cache_safe &&
-           !inputs.poison_verify && (inputs.exact_storage || inputs.seed_skip) &&
+    return !inputs.renderer_owned && inputs.dcc_cache_safe &&
+           !inputs.poison_verify && (inputs.exact_storage || inputs.write_only) &&
            inputs.persistent_enabled;
 }
 
@@ -197,12 +199,9 @@ inline bool claim_compute_transfer_gate_selector_summary(
 //     the metadata range, not `gpu_addr`).
 //   * OVER-counts: `compute_transfer_seed_borrowed` bindings are scored as guest seeds, but they
 //     read a retained GPU image rather than guest memory.
-//   * ASYMMETRIC: `SpirvDescriptorBinding::readable` marks a write-only output that need not be
-//     seeded. The image path consults it; `BoundBuffer` copies `writable` but never `readable`,
-//     so write-only IMAGES are excluded from seeds while write-only BUFFERS are included. That
-//     matches what prosper's buffer upload actually does today -- it does not consult `readable`
-//     either, so those bytes really are read -- but the two paths do not agree, and if the upload
-//     ever starts honouring `readable` this census must change with it.
+//   * OVER-counts: retained storage and buffer sources can validate without uploading. Their
+//     guest ranges are still scored as seeds here; this is a dependency census, not transferred
+//     byte accounting. Write-only storage also preserves current inputs for untouched texels.
 //   * DEPTH-1 ONLY: overlap is measured against the immediately preceding dispatch, so the rate
 //     is a lower bound for any ring depth greater than one.
 struct ComputeGuestRange {
@@ -230,8 +229,8 @@ constexpr bool compute_guest_range_is_real(const ComputeGuestRange& r) {
 }
 
 // Half-open [addr, addr+bytes) intersection. A zero-length range touches nothing and so can
-// never alias -- that is the `seed_skip`/`renderer_owned` case, where nothing is read from guest
-// memory at all, and counting it as an overlap would overstate the hazard.
+// never alias. Report actual guest ranges: write-only storage still needs current input contents
+// for texels untouched by this dispatch, unless validated GPU contents already supply them.
 constexpr bool compute_guest_ranges_overlap(const ComputeGuestRange& a,
                                             const ComputeGuestRange& b) {
     if (a.bytes == 0 || b.bytes == 0) return false;

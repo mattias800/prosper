@@ -36,3 +36,9 @@ a *selector* — `PROSPER_COMPUTE_TRANSFER_PRODUCER_HASH` / `..._CONSUMER_HASH` 
 nothing at all unless a specific producer/consumer program pair was named on the command line. The
 other censuses here count on every run. Reading a zero from the transfer-gate census on a default
 launch says nothing about the code it instruments.
+
+`storage_write_mask_spirv.hpp` is a Vulkan-free module transformation for exact store tracking when
+a raw storage format cannot round-trip every guest encoding. It preserves control flow and marks
+actual image stores, including stores whose converted value equals the input. It does not own mask
+memory or authorize guest bytes; allocation, seeding, synchronization and untouched-byte restoration
+belong to the live backend. Unsupported provenance is an explicit error.

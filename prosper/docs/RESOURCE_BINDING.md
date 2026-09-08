@@ -133,15 +133,29 @@ same contract with reflected descriptor count and dynamic-index metadata; they a
 
 Live compute resolves each dispatch's exact storage-image alias groups before preparing their
 canonical images (`frontends/shared/compute/storage_image_alias_plan.hpp`). Access is a group
-property: any readable or atomic member prohibits seed omission and destructive poison proving.
+property: any readable or atomic member requires canonical current inputs for raw storage.
 The plan follows the existing late-fold identity, including view shape, capture backing and DCC;
 it does not change which descriptors actually share a Vulkan image. Sampled images remain separate.
 
-Cached coverage verdicts include the sorted group binding set. Moving an intact group does not
-change that identity, but joining or splitting does: two writers may cover an entire image together
-while neither does alone, and a previously inactive owner may gain a writer. Both proof lookup and
-publication use the same member-aware key. These are seed-safety constraints, not a static proof
-that a shader's coverage is invariant under arbitrary input changes (#3391).
+Coverage from previous dispatches is not reusable authority: current masks, coordinates and layers
+can change without changing code or launch shape. Native storage retains validated exact inputs;
+wholly write-only raw groups may retain extra precision only while packing those channels still
+matches validated current guest bytes. A validation miss requires a fresh seed. Readable or atomic
+raw aliases require canonical input channels. No historical Full/None verdict suppresses seeding or
+writeback (#3467).
+
+SNORM's redundant minimum encoding needs an exact GPU store mask: untouched texels preserve their
+original guest bytes, while actual stores undergo normal conversion even when their channel value
+equals the input. Mask bindings include every writer in the alias group and follow ordinary buffer
+completion and host-read synchronization. Binary16 and F11/F10 need no such mask: exhaustive scalar
+and public storage-ABI tests cover every encoding, including NaN payloads, in separate scalar/F16C
+unpack and pack combinations.
+
+Preserving current renderer-owned inputs does not require a CPU snapshot when an exact native
+RGBA8 source can be pinned on the same Vulkan device with transfer-source usage. Storage-only
+dispatches copy that source into a private writable image, restore its layout, and retain ordinary
+guest writeback. Missing or incompatible imports fall back to current snapshots; neither a matching
+address nor matching texel width alone authorizes this copy (#3407).
 
 ### Write-watch alias protection
 
@@ -174,6 +188,13 @@ This does not establish complete recovery after diagnostic-only partial protecti
 
 ### Ruled out: per-binding seed safety
 
+- **Fixed code, launch shape and alias membership establish future write coverage:** falsified by
+  Full/Partial/None transitions driven solely by changed input masks, coordinates or array layers.
+  Historical verdicts fail; preserving validated current inputs passes the same pixel oracles (#3467).
+- **Restoring raw texels whose converted value is unchanged preserves guest semantics:** falsified
+  by SNORM's two encodings of -1. An explicit store must canonicalize the redundant minimum, while
+  an untouched texel must retain it. Equality cannot distinguish those cases; actual store tracking
+  can (#3467).
 - **A write-only owner's reflection is sufficient to omit seed data, provided untouched image
   texels are restored afterwards:** falsified by a race-free storage-image read into an independent
   SSBO. Restoring the image cannot repair values already consumed by another output. Reverting
