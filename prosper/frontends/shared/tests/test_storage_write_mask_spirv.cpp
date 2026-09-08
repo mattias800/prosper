@@ -261,6 +261,72 @@ int main(int argc, char** argv) {
             duplicated_target.words[p + 3] = 5;
     reject(duplicated_target, "duplicate target variables cannot silently leave one untracked");
 
+    // A separate R32_UINT image atomic must keep executing when another storage image needs a
+    // conversion mask. Exercise both a read-only selected image and one with actual selected stores.
+    for (bool selected_writes : {false, true}) {
+        auto atomic = fixture(1, false, {2, 1, 0}, true, false, selected_writes);
+        Words annotations, declarations, operation;
+        put(annotations, 71, {65, 34, 0}); put(annotations, 71, {65, 33, 6});
+        put(declarations, 25, {60, 3, 1, 0, 0, 0, 2, 33}); // R32ui
+        put(declarations, 32, {61, 0, 60}); // UniformConstant image pointer
+        put(declarations, 32, {62, 11, 3}); // Image texel pointer
+        put(declarations, 43, {3, 63, 0}); put(declarations, 43, {3, 64, 1});
+        put(declarations, 59, {61, 65, 0});
+        put(operation, 60, {62, 66, 65, 25, 63}); // pointer to the unrelated image
+        put(operation, 234, {3, 67, 66, 64, 63, 64}); // AtomicIAdd, Device, Relaxed
+        Words original(atomic.words.begin(), atomic.words.begin() + 5);
+        bool added_annotations = false, added_declarations = false;
+        for (size_t p = 5; p < atomic.words.size(); p += atomic.words[p] >> 16) {
+            const uint32_t count = atomic.words[p] >> 16, op = atomic.words[p] & 0xffffu;
+            if (op == 14 && !selected_writes) put(original, 17, {55}); // ReadWithoutFormat
+            if (op == 19 && !added_annotations) {
+                original.insert(original.end(), annotations.begin(), annotations.end());
+                added_annotations = true;
+            }
+            if (op == 59 && !added_declarations) {
+                original.insert(original.end(), declarations.begin(), declarations.end());
+                added_declarations = true;
+            }
+            if (op == 253) {
+                if (!selected_writes) put(original, 98, {5, 68, 42, 25}); // actual image read
+                original.insert(original.end(), operation.begin(), operation.end());
+            }
+            original.insert(original.end(), atomic.words.begin() + p, atomic.words.begin() + p + count);
+        }
+        atomic.words = std::move(original);
+        const auto result = instrument_storage_image_writes(atomic.words, std::span(&atomic.target, 1));
+        check(bool(result) && result.instrumented_writes == uint32_t(selected_writes),
+              "unrelated image atomic coexists with read-only or writable selected image");
+        if (result) {
+            check(instructions(atomic.words, 60) == instructions(result.words, 60) &&
+                      instructions(atomic.words, 234) == instructions(result.words, 234),
+                  "unrelated image pointer and real atomic operation remain byte-identical");
+            const auto marks = evaluate(result.words);
+            check(marks.size() == unsigned(selected_writes) &&
+                      (marks.empty() || (marks[0].index == 9 && marks[0].value == 1)),
+                  "only actual selected stores mark the conversion mask");
+            if (!output.empty()) {
+                std::ofstream file(output / (selected_writes ? "unrelated-atomic-write.spv"
+                                                            : "unrelated-atomic-readonly.spv"),
+                                   std::ios::binary);
+                file.write(reinterpret_cast<const char*>(result.words.data()), result.words.size() * 4);
+            }
+        }
+        auto selected_atomic = atomic;
+        selected_atomic.target.image_binding = 6;
+        reject(selected_atomic, "selected image atomics still reject");
+        // A copied pointer is legal provenance, but deliberately beyond this direct-global guard.
+        // Do not interpret the failed direct lookup as proof that it cannot reference a target.
+        for (size_t p = 5; p < atomic.words.size(); p += atomic.words[p] >> 16)
+            if ((atomic.words[p] & 0xffffu) == 60) {
+                atomic.words[p + 3] = 69;
+                const Words copied{(4u << 16) | 83u, 61, 69, 65};
+                atomic.words.insert(atomic.words.begin() + p, copied.begin(), copied.end());
+                break;
+            }
+        reject(atomic, "unresolved copied image pointer still rejects conservatively");
+    }
+
     // A narrowed execution mask and a merge phi make moving the generated atomic
     // outside the actual store block observable structurally and to spirv-val.
     auto guarded = fixture(1, false, {1, 1, 0});

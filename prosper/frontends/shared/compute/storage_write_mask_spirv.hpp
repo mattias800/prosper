@@ -34,7 +34,7 @@ struct StorageWriteMaskSpirvResult {
 
 // Deliberately bounded to the compiler's direct, non-MS storage-image
 // loads. This is not a general SPIR-V validator. The original module must already
-// be valid. Unknown store provenance, descriptor arrays, image atomics, and
+// be valid. Unknown store provenance, descriptor arrays, selected image atomics, and
 // unsupported coordinate types are errors, never permission to omit tracking.
 // No control-flow edges are changed: out-of-range writes atomically OR zero into
 // mask[0]. In-range writes OR one at their exact texel, including same-value
@@ -183,23 +183,36 @@ inline StorageWriteMaskSpirvResult instrument_storage_image_writes(
             prior.target.width != target.width || prior.target.height != target.height ||
             prior.target.depth != target.depth)) return fail("aliased masks have different views");
     }
-    auto direct_image_variable = [&](uint32_t value) -> uint32_t {
-        const auto load = loads.find(value);
-        if (load == loads.end()) return 0;
-        const auto var = variables.find(module[load->second.at + 3]);
+    auto direct_image_global = [&](uint32_t variable) -> uint32_t {
+        const auto var = variables.find(variable);
         if (var == variables.end()) return 0;
         const Inst* ptr = get_type(module[var->second.at + 1]);
         if (!ptr || ptr->op != 32 || ptr->count != 4 || module[ptr->at + 2] != 0 ||
-            module[ptr->at + 3] != module[load->second.at + 1]) return 0;
+            module[var->second.at + 3] != 0) return 0;
         const Inst* type = get_type(module[ptr->at + 3]);
         return type && type->op == 25 ? var->first : 0;
+    };
+    auto direct_image_variable = [&](uint32_t value) -> uint32_t {
+        const auto load = loads.find(value);
+        if (load == loads.end()) return 0;
+        const uint32_t variable = direct_image_global(module[load->second.at + 3]);
+        if (!variable) return 0;
+        const Inst* ptr = get_type(module[variables.at(variable).at + 1]);
+        return module[ptr->at + 3] == module[load->second.at + 1] ? variable : 0;
     };
     struct Write { TargetInfo target; uint32_t coordinate, scalar_type, components; bool signed_coord; };
     std::map<size_t, Write> writes;
     for (const auto& inst : instructions) {
-        // OpImageTexelPointer takes a pointer to an image variable, unlike OpImageWrite.
-        // Refuse all such operations conservatively; a pointer alias could hide a target.
-        if (inst.op == 60) return fail("image atomics cannot be tracked by image-store masks");
+        // OpImageTexelPointer uses a pointer to an image variable, unlike OpImageWrite.
+        // A known unrelated global cannot affect a selected mask. Selected or unresolved pointers
+        // still reject: treating unknown pointer provenance as unrelated could erase real stores.
+        if (inst.op == 60) {
+            if (inst.count != 6) return fail("invalid image texel pointer");
+            const uint32_t variable = direct_image_global(module[inst.at + 3]);
+            if (!variable || selected.count(variable))
+                return fail("selected or unresolved image atomic cannot use image-store masks");
+            continue;
+        }
         if (inst.op != 99) continue;
         if (inst.count < 4) return fail("invalid OpImageWrite");
         const uint32_t variable = direct_image_variable(module[inst.at + 1]);
