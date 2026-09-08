@@ -21,9 +21,10 @@ inline std::atomic<bool>& gpu_retile_poison_output_for_test() {
 }
 
 struct GpuRetileParameters {
-    std::array<uint32_t, 22> words{};
+    std::array<uint32_t, 26> words{};
     uint64_t linear_bytes = 0, tiled_bytes = 0;
-    uint32_t groups_x = 0, groups_y = 0;
+    uint32_t groups_x = 0, groups_y = 0, groups_z = 1;
+    bool volume = false;
 
     bool initialize(uint32_t width, uint32_t height, uint32_t bpe, uint32_t mode,
                     const VkPhysicalDeviceLimits& limits) {
@@ -60,6 +61,43 @@ struct GpuRetileParameters {
         groups_y = uint32_t(padded_height);
         return true;
     }
+    bool initialize_volume(uint32_t width, uint32_t height, uint32_t depth,
+                           uint32_t bpe, uint32_t mode, const VkPhysicalDeviceLimits& limits) {
+        *this = {};
+        std::array<uint32_t, 16> equation{};
+        uint32_t bw = 0, bh = 0, bd = 0, bits = 0;
+        if (!width || !height || !depth ||
+            !prosper::gpu::tile_volume_word_equation(mode, bpe, equation, bw, bh, bd, bits))
+            return false;
+        if (!std::has_single_bit(bw) || !std::has_single_bit(bh) || !std::has_single_bit(bd))
+            return false;
+        const uint64_t row_words = uint64_t(width) * (bpe / 4);
+        const uint64_t bx = (uint64_t(width) + bw - 1) / bw;
+        const uint64_t by = (uint64_t(height) + bh - 1) / bh;
+        const uint64_t bz = (uint64_t(depth) + bd - 1) / bd;
+        const uint64_t block_bytes = uint64_t{1} << bits;
+        if (row_words > UINT32_MAX / uint64_t(height) ||
+            row_words * height > UINT32_MAX / uint64_t(depth) ||
+            bx > UINT32_MAX / block_bytes / by ||
+            bx * by > UINT32_MAX / block_bytes / bz) return false;
+        linear_bytes = row_words * height * depth * 4;
+        tiled_bytes = bx * by * bz * block_bytes;
+        const uint64_t gx = (bx * bw * (bpe / 4) + 127) / 128;
+        const uint64_t gy = by * bh, gz = bz * bd;
+        if (linear_bytes > limits.maxStorageBufferRange || tiled_bytes > limits.maxStorageBufferRange ||
+            limits.maxComputeWorkGroupSize[0] < 128 || limits.maxComputeWorkGroupInvocations < 128 ||
+            limits.maxPushConstantsSize < sizeof(words) || gx > limits.maxComputeWorkGroupCount[0] ||
+            gy > limits.maxComputeWorkGroupCount[1] || gz > limits.maxComputeWorkGroupCount[2])
+            return false;
+        words[0] = width; words[1] = height; words[2] = std::countr_zero(bpe / 4);
+        words[3] = std::countr_zero(bw); words[4] = std::countr_zero(bh); words[5] = uint32_t(bx);
+        std::copy(equation.begin(), equation.end(), words.begin() + 6);
+        words[22] = depth; words[23] = std::countr_zero(bd); words[24] = uint32_t(by);
+        words[25] = bits - 2; // Word offset of a whole block.
+        groups_x = uint32_t(gx); groups_y = uint32_t(gy); groups_z = uint32_t(gz);
+        volume = true;
+        return true;
+    }
 };
 
 // Context-owned pipeline. Per-dispatch buffers and descriptors remain owned by
@@ -77,7 +115,7 @@ struct GpuRetilePipeline {
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
         pipeline = VK_NULL_HANDLE; layout = VK_NULL_HANDLE; descriptors = VK_NULL_HANDLE;
     }
-    VkResult initialize(VkDevice dev, VkPipelineCache cache) {
+    VkResult initialize(VkDevice dev, VkPipelineCache cache, bool volume = false) {
         if (attempted) return setup_result;
         attempted = true; device = dev;
         const VkDescriptorSetLayoutBinding bindings[]{
@@ -87,13 +125,13 @@ struct GpuRetilePipeline {
         dci.bindingCount = 2; dci.pBindings = bindings;
         setup_result = vkCreateDescriptorSetLayout(device, &dci, nullptr, &descriptors);
         if (setup_result != VK_SUCCESS) return setup_result;
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 22 * sizeof(uint32_t)};
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 26 * sizeof(uint32_t)};
         VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         lci.setLayoutCount = 1; lci.pSetLayouts = &descriptors;
         lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &push;
         setup_result = vkCreatePipelineLayout(device, &lci, nullptr, &layout);
         if (setup_result != VK_SUCCESS) { destroy(); return setup_result; }
-        const auto words = prosper::gpu::build_compute_retile_words();
+        const auto words = prosper::gpu::build_compute_retile_words(volume);
         VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sci.codeSize = words.size() * sizeof(uint32_t); sci.pCode = words.data();
         VkShaderModule shader = VK_NULL_HANDLE;
@@ -157,7 +195,7 @@ struct GpuRetilePipeline {
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p.words), p.words.data());
-        vkCmdDispatch(command, p.groups_x, p.groups_y, 1);
+        vkCmdDispatch(command, p.groups_x, p.groups_y, p.groups_z);
         gpu_retile_recordings().fetch_add(1, std::memory_order_relaxed);
         // The host reads the entire shader-written allocation, even if exact-result
         // comparison later skips this mapping.

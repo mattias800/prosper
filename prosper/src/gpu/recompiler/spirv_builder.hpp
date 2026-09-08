@@ -37,10 +37,11 @@ std::vector<uint32_t> build_compute_detile_rgba16f();
 // Binding 0: storage buffer of uint32 texels; push constant: texel count.
 std::vector<uint32_t> build_compute_rgba8_to_packed10();
 
-// Exact row-major words (binding 0) -> 2D 64 KiB guest tiles (binding 1).
+// Exact row-major words (binding 0) -> 2D 64 KiB or standard 3D guest tiles (binding 1).
 // Push words: width, height, log2(words/texel), log2(block width), log2(block height),
-// blocks/row, followed by 16 packed x/y equation masks. Dispatch the full padded
-// rectangle; out-of-image texels write zero without reading the linear source.
-std::vector<uint32_t> build_compute_retile_words();
+// blocks/row, then 16 packed x/y (or x/y/z) equation masks. Volume words 22..25:
+// depth, log2(block depth), block rows/plane, log2(words/block). Dispatch the full
+// padded rectangle/volume; out-of-image texels write zero without reading the source.
+std::vector<uint32_t> build_compute_retile_words(bool volume = false);
 
 } // namespace prosper::gpu

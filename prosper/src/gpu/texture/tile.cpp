@@ -1263,6 +1263,24 @@ bool tile64_word_equation(uint32_t mode, uint32_t bpe,
     return true;
 }
 
+bool tile_volume_word_equation(uint32_t mode, uint32_t bpe,
+                               std::array<uint32_t, 16>& equation,
+                               uint32_t& bw, uint32_t& bh, uint32_t& bd, uint32_t& bits) {
+    equation = {};
+    if ((mode != uint32_t(TileMode::Sw4KbS) && mode != uint32_t(TileMode::Sw64KbS)) ||
+        (bpe != 4 && bpe != 8 && bpe != 16)) return false;
+    const auto el = sw64kb_elem_log2(bpe);
+    const bool small = mode == uint32_t(TileMode::Sw4KbS);
+    const auto* dims = small ? kSw4kbS3Dims[el] : kSw64kbS3Dims[el];
+    bw = dims[0]; bh = dims[1]; bd = dims[2]; bits = small ? 12u : 16u;
+    for (uint32_t bit = el; bit < bits; ++bit) {
+        const auto& p = kSw64kbS3[el][bit];
+        if ((uint32_t(p.x) | uint32_t(p.y) | uint32_t(p.z)) & ~255u) return false;
+        equation[bit] = uint32_t(p.x) | (uint32_t(p.y) << 8) | (uint32_t(p.z) << 16);
+    }
+    return true;
+}
+
 size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, uint32_t pitch,
                            uint32_t bytes_per_texel) {
     if (!tile_mode_is_tiled(tile_mode)) return (size_t)width * height * bytes_per_texel;

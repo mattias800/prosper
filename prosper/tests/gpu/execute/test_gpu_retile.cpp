@@ -39,18 +39,42 @@ static bool equation_covers_block(uint32_t mode, uint32_t bpe, uint32_t bx,
     }
     return written == seen.size();
 }
-int main(int argc, char** argv) {
-    const bool cpu = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
+static bool volume_equation_covers_block(uint32_t mode, uint32_t bpe, bool collapse = false) {
+    std::array<uint32_t, 16> equation{};
+    uint32_t bw = 0, bh = 0, bd = 0, bits = 0;
+    if (!tile_volume_word_equation(mode, bpe, equation, bw, bh, bd, bits)) return false;
+    if (collapse) equation[bits - 1] = 0;
+    std::vector<bool> seen(size_t{1} << (bits - 2));
+    size_t written = 0;
+    for (uint32_t z = 0; z < bd; ++z) for (uint32_t y = 0; y < bh; ++y)
+    for (uint32_t x = 0; x < bw; ++x) for (uint32_t component = 0; component < bpe / 4; ++component) {
+        uint32_t offset = component * 4;
+        for (uint32_t bit = 2; bit < bits; ++bit) {
+            const auto e = equation[bit];
+            offset |= uint32_t(std::popcount((x & (e & 255)) ^
+                (y & ((e >> 8) & 255)) ^ (z & (e >> 16))) & 1) << bit;
+        }
+        if ((offset & 3) || offset / 4 >= seen.size() || seen[offset / 4]) return false;
+        seen[offset / 4] = true; ++written;
+    }
+    return written == seen.size();
+}
+
+int run_case(int argc, char** argv) {
+    const bool mixed = argc == 2 && std::strstr(argv[1], "mixed");
+    const bool volume = argc == 2 && std::strstr(argv[1], "volume");
+    const bool cpu = argc == 2 && std::strstr(argv[1], "cpu");
     const bool clean = argc == 2 && std::strcmp(argv[1], "--clean") == 0;
-    const bool mapping = argc == 2 && std::strncmp(argv[1], "--map-", 6) == 0;
-    const bool allocation = argc == 2 && std::strncmp(argv[1], "--alloc-", 8) == 0;
+    const bool mapping = argc == 2 && std::strstr(argv[1], "map-");
+    const bool allocation = argc == 2 && std::strstr(argv[1], "alloc-");
     const bool fault_mode = mapping || allocation;
     const bool loss = fault_mode && std::strstr(argv[1], "loss");
     gpu_retile_poison_output_for_test().store(!cpu && !clean);
     VkPhysicalDeviceLimits limits{};
     limits.maxStorageBufferRange = UINT32_MAX;
     limits.maxComputeWorkGroupSize[0] = limits.maxComputeWorkGroupInvocations = 128;
-    limits.maxComputeWorkGroupCount[0] = limits.maxComputeWorkGroupCount[1] = 65535;
+    limits.maxComputeWorkGroupCount[0] = limits.maxComputeWorkGroupCount[1] =
+        limits.maxComputeWorkGroupCount[2] = 65535;
     limits.maxPushConstantsSize = 128;
     GpuRetileParameters params;
     check(params.initialize(3840, 2160, 4, 27, limits) &&
@@ -85,19 +109,54 @@ int main(int argc, char** argv) {
               "full block equation writes every output word exactly once, including nonzero block coordinates");
     check(!equation_covers_block(27, 4, 0, 0, true),
           "equation coverage guard rejects a manually collapsed address bit");
+    for (uint32_t mode : {5u, 9u}) for (uint32_t bpe : {4u, 8u, 16u})
+        check(volume_equation_covers_block(mode, bpe),
+              "3D equation writes every physical word exactly once");
+    check(!volume_equation_covers_block(9, 8, true),
+          "3D coverage guard rejects a collapsed coordinate bit");
     struct Format { DataFormat format; uint32_t components, bpe; };
     constexpr Format formats[]{ {DataFormat::Uint32, 1, 4}, {DataFormat::Uint8, 4, 4},
         {DataFormat::Unorm8, 4, 4}, {DataFormat::Float16, 4, 8}, {DataFormat::Float32, 4, 16} };
+    check(params.initialize_volume(64, 64, 128, 8, 9, limits) &&
+              params.linear_bytes == 4194304 && params.tiled_bytes == 4194304 &&
+              params.groups_z == 128, "representative 4 MiB standard 3D RGBA16F volume is admitted");
+    check(!params.initialize_volume(UINT32_MAX, UINT32_MAX, UINT32_MAX, 16, 9, limits) &&
+          !params.initialize_volume(64, 64, 128, 2, 9, limits) &&
+          !params.initialize_volume(64, 64, 128, 8, 27, limits),
+          "overflow, sub-word texels and unsupported 3D layouts decline");
+    auto depth_limits = limits; depth_limits.maxComputeWorkGroupCount[2] = 21;
+    check(!params.initialize_volume(67, 19, 21, 8, 9, depth_limits),
+          "3D workgroup limit applies to padded depth");
+    const std::vector<uint32_t> modes = mixed ? std::vector<uint32_t>{9} : volume ? std::vector<uint32_t>{5, 9}
+                                              : std::vector<uint32_t>{9, 24, 27};
+    const std::vector<std::pair<uint32_t, uint32_t>> extents = mixed
+        ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}} : volume
+        ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}, {128, 64}}
+        : std::vector<std::pair<uint32_t, uint32_t>>{{257, 131}, {384, 256}};
     uint64_t code = 0x34070000;
-    for (uint32_t mode : {9u, 24u, 27u}) for (auto format : formats)
-    for (auto [width, height] : {std::pair{257u, 131u}, std::pair{384u, 256u}})
-    for (uint32_t view : {0u, 1u, 2u}) {
+    for (uint32_t mode : modes) for (auto format : formats)
+    for (auto [width, height] : extents)
+    for (uint32_t view = 0; view < ((volume || mixed) ? 1u : 3u); ++view) {
+        if (mixed && format.format != DataFormat::Float16) continue;
+        // Integer 3D images still use the existing raw interchange path. Its packing fallback
+        // remains covered; this retile change does not broaden native storage declarations.
+        const bool native_volume = native_storage_3d_format_support_bit(
+            format.format, format.components) != 0;
+        const bool gpu = !cpu && (!volume || native_volume);
+        if (fault_mode && volume && !native_volume) continue;
         // A one-layer array descriptor may be consumed through either a plain
         // 2D instruction or an array instruction retaining its layer coordinate.
-        const uint32_t resource_dim = view ? 5u : 1u;
-        const uint32_t instruction_dim = view == 2 ? 5u : 1u;
-        const size_t linear_bytes = size_t(width) * height * format.bpe;
-        const size_t tiled_bytes = tiled_surface_bytes(width, height, mode, 0, format.bpe);
+        const uint32_t resource_dim = volume ? 2u : view ? 5u : 1u;
+        const uint32_t instruction_dim = volume ? 2u : view == 2 ? 5u : 1u;
+        const uint32_t depth = volume ? (width == 67 ? 21u : 32u) : 1u;
+        const size_t linear_bytes = size_t(width) * height * depth * format.bpe;
+        const size_t tiled_bytes = volume ? tiled_volume_bytes(width, height, depth, mode, format.bpe)
+                                           : tiled_surface_bytes(width, height, mode, 0, format.bpe);
+        auto tile = [&](uint8_t* dst, const uint8_t* src) {
+            if (volume) check(tile_volume(dst, tiled_bytes, src, width, height, depth, mode, format.bpe),
+                              "CPU volume layout supports the test resource");
+            else tile_surface(dst, src, width, height, mode, 0, format.bpe);
+        };
         std::vector<uint8_t> source_linear(linear_bytes), expected_linear(linear_bytes);
         std::vector<uint8_t> source(tiled_bytes), destination(tiled_bytes + 64, 0xcc);
         auto fill = [&](std::vector<uint8_t>& bytes, uint32_t salt) {
@@ -123,7 +182,7 @@ int main(int argc, char** argv) {
             }
         };
         fill(expected_linear, 173);
-        tile_surface(destination.data(), expected_linear.data(), width, height, mode, 0, format.bpe);
+        tile(destination.data(), expected_linear.data());
         std::vector<uint32_t> coordinates(64), dummy(4);
         for (uint32_t lane = 0; lane < 64; ++lane) coordinates[lane] = lane;
         ShaderResourceTable resources;
@@ -136,7 +195,7 @@ int main(int argc, char** argv) {
         for (uint32_t binding : {4u, 5u}) {
             ShaderResource r{}; r.cls = ResourceClass::StorageImage; r.binding = binding;
             r.sgpr_base = binding == 4 ? 0 : 8; r.img_dim = resource_dim;
-            r.width = width; r.height = height; r.depth = 1;
+            r.width = width; r.height = height; r.depth = depth;
             r.format = format.format; r.num_components = format.components; r.tile_mode = mode;
             r.size = uint32_t(tiled_bytes);
             r.gpu_addr = reinterpret_cast<uint64_t>(binding == 4 ? source.data() : destination.data());
@@ -145,21 +204,23 @@ int main(int argc, char** argv) {
         const auto before = gpu_retile_recordings().load();
         for (uint32_t round = 0; round < 3; ++round) {
             fill(source_linear, 7 + round * 31);
-            tile_surface(source.data(), source_linear.data(), width, height, mode, 0, format.bpe);
+            tile(source.data(), source_linear.data());
             const uint32_t row = round == 0 ? 0 : round == 1 ? height / 2 : height - 1;
             const uint32_t first_x = round == 2 ? width - 64 : 0;
+            const uint32_t slice = round == 0 ? 0 : round == 1 ? depth / 2 : depth - 1;
             const uint32_t shader[]{
                 0x4A0800FFu, first_x, // v_add_nc_u32 v4, first_x, v0
                 0x7E0A02FFu, row, // v5=selected y
-                0x7E0C0280u, // v6=layer zero for the array instruction
+                0x7E0C02FFu, slice, // v6=selected depth slice or array layer zero
                 0xF0000F00u | (instruction_dim << 3), 0x00000004u, 0xBF8C3F70u,
                 0xF0200F00u | (instruction_dim << 3), 0x00020004u, 0xBF810000u};
             ComputeItem item;
             ComputeShaderConfig config;
             config.user_sgprs.resize(16); config.local_x = 64;
             config.local_y = config.local_z = 1; config.tidig_comp_cnt = 0;
-            config.native_storage_format_support = native_storage_format_support_bit(
-                format.format, format.components);
+            config.native_storage_format_support = volume
+                ? native_storage_3d_format_support_bit(format.format, format.components)
+                : native_storage_format_support_bit(format.format, format.components);
             item.spirv = recompile_compute(shader, std::size(shader), &resources, config);
             item.resources = std::make_shared<ShaderResourceTable>(resources);
             item.user_sgprs = config.user_sgprs;
@@ -169,7 +230,7 @@ int main(int argc, char** argv) {
             for (const auto& descriptor : reflection.descriptors)
                 if (descriptor.kind == SpirvDescriptorKind::StorageImage &&
                     (descriptor.binding == 4 || descriptor.binding == 5) &&
-                    descriptor.image_dim == 1 && descriptor.image_arrayed == (view == 2))
+                    descriptor.image_dim == (volume ? 2u : 1u) && descriptor.image_arrayed == (view == 2))
                     ++matching_views;
             check(reflection.ok() && matching_views == 2,
                   "both storage views reflect the intended ordinary or array shader type");
@@ -196,18 +257,18 @@ int main(int argc, char** argv) {
                 return failures ? 1 : 0;
             }
             check(executed, "partial guest image copy executes through live Vulkan");
-            check(gpu_retile_recordings().load() - retile_before == (cpu ? 0 : inject ? 1 : 2),
+            check(gpu_retile_recordings().load() - retile_before == (!gpu ? 0 : inject ? 1 : 2),
                   "both storage images take the selected GPU/CPU path, including the destination");
             if (code == 0x34070000 && round == 0 && !inject)
-                check(backend_host_read_barrier_count().load() - barriers_before == (cpu ? 2 : 4),
+                check(backend_host_read_barrier_count().load() - barriers_before == (gpu ? 4 : 2),
                       "first dispatch records host availability for both linear and both tiled results");
             for (uint32_t lane : coordinates) {
                 const uint32_t x = lane + first_x;
-                std::copy_n(source_linear.data() + (size_t(row) * width + x) * format.bpe,
-                            format.bpe, expected_linear.data() + (size_t(row) * width + x) * format.bpe);
+                std::copy_n(source_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe,
+                            format.bpe, expected_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe);
             }
             std::vector<uint8_t> expected(tiled_bytes);
-            tile_surface(expected.data(), expected_linear.data(), width, height, mode, 0, format.bpe);
+            tile(expected.data(), expected_linear.data());
             check(std::equal(expected.begin(), expected.end(), destination.begin()),
                   "every guest byte matches CPU tiling, including untouched texels and padding");
             check(std::all_of(destination.begin() + tiled_bytes, destination.end(),
@@ -216,10 +277,22 @@ int main(int argc, char** argv) {
         std::printf("mode=%u bpe=%u format=%u extent=%ux%u resource-dim=%u instruction-dim=%u GPU retile dispatches=%llu\n",
             mode, format.bpe, unsigned(format.format), width, height, resource_dim, instruction_dim,
             static_cast<unsigned long long>(gpu_retile_recordings().load() - before));
-        check(cpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + (fault_mode ? 5 : 6),
-              cpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
+        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + (fault_mode ? 5 : 6),
+              !gpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
         if (fault_mode) return failures ? 1 : 0;
         code += 16;
     }
     return failures ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--mixed") == 0) {
+        // All three use the same retained live context and its immutable retile pipelines.
+        for (const char* option : {"--mixed-2d", "--mixed-volume", "--mixed-2d"}) {
+            char* args[]{argv[0], const_cast<char*>(option)};
+            if (run_case(2, args)) return 1;
+        }
+        return 0;
+    }
+    return run_case(argc, argv);
 }

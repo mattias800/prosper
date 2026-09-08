@@ -50,6 +50,13 @@ bool tile64_word_equation(uint32_t tile_mode, uint32_t bytes_per_texel,
                           std::array<uint32_t, 16>& equation,
                           uint32_t& block_width, uint32_t& block_height);
 
+// Standard 3D word tiling: each equation packs x/y/z masks in successive bytes.
+// Only 4/8/16-byte texels have independently writable 32-bit output words.
+bool tile_volume_word_equation(uint32_t tile_mode, uint32_t bytes_per_texel,
+                               std::array<uint32_t, 16>& equation,
+                               uint32_t& block_width, uint32_t& block_height,
+                               uint32_t& block_depth, uint32_t& block_bits);
+
 // libSceVideoOut's own two-value tiling enum, as passed to sceVideoOutSetBufferAttribute(2) and
 // recorded with each registered display buffer. It is NOT a GFX10 swizzle index: it only says
 // whether the scanout surface is stored in the hardware's render-target layout or row-major.

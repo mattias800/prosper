@@ -3321,7 +3321,16 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   add_test(NAME gpu_retile_mapping_loss COMMAND test_gpu_retile --map-loss)
   add_test(NAME gpu_retile_allocation_fallback COMMAND test_gpu_retile --alloc-oom)
   add_test(NAME gpu_retile_mapping_fallback COMMAND test_gpu_retile --map-oom)
-  set_tests_properties(gpu_retile_cpu PROPERTIES ENVIRONMENT "PROSPER_NO_GPU_RETILE=1")
+  add_test(NAME gpu_retile_mixed COMMAND test_gpu_retile --mixed)
+  add_test(NAME gpu_retile_volume COMMAND test_gpu_retile --volume)
+  add_test(NAME gpu_retile_volume_cpu COMMAND test_gpu_retile --volume-cpu)
+  add_test(NAME gpu_retile_volume_allocation_fallback COMMAND test_gpu_retile --volume-alloc-oom)
+  add_test(NAME gpu_retile_volume_mapping_loss COMMAND test_gpu_retile --volume-map-loss)
+  set_tests_properties(gpu_retile_mixed gpu_retile_volume gpu_retile_volume_cpu
+                       gpu_retile_volume_allocation_fallback gpu_retile_volume_mapping_loss
+                       PROPERTIES TIMEOUT 120)
+  set_tests_properties(gpu_retile_cpu gpu_retile_volume_cpu
+                       PROPERTIES ENVIRONMENT "PROSPER_NO_GPU_RETILE=1")
   add_executable(test_gpu_detile_render tests/gpu/execute/test_gpu_detile_render.cpp)
   target_include_directories(test_gpu_detile_render PRIVATE tests frontends)
   target_link_libraries(test_gpu_detile_render PRIVATE prosper_live_renderer Vulkan::Vulkan)

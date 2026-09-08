@@ -2067,3 +2067,14 @@ temporal window around the Plucky title/gameplay transition. It must include the
 48x48 volumes and close with zero unresolved leaves, providing a native pixel oracle as well as exact compute
 pipeline contracts. Keep the exact-byte and disable-switch A/B discipline used here, and preserve
 screenshot/capture correctness while reducing the synchronous boundaries.
+
+
+### Ruled out: reusable CPU comparison workers (2026-09-08)
+
+A bounded reusable-worker candidate for `parallel_compute_texels` was implemented and rejected
+under #3407. The production-backend fixture's 63.75 MiB equal-result comparisons became slower
+with both four and eight reused workers across three fresh-process repetitions; smaller comparisons
+were mixed and did not establish an enclosing `execute_item` gain. The candidate was discarded.
+This rejects that implementation on the measured workload, not all worker-pool designs or the
+possibility that thread creation costs matter. Retained commands, source identities and measurements
+are in #3407; no game speedup is claimed from this experiment.
