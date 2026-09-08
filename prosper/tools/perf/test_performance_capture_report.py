@@ -410,6 +410,7 @@ BROKEN_DISPATCH_COMPUTE = [{
     "gpu_device_ms": 0.0, "gpu_timestamp_samples": 0,
 }]
 
+
 class ComputeDecompositionTests(unittest.TestCase):
     def _render(self, compute):
         summary = summarize(capture(SAMPLES, compute=compute))
@@ -545,10 +546,18 @@ class ComputeDecompositionTests(unittest.TestCase):
                        if line.strip().startswith("CPU phases of"))
         self.assertIn("pipeline=-10.0ms", summary)
         self.assertIn("pipeline=-10.0ms", self._group_line(text))
-        # And with it visible, the printed shares add up to the whole rather than to 183%.
-        shares = [float(part.rsplit("(", 1)[1].removesuffix("%)"))
-                  for part in summary.split() if part.endswith("%)")]
-        self.assertAlmostEqual(sum(shares), 100.0, places=1)
+        # And with it visible, the printed parts account for the whole rather than 183% of it.
+        #
+        # Summed in MILLISECONDS, not in the rendered percentages. Percentages are each rounded
+        # to one decimal before being printed, so their sum lands on 100.0 only when the errors
+        # happen to cancel: this fixture does (its suppressed phases are exactly 0.0 and its
+        # +/-0.033 errors are equal and opposite), while HIDDEN_COST_COMPUTE sums to 99.9 with
+        # nothing suppressed at all. A tolerance wide enough for both would no longer detect the
+        # 183% this arm exists to catch, so the check is done on the underlying values, as
+        # test_group_line_cpu_fields_account_for_its_own_total already does.
+        values = [float(part.split("=")[1].split("ms")[0])
+                  for part in summary.split() if "=" in part and "ms" in part]
+        self.assertAlmostEqual(sum(values), 12.0, places=3)
 
     def test_absent_gpu_timestamps_do_not_invent_a_bracket_table(self):
         from performance_capture_report import COMPUTE_GPU_BRACKETS

@@ -694,6 +694,11 @@ def print_summary(summary):
             cpu_parts.append(f"unattributed={unattributed:.1f}ms")
         gpu_parts = []
         for field in COMPUTE_GPU_BRACKETS:
+            # One-sided deliberately, unlike the CPU loop above. These are masked differences of
+            # GPU tick counters, so an out-of-order pair does not go negative -- it WRAPS to an
+            # enormous positive, which this threshold cannot hide and abs() would not help with.
+            # The summary table's shared abs() makes such a value loud instead: an injected
+            # storage-copy of 500ms against a 65ms device prints 769.2% with a -684.6% remainder.
             if group.get(field, 0.0) >= 0.05:
                 gpu_parts.append(f"{PHASE_LABELS[field]}={group[field]:.1f}ms")
         sections = []
