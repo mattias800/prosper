@@ -631,9 +631,8 @@ def _print_compute_phases(summary):
                  if abs(unattributed) >= 0.05 else None)
         _print_phase_line(f"GPU brackets of {device:.1f}ms device", gpu, device, extra)
         shader = gpu.get("gpu_shader_ms", 0.0)
-        if device > 0 and shader >= 0.0:
-            print(f"    the guest's own compute shader is {100.0 * shader / device:.1f}% of the "
-                  f"device time prosper spends running it")
+        print(f"    the guest's own compute shader is {100.0 * shader / device:.1f}% of the "
+              f"device time prosper spends running it")
 
 
 def _fmt_rate(value):
@@ -670,21 +669,33 @@ def print_summary(summary):
         addresses = ",".join(group["addresses"])
         if group["address_count"] > len(group["addresses"]):
             addresses += f",+{group['address_count'] - len(group['addresses'])}"
-        parts = []
+        # Two scopes on one line, so they are LABELLED and the nesting is stated. Printed flat,
+        # these numbers invite being added up: the CPU phases partition total, the GPU brackets
+        # partition dev, and dev is itself inside wait -- so a flat list of eleven fields sums to
+        # well over the total on the same line and reads as an arithmetic error in the tool.
+        cpu_parts = []
         for field in COMPUTE_CPU_PHASES:
             if group.get(field, 0.0) >= 0.05:
-                parts.append(f"{PHASE_LABELS[field]}={group[field]:.1f}ms")
+                cpu_parts.append(f"{PHASE_LABELS[field]}={group[field]:.1f}ms")
         # Name the remainder instead of leaving it to subtraction: an unmeasured cost hides here.
+        # Signed, and printed on either side of zero, matching the convention this file uses for
+        # every other remainder -- a negative one is a real producer state, not a rounding artifact.
         cpu_attributed = sum(group.get(field, 0.0) for field in COMPUTE_CPU_PHASES)
         unattributed = group.get("total_ms", 0.0) - cpu_attributed
-        if unattributed >= 0.05:
-            parts.append(f"unattributed={unattributed:.1f}ms")
-        if group.get("gpu_device_ms", 0.0) >= 0.05:
-            parts.append(f"dev={group['gpu_device_ms']:.1f}ms")
+        if abs(unattributed) >= 0.05:
+            cpu_parts.append(f"unattributed={unattributed:.1f}ms")
+        gpu_parts = []
         for field in COMPUTE_GPU_BRACKETS:
             if group.get(field, 0.0) >= 0.05:
-                parts.append(f"{PHASE_LABELS[field]}={group[field]:.1f}ms")
-        breakdown_str = f" ({' '.join(parts)})" if parts else ""
+                gpu_parts.append(f"{PHASE_LABELS[field]}={group[field]:.1f}ms")
+        sections = []
+        if cpu_parts:
+            sections.append("cpu " + " ".join(cpu_parts))
+        device_ms = group.get("gpu_device_ms", 0.0)
+        if device_ms >= 0.05:
+            inside = f" of which {' '.join(gpu_parts)}" if gpu_parts else ""
+            sections.append(f"gpu dev={device_ms:.1f}ms (inside wait){inside}")
+        breakdown_str = f" [{' | '.join(sections)}]" if sections else ""
         print(f"  {group['program_hash']} records={group['records']} "
               f"dispatches={group['dispatches']} total={group['total_ms']:.1f} ms "
               f"mean={group['mean_ms']:.2f} ms max={group['max_ms']:.2f} ms{breakdown_str} "

@@ -405,6 +405,19 @@ class ComputeDecompositionTests(unittest.TestCase):
             print_summary(summary)
         return summary, buffer.getvalue()
 
+    def _group_line(self, text):
+        """The per-program line alone.
+
+        Every assertion about the group breakdown must run against THIS, not against the whole
+        report: the summary table prints the same field names, so a substring match on the full
+        text is satisfied by the summary and never reaches the group line. That is why reverting
+        the entire group-line change once left this suite green.
+        """
+        lines = [line for line in text.splitlines() if line.strip().startswith("0x")
+                 and "records=" in line]
+        self.assertEqual(len(lines), 1, f"expected exactly one group line in:\n{text}")
+        return lines[0]
+
     def test_every_captured_timer_is_reported(self):
         # Fails on the old report, which printed setup/writeback/wait/dev/shader and dropped the
         # rest -- including the two that hold 92% of this dispatch.
@@ -442,6 +455,40 @@ class ComputeDecompositionTests(unittest.TestCase):
         # The headline this whole change exists to surface.
         _, text = self._render(HIDDEN_COST_COMPUTE)
         self.assertIn("compute shader is 6.2% of the device time", text)
+
+    def test_group_line_carries_the_dropped_timers(self):
+        # Asserted on the group line ALONE. The old report printed five fields here and the
+        # two holding 92% of this dispatch were absent; a whole-text match cannot see that,
+        # because the summary table above prints the same names.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        line = self._group_line(text)
+        self.assertIn("pipeline=220.0ms", line)
+        self.assertIn("storage-copy=55.0ms", line)
+        self.assertIn("cleanup=1.0ms", line)
+        self.assertIn("unattributed=4.0ms", line)
+
+    def test_group_line_separates_the_two_scopes(self):
+        # Printed flat, the eleven fields sum to 430ms against the 300ms total on the same line,
+        # because the GPU brackets are inside dev which is inside wait. The line must say so
+        # rather than leaving a reader to add them up and conclude the tool cannot count.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        line = self._group_line(text)
+        self.assertIn("cpu ", line)
+        self.assertIn("gpu dev=65.0ms (inside wait)", line)
+        self.assertIn("of which", line)
+        cpu_section = line.split("[", 1)[1].split(" | ", 1)[0]
+        self.assertNotIn("storage-copy", cpu_section)
+        self.assertNotIn("dev=", cpu_section)
+
+    def test_group_line_cpu_fields_account_for_its_own_total(self):
+        # The invariant the labelling exists to protect: the cpu section, remainder included,
+        # sums to the total printed on the same line.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        line = self._group_line(text)
+        cpu_section = line.split("[", 1)[1].split(" | ", 1)[0]
+        values = [float(part.split("=")[1].removesuffix("ms"))
+                  for part in cpu_section.split() if "=" in part]
+        self.assertAlmostEqual(sum(values), 300.0, places=1)
 
     def test_absent_gpu_timestamps_do_not_invent_a_bracket_table(self):
         from performance_capture_report import COMPUTE_GPU_BRACKETS
