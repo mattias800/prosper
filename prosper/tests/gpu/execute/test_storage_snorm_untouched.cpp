@@ -62,6 +62,8 @@ int main(int argc, char** argv) {
     const uint32_t stored = minimum + 1; // Explicit imageStore(-1) uses -32767 / -127.
     std::vector<uint8_t> guest(texels * bytes);
     std::vector<uint32_t> mask(width), expected(texels), observed(texels, 0xccccccccu);
+    constexpr uint32_t unused_sentinel = 0x96a53cf0u;
+    std::vector<uint32_t> unused(texels, unused_sentinel);
     ShaderResource image{};
     image.cls = ResourceClass::StorageImage;
     image.binding = 5;
@@ -77,6 +79,11 @@ int main(int argc, char** argv) {
     image.linear_row_pitch_bytes = width * bytes;
     ShaderResourceTable producer_table;
     producer_table.resources = {buffer(mask.data(), mask.size() * 4), image};
+    // Binding 6 is absent from the original module, but occupied in its resource
+    // table. Injected instrumentation must not reuse max-reflected-binding + 1.
+    auto unused_resource = buffer(unused.data(), unused.size() * 4);
+    unused_resource.binding = 6;
+    producer_table.resources.push_back(unused_resource);
     std::vector<uint32_t> writer{
         0x7e080300u,             // v4 = local X
         0xe0302000u, 0x80000804u, // v8 = mask[X]
@@ -122,6 +129,9 @@ int main(int argc, char** argv) {
             expected[i] = mask[i % width] ? stored : minimum;
         }
         check(prosper::frontend::execute_live_compute_items({producer}), "SNORM producer executes");
+        check(std::all_of(unused.begin(), unused.end(),
+                          [](uint32_t value) { return value == unused_sentinel; }),
+              "injected write mask never touches an occupied unreferenced resource binding");
         std::fill(observed.begin(), observed.end(), 0xccccccccu);
         check(prosper::frontend::execute_live_compute_items({consumer}), "UINT GPU reader executes");
         bool guest_ok = true;
