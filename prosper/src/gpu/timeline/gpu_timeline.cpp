@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,8 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <optional>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -2111,12 +2114,28 @@ uint64_t capture_max_submits() {
 // Capture ONE complete displayed frame — every submit between two presents — on demand, so the produced
 // .prgbundle replays faithfully (the producer submits re-run and regenerate renderer-owned RTTs a single
 // .prgcap leaves black). State machine: F9 arms `armed_path`; the NEXT present promotes it to a fresh
-// capturing frame; each submit appends; the following present writes the bundle and disarms. The hot
+// capturing frame; each submit appends; the following present queues owned writing and disarms. The hot
 // per-submit/per-present hooks are guarded by g_interactive_frame_active (one atomic load) so normal
 // play pays nothing until F9 is pressed.
 namespace {
+std::atomic<bool> g_interactive_frame_active{false}; // armed OR collecting guest state
 struct InteractiveFrameBundle {
+    struct WriteJob {
+        GpuCaptureBundle bundle;
+        InteractiveGrabOutcome outcome;
+        std::function<void()> hook;
+    };
     std::mutex mx;
+    std::mutex shutdown_mx;
+    std::condition_variable wake;
+    std::thread writer;
+    std::optional<WriteJob> job;
+    std::function<void()> writer_hook;
+    bool writing = false;
+    bool stopping = false;
+    ~InteractiveFrameBundle() { shutdown(); }
+    void run_writer();
+    void shutdown();
     std::string armed_path;      // set by F9; the next present begins the window
     uint32_t arm_delay_presents = 0; // optional complete presents to skip before that boundary
     std::string current_path;    // path for the window currently being captured
@@ -2129,9 +2148,7 @@ struct InteractiveFrameBundle {
     std::string pending_failure_error;
     // Outcome of the last completed grab, awaiting collection by the frontend (#1587).
     bool outcome_pending = false;
-    bool outcome_ok = false;
-    std::string outcome_path;
-    std::string outcome_error;
+    InteractiveGrabOutcome outcome;
     uint32_t frames_wanted = 1;  // one frame suffices: the capture seeds the sampled renderer-owned RTTs
                                  // with their live pixels (#1291), so a deferred/temporal-AA frame replays
                                  // faithfully from a single submit — no need to re-run producers across a
@@ -2142,7 +2159,6 @@ struct InteractiveFrameBundle {
     GpuCaptureBundle bundle;
 };
 InteractiveFrameBundle& interactive_frame_bundle() { static InteractiveFrameBundle b; return b; }
-std::atomic<bool> g_interactive_frame_active{false};   // armed OR capturing
 // Latched, never cleared. `g_interactive_frame_active` goes back to false when a window closes, so
 // it cannot answer "did anything ever arm?" — which is exactly the question the exit report needs in
 // order to say that PROSPER_CAPTURE_BUNDLE was set and nothing ever used it (#2565).
@@ -2167,32 +2183,105 @@ bool append_capture_to_frame_bundle(GpuCaptureBundle& bundle, const GpuCaptureFi
 }
 }  // namespace
 
-std::string request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
-                                               uint32_t delay_presents) {
+InteractiveGrabRequest request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
+                                                          uint32_t delay_presents) {
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
-    // An arm that has not been promoted yet is REPLACED here, and a replaced capture never runs and
-    // never reports an outcome. Report it to the caller under this lock — asking beforehand would
-    // race the render thread promoting it, and the answer would be wrong exactly when it mattered.
-    //
-    // `path` must not alias b.armed_path, or it would be read after being moved from — the classic
-    // way this pattern breaks. It cannot: InteractiveFrameBundle is file-static with no accessor, so
-    // every caller passes its own storage.
+    if (b.stopping) return {false, {}, "capture writer is shutting down"};
+    if (b.capturing || b.writing || b.outcome_pending)
+        return {false, {}, "previous capture is collecting, writing, or awaiting its result"};
+    if (path.empty()) return {false, {}, "capture path is empty"};
+    // Start before admitting any guest collection. Failure leaves the previous unstarted arm intact.
+    if (!b.writer.joinable()) {
+        try { b.writer = std::thread([&b] { b.run_writer(); }); }
+        catch (const std::exception& error) { return {false, {}, error.what()}; }
+    }
     std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
     b.arm_delay_presents = delay_presents;
     if (max_mb)
         b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(
-                                 max_mb, kInteractiveBundleMinMb, kInteractiveBundleMaxMb))
-                             << 20;
-    // Strict, and it says what it did (#2565). An unparseable value used to become 0 and then be
-    // clamped straight back to the 1-present default, which is precisely the width the empty-window
-    // message tells the operator to widen — so a mistyped remedy reproduced the original failure and
-    // read as the remedy not working. The value in force is unchanged; the silence is not.
+                                 max_mb, kInteractiveBundleMinMb, kInteractiveBundleMaxMb)) << 20;
     if (std::getenv("PROSPER_CAPTURE_FRAMES")) b.frames_wanted = resolve_capture_frames();
     g_interactive_frame_active.store(true, std::memory_order_release);
     g_interactive_capture_ever_armed.store(true, std::memory_order_release);
-    return replaced;
+    return {true, std::move(replaced), {}};
+}
+
+void InteractiveFrameBundle::run_writer() {
+    for (;;) {
+        WriteJob work;
+        {
+            std::unique_lock lock(mx);
+            wake.wait(lock, [&] { return job.has_value() || stopping; });
+            if (!job) return;
+            work = std::move(*job);
+            job.reset();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const size_t submits = work.bundle.submits.size();
+        try {
+            if (work.hook) work.hook();
+            if (work.outcome.error.empty())
+                work.outcome.ok = write_gpu_capture_bundle(
+                    work.outcome.bundle_path, work.bundle, work.outcome.error);
+        } catch (const std::exception& error) {
+            work.outcome.ok = false;
+            work.outcome.error = error.what();
+        } catch (...) {
+            work.outcome.ok = false;
+            work.outcome.error = "unexpected capture writer exception";
+        }
+        // Free the potentially gigabyte-sized payload here, before opening admission again.
+        work.bundle = {};
+        if (work.outcome.ok)
+            std::fprintf(stderr, "[grab] frame-bundle written (%zu submits) -> %s\n",
+                         submits, work.outcome.bundle_path.c_str());
+        else
+            std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n",
+                         work.outcome.error.c_str());
+        std::fprintf(stderr, "[grab] frame-bundle owned writer finished in %.3f ms\n",
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start).count());
+        {
+            std::lock_guard lock(mx);
+            outcome = std::move(work.outcome);
+            outcome_pending = true;
+            writing = false;
+        }
+    }
+}
+
+void InteractiveFrameBundle::shutdown() {
+    // Serializes joiners without holding the state mutex while the writer publishes its result.
+    std::lock_guard shutdown_lock(shutdown_mx);
+    {
+        std::lock_guard lock(mx);
+        stopping = true;
+        if (capturing || !armed_path.empty()) {
+            WriteJob cancelled;
+            cancelled.bundle = std::move(bundle);
+            cancelled.outcome.bundle_path = capturing ? current_path : armed_path;
+            cancelled.outcome.max_unique_bytes = max_unique_bytes;
+            cancelled.outcome.error = "capture window cancelled at shutdown";
+            job = std::move(cancelled);
+            writing = true;
+            capturing = false;
+            armed_path.clear(); current_path.clear();
+        }
+        g_interactive_frame_active.store(false, std::memory_order_release);
+        wake.notify_one();
+    }
+    if (writer.joinable()) writer.join();
+}
+
+void shutdown_interactive_capture_bundle() { interactive_frame_bundle().shutdown(); }
+bool set_interactive_bundle_writer_hook_for_test(std::function<void()> hook) {
+    auto& b = interactive_frame_bundle();
+    std::lock_guard lock(b.mx);
+    if (b.capturing || b.writing || !b.armed_path.empty() || b.stopping) return false;
+    b.writer_hook = std::move(hook);
+    return true;
 }
 bool interactive_capture_bundle_active() {
     return g_interactive_frame_active.load(std::memory_order_acquire);
@@ -2383,7 +2472,12 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
     // The marker is a phase gate, not a frame oracle. Skip exactly one completed present so the
     // transition boundary cannot be mistaken for the scene it announced, then use the established
     // F9 whole-frame path to retain every submit and persistent RTT/DS boundary seed.
-    const std::string replaced = request_interactive_capture_bundle(state.path, state.max_mb, 1);
+    const auto request = request_interactive_capture_bundle(state.path, state.max_mb, 1);
+    if (!request.accepted) {
+        std::fprintf(stderr, "[grab] guest-log capture rejected: %s\n", request.error.c_str());
+        return;
+    }
+    const auto& replaced = request.replaced_path;
     std::string source_names;
     constexpr const char* names[] = {
         "unknown", "printf", "puts", "putchar", "fputs", "fwrite", "write",
@@ -2764,8 +2858,12 @@ void capture_bundle_trigger_file_on_present(uint64_t present_count) {
     if (state.fired.exchange(true, std::memory_order_acq_rel)) return;
     g_automatic_capture_gate_fired[kGateTriggerFile].store(true, std::memory_order_release);
 
-    const std::string replaced =
-        request_interactive_capture_bundle(state.bundle_path, state.max_mb);
+    const auto request = request_interactive_capture_bundle(state.bundle_path, state.max_mb);
+    if (!request.accepted) {
+        std::fprintf(stderr, "[grab] trigger-file capture rejected: %s\n", request.error.c_str());
+        return;
+    }
+    const auto& replaced = request.replaced_path;
     std::fprintf(stderr,
                  "[grab] trigger file observed at present %llu; whole-frame capture armed; "
                  "trigger path %s; target path %s\n",
@@ -2953,12 +3051,10 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     b.submits = append.submits_appended;
 }
 
-// Called per present (flip): starts the frame on the first present after F9, writes it on the next.
+// Called per present: opens the window, then transfers its owned payload to the writer at closure.
 void interactive_frame_bundle_on_present() {
     if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
     InteractiveFrameBundle& b = interactive_frame_bundle();
-    std::string write_path;
-    GpuCaptureBundle write_bundle;
     {
         std::lock_guard<std::mutex> lk(b.mx);
         if (b.capturing) {
@@ -2995,13 +3091,15 @@ void interactive_frame_bundle_on_present() {
                 (!wait_for_submits || b.submits > 0 ||
                  b.frames_seen >= kNoSubmitPresentCeiling);
             if (b.failed || window_complete) {   // window complete (or aborted)
-                if (!b.failed && b.submits > 0) { write_path = b.current_path; write_bundle = std::move(b.bundle); }
-                else if (b.failed) {
+                InteractiveFrameBundle::WriteJob work;
+                work.outcome.bundle_path = b.current_path;
+                work.outcome.max_unique_bytes = b.max_unique_bytes;
+                work.hook = b.writer_hook;
+                if (b.failed) {
                     std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
-                    b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
-                    b.outcome_error = b.pending_failure_error.empty() ? std::string("grab aborted")
+                    work.outcome.error = b.pending_failure_error.empty() ? std::string("grab aborted")
                                                                      : b.pending_failure_error;
-                } else {
+                } else if (!b.submits) {
                     // Names no key: this path is reached by the scheduled triggers too (#2233), where there is
                     // no operator. It also points at the actual fix rather than at a repeat -- a
                     // single-present window on a title that presents faster than it submits catches
@@ -3021,10 +3119,13 @@ void interactive_frame_bundle_on_present() {
                                      std::chrono::steady_clock::now().time_since_epoch()).count() -
                                      g_grab_window_open_ms),
                                  b.frames_seen);
-                    b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
-                    b.outcome_error = "the capture window contained no GPU submits";
+                    work.outcome.error = "the capture window contained no GPU submits";
                 }
-                b.capturing = false; b.current_path.clear(); b.bundle = GpuCaptureBundle{};
+                work.bundle = std::move(b.bundle);
+                b.job = std::move(work);
+                b.writing = true;
+                b.wake.notify_one();
+                b.capturing = false; b.current_path.clear();
                 b.submits = 0; b.frames_seen = 0; b.failed = false;
                 b.pending_failure_error.clear();
                 if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
@@ -3046,33 +3147,14 @@ void interactive_frame_bundle_on_present() {
                          b.frames_wanted, b.current_path.c_str());
         }
     }
-    if (!write_path.empty()) {
-        std::string error;
-        const size_t n = write_bundle.submits.size();
-        const bool written = write_gpu_capture_bundle(write_path, write_bundle, error);
-        if (written)
-            // Path LAST. This line reports a file that now exists, so it may carry an arrow — but
-            // anything after the path turns the documented read into a path that does not exist.
-            std::fprintf(stderr, "[grab] frame-bundle written (%zu submits) -> %s\n", n, write_path.c_str());
-        else
-            std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", error.c_str());
-        InteractiveFrameBundle& b = interactive_frame_bundle();
-        std::lock_guard<std::mutex> lk(b.mx);
-        b.outcome_pending = true; b.outcome_ok = written; b.outcome_path = write_path;
-        b.outcome_error = written ? std::string() : error;
-    }
 }
 
 bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
     if (!b.outcome_pending) return false;
-    out.ok = b.outcome_ok;
-    out.bundle_path = b.outcome_path;
-    out.error = b.outcome_error;
-    out.max_unique_bytes = b.max_unique_bytes;
-    b.outcome_pending = false; b.outcome_ok = false;
-    b.outcome_path.clear(); b.outcome_error.clear();
+    out = std::move(b.outcome);
+    b.outcome_pending = false;
     return true;
 }
 
@@ -3719,15 +3801,19 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
     if (scheduled.valid && present_count >= scheduled.present &&
         !scheduled_fired.exchange(true, std::memory_order_acq_rel)) {
         g_automatic_capture_gate_fired[kGateAtPresent].store(true, std::memory_order_release);
-        const std::string replaced =
-            request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
-        std::fprintf(stderr,
-                     "[grab] scheduled whole-frame capture armed at present %llu; target path %s\n",
-                     static_cast<unsigned long long>(present_count), scheduled.path.c_str());
-        if (!replaced.empty())
+        const auto request = request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
+        if (!request.accepted)
+            std::fprintf(stderr, "[grab] scheduled capture rejected: %s\n", request.error.c_str());
+        else {
+            const auto& replaced = request.replaced_path;
             std::fprintf(stderr,
-                         "[grab] this arm replaced an armed capture that had not started; it will "
-                         "never report: %s\n", replaced.c_str());
+                         "[grab] scheduled whole-frame capture armed at present %llu; target path %s\n",
+                         static_cast<unsigned long long>(present_count), scheduled.path.c_str());
+            if (!replaced.empty())
+                std::fprintf(stderr,
+                             "[grab] this arm replaced an armed capture that had not started; it will "
+                             "never report: %s\n", replaced.c_str());
+        }
     }
     interactive_frame_bundle_on_present();
     static const bool requested = [] {

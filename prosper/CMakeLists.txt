@@ -2177,6 +2177,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
   add_test(NAME gpu_capture_bundle_roundtrip COMMAND test_gpu_capture_bundle)
 
+  add_executable(test_interactive_capture_writer tests/gpu/capture/test_interactive_capture_writer.cpp)
+  target_include_directories(test_interactive_capture_writer PRIVATE tests)
+  target_link_libraries(test_interactive_capture_writer PRIVATE prosper_core)
+  add_test(NAME interactive_capture_writer COMMAND test_interactive_capture_writer)
+  add_test(NAME interactive_capture_writer_shutdown_collecting COMMAND test_interactive_capture_writer shutdown)
+  set_tests_properties(interactive_capture_writer interactive_capture_writer_shutdown_collecting
+                       PROPERTIES TIMEOUT 30)
+
   # Framerate must count DISTINCT guest frames, not publications: the renderer re-serves its retained
   # frame through the ordinary publish path, so a present-counting fps reads full speed for a frozen
   # title (#2783 / instrument trap 90). Pure -- no Vulkan, no dump.

@@ -1,3 +1,4 @@
+#include "fixtures/interactive_capture_wait.h"
 // Externally triggered headless whole-frame capture. Pure/offline: no guest or Vulkan device.
 #include "gpu/capture/gpu_capture_bundle.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
@@ -133,6 +134,9 @@ int main(int argc, char** argv) {
     record_gpu_timeline_submit(state, 91);
     record_gpu_timeline_present(4, 0, 0, 4, 4);
 
+    InteractiveGrabOutcome completed;
+    CHECK(wait_for_interactive_grab(completed) && completed.ok,
+          "background bundle installation completes before reading its bytes");
     GpuCaptureBundle bundle;
     std::string error;
     CHECK(read_gpu_capture_bundle(bundle_path.string(), bundle, error),

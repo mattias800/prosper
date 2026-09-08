@@ -1790,11 +1790,92 @@ int main(int argc, char** argv) {
         suffix = 0;
         return false;
     };
+    // Shared result reporting for the app loop and the explicit shutdown drain.
+    auto reportGrabOutcome = [&] {
+        prosper::gpu::InteractiveGrabOutcome grab;
+        if (prosper::gpu::take_interactive_grab_outcome(grab)) {
+            unsigned bundleSuffix = 0;
+            // Not every outcome is a frame grab's: the same channel reports the env-driven
+            // captures, whose path this frontend never created.
+            const bool reservedHere = take_bundle_reservation(grab.bundle_path, bundleSuffix);
+            if (grab.ok) {
+                // The file exists now, so this line may name it.
+                std::fprintf(stderr, "%s\n",
+                             prosper::frontend::frame_grab_write_line(
+                                 "bundle", grab.bundle_path, bundleSuffix).c_str());
+                grabNotice = "F9: captured " +
+                    std::filesystem::path(grab.bundle_path).filename().string();
+            } else {
+                // What became of the output path. Every branch reports the state it actually
+                // found, and NOTHING is deleted unless this frontend created it: a capture
+                // configured through PROSPER_CAPTURE_BUNDLE* arrives on this same channel with a
+                // path prosper never reserved, and a zero-byte file sitting at such a path
+                // belongs to whoever put it there.
+                std::string state;
+                if (grab.bundle_path.empty()) {
+                    state = "no output path was recorded for it";
+                } else if (!reservedHere) {
+                    state = "this path was configured, not reserved by a frame grab: nothing was "
+                            "written to it and nothing was removed";
+                } else {
+                    std::error_code ec;
+                    const bool present = std::filesystem::exists(grab.bundle_path, ec);
+                    if (ec) {
+                        // "I could not tell" is not "gone" — an unreadable parent directory
+                        // lands here, and naming the wrong cause is what this logging avoids.
+                        state = "its reserved file could not be checked: " + ec.message();
+                    } else if (!present) {
+                        state = "its reserved file is already gone";
+                    } else {
+                        const uintmax_t bytes = std::filesystem::file_size(grab.bundle_path, ec);
+                        if (ec) {
+                            state = "its reserved file could not be examined: " + ec.message();
+                        } else if (bytes != 0) {
+                            // Cannot happen on this path today; if it ever does, the file has real
+                            // content and is not ours to delete.
+                            state = "its reserved file holds " + std::to_string(bytes) +
+                                    " bytes and was left alone";
+                        } else {
+                            // Leaving a zero-byte .prgbundle after saying none was written would
+                            // be the same class of untrue statement this logging exists to avoid.
+                            const bool removed = std::filesystem::remove(grab.bundle_path, ec);
+                            if (removed && !ec) state = "the empty reservation has been removed";
+                            // remove() reports false with NO error when the file was already
+                            // gone — a race with an external deleter. Printing "could not be
+                            // removed: Success" there would assert a failure that did not happen.
+                            else if (!ec)       state = "the empty reservation was already gone";
+                            else                state = "the empty reservation could not be removed: " +
+                                                        ec.message();
+                        }
+                    }
+                }
+                std::fprintf(stderr,
+                    "\n=========================== F9 FRAME GRAB FAILED ===========================\n"
+                    "  %s\n"
+                    "  no bundle content was written; the output path was %s\n"
+                    "  %s\n"
+                    "  %s\n"
+                    "  budget in force: %llu MiB -- raise it with "
+                    "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and re-arm the capture\n"
+                    "============================================================================\n\n",
+                    grab.error.c_str(), grab.bundle_path.c_str(), state.c_str(),
+                    reservedHere
+                        ? "the .bmp screenshot for this press is a separate file with the same stem"
+                        : "this capture was configured, not pressed; it has no screenshot",
+                    static_cast<unsigned long long>(grab.max_unique_bytes >> 20));
+                grabNotice = "F9 GRAB FAILED - see console (raise PROSPER_CAPTURE_BUNDLE_MAX_MB)";
+            }
+            grabNoticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(grab.ok ? 4 : 12);
+            if (win) SDL_SetWindowTitle(win, (title + " - " + grabNotice).c_str());
+        }
+    };
+
     // The F9 frame grab, callable from the hotkey AND from the headless triggers below (#2233).
     // Extracted verbatim so an unattended capture takes exactly the interactive path -- the
     // supersede accounting and the reservation bookkeeping included. A second implementation for
     // automation would mean a second set of rules for who owns a reserved file, and that is the
     // one part of this that has already been hard to get right.
+
     auto arm_frame_grab = [&](bool automatic, const char* why) {
         // Every line this path emits is read by an agent, not an operator. `source` names what armed
         // the capture, so a SCHEDULED grab reports its trigger rather than a keypress nobody made --
@@ -1821,22 +1902,31 @@ int main(int argc, char** argv) {
                 // apart from a result, and this fleet's agents read these logs to find artifacts.
                 // The real paths are logged by the writes, once the files exist. Do not "helpfully"
                 // restore a filename here.
-                std::fprintf(stderr, "%s\n",
-                             prosper::frontend::frame_grab_arm_line(
-                                 grab.index, grabNamer.title_label(), source).c_str());
                 // Honour PROSPER_CAPTURE_BUNDLE_MAX_MB here too (#1587). It was consulted only on
                 // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
                 // no way to raise it without editing code — and one 3840x2160 frame of a deferred
                 // renderer exceeds that, which made F9 unusable on 4K UE titles.
-                // Supersede and EXPLAIN, rather than refuse. A press that lands before the
-                // previous arm was promoted replaces it, and a replaced arm never runs and never
-                // reports — so this frontend is the only thing that can account for the names it
-                // reserved. Refusing the press instead was considered and rejected: the flag that
-                // says "a grab is in flight" is cleared only by a guest PRESENT, so a hung title
-                // would leave F9 dead for the rest of the session — and a hung title is exactly
-                // when someone reaches for F9.
-                const std::string replaced =
+                const auto request =
                     prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
+                if (!request.accepted) {
+                    // These are this request's exclusive reservations, never the previous grab's.
+                    for (const auto& path : {grab.bundle, grab.screenshot}) {
+                        std::error_code ec;
+                        if (std::filesystem::is_regular_file(path, ec) && !ec &&
+                            std::filesystem::file_size(path, ec) == 0 && !ec)
+                            std::filesystem::remove(path, ec);
+                    }
+                    std::fprintf(stderr, "[grab] %s request rejected: %s\n", source,
+                                 request.error.c_str());
+                    grabNotice = "Capture busy: " + request.error;
+                    grabNoticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                    if (win) SDL_SetWindowTitle(win, (title + " - " + grabNotice).c_str());
+                    return;
+                }
+                const auto& replaced = request.replaced_path;
+                std::fprintf(stderr, "%s\n",
+                             prosper::frontend::frame_grab_arm_line(
+                                 grab.index, grabNamer.title_label(), source).c_str());
                 if (!grab.warning.empty())
                     std::fprintf(stderr, "[grab] %s\n", grab.warning.c_str());
                 if (!replaced.empty()) {
@@ -2810,82 +2900,7 @@ int main(int argc, char** argv) {
         // is deliberately non-modal: F9 can be pressed during a routed run, and a message box would
         // block the render loop mid-capture.
         {
-            prosper::gpu::InteractiveGrabOutcome grab;
-            if (prosper::gpu::take_interactive_grab_outcome(grab)) {
-                unsigned bundleSuffix = 0;
-                // Not every outcome is a frame grab's: the same channel reports the env-driven
-                // captures, whose path this frontend never created.
-                const bool reservedHere = take_bundle_reservation(grab.bundle_path, bundleSuffix);
-                if (grab.ok) {
-                    // The file exists now, so this line may name it.
-                    std::fprintf(stderr, "%s\n",
-                                 prosper::frontend::frame_grab_write_line(
-                                     "bundle", grab.bundle_path, bundleSuffix).c_str());
-                    grabNotice = "F9: captured " +
-                        std::filesystem::path(grab.bundle_path).filename().string();
-                } else {
-                    // What became of the output path. Every branch reports the state it actually
-                    // found, and NOTHING is deleted unless this frontend created it: a capture
-                    // configured through PROSPER_CAPTURE_BUNDLE* arrives on this same channel with a
-                    // path prosper never reserved, and a zero-byte file sitting at such a path
-                    // belongs to whoever put it there.
-                    std::string state;
-                    if (grab.bundle_path.empty()) {
-                        state = "no output path was recorded for it";
-                    } else if (!reservedHere) {
-                        state = "this path was configured, not reserved by a frame grab: nothing was "
-                                "written to it and nothing was removed";
-                    } else {
-                        std::error_code ec;
-                        const bool present = std::filesystem::exists(grab.bundle_path, ec);
-                        if (ec) {
-                            // "I could not tell" is not "gone" — an unreadable parent directory
-                            // lands here, and naming the wrong cause is what this logging avoids.
-                            state = "its reserved file could not be checked: " + ec.message();
-                        } else if (!present) {
-                            state = "its reserved file is already gone";
-                        } else {
-                            const uintmax_t bytes = std::filesystem::file_size(grab.bundle_path, ec);
-                            if (ec) {
-                                state = "its reserved file could not be examined: " + ec.message();
-                            } else if (bytes != 0) {
-                                // Cannot happen on this path today; if it ever does, the file has real
-                                // content and is not ours to delete.
-                                state = "its reserved file holds " + std::to_string(bytes) +
-                                        " bytes and was left alone";
-                            } else {
-                                // Leaving a zero-byte .prgbundle after saying none was written would
-                                // be the same class of untrue statement this logging exists to avoid.
-                                const bool removed = std::filesystem::remove(grab.bundle_path, ec);
-                                if (removed && !ec) state = "the empty reservation has been removed";
-                                // remove() reports false with NO error when the file was already
-                                // gone — a race with an external deleter. Printing "could not be
-                                // removed: Success" there would assert a failure that did not happen.
-                                else if (!ec)       state = "the empty reservation was already gone";
-                                else                state = "the empty reservation could not be removed: " +
-                                                            ec.message();
-                            }
-                        }
-                    }
-                    std::fprintf(stderr,
-                        "\n=========================== F9 FRAME GRAB FAILED ===========================\n"
-                        "  %s\n"
-                        "  no bundle content was written; the output path was %s\n"
-                        "  %s\n"
-                        "  %s\n"
-                        "  budget in force: %llu MiB -- raise it with "
-                        "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and re-arm the capture\n"
-                        "============================================================================\n\n",
-                        grab.error.c_str(), grab.bundle_path.c_str(), state.c_str(),
-                        reservedHere
-                            ? "the .bmp screenshot for this press is a separate file with the same stem"
-                            : "this capture was configured, not pressed; it has no screenshot",
-                        static_cast<unsigned long long>(grab.max_unique_bytes >> 20));
-                    grabNotice = "F9 GRAB FAILED - see console (raise PROSPER_CAPTURE_BUNDLE_MAX_MB)";
-                }
-                grabNoticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(grab.ok ? 4 : 12);
-                if (win) SDL_SetWindowTitle(win, (title + " - " + grabNotice).c_str());
-            }
+            reportGrabOutcome();
             if (!grabNotice.empty() && std::chrono::steady_clock::now() >= grabNoticeUntil) {
                 grabNotice.clear();
                 if (win) SDL_SetWindowTitle(win, title.c_str());
@@ -3139,6 +3154,11 @@ int main(int argc, char** argv) {
     // deliberate _Exit, so a registered flush list is the natural home; that is a cross-layer seam
     // which does not exist yet and is deliberately not invented here.
     //
+    // Completed F9 jobs own all their bytes. Drain them before _Exit skips destructors; an
+    // unfinished guest capture is cancelled explicitly rather than written as a complete frame.
+    prosper::gpu::shutdown_interactive_capture_bundle();
+    reportGrabOutcome();
+
     // Unlike its F8 sibling below, this CLOSES rather than cancels. RenderDoc decides for itself
     // whether the span held anything: a span containing real work is written and worth having even
     // though it ended at shutdown rather than on a guest present, and one containing nothing returns

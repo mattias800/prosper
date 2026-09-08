@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include "fixtures/test_scratch.h"
+#include "fixtures/interactive_capture_wait.h"
 
 using namespace prosper::gpu;
 
@@ -261,6 +262,10 @@ int main() {
     record_gpu_timeline_present(3, 0, 0, 1920, 1080);   // end the frame (no submits captured here)
     CHECK(!interactive_capture_bundle_active(),
           "the following present ends the frame and disarms (no re-arm)");
+    InteractiveGrabOutcome first_empty;
+    CHECK(wait_for_interactive_grab(first_empty) && !first_empty.ok &&
+          first_empty.bundle_path.find("prosper_frame_grab_unit.prgbundle") != std::string::npos,
+          "the first empty window reports its own failure before rearming");
     (void)request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit2.prgbundle"));
     CHECK(interactive_capture_bundle_active(), "the grab can be re-armed for another press");
     record_gpu_timeline_present(4, 0, 0, 1920, 1080);
@@ -275,7 +280,7 @@ int main() {
         InteractiveGrabOutcome outcome;
         // Both grabs above ended with an empty window (no submits recorded between the presents).
         // That is a failure the user needs told, not silence.
-        CHECK(take_interactive_grab_outcome(outcome),
+        CHECK(wait_for_interactive_grab(outcome),
               "#1587: a completed grab leaves an outcome for the frontend to report");
         CHECK(!outcome.ok && !outcome.error.empty(),
               "#1587: an empty-window grab reports failure with a reason, not silence");
@@ -298,7 +303,7 @@ int main() {
         record_gpu_timeline_present(6, 0, 0, 3840, 2160);
         record_gpu_timeline_present(7, 0, 0, 3840, 2160);
         InteractiveGrabOutcome budget;
-        CHECK(take_interactive_grab_outcome(budget) && budget.max_unique_bytes == (3072ull << 20),
+        CHECK(wait_for_interactive_grab(budget) && budget.max_unique_bytes == (3072ull << 20),
               "#1587: a requested budget of 3072 MiB is the budget actually in force");
         // And the clamp still holds at the top end.
         (void)request_interactive_capture_bundle(
@@ -306,7 +311,7 @@ int main() {
         record_gpu_timeline_present(8, 0, 0, 3840, 2160);
         record_gpu_timeline_present(9, 0, 0, 3840, 2160);
         InteractiveGrabOutcome clamped;
-        CHECK(take_interactive_grab_outcome(clamped) && clamped.max_unique_bytes == (3072ull << 20),
+        CHECK(wait_for_interactive_grab(clamped) && clamped.max_unique_bytes == (3072ull << 20),
               "#1587: an over-large request clamps to the 3072 MiB ceiling rather than overflowing");
         // Restore the default budget: this state is global, and leaving it at 3072 would silently
         // change the ceiling every later grab in this binary runs under.
@@ -315,7 +320,7 @@ int main() {
         record_gpu_timeline_present(10, 0, 0, 1920, 1080);
         record_gpu_timeline_present(11, 0, 0, 1920, 1080);
         InteractiveGrabOutcome restored;
-        CHECK(take_interactive_grab_outcome(restored) && restored.max_unique_bytes == (2048ull << 20),
+        CHECK(wait_for_interactive_grab(restored) && restored.max_unique_bytes == (2048ull << 20),
               "#1587: the budget is restored to the default for later grabs");
     }
 
@@ -335,6 +340,8 @@ int main() {
     record_gpu_timeline_submit(empty_submit, 77);
     record_gpu_timeline_submit(empty_submit, 78);
     record_gpu_timeline_present(7, 0, 0, 1920, 1080);
+    InteractiveGrabOutcome ok_outcome;
+    CHECK(wait_for_interactive_grab(ok_outcome), "owned DS bundle writer completes");
     GpuCaptureBundle ds_bundle;
     GpuCaptureFile ds_first, ds_second;
     CHECK(ds_snapshots == 1 && read_gpu_capture_bundle(ds_bundle_path.string(), ds_bundle, error) &&
@@ -350,8 +357,7 @@ int main() {
     // would pass the suite. It also restores the consume-once invariant: leaving this grab's outcome
     // uncollected would hand it to whichever later test polls next.
     {
-        InteractiveGrabOutcome ok_outcome;
-        CHECK(take_interactive_grab_outcome(ok_outcome) && ok_outcome.ok &&
+        CHECK(ok_outcome.ok &&
               ok_outcome.error.empty() &&
               ok_outcome.bundle_path == ds_bundle_path.string(),
               "#1587: a grab that writes its bundle publishes ok with no error and the exact path");
