@@ -157,6 +157,15 @@ def unjudgeable(row):
     within a single commit: the record side omitted the unrecorded-device case, so a run mixing a
     device-less row with a good one recorded that row as 0 and then refused to compare against the
     file it had just written. A predicate that decides what counts as evidence belongs in one place.
+
+    ADMISSION RULE, because this body answers two different questions and they only happen to agree.
+    The record side asks "can this row DEFINE truth?"; the compare side asks "can it be MEASURED
+    AGAINST truth?". All three conditions below make a row unusable for BOTH, which is what makes one
+    predicate correct today. A condition that disqualifies a row for only one of them does NOT belong
+    here -- it belongs at that caller, or the two sides silently inherit each other's standards.
+
+    Two contract facts both callers rely on: the returned reason is never falsy when there is one
+    (they test `if why`), and it reads as a fragment following a title id (they format `"%s %s"`).
     """
     if row["exited_early"]:
         return "exited early after %.0fs (rc=%s)" % (row["elapsed"], row["returncode"])

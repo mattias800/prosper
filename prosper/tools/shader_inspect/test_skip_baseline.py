@@ -162,6 +162,22 @@ def main() -> int:
     data, why = skip_survey.baseline_from([row("PPSA13579", 8), row("PPSA02664", 4, device=AMD)])
     check("a baseline REFUSES a run spanning two GPUs", data is None, why)
 
+    # ---- F3: an ORDERING, which a condition-mutation sweep cannot express -------------------------
+    #
+    # Every guard in this file is pinned by neutralising its condition. F3 is not a condition: it is
+    # that the write happens AFTER the refusal check. Hoisting `write_text` above the guard leaves
+    # every condition untouched and the suite green, while restoring the bug where a refused write
+    # clobbers the committed baseline and prints "REFUSING to write". This arm asserts the effect on
+    # disk rather than the control flow, which is the only way to see it.
+    with tempfile.TemporaryDirectory() as tmp:
+        existing = Path(tmp) / "committed.json"
+        existing.write_text('{"device": "PRECIOUS", "titles": {"KEEP": 1}}')
+        before = existing.read_bytes()
+        data, why = skip_survey.write_baseline([row("PPSA13579", 0, frames=0)], existing)
+        check("a refused write returns no data", data is None, why)
+        check("a refused write leaves an existing baseline BYTE-IDENTICAL",
+              existing.read_bytes() == before, existing.read_text())
+
     # ---- round-trip ------------------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "baseline.json"
