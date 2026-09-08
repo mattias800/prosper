@@ -5942,8 +5942,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // re-proves (a hard-coded store bound cannot silently under-cover a bigger extent). What this key
     // does NOT catch is a store whose predicate depends on per-frame INPUT (`if (buffer[gid] > k)
     // store`) that is full on the proving frame but partial later; that residual soundness gap is
-    // tracked in #1127 -- no exercised title shader triggers it, and a shader first seen partial is
-    // cached Partial and always seeds (safe).
+    // tracked in #3467. Program and launch identity below prevent replacement from inheriting a
+    // verdict, but do not prove input independence. A shader first seen partial seeds normally.
     using prosper::frontend::SeedCoverage;
     using prosper::frontend::classify_seed_coverage;
     using prosper::frontend::classify_near_full_coverage;
@@ -5960,13 +5960,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         uint32_t skips = 0;
         uint64_t written_layers = ~0ULL;
         bool near_full = false;
+        uint64_t last_used = 0;
+        // The guest code address can be reused or recompiled with different lowering.
+        // Own the effective module: item storage and pipeline-cache entries can expire.
+        // Exact bytes, rather than a hash alone, authorize reuse of every verdict kind.
+        std::vector<uint32_t> program;
+        uint32_t subgroup_size = 0;
+        uint32_t required_subgroup_size = 0;
+        std::array<uint32_t, 3> groups{};
     };
     // Coverage was observed over the shared image, so its writer membership is part of the proof.
     // Splitting a previously full-coverage alias group can leave the owner only partially written.
     using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
                                        std::vector<uint32_t>>;
     static std::mutex seed_coverage_mu;
-    static std::map<SeedCoverageKey, SeedVerdict> seed_coverage_proof;
+    // A guest address can alternate between compiled representations every frame.
+    // Retain a bounded set so those variants do not force each other to re-prove.
+    constexpr size_t kSeedVariantsPerKey = 4;
+    static std::map<SeedCoverageKey, std::vector<SeedVerdict>> seed_coverage_proof;
+    static uint64_t seed_coverage_clock = 0;
+    const auto matches_seed_program = [&](const SeedVerdict& verdict) {
+        return verdict.program == spirv && verdict.subgroup_size == effective_subgroup &&
+               verdict.required_subgroup_size == item.required_subgroup_size &&
+               verdict.groups == std::array<uint32_t, 3>{
+                   dispatch_groups[0], dispatch_groups[1], dispatch_groups[2]};
+    };
     // PROSPER_SEED_REPROVE=N: re-prove every N fast-skips (default 256; explicit 0 disables = old
     // prove-once). Parsed fail-safe -- garbage/overflow keeps the 256 default rather than silently
     // disabling the safety (see seed_reprove_interval_from_env).
@@ -7290,16 +7308,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     auto it = seed_coverage_proof.find(proof_key);
                     if (it != seed_coverage_proof.end()) {
-                        known = true;
-                        proven_full = it->second.cov == SeedCoverage::Full;
-                        proven_none = it->second.cov == SeedCoverage::None;
-                        bi.written_layers_mask = it->second.written_layers;
-                        // #1127: periodically re-prove a Full, None, or layer-masked/near-full Partial verdict
-                        // so a data-dependent store that later changes coverage is caught (#3328 B1/N2). The helper
-                        // resets the counter, so concurrent dispatches on this key don't all re-prove at once.
-                        if (seed_verdict_reprove_eligible(it->second.cov, it->second.written_layers, it->second.near_full) &&
-                            seed_reprove_due(it->second.skips, kSeedReproveInterval))
-                            reprove_due = true;
+                        auto verdict = std::find_if(it->second.begin(), it->second.end(),
+                                                    matches_seed_program);
+                        if (verdict != it->second.end()) {
+                            verdict->last_used = ++seed_coverage_clock;
+                            known = true;
+                            proven_full = verdict->cov == SeedCoverage::Full;
+                            proven_none = verdict->cov == SeedCoverage::None;
+                            bi.written_layers_mask = verdict->written_layers;
+                            // Reproof counters belong to this exact executable/launch variant.
+                            if (seed_verdict_reprove_eligible(
+                                    verdict->cov, verdict->written_layers, verdict->near_full) &&
+                                seed_reprove_due(verdict->skips, kSeedReproveInterval))
+                                reprove_due = true;
+                        }
                     }
                 }
                 if (force_verify || reprove_due) {
@@ -11028,8 +11050,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 {
                     const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
-                    // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
-                    seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0, written_layers, near_full };
+                    auto& variants = seed_coverage_proof[proof_key];
+                    auto verdict = std::find_if(variants.begin(), variants.end(), matches_seed_program);
+                    if (verdict == variants.end() && variants.size() == kSeedVariantsPerKey)
+                        verdict = std::min_element(variants.begin(), variants.end(),
+                            [](const SeedVerdict& a, const SeedVerdict& b) {
+                                return a.last_used < b.last_used;
+                            });
+                    // Reproof resets this variant's counter. At capacity only the least-recently
+                    // used variant loses its proof; eviction always returns it to Unknown.
+                    SeedVerdict fresh{
+                        cov, 0, written_layers, near_full, ++seed_coverage_clock, spirv,
+                        effective_subgroup, item.required_subgroup_size,
+                        {dispatch_groups[0], dispatch_groups[1], dispatch_groups[2]}};
+                    if (verdict == variants.end()) variants.push_back(std::move(fresh));
+                    else *verdict = std::move(fresh);
                 }
                 if (survived == 0) {
                     std::fprintf(stderr,
