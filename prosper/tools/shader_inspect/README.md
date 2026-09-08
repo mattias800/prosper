@@ -119,19 +119,40 @@ dropped. On *Grand Theft Auto V* that removes most of the world's lighting (#346
 
 ```sh
 shader_inspect <raw-rdna2.bin> --wave-reasons
-wave-reasons required-subgroup-size=64 reasons=0x2 names=wave-any native-wave32-admitted=1
-wave-reasons-end file=... dwords=12 recompiled=1 table_dependent=0 endpgm=1
+wave-reasons required-subgroup-size=64 reasons=0x2 names=wave-any reason-set-admissible=1 \
+    internal-gds=0 subgroup-features=0x1
+wave-reasons gate-undecided=title-allowlist,host-subgroup-size-control,host-subgroup-features ...
+wave-reasons-end file=... input=rdna2 dwords=12 recompiled=1 table_dependent=0 endpgm=1
 ```
 
-`native-wave32-admitted` mirrors the shipping gate in `tests/fixtures/render_runner.h`
-**exactly** -- equality against `kFragmentWaveReasonWaveAny` -- rather than re-deriving what
-ought to be admissible. The census reports the emulator that ships; a proposal about what
-*should* be admitted belongs in the classifier, where a test can hold it.
+### `reason-set-admissible` is NOT `admitted`, and the difference is most of the answer
 
-A module that needs no particular width reports `size=0 reasons=0x0 admitted=0`: it never
-reaches the gate, and counting it as admitted would bury the interesting population under every
-ordinary shader in a dump. A module carrying no reason marker at all reports `reasons=absent`,
-never `0x0` -- absent is not none.
+The renderer's gate is **five conjuncts** (`tests/fixtures/render_runner.h:7128-7133`). The
+reason-set equality at `:7140` -- the one this field mirrors -- is only the innermost. The
+decisive one is `bd.allow_native_fragment_vote_width`, which **defaults false** (`:565`) and is
+set in exactly one place, from `title_id == "PPSA04263"` (`live_renderer.cpp:1216`, assigned
+`:7591`). Its own comment says so: *"Tests, replay and all other titles leave this false."*
+
+**So outside GTA V, every shader requiring more than 32 lanes is dropped regardless of its
+reason set.** An earlier version of this tool called the reason-set test `native-wave32-admitted`
+and was therefore wrong in the one direction that mattered: it under-reported the loss #3464
+exists to size. Its *Blasphemous 2* validation run reported `0 dropped` where the true answer
+was `2` -- and it went unquestioned because it agreed with the expectation.
+
+The two conjuncts a module CAN decide are reported beside it (`internal-gds`,
+`subgroup-features`); the three it cannot are named on their own `gate-undecided=` line, every
+time, so no consumer can read admission into the row by omission. For a per-title verdict use
+`capture_wave_census.py --title`.
+
+A module that needs no particular width reports `size=0 reasons=absent reason-set-admissible=0`.
+`reasons=0x0` is never printed: a module either carries the marker or does not, and `absent` is
+not none. A module that fails to recompile prints **no census row at all** -- only the sentinel,
+with `recompiled=0`.
+
+A SPIR-V input reports `recompiled=n/a` (nothing was recompiled -- the module was read) plus
+`spirv-walk=ok|truncated`. That last field exists because a corrupt module reports `size=0
+reasons=absent`, byte-identical to a genuine wave-free shader, so without it an unreadable dump
+lands in the population that says #3464 does not affect it.
 
 `wave_reason_census.py` tallies the mode over a directory and prints the reason-set histogram
 plus the names of the dropped shaders. It exists because the *runtime* skip log answers this

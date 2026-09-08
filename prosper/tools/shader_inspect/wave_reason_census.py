@@ -4,7 +4,7 @@
 Answers, for a whole title rather than for whatever a route happened to reach: how many fragment
 shaders require the guest Wave64, what they require it for, and how many of those prosper admits
 today at a host native wave32. On any NVIDIA host the entire supported subgroup range is 32..32, so
-every shader this reports as requiring 64 and not admitted is a shader that is DROPPED -- on GTA V
+a shader requiring 64 that the renderer does not admit is DROPPED entirely -- on GTA V
 that is most of the world's lighting (#3464).
 
 Why a whole-database sweep rather than the runtime skip log: the runtime logs once per distinct
@@ -29,19 +29,19 @@ from pathlib import Path
 
 END = re.compile(r"wave-reasons-end .*?recompiled=(\d+) table_dependent=(\d+) endpgm=(\d+)")
 ROW = re.compile(r"wave-reasons required-subgroup-size=(\d+) reasons=(\S+) names=(\S+) "
-                 r"native-wave32-admitted=(\d+)")
+                 r"reason-set-admissible=(\d+)")
 
 
 class Result:
     __slots__ = ("path", "recompiled", "table_dependent", "endpgm",
-                 "size", "reasons", "names", "admitted", "error")
+                 "size", "reasons", "names", "admissible", "error")
 
     def __init__(self, path):
         self.path = path
         self.recompiled = self.table_dependent = self.endpgm = 0
         self.size = 0
         self.reasons = self.names = ""
-        self.admitted = 0
+        self.admissible = 0
         self.error = ""
 
 
@@ -64,7 +64,7 @@ def inspect(binary: str, path: Path) -> Result:
     if row:
         r.size = int(row.group(1))
         r.reasons, r.names = row.group(2), row.group(3)
-        r.admitted = int(row.group(4))
+        r.admissible = int(row.group(4))
     return r
 
 
@@ -77,6 +77,10 @@ def main() -> int:
     ap.add_argument("--csv")
     ap.add_argument("--jobs", type=int, default=16)
     args = ap.parse_args()
+    # Absolute up front: a relative tool path a shell resolves is not necessarily one
+    # CreateProcess resolves on Windows. Caught here by the sentinel check rather than
+    # producing a wrong number, but it still made the documented invocation fail.
+    args.binary = str(Path(args.binary).resolve())
 
     root = Path(args.directory)
     token = "_%s_" % args.stage_token
@@ -92,8 +96,14 @@ def main() -> int:
     unrecompiled = [r for r in results if not r.error and not r.recompiled]
     ok = [r for r in results if not r.error and r.recompiled]
     needs = [r for r in ok if r.size > 32]
-    admitted = [r for r in needs if r.admitted]
-    dropped = [r for r in needs if not r.admitted]
+    # The reason-set test is only the INNERMOST of the renderer's five conjuncts
+    # (render_runner.h:7128-7133). The decisive one, `allow_native_fragment_vote_width`,
+    # defaults false (:565) and comes from `title_id == "PPSA04263"` alone
+    # (live_renderer.cpp:1216), and two more are properties of the HOST. A raw-dump sweep has
+    # neither a title nor a host, so it reports the module property under its own name and
+    # never calls anything admitted -- an earlier version did, and undercounted the loss
+    # #3464 is about for every title but one.
+    admissible = [r for r in needs if r.admissible]
 
     print("files=%d  errors=%d  unrecompiled(no resource table)=%d  analysed=%d"
           % (len(files), len(errors), len(unrecompiled), len(ok)))
@@ -101,17 +111,21 @@ def main() -> int:
         print("\nNOTHING was analysed -- every shader needed a resource table this tool cannot")
         print("supply. No statement about wave width can be made from this run.")
     else:
-        print("of the analysed: require>32=%d  of those admitted at native wave32=%d  DROPPED=%d"
-              % (len(needs), len(admitted), len(dropped)))
+        print("of the analysed: require>32=%d  of those reason-set admissible=%d"
+              % (len(needs), len(admissible)))
+        print("NOTE: admissible is NOT admitted. The renderer also requires the title to be on")
+        print("the native-wave32 allowlist (currently PPSA04263 only) and the host to support")
+        print("the width and features. For a per-title verdict use capture_wave_census.py.")
         by_reason = collections.Counter((r.reasons, r.names) for r in needs)
         if by_reason:
             print("\nreason sets among the %d that require a wide wave:" % len(needs))
             for (mask, names), n in by_reason.most_common():
                 print("  %-8s %-40s %4d" % (mask, names, n))
-        if dropped:
-            print("\nfirst dropped shaders by name:")
-            for r in sorted(dropped, key=lambda r: r.path.name)[:20]:
-                print("  %s  %s" % (r.reasons, r.path.name))
+        if needs:
+            print("\nfirst wide-wave shaders by name:")
+            for r in sorted(needs, key=lambda r: r.path.name)[:20]:
+                print("  %-8s admissible=%d  %s"
+                      % (r.reasons, r.admissible, r.path.name))
     # The caveat repeated at the END too: a reader who scrolls to the bottom for the numbers must
     # meet it there as well as at the top.
     if unrecompiled:
@@ -128,10 +142,10 @@ def main() -> int:
             w = csv.writer(fh)
             w.writerow(["name", "recompiled", "table_dependent", "endpgm",
                         "required_subgroup_size", "reasons", "names",
-                        "native_wave32_admitted", "error"])
+                        "reason_set_admissible", "error"])
             for r in results:
                 w.writerow([r.path.name, r.recompiled, r.table_dependent, r.endpgm,
-                            r.size, r.reasons, r.names, r.admitted, r.error])
+                            r.size, r.reasons, r.names, r.admissible, r.error])
         print("\nwrote %s" % args.csv)
     return 0
 

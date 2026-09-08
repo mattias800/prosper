@@ -150,8 +150,8 @@ def main() -> int:
     # its reason set equals kFragmentWaveReasonWaveAny exactly. A reason set of precisely WaveAny
     # is therefore admitted today, and the census must say so in the same terms, so a count taken
     # over a title's shaders describes the emulator someone actually runs.
-    check("wave-reasons census reports native-wave32 admission",
-          "native-wave32-admitted=1" in out, "\n" + out)
+    check("wave-reasons census reports reason-set admissibility",
+          "reason-set-admissible=1" in out, "\n" + out)
 
     # A shader with no wave op at all must report a real, empty census -- not silence, which a
     # consumer cannot distinguish from a crash.
@@ -166,8 +166,8 @@ def main() -> int:
     # A shader that requires no width at all never reaches the gate, so it is not "admitted" by
     # it. Conflating "needs nothing" with "needs something prosper can supply" would inflate every
     # admission count by the entire population of ordinary shaders.
-    check("a wave-free shader is not counted as gate-admitted",
-          "native-wave32-admitted=0" in out, "\n" + out)
+    check("a wave-free shader is not reason-set admissible",
+          "reason-set-admissible=0" in out, "\n" + out)
 
     # ---- #3464: the census must read a SPIR-V module too ------------------------------------
     #
@@ -199,21 +199,78 @@ def main() -> int:
     check("a SPIR-V module reports its recorded reasons",
           "reasons=0x41" in out and "lane-id" in out and "wave-ballot" in out, "\n" + out)
     # 0x41 is not equal to kFragmentWaveReasonWaveAny, so the shipping gate drops it.
-    check("a SPIR-V module blocked by lane-id is not gate-admitted",
-          "native-wave32-admitted=0" in out, "\n" + out)
+    check("a SPIR-V module blocked by lane-id is not reason-set admissible",
+          "reason-set-admissible=0" in out, "\n" + out)
 
     # WaveAny alone IS admitted, so the column cannot be reading a constant.
     code, out = run(binary, spirv_module(64, 0x2), extra=["--wave-reasons"])
-    check("a wave-any-only SPIR-V module is gate-admitted",
-          "native-wave32-admitted=1" in out, "\n" + out)
+    check("a wave-any-only SPIR-V module is reason-set admissible",
+          "reason-set-admissible=1" in out, "\n" + out)
 
     # No marker at all: absent is not none, and must never be printed as a mask.
     code, out = run(binary, [0x07230203, 0x00010300, 0, 1, 0], extra=["--wave-reasons"])
     check("an unmarked SPIR-V module reports absent, not 0x0",
           "reasons=absent" in out and "reasons=0x0" not in out, "\n" + out)
-    check("an unmarked SPIR-V module is not gate-admitted",
-          "native-wave32-admitted=0" in out, "\n" + out)
+    check("an unmarked SPIR-V module is not reason-set admissible",
+          "reason-set-admissible=0" in out, "\n" + out)
 
+    # ---- #3464 review: the census must not claim ADMISSION it cannot determine -------------
+    #
+    # render_runner.h:7128-7133 is a five-conjunct condition and only the innermost equality
+    # (:7140) is a module property. `bd.allow_native_fragment_vote_width` defaults false
+    # (:565) and is set from `title_id == "PPSA04263"` alone (live_renderer.cpp:1216, :7591),
+    # and two more conjuncts depend on the HOST's subgroup limits. An offline tool knows none
+    # of those, so it must report the reason-set test under its own name and say plainly that
+    # admission needs more -- otherwise every non-GTA-V count reads as admitted when the
+    # renderer in fact drops the shader.
+    code, out = run(binary, spirv_module(64, 0x2), extra=["--wave-reasons"])
+    check("the census states that admission is not decided by the module alone",
+          "gate-undecided=" in out, "\n" + out)
+    check("the census names the title allowlist as an undecided conjunct",
+          "title-allowlist" in out, "\n" + out)
+    check("the census names the host subgroup limits as an undecided conjunct",
+          "host-subgroup" in out, "\n" + out)
+    # The two conjuncts a module CAN decide are reported rather than silently assumed to pass.
+    check("the census reports the internal-GDS conjunct",
+          "internal-gds=" in out, "\n" + out)
+    check("the census reports the required subgroup features",
+          "subgroup-features=0x" in out, "\n" + out)
+
+    # And the old name must be gone: a consumer keying on it would otherwise keep reading an
+    # admission claim that is no longer made.
+    check("the overclaiming field name is gone",
+          "native-wave32-admitted" not in out, "\n" + out)
+    # ---- #3464 review: a corrupt module must not be counted as "needs nothing" --------------
+    #
+    # `required-subgroup-size=0 reasons=absent` is what a genuine wave-free shader reports AND
+    # what a truncated one reports, so a corrupt dump lands in the population that says #3464
+    # does not affect it. The marker search already walks word/opcode pairs, so whether that
+    # walk lands exactly on the end is free to report -- and it is the difference between a
+    # module that says nothing and a module that could not be read.
+    code, out = run(binary, spirv_module(64, 0x2), extra=["--wave-reasons"])
+    check("a well-formed module reports a clean walk",
+          "spirv-walk=ok" in out, "\n" + out)
+
+    # An instruction claiming more words than remain: the walk cannot complete.
+    truncated = [0x07230203, 0x00010300, 0, 1, 0, (999 << 16) | 330]
+    code, out = run(binary, truncated, extra=["--wave-reasons"])
+    check("an overrunning instruction is reported as a bad walk",
+          "spirv-walk=truncated" in out, "\n" + out)
+    check("a bad walk still emits the sentinel",
+          "wave-reasons-end" in out, "\n" + out)
+
+    # A zero word count would loop forever if the walk were unguarded; it must terminate AND
+    # be reported as unreadable rather than as a shader with no requirement.
+    zero_len = [0x07230203, 0x00010300, 0, 1, 0, 0]
+    code, out = run(binary, zero_len, extra=["--wave-reasons"])
+    check("a zero-length instruction is reported as a bad walk",
+          "spirv-walk=truncated" in out, "\n" + out)
+
+    # And the header alone IS a clean walk -- zero instructions is a complete stream, not a
+    # corrupt one. Without this the fix would just relabel every wave-free module as corrupt.
+    code, out = run(binary, [0x07230203, 0x00010300, 0, 1, 0], extra=["--wave-reasons"])
+    check("a header-only module is a clean walk, not a truncated one",
+          "spirv-walk=ok" in out, "\n" + out)
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0
 
