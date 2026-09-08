@@ -2,8 +2,11 @@
 
 import unittest
 
+import contextlib
+import io
+
 from performance_capture_report import (CaptureError, CLASSIFICATION_EVIDENCE_SHARE,
-                                        READBACK_NOTE_MIN_SHARE, summarize,
+                                        READBACK_NOTE_MIN_SHARE, print_summary, summarize,
                                         validate_capture)
 
 
@@ -378,6 +381,195 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         records.pop()
         with self.assertRaisesRegex(CaptureError, "incomplete"):
             validate_capture(records)
+
+
+# The record shape that made #3447 invisible: almost all of the cost is in `pipeline_ms` and
+# `gpu_storage_copy_ms`, both of which the report captured and never printed. The five timers it
+# did print account for 6 ms of a 300 ms dispatch.
+HIDDEN_COST_COMPUTE = [{
+    "program_addr": 0x1000, "program_hash": 0xABCD, "dispatches": 1,
+    "total_ms": 300.0,
+    "setup_ms": 2.0, "pipeline_ms": 220.0, "dispatch_wait_ms": 70.0,
+    "writeback_ms": 3.0, "cleanup_ms": 1.0,
+    "gpu_device_ms": 65.0, "gpu_pre_ms": 1.0, "gpu_shader_ms": 4.0,
+    "gpu_storage_copy_ms": 55.0, "gpu_compare_ms": 5.0, "gpu_restore_ms": 0.0,
+    "gpu_timestamp_samples": 1,
+}]
+
+
+
+# A dispatch that broke during setup, in the shape #3461 describes: `phase_writeback` never
+# advanced, so `cleanup_ms` books the whole item and `pipeline_ms` books the compensating
+# negative. The stored values are self-consistent -- they telescope to the item duration --
+# so the capture is right and only the RENDERING can go wrong.
+BROKEN_DISPATCH_COMPUTE = [{
+    "program_addr": 0x2000, "program_hash": 0xBEEF, "dispatches": 1,
+    "total_ms": 12.0,
+    "setup_ms": 10.0, "pipeline_ms": -10.0, "dispatch_wait_ms": 0.0,
+    "writeback_ms": 0.0, "cleanup_ms": 12.0,
+    "gpu_device_ms": 0.0, "gpu_timestamp_samples": 0,
+}]
+
+
+class ComputeDecompositionTests(unittest.TestCase):
+    def _render(self, compute):
+        summary = summarize(capture(SAMPLES, compute=compute))
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            print_summary(summary)
+        return summary, buffer.getvalue()
+
+    def _group_line(self, text):
+        """The per-program line alone.
+
+        Every assertion about the group breakdown must run against THIS, not against the whole
+        report: the summary table prints the same field names, so a substring match on the full
+        text is satisfied by the summary and never reaches the group line. That is why reverting
+        the entire group-line change once left this suite green.
+        """
+        lines = [line for line in text.splitlines() if line.strip().startswith("0x")
+                 and "records=" in line]
+        self.assertEqual(len(lines), 1, f"expected exactly one group line in:\n{text}")
+        return lines[0]
+
+    def test_every_captured_timer_is_reported(self):
+        # COVERAGE arm, deliberately whole-text: it asserts the summary carries every field and
+        # that each name reaches the output SOMEWHERE. It does not distinguish the summary from
+        # the group line -- either satisfies it -- so it survives a mutation of either surface.
+        # The surface-specific pinning is done by the summary arms and the _group_line arms;
+        # this one exists so a newly added timer that reaches neither surface still fails.
+        from performance_capture_report import COMPUTE_CPU_PHASES, COMPUTE_GPU_BRACKETS
+        summary, text = self._render(HIDDEN_COST_COMPUTE)
+        for field in COMPUTE_CPU_PHASES:
+            self.assertIn(field, summary["compute_cpu_phases"], field)
+        for field in COMPUTE_GPU_BRACKETS:
+            self.assertIn(field, summary["compute_gpu_brackets"], field)
+        self.assertEqual(summary["compute_cpu_phases"]["pipeline_ms"], 220.0)
+        self.assertEqual(summary["compute_gpu_brackets"]["gpu_storage_copy_ms"], 55.0)
+        self.assertIn("pipeline=220.0ms", text)
+        self.assertIn("storage-copy=55.0ms", text)
+
+    def test_dominant_timer_reaches_the_printed_output(self):
+        # The point of the fix: the largest cost must be visible without parsing the file by hand.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("(73.3%)", text)   # pipeline_ms, 220 of 300
+        self.assertIn("(84.6%)", text)   # gpu_storage_copy_ms, 55 of 65 device
+
+    def test_remainder_is_named_rather_than_left_to_subtraction(self):
+        # 300 total against 296 of named CPU phases: the 4 ms must be stated, not inferred.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("unattributed=4.0ms", text)
+
+    def test_gpu_brackets_are_scaled_against_device_time_not_total(self):
+        # The brackets sit inside dispatch_wait, so they partition gpu_device_ms. Scaling them
+        # against total_ms would understate the storage copy by 4.6x here and invite summing two
+        # sibling decompositions into one bogus 100%.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("GPU brackets of 65.0ms device", text)
+        self.assertNotIn("storage-copy=55.0ms (18.3%)", text)
+
+    def test_shader_share_of_device_time_is_stated(self):
+        # The headline this whole change exists to surface.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("compute shader is 6.2% of the device time", text)
+
+    def test_group_line_carries_the_dropped_timers(self):
+        # Asserted on the group line ALONE. The old report printed five fields here and the
+        # two holding 92% of this dispatch were absent; a whole-text match cannot see that,
+        # because the summary table above prints the same names.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        line = self._group_line(text)
+        self.assertIn("pipeline=220.0ms", line)
+        self.assertIn("storage-copy=55.0ms", line)
+        self.assertIn("cleanup=1.0ms", line)
+        self.assertIn("unattributed=4.0ms", line)
+
+    def test_group_line_separates_the_two_scopes(self):
+        # Printed flat, the eleven fields sum to 430ms against the 300ms total on the same line,
+        # because the GPU brackets are inside dev which is inside wait. The line must say so
+        # rather than leaving a reader to add them up and conclude the tool cannot count.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        line = self._group_line(text)
+        self.assertIn("cpu ", line)
+        self.assertIn("gpu dev=65.0ms (inside wait)", line)
+        self.assertIn("of which", line)
+        cpu_section = line.split("[", 1)[1].split(" | ", 1)[0]
+        self.assertNotIn("storage-copy", cpu_section)
+        self.assertNotIn("dev=", cpu_section)
+
+    def test_group_line_cpu_fields_account_for_its_own_total(self):
+        # The invariant the labelling exists to protect: the cpu section, remainder included,
+        # sums to the total printed on the same line.
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        line = self._group_line(text)
+        cpu_section = line.split("[", 1)[1].split(" | ", 1)[0]
+        values = [float(part.split("=")[1].removesuffix("ms"))
+                  for part in cpu_section.split() if "=" in part]
+        self.assertAlmostEqual(sum(values), 300.0, places=1)
+
+    def test_negative_remainder_is_shown_signed_on_both_surfaces(self):
+        # A record whose named phases exceed its own total. NO CURRENT PRODUCER PATH BUILDS ONE,
+        # and the reason is worth stating so nobody re-derives it: the five CPU phases are
+        # consecutive differences over start->setup->pipeline->dispatch->writeback->cleanup
+        # (live_compute.cpp:11639-11643), and phase_milliseconds (:11635) is a plain signed
+        # difference with no clamping, so they telescope to cleanup-start for ANY ordering of the
+        # markers -- degenerate ones included. A break leaves a marker behind and yields a
+        # negative PHASE offset by a compensating positive one; the SUM is unchanged. Since
+        # total_ms spans at least that window, the remainder cannot go negative today.
+        #
+        # An earlier version of this comment claimed a break before phase_pipeline produced one.
+        # It does not, and the claim reached here from a review citation that skipped the
+        # telescoping step -- which is why it is corrected rather than quietly dropped.
+        #
+        # The arm stays because the THRESHOLD is what is under test, not that mechanism: a
+        # one-sided threshold would silently hide a negative remainder if the telescoping ever
+        # broke (a clamp, or a phase measured outside the start..cleanup window), and a
+        # remainder that does not partition its total is precisely what this report exists to
+        # surface. It also matches the signed convention used for every other remainder here.
+        over = [dict(HIDDEN_COST_COMPUTE[0])]
+        over[0]["total_ms"] = 290.0          # named CPU phases sum to 296.0
+        _, text = self._render(over)
+        self.assertIn("unattributed=-6.0ms", self._group_line(text))
+        cpu_summary = next(line for line in text.splitlines()
+                           if line.strip().startswith("CPU phases of"))
+        self.assertIn("unattributed=-6.0ms", cpu_summary)
+
+    def test_negative_phase_values_are_printed_not_suppressed(self):
+        # A `value < 0.05` threshold treats a negative as an absence. That hid the compensating
+        # term of a signed pair, so the visible parts summed to 183% of their own total, while
+        # the `unattributed` row -- computed from the full set, hidden term included -- came to
+        # exactly zero and printed nothing. The one mechanism that would have flagged the
+        # inconsistency was silenced by the very value it should have reported, which is the
+        # same shape as the defect this whole change exists to fix.
+        _, text = self._render(BROKEN_DISPATCH_COMPUTE)
+        summary = next(line for line in text.splitlines()
+                       if line.strip().startswith("CPU phases of"))
+        self.assertIn("pipeline=-10.0ms", summary)
+        self.assertIn("pipeline=-10.0ms", self._group_line(text))
+        # And with it visible, the printed parts account for the whole rather than 183% of it.
+        #
+        # Summed in MILLISECONDS, not in the rendered percentages. Percentages are each rounded
+        # to one decimal before being printed, so their sum lands on 100.0 only when the errors
+        # happen to cancel: this fixture does (its suppressed phases are exactly 0.0 and its
+        # +/-0.033 errors are equal and opposite), while HIDDEN_COST_COMPUTE sums to 99.9 with
+        # nothing suppressed at all. A tolerance wide enough for both would no longer detect the
+        # 183% this arm exists to catch, so the check is done on the underlying values, as
+        # test_group_line_cpu_fields_account_for_its_own_total already does.
+        values = [float(part.split("=")[1].split("ms")[0])
+                  for part in summary.split() if "=" in part and "ms" in part]
+        self.assertAlmostEqual(sum(values), 12.0, places=3)
+
+    def test_absent_gpu_timestamps_do_not_invent_a_bracket_table(self):
+        from performance_capture_report import COMPUTE_GPU_BRACKETS
+        no_gpu = [dict(HIDDEN_COST_COMPUTE[0])]
+        for field in ("gpu_device_ms", *COMPUTE_GPU_BRACKETS):
+            no_gpu[0][field] = 0.0
+        no_gpu[0]["gpu_timestamp_samples"] = 0
+        _, text = self._render(no_gpu)
+        self.assertIn("CPU phases of 300.0ms total", text)
+        self.assertNotIn("GPU brackets of", text)
+        # ...and the header must not advertise a section this capture cannot supply.
+        self.assertNotIn("GPU brackets partition", text)
 
 
 if __name__ == "__main__":
