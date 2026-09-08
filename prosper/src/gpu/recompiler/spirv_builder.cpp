@@ -433,7 +433,7 @@ std::vector<uint32_t> build_compute_detile_rgba16f() {
   return e.assemble();
 }
 
-std::vector<uint32_t> build_compute_retile_words() {
+std::vector<uint32_t> build_compute_retile_words(bool volume) {
     Emitter e;
     const auto void_t = e.id(), fn_t = e.id(), bool_t = e.id(), uint_t = e.id();
     const auto v3_t = e.id(), input_ptr = e.id(), gid = e.id();
@@ -478,7 +478,7 @@ std::vector<uint32_t> build_compute_retile_words() {
         const auto id = e.id(); constants.emplace_back(value, id);
         Emitter::put(e.types, Op_Constant, {uint_t, id, value}); return id;
     };
-    Emitter::put(e.types, Op_TypeArray, {push_array, uint_t, constant(22)});
+    Emitter::put(e.types, Op_TypeArray, {push_array, uint_t, constant(26)});
     Emitter::put(e.types, Op_TypeStruct, {push_t, push_array});
     Emitter::put(e.types, Op_TypePointer, {push_ptr, SC_PushConstant, push_t});
     Emitter::put(e.types, Op_TypePointer, {push_word, SC_PushConstant, uint_t});
@@ -496,10 +496,22 @@ std::vector<uint32_t> build_compute_retile_words() {
     Emitter::put(e.code, Op_Label, {entry});
     uint32_t params[6]{};
     for (uint32_t i = 0; i < 6; ++i) params[i] = load(push, push_word, constant(i));
+    uint32_t depth = 0, block_depth = 0, blocks_y = 0, block_shift = constant(14);
+    if (volume) {
+        depth = load(push, push_word, constant(22));
+        block_depth = load(push, push_word, constant(23));
+        blocks_y = load(push, push_word, constant(24));
+        block_shift = load(push, push_word, constant(25));
+    }
     const auto id3 = e.id(), word_x = e.id(), y = e.id();
+    uint32_t z = 0;
     Emitter::put(e.code, Op_Load, {v3_t, id3, gid});
     Emitter::put(e.code, Op_CompositeExtract, {uint_t, word_x, id3, 0});
     Emitter::put(e.code, Op_CompositeExtract, {uint_t, y, id3, 1});
+    if (volume) {
+        z = e.id();
+        Emitter::put(e.code, Op_CompositeExtract, {uint_t, z, id3, 2});
+    }
     const auto row_words = binary(Op_ShiftLeftLogical, params[0], params[2]);
     const auto padded_row_words = binary(Op_ShiftLeftLogical, params[5],
         binary(Op_IAdd, params[3], params[2]));
@@ -518,32 +530,53 @@ std::vector<uint32_t> build_compute_retile_words() {
     const auto component_mask = binary(Op_ISub,
         binary(Op_ShiftLeftLogical, constant(1), params[2]), constant(1));
     const auto component = binary(Op_BitwiseAnd, word_x, component_mask);
-    const auto block = binary(Op_IAdd,
-        binary(Op_IMul, binary(Op_ShiftRightLogical, y, params[4]), params[5]),
+    auto block_row = binary(Op_ShiftRightLogical, y, params[4]);
+    if (volume)
+        block_row = binary(Op_IAdd, block_row,
+            binary(Op_IMul, binary(Op_ShiftRightLogical, z, block_depth), blocks_y));
+    const auto block = binary(Op_IAdd, binary(Op_IMul, block_row, params[5]),
         binary(Op_ShiftRightLogical, x, params[3]));
     uint32_t byte_offset = binary(Op_ShiftLeftLogical, component, constant(2));
     for (uint32_t bit = 2; bit < 16; ++bit) {
         const auto equation = load(push, push_word, constant(bit + 6));
-        const auto coordinate = binary(Op_BitwiseXor,
-            binary(Op_BitwiseAnd, x, binary(Op_BitwiseAnd, equation, constant(65535))),
-            binary(Op_BitwiseAnd, y, binary(Op_ShiftRightLogical, equation, constant(16))));
+        uint32_t coordinate;
+        if (volume) {
+            const auto xy = binary(Op_BitwiseXor,
+                binary(Op_BitwiseAnd, x, binary(Op_BitwiseAnd, equation, constant(255))),
+                binary(Op_BitwiseAnd, y, binary(Op_BitwiseAnd,
+                    binary(Op_ShiftRightLogical, equation, constant(8)), constant(255))));
+            coordinate = binary(Op_BitwiseXor, xy,
+                binary(Op_BitwiseAnd, z, binary(Op_ShiftRightLogical, equation, constant(16))));
+        } else {
+            coordinate = binary(Op_BitwiseXor,
+                binary(Op_BitwiseAnd, x, binary(Op_BitwiseAnd, equation, constant(65535))),
+                binary(Op_BitwiseAnd, y, binary(Op_ShiftRightLogical, equation, constant(16))));
+        }
         const auto population = e.id();
         Emitter::put(e.code, Op_BitCount, {uint_t, population, coordinate});
         byte_offset = binary(Op_BitwiseOr, byte_offset,
             binary(Op_ShiftLeftLogical, binary(Op_BitwiseAnd, population, constant(1)), constant(bit)));
     }
-    const auto address = binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, constant(14)),
+    const auto address = binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, block_shift),
         binary(Op_ShiftRightLogical, byte_offset, constant(2)));
     // Padding has no source texel. Branch before the load; selecting zero AFTER
     // an out-of-range read would still violate the source descriptor's bounds.
-    const auto pixel_x = e.id(), pixel_y = e.id(), pixel_valid = e.id();
+    const auto pixel_x = e.id(), pixel_y = e.id();
+    auto pixel_valid = e.id();
     Emitter::put(e.code, Op_ULessThan, {bool_t, pixel_x, word_x, row_words});
     Emitter::put(e.code, Op_ULessThan, {bool_t, pixel_y, y, params[1]});
     Emitter::put(e.code, Op_LogicalAnd, {bool_t, pixel_valid, pixel_x, pixel_y});
+    if (volume) {
+        const auto pixel_z = e.id(), all = e.id();
+        Emitter::put(e.code, Op_ULessThan, {bool_t, pixel_z, z, depth});
+        Emitter::put(e.code, Op_LogicalAnd, {bool_t, all, pixel_valid, pixel_z});
+        pixel_valid = all;
+    }
     Emitter::put(e.code, Op_SelectionMerge, {pixel_done, 0});
     Emitter::put(e.code, Op_BranchConditional, {pixel_valid, read_pixel, pixel_done});
     Emitter::put(e.code, Op_Label, {read_pixel});
-    const auto linear = binary(Op_IAdd, binary(Op_IMul, y, row_words), word_x);
+    const auto row = volume ? binary(Op_IAdd, binary(Op_IMul, z, params[1]), y) : y;
+    const auto linear = binary(Op_IAdd, binary(Op_IMul, row, row_words), word_x);
     const auto loaded = load(source, word_ptr, linear);
     Emitter::put(e.code, Op_Branch, {pixel_done});
     Emitter::put(e.code, Op_Label, {pixel_done});
