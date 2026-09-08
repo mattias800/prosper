@@ -25,28 +25,43 @@ import re
 import statistics
 import sys
 
-FLIP = re.compile(r"\[ev\] GpuFlip t=([0-9.]+)")
+# Match the timestamp wherever it sits on the line. The emitter also prints handle/bufidx/
+# mode/fliparg, and requiring t= to sit adjacent to the tag is what let a format mismatch go
+# unnoticed: this tool read zero flips from every real run for as long as it existed, and
+# reported that as "nothing to pace" (#3452). `.` excludes newline without DOTALL, so a match
+# cannot run past the end of one line.
+FLIP = re.compile(r"\[ev\] GpuFlip\b.*?\bt=([0-9.]+)")
+# Any line announcing a flip at all. Used only to tell 'this run had no flips' apart from
+# 'this tool could not read the flips this run recorded' -- the distinction #3452 turned on.
+FLIP_TAG = re.compile(r"\[ev\] GpuFlip\b")
 # The Win32 timer tick on dev boxes is 15.625 ms; quantized waits land on its multiples.
 TICK_MS = 15.625
 
 
 def parse_flips(paths):
+    """Return (timestamps, untimed): untimed counts flip lines carrying no readable t=.
+
+    The second value exists so a parse failure cannot be reported as an empty run. A log full
+    of flips the parser cannot read, and a log with no flips, are different facts; this tool
+    printed the same sentence for both until #3452.
+    """
     stamps = []
+    untimed = 0
     for path in paths:
-        if path == "-":
-            handle = sys.stdin
+        opened = None if path == "-" else open(path, encoding="utf-8", errors="replace")
+        handle = sys.stdin if opened is None else opened
+        try:
             for line in handle:
                 m = FLIP.search(line)
                 if m:
                     stamps.append(float(m.group(1)))
-        else:
-            with open(path, encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    m = FLIP.search(line)
-                    if m:
-                        stamps.append(float(m.group(1)))
+                elif FLIP_TAG.search(line):
+                    untimed += 1
+        finally:
+            if opened is not None:
+                opened.close()
     stamps.sort()
-    return stamps
+    return stamps, untimed
 
 
 def classify(ms, tick):
@@ -58,8 +73,16 @@ def classify(ms, tick):
     return "between ticks"
 
 
-def report(stamps, window_s, tick):
+def report(stamps, window_s, tick, untimed=0):
     if len(stamps) < 2:
+        if untimed:
+            # Name the TOOL as the failure. Saying 'nothing to pace' about a log holding
+            # thousands of flip lines is how #3452 stayed invisible for as long as it did:
+            # the sentence described the run, and the run was fine.
+            print(f'{untimed} flip line(s) found, none with a readable t= timestamp: this log'
+                  f' cannot be paced. The emitter and this parser disagree on the line format,'
+                  f' or the run predates the timestamp added in #3452.')
+            return
         print("fewer than 2 flips recorded -- nothing to pace")
         return
     intervals = [ms for ms in ((b - a) * 1000.0 for a, b in zip(stamps, stamps[1:]))
@@ -112,8 +135,8 @@ def main():
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
-    stamps = parse_flips(paths)
-    report(stamps, args.window_s, args.tick_ms)
+    stamps, untimed = parse_flips(paths)
+    report(stamps, args.window_s, args.tick_ms, untimed)
     return 0
 
 

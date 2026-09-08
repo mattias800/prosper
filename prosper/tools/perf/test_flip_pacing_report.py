@@ -71,6 +71,46 @@ def main():
     if "fewer than 2 flips" not in out:
         failures.append(f"case 4: expected the too-few-flips refusal, got: {out!r}")
 
+    # 5. THE DOMAIN ARM. Every case above composes its own input in the format this parser
+    #    expects, so all of them passed for as long as the tool existed while it read zero
+    #    flips from every real log: the emitter never wrote the `t=` the parser required
+    #    (#3452). A control drawn from the same source as the null tests the discriminator,
+    #    never the domain. These two lines are copied VERBATIM from prosper-app stderr with
+    #    PROSPER_EVLOG=1, so a future divergence between emitter and parser fails here.
+    real = (
+        "[ev] GpuFlip t=41.416330 handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0" "\n"
+        "[ev] GpuFlip t=41.432850 handle=0x1002 bufidx=1 mode=0x1 fliparg=0x0" "\n"
+    )
+    out, _ = run(real)
+    if "cannot be paced" in out or "fewer than 2 flips" in out:
+        failures.append(f"case 5: the parser could not read real emitter output: {out!r}")
+
+    # 6. A flip line with no timestamp must be reported as a TOOL failure, naming the count,
+    #    not as a fact about the run. This is the exact shape that hid #3452: 7,938 flip lines
+    #    in a real log reported as "nothing to pace".
+    untimed = "[ev] GpuFlip handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0" "\n"
+    out, _ = run(untimed * 3)
+    if "3 flip line(s) found" not in out or "cannot be paced" not in out:
+        failures.append(f"case 6: expected a loud parse failure naming the count, got: {out!r}")
+    if "fewer than 2 flips" in out:
+        failures.append("case 6: reported a parse failure as an empty run")
+
+    # 7. THE EMITTER LINK. Cases 1-6 all feed strings this file composes, so none of them can
+    #    notice the emitter dropping or moving the timestamp -- which is the regression that
+    #    actually happened, and it hid for the tool's whole life. Read the emitter source and
+    #    require the field to still be there. A format string is not a live run, but it is the
+    #    one link to the producer a pure unit test can hold.
+    emitter = (Path(__file__).resolve().parents[2] / "src/hle/graphics/hle_graphics.cpp")
+    if not emitter.is_file():
+        failures.append(f"case 7: emitter source not found at {emitter}")
+    else:
+        text = emitter.read_text(encoding="utf-8", errors="replace")
+        flip_lines = [line for line in text.splitlines() if "[ev] GpuFlip" in line]
+        if not flip_lines:
+            failures.append("case 7: no [ev] GpuFlip emitter found in hle_graphics.cpp")
+        elif not any("t=%" in line for line in flip_lines):
+            failures.append("case 7: the [ev] GpuFlip emitter writes no t= timestamp, so every real log is unpaceable (#3452): " + flip_lines[0].strip())
+
     if failures:
         print("FAILURES:")
         for failure in failures:
