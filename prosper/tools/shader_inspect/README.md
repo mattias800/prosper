@@ -111,6 +111,56 @@ input or one that is not a whole number of dwords. A stream that stops short of 
 reported as `endpgm=0` rather than as a failure — a census over a truncated dump is still an exact
 census of what could be decoded.
 
+## `--wave-reasons`: which shaders need the guest Wave64, and why
+
+On any NVIDIA host the entire supported subgroup range is `32..32` -- no extension, driver or
+device yields a 64-wide subgroup -- so a fragment module that requires the guest's Wave64 is
+dropped. On *Grand Theft Auto V* that removes most of the world's lighting (#3464).
+
+```sh
+shader_inspect <raw-rdna2.bin> --wave-reasons
+wave-reasons required-subgroup-size=64 reasons=0x2 names=wave-any native-wave32-admitted=1
+wave-reasons-end file=... dwords=12 recompiled=1 table_dependent=0 endpgm=1
+```
+
+`native-wave32-admitted` mirrors the shipping gate in `tests/fixtures/render_runner.h`
+**exactly** -- equality against `kFragmentWaveReasonWaveAny` -- rather than re-deriving what
+ought to be admissible. The census reports the emulator that ships; a proposal about what
+*should* be admitted belongs in the classifier, where a test can hold it.
+
+A module that needs no particular width reports `size=0 reasons=0x0 admitted=0`: it never
+reaches the gate, and counting it as admitted would bury the interesting population under every
+ordinary shader in a dump. A module carrying no reason marker at all reports `reasons=absent`,
+never `0x0` -- absent is not none.
+
+`wave_reason_census.py` tallies the mode over a directory and prints the reason-set histogram
+plus the names of the dropped shaders. It exists because the *runtime* skip log answers this
+only for whatever a route happened to reach, once per distinct shader, at whatever scene depth
+the run stopped: two runtime counts taken that way, 43 and 86, differed by run length alone and
+read as a regression until they were matched by frame.
+
+### Measured limit: over a raw dump this mode is mostly blind, and says so
+
+Run against a 3,453-shader dump of GTA V's pixel-shader database (2026-09-08):
+
+```
+files=3453  errors=0  unrecompiled(no resource table)=3430  analysed=23
+```
+
+**99.3% contributed no reason data.** A real pixel shader samples a texture, and the section
+below explains why a table-less tool can never lower one. The 23 that were analysed are the
+shaders that happen not to touch memory, which is not a random sample of anything -- a
+texture-sampling lighting shader is exactly the kind that is missing.
+
+This is reported rather than hidden: an unrecompilable shader is counted in its own column and
+is **never** tallied as `requires nothing`, and the tally prints the caveat both above and below
+its numbers. A census that silently equated "could not be analysed" with "needs no wide wave"
+would have reported that GTA V has essentially no Wave64 problem, which is the opposite of the
+truth.
+
+For a census over shaders that use memory, the reasons must come from a path that HAS the real
+descriptors -- `gpu_replay <capture>.prgcap`, as with every other table-dependent verdict here.
+
 ## `--stage` cannot prove a shader is unsupported (#1571)
 
 **`shader_inspect` has no resource table, and a table-less stage rejection is NOT evidence of a shader

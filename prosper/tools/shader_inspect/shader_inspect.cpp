@@ -34,6 +34,45 @@ const char* operand_kind_name(OperandKind kind) {
     return index < std::size(names) ? names[index] : "invalid";
 }
 
+// The fragment wave-reason bits, named. Kept adjacent to the constants they mirror so a bit
+// added to rdna2_to_spirv.hpp without a name here shows up as an `unknown-bitN` token rather
+// than silently vanishing from the census.
+struct WaveReasonName {
+    uint32_t bit;
+    const char* name;
+};
+
+constexpr WaveReasonName kWaveReasonNames[] = {
+    {kFragmentWaveReasonLaneId,       "lane-id"},
+    {kFragmentWaveReasonWaveAny,      "wave-any"},
+    {kFragmentWaveReasonDppRow16,     "dpp-row16"},
+    {kFragmentWaveReasonPermLane32,   "permlane32"},
+    {kFragmentWaveReasonReadLane64,   "readlane64"},
+    {kFragmentWaveReasonShuffle,      "shuffle"},
+    {kFragmentWaveReasonWaveBallot,   "wave-ballot"},
+    {kFragmentWaveReasonScalarReduce, "scalar-reduce"},
+};
+
+// Prints the set bits by name, then any bit this table does not know about. The unknown pass
+// is the point: it makes a header change visible in the census output instead of dropping it.
+void print_wave_reason_names(uint32_t reasons) {
+    uint32_t named = 0;
+    bool first = true;
+    for (const WaveReasonName& entry : kWaveReasonNames) {
+        named |= entry.bit;
+        if (!(reasons & entry.bit)) continue;
+        std::printf("%s%s", first ? "" : ",", entry.name);
+        first = false;
+    }
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+        const uint32_t mask = 1u << bit;
+        if (!(reasons & mask) || (named & mask)) continue;
+        std::printf("%sunknown-bit%u", first ? "" : ",", bit);
+        first = false;
+    }
+    if (first) std::printf("none");
+}
+
 bool is_branch(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
            in.opcode != 0x03;
@@ -84,6 +123,7 @@ int main(int argc, char** argv) {
     std::string stage;
     std::string input_path;
     bool mimg_sites = false;
+    bool wave_reasons = false;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
         const std::string arg = argv[i];
@@ -92,6 +132,8 @@ int main(int argc, char** argv) {
             else stage = argv[++i];
         } else if (arg == "--mimg-sites") {
             mimg_sites = true;
+        } else if (arg == "--wave-reasons") {
+            wave_reasons = true;
         } else if (!arg.empty() && arg[0] == '-') {
             bad_usage = true;
         } else if (input_path.empty()) {
@@ -101,15 +143,20 @@ int main(int argc, char** argv) {
         }
     }
     if (input_path.empty() || bad_usage || (mimg_sites && !stage.empty()) ||
+        (wave_reasons && !stage.empty()) || (wave_reasons && mimg_sites) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
+    std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
         std::fprintf(stderr,
             "\n"
             "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
             "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the same\n"
             "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
             "census from a run that died before printing one.\n"
+            "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
+            "wave width the recompiled module requires, why, and whether render_runner.h would\n"
+            "admit it at a host native wave32 today. Same sentinel discipline as --mimg-sites.\n"
             "\n"
             "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
             "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
@@ -178,6 +225,55 @@ int main(int argc, char** argv) {
         }
         std::printf("mimg-sites-end dwords=%zu consumed=%zu instructions=%zu sites=%zu endpgm=%d\n",
                     words.size(), consumed, instructions.size(), sites, walk_ended ? 1 : 0);
+        return 0;
+    }
+
+    // --wave-reasons: the fragment wave-width census, and nothing else.
+    //
+    // Motivation (#3464): on any NVIDIA host the entire supported subgroup range is 32..32, so a
+    // fragment module that requires the guest's Wave64 is DROPPED -- on GTA V that removes most
+    // of the world's lighting. Deciding what to do about it needs to start from what the title's
+    // shaders actually require, and a runtime skip log answers that only for whatever the route
+    // happened to reach, once per distinct shader, at whatever scene depth the run stopped.
+    // (Two counts taken that way, 43 and 86, differed by run length alone and read as a
+    // regression.) Over a dump of the title's shader database this is instead a total.
+    //
+    // `native-wave32-admitted` mirrors render_runner.h's gate EXACTLY -- equality against
+    // kFragmentWaveReasonWaveAny -- rather than re-deriving what ought to be admissible. The
+    // census reports the emulator that ships; proposals about what SHOULD be admitted belong in
+    // the classifier, where a test can hold them.
+    //
+    // A module needing no particular width reports size=0, reasons=0x0 and admitted=0: it never
+    // reaches the gate, and counting it as admitted would bury the interesting population under
+    // every ordinary shader in the dump.
+    //
+    // `wave-reasons-end` is a completion sentinel, not decoration -- see --mimg-sites above.
+    // A recompile that fails prints reasons=absent rather than 0x0, because a raw dump carries
+    // no descriptors and most real fragment shaders sample a texture: that is the tool's
+    // limitation and must never be tallied as `requires nothing`.
+    if (wave_reasons) {
+        const std::vector<uint32_t> spirv = recompile_fragment(words.data(), words.size());
+        const bool recompiled = !spirv.empty();
+        uint32_t table_dependent = 0;
+        for (const Rdna2Inst& in : instructions)
+            if (needs_resource_table(in.fmt, "fragment")) ++table_dependent;
+        if (recompiled) {
+            const uint32_t size = fragment_spirv_required_subgroup_size(spirv);
+            const uint32_t reasons = fragment_spirv_required_subgroup_reasons(spirv);
+            // UINT32_MAX means the module carries no reason marker at all. Absent is not none,
+            // so it is reported as `absent` and never printed as a mask a consumer would sum.
+            const bool marked = reasons != UINT32_MAX;
+            const bool admitted = marked && reasons == kFragmentWaveReasonWaveAny;
+            std::printf("wave-reasons required-subgroup-size=%u reasons=", size);
+            if (marked) std::printf("0x%x names=", reasons);
+            else std::printf("absent names=");
+            print_wave_reason_names(marked ? reasons : 0u);
+            std::printf(" native-wave32-admitted=%d\n", admitted ? 1 : 0);
+        }
+        std::printf("wave-reasons-end file=%s dwords=%zu recompiled=%d "
+                    "table_dependent=%u endpgm=%d\n",
+                    input_path.c_str(), words.size(), recompiled ? 1 : 0, table_dependent,
+                    (!instructions.empty() && instructions.back().is_end) ? 1 : 0);
         return 0;
     }
 
