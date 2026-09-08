@@ -107,11 +107,24 @@ def main() -> int:
     # It is a copy of a title id that lives in live_renderer.cpp; if that gains a title and this does
     # not, the survey reports a structural zero as a real one.
     live = source(REPO / "prosper" / "frontends" / "shared" / "live" / "live_renderer.cpp")
-    ids = set(re.findall(r'title_id == "([A-Z]{4}\d{5})"', live))
+    # Anchored on the ASSIGNMENT, not on any `title_id ==` in the file. A bare match would
+    # redden on an unrelated per-title switch, and the natural repair -- adding that title
+    # to NATIVE_VOTE_ALLOWLIST -- would make the survey report "wave-any is admitted here"
+    # for a title where it is not.
+    ids = set(re.findall(r'gta5_native_fragment_vote\s*=\s*([^;]+);', live))
+    ids = set(re.findall(r'"([A-Z]{4}\d{5})"', " ".join(ids)))
     check("skip_survey's allowlist matches live_renderer's title gate",
           ids == set(skip_survey.NATIVE_VOTE_ALLOWLIST),
           "-- renderer has %s, survey has %s" % (sorted(ids),
                                                  sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
+
+    # N7: `admitted` is a shader count only because the emitter dedupes on shader identity
+    # before printing. Nothing else pins that, so a refactor dropping the guard would turn
+    # the column into a draw count with no test noticing -- the exact units confusion the
+    # module docstring warns about, arriving through the other door.
+    check("the admit emitter still dedupes on shader identity",
+          "native_width_logged.insert(shader_key).second" in rr,
+          "-- admitted would become a DRAW count while still labelled shaders")
 
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0

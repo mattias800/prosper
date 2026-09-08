@@ -11,9 +11,14 @@ GPU replay, no new emulator code.
 
 WHAT THIS COUNTS, and the trap it is built around. The renderer's skip message sits INSIDE a dedupe
 guard keyed on shader identity, while the `continue` that drops the draw sits OUTSIDE it. So this
-counts DISTINCT SHADERS, and it is NOT a draw count -- a census that divided one by the other
-reported "1.5% of draws" and had to be withdrawn (render_runner.h:6940-6944). Every number here is
-shaders.
+counts SHADERS, not draws -- a census that divided one by the other reported "1.5% of draws" and
+had to be withdrawn (render_runner.h:6940-6944).
+
+They are UPPER BOUNDS on distinct shaders, not exact counts, and are in different units from
+`capture_wave_census.py`. The `fs=` field is the renderer's compile-instance key, not a content
+hash, so one program compiled twice counts twice here while the capture census keys on content.
+The two tools' numbers therefore must not be differenced -- which is also true for a larger
+reason already recorded there: this samples a boot, that samples one frame.
 
 WHAT A ZERO MEANS, and this is the thing most likely to be misread. **A zero is never a clean bill
 of health**, for TWO independent reasons, and an early version of this file published only the first.
@@ -25,8 +30,11 @@ a zero means only "none in the surveyed window". Measured on this tool's first r
 **(2) Admission.** On a title covered by the native-wave32 allowlist, a fragment shader whose reason
 set is exactly `wave-any` is ADMITTED rather than skipped -- `render_runner.h:7140-7155` sets
 `fragment_subgroup_skip = false` and logs `[render] GTA V native-width fragment vote:` INSTEAD of the
-skip line this tool counts. So on `PPSA04263` the wave-any class is invisible here at **any** route
-and **any** window length, and wave-any is exactly the class every hit in the corpus belongs to.
+skip line. So on `PPSA04263` that class never appears in the REFUSED column at any route or window,
+and wave-any is exactly the class every hit in the corpus belongs to. It is not invisible: it is
+counted separately, as `admitted`. An earlier version of this file said "invisible at any route",
+which was true before the admit line was counted and false afterwards -- printed, at that point,
+immediately beside the column counting it.
 
 (2) is the dangerous one, because (1) alone invites the obvious repair -- "run the Story/Performance
 route and look again" -- which cannot surface a single wave-any shader on that title. So this tool
@@ -101,8 +109,14 @@ def survey(app, dump, seconds, out_dir):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 # kill() only sends the signal; without this the file may still be open when the
-                # log is read below.
-                proc.wait(timeout=15)
+                # log is read below. Guarded because on Windows kill() is
+                # TerminateProcess and this second wait can still time out -- letting it
+                # raise would abort the whole corpus run over one stuck title, losing
+                # every result already gathered.
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    pass
     elapsed = time.time() - started
     text = log.read_text(encoding="utf-8", errors="replace")
 
@@ -167,8 +181,8 @@ def main() -> int:
             # this tool structurally cannot see.
             notes.append("none in window")
         if r["title"] in NATIVE_VOTE_ALLOWLIST:
-            notes.append("ALLOWLISTED: wave-any is admitted here, not skipped -- invisible to this "
-                         "tool at any route")
+            notes.append("ALLOWLISTED: wave-any is ADMITTED here, not skipped -- it is in the "
+                         "admitted column, never the refused one, at any route")
         if r["title"] in ROUTE_GATED:
             notes.append(ROUTE_GATED[r["title"]])
         if r["exited_early"]:
