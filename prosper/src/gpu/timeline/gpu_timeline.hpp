@@ -286,15 +286,24 @@ void close_gpu_timeline();
 // thread; the frame is captured on the render thread between the next two presents. On-demand: near-zero
 // cost (one atomic load per submit) until armed.
 //
-// Returns the path of an arm this call REPLACED, or "" when there was none. A replaced arm had not
-// started capturing yet, so it never runs and never reports an outcome — the caller is the only one
-// who can explain, or clean up, whatever it had already created under that name.
-[[nodiscard]] std::string request_interactive_capture_bundle(const std::string& path,
+// An unstarted arm may be replaced. Collecting/writing a bundle, or an unread outcome, rejects a
+// new request before it can collect another large payload. Rejection leaves the existing job intact.
+struct InteractiveGrabRequest {
+    bool accepted = false;
+    std::string replaced_path;
+    std::string error;
+};
+[[nodiscard]] InteractiveGrabRequest request_interactive_capture_bundle(const std::string& path,
                                                              uint32_t max_mb = 0,
                                                              uint32_t delay_presents = 0);
 bool interactive_capture_bundle_active();
+// Stop admission, cancel an incomplete window, and drain completed owned work. No guest/Vulkan
+// access is performed by the writer. Call before deliberate _Exit; ordinary teardown also drains.
+void shutdown_interactive_capture_bundle();
+// Test latch at the real writer boundary; install only while idle. The hook does not replace I/O.
+bool set_interactive_bundle_writer_hook_for_test(std::function<void()> hook);
 
-// The outcome of the most recently COMPLETED interactive grab, so a frontend can tell the user what
+// The retained outcome of a COMPLETED interactive grab, so a frontend can tell the user what
 // happened instead of leaving the answer in stderr among tens of thousands of lines (#1587). The user
 // pressed a key; a keystroke that silently produces nothing is indistinguishable from one that never
 // registered, and several agents on a 4K title concluded exactly that.
