@@ -4697,6 +4697,121 @@ int main() {
               "linear array writeback preserves aligned rows, sibling slices, mips, and padding");
     }
 
+    // A warm selected-mip snapshot must describe the GPU's latest output, including the mip offset.
+    // Restore an earlier last row, then write a DIFFERENT row: stale cache authority would copy the
+    // newer last row back over that guest restoration. Check the complete backing, not just stores.
+    auto array_snapshot_restore = [&](ShaderResourceTable table, std::vector<uint8_t>& source,
+                                       std::vector<uint8_t>& destination, size_t stride,
+                                       size_t mip_offset, size_t slice_bytes, uint64_t code_addr) {
+        // Native typed bytes permit retention of a partial output; the raw interchange path
+        // intentionally stays transient and cannot exercise snapshot invalidation.
+        for (auto& resource : table.resources)
+            if (resource.binding == 4 || resource.binding == 5)
+                resource.format = DataFormat::Uint8;
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(16);
+        config.local_x = W * 4;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Uint8, 4);
+        const auto& target = table.resources.back();
+        const uint32_t width = target.width;
+        const uint32_t mode = target.tile_mode;
+        const size_t pitch = mode ? width * 4 : linear_sampled_row_pitch(width, 4);
+        const size_t selected_begin = 2 * stride + mip_offset;
+        auto modify_source_row = [&](uint32_t row) {
+            if (mode) {
+                std::vector<uint8_t> linear(width * TILED_H * 4);
+                detile_surface(linear.data(), source.data() + selected_begin,
+                               width, TILED_H, mode, 0, 4);
+                for (size_t x = 0; x < W * 4; ++x) linear[row * width * 4 + x] ^= 0x5b;
+                tile_surface(source.data() + selected_begin, linear.data(),
+                             width, TILED_H, mode, 0, 4);
+            } else {
+                for (size_t x = 0; x < W * 4; ++x)
+                    source[selected_begin + row * pitch + x] ^= 0x5b;
+            }
+        };
+        auto expected_row = [&](std::vector<uint8_t>& expected, uint32_t row) {
+            if (mode) {
+                std::vector<uint8_t> src(width * TILED_H * 4), dst(src.size());
+                detile_surface(src.data(), source.data() + selected_begin,
+                               width, TILED_H, mode, 0, 4);
+                detile_surface(dst.data(), expected.data() + selected_begin,
+                               width, TILED_H, mode, 0, 4);
+                std::copy_n(src.begin() + row * width * 4, W * 4,
+                            dst.begin() + row * width * 4);
+                tile_surface(expected.data() + selected_begin, dst.data(),
+                             width, TILED_H, mode, 0, 4);
+            } else {
+                std::memcpy(expected.data() + selected_begin + row * pitch,
+                            source.data() + selected_begin + row * pitch, W * 4);
+            }
+        };
+        // A realistic over-dispatch qualifies for coverage proving, but only the first row's
+        // lanes store. Mask the extra lanes so neither source reads nor stores are out of bounds.
+        std::vector<uint32_t> row_zero_code{0x7DA800C0u}; // v_cmpx_gt_u32 64, v0
+        row_zero_code.insert(row_zero_code.end(), std::begin(image_copy_2d_array),
+                             std::end(image_copy_2d_array));
+        std::vector<uint32_t> last_row_code = row_zero_code;
+        last_row_code[2] = 0x7E0A0280u + TILED_H - 1; // v5 = last row (inline integer).
+        ComputeItem item;
+        item.resources = std::make_shared<ShaderResourceTable>(table);
+        item.launch.threads_x = item.launch.local_x = W * 4;
+        item.launch.threads_y = item.launch.threads_z = 1;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = code_addr + 1;
+        item.spirv = recompile_compute(
+            row_zero_code.data(), row_zero_code.size(), &table, config);
+        CHECK(!item.spirv.empty(), "array restore row-zero kernel recompiles");
+        if (item.spirv.empty()) return;
+        const std::vector<uint32_t> row_zero_spirv = item.spirv;
+        for (unsigned warm = 0; warm < 2; ++warm)
+            CHECK(prosper::frontend::execute_live_compute_items({item}),
+                  "array row-zero writer proves coverage before the restore sequence");
+        item.code_addr = code_addr;
+        item.spirv = recompile_compute(last_row_code.data(), last_row_code.size(), &table, config);
+        CHECK(mip_offset != 0 && !item.spirv.empty(),
+              "warm array restore uses a nonzero selected mip and last-row shader");
+        if (item.spirv.empty()) return;
+        // Pass coverage proving and cold admission before changing the retained output.
+        for (unsigned warm = 0; warm < 3; ++warm)
+            CHECK(prosper::frontend::execute_live_compute_items({item}),
+                  "selected-mip last-row writer warms the production image cache");
+        const std::vector<uint8_t> before = destination;
+        modify_source_row(TILED_H - 1);
+        std::vector<uint8_t> changed = before;
+        expected_row(changed, TILED_H - 1);
+        bool changed_outside_old_snapshot_range = false;
+        for (size_t i = 2 * stride + slice_bytes; i < destination.size(); ++i)
+            changed_outside_old_snapshot_range |= changed[i] != before[i];
+        CHECK(changed_outside_old_snapshot_range,
+              "last-row mutation reaches beyond the incorrectly unoffset snapshot range");
+        CHECK(prosper::frontend::execute_live_compute_items({item}) && destination == changed,
+              "warm array dispatch publishes the changed last row exactly");
+        std::copy(before.begin(), before.end(), destination.begin());
+        modify_source_row(0);
+        std::vector<uint8_t> restored = before;
+        expected_row(restored, 0);
+        item.code_addr = code_addr + 1;
+        item.spirv = row_zero_spirv;
+        // The row-zero program was warmed before changing the last row, so this pass can reuse
+        // the retained image and must independently validate its guest source.
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "array row-zero writer executes after restoring the guest last row");
+        CHECK(destination == restored,
+              mode ? "warm tiled array preserves restored guest texels and all sibling bytes"
+                   : "warm linear array preserves restored guest texels and all sibling bytes");
+    };
+    array_snapshot_restore(array_rt, array_src, array_dst, array_stride,
+                           array_level.byte_offset, array_selected_bytes, 0x34560000);
+    array_snapshot_restore(linear_array_rt, linear_array_src, linear_array_dst,
+                           linear_array_stride, linear_array_level.byte_offset,
+                           linear_array_pitch * TILED_H, 0x34560002);
+
     // Exercise the wider element mappings that become default-on with tiled storage. Float16 uses
     // finite values so half->float->half is exact; Float32 follows the backend's raw channel contract.
     auto wide_tiled_roundtrip = [&](DataFormat format, uint32_t bytes_per_texel,

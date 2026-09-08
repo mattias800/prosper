@@ -2084,11 +2084,13 @@ struct VulkanComputeContext {
     void update_image_source_snapshot_layers(CachedComputeImage& cached,
                                              const uint8_t* source, size_t bytes,
                                              uint32_t depth, uint64_t written_layers_mask,
-                                             size_t layer_stride, size_t slice_bytes) {
+                                             size_t layer_stride, size_t slice_bytes,
+                                             size_t mip_offset) {
         if (!source || !bytes) return;
         if (cached.source_snapshot.size() != bytes || depth <= 1 || depth > 64 ||
             written_layers_mask == ~0ULL || layer_stride == 0 || slice_bytes == 0 ||
-            slice_bytes > bytes || layer_stride > (bytes - slice_bytes) / (depth - 1)) {
+            mip_offset > bytes || slice_bytes > bytes - mip_offset ||
+            layer_stride > (bytes - mip_offset - slice_bytes) / (depth - 1)) {
             remember_image_source_snapshot(
                 cached, source, bytes, true, SnapshotReason::ReadModifyWrite);
             return;
@@ -2096,11 +2098,9 @@ struct VulkanComputeContext {
         size_t copied = 0;
         for (uint32_t layer = 0; layer < depth && layer < 64; ++layer) {
             if (!(written_layers_mask & (1ULL << layer))) continue;
-            const size_t offset = layer_stride * layer;
-            if (offset + slice_bytes <= bytes) {
-                std::memcpy(cached.source_snapshot.data() + offset, source + offset, slice_bytes);
-                copied += slice_bytes;
-            }
+            const size_t offset = layer_stride * layer + mip_offset;
+            std::memcpy(cached.source_snapshot.data() + offset, source + offset, slice_bytes);
+            copied += slice_bytes;
         }
         ++image_source_snapshot_copies;
         image_source_snapshot_bytes += copied;
@@ -3006,9 +3006,12 @@ struct VulkanComputeContext {
             // contract because their prior guest bytes are observable by the next dispatch.
             if (current_source) {
                 if (array_depth > 1 && written_layers_mask != ~0ULL) {
+                    // Match array writeback's selected subresource. Packed tails are addressed
+                    // within the slice base by mip_tail_x/y; ordinary mips add their byte offset.
                     update_image_source_snapshot_layers(
                         cached, current_source, key.guest_bytes, array_depth,
-                        written_layers_mask, layer_stride, slice_bytes);
+                        written_layers_mask, layer_stride, slice_bytes,
+                        key.tile_mode && key.in_mip_tail ? 0 : key.layer_mip_offset);
                 } else {
                     remember_image_source_snapshot(
                         cached, current_source, key.guest_bytes, true,
