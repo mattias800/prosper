@@ -10311,7 +10311,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
                                      nullptr, 1, &mirror_to_general);
             }
-            if (bi.cache_candidate || bi.persistent ||
+            // Promotion is decided after host writeback, but a possible retained result must
+            // already have the GENERAL layout promised to both compute and graphics consumers.
+            if (bi.cache_candidate || bi.persistent || bi.renderer_seeded_result_candidate ||
                 bi.post_writeback_promotion_candidate) {
                 VkImageMemoryBarrier to_general = to_src;
                 to_general.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
