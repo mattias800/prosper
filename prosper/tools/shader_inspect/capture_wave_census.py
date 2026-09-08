@@ -9,7 +9,7 @@ gpu_replay has the real descriptors. This script drives it:
 
     gpu_replay --bundle F --bundle-extract-submit N cap.prgcap   # one submit, replayable
     gpu_replay --inspect-only cap.prgcap                         # draw list, with fs= identities
-    gpu_replay --dump-shader ID:fs fs.spv cap.prgcap             # the REAL-TABLE compiled module
+    gpu_replay --inspect-only --dump-shader ID:fs fs.spv cap.prgcap   # REAL-TABLE module
     shader_inspect fs.spv --wave-reasons                         # reads that module's own markers
 
 so every reason it reports comes from a module compiled the way the renderer compiles it, and no
@@ -119,7 +119,13 @@ def main() -> int:
     results = {}
     for fs_hash, (draw_id, dwords) in sorted(first_draw.items()):
         spv = work / ("fs_%s.spv" % fs_hash)
-        run([args.gpu_replay, "--dump-shader", "%s:fs" % draw_id, spv, capture])
+        # --inspect-only alongside --dump-shader: the module is written from the same
+        # realization either way (byte-identical output, verified), but the frame is not
+        # REPLAYED. That matters beyond speed on the title this exists for -- GTA V has two
+        # compute programs that hang the GPU into a driver recovery (#2542, #2690), and a
+        # census over N distinct shaders would otherwise trigger them N times.
+        run([args.gpu_replay, "--inspect-only", "--dump-shader", "%s:fs" % draw_id,
+             spv, capture])
         if not spv.exists():
             results[fs_hash] = ("dump-failed", 0, "", "", 0)
             continue
