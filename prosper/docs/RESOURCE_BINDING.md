@@ -158,7 +158,10 @@ guest writeback. Missing or incompatible imports fall back to current snapshots;
 address nor matching texel width alone authorizes this copy (#3407).
 
 After successful ordinary writeback, that private native RGBA8 result can be retained for the
-existing validated storage-to-sampled transfer path and compatible graphics exports. This does not
+existing validated storage-to-sampled transfer path. This promotion does not authorize graphics
+exports: in the measured workload, repeated page-watch registration outweighed the conversion saving.
+Linux consumers without ordered-journal authority fall back to guest preparation; Windows retains
+its existing exact guest mirror. This does not
 authorize input reuse by a later renderer-owned producer. Retention refuses overlapping writes from
 independent image owners or any metadata reset, using effective host/guest destinations rather than
 advertised addresses alone. Publication waits for all writebacks, and guest mutation still invalidates

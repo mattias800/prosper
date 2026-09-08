@@ -131,7 +131,9 @@ only after completion is established. `PROSPER_NO_STANDALONE_RTT_SEED` selects t
 F8-gated `compute-rtt-seed` rows distinguish admission from recorded copies.
 
 A completed private renderer-seeded native RGBA8 image may be retained under the existing image
-budget for validated storage-to-sampled transfers and compatible graphics consumers. Input cache
+budget for validated storage-to-sampled transfers. This new result does not authorize graphics
+export or create its page watch: Linux uses the ordered journal and declines outside its authority;
+Windows retains its exact guest mirror. Ordinary graphics preparation remains the fallback. Input cache
 reuse remains excluded for renderer owners: their next dispatch acquires the current renderer image.
 Retain only after ordinary guest/DCC writeback; publish authority only after every writeback succeeds.
 Refuse a result if another independent storage owner's effective writeback destination or any DCC

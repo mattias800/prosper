@@ -391,6 +391,18 @@ int main(int argc, char** argv) {
                             } else {
                                 check(std::equal(expected.begin(), expected.end(), guest.begin()),
                                       "ordered producer publishes every expected renderer-seeded channel");
+                                {
+                                    // This completed result is for ordered compute transfer only.
+                                    // Even an exact graphics descriptor must not promote it into
+                                    // graphics-export/watch ownership. Release an unexpected lease
+                                    // before the consumer so the negative control keeps running.
+                                    prosper::frontend::LiveComputeImageImport graphics_import;
+                                    const bool exported = prosper::frontend::import_live_compute_storage_image(
+                                        normalized_table.resources.back(), guest_bytes, graphics_import);
+                                    check(!exported && !graphics_import.valid(),
+                                          "renderer-seeded completed result refuses graphics export");
+                                    graphics_import = {};
+                                }
                                 if (guest_mutation) {
                                     // A real intervening write invalidates the submit journal.
                                     constexpr size_t changed = 13 * width * 4 + 7;
@@ -433,6 +445,32 @@ int main(int argc, char** argv) {
                   "ordered retained result preserves the independent guest tail");
             source_preserved();
         }
+        // No ordered-submit journal survives this boundary. The completed result
+        // must not conceal an unnotified CPU mutation: Linux has no new export
+        // watch here, and the Windows exact mirror must reject changed bytes.
+        check(!guest_gpu_write_tracking_active(), "outside-submit mutation has no active ordered journal");
+        constexpr size_t outside_changed = 11 * width * 4 + 3;
+        guest[outside_changed] ^= 0x63;
+        expected[outside_changed] ^= 0x63;
+        const auto outside_guest = guest;
+        std::fill(observed.begin(), observed.end(), 0xccccccccu);
+        const auto before_outside_transfers = prosper::frontend::live_compute_storage_transfer_seeds();
+        renderer_visible = false;
+        const bool outside_ok = prosper::frontend::execute_live_compute_items({normalized_consumer});
+        renderer_visible = true;
+        bool outside_pixels_ok = true;
+        for (size_t i = 0; i < observed.size(); ++i) {
+            const float value = std::bit_cast<float>(observed[i]);
+            outside_pixels_ok &= std::isfinite(value) &&
+                std::abs(value - expected[i] / 255.0f) <= 0.000001f;
+        }
+        check(outside_ok && outside_pixels_ok && guest == outside_guest &&
+                  std::equal(expected.begin(), expected.end(), guest.begin()),
+              "outside-submit sampled fallback sees unnotified guest mutation on every channel");
+        check(prosper::frontend::live_compute_storage_transfer_seeds() == before_outside_transfers,
+              "unnotified guest mutation refuses completed-result transfer outside ordered submit");
+        source_preserved();
+
         // These descriptors overlap guest bytes but differ in extent, so they are
         // independent writable owners rather than one folded alias. A's private
         // completed image cannot represent the final A+B guest composite.

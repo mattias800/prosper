@@ -11476,8 +11476,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         image.resource->gpu_addr, image.guest_bytes),
                     authorized);
             }
+            // Renderer-result retention serves the ordered compute handoff. Exporting these
+            // freshly replaced entries to graphics creates/destroys a full guest-page watch on
+            // every dispatch, exceeding the avoided conversion cost in the measured workload. Keep that path
+            // disabled here: compute uses the existing journal (or Windows exact mirror), and
+            // a borrower without current authority falls back to ordinary guest preparation.
             const bool graphics_export_authorized = publish_eligible &&
-                image.graphics_sampled_usage &&
+                !image.renderer_seeded_result_candidate && image.graphics_sampled_usage &&
                 ctx.authorize_cached_image_export(image.cache_key, item.command_order);
             // #3307: the producer half of the borrow partition. Without it, a consumer that finds
             // no cache entry cannot tell a producer that declined to publish from a producer that
