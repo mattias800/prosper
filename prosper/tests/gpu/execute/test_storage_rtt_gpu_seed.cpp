@@ -251,6 +251,22 @@ int main(int argc, char** argv) {
             observe_guest(); source_preserved();
         }
         miss = Miss::None;
+        refresh(19);
+        auto short_backing = producer;
+        short_backing.resources = std::make_shared<ShaderResourceTable>(*producer.resources);
+        // Nonzero metadata passes reflection, then the real image materializer
+        // refuses the short destination after importing its exact renderer seed.
+        short_backing.resources->resources[1].size = 1;
+        const auto before_setup_guest = guest;
+        const unsigned before_setup_reads = reads, before_setup_imports = imports;
+        const uint64_t before_setup_submits = prosper::frontend::live_compute_queue_submit_attempts();
+        check(!prosper::frontend::execute_live_compute_items({short_backing}),
+              "short storage backing declines after seed admission");
+        check(guest == before_setup_guest && reads == before_setup_reads &&
+                  imports == before_setup_imports + 1 && imports == releases &&
+                  prosper::frontend::live_compute_queue_submit_attempts() == before_setup_submits,
+              "setup failure releases its admitted source pin without snapshot, submit or guest write");
+        source_preserved();
         refresh(20);
         const auto before_guest = guest;
         const unsigned before_reads = reads, before_imports = imports;
