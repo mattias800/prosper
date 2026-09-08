@@ -25,28 +25,62 @@ import re
 import statistics
 import sys
 
-FLIP = re.compile(r"\[ev\] GpuFlip t=([0-9.]+)")
+# Match the timestamp wherever it sits on the line. The emitter also prints handle/bufidx/
+# mode/fliparg, and requiring t= to sit adjacent to the tag is what let a format mismatch go
+# unnoticed: this tool read zero flips from every real run for as long as it existed, and
+# reported that as "nothing to pace" (#3452). `.` excludes newline without DOTALL, so a match
+# cannot run past the end of one line.
+FLIP = re.compile(r"\[ev\] GpuFlip\b.*?\bt=([0-9.]+)")
+# Any line announcing a flip at all. Used only to tell 'this run had no flips' apart from
+# 'this tool could not read the flips this run recorded' -- the distinction #3452 turned on.
+FLIP_TAG = re.compile(r"\[ev\] GpuFlip\b")
 # The Win32 timer tick on dev boxes is 15.625 ms; quantized waits land on its multiples.
 TICK_MS = 15.625
 
 
 def parse_flips(paths):
-    stamps = []
+    """Return one (path, timestamps, untimed) timeline PER SOURCE. Never pooled.
+
+    `untimed` exists so a parse failure cannot be reported as an empty run: a log full of flips
+    the parser cannot read, and a log with no flips, are different facts, and this tool printed
+    the same sentence for both until #3452.
+
+    Timelines are kept separate because the timestamp epoch is PER PROCESS -- every run starts
+    near zero. Pooling and sorting two logs interleaves them into intervals neither run
+    contained: a 60 fps and a 30 fps capture merge into a plausible-looking distribution with a
+    fabricated sub-tick histogram, which this report's own wording then calls work-bound
+    production. Comparing two runs is exactly the A/B this tool is for, so the wrong answer was
+    reachable by its intended use.
+    """
+    timelines = []
     for path in paths:
-        if path == "-":
-            handle = sys.stdin
+        stamps = []
+        untimed = 0
+        opened = None if path == "-" else open(path, encoding="utf-8", errors="replace")
+        handle = sys.stdin if opened is None else opened
+        try:
             for line in handle:
                 m = FLIP.search(line)
                 if m:
-                    stamps.append(float(m.group(1)))
-        else:
-            with open(path, encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    m = FLIP.search(line)
-                    if m:
+                    try:
                         stamps.append(float(m.group(1)))
-    stamps.sort()
-    return stamps
+                    except ValueError:
+                        # A malformed number is an unreadable flip, not a missing one.
+                        untimed += 1
+                elif FLIP_TAG.search(line):
+                    untimed += 1
+        finally:
+            if opened is not None:
+                opened.close()
+        # Detect concatenated runs BEFORE sorting. The per-source split cannot see them --
+        # `cat a.log b.log | tool` is one stream -- and sorting is what destroys the evidence:
+        # the epoch is per process, so a second run restarts near zero and steps BACKWARDS in
+        # file order. Sorted, that is indistinguishable from one slow run, which is the
+        # fabricated distribution this tool must never produce.
+        restarts = sum(1 for a, b in zip(stamps, stamps[1:]) if b < a)
+        stamps.sort()
+        timelines.append((path, stamps, untimed, restarts))
+    return timelines
 
 
 def classify(ms, tick):
@@ -58,8 +92,28 @@ def classify(ms, tick):
     return "between ticks"
 
 
-def report(stamps, window_s, tick):
+def report(stamps, window_s, tick, untimed=0, restarts=0):
+    # Report the unreadable population WHENEVER it exists, not only when nothing parsed. Two
+    # readable flips among thousands of unreadable ones produced a confident distribution over
+    # 0.06% of the data and said nothing about the rest -- #3452's own failure, one branch lower.
+    if restarts:
+        print(f"WARNING: the timestamps step backwards {restarts} time(s), so this input holds"
+              f" more than one run (the epoch is per process). Intervals across a restart are not"
+              f" real. Pass each run as its own argument instead of concatenating them.")
+    if untimed and stamps:
+        share = 100.0 * untimed / (untimed + len(stamps))
+        print(f"WARNING: {untimed} of {untimed + len(stamps)} flip line(s) ({share:.1f}%) carried"
+              f" no readable t= timestamp and are NOT in the figures below."
+              f" Treat this distribution as describing only the {len(stamps)} that parsed.")
     if len(stamps) < 2:
+        if untimed:
+            # Name the TOOL as the failure. Saying 'nothing to pace' about a log holding
+            # thousands of flip lines is how #3452 stayed invisible for as long as it did:
+            # the sentence described the run, and the run was fine.
+            print(f'{untimed} flip line(s) found, none with a readable t= timestamp: this log'
+                  f' cannot be paced. The emitter and this parser disagree on the line format,'
+                  f' or the run predates the timestamp added in #3452.')
+            return
         print("fewer than 2 flips recorded -- nothing to pace")
         return
     intervals = [ms for ms in ((b - a) * 1000.0 for a, b in zip(stamps, stamps[1:]))
@@ -112,8 +166,16 @@ def main():
     args = parser.parse_args()
 
     paths = args.logs if args.logs else ["-"]
-    stamps = parse_flips(paths)
-    report(stamps, args.window_s, args.tick_ms)
+    timelines = parse_flips(paths)
+    # One report per source. Several logs are several runs, each with its own epoch, so they
+    # are never merged -- see parse_flips. A header only when there is more than one, so the
+    # single-log output a reader already knows is unchanged.
+    for index, (path, stamps, untimed, restarts) in enumerate(timelines):
+        if len(timelines) > 1:
+            if index:
+                print("")
+            print(f"=== {path} ===")
+        report(stamps, args.window_s, args.tick_ms, untimed, restarts)
     return 0
 
 

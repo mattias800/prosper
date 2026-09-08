@@ -677,6 +677,20 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
 }
 
 namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
+
+namespace {
+// Seconds since the first FLIP event (this counter's own first call, not the first evlog
+// line of any kind), for the pacing reports. A flip line without a timestamp
+// records THAT a flip happened but not WHEN, so the interval distribution -- the thing that
+// separates a hard pacer from a tick-quantized wait from work-bound production -- cannot be
+// formed at all. flip_pacing_report.py has always read a t= field here and this emitter never
+// wrote one, so it parsed zero flips from every real run and reported that as 'nothing to
+// pace' (#3452). steady_clock, not system_clock: this is an interval timebase and must not step.
+double evlog_seconds() {
+    static const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+} // namespace
 // Implemented in hle_kernel_time.cpp (the equeue backend). Register a flip/vblank event source so the
 // ~60 Hz pump posts events into the given equeue; the game's WaitEqueue then returns them.
 void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata);
@@ -767,8 +781,8 @@ HLE(g_vo_set_flip_rate) {
 HLE(g_vo_submitflip)  {
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
-    if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
-        (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
+    if (evlog()) fprintf(stderr, "[ev] SubmitFlip t=%.6f handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
+                         evlog_seconds(), (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
     const int32_t buffer_index = (int32_t)a1;
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
@@ -787,8 +801,11 @@ HLE(g_vo_submitflip)  {
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
-    if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
-                         handle, bufidx, flip_mode, (unsigned long long)flip_arg);
+    // t= leads the payload so the pacing report's existing anchor matches. The parser is
+    // position-tolerant now, but keeping the field first costs nothing and stays compatible.
+    if (evlog()) fprintf(stderr, "[ev] GpuFlip t=%.6f handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
+                         evlog_seconds(), handle, bufidx, flip_mode,
+                         (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
     flip_pace_wait();                      // both halves pace: see flip_pace_wait
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
