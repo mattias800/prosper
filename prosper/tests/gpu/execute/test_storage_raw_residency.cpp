@@ -50,10 +50,11 @@ ShaderResource buffer(void* data, uint32_t bytes, uint32_t stride) {
     return r;
 }
 void append_output(std::vector<uint32_t>& code, uint32_t row) {
+    code.insert(code.end(), {0xbe8403ffu, row * width * 16u}); // s4 = row byte offset
     for (uint32_t c = 0; c < 4; ++c)
         code.insert(code.end(), {
-            0xe0702000u | (row * width * 16u + c * 4u),
-            0x80000004u | ((8u + c) << 8), // store v8..v11, v4 index, s[0:3]
+            0xe0702000u | (c * 4u),
+            0x04000004u | ((8u + c) << 8), // store v8..v11, v4 index, s[0:3], soffset s4
         });
 }
 } // namespace
@@ -68,6 +69,7 @@ int main() {
     image.img_dim = 1;
     image.format = DataFormat::Unorm8;
     image.num_components = 4;
+    for (uint32_t c = 0; c < 4; ++c) image.swizzle[c] = 4 + c;
     image.width = width;
     image.height = height;
     image.depth = 1;
