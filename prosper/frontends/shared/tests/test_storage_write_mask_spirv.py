@@ -14,8 +14,8 @@ def main() -> int:
         subprocess.run([sys.argv[1], directory], check=True)
         modules = sorted(pathlib.Path(directory).glob("*.spv"))
         # An empty/truncated fixture export cannot silently pass validation.
-        if len(modules) != 94:
-            raise SystemExit(f"expected 94 complete mask fixtures, found {len(modules)}")
+        if len(modules) != 96:
+            raise SystemExit(f"expected 96 complete mask fixtures, found {len(modules)}")
         for module in modules:
             subprocess.run(
                 [sys.argv[2], "--target-env", "vulkan1.3", str(module)], check=True
