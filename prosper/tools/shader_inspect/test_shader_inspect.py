@@ -285,8 +285,13 @@ def main() -> int:
           "recompiled=0" in out, "\n" + out)
     check("a failed recompile emits NO census row",
           "required-subgroup-size=" not in out, "\n" + out)
-    check("a failed recompile is not reported as reason-set admissible",
-          "reason-set-admissible=1" not in out, "\n" + out)
+    # NOT `reason-set-admissible=1 not in out`, which was the first draft: that is implied by
+    # the row-absence arm above, and in the one world where THAT breaks the printed value is 0
+    # anyway -- an arm satisfied for a reason other than the one it names. The gate-undecided
+    # line is a SEPARATE printf and can be moved out of the recompiled guard on its own, so
+    # asserting on its absence covers a failure the row-absence arm cannot see.
+    check("a failed recompile emits no gate-undecided line either",
+          "gate-undecided=" not in out, "\n" + out)
 
     # And the SPIR-V sentinel must say recompiled=n/a -- nothing was recompiled, it was read.
     # Load-bearing: wave_reason_census.py distinguishes the two on this field.
