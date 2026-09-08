@@ -213,6 +213,54 @@ int main(int argc, char** argv) {
             file.write(reinterpret_cast<const char*>(mixed_result.words.data()), mixed_result.words.size() * 4);
         }
     }
+    // The ordinary recompiler declares separate sampled-image and sampler
+    // variables on one combined binding. They are unrelated to the tracked store.
+    auto sampled_pair = fixture(1, false, {2, 1, 0});
+    Words pair_annotations, pair_declarations;
+    for (uint32_t variable : {82u, 85u}) {
+        put(pair_annotations, 71, {variable, 34, 0});
+        put(pair_annotations, 71, {variable, 33, 4});
+    }
+    put(pair_declarations, 25, {80, 3, 1, 0, 0, 0, 1, 0});
+    put(pair_declarations, 32, {81, 0, 80});
+    put(pair_declarations, 59, {81, 82, 0});
+    put(pair_declarations, 26, {83});
+    put(pair_declarations, 32, {84, 0, 83});
+    put(pair_declarations, 59, {84, 85, 0});
+    Words with_pair(sampled_pair.words.begin(), sampled_pair.words.begin() + 5);
+    bool annotations_added = false;
+    for (size_t p = 5; p < sampled_pair.words.size(); p += sampled_pair.words[p] >> 16) {
+        const uint32_t op = sampled_pair.words[p] & 0xffffu;
+        if (op == 19 && !annotations_added) {
+            with_pair.insert(with_pair.end(), pair_annotations.begin(), pair_annotations.end());
+            annotations_added = true;
+        }
+        if (op == 54) with_pair.insert(with_pair.end(), pair_declarations.begin(), pair_declarations.end());
+        with_pair.insert(with_pair.end(), sampled_pair.words.begin() + p,
+                         sampled_pair.words.begin() + p + (sampled_pair.words[p] >> 16));
+    }
+    sampled_pair.words = std::move(with_pair);
+    const auto pair_result = instrument_storage_image_writes(sampled_pair.words, std::span(&sampled_pair.target, 1));
+    check(bool(pair_result) && pair_result.instrumented_writes == 1,
+          "unrelated sampled-image and sampler sharing one binding do not reject storage tracking");
+    if (pair_result) {
+        const auto atomics = evaluate(pair_result.words);
+        check(atomics.size() == 1 && atomics[0].index == 9 && atomics[0].value == 1,
+              "combined sampled descriptor preserves exact target mask store");
+        if (!output.empty()) {
+            std::ofstream file(output / "combined-image-sampler.spv", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(pair_result.words.data()), pair_result.words.size() * 4);
+        }
+    }
+    sampled_pair.target.mask_binding = 4;
+    reject(sampled_pair, "mask collision with a combined descriptor still rejects");
+    auto duplicated_target = fixture(1, false, {2, 1, 0}, true, true);
+    for (size_t p = 5; p < duplicated_target.words.size(); p += duplicated_target.words[p] >> 16)
+        if ((duplicated_target.words[p] & 0xffffu) == 71 &&
+            duplicated_target.words[p + 1] == 13 && duplicated_target.words[p + 2] == 33)
+            duplicated_target.words[p + 3] = 5;
+    reject(duplicated_target, "duplicate target variables cannot silently leave one untracked");
+
     // A narrowed execution mask and a merge phi make moving the generated atomic
     // outside the actual store block observable structurally and to spirv-val.
     auto guarded = fixture(1, false, {1, 1, 0});

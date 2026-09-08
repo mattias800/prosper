@@ -124,12 +124,14 @@ inline StorageWriteMaskSpirvResult instrument_storage_image_writes(
     if (targets.empty()) return StorageWriteMaskSpirvResult{Words(module.begin(), module.end()), {}, 0};
     // Avoid collisions with existing descriptors, not only the selected images.
     using Binding = std::pair<uint32_t, uint32_t>;
-    std::map<Binding, uint32_t> descriptors;
+    std::map<Binding, std::vector<uint32_t>> descriptors;
     for (const auto& [id, binding] : bindings) {
         const auto set = sets.find(id);
         if (set == sets.end()) return fail("descriptor has no direct DescriptorSet decoration");
-        if (!descriptors.emplace(Binding{set->second, binding}, id).second)
-            return fail("ambiguous descriptor binding");
+        // Separate sampled-image and sampler variables may legitimately share a
+        // combined descriptor binding. Only selected storage-image ambiguity is
+        // unsafe; unrelated descriptor multiplicity does not affect store masks.
+        descriptors[{set->second, binding}].push_back(id);
     }
     struct TargetInfo { StorageWriteMaskTarget target; uint32_t dim, variable, image_type; };
     std::map<uint32_t, TargetInfo> selected;
@@ -145,7 +147,9 @@ inline StorageWriteMaskSpirvResult instrument_storage_image_writes(
             return fail("invalid or overflowing store-mask extent");
         const auto descriptor = descriptors.find({target.descriptor_set, target.image_binding});
         if (descriptor == descriptors.end()) return fail("target image binding is absent");
-        const auto variable = variables.find(descriptor->second);
+        if (descriptor->second.size() != 1) return fail("ambiguous target image binding");
+        const uint32_t descriptor_variable = descriptor->second.front();
+        const auto variable = variables.find(descriptor_variable);
         if (variable == variables.end()) return fail("target is not a global variable");
         const Inst* pointer = get_type(module[variable->second.at + 1]);
         if (!pointer || pointer->op != 32 || pointer->count != 4 ||
@@ -168,7 +172,7 @@ inline StorageWriteMaskSpirvResult instrument_storage_image_writes(
             (dim == 2 && arrayed) || (dim == 0 && target.height != 1) ||
             (dim < 2 && !arrayed && target.depth != 1))
             return fail("unsupported or inconsistent image dimensions");
-        const TargetInfo info{target, dim, descriptor->second, image_type};
+        const TargetInfo info{target, dim, descriptor_variable, image_type};
         if (!selected.emplace(info.variable, info).second)
             return fail("duplicate target image");
         const Binding mask_key{target.descriptor_set, target.mask_binding};
