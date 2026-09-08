@@ -753,10 +753,15 @@ bool page_requires_read_only_locked(const WatchState& w, const WatchedPage& page
            (trace_page && w.trace.status == GuestDmemWriteTraceStatus::Armed);
 }
 
+WatchedPage* page_pointer(WatchedPage* page) { return page; }
+WatchedPage* page_pointer(const RegistrationPage& page) { return page.page; }
+
+template <typename Page>
 std::vector<ProtectionRun> protection_runs(const WatchState& w,
-                                           const std::vector<WatchedPage*>& pages, bool arm) {
+                                           const std::vector<Page>& pages, bool arm) {
     std::vector<ProtectionRun> runs;
-    for (WatchedPage* page : pages) {
+    for (const auto& entry : pages) {
+        WatchedPage* page = page_pointer(entry);
         if (!page) continue;
         const bool prior_read_only = page_requires_read_only_locked(w, *page, page->armed);
         const bool wanted_read_only = page_requires_read_only_locked(w, *page, arm);
@@ -764,9 +769,19 @@ std::vector<ProtectionRun> protection_runs(const WatchState& w,
         for (const PageAlias& alias : page->aliases) {
             if (!cpu_writable(alias.prot)) continue;
             const int full = host_prot(alias.prot);
-            runs.push_back({alias.addr, kPage,
-                            prior_read_only ? (full & ~PROT_WRITE) : full,
-                            wanted_read_only ? (full & ~PROT_WRITE) : full});
+            const ProtectionRun run{alias.addr, kPage,
+                                    prior_read_only ? (full & ~PROT_WRITE) : full,
+                                    wanted_read_only ? (full & ~PROT_WRITE) : full};
+            // Ordered single-alias spans are common for image writeback. Combine them while
+            // collecting, so a contiguous texture needs one record rather than thousands of
+            // per-page records to allocate and sort. Keep the general sort/merge below for
+            // interleaved aliases, unordered physical-page walks, and protection boundaries.
+            if (!runs.empty() && runs.back().from == run.from && runs.back().to == run.to &&
+                runs.back().addr + runs.back().size == run.addr) {
+                runs.back().size += run.size;
+            } else {
+                runs.push_back(run);
+            }
         }
     }
     std::sort(runs.begin(), runs.end(), [](const ProtectionRun& a, const ProtectionRun& b) {
@@ -774,26 +789,31 @@ std::vector<ProtectionRun> protection_runs(const WatchState& w,
         if (a.to != b.to) return a.to < b.to;
         return a.addr < b.addr;
     });
-    std::vector<ProtectionRun> merged;
-    merged.reserve(runs.size());
-    for (const ProtectionRun& run : runs) {
-        if (!merged.empty() && merged.back().from == run.from && merged.back().to == run.to &&
-            merged.back().addr + merged.back().size == run.addr) {
-            merged.back().size += run.size;
+    size_t merged_count = 0;
+    // Compact the sorted records in their existing storage. Read by value: an output slot can
+    // be the current input slot, and no output ever reaches an unread record.
+    for (const ProtectionRun run : runs) {
+        if (merged_count && runs[merged_count - 1].from == run.from &&
+            runs[merged_count - 1].to == run.to &&
+            runs[merged_count - 1].addr + runs[merged_count - 1].size == run.addr) {
+            runs[merged_count - 1].size += run.size;
         } else {
-            merged.push_back(run);
+            runs[merged_count++] = run;
         }
     }
-    return merged;
+    runs.resize(merged_count);
+    return runs;
 }
 
 // mprotect every writable alias of `pages` to read-only (arm) or back to its guest prot (disarm).
 // Read-only / PROT_NONE aliases are left untouched (a CPU store can't dirty them). Returns false and
 // attempts rollback on the first mprotect failure. Failed/partial coverage remains explicit until
 // a complete pass succeeds; rollback itself can fail and is not proof that all aliases are restored.
-bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool arm) {
+template <typename Page>
+bool set_pages_armed(WatchState& w, const std::vector<Page>& pages, bool arm) {
     if (arm && w.trace.status == GuestDmemWriteTraceStatus::Stepping &&
-        std::any_of(pages.begin(), pages.end(), [&](const WatchedPage* page) {
+        std::any_of(pages.begin(), pages.end(), [&](const auto& entry) {
+            const WatchedPage* page = page_pointer(entry);
             return page && trace_covers_phys_locked(w, page->phys);
         }))
         return false;
@@ -802,7 +822,8 @@ bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool
     for (const ProtectionRun& run : runs) {
         if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
                            static_cast<size_t>(run.size), run.to) != 0) {
-            for (WatchedPage* page : pages) if (page) page->coverage_incomplete = true;
+            for (const auto& entry : pages)
+                if (WatchedPage* page = page_pointer(entry)) page->coverage_incomplete = true;
             while (changed) {
                 const ProtectionRun& prior = runs[--changed];
                 watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
@@ -812,9 +833,11 @@ bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool
         }
         ++changed;
     }
-    for (WatchedPage* page : pages) if (page) {
-        page->armed = arm;
-        page->coverage_incomplete = false;
+    for (const auto& entry : pages) {
+        if (WatchedPage* page = page_pointer(entry)) {
+            page->armed = arm;
+            page->coverage_incomplete = false;
+        }
     }
     return true;
 }
@@ -1399,9 +1422,9 @@ bool GuestWriteWatch::rearm() {
     std::lock_guard lock(w.mutex);
     auto found = w.registrations.find(id_);
     if (found == w.registrations.end() || !found->second.mapping_valid) return false;
-    std::vector<WatchedPage*> pages;
-    for (const RegistrationPage& rp : found->second.pages) if (rp.page) pages.push_back(rp.page);
-    if (!set_pages_armed(w, pages, true)) return false;   // couldn't re-protect -> caller re-creates
+    // The registration already owns the page list under this lock. Use it directly instead of
+    // allocating and copying a second list, including when all pages are already armed.
+    if (!set_pages_armed(w, found->second.pages, true)) return false;
     for (RegistrationPage& rp : found->second.pages) if (rp.page) rp.generation = rp.page->generation;
     found->second.gpu_dirty = false;
     bump(stats().rearms);

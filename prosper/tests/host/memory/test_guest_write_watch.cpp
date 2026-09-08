@@ -86,12 +86,43 @@ int main() {
 #else   // ---- Linux: exercise the real mprotect + SIGSEGV dirty-tracking (#1144) ------------------
 
 #include <cerrno>
+#include <atomic>
 #include <csignal>
 #include <cstring>
+#include <new>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+// Count requested scalar C++ allocation bytes only in explicit single-threaded scopes below.
+// This observes the linked production vectors, not malloc/aligned allocations or physical memory.
+std::atomic<bool> count_allocations{false};
+std::atomic<size_t> requested_allocation_bytes{0};
+class AllocationScope {
+public:
+    AllocationScope() {
+        requested_allocation_bytes.store(0, std::memory_order_relaxed);
+        count_allocations.store(true, std::memory_order_relaxed);
+    }
+    ~AllocationScope() { count_allocations.store(false, std::memory_order_relaxed); }
+    size_t finish() {
+        count_allocations.store(false, std::memory_order_relaxed);
+        return requested_allocation_bytes.load(std::memory_order_relaxed);
+    }
+};
+} // namespace
+
+void* operator new(std::size_t bytes) {
+    void* allocation = std::malloc(bytes ? bytes : 1);
+    if (!allocation) throw std::bad_alloc();
+    if (count_allocations.load(std::memory_order_relaxed))
+        requested_allocation_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return allocation;
+}
+void operator delete(void* allocation) noexcept { std::free(allocation); }
+void operator delete(void* allocation, std::size_t) noexcept { std::free(allocation); }
 
 namespace {
 // dmem is section-backed (one memfd, MAP_SHARED at multiple VAs) — mirror that so the alias handling
@@ -218,6 +249,230 @@ int main() {
             }
             close(large_fd);
         }
+    }
+
+    // Long protection runs must stop at unwatched gaps and guest-permission boundaries, even
+    // when each physical page has multiple aliases. Probe the actual permissions independently
+    // of the fault handler, then use real parent-thread stores to observe dirty generations.
+    {
+        const size_t max_unit_pages = (1u << 20) / (6 * page);
+        const size_t unit_pages = max_unit_pages < 8 ? max_unit_pages : 8;
+        CHECK(unit_pages != 0, "long-run fixture fits the watch size policy");
+        if (!unit_pages) return 1;
+        const size_t unit = unit_pages * page;
+        const size_t run_bytes = 16 * unit;
+        int run_fd = memfd_create("prosper-ww-long-runs", 0);
+        CHECK(run_fd >= 0, "long-run memfd created");
+        if (run_fd < 0) return 1;
+        const bool sized = ftruncate(run_fd, static_cast<off_t>(run_bytes)) == 0;
+        CHECK(sized, "long-run memfd sized");
+        if (!sized) return 1;
+        auto* first = static_cast<uint8_t*>(mmap(
+            nullptr, run_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, run_fd, 0));
+        auto* second = static_cast<uint8_t*>(mmap(
+            nullptr, run_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, run_fd, 0));
+        CHECK(first != MAP_FAILED && second != MAP_FAILED, "long-run aliases mapped");
+        if (first == MAP_FAILED || second == MAP_FAILED) return 1;
+        const bool permissions = mprotect(second + 4 * unit, 2 * unit, PROT_READ) == 0 &&
+            mprotect(second + 6 * unit, 2 * unit, PROT_NONE) == 0;
+        // Replace part of B with an anonymous guard: it is a hole in physical alias coverage,
+        // kept reserved so a later host allocation cannot reuse the addresses during probes.
+        void* guard = mmap(second + 8 * unit, 4 * unit, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        CHECK(permissions && guard == second + 8 * unit,
+              "long-run read-only, inaccessible and non-alias guard sections installed");
+        if (!permissions || guard != second + 8 * unit) return 1;
+        constexpr uint64_t phys = 0x20000000;
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(first), run_bytes, phys, kCpuRw);
+        auto add_second = [&](size_t begin, size_t units, uint32_t prot) {
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                reinterpret_cast<uint64_t>(second + begin * unit), units * unit,
+                phys + begin * unit, prot);
+        };
+        add_second(0, 4, kCpuRw);
+        add_second(4, 2, 0x1); // CPU_READ only
+        add_second(6, 2, 0x0); // no CPU access; outside both watched physical intervals
+        add_second(12, 4, kCpuRw);
+        auto left = GuestWriteWatch::create(reinterpret_cast<uint64_t>(first), 6 * unit);
+        auto right = GuestWriteWatch::create(
+            reinterpret_cast<uint64_t>(first + 10 * unit), 6 * unit);
+        CHECK(left && right && left.query() == GuestWriteWatchQuery::Unchanged &&
+                  right.query() == GuestWriteWatchQuery::Unchanged,
+              "disjoint long watches arm across multiple aliases and an alias gap");
+        if (!left || !right) return 1;
+        auto fixed_permissions = [&] {
+            CHECK(probe_access(second + 4 * unit + 32, false) == AccessProbe::Allowed &&
+                      probe_access(second + 4 * unit + 32, true) == AccessProbe::Faulted &&
+                      probe_access(second + 6 * unit + 32, false) == AccessProbe::Faulted &&
+                      probe_access(second + 6 * unit + 32, true) == AccessProbe::Faulted &&
+                      probe_access(second + 8 * unit + 32, true) == AccessProbe::Faulted,
+                  "protection runs preserve read-only, inaccessible and non-alias guard sections");
+        };
+        auto armed_permissions = [&] {
+            CHECK(probe_access(first + 32, true) == AccessProbe::Faulted &&
+                      probe_access(first + 6 * unit - 32, true) == AccessProbe::Faulted &&
+                      probe_access(first + 10 * unit + 32, true) == AccessProbe::Faulted &&
+                      probe_access(first + run_bytes - 32, true) == AccessProbe::Faulted &&
+                      probe_access(second + 32, true) == AccessProbe::Faulted &&
+                      probe_access(second + run_bytes - 32, true) == AccessProbe::Faulted &&
+                      probe_access(first + 8 * unit + 32, true) == AccessProbe::Allowed,
+                  "both ends of each long run arm while the unwatched primary gap stays writable");
+        };
+        armed_permissions();
+        fixed_permissions();
+        first[32] = 0x31;
+        CHECK(second[32] == 0x31 && left.query() == GuestWriteWatchQuery::Dirty &&
+                  right.query() == GuestWriteWatchQuery::Unchanged,
+              "real store dirties only its long physical interval");
+        prosper::host::guest_write_watch_notify_host_write(
+            reinterpret_cast<uint64_t>(first), run_bytes);
+        CHECK(left.query() == GuestWriteWatchQuery::Dirty &&
+                  right.query() == GuestWriteWatchQuery::Dirty &&
+                  probe_access(first + 6 * unit - 32, true) == AccessProbe::Allowed &&
+                  probe_access(first + 10 * unit + 32, true) == AccessProbe::Allowed &&
+                  probe_access(second + 32, true) == AccessProbe::Allowed &&
+                  probe_access(second + run_bytes - 32, true) == AccessProbe::Allowed,
+              "host notification across a gap disarms every writable alias and dirties both owners");
+        first[4 * unit + 32] = 0x42;
+        first[10 * unit + 32] = 0x53;
+        CHECK(second[4 * unit + 32] == 0x42,
+              "host write is visible through the permanently read-only alias");
+        prosper::host::guest_write_watch_notify_host_write_done(
+            reinterpret_cast<uint64_t>(first), run_bytes);
+        fixed_permissions();
+        CHECK(left.rearm() && right.rearm() && left.query() == GuestWriteWatchQuery::Unchanged &&
+                  right.query() == GuestWriteWatchQuery::Unchanged,
+              "long-run rearm establishes fresh generations after the host write");
+        armed_permissions();
+        second[run_bytes - 32] = 0x64;
+        CHECK(first[run_bytes - 32] == 0x64 && right.query() == GuestWriteWatchQuery::Dirty &&
+                  left.query() == GuestWriteWatchQuery::Unchanged,
+              "real store through the far sibling alias dirties only the second interval");
+        CHECK(right.rearm(), "second long interval rearms after the sibling store");
+        left.reset();
+        CHECK(probe_access(first + 32, true) == AccessProbe::Allowed &&
+                  probe_access(second + 32, true) == AccessProbe::Allowed &&
+                  probe_access(first + run_bytes - 32, true) == AccessProbe::Faulted,
+              "releasing one long interval restores its aliases without disarming another owner");
+        right.reset();
+        CHECK(probe_access(first + run_bytes - 32, true) == AccessProbe::Allowed &&
+                  probe_access(second + run_bytes - 32, true) == AccessProbe::Allowed,
+              "final long-run release restores writable tail aliases");
+        fixed_permissions();
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(first), run_bytes);
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(second), run_bytes);
+        munmap(first, run_bytes);
+        munmap(second, run_bytes);
+        close(run_fd);
+    }
+
+    // Allocation cost is the regression oracle, not elapsed time: one contiguous alias must not
+    // expand into temporary protection records per page. Keep the actual mappings and dirty-state
+    // checks so a shortcut that stops protecting pages cannot satisfy the allocation budget.
+    {
+        const size_t allowed_pages = (1u << 20) / page;
+        const size_t pages = allowed_pages < 64 ? allowed_pages : 64;
+        CHECK(pages >= 16, "allocation fixture has enough pages within the watch cap");
+        if (pages < 16) return 1;
+        const size_t bytes = pages * page;
+        int allocation_fd = memfd_create("prosper-ww-allocation", 0);
+        CHECK(allocation_fd >= 0, "allocation fixture memfd created");
+        if (allocation_fd < 0) return 1;
+        const bool sized = ftruncate(allocation_fd, static_cast<off_t>(bytes)) == 0;
+        CHECK(sized, "allocation fixture memfd sized");
+        if (!sized) return 1;
+        auto* mapped = static_cast<uint8_t*>(mmap(
+            nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, allocation_fd, 0));
+        CHECK(mapped != MAP_FAILED, "allocation fixture mapped");
+        if (mapped == MAP_FAILED) return 1;
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(mapped), bytes, 0x30000000, kCpuRw);
+        auto first = GuestWriteWatch::create(reinterpret_cast<uint64_t>(mapped), bytes);
+        auto second = GuestWriteWatch::create(reinterpret_cast<uint64_t>(mapped), bytes);
+        CHECK(first && second && first.query() == GuestWriteWatchQuery::Unchanged &&
+                  second.query() == GuestWriteWatchQuery::Unchanged,
+              "two registrations start clean over one contiguous alias");
+        if (!first || !second) return 1;
+        mapped[32] = 0x91;
+        CHECK(first.query() == GuestWriteWatchQuery::Dirty &&
+                  second.query() == GuestWriteWatchQuery::Dirty,
+              "one raw store dirties both registrations of its physical page");
+        CHECK(first.rearm() && first.query() == GuestWriteWatchQuery::Unchanged &&
+                  second.query() == GuestWriteWatchQuery::Dirty,
+              "first owner rearm does not clear the sibling's dirty generation");
+        CHECK(second.rearm() && second.query() == GuestWriteWatchQuery::Unchanged,
+              "sibling can acknowledge its dirty generation while pages are already armed");
+        prosper::host::guest_write_watch_notify_gpu_write(
+            reinterpret_cast<uint64_t>(mapped), bytes);
+        CHECK(first.query() == GuestWriteWatchQuery::Dirty &&
+                  second.query() == GuestWriteWatchQuery::Dirty &&
+                  probe_access(mapped + 32, true) == AccessProbe::Faulted,
+              "GPU notification dirties both owners without removing actual read-only protection");
+        CHECK(first.rearm() && first.query() == GuestWriteWatchQuery::Unchanged &&
+                  second.query() == GuestWriteWatchQuery::Dirty,
+              "first owner rearm clears only its own GPU-dirty state");
+        CHECK(second.rearm() && second.query() == GuestWriteWatchQuery::Unchanged,
+              "second owner separately clears its GPU-dirty state");
+
+        size_t disarm_bytes, rearm_bytes, noop_bytes, sibling_bytes;
+        bool rearmed, noop_rearmed, sibling_rearmed;
+        {
+            AllocationScope allocations;
+            prosper::host::guest_write_watch_notify_host_write(
+                reinterpret_cast<uint64_t>(mapped), bytes);
+            disarm_bytes = allocations.finish();
+        }
+        CHECK(first.query() == GuestWriteWatchQuery::Dirty &&
+                  second.query() == GuestWriteWatchQuery::Dirty &&
+                  probe_access(mapped + 32, true) == AccessProbe::Allowed &&
+                  probe_access(mapped + bytes - 32, true) == AccessProbe::Allowed,
+              "counted disarm restores both ends and invalidates both registrations");
+        mapped[bytes - 32] = 0xa2;
+        prosper::host::guest_write_watch_notify_host_write_done(
+            reinterpret_cast<uint64_t>(mapped), bytes);
+        {
+            AllocationScope allocations;
+            rearmed = first.rearm();
+            rearm_bytes = allocations.finish();
+        }
+        CHECK(rearmed && first.query() == GuestWriteWatchQuery::Unchanged &&
+                  second.query() == GuestWriteWatchQuery::Dirty &&
+                  probe_access(mapped + 32, true) == AccessProbe::Faulted &&
+                  probe_access(mapped + bytes - 32, true) == AccessProbe::Faulted,
+              "counted rearm protects both ends without cleaning the sibling");
+        {
+            AllocationScope allocations;
+            noop_rearmed = first.rearm();
+            noop_bytes = allocations.finish();
+        }
+        {
+            AllocationScope allocations;
+            sibling_rearmed = second.rearm();
+            sibling_bytes = allocations.finish();
+        }
+        CHECK(noop_rearmed && sibling_rearmed &&
+                  first.query() == GuestWriteWatchQuery::Unchanged &&
+                  second.query() == GuestWriteWatchQuery::Unchanged,
+              "no-op and sibling rearms both preserve real clean authority");
+        CHECK(disarm_bytes <= 24 * pages,
+              "contiguous disarm scratch stays within the page-pointer collection budget");
+        CHECK(rearm_bytes <= 256,
+              "contiguous rearm allocates bounded runs instead of per-page scratch");
+        CHECK(noop_bytes == 0 && sibling_bytes == 0,
+              "already-protected owner and sibling rearms allocate no temporary page vectors");
+        std::printf("watch scalar allocation requests: pages=%zu disarm=%zu rearm=%zu noop=%zu sibling=%zu\n",
+                    pages, disarm_bytes, rearm_bytes, noop_bytes, sibling_bytes);
+        first.reset();
+        second.reset();
+        CHECK(probe_access(mapped + bytes - 32, true) == AccessProbe::Allowed,
+              "allocation fixture final release restores actual write permission");
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(mapped), bytes);
+        munmap(mapped, bytes);
+        close(allocation_fd);
     }
 
     // Arm a watch over the whole range and confirm it starts Unchanged.
