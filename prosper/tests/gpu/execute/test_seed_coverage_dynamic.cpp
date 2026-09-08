@@ -51,28 +51,37 @@ ComputeItem item(const std::vector<uint32_t>& code, const ShaderResourceTable& r
 int main(int argc, char** argv) {
     const bool launch = argc == 2 && std::strcmp(argv[1], "launch") == 0;
     const bool mask_mode = argc == 2 && std::strcmp(argv[1], "mask") == 0;
-    if (!launch && !mask_mode) {
-        std::fprintf(stderr, "usage: test_seed_coverage_dynamic launch|mask\n");
+    const bool coordinates = argc == 2 && std::strcmp(argv[1], "coordinates") == 0;
+    const bool layered = argc == 2 && std::strcmp(argv[1], "layers") == 0;
+    if (!launch && !mask_mode && !coordinates && !layered) {
+        std::fprintf(stderr, "usage: test_seed_coverage_dynamic launch|mask|coordinates|layers\n");
         return 2;
     }
-    std::vector<uint32_t> guest(texels), observed(texels, 0xccccccccu);
-    std::vector<uint32_t> mask(width, 1), expected(texels, stored);
-    for (uint32_t i = 0; i < texels; ++i) guest[i] = 0xabc00000u + i;
+    const uint32_t layers = layered ? 3 : 1;
+    std::vector<uint32_t> guest(texels * layers), observed(texels * layers, 0xccccccccu);
+    // The second half contains destinations for the coordinate-only transition.
+    std::vector<uint32_t> mask(width * 2, 1), expected(texels * layers, stored);
+    for (uint32_t x = 0; x < width; ++x) mask[width + x] = x;
+    for (uint32_t i = 0; i < guest.size(); ++i) guest[i] = 0xabc00000u + i;
     ShaderResource image{};
     image.cls = ResourceClass::StorageImage;
     image.binding = 5;
     image.sgpr_base = 8;
-    image.img_dim = 1;
+    image.img_dim = layered ? 5 : 1;
     image.format = DataFormat::Uint32;
     image.num_components = 1;
     image.width = width;
     image.height = height;
-    image.depth = 1;
+    image.depth = layers;
     image.gpu_addr = reinterpret_cast<uint64_t>(guest.data());
-    image.size = texels * sizeof(uint32_t);
+    image.size = guest.size() * sizeof(uint32_t);
+    if (layered) {
+        image.linear_row_pitch_bytes = width * sizeof(uint32_t);
+        image.layer_stride_bytes = texels * sizeof(uint32_t);
+    }
     ShaderResourceTable producer_resources;
     producer_resources.resources.push_back(image);
-    if (mask_mode) {
+    if (!launch) {
         ShaderResource input{};
         input.cls = ResourceClass::ConstantBuffer;
         input.binding = 2;
@@ -81,7 +90,7 @@ int main(int argc, char** argv) {
         input.num_components = 1;
         input.stride = sizeof(uint32_t);
         input.gpu_addr = reinterpret_cast<uint64_t>(mask.data());
-        input.size = width * sizeof(uint32_t);
+        input.size = mask.size() * sizeof(uint32_t);
         producer_resources.resources.push_back(input);
     }
 
@@ -92,24 +101,39 @@ int main(int argc, char** argv) {
         0xbf840000u,             // s_cbranch_scc0 end (patched below)
         0xd7460004u, 0x04010c10u, // v4 = (s16 << 6) + v0: global X
     };
-    if (mask_mode) {
+    if (layered) {
+        writer.erase(writer.begin(), writer.begin() + 2);
         writer.insert(writer.end(), {
-            0xe0302000u, 0x80000804u, // buffer_load_dword v8, v4, s[0:3], 0 idxen
+            0x7e0c0211u,             // v6 = s17: array layer
+            0x7e0e0211u,             // v7 = s17: per-layer mask index
+        });
+    }
+    if (!launch) {
+        writer.insert(writer.end(), {
+            0xe0302000u, layered ? 0x80000807u : 0x80000804u,
             0xbf8c3f70u,
             0x7daa1080u,             // v_cmpx_ne_u32 0, v8
+        });
+    }
+    if (coordinates) {
+        writer.insert(writer.end(), {
+            0xe0302000u | (width * 4u), 0x80000904u, // destination[x] -> v9
+            0xbf8c3f70u,
+            0x7e080309u,             // v4 = destination; mask is unchanged when it moves
         });
     }
     writer.insert(writer.end(), {0x7e0002ffu, stored}); // v0 = stored integer
     for (uint32_t y = 0; y < height; ++y) {
         writer.insert(writer.end(), {
             0x7e0a0280u + y,         // v5 = row
-            0xf0200108u, 0x00020004u, // IMAGE_STORE x, coords v4/v5, s[8:15]
+            layered ? 0xf0200128u : 0xf0200108u, 0x00020004u,
         });
     }
-    writer[1] |= static_cast<uint32_t>(writer.size() - 2);
+    if (!layered) writer[1] |= static_cast<uint32_t>(writer.size() - 2);
     writer.push_back(0xbf810000u);
     const uint64_t address = launch ? 0x34671001u : 0x34672001u;
     ComputeItem producer = item(writer, producer_resources, address, 1);
+    producer.launch.groups_y = producer.launch.threads_y = layers;
     const auto original_spirv = producer.spirv;
     const auto original_sgprs = producer.user_sgprs;
 
@@ -124,20 +148,28 @@ int main(int argc, char** argv) {
     output.num_components = 1;
     output.stride = sizeof(uint32_t);
     output.gpu_addr = reinterpret_cast<uint64_t>(observed.data());
-    output.size = texels * sizeof(uint32_t);
+    output.size = observed.size() * sizeof(uint32_t);
     ShaderResourceTable consumer_resources;
     consumer_resources.resources = {output, sampled};
     std::vector<uint32_t> reader{0xd7460004u, 0x04010c10u}; // v4 = global X
+    if (layered) {
+        reader.insert(reader.end(), {
+            0x7e0c0211u,             // v6 = s17: sampled array layer
+            0xd7460007u, (0x104u << 18) | (138u << 9) | 17u,
+                                    // v7 = (s17 << 10) + v4: SSBO layer base + X
+        });
+    }
     for (uint32_t y = 0; y < height; ++y) {
         reader.insert(reader.end(), {
             0x7e0a0280u + y,
-            0xf0000108u, 0x00020804u, // IMAGE_LOAD x -> v8, coords v4/v5
+            layered ? 0xf0000128u : 0xf0000108u, 0x00020804u,
             0xbf8c3f70u,
-            0xe0702000u | (y * width * 4u), 0x80000804u,
+            0xe0702000u | (y * width * 4u), layered ? 0x80000807u : 0x80000804u,
         });
     }
     reader.push_back(0xbf810000u);
-    const ComputeItem consumer = item(reader, consumer_resources, address + 1, 2);
+    ComputeItem consumer = item(reader, consumer_resources, address + 1, 2);
+    consumer.launch.groups_y = consumer.launch.threads_y = layers;
     check(!producer.spirv.empty() && !consumer.spirv.empty(), "both actual shaders recompile");
     if (failures) return 1;
 
@@ -163,10 +195,10 @@ int main(int argc, char** argv) {
                   "consumer uses a retained GPU image transfer");
     };
     auto pixels = [&](const char* phase) {
-        for (uint32_t i = 0; i < texels; ++i) {
+        for (uint32_t i = 0; i < guest.size(); ++i) {
             if (guest[i] != expected[i] || observed[i] != expected[i]) {
-                std::fprintf(stderr, "%s %s witness (%u,%u): guest=%08x GPU=%08x expected=%08x\n",
-                             argv[1], phase, i % width, i / width,
+                std::fprintf(stderr, "%s %s witness (%u,%u,%u): guest=%08x GPU=%08x expected=%08x\n",
+                             argv[1], phase, i % width, (i / width) % height, i / texels,
                              guest[i], observed[i], expected[i]);
                 break;
             }
@@ -176,27 +208,70 @@ int main(int argc, char** argv) {
     };
     check(prosper::frontend::execute_live_compute_items({producer}),
           "initial full writer establishes its coverage proof");
-    consume(true);
+    // The array consumer still executes a real IMAGE_LOAD-to-SSBO shader, but
+    // multi-layer native image borrowing is not this fixture's contract.
+    consume(!layered);
     pixels("full");
     if (failures) return 1;
 
-    if (launch) {
-        producer.launch.groups_x = 1;
-        producer.launch.groups_y = 2;
-        producer.launch.threads_x = 64;
-        producer.launch.threads_y = 2;
-        check(producer.launch.groups_x * producer.launch.groups_y * producer.launch.local_x == width,
-              "changed launch preserves the total invocation count");
-    } else {
-        mask[0] = 0;
-        check(producer.launch.groups_x == 2 && producer.launch.groups_y == 1 &&
-              producer.launch.groups_z == 1 && producer.launch.local_x == 64,
-              "runtime input change preserves the launch");
+    if (!launch) {
+        auto transition = [&](const char* phase, uint32_t salt) {
+            check(producer.spirv == original_spirv && producer.user_sgprs == original_sgprs &&
+                  producer.launch.groups_x == 2 && producer.launch.groups_y == layers &&
+                  producer.launch.groups_z == 1 && producer.launch.local_x == 64,
+                  "input transition preserves executable, user SGPRs and launch");
+            for (uint32_t i = 0; i < guest.size(); ++i)
+                guest[i] = 0x24680000u ^ (salt << 16) ^ i;
+            expected = guest;
+            for (uint32_t z = 0; z < layers; ++z)
+                for (uint32_t x = 0; x < width; ++x) {
+                    if (!mask[layered ? z : x]) continue;
+                    const uint32_t destination = coordinates ? mask[width + x] : x;
+                    check(destination < width, "fixture destination stays inside the image");
+                    if (destination >= width) continue;
+                    for (uint32_t y = 0; y < height; ++y)
+                        expected[z * texels + y * width + destination] = stored;
+                }
+            consume(false); // An input change may need a correct fresh GPU upload.
+            pixels(phase);
+            consume(false);
+            pixels("unchanged input repeat");
+        };
+        if (layered) {
+            mask[0] = 1; mask[1] = mask[2] = 0;
+            transition("Full to layer zero only", 1);
+            mask[0] = 0; mask[2] = 1;
+            transition("written layer moves to layer two", 2);
+        } else {
+            std::fill(mask.begin(), mask.begin() + width, 1);
+            if (coordinates)
+                std::fill(mask.begin() + width / 2, mask.begin() + width, 0);
+            else
+                mask[0] = 0;
+            transition("Full to Partial", 1);
+            if (coordinates) {
+                for (uint32_t x = 0; x < width / 2; ++x) mask[width + x] = x + width / 2;
+                transition("fixed active mask moves coordinates to right half", 2);
+            }
+        }
+        std::fill(mask.begin(), mask.begin() + width, 0);
+        transition("Partial to None", 3);
+        std::fill(mask.begin(), mask.begin() + width, 1);
+        for (uint32_t x = 0; x < width; ++x) mask[width + x] = x;
+        transition("None to Full", 4);
+        return failures ? 1 : 0;
     }
+
+    producer.launch.groups_x = 1;
+    producer.launch.groups_y = 2;
+    producer.launch.threads_x = 64;
+    producer.launch.threads_y = 2;
+    check(producer.launch.groups_x * producer.launch.groups_y * producer.launch.local_x == width,
+          "changed launch preserves the total invocation count");
     check(producer.spirv == original_spirv && producer.user_sgprs == original_sgprs,
           "coverage change preserves exact executable bytes and user SGPRs");
     for (uint32_t i = 0; i < texels; ++i) {
-        if (launch ? i % width >= 64 : i % width == 0)
+        if (i % width >= 64)
             guest[i] = expected[i] = 0x24680000u + i;
     }
     // Reproving partial coverage can repair poison into guest bytes and invalidate
