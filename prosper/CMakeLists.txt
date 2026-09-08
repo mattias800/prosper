@@ -2122,6 +2122,16 @@ if(TARGET prosper_core)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_skip_survey.py")
   endif()
 
+  # The baseline comparison's non-obvious verdicts: a run that cannot be judged must FAIL, and a
+  # different GPU must refuse to compare at all. Both are ways the guard could go green while
+  # measuring nothing -- an AMD host refuses no shaders, so an NVIDIA baseline compared there
+  # would report every shader fixed. Pure logic over fixtures: no dump, no GPU, no boot.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME skip_baseline_refuses_what_it_cannot_compare
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_skip_baseline.py")
+  endif()
+
   # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —
   # a strict-validation gate (the render tests only prove llvmpipe accepts them; llvmpipe is
   # lenient). No Vulkan needed, but spirv-val (spirv-tools) IS required: it used to report PASS when
