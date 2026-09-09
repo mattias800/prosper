@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -139,8 +140,29 @@ struct TemporaryBundleFile {
         file.close();
         if (!flushed || !file) { error = "cannot finish bundle temporary file"; return false; }
 #ifdef _WIN32
-        if (!MoveFileExW(payload.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            error = "cannot install bundle: Windows error " + std::to_string(GetLastError());
+        // Replacing a file on Windows leaves the old destination briefly in a delete-pending state,
+        // and a second MoveFileEx onto it during that window is refused with ERROR_ACCESS_DENIED
+        // even though nothing is wrong with either writer. Two captures installing to one path is
+        // not hypothetical -- it is what the concurrent-writer contract in
+        // test_gpu_capture_bundle_streaming asserts, and it failed 5 runs in 20 without this (#3494).
+        //
+        // Bounded, and only for the codes that are transient by construction. A destination another
+        // process holds open for the whole call still fails after the budget, which is what the
+        // "OS sharing restriction refuses replacement" arm in that same test requires: a retry loop
+        // that never gave up would turn that refusal into a hang.
+        DWORD install_error = 0;
+        for (unsigned attempt = 0; attempt < 50; ++attempt) {
+            if (MoveFileExW(payload.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                install_error = 0;
+                break;
+            }
+            install_error = GetLastError();
+            if (install_error != ERROR_ACCESS_DENIED && install_error != ERROR_SHARING_VIOLATION)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (install_error) {
+            error = "cannot install bundle: Windows error " + std::to_string(install_error);
             return false;
         }
 #else
