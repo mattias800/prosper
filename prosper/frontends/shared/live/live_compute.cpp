@@ -1489,7 +1489,7 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
-    GpuRetilePipeline retile_pipeline, volume_retile_pipeline;
+    GpuRetilePipeline retile_pipeline, volume_retile_pipeline, paired16_retile_pipeline;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -1675,6 +1675,7 @@ struct VulkanComputeContext {
         packed_rtt_conversion.destroy();
         retile_pipeline.destroy();
         volume_retile_pipeline.destroy();
+        paired16_retile_pipeline.destroy();
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -9594,27 +9595,46 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const auto* r = bi.resource;
                 if (!bi.storage_writeback || bi.alias_of != SIZE_MAX || bi.imported || bi.storage_write_mask ||
                     !bi.exact_storage_bytes() || !r ||
-                    bi.array_layers != 1 || r->in_mip_tail ||
+                    r->in_mip_tail ||
                     r->layer_mip_offset_bytes || !staging[i]) continue;
                 const bool volume = r->img_dim == 2 && r->depth > 1 && bi.texel_depth == r->depth;
-                if (!volume && (r->depth != 1 || (r->img_dim != 1 && r->img_dim != 5) ||
-                                bi.texel_depth != 1)) continue;
+                const bool array = r->img_dim == 5 && r->depth > 1 &&
+                    bi.array_layers == r->depth && bi.texel_depth == r->depth;
+                if (!array && (bi.array_layers != 1 || (!volume &&
+                    (r->depth != 1 || (r->img_dim != 1 && r->img_dim != 5) || bi.texel_depth != 1))))
+                    continue;
                 // One-layer array descriptors use the same physical 2D tiling,
                 // with either an ordinary or a reflected one-layer array view.
                 const uint32_t bpe = r->format == DataFormat::Float10_11_11 ||
                     r->format == DataFormat::Unorm2_10_10_10 ? 4u :
                     data_format_bytes(r->format) * (r->num_components ? r->num_components : 1u);
-                const bool layout_ok = volume
+                // Paired halfwords require a tight, single-mip ordinary array. An
+                // ambiguous view/stride retains the established CPU layout path.
+                if (array && (bpe != 2 || r->sample_count != 1 || r->declared_mip_levels != 1 ||
+                    bi.mip_levels != 1 || r->mip_chain_base_level || r->mip_chain_max_level ||
+                    r->linear_row_pitch_bytes || r->mip_tail_offset || r->mip_tail_bytes ||
+                    r->mip_tail_x || r->mip_tail_y || r->compression_enabled ||
+                    r->write_compress_enabled || r->metadata_addr || r->dcc_metadata_host_data ||
+                    (r->mip_chain_element_width && r->mip_chain_element_width != r->width) ||
+                    (r->mip_chain_element_height && r->mip_chain_element_height != r->height) ||
+                    (r->mip_chain_bytes_per_block && r->mip_chain_bytes_per_block != bpe))) continue;
+                const bool layout_ok = array
+                    ? bi.retile_parameters.initialize_paired16_array(r->width, r->height, r->depth,
+                        r->tile_mode, properties.limits)
+                    : volume
                     ? bi.retile_parameters.initialize_volume(r->width, r->height, r->depth,
                         bpe, r->tile_mode, properties.limits)
                     : bi.retile_parameters.initialize(r->width, r->height, bpe,
                         r->tile_mode, properties.limits);
                 if (!layout_ok ||
                     bi.retile_parameters.tiled_bytes != bi.guest_bytes ||
-                    bi.retile_parameters.linear_bytes != staging_bytes[i]) continue;
-                auto& retile = volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline;
+                    bi.retile_parameters.linear_bytes != staging_bytes[i] ||
+                    (array && r->layer_stride_bytes && r->layer_stride_bytes !=
+                        bi.retile_parameters.tiled_bytes / r->depth)) continue;
+                auto& retile = array ? ctx.paired16_retile_pipeline :
+                    volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline;
                 auto prepare = [&] {
-                    if (!vk_soft_ok(retile.initialize(ctx.device, ctx.pipeline_cache, volume),
+                    if (!vk_soft_ok(retile.initialize(ctx.device, ctx.pipeline_cache, bi.retile_parameters.kind),
                                     "retile-pipeline")) return false;
                     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                     ci.size = bi.retile_parameters.tiled_bytes;
@@ -10489,7 +10509,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // buffer, and the source scope has to name the write that actually produced the bytes.
             prosper::gpu::record_host_read_barrier(command, staging[i]);
             if (bi.retile_buffer)
-                (bi.retile_parameters.volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
+                (bi.retile_parameters.kind == RetileShaderKind::Paired16Array ? ctx.paired16_retile_pipeline :
+                 bi.retile_parameters.kind == RetileShaderKind::Volume3D ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
                     .record(command, staging[i], bi.retile_buffer,
                             bi.retile_set, bi.retile_parameters);
             if (bi.mirror_result_to_imported) {

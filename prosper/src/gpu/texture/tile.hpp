@@ -44,6 +44,11 @@ bool tile_mode_is_tiled(uint32_t tile_mode);
 // are 128x64 texels / 64 KiB; this is not the volume or mip-tail equation.
 std::array<uint32_t, 16> tile27_rgba16f_equation();
 
+// Mode 24, two-byte texels: even-x pairs own one aligned 32-bit word.
+// Bit 1 is x0 alone; all higher address bits exclude x0. No 16-bit stores needed.
+bool tile64_paired16_equation(uint32_t tile_mode, std::array<uint32_t, 16>& equation,
+                              uint32_t& block_width, uint32_t& block_height);
+
 // Exact 2D 64 KiB equation used by tile_surface, for word-addressable texels.
 // Rejects other layouts; callers must separately exclude volume/mip-tail views.
 bool tile64_word_equation(uint32_t tile_mode, uint32_t bytes_per_texel,

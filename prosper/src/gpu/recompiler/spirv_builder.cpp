@@ -433,7 +433,9 @@ std::vector<uint32_t> build_compute_detile_rgba16f() {
   return e.assemble();
 }
 
-std::vector<uint32_t> build_compute_retile_words(bool volume) {
+std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
+    const bool volume = kind == RetileShaderKind::Volume3D;
+    const bool paired = kind == RetileShaderKind::Paired16Array;
     Emitter e;
     const auto void_t = e.id(), fn_t = e.id(), bool_t = e.id(), uint_t = e.id();
     const auto v3_t = e.id(), input_ptr = e.id(), gid = e.id();
@@ -503,18 +505,26 @@ std::vector<uint32_t> build_compute_retile_words(bool volume) {
         blocks_y = load(push, push_word, constant(24));
         block_shift = load(push, push_word, constant(25));
     }
+    uint32_t linear_layer_words = 0, tiled_layer_words = 0;
+    if (paired) {
+        depth = load(push, push_word, constant(22));
+        linear_layer_words = load(push, push_word, constant(23));
+        tiled_layer_words = load(push, push_word, constant(24));
+    }
     const auto id3 = e.id(), word_x = e.id(), y = e.id();
     uint32_t z = 0;
     Emitter::put(e.code, Op_Load, {v3_t, id3, gid});
     Emitter::put(e.code, Op_CompositeExtract, {uint_t, word_x, id3, 0});
     Emitter::put(e.code, Op_CompositeExtract, {uint_t, y, id3, 1});
-    if (volume) {
+    if (volume || paired) {
         z = e.id();
         Emitter::put(e.code, Op_CompositeExtract, {uint_t, z, id3, 2});
     }
-    const auto row_words = binary(Op_ShiftLeftLogical, params[0], params[2]);
+    const auto row_words = paired ? binary(Op_ShiftRightLogical, params[0], constant(1))
+        : binary(Op_ShiftLeftLogical, params[0], params[2]);
     const auto padded_row_words = binary(Op_ShiftLeftLogical, params[5],
-        binary(Op_IAdd, params[3], params[2]));
+        paired ? binary(Op_ISub, params[3], constant(1))
+               : binary(Op_IAdd, params[3], params[2]));
     const auto height_mask = binary(Op_ISub,
         binary(Op_ShiftLeftLogical, constant(1), params[4]), constant(1));
     const auto padded_height = binary(Op_ShiftLeftLogical,
@@ -523,13 +533,20 @@ std::vector<uint32_t> build_compute_retile_words(bool volume) {
     Emitter::put(e.code, Op_ULessThan, {bool_t, x_valid, word_x, padded_row_words});
     Emitter::put(e.code, Op_ULessThan, {bool_t, y_valid, y, padded_height});
     Emitter::put(e.code, Op_LogicalAnd, {bool_t, valid, x_valid, y_valid});
+    auto in_bounds = valid;
+    if (paired) {
+        const auto layer_valid = e.id(); in_bounds = e.id();
+        Emitter::put(e.code, Op_ULessThan, {bool_t, layer_valid, z, depth});
+        Emitter::put(e.code, Op_LogicalAnd, {bool_t, in_bounds, valid, layer_valid});
+    }
     Emitter::put(e.code, Op_SelectionMerge, {done, 0});
-    Emitter::put(e.code, Op_BranchConditional, {valid, body, done});
+    Emitter::put(e.code, Op_BranchConditional, {in_bounds, body, done});
     Emitter::put(e.code, Op_Label, {body});
-    const auto x = binary(Op_ShiftRightLogical, word_x, params[2]);
+    const auto x = paired ? binary(Op_ShiftLeftLogical, word_x, constant(1))
+                          : binary(Op_ShiftRightLogical, word_x, params[2]);
     const auto component_mask = binary(Op_ISub,
         binary(Op_ShiftLeftLogical, constant(1), params[2]), constant(1));
-    const auto component = binary(Op_BitwiseAnd, word_x, component_mask);
+    const auto component = paired ? constant(0) : binary(Op_BitwiseAnd, word_x, component_mask);
     auto block_row = binary(Op_ShiftRightLogical, y, params[4]);
     if (volume)
         block_row = binary(Op_IAdd, block_row,
@@ -557,8 +574,9 @@ std::vector<uint32_t> build_compute_retile_words(bool volume) {
         byte_offset = binary(Op_BitwiseOr, byte_offset,
             binary(Op_ShiftLeftLogical, binary(Op_BitwiseAnd, population, constant(1)), constant(bit)));
     }
-    const auto address = binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, block_shift),
+    auto address = binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, block_shift),
         binary(Op_ShiftRightLogical, byte_offset, constant(2)));
+    if (paired) address = binary(Op_IAdd, address, binary(Op_IMul, z, tiled_layer_words));
     // Padding has no source texel. Branch before the load; selecting zero AFTER
     // an out-of-range read would still violate the source descriptor's bounds.
     const auto pixel_x = e.id(), pixel_y = e.id();
@@ -576,7 +594,8 @@ std::vector<uint32_t> build_compute_retile_words(bool volume) {
     Emitter::put(e.code, Op_BranchConditional, {pixel_valid, read_pixel, pixel_done});
     Emitter::put(e.code, Op_Label, {read_pixel});
     const auto row = volume ? binary(Op_IAdd, binary(Op_IMul, z, params[1]), y) : y;
-    const auto linear = binary(Op_IAdd, binary(Op_IMul, row, row_words), word_x);
+    auto linear = binary(Op_IAdd, binary(Op_IMul, row, row_words), word_x);
+    if (paired) linear = binary(Op_IAdd, linear, binary(Op_IMul, z, linear_layer_words));
     const auto loaded = load(source, word_ptr, linear);
     Emitter::put(e.code, Op_Branch, {pixel_done});
     Emitter::put(e.code, Op_Label, {pixel_done});

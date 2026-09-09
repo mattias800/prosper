@@ -21,13 +21,14 @@ static bool equation_covers_block(uint32_t mode, uint32_t bpe, uint32_t bx,
                                  uint32_t by, bool broken = false) {
     std::array<uint32_t, 16> equation{};
     uint32_t bw = 0, bh = 0;
-    if (!tile64_word_equation(mode, bpe, equation, bw, bh)) return false;
+    if (!(bpe == 2 ? tile64_paired16_equation(mode, equation, bw, bh)
+                   : tile64_word_equation(mode, bpe, equation, bw, bh))) return false;
     if (broken) equation[15] = 0; // deliberately collapse one address bit
     std::vector<bool> seen(65536 / 4);
     size_t written = 0;
     for (uint32_t y = by * bh; y < (by + 1) * bh; ++y)
-    for (uint32_t x = bx * bw; x < (bx + 1) * bw; ++x)
-    for (uint32_t component = 0; component < bpe / 4; ++component) {
+    for (uint32_t x = bx * bw; x < (bx + 1) * bw; x += bpe == 2 ? 2 : 1)
+    for (uint32_t component = 0; component < std::max(1u, bpe / 4); ++component) {
         uint32_t offset = component * 4;
         for (uint32_t bit = 2; bit < 16; ++bit) {
             const uint32_t parity = std::popcount(
@@ -63,6 +64,8 @@ static bool volume_equation_covers_block(uint32_t mode, uint32_t bpe, bool colla
 int run_case(int argc, char** argv) {
     const bool mixed = argc == 2 && std::strstr(argv[1], "mixed");
     const bool volume = argc == 2 && std::strstr(argv[1], "volume");
+    const bool array16 = argc == 2 && std::strstr(argv[1], "array16");
+    const bool shape_refusal = array16 && std::strstr(argv[1], "shape-refusal");
     const bool cpu = argc == 2 && std::strstr(argv[1], "cpu");
     const bool clean = argc == 2 && std::strcmp(argv[1], "--clean") == 0;
     const bool mapping = argc == 2 && std::strstr(argv[1], "map-");
@@ -114,8 +117,38 @@ int run_case(int argc, char** argv) {
               "3D equation writes every physical word exactly once");
     check(!volume_equation_covers_block(9, 8, true),
           "3D coverage guard rejects a collapsed coordinate bit");
+    check(params.initialize_paired16_array(512, 512, 6, 24, limits) &&
+          params.linear_bytes == 3145728 && params.tiled_bytes == 3145728 &&
+          params.words[23] == 131072 && params.words[24] == 131072 &&
+          params.groups_x == 2 && params.groups_y == 512 && params.groups_z == 6,
+          "six ordinary R16 layers have exact independent word strides");
+    check(!params.initialize_paired16_array(511, 512, 6, 24, limits) &&
+          !params.initialize_paired16_array(512, 512, 0, 24, limits) &&
+          !params.initialize_paired16_array(0, 512, 6, 24, limits) &&
+          !params.initialize_paired16_array(512, 0, 6, 24, limits) &&
+          !params.initialize_paired16_array(512, 512, 6, 27, limits) &&
+          !params.initialize_paired16_array(UINT32_MAX - 1, UINT32_MAX, UINT32_MAX, 24, limits) &&
+          !params.initialize_paired16_array(512, 512, UINT32_MAX, 24, limits),
+          "unpaired rows, unsupported modes, zero shape and overflow decline");
+    for (unsigned field = 0; field < 7; ++field) {
+        auto reduced = limits;
+        if (field == 0) reduced.maxStorageBufferRange = 3145727;
+        if (field == 1) reduced.maxPushConstantsSize = 103;
+        if (field == 2) reduced.maxComputeWorkGroupInvocations = 127;
+        if (field == 3) reduced.maxComputeWorkGroupCount[0] = 1;
+        if (field == 4) reduced.maxComputeWorkGroupCount[1] = 511;
+        if (field == 5) reduced.maxComputeWorkGroupCount[2] = 5;
+        if (field == 6) reduced.maxComputeWorkGroupSize[0] = 127;
+        check(!params.initialize_paired16_array(512, 512, 6, 24, reduced),
+              "paired array respects every device range and dispatch limit");
+    }
+    for (auto [bx, by] : {std::pair{0u, 0u}, std::pair{1u, 1u},
+                          std::pair{3u, 5u}, std::pair{17u, 33u}})
+        check(equation_covers_block(24, 2, bx, by), "paired words cover each complete tile without overlap");
+    check(!equation_covers_block(24, 2, 0, 0, true), "paired permutation guard detects a collapsed bit");
     struct Format { DataFormat format; uint32_t components, bpe; };
-    constexpr Format formats[]{ {DataFormat::Uint32, 1, 4}, {DataFormat::Uint8, 4, 4},
+    const std::vector<Format> formats = array16 ? std::vector<Format>{{DataFormat::Uint16, 1, 2},
+        {DataFormat::Unorm8, 2, 2}, {DataFormat::Float16, 1, 2}} : std::vector<Format>{ {DataFormat::Uint32, 1, 4}, {DataFormat::Uint8, 4, 4},
         {DataFormat::Unorm8, 4, 4}, {DataFormat::Float16, 4, 8}, {DataFormat::Float32, 4, 16} };
     check(params.initialize_volume(64, 64, 128, 8, 9, limits) &&
               params.linear_bytes == 4194304 && params.tiled_bytes == 4194304 &&
@@ -127,38 +160,45 @@ int run_case(int argc, char** argv) {
     auto depth_limits = limits; depth_limits.maxComputeWorkGroupCount[2] = 21;
     check(!params.initialize_volume(67, 19, 21, 8, 9, depth_limits),
           "3D workgroup limit applies to padded depth");
-    const std::vector<uint32_t> modes = mixed ? std::vector<uint32_t>{9} : volume ? std::vector<uint32_t>{5, 9}
+    const std::vector<uint32_t> modes = array16 ? std::vector<uint32_t>{24} : mixed ? std::vector<uint32_t>{9} : volume ? std::vector<uint32_t>{5, 9}
                                               : std::vector<uint32_t>{9, 24, 27};
-    const std::vector<std::pair<uint32_t, uint32_t>> extents = mixed
+    const std::vector<std::pair<uint32_t, uint32_t>> extents = array16
+        ? (shape_refusal ? std::vector<std::pair<uint32_t, uint32_t>>{{257, 131}, {258, 131}}
+                         : std::vector<std::pair<uint32_t, uint32_t>>{{258, 131}, {512, 512}}) : mixed
         ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}} : volume
         ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}, {128, 64}}
         : std::vector<std::pair<uint32_t, uint32_t>>{{257, 131}, {384, 256}};
     uint64_t code = 0x34070000;
     for (uint32_t mode : modes) for (auto format : formats)
     for (auto [width, height] : extents)
-    for (uint32_t view = 0; view < ((volume || mixed) ? 1u : 3u); ++view) {
-        if (mixed && format.format != DataFormat::Float16) continue;
+    for (uint32_t view = 0; view < ((volume || mixed || array16) ? 1u : 3u); ++view) {
+        if (mixed && !array16 && format.format != DataFormat::Float16) continue;
         // Integer 3D images still use the existing raw interchange path. Its packing fallback
         // remains covered; this retile change does not broaden native storage declarations.
         const bool native_volume = native_storage_3d_format_support_bit(
             format.format, format.components) != 0;
-        const bool gpu = !cpu && (!volume || native_volume);
+        const bool gpu = !cpu && !shape_refusal && (!volume || native_volume);
         if (fault_mode && volume && !native_volume) continue;
         // A one-layer array descriptor may be consumed through either a plain
         // 2D instruction or an array instruction retaining its layer coordinate.
-        const uint32_t resource_dim = volume ? 2u : view ? 5u : 1u;
-        const uint32_t instruction_dim = volume ? 2u : view == 2 ? 5u : 1u;
-        const uint32_t depth = volume ? (width == 67 ? 21u : 32u) : 1u;
+        const uint32_t resource_dim = volume ? 2u : (array16 || view) ? 5u : 1u;
+        const uint32_t instruction_dim = volume ? 2u : (array16 || view == 2) ? 5u : 1u;
+        const uint32_t depth = array16 ? 6u : volume ? (width == 67 ? 21u : 32u) : 1u;
         const size_t linear_bytes = size_t(width) * height * depth * format.bpe;
+        const size_t tile_slice = tiled_surface_bytes(width, height, mode, 0, format.bpe);
+        const size_t layer_stride = tile_slice + (shape_refusal && !(width & 1) ? 65536 : 0);
         const size_t tiled_bytes = volume ? tiled_volume_bytes(width, height, depth, mode, format.bpe)
-                                           : tiled_surface_bytes(width, height, mode, 0, format.bpe);
+                                         : layer_stride * (depth - 1) + tile_slice;
         auto tile = [&](uint8_t* dst, const uint8_t* src) {
             if (volume) check(tile_volume(dst, tiled_bytes, src, width, height, depth, mode, format.bpe),
                               "CPU volume layout supports the test resource");
-            else tile_surface(dst, src, width, height, mode, 0, format.bpe);
+            else for (uint32_t layer = 0; layer < depth; ++layer)
+                tile_surface(dst + layer * layer_stride,
+                             src + size_t(layer) * width * height * format.bpe,
+                             width, height, mode, 0, format.bpe);
         };
         std::vector<uint8_t> source_linear(linear_bytes), expected_linear(linear_bytes);
-        std::vector<uint8_t> source(tiled_bytes), destination(tiled_bytes + 64, 0xcc);
+        std::vector<uint8_t> source(tiled_bytes, 0xb7), destination(tiled_bytes + 64, 0xcc);
         auto fill = [&](std::vector<uint8_t>& bytes, uint32_t salt) {
             auto mixed = [&](uint32_t index) {
                 uint32_t v = index + salt * 0x9e3779b9u;
@@ -198,6 +238,12 @@ int run_case(int argc, char** argv) {
             r.width = width; r.height = height; r.depth = depth;
             r.format = format.format; r.num_components = format.components; r.tile_mode = mode;
             r.size = uint32_t(tiled_bytes);
+            if (array16) {
+                // Both inferred and explicit exact strides occur in decoded resources.
+                r.layer_stride_bytes = (width == 512 || shape_refusal) ? uint32_t(layer_stride) : 0;
+                r.mip_chain_element_width = width; r.mip_chain_element_height = height;
+                r.mip_chain_bytes_per_block = format.bpe;
+            }
             r.gpu_addr = reinterpret_cast<uint64_t>(binding == 4 ? source.data() : destination.data());
             resources.resources.push_back(r);
         }
@@ -208,7 +254,8 @@ int run_case(int argc, char** argv) {
             fill(source_linear, 7 + round * 31);
             tile(source.data(), source_linear.data());
             const uint32_t row = round == 0 ? 0 : round == 1 ? height / 2 : height - 1;
-            const uint32_t first_x = round == 2 ? width - 64 : 0;
+            // Odd starts/ends independently update the high and low halves of paired stores.
+            const uint32_t first_x = round == 2 ? width - 64 : (array16 && round == 1 ? 1 : 0);
             const uint32_t slice = round == 0 ? 0 : round == 1 ? depth / 2 : depth - 1;
             const uint32_t shader[]{
                 0x4A0800FFu, first_x, // v_add_nc_u32 v4, first_x, v0
@@ -232,7 +279,7 @@ int run_case(int argc, char** argv) {
             for (const auto& descriptor : reflection.descriptors)
                 if (descriptor.kind == SpirvDescriptorKind::StorageImage &&
                     (descriptor.binding == 4 || descriptor.binding == 5) &&
-                    descriptor.image_dim == (volume ? 2u : 1u) && descriptor.image_arrayed == (view == 2))
+                    descriptor.image_dim == (volume ? 2u : 1u) && descriptor.image_arrayed == (array16 || view == 2))
                     ++matching_views;
             check(reflection.ok() && matching_views == 2,
                   "both storage views reflect the intended ordinary or array shader type");
@@ -275,7 +322,7 @@ int run_case(int argc, char** argv) {
                 std::copy_n(source_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe,
                             format.bpe, expected_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe);
             }
-            std::vector<uint8_t> expected(tiled_bytes);
+            std::vector<uint8_t> expected(tiled_bytes, 0xcc);
             tile(expected.data(), expected_linear.data());
             check(std::equal(expected.begin(), expected.end(), destination.begin()),
                   "every guest byte matches CPU tiling, including untouched texels and padding");
@@ -296,7 +343,7 @@ int run_case(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--mixed") == 0) {
         // All three use the same retained live context and its immutable retile pipelines.
-        for (const char* option : {"--mixed-2d", "--mixed-volume", "--mixed-2d"}) {
+        for (const char* option : {"--mixed-2d", "--mixed-volume", "--mixed-array16", "--mixed-2d"}) {
             char* args[]{argv[0], const_cast<char*>(option)};
             if (run_case(2, args)) return 1;
         }
