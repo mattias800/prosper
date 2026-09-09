@@ -6659,6 +6659,430 @@ int main() {
     }
     printf("  [ok]   packed POS_X/Y_FLOAT system VGPRs source gl_FragCoord\n");
 
+
+    // ---------------------------------------------------------------------------------------
+    // fragment_spirv_wave_width_independent: the shipped predicate behind #3464's native-wave32
+    // allowance. Its POSITIVE answer is what lets a draw run at the host's 32-lane fragment
+    // subgroup instead of being skipped, so the checks that matter are the REFUSALS -- and the
+    // sharpest of them is the counterexample that retired the value-reachability predecessor:
+    //
+    //     let the guest predicate be true in the upper 32 lanes and false in the lower. Branch on
+    //     any(P) and store a constant into the colour output in the taken block. A 64-lane wave
+    //     takes the branch and every lane sees the constant; two independent 32-lane groups
+    //     disagree, and the constant lands in one half only.
+    //
+    // The vote's VALUE never reaches that store -- only the branch does -- so asking whether a vote
+    // can reach an output calls the module safe. It is not.
+    //
+    // Every module below is assembled BY HAND from raw words rather than recompiled, so each case
+    // exists independently of what the emitter happens to produce. The divergent and uniform arms
+    // are the same shapes with one word changed (Input vs StorageBuffer), which is what makes
+    // either verdict meaningful: were the uniform arm inert the second group would fail, and were
+    // it too permissive the first would.
+    {
+        auto ins = [](std::vector<uint32_t>& out, uint32_t op,
+                      std::initializer_list<uint32_t> operands) {
+            out.push_back(((1u + (uint32_t)operands.size()) << 16) | op);
+            for (uint32_t w : operands) out.push_back(w);
+        };
+        // ids: 1 bool, 2 float, 3 vec4, 4 ptr_out, 5 out_var, 6 scope const, 7 ptr_src,
+        //      8 src_var, 9 the vote's predicate, 10 the vote, 11 a constant, 20.. labels
+        const uint32_t kInput = 1, kOutput = 3, kFunction = 7, kStorageBuffer = 12;
+        auto preamble = [&](uint32_t storage) {
+            std::vector<uint32_t> b{0x07230203u, 0x00010300u, 0, 64, 0};
+            ins(b, 20, {1});                    // OpTypeBool
+            ins(b, 22, {2, 32});                // OpTypeFloat 32
+            ins(b, 23, {3, 2, 4});              // OpTypeVector
+            ins(b, 32, {4, 3, kOutput});        // OpTypePointer Output vec4
+            ins(b, 59, {4, 5, kOutput});        // OpVariable Output
+            ins(b, 43, {2, 6, 3});              // OpConstant, used as the scope literal
+            ins(b, 43, {2, 11, 1});             // OpConstant, the value a taken block stores
+            ins(b, 32, {7, 1, storage});        // OpTypePointer <storage> bool
+            ins(b, 59, {7, 8, storage});        // OpVariable <storage>
+            ins(b, 61, {1, 9, 8});              // OpLoad -> %9
+            return b;
+        };
+        // any(P) guards a block that stores a constant into the colour output.
+        auto branch_only = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(storage);
+            ins(b, 335, {1, 10, 6, 9});         // OpGroupNonUniformAny
+            ins(b, 248, {20});                  // OpLabel
+            ins(b, 247, {22, 0});               // OpSelectionMerge
+            ins(b, 250, {10, 21, 22});          // OpBranchConditional
+            ins(b, 248, {21}); ins(b, 62, {5, 11}); ins(b, 249, {22});
+            ins(b, 248, {22}); ins(b, 253, {});
+            return b;
+        };
+        // The two arms merge in a phi carrying different values, and the phi reaches the output.
+        auto phi_of_constants = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(storage);
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 248, {20});
+            ins(b, 247, {23, 0});
+            ins(b, 250, {10, 21, 22});
+            ins(b, 248, {21}); ins(b, 249, {23});
+            ins(b, 248, {22}); ins(b, 249, {23});
+            ins(b, 248, {23});
+            ins(b, 245, {2, 24, 11, 21, 6, 22});   // OpPhi, a different value per edge
+            ins(b, 62, {5, 24});
+            ins(b, 253, {});
+            return b;
+        };
+        // The one shape the predecessor did catch: the vote's own value is stored.
+        auto value_to_output = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(storage);
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 248, {20}); ins(b, 62, {5, 10}); ins(b, 253, {});
+            return b;
+        };
+
+        struct Case { const char* what; std::vector<uint32_t> spv; bool expect_independent; };
+        std::vector<uint32_t> dead = preamble(kInput);
+        ins(dead, 335, {1, 10, 6, 9});
+        ins(dead, 248, {20});
+        ins(dead, 247, {22, 0});
+        ins(dead, 250, {10, 21, 22});
+        ins(dead, 248, {21}); ins(dead, 129, {2, 25, 11, 11}); ins(dead, 249, {22});
+        ins(dead, 248, {22}); ins(dead, 62, {5, 11}); ins(dead, 253, {});
+
+        std::vector<uint32_t> unstructured = preamble(kInput);
+        ins(unstructured, 335, {1, 10, 6, 9});
+        ins(unstructured, 248, {20});
+        ins(unstructured, 250, {10, 21, 22});      // no OpSelectionMerge: no region to bound
+        ins(unstructured, 248, {21}); ins(unstructured, 249, {22});
+        ins(unstructured, 248, {22}); ins(unstructured, 253, {});
+
+        std::vector<uint32_t> uniform_ballot = preamble(kStorageBuffer);
+        ins(uniform_ballot, 21, {30, 32, 0});      // OpTypeInt 32 unsigned
+        ins(uniform_ballot, 23, {31, 30, 4});      // OpTypeVector uint 4
+        ins(uniform_ballot, 339, {31, 10, 6, 9});  // OpGroupNonUniformBallot
+        ins(uniform_ballot, 248, {20});
+        ins(uniform_ballot, 81, {30, 33, 10, 0});  // OpCompositeExtract .x
+        ins(uniform_ballot, 62, {5, 33});
+        ins(uniform_ballot, 253, {});
+
+        // The effect the region performs is a STORAGE BUFFER write, not a colour store. A check
+        // that only looked for Output stores would call this safe; it is not, because the write
+        // happens in one 32-lane group and not the other and the rest of the draw can read it.
+        std::vector<uint32_t> guards_uav = preamble(kInput);
+        ins(guards_uav, 32, {40, 2, kStorageBuffer});
+        ins(guards_uav, 59, {40, 41, kStorageBuffer});
+        ins(guards_uav, 335, {1, 10, 6, 9});
+        ins(guards_uav, 248, {20});
+        ins(guards_uav, 247, {22, 0});
+        ins(guards_uav, 250, {10, 21, 22});
+        ins(guards_uav, 248, {21}); ins(guards_uav, 62, {41, 11}); ins(guards_uav, 249, {22});
+        ins(guards_uav, 248, {22}); ins(guards_uav, 253, {});
+
+        // Whether the fragment survives at all is the vote's answer.
+        std::vector<uint32_t> guards_discard = preamble(kInput);
+        ins(guards_discard, 335, {1, 10, 6, 9});
+        ins(guards_discard, 248, {20});
+        ins(guards_discard, 247, {22, 0});
+        ins(guards_discard, 250, {10, 21, 22});
+        ins(guards_discard, 248, {21}); ins(guards_discard, 252, {});
+        ins(guards_discard, 248, {22}); ins(guards_discard, 62, {5, 11});
+        ins(guards_discard, 253, {});
+
+        // The uniform branch_only module with ONE extra instruction: an unrelated store into a
+        // second storage buffer, outside the vote's region. That instruction is the whole
+        // experiment -- if the verdict does not flip, "uniform" is only testing which storage class
+        // the pointer had rather than whether the value is invocation-invariant.
+        std::vector<uint32_t> uniform_but_writes = preamble(kStorageBuffer);
+        ins(uniform_but_writes, 32, {40, 2, kStorageBuffer});
+        ins(uniform_but_writes, 59, {40, 41, kStorageBuffer});
+        ins(uniform_but_writes, 335, {1, 10, 6, 9});
+        ins(uniform_but_writes, 248, {20});
+        ins(uniform_but_writes, 62, {41, 11});          // the extra instruction: a UAV write
+        ins(uniform_but_writes, 247, {22, 0});
+        ins(uniform_but_writes, 250, {10, 21, 22});
+        ins(uniform_but_writes, 248, {21}); ins(uniform_but_writes, 62, {5, 11});
+        ins(uniform_but_writes, 249, {22});
+        ins(uniform_but_writes, 248, {22}); ins(uniform_but_writes, 253, {});
+
+        // A divergent branch reconverges in a phi, and the PHI is what the vote reduces. Both
+        // incoming values are uniform constants, so a rule that asked only "are the incoming
+        // values uniform?" called the phi uniform and admitted this -- while the phi IS the
+        // divergent predicate that selected it. The identical-edge variant differs by one operand
+        // id and nothing else, so a phi rule that is inert and one that is too permissive both fail.
+        auto phi_before_vote = [&](uint32_t lower_value) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 248, {20});
+            ins(b, 247, {23, 0});
+            ins(b, 250, {9, 21, 22});          // branch on the DIVERGENT value itself
+            ins(b, 248, {21}); ins(b, 249, {23});
+            ins(b, 248, {22}); ins(b, 249, {23});
+            ins(b, 248, {23});
+            ins(b, 245, {1, 24, 11, 21, lower_value, 22});
+            ins(b, 335, {1, 10, 6, 24});       // the vote reduces the PHI
+            ins(b, 62, {5, 10});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // A vote over a value read back through an ACCESS CHAIN. As a Function local the array is
+        // per-invocation: a divergent value is written into it and read back, so the vote is
+        // divergent however uniform the POINTER is. A Function variable with a uniform initializer
+        // used to inherit that uniformity, the chain inherited it from the variable and the load
+        // from the chain, so the vote cleared on where it pointed rather than on what was there.
+        // The StorageBuffer spelling is the same module with one word changed, and must still be
+        // admitted -- otherwise the fix is "stop trusting access chains" rather than a fix.
+        auto vote_over_chain = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0});
+            ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, storage, 32});
+            ins(b, 44, {32, 34, 11, 11, 11, 11});
+            ins(b, 59, {33, 35, storage, 34});
+            ins(b, 32, {36, storage, 1});
+            ins(b, 248, {20});
+            ins(b, 65, {36, 37, 35, 31});
+            if (storage == kFunction) ins(b, 62, {37, 9});   // store the DIVERGENT value
+            ins(b, 61, {1, 38, 37});
+            ins(b, 335, {1, 10, 6, 38});
+            ins(b, 62, {5, 10});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // The vote reaches an OpSwitch SELECTOR and each case stores a different constant. Modelling
+        // only a switch's successors and not its selector left this with no control dependence at
+        // all -- nothing in it is an OpBranchConditional, so the whole construct was invisible. The
+        // CFG emitter builds a switch on the guest PC, so the shape is not theoretical.
+        std::vector<uint32_t> vote_to_switch = preamble(kInput);
+        ins(vote_to_switch, 248, {20}); ins(vote_to_switch, 61, {1, 9, 8});
+        ins(vote_to_switch, 335, {1, 10, 6, 9});
+        ins(vote_to_switch, 169, {2, 25, 10, 11, 6});      // OpSelect -> selector from the vote
+        ins(vote_to_switch, 247, {28, 0});
+        ins(vote_to_switch, 251, {25, 26, 0, 27});         // OpSwitch
+        ins(vote_to_switch, 248, {26}); ins(vote_to_switch, 62, {5, 11});
+        ins(vote_to_switch, 249, {28});
+        ins(vote_to_switch, 248, {27}); ins(vote_to_switch, 62, {5, 6});
+        ins(vote_to_switch, 249, {28});
+        ins(vote_to_switch, 248, {28}); ins(vote_to_switch, 253, {});
+
+        // A vote-tainted value stored into a local through ONE access chain and read back through
+        // ANOTHER into the same slot. Keying taint by pointer id lost the dependence, and the
+        // emitter mints a fresh chain per guest-scratch access, so one slot really is reached
+        // through several ids. `stored` is the whole experiment: the vote, or a constant.
+        auto two_chains = [&](uint32_t stored) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, kFunction, 32});
+            ins(b, 59, {33, 34, kFunction});
+            ins(b, 32, {35, kFunction, 1});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 65, {35, 36, 34, 31});                  // chain A
+            ins(b, 62, {36, stored});
+            ins(b, 65, {35, 37, 34, 31});                  // chain B, same slot
+            ins(b, 61, {1, 38, 37});
+            ins(b, 62, {5, 38});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // One slot reached through an access chain and an OpCopyObject of it. OpCopyObject derives
+        // a pointer without being a chain, so a root map following only chains gave the copy its own
+        // identity and lost the store/load dependence.
+        auto slot_via_copy = [&](uint32_t stored) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, kFunction, 32}); ins(b, 59, {33, 34, kFunction});
+            ins(b, 32, {35, kFunction, 1});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 65, {35, 36, 34, 31});
+            ins(b, 62, {36, stored});
+            ins(b, 83, {35, 37, 36});                      // OpCopyObject of that pointer
+            ins(b, 61, {1, 38, 37});
+            ins(b, 62, {5, 38});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // A vote-guarded region performing an atomic. 234 (OpAtomicIAdd) sits inside the numeric
+        // window the observable check used and 6035 (OpAtomicFAddEXT) does not, while the modules
+        // are otherwise identical -- so a membership test written as a range admitted one.
+        auto region_atomic = [&](uint32_t atomic_op) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 247, {22, 0});
+            ins(b, 250, {10, 21, 22});
+            ins(b, 248, {21}); ins(b, atomic_op, {30, 39, 34, 6, 6, 31}); ins(b, 249, {22});
+            ins(b, 248, {22}); ins(b, 62, {5, 11}); ins(b, 253, {});
+            return b;
+        };
+
+        // The CONTROL-DEPENDENCE twin of the two-chain fixture: the value stored inside the region
+        // is a CONSTANT, so nothing carries the vote by data flow -- what carries it is whether the
+        // store ran. The two reach the taint through different code.
+        std::vector<uint32_t> region_second_chain = preamble(kInput);
+        {
+            std::vector<uint32_t>& b = region_second_chain;
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, kFunction, 32}); ins(b, 59, {33, 34, kFunction});
+            ins(b, 32, {35, kFunction, 1});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 247, {22, 0});
+            ins(b, 250, {10, 21, 22});
+            ins(b, 248, {21}); ins(b, 65, {35, 36, 34, 31}); ins(b, 62, {36, 11});
+            ins(b, 249, {22});
+            ins(b, 248, {22});
+            ins(b, 65, {35, 37, 34, 31});                  // a SECOND chain into the same slot
+            ins(b, 61, {1, 38, 37});
+            ins(b, 62, {5, 38});
+            ins(b, 253, {});
+        }
+
+        // A vote-derived value written to a UAV by an atomic, in straight-line code. The
+        // leaving-scan tested word 3 -- an atomic's POINTER -- while the value it writes is further
+        // along, so the scan fired and read the wrong word. The swapped form was already refused,
+        // which is what proved the scan ran at all; the pair separates "fires" from "reads right".
+        auto atomic_writes_vote = [&](bool swap) {
+            const uint32_t ptr = swap ? 10u : 34u, val = swap ? 34u : 10u;
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 234, {30, 39, ptr, 6, 6, val});         // OpAtomicIAdd
+            ins(b, 62, {5, 11});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // A tainted local moved to the colour output. OpCopyMemory moves a value with no
+        // OpLoad/OpStore pair for the closure to follow; the `false` spelling is the same module
+        // written as a load and a store, which was always refused.
+        auto copy_memory_out = [&](bool via_copy) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 32, {30, kFunction, 1}); ins(b, 59, {30, 31, kFunction});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 62, {31, 10});                          // store the vote into a local
+            if (via_copy) {
+                ins(b, 63, {5, 31});                       // OpCopyMemory out
+            } else {
+                ins(b, 61, {1, 32, 31}); ins(b, 62, {5, 32});
+            }
+            ins(b, 253, {});
+            return b;
+        };
+
+        // A vote over a storage-buffer load in a shader whose only memory write is `op`.
+        // `writes_memory` gates the uniform arm -- a buffer this shader writes cannot lend
+        // uniformity -- and it was the THIRD place spelling out which opcodes write memory. It kept
+        // the 227..242 window after the others moved to a named set, so OpAtomicFAddEXT (6035)
+        // counted as no write while the identical module with OpAtomicIAdd (234) counted; op 0 is
+        // OpCopyMemory into the buffer, which that predicate had never heard of.
+        auto buffer_written_by = [&](uint32_t op) {
+            std::vector<uint32_t> b = preamble(kStorageBuffer);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            if (op == 0) ins(b, 63, {34, 8});                 // OpCopyMemory into the buffer
+            else ins(b, op, {30, 39, 34, 6, 6, 31});          // ...or an atomic on it
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 62, {5, 10});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // Observable and yet writing nothing a later load can read back. `writes_memory` is defined
+        // in terms of the observable-effect predicate, and folding barriers in without excluding
+        // them cost Evergate 10 of its 11 provable modules -- any module containing one stopped
+        // being able to treat a constant buffer as uniform.
+        std::vector<uint32_t> barrier_only = preamble(kStorageBuffer);
+        ins(barrier_only, 248, {20}); ins(barrier_only, 61, {1, 9, 8});
+        ins(barrier_only, 224, {6, 6, 6});                    // OpControlBarrier
+        ins(barrier_only, 335, {1, 10, 6, 9});
+        ins(barrier_only, 62, {5, 10}); ins(barrier_only, 253, {});
+
+        std::vector<uint32_t> no_votes = preamble(kInput);
+        ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
+
+        const Case cases[] = {
+            {"a divergent vote guarding a store to the colour output",
+             branch_only(kInput), false},
+            {"a divergent vote whose arms merge in a phi that reaches the output",
+             phi_of_constants(kInput), false},
+            {"a divergent vote whose value is stored to the colour output",
+             value_to_output(kInput), false},
+            {"a vote-conditioned branch with no merge instruction", unstructured, false},
+            {"a BALLOT over a uniform value reaching the output", uniform_ballot, false},
+            {"a divergent vote guarding a STORAGE BUFFER write", guards_uav, false},
+            {"a divergent vote guarding a discard", guards_discard, false},
+            {"a vote over a storage buffer THIS SHADER WRITES", uniform_but_writes, false},
+            {"a vote over a phi whose DIVERGENT branch chose between uniform constants",
+             phi_before_vote(6), false},
+            {"a vote over a phi whose edges all carry the SAME value",
+             phi_before_vote(11), true},
+            {"a vote over a LOCAL written per lane and read back through an access chain",
+             vote_over_chain(kFunction), false},
+            {"a vote over a constant buffer read through an access chain",
+             vote_over_chain(kStorageBuffer), true},
+            {"a vote reaching an OpSwitch selector whose cases store different constants",
+             vote_to_switch, false},
+            {"a vote stored and reloaded through TWO chains into one local slot",
+             two_chains(10), false},
+            {"two chains into one slot carrying a value the vote never touched",
+             two_chains(11), true},
+            {"a vote reaching one slot through an access chain and an OpCopyObject of it",
+             slot_via_copy(10), false},
+            {"a chain and an OpCopyObject carrying a value the vote never touched",
+             slot_via_copy(11), true},
+            {"a vote-guarded region performing an INTEGER atomic", region_atomic(234), false},
+            {"a vote-guarded region performing a FLOAT atomic outside the old range",
+             region_atomic(6035), false},
+            {"a vote-guarded region whose store is read back through a second chain",
+             region_second_chain, false},
+            {"a vote-derived value written to a UAV by an atomic",
+             atomic_writes_vote(false), false},
+            {"...and with the atomic's pointer and value exchanged",
+             atomic_writes_vote(true), false},
+            {"a tainted local moved to the colour output by OpCopyMemory",
+             copy_memory_out(true), false},
+            {"...and the same module written as a load and a store",
+             copy_memory_out(false), false},
+            {"a vote over a buffer this shader writes with a FLOAT atomic",
+             buffer_written_by(6035), false},
+            {"...and with an integer atomic, which the old window did catch",
+             buffer_written_by(234), false},
+            {"a vote over a buffer this shader writes with OpCopyMemory",
+             buffer_written_by(0), false},
+            {"a barrier is observable but is not a memory write", barrier_only, true},
+            {"a UNIFORM vote guarding a store to the colour output",
+             branch_only(kStorageBuffer), true},
+            {"a UNIFORM vote whose arms merge in a phi that reaches the output",
+             phi_of_constants(kStorageBuffer), true},
+            {"a UNIFORM vote whose value is stored to the colour output",
+             value_to_output(kStorageBuffer), true},
+            {"a divergent vote that cannot influence any output", dead, true},
+            {"a module with no wave vote at all", no_votes, true},
+            {"a module that is not SPIR-V at all", std::vector<uint32_t>{1, 2, 3, 4, 5}, false},
+        };
+        for (const Case& c : cases) {
+            const bool got = fragment_spirv_wave_width_independent(c.spv);
+            if (got != c.expect_independent) {
+                printf("  [FAIL] wave width independence: %s -> %s, expected %s\n", c.what,
+                       got ? "independent" : "NOT PROVEN",
+                       c.expect_independent ? "independent" : "NOT PROVEN");
+                return 1;
+            }
+        }
+        printf("  [ok]   wave width independence: %zu hand-built modules classified as expected\n",
+               sizeof(cases) / sizeof(cases[0]));
+    }
+
     printf("== PASS ==\n");
     return 0;
 }

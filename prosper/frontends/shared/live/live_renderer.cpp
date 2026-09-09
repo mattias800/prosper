@@ -1209,11 +1209,54 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
-    // GTA V's reviewed Performance-mode route contains Wave64 fragment programs whose only
-    // remaining width reason is a control-flow WaveAny. The backend may run that narrow class at
-    // NVIDIA's native Wave32 only for this title; every other title keeps master's fail-visible
-    // exact-width contract, and ballots/lane identity/scalar reductions stay exact even here.
-    const bool gta5_native_fragment_vote = title_id == "PPSA04263";
+    // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
+    //
+    // The classifier (render_runner.h) admits a reason set of EXACTLY kFragmentWaveReasonWaveAny --
+    // no lane identity, no ballot, no shuffle, no scalar reduction. What this list controls is which
+    // titles that classifier is trusted on, and it is a list rather than a switch for a measured
+    // reason: every entry has a before/after survey on a reviewed route on this project's hardware,
+    // and joining it is one run (`tools/shader_inspect/skip_survey.py --from-snapshots`).
+    //
+    // Why not simply always-on, which is what #3464 W5 first proposed. The surveyed set is NOT a
+    // random sample of the corpus -- it is the titles that have snapshot routes, which biases toward
+    // simple, mature fragment work. That is exactly the population least likely to contain the
+    // shader this classifier still mis-admits, because the "control-flow only" property the safety
+    // argument rests on is NOT what the classifier tests (it tests the reason set, and the vote taint
+    // that would raise ScalarReduce has known escapes: `sel()` drops the taint `bsel()` propagates,
+    // and a vote routed into VCC is read per-lane by v_cndmask_b32 with no marker). Until the
+    // classifier tests the property its safety argument claims, each title is admitted on evidence.
+    //
+    // Keeping it title-keyed also preserves an invariant an always-on switch silently broke: tests
+    // and gpu_replay call register_live_renderer without a title_id (live_renderer.hpp:156 defaults
+    // it to {}), so they match nothing and keep the strict exact-width contract. gpu_replay gates on
+    // expected_output_hash, so admitting there would have moved the project's offline oracle.
+    //
+    // Measured on Windows/NVIDIA, reviewed routes (#3464, PR #3480). Modules reporting exactly
+    // WaveAny, and how many of them are PROVABLY width-independent:
+    //   PPSA01885 Evergate         11 of 11 (title + gameplay routes; the title screen's missing
+    //                                        3D content is restored, confirmed by eye)
+    //   PPSA02664 Alex Kidd DX       8 of 8  (title screen confirmed correct by eye; its WORLD has
+    //                                        a separate, unrelated defect -- #3479)
+    //   PPSA13579 Blasphemous 2      1 of 8
+    //   PPSA25009 Blue Prince       18 of 22
+    //   PPSA04263 Grand Theft Auto V         the original reviewed bank route
+    //
+    // Two of those titles are on the list although most or some of their modules do NOT clear. That
+    // is safe BECAUSE the decision is per module: the 11 that cannot be proved keep the exact-width
+    // contract and are refused individually. Admitting a title no longer means trusting all of its
+    // shaders, which is what made a title the wrong unit before.
+    //
+    // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
+    // run away, and with the per-module proof the run is confirmation rather than a gamble.
+    static const char* const kNativeFragmentVoteTitles[] = {
+        "PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009",
+    };
+    // The opt-out exists so the A/B stays reproducible, following PROSPER_NO_GUEST_FS: a default-on
+    // behaviour whose disable switch is for bisection, not for routine use.
+    const bool native_fragment_vote_width =
+        !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
+        std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
+                    [&](const char* id) { return title_id == id; });
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -1699,7 +1742,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     if (batch_backend_submits)
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps, invalidate_ds, gta5_native_fragment_vote](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             // #2215 instrument: publish which thread is inside a submit-render callback right
@@ -7590,7 +7633,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.allow_native_fragment_vote_width =
-                        !fs_ov && gta5_native_fragment_vote;
+                        !fs_ov && native_fragment_vote_width;
                     bd.draw_index = it.draw_index;
                     bd.command_order = it.command_order;
                     bd.vcount = refvs ? 3u : it.vertex_count;

@@ -550,6 +550,33 @@ inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.
+// Whether this fragment module's wave votes answer the same at a narrower subgroup width.
+//
+// The native-wave32 allowance needs exactly this and nothing weaker. NVIDIA reports
+// minSubgroupSize == maxSubgroupSize == 32 for fragment, so a guest program that asked for a
+// 64-lane wave either runs over two independent 32-lane groups or does not run at all -- and the
+// only honest way to let it run is to prove the split cannot change a pixel.
+//
+// A vote clears on either of two independent grounds:
+//   (a) its operand is provably wave-uniform. Any(P) reduces P over whatever lanes the group holds,
+//       so when every invocation agrees on P the reduction IS P, at any width.
+//   (b) its result cannot influence a colour output -- through data flow OR through control
+//       dependence. A dead vote can be answered any way at all.
+//
+// Both halves of (b) are load-bearing, and the second one is the correction this replaced. Value
+// reachability alone says a vote used only as a branch condition is harmless, when in fact it
+// decides WHICH store runs: with the guest predicate true in the upper 32 lanes and false in the
+// lower, a 64-lane any() takes a branch that two 32-lane groups disagree about, and whatever the
+// taken block writes lands in one half only. Measured over 49 real fragment modules from four
+// titles, value reachability clears 49 of 49 while control dependence clears 1 -- so the weaker
+// question was not merely imprecise, it could not see the population at all. With arm (a) added,
+// 38 of the 49 clear.
+//
+// The error direction is chosen throughout: a module that cannot be parsed, a construct without a
+// merge, an opcode nobody classified -- each answers "not proven", costing a draw its native-width
+// fast path rather than shipping a wrong pixel.
+bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv);
+
 uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv);
 
 inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;

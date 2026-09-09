@@ -2136,6 +2136,21 @@ if(TARGET prosper_core)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_skip_baseline.py")
   endif()
 
+  # Whether a fragment module answers the same over two 32-lane groups as over one 64-lane wave --
+  # the property the wave32 allowance actually needs, and NOT the one the shipping classifier tests
+  # (it tests the reason set, i.e. how the vote was produced). Its fixtures are hand-assembled
+  # SPIR-V, so each case exists independently of what the emitter happens to produce.
+  #
+  # Half the cases must be REFUSED, including the one that retired the earlier value-reachability
+  # predicate: a vote used only as a branch condition never flows into a store, yet it decides which
+  # store runs. The divergent and uniform arms are the same three shapes with one word changed, so
+  # a uniform arm that did nothing and one that did too much both fail rather than look perfect.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME wave_width_independence_refuses_the_class
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_wave_width_independent.py")
+  endif()
+
   # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —
   # a strict-validation gate (the render tests only prove llvmpipe accepts them; llvmpipe is
   # lenient). No Vulkan needed, but spirv-val (spirv-tools) IS required: it used to report PASS when

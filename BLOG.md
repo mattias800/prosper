@@ -19,6 +19,35 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-09
+
+### Two title screens NVIDIA was throwing away, and the proof that lets us keep them
+
+PS5 shaders often ask for a 64-lane wave. NVIDIA's fragment stage only offers 32 and no extension
+changes that, so prosper was dropping every shader that asked — and a dropped fragment shader takes
+its draws with it. That is why Evergate's title screen was a logo on an empty void and Alex Kidd's
+was menu text on bare wallpaper, on Windows, while both were fine on AMD.
+
+The fix is not a switch, it is a proof. For each shader prosper now works out whether answering its
+wave vote over two 32-lane groups instead of one 64-lane wave could change a single pixel. Usually it
+cannot — the guest is testing a constant-buffer scalar every pixel agrees on — and those shaders now
+run. The ones where it could still keep the strict contract and are still dropped.
+
+Each pair below is the same route and the same frame, with `PROSPER_STRICT_FRAGMENT_WAVE_WIDTH=1` the
+only difference.
+
+![Evergate's title screen with the strict wave contract: the logo, "Press any button" and the Stone Lantern mark floating on an empty purple void](assets/screenshots/evergate-title-wave64-strict.webp)
+
+![The same frame with the proof: the seed-pod tree on its cliff, the cloud bank, the beam and the standing stones all present](assets/screenshots/evergate-title-wave32-proved.webp)
+
+![Alex Kidd in Miracle World DX with the strict wave contract: the wallpaper pattern on black, no key art and no menu panel](assets/screenshots/alexkidd-title-wave64-strict.webp)
+
+![The same frame with the proof: Alex mid-punch, both dragons, the game logo and the full menu on its orange panel](assets/screenshots/alexkidd-title-wave32-proved.webp)
+
+Alex Kidd's *world* is still wrong on this machine, and it is a different defect — the wave width
+makes no measurable difference to it either way.
+[#3479](https://github.com/mattias800/prosper/issues/3479).
+
 ## 2026-09-06
 
 ### Thirty-one cores watched one core convert a 4K video frame
