@@ -388,11 +388,24 @@ void test_kernel_memory_pool() {
             snprintf(msg, sizeof(msg), "GetPageTableStats leaves the upper 4 bytes of out%d alone", i);
             CHECK((uint32_t)(slot[i] >> 32) == 0x5A5A5A5Au, msg);
         }
-        // Kills: dropping the null guards on the second, third or fourth pointer -- a plausible
-        // edit, since only the first is obviously an out-parameter at a glance.
-        uint64_t one = 0;
-        CHECK(pts((uint64_t)(uintptr_t)&one, 0, 0, 0, 0, 0) != 0,
-              "GetPageTableStats rejects a null in ANY of its four slots");
+        // Kills: dropping the null guard on ANY ONE of the four pointers -- a plausible edit,
+        // since only the first is obviously an out-parameter at a glance.
+        //
+        // Each iteration nulls exactly ONE slot and leaves the other three valid, which is the
+        // whole point. The first version of this arm passed a single configuration -- one valid
+        // pointer and three nulls -- and asserted it covered "any" slot. It did not: deleting the
+        // `!a2` or `!a3` disjunct still left `!a1` to catch that call, so the arm stayed green
+        // against the very mutation it named. An arm that sits NEXT to the gap it claims reads
+        // exactly like one that covers it. Raised in review of #3505.
+        for (int null_slot = 0; null_slot < 4; ++null_slot) {
+            uint64_t sink[4] = {0, 0, 0, 0};
+            uint64_t arg[4];
+            for (int j = 0; j < 4; ++j) arg[j] = (uint64_t)(uintptr_t)&sink[j];
+            arg[null_slot] = 0;
+            char msg[160];
+            snprintf(msg, sizeof(msg), "GetPageTableStats rejects a null in slot %d ALONE", null_slot);
+            CHECK(pts(arg[0], arg[1], arg[2], arg[3], 0, 0) != 0, msg);
+        }
     }
 
     // ---- sceKernelMemoryPoolReserve: the call whose unwritten output crashed PPSA25258 ----
