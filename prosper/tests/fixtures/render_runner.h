@@ -39,6 +39,7 @@
 #include <functional>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <list>
 #include <iterator>
 #include <span>
@@ -3082,10 +3083,12 @@ struct ResidentRenderBuffer {
     VkDeviceSize snapshot_bytes = 0;
     VkDeviceSize retained_bytes() const { return storage.allocation_bytes + snapshot_bytes; }
     std::shared_ptr<std::atomic<uint64_t>> charged_bytes;
+    std::shared_ptr<std::atomic<uint64_t>> charged_owners;
     ~ResidentRenderBuffer() {
         const auto bytes = retained_bytes();
         destroy_render_host_buffer(device, storage);
         if (charged_bytes) charged_bytes->fetch_sub(bytes, std::memory_order_relaxed);
+        if (charged_owners) charged_owners->fetch_sub(1, std::memory_order_relaxed);
     }
 };
 
@@ -3099,6 +3102,11 @@ struct ResidentRenderBufferKeyHash {
         return static_cast<size_t>(key.identity ^ (key.bytes * 0x9e3779b97f4a7c15ull));
     }
 };
+// Bound this cache's additional standalone allocations, including detached submission owners.
+// Other pools and images consume allocation slots too; this is not device-wide accounting.
+inline uint64_t resident_render_buffer_owner_limit(uint32_t device_allocation_limit) {
+    return std::min<uint64_t>(4096, device_allocation_limit / 16u);
+}
 struct ResidentRenderBufferCache {
     ResidentRenderBufferCache() = default;
     ResidentRenderBufferCache(const ResidentRenderBufferCache&) = delete;
@@ -3180,6 +3188,11 @@ struct ResidentRenderBufferCache {
                        ResidentRenderBufferKeyHash> index;
     std::shared_ptr<std::atomic<uint64_t>> charged_bytes =
         std::make_shared<std::atomic<uint64_t>>(0);
+    std::shared_ptr<std::atomic<uint64_t>> charged_owners =
+        std::make_shared<std::atomic<uint64_t>>(0);
+    // A key survives unrelated list moves and is safely re-resolved after erasure or cache clear.
+    // Inspecting an entry must not make it more recently used.
+    std::optional<ResidentRenderBufferKey> rekey_next;
 
     // Called under BackendPersistentResourceGuard; cleanup only destroys independent owners.
     Owner find(VkDevice device, ResidentRenderBufferKey key, const void* source,
@@ -3220,19 +3233,32 @@ struct ResidentRenderBufferCache {
                 VkDeviceSize limit, BackendResourceReuseStats& stats,
                 uint64_t direct_guest_addr = 0, double* watch_ms = nullptr) {
         const uint64_t source_addr = Entry::eligible_address(key, source, direct_guest_addr);
+        const auto owner_limit = resident_render_buffer_owner_limit(
+            ctx.detile_limits.maxMemoryAllocationCount);
+        if (!owner_limit) return {};
         if (index.contains(key) || key.bytes > limit / 2) return {};
         const auto capacity = render_host_buffer_capacity(key.bytes);
         if (capacity > limit - key.bytes) return {};
         const auto minimum_charge = capacity + key.bytes;
         const auto charged = charged_bytes->load(std::memory_order_relaxed);
         if (charged > limit) return {};
-        if (charged > limit - minimum_charge || index.size() >= 4096) {
+        if (charged > limit - minimum_charge || index.size() >= 4096 ||
+            charged_owners->load(std::memory_order_relaxed) >= owner_limit) {
             // A streaming working set can exceed residency without changing its allocation
             // shapes. Rekey an idle exact-size upload instead of freeing it and allocating the
             // same Vulkan buffer again. Pending versions remain ineligible and retain their charge.
-            size_t inspected = 0;
-            for (auto entry = lru.begin(); entry != lru.end() && inspected < 32;
-                 ++entry, ++inspected) {
+            auto scan = lru.begin();
+            if (rekey_next) {
+                const auto next = index.find(*rekey_next);
+                if (next != index.end()) scan = next->second;
+            }
+            const auto inspect_count = std::min<size_t>(32, lru.size());
+            for (size_t inspected = 0; inspected < inspect_count; ++inspected) {
+                const auto entry = scan++;
+                if (scan == lru.end()) scan = lru.begin();
+                // Save before a successful rekey moves this element to the MRU end. With one
+                // element the old key may disappear; next admission simply resumes at begin().
+                rekey_next = scan->key;
                 if (entry->key.bytes != key.bytes || entry->owner.use_count() != 1 ||
                     entry->owner->device != ctx.dev ||
                     entry->owner->snapshot_bytes != key.bytes)
@@ -3269,6 +3295,8 @@ struct ResidentRenderBufferCache {
             return {};
         owner->charged_bytes = charged_bytes;
         charged_bytes->fetch_add(owner->retained_bytes(), std::memory_order_relaxed);
+        owner->charged_owners = charged_owners;
+        charged_owners->fetch_add(1, std::memory_order_relaxed);
         std::memcpy(owner->snapshot.get(), source, key.bytes);
         std::memcpy(owner->storage.mapped, owner->snapshot.get(), key.bytes);
         stats.buffer_upload_bytes += key.bytes;
@@ -3297,6 +3325,25 @@ inline VkDeviceSize resident_render_buffer_limit() {
         "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", getenv("PROSPER_BACKEND_BUFFER_RESIDENCY_MB"),
         default_mib, 2048, "MiB");
     return limit * 1024ull * 1024ull;
+}
+
+struct ResidentRenderBufferCacheSnapshot {
+    bool available;
+    size_t indexed_entries;
+    uint64_t live_owners, charged_bytes, owner_limit;
+    VkDeviceSize byte_limit;
+};
+// External diagnostic entry point: callers must not already hold the backend guard. The two
+// lifetime gauges are individually atomic, but detached cleanup may advance between their reads.
+inline ResidentRenderBufferCacheSnapshot resident_render_buffer_cache_snapshot() {
+    const auto* ctx = published_render_cache_context().load(std::memory_order_acquire);
+    if (!ctx || !ctx->ok) return {}; // Observing statistics must not initialize a Vulkan device.
+    BackendPersistentResourceGuard guard;
+    const auto& cache = resident_render_buffer_cache();
+    return {true, cache.index.size(), cache.charged_owners->load(std::memory_order_relaxed),
+            cache.charged_bytes->load(std::memory_order_relaxed),
+            resident_render_buffer_owner_limit(ctx->detile_limits.maxMemoryAllocationCount),
+            resident_render_buffer_limit()};
 }
 
 // Deterministic one-shot injection for the fresh storage-buffer upload regression checks. The
@@ -7069,7 +7116,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
         !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
-        resident_render_buffer_limit() != 0;
+        resident_render_buffer_limit() != 0 &&
+        resident_render_buffer_owner_limit(ctx.detile_limits.maxMemoryAllocationCount) != 0;
     const bool readonly_buffer_watch =
         getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
     if (readonly_buffer_pass) {

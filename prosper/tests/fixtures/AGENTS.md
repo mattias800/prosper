@@ -82,6 +82,9 @@ diverge. Fixtures that only one test uses belong beside that test, not here.
 
 ## Retained buffer inputs
 
+The [measurement and contract notes](../../docs/RENDERER_BUFFER_RESIDENCY_2026_09.md) retain
+accepted mechanism evidence, adverse game comparisons and their limits.
+
 Cross-call storage uploads own whole Vulkan buffers; they never retain a guest pointer or an arena
 slice. Reuse compares the complete current materialized input against an owned CPU snapshot, never the
 potentially uncached Vulkan mapping. The snapshot also supplies the exact device upload bytes. Refresh in place is permitted only
@@ -96,12 +99,23 @@ within-call alias memo: a writable later draw cannot reach retained input throug
 Small inputs, descriptor-table entries, GDS, zero identities and diagnostic mutation retain their
 existing routes. Reflection observes writes; absence of a writable flag alone is not proof.
 
-At capacity, new identities may rekey one of at most 32 old entries only when its device and exact
+At capacity, new identities may rekey one of at most 32 inspected entries only when its device and exact
 size match and no submission owns it. Otherwise the ordinary upload route handles the miss;
 known capacity pressure does not evict unrelated entries or allocate new storage. Preflight uses
 the pool capacity class plus snapshot size; actual driver allocation requirements are checked
 after allocation and may still decline admission. Admitted-byte counters mean
 new key payloads, including rekeyed allocations, and are not Vulkan allocation-byte counters.
+The bounded search resumes from its previous cursor, so an incompatible old prefix cannot hide
+later reusable entries forever. Inspection does not change LRU recency; the cursor is a key that
+can safely disappear through rekey, source replacement or cache clearing.
+
+In addition to bytes, admission limits all live retained owners to the smaller of 4096 and one
+sixteenth of the device's advertised memory-allocation limit. Detached submission owners remain
+counted until their actual Vulkan allocation is freed; explicit byte overrides retain this bound.
+This limits the cache's added allocation population, not the whole device's independent allocators.
+Timing logs report sampled entry, owner and byte occupancy. Cleanup can change the two atomic
+lifetime gauges between reads, so they are not a transactional accounting snapshot. Reading these
+statistics never initializes Vulkan.
 
 Only explicit direct guest views may use a cache-entry write watch; hosted, copied, padded and
 descriptor-table data retain full comparison. Two exact equal validations precede promotion; arm

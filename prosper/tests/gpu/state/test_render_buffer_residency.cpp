@@ -387,8 +387,104 @@ void guest_buffer_watch(const Fixture&) {
 #endif
 } // namespace
 
+namespace {
+void resident_owner_limits() {
+    CHECK(resident_render_buffer_owner_limit(0) == 0 &&
+              resident_render_buffer_owner_limit(15) == 0 &&
+              resident_render_buffer_owner_limit(16) == 1 &&
+              resident_render_buffer_owner_limit(4096) == 256 &&
+              resident_render_buffer_owner_limit(UINT32_MAX) == 4096,
+          "resident owner allowance is a bounded fraction of the device allocation limit");
+    BackendPersistentResourceGuard guard;
+    const auto& ctx = render_vk_ctx();
+    CHECK(ctx.ok, "allocation-count controls have a real Vulkan device");
+    if (!ctx.ok) return;
+    auto constrained = ctx;
+    constrained.detile_limits.maxMemoryAllocationCount = 0;
+    ResidentRenderBufferCache cache;
+    auto source = payload();
+    constexpr VkDeviceSize Limit = 64ull * 1024 * 1024;
+    constexpr uint64_t Identity = 0x3489e0000ull;
+    BackendResourceReuseStats stats;
+    auto& pool = render_host_buffer_pool();
+    auto acquisitions = [&] { return pool.hits + pool.misses; };
+    const auto before_zero = acquisitions();
+    CHECK(!cache.admit(constrained, {Identity, Bytes}, source.data(), Limit, stats) &&
+              acquisitions() == before_zero && cache.charged_owners->load() == 0,
+          "zero owner allowance declines before acquiring any Vulkan buffer");
+    constrained.detile_limits.maxMemoryAllocationCount = 16; // One local owner, not driver stress.
+    auto pin = cache.admit(constrained, {Identity, Bytes}, source.data(), Limit, stats);
+    CHECK(pin && cache.charged_owners->load() == 1,
+          "a successful retained allocation consumes one owner allowance");
+    if (!pin) return;
+    source[0] ^= 1;
+    CHECK(!cache.find(ctx.dev, {Identity, Bytes}, source.data(), stats) &&
+              cache.index.empty() && cache.charged_owners->load() == 1,
+          "detached pinned allocation remains counted after its index entry disappears");
+    const auto before_pinned = acquisitions();
+    CHECK(!cache.admit(constrained, {Identity+1, Bytes}, source.data(), Limit, stats) &&
+              acquisitions() == before_pinned && cache.charged_owners->load() == 1,
+          "ample byte budget cannot bypass the detached owner's allocation allowance");
+    pin.reset();
+    CHECK(cache.charged_owners->load() == 0 && cache.charged_bytes->load() == 0,
+          "final detached owner releases its allocation and byte charges");
+
+    // Populate 32 incompatible old sizes before one compatible idle tail. Byte space remains
+    // plentiful; only the injected 33-owner limit forces the bounded rekey path.
+    constrained.detile_limits.maxMemoryAllocationCount = 33 * 16;
+    for (uint64_t i = 0; i < 32; ++i) {
+        auto prefix = cache.admit(constrained, {Identity+10+i, Bytes/2},
+                                  source.data(), Limit, stats);
+        CHECK(bool(prefix), "incompatible prefix owns a real four-KiB Vulkan upload");
+    }
+    auto tail = cache.admit(constrained, {Identity+50, Bytes}, source.data(), Limit, stats);
+    CHECK(tail && cache.charged_owners->load() == 33 && cache.charged_bytes->load() < Limit/2,
+          "compatible tail reaches owner pressure with ample byte headroom");
+    if (!tail) return;
+    const auto tail_buffer = tail->storage.buffer;
+    tail.reset();
+    const auto before_scan = acquisitions();
+    const auto bytes_before_scan = cache.charged_bytes->load();
+    CHECK(!cache.admit(constrained, {Identity+51, Bytes}, source.data(), Limit, stats) &&
+              acquisitions() == before_scan && cache.lru.front().key.identity == Identity+10,
+          "first 32-entry scan is bounded and does not alter LRU recency or allocate");
+    auto reached = cache.admit(constrained, {Identity+51, Bytes}, source.data(), Limit, stats);
+    CHECK(reached && reached->storage.buffer == tail_buffer &&
+              cache.charged_owners->load() == 33 && acquisitions() == before_scan &&
+              cache.charged_bytes->load() == bytes_before_scan &&
+              !cache.index.contains({Identity+50, Bytes}) &&
+              cache.index.at({Identity+51, Bytes})->owner == reached,
+          "next bounded scan reaches the compatible tail and rekeys the same Vulkan buffer");
+    if (!reached) return;
+    auto changed = source;
+    changed[0] ^= 1;
+    CHECK(!cache.admit(constrained, {Identity+52, Bytes}, changed.data(), Limit, stats) &&
+              !cache.admit(constrained, {Identity+52, Bytes}, changed.data(), Limit, stats) &&
+              acquisitions() == before_scan && cache.index.contains({Identity+51, Bytes}) &&
+              std::memcmp(reached->snapshot.get(), source.data(), Bytes) == 0,
+          "rotating scan cannot overwrite a pinned tail or exceed the owner allowance");
+    const auto ledger = cache.charged_owners;
+    cache.index.clear();
+    cache.lru.clear();
+    CHECK(ledger->load() == 1, "explicit cache clear leaves the surviving pin counted");
+    reached.reset();
+    CHECK(ledger->load() == 0, "last pin releases the final counted allocation after clear");
+    constrained.detile_limits.maxMemoryAllocationCount = 16;
+    auto fresh = cache.admit(constrained, {Identity+60, Bytes}, source.data(), Limit, stats);
+    CHECK(bool(fresh), "cache can admit after an explicit clear with an old cursor key");
+    fresh.reset();
+    CHECK(bool(cache.admit(constrained, {Identity+61, Bytes}, source.data(), Limit, stats)),
+          "missing old cursor safely resumes at the remaining singleton");
+}
+} // namespace
+
 int main(int argc, char** argv) {
     std::printf("== renderer buffer residency ==\n");
+    CHECK(published_render_cache_context().load(std::memory_order_acquire) == nullptr,
+          "cold diagnostic control starts before Vulkan context publication");
+    CHECK(!resident_render_buffer_cache_snapshot().available &&
+              published_render_cache_context().load(std::memory_order_acquire) == nullptr,
+          "unavailable residency statistics do not initialize Vulkan");
     Fixture f;
     CHECK(!f.vs.empty() && !f.fs.empty(), "real vertex-fetch and green fragment shaders compile");
     if (f.vs.empty() || f.fs.empty()) return 1;
@@ -534,6 +630,7 @@ int main(int argc, char** argv) {
     }
     const auto& ctx=render_vk_ctx();
     BackendSubmissionBatchResult submitted;
+    const auto owners_before_completion = cache.charged_owners->load();
     {
         BackendPersistentResourceGuard guard;
         submitted=batch.submit_and_wait(ctx.dev,ctx.queue,false);
@@ -543,6 +640,8 @@ int main(int argc, char** argv) {
               submitted.command_buffers==2, "both recorded passes complete successfully");
     if (submitted.submit_result!=VK_SUCCESS || submitted.wait_result!=VK_SUCCESS) return 1;
     CHECK(!batch.pending() && old.expired(),"completed cleanup releases the detached old version");
+    CHECK(cache.charged_owners->load() + 1 == owners_before_completion,
+          "actual submission completion releases exactly the detached owner allowance");
     std::vector<uint8_t> a_pixels,b_pixels; std::string error;
     CHECK(readback_persistent_color_target(target_a.persistent_id,W,H,VK_FORMAT_UNDEFINED,a_pixels,error) &&
               a_pixels==green,"earlier queued draw reads original bytes after later source mutation");
@@ -590,11 +689,14 @@ int main(int argc, char** argv) {
     {
         BackendPersistentResourceGuard guard;
         const auto before=cache.charged_bytes->load();
+        const auto owners_before_discard = cache.charged_owners->load();
         discarded.discard();
         discarded.complete();
         CHECK(!discarded.pending() && detached.expired() && detached_charge!=0 &&
                   cache.charged_bytes->load()==before-detached_charge,
               "never-submitted discard cleanup releases exactly the detached version charge");
+        CHECK(cache.charged_owners->load() + 1 == owners_before_discard,
+              "never-submitted discard releases exactly the detached owner allowance");
     }
     CHECK(solid(f.render(discard_source,DiscardIdentity),false) &&
               backend_resource_reuse_stats().buffer_resident_hits==1,
@@ -736,6 +838,7 @@ int main(int argc, char** argv) {
           "rounded rekey uploads the changed bytes to the actual GPU draw");
     disabled(false);
     guest_buffer_watch(f);
+    resident_owner_limits();
     std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;
 }

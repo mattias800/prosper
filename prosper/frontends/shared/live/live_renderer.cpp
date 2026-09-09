@@ -10933,6 +10933,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             backend_buffers.cached_buffers,
                             backend_buffers.cached_bytes / (1024.0 * 1024.0),
                             (unsigned long long)backend_buffers.evictions);
+                    // Sampled occupancy, not accumulated bytes or an upload working set.
+                    // Detached submission versions consume the owner/byte allowances too.
+                    const auto resident = prosper::test::resident_render_buffer_cache_snapshot();
+                    fprintf(stderr,
+                            "[render-timing] buffer_residency available=%u entries=%zu live_owners=%llu "
+                            "owner_limit=%llu charged_bytes=%llu byte_limit=%llu\n",
+                            unsigned(resident.available), resident.indexed_entries,
+                            (unsigned long long)resident.live_owners,
+                            (unsigned long long)resident.owner_limit,
+                            (unsigned long long)resident.charged_bytes,
+                            (unsigned long long)resident.byte_limit);
                     fprintf(stderr,
                             "[render-timing] publish_source selected=%llu fmt0=%llu unknown=%llu passes_fmt0=%llu\n",
                             (unsigned long long)totals.publish_selected,
