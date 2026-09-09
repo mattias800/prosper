@@ -1684,7 +1684,145 @@ HLE(k_map_flexible_noname) { return k_map_flexible(a0, a1, a2, a3, 0, 0); }
 // (Unity/allocator sizing) -> either a wild over-commit or a refusal to allocate. We don't pool-account
 // flexible memory, so report the configured 512 MiB pool (shadPS4 parity); a later map that exceeds host
 // memory still fails cleanly with ENOMEM.
-HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0 = 512ull * 1024 * 1024; return 0; }
+// The one flexible-memory pool size. Both the Available and the Configured entry points answer
+// from it (#3502): two literals here would let the pair drift, and a guest that sizes an
+// allocator from Configured and then checks it against Available would see the drift, not us.
+constexpr uint64_t kFlexibleMemoryPoolBytes = 512ull * 1024 * 1024;   // shadPS4 parity
+HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0 = kFlexibleMemoryPoolBytes; return 0; }
+
+// ---- PS4/PS5 memory-pool API (#3502) -----------------------------------------------------------
+// An alternative to AllocateDirectMemory + MapDirectMemory: Expand takes physical memory into the
+// process's pool, Reserve claims virtual address space, Commit backs a reserved range. All three
+// were UNREGISTERED, so the dispatcher answered SCE_OK and wrote no out-parameter -- NINJA GAIDEN 4
+// (#3500) called Reserve during C-runtime init, never received an address, passed the untouched
+// value to Commit, and died dereferencing it. Same class as sceKernelAvailableFlexibleMemorySize
+// above, whose comment records the identical defect being fixed once already.
+//
+// The argument layout is LIVE-CAPTURED from the guest (PPSA25258, 2026-09-09), not assumed --
+// writing an out-parameter through a wrongly-positioned argument would be worse than the stub:
+//   Expand  a0=searchStart a1=searchEnd a2=len       a3=alignment a4=physAddrOut
+//   Reserve a0=addrIn      a1=len       a2=alignment a3=flags     a4=addrOut
+//   Commit  a0=addr        a1=len       a2=type      a3=prot      a4=flags
+// Observed: Expand(0, 0x400000000, 0xa6c00000, 0x10000, out) -> Reserve(0x1000000000, 0x400000,
+// 0x400000, 0, out) -> Commit(0, 0x400000, 0xc, 0x32, 0). Commit's addr=0 IS Reserve's unwritten
+// out-parameter, which is the null that faulted -- the chain is confirmed by the guest's own
+// arguments, not merely by call ordering.
+//
+// a5 is caller-indeterminate scratch on the 5-argument entry points and must never be read -- the
+// same trap sceKernelMapFlexibleMemory's a4 carries (see k_map_flexible_noname above). The probe
+// recorded a5 holding a stack address two bytes below a4, i.e. pure garbage.
+//
+// CONFIDENCE: HIGH on the argument layout (live-captured on the failing title).
+// CONFIDENCE: MED on pool accounting: prosper does not model a pool distinct from the direct-memory
+// arena, so Expand draws from that arena and Commit backs the reserved VA with ordinary anonymous
+// memory. The guest observes the contract it depends on -- a reservation address it can commit and
+// then use -- but a title that reads back pool-specific accounting would not be served by this.
+
+// sceKernelMemoryPoolExpand(off_t searchStart, off_t searchEnd, size_t len, size_t align,
+//                           off_t* physAddrOut)
+HLE(k_pool_expand) {
+    // Every rejection below happens BEFORE dmem_take. Validating after it would consume arena on a
+    // call that then faults writing the result -- the allocation is unrecoverable because nothing
+    // has the offset yet. Raised in review of #3505.
+    if (a3 && (a3 & (a3 - 1))) return 0x80020016ull;   // non-power-of-two alignment breaks the
+                                                       // & ~(align-1) rounding below
+    // Length, 16 KiB granularity, and physAddrOut plausibility all come from the sibling
+    // allocator's own validator rather than being re-checked here. Its comment records why the
+    // pointer test belongs before the take: the old code allocated first and skipped the guarded
+    // write, giving false success plus leaked physical capacity. Answering the pool API more
+    // permissively than the arena underneath it is how the two drift apart.
+    if (!valid_dmem_allocation(a2, a3, 0, a4)) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    const uint64_t align = a3 ? a3 : 0x4000;
+    uint64_t off = 0;
+    if (!dmem_take(a2, align, 0, off, a0, a1 ? a1 : ~0ull)) {
+        MLOG("pool_expand len=0x%llx align=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
+             (unsigned long long)a2, (unsigned long long)align,
+             (unsigned long long)a0, (unsigned long long)a1);
+        return 0x8002000cull;                                        // SCE_KERNEL_ERROR_ENOMEM
+    }
+    dmem_zero(off, a2);                       // fresh allocation -> zeroed pages (console semantics)
+    *(uint64_t*)(uintptr_t)a4 = off;
+    MLOG("pool_expand range=[0x%llx,0x%llx) len=0x%llx align=0x%llx -> phys=0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)align, (unsigned long long)off);
+    return 0;
+}
+
+// sceKernelMemoryPoolReserve(void* addrIn, size_t len, size_t align, int flags, void** addrOut)
+// Delegates to k_reserve_vrange rather than repeating it: that function carries the #312/#946
+// huge-reservation steering and the #115 idempotent re-reserve, both of which cost live
+// investigations to get right, and NINJA GAIDEN 4 reserves at 0x1000000000 -- the exact hint those
+// workarounds exist for. Only the calling convention differs (hint by value + separate out-pointer,
+// versus one in/out pointer), so adapt and forward.
+HLE(k_pool_reserve) {
+    if (!a4 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
+    uint64_t addr = a0;
+    const uint64_t rc = k_reserve_vrange((uint64_t)(uintptr_t)&addr, a1, a3, a2, 0, 0);
+    if (rc != 0) {
+        MLOG("pool_reserve hint=0x%llx len=0x%llx align=0x%llx flags=0x%llx -> 0x%llx\n",
+             (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+             (unsigned long long)a3, (unsigned long long)rc);
+        return rc;
+    }
+    *(uint64_t*)(uintptr_t)a4 = addr;
+    MLOG("pool_reserve hint=0x%llx len=0x%llx align=0x%llx -> 0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)addr);
+    return 0;
+}
+
+// sceKernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags)
+// Backs an address the guest has already reserved, so the mapping is FIXED regardless of the
+// caller's `flags` word -- that word carries pool flags, not the map flags k_map_flexible reads.
+// `type` (a2) is the direct-memory type; prosper does not model per-type pools, so it is logged and
+// otherwise unused. Passing a null name keeps track() from strncpy'ing a wild pointer.
+HLE(k_pool_commit) {
+    if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
+    uint64_t addr = a0;
+    const uint64_t rc = k_map_flexible((uint64_t)(uintptr_t)&addr, a1, a3, 0x10 /*SCE_KERNEL_MAP_FIXED*/,
+                                       0, 0);
+    MLOG("pool_commit addr=0x%llx len=0x%llx type=0x%llx prot=0x%llx -> 0x%llx (mapped 0x%llx)\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)a3, (unsigned long long)rc, (unsigned long long)addr);
+    return rc;
+}
+
+// sceKernelConfiguredFlexibleMemorySize(size_t* sizeOut): the flexible budget this process was
+// CONFIGURED with, as distinct from what remains Available above. FF Tactics (#3498) reads it during
+// startup and raises sceKernelDebugRaiseExceptionOnReleaseMode two calls later when it comes back
+// unwritten. Both entry points answer from one constant so the pair can never drift -- the charter's
+// rule that a value reachable through two APIs is derived in one place.
+HLE(k_configured_flexible) {
+    if (!a0) return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
+    *(uint64_t*)(uintptr_t)a0 = kFlexibleMemoryPoolBytes;
+    return 0;
+}
+
+// sceKernelGetPageTableStats(int* out0, int* out1, int* out2, int* out3)
+// FOUR 32-bit out-parameters. Established from the guest (PPSA21783, 2026-09-09): the four
+// arguments were consecutive stack addresses four bytes apart and descending -- ...c94, ...c90,
+// ...c8c, ...c88 -- which is four adjacent `int`s passed in order, and a5 held an unrelated value.
+//
+// The FIELD SEMANTICS are NOT established. No published contract was consulted for the order or
+// meaning, and the guest's use of the values has not been disassembled. prosper does not account
+// page-table memory at all, so all four are answered 0: "nothing measured". That is a DEFINED
+// answer where the unregistered path left the guest reading its own uninitialised stack, which is
+// the whole defect class this change addresses -- but it is not a correct one, and it should not be
+// mistaken for one.
+//
+// CONFIDENCE: HIGH on the argument count and width (live-captured).
+// CONFIDENCE: LOW on the values. If a title divides by one of these, or treats a zero as "no
+// capacity", zero is wrong and the fix is to derive real figures from prosper's own mapping tables
+// -- not to substitute a plausible-looking constant, which would be fabrication.
+HLE(k_pagetable_stats) {
+    if (!a0 || !a1 || !a2 || !a3) return 0x80020016ull;              // SCE_KERNEL_ERROR_EINVAL
+    *(uint32_t*)(uintptr_t)a0 = 0;
+    *(uint32_t*)(uintptr_t)a1 = 0;
+    *(uint32_t*)(uintptr_t)a2 = 0;
+    *(uint32_t*)(uintptr_t)a3 = 0;
+    MLOG("pagetable_stats -> 0,0,0,0 (prosper does not account page-table memory)\n");
+    return 0;
+}
 
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
 HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
@@ -3467,6 +3605,14 @@ void register_kernel_mem_hle() {
     Hle::register_fn("4h6F1LLbTiw", (HleFn)k_map_flexible_noname,
                      "sceKernelMapFlexibleMemoryInternal");
     R("sceKernelAvailableFlexibleMemorySize", k_avail_flexible);   // was MISSING -> uninitialized budget
+    // #3502: registered by RAW NID exactly as the guest imports them. The name->NID hash is not
+    // re-derived here because these were resolved from the 3.20 reference against the live import
+    // list, and a hash mismatch would silently restore the return-0 stub this change exists to fix.
+    Hle::register_fn("qCSfqDILlns", (HleFn)k_pool_expand,        "sceKernelMemoryPoolExpand");
+    Hle::register_fn("pU-QydtGcGY", (HleFn)k_pool_reserve,       "sceKernelMemoryPoolReserve");
+    Hle::register_fn("Vzl66WmfLvk", (HleFn)k_pool_commit,        "sceKernelMemoryPoolCommit");
+    Hle::register_fn("n1-v6FgU7MQ", (HleFn)k_configured_flexible, "sceKernelConfiguredFlexibleMemorySize");
+    Hle::register_fn("tZ2yplY8MBY", (HleFn)k_pagetable_stats,    "sceKernelGetPageTableStats");
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);  // 4-arg signature (physOut at arg3)
     R("sceKernelMapDirectMemory", k_map_dmem);
@@ -6423,7 +6569,145 @@ HLE(k_map_flexible) {
 HLE(k_map_flexible_noname) { return k_map_flexible(a0, a1, a2, a3, 0, 0); }
 
 // sceKernelAvailableFlexibleMemorySize(size_t* sizeOut) — 512 MiB budget (shadPS4 parity).
-HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0 = 512ull * 1024 * 1024; return 0; }
+// The one flexible-memory pool size. Both the Available and the Configured entry points answer
+// from it (#3502): two literals here would let the pair drift, and a guest that sizes an
+// allocator from Configured and then checks it against Available would see the drift, not us.
+constexpr uint64_t kFlexibleMemoryPoolBytes = 512ull * 1024 * 1024;   // shadPS4 parity
+HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0 = kFlexibleMemoryPoolBytes; return 0; }
+
+// ---- PS4/PS5 memory-pool API (#3502) -----------------------------------------------------------
+// An alternative to AllocateDirectMemory + MapDirectMemory: Expand takes physical memory into the
+// process's pool, Reserve claims virtual address space, Commit backs a reserved range. All three
+// were UNREGISTERED, so the dispatcher answered SCE_OK and wrote no out-parameter -- NINJA GAIDEN 4
+// (#3500) called Reserve during C-runtime init, never received an address, passed the untouched
+// value to Commit, and died dereferencing it. Same class as sceKernelAvailableFlexibleMemorySize
+// above, whose comment records the identical defect being fixed once already.
+//
+// The argument layout is LIVE-CAPTURED from the guest (PPSA25258, 2026-09-09), not assumed --
+// writing an out-parameter through a wrongly-positioned argument would be worse than the stub:
+//   Expand  a0=searchStart a1=searchEnd a2=len       a3=alignment a4=physAddrOut
+//   Reserve a0=addrIn      a1=len       a2=alignment a3=flags     a4=addrOut
+//   Commit  a0=addr        a1=len       a2=type      a3=prot      a4=flags
+// Observed: Expand(0, 0x400000000, 0xa6c00000, 0x10000, out) -> Reserve(0x1000000000, 0x400000,
+// 0x400000, 0, out) -> Commit(0, 0x400000, 0xc, 0x32, 0). Commit's addr=0 IS Reserve's unwritten
+// out-parameter, which is the null that faulted -- the chain is confirmed by the guest's own
+// arguments, not merely by call ordering.
+//
+// a5 is caller-indeterminate scratch on the 5-argument entry points and must never be read -- the
+// same trap sceKernelMapFlexibleMemory's a4 carries (see k_map_flexible_noname above). The probe
+// recorded a5 holding a stack address two bytes below a4, i.e. pure garbage.
+//
+// CONFIDENCE: HIGH on the argument layout (live-captured on the failing title).
+// CONFIDENCE: MED on pool accounting: prosper does not model a pool distinct from the direct-memory
+// arena, so Expand draws from that arena and Commit backs the reserved VA with ordinary anonymous
+// memory. The guest observes the contract it depends on -- a reservation address it can commit and
+// then use -- but a title that reads back pool-specific accounting would not be served by this.
+
+// sceKernelMemoryPoolExpand(off_t searchStart, off_t searchEnd, size_t len, size_t align,
+//                           off_t* physAddrOut)
+HLE(k_pool_expand) {
+    // Every rejection below happens BEFORE dmem_take. Validating after it would consume arena on a
+    // call that then faults writing the result -- the allocation is unrecoverable because nothing
+    // has the offset yet. Raised in review of #3505.
+    if (a3 && (a3 & (a3 - 1))) return 0x80020016ull;   // non-power-of-two alignment breaks the
+                                                       // & ~(align-1) rounding below
+    // Length, 16 KiB granularity, and physAddrOut plausibility all come from the sibling
+    // allocator's own validator rather than being re-checked here. Its comment records why the
+    // pointer test belongs before the take: the old code allocated first and skipped the guarded
+    // write, giving false success plus leaked physical capacity. Answering the pool API more
+    // permissively than the arena underneath it is how the two drift apart.
+    if (!valid_dmem_allocation(a2, a3, 0, a4)) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    const uint64_t align = a3 ? a3 : 0x4000;
+    uint64_t off = 0;
+    if (!dmem_take(a2, align, 0, off, a0, a1 ? a1 : ~0ull)) {
+        MLOG("pool_expand len=0x%llx align=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
+             (unsigned long long)a2, (unsigned long long)align,
+             (unsigned long long)a0, (unsigned long long)a1);
+        return 0x8002000cull;                                        // SCE_KERNEL_ERROR_ENOMEM
+    }
+    dmem_zero(off, a2);                       // fresh allocation -> zeroed pages (console semantics)
+    *(uint64_t*)(uintptr_t)a4 = off;
+    MLOG("pool_expand range=[0x%llx,0x%llx) len=0x%llx align=0x%llx -> phys=0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)align, (unsigned long long)off);
+    return 0;
+}
+
+// sceKernelMemoryPoolReserve(void* addrIn, size_t len, size_t align, int flags, void** addrOut)
+// Delegates to k_reserve_vrange rather than repeating it: that function carries the #312/#946
+// huge-reservation steering and the #115 idempotent re-reserve, both of which cost live
+// investigations to get right, and NINJA GAIDEN 4 reserves at 0x1000000000 -- the exact hint those
+// workarounds exist for. Only the calling convention differs (hint by value + separate out-pointer,
+// versus one in/out pointer), so adapt and forward.
+HLE(k_pool_reserve) {
+    if (!a4 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
+    uint64_t addr = a0;
+    const uint64_t rc = k_reserve_vrange((uint64_t)(uintptr_t)&addr, a1, a3, a2, 0, 0);
+    if (rc != 0) {
+        MLOG("pool_reserve hint=0x%llx len=0x%llx align=0x%llx flags=0x%llx -> 0x%llx\n",
+             (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+             (unsigned long long)a3, (unsigned long long)rc);
+        return rc;
+    }
+    *(uint64_t*)(uintptr_t)a4 = addr;
+    MLOG("pool_reserve hint=0x%llx len=0x%llx align=0x%llx -> 0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)addr);
+    return 0;
+}
+
+// sceKernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags)
+// Backs an address the guest has already reserved, so the mapping is FIXED regardless of the
+// caller's `flags` word -- that word carries pool flags, not the map flags k_map_flexible reads.
+// `type` (a2) is the direct-memory type; prosper does not model per-type pools, so it is logged and
+// otherwise unused. Passing a null name keeps track() from strncpy'ing a wild pointer.
+HLE(k_pool_commit) {
+    if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
+    uint64_t addr = a0;
+    const uint64_t rc = k_map_flexible((uint64_t)(uintptr_t)&addr, a1, a3, 0x10 /*SCE_KERNEL_MAP_FIXED*/,
+                                       0, 0);
+    MLOG("pool_commit addr=0x%llx len=0x%llx type=0x%llx prot=0x%llx -> 0x%llx (mapped 0x%llx)\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)a3, (unsigned long long)rc, (unsigned long long)addr);
+    return rc;
+}
+
+// sceKernelConfiguredFlexibleMemorySize(size_t* sizeOut): the flexible budget this process was
+// CONFIGURED with, as distinct from what remains Available above. FF Tactics (#3498) reads it during
+// startup and raises sceKernelDebugRaiseExceptionOnReleaseMode two calls later when it comes back
+// unwritten. Both entry points answer from one constant so the pair can never drift -- the charter's
+// rule that a value reachable through two APIs is derived in one place.
+HLE(k_configured_flexible) {
+    if (!a0) return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
+    *(uint64_t*)(uintptr_t)a0 = kFlexibleMemoryPoolBytes;
+    return 0;
+}
+
+// sceKernelGetPageTableStats(int* out0, int* out1, int* out2, int* out3)
+// FOUR 32-bit out-parameters. Established from the guest (PPSA21783, 2026-09-09): the four
+// arguments were consecutive stack addresses four bytes apart and descending -- ...c94, ...c90,
+// ...c8c, ...c88 -- which is four adjacent `int`s passed in order, and a5 held an unrelated value.
+//
+// The FIELD SEMANTICS are NOT established. No published contract was consulted for the order or
+// meaning, and the guest's use of the values has not been disassembled. prosper does not account
+// page-table memory at all, so all four are answered 0: "nothing measured". That is a DEFINED
+// answer where the unregistered path left the guest reading its own uninitialised stack, which is
+// the whole defect class this change addresses -- but it is not a correct one, and it should not be
+// mistaken for one.
+//
+// CONFIDENCE: HIGH on the argument count and width (live-captured).
+// CONFIDENCE: LOW on the values. If a title divides by one of these, or treats a zero as "no
+// capacity", zero is wrong and the fix is to derive real figures from prosper's own mapping tables
+// -- not to substitute a plausible-looking constant, which would be fabrication.
+HLE(k_pagetable_stats) {
+    if (!a0 || !a1 || !a2 || !a3) return 0x80020016ull;              // SCE_KERNEL_ERROR_EINVAL
+    *(uint32_t*)(uintptr_t)a0 = 0;
+    *(uint32_t*)(uintptr_t)a1 = 0;
+    *(uint32_t*)(uintptr_t)a2 = 0;
+    *(uint32_t*)(uintptr_t)a3 = 0;
+    MLOG("pagetable_stats -> 0,0,0,0 (prosper does not account page-table memory)\n");
+    return 0;
+}
 
 // sceKernelAllocateDirectMemory(start, end, len, align, memType, off_t* physOut)
 HLE(k_alloc_dmem) {
@@ -7275,6 +7559,14 @@ void register_kernel_mem_hle() {
     R("sceKernelMapFlexibleMemory", k_map_flexible_noname);
     Hle::register_fn("4h6F1LLbTiw", (HleFn)k_map_flexible_noname, "sceKernelMapFlexibleMemoryInternal");
     R("sceKernelAvailableFlexibleMemorySize", k_avail_flexible);
+    // #3502: registered by RAW NID exactly as the guest imports them. The name->NID hash is not
+    // re-derived here because these were resolved from the 3.20 reference against the live import
+    // list, and a hash mismatch would silently restore the return-0 stub this change exists to fix.
+    Hle::register_fn("qCSfqDILlns", (HleFn)k_pool_expand,        "sceKernelMemoryPoolExpand");
+    Hle::register_fn("pU-QydtGcGY", (HleFn)k_pool_reserve,       "sceKernelMemoryPoolReserve");
+    Hle::register_fn("Vzl66WmfLvk", (HleFn)k_pool_commit,        "sceKernelMemoryPoolCommit");
+    Hle::register_fn("n1-v6FgU7MQ", (HleFn)k_configured_flexible, "sceKernelConfiguredFlexibleMemorySize");
+    Hle::register_fn("tZ2yplY8MBY", (HleFn)k_pagetable_stats,    "sceKernelGetPageTableStats");
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);
     R("sceKernelMapDirectMemory", k_map_dmem);

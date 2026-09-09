@@ -47,6 +47,23 @@ only difference.
 Alex Kidd's *world* is still wrong on this machine, and it is a different defect — the wave width
 makes no measurable difference to it either way.
 [#3479](https://github.com/mattias800/prosper/issues/3479).
+### Five new games, and three of them died the same way
+
+Five titles were added to the library and booted for the first time. *Syberia - The World Before*
+got furthest by a distance — its title screen and main menu render, and the audio is clean from the
+first second, over a splash that is still black. Three of the other four never presented a frame,
+and all three died of one thing: a kernel call prosper had never registered, answering "success"
+while writing nothing, so the guest read its own uninitialised stack as an address.
+
+### The argument that proved it was in the guest's own registers
+
+*NINJA GAIDEN 4* asks the kernel to reserve address space, and prosper's unregistered stub told it
+that worked without ever handing back an address. Rather than assume the call's shape from a
+published signature, we registered it as a probe that logs and does nothing — and the next call in
+the log asks to commit memory at address zero. That zero is the reservation that never came back,
+and a few instructions later it is the null the title crashes on. The crash is gone; the title now
+runs for two minutes without faulting and still draws nothing, which is a different and later
+problem. [#3502](https://github.com/mattias800/prosper/issues/3502)
 
 ## 2026-09-06
 
