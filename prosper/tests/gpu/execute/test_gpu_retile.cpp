@@ -214,7 +214,10 @@ int run_case(int argc, char** argv) {
         // remains covered; this retile change does not broaden native storage declarations.
         const bool native_volume = native_storage_3d_format_support_bit(
             format.format, format.components) != 0;
-        const bool gpu = !cpu && !shape_refusal && (!volume || native_volume);
+        // Multi-layer native float storage is not admitted by the existing recompiler.
+        // Keep RG8/R16F arrays as raw CPU fallback coverage, without widening codegen.
+        const bool native_array = !array16 || format.format == DataFormat::Uint16;
+        const bool gpu = !cpu && !shape_refusal && native_array && (!volume || native_volume);
         if (fault_mode && volume && !native_volume) continue;
         // A one-layer array descriptor may be consumed through either a plain
         // 2D instruction or an array instruction retaining its layer coordinate.
@@ -320,6 +323,18 @@ int run_case(int argc, char** argv) {
                     ++matching_views;
             check(reflection.ok() && matching_views == 2,
                   "both storage views reflect the intended ordinary or array shader type");
+            if (array16) {
+                size_t matching_formats = 0;
+                for (const auto& descriptor : reflection.descriptors)
+                    if (descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                        (descriptor.binding == 4 || descriptor.binding == 5) &&
+                        descriptor.image_numeric_class == SpirvImageNumericClass::Uint &&
+                        descriptor.storage_image_format == (native_array ? kSpirvImageFormatR16ui : 0u))
+                        ++matching_formats;
+                check(reflection.ok() && matching_formats == 2,
+                      native_array ? "R16 array source and destination reflect exact native R16ui storage"
+                                   : "RG8/R16F arrays explicitly retain raw unsigned interchange storage");
+            }
             const auto* source_access = find_spirv_descriptor_binding(reflection, 0, 4);
             const auto* destination_access = find_spirv_descriptor_binding(reflection, 0, 5);
             check(reflection.storage_image_writes_complete && source_access && destination_access &&
