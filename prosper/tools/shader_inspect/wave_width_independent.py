@@ -50,6 +50,17 @@ OP_GROUP_NON_UNIFORM_ANY = 335      # matches the emitter's own Op_GroupNonUnifo
 OP_GROUP_NON_UNIFORM_BALLOT = 339
 OP_IMAGE_WRITE, OP_KILL, OP_FUNCTION_CALL = 99, 252, 57
 
+# Every way one pointer is derived from another. Missing any of these splits one slot into two.
+POINTER_DERIVING_OPS = {
+    OP_ACCESS_CHAIN, 66,   # OpInBoundsAccessChain
+    67, 70,                # OpPtrAccessChain, OpInBoundsPtrAccessChain
+    83,                    # OpCopyObject
+}
+# Atomics, named rather than taken as the numeric window 227..242: the float and flag forms sit
+# outside it, so a vote-guarded OpAtomicFAddEXT admitted while the same module using OpAtomicIAdd
+# refused. One opcode number was the whole difference.
+ATOMIC_OPS = set(range(227, 243)) | {318, 319, 5614, 5615, 6035}
+
 STORAGE_UNIFORM_CONSTANT, STORAGE_INPUT, STORAGE_UNIFORM = 0, 1, 2
 STORAGE_OUTPUT, STORAGE_FUNCTION, STORAGE_PUSH, STORAGE_SB = 3, 7, 9, 12
 UNIFORM_STORAGE = {STORAGE_UNIFORM, STORAGE_SB, STORAGE_PUSH, STORAGE_UNIFORM_CONSTANT}
@@ -129,12 +140,22 @@ class Module:
         while changed:
             changed = False
             for op, w in self.insts:
-                if op != OP_ACCESS_CHAIN or len(w) < 4:
+                if op not in POINTER_DERIVING_OPS or len(w) < 4:
                     continue
                 base = self.pointer_root.get(w[3])
                 if base is not None and w[2] not in self.pointer_root:
                     self.pointer_root[w[2]] = base
                     changed = True
+
+    def pointer_is_known(self, ptr):
+        """An unknown pointer must NOT root at itself.
+
+        That was an identity fallback dressed as a lookup: a pointer the map has never seen became
+        its own slot, so a store through one id and a load through another lost the dependence --
+        the very defect the root map exists to prevent, reintroduced by its own default. Callers
+        treat unknown as "could be any local".
+        """
+        return ptr in self.pointer_root
 
     def root_of(self, ptr):
         return self.pointer_root.get(ptr, ptr)
@@ -171,7 +192,7 @@ class Module:
         and keep their uniformity regardless.
         """
         for op, w in self.insts:
-            if op == OP_IMAGE_WRITE or 227 <= op <= 242:
+            if op == OP_IMAGE_WRITE or op in ATOMIC_OPS:
                 return True
             if op == OP_STORE and len(w) >= 3 and w[1] not in self.locals \
                     and w[1] not in self.outputs:
@@ -257,13 +278,21 @@ class Module:
             changed = False
             for op, w in self.insts:
                 if op == OP_STORE and len(w) >= 3:
-                    slot = self.root_of(w[1])
-                    if w[2] in tainted and slot in self.locals and slot not in tainted_ptrs:
-                        tainted_ptrs.add(slot)
-                        changed = True
+                    if w[2] in tainted:
+                        if not self.pointer_is_known(w[1]):     # unknown: could be any of them
+                            if not self.locals <= tainted_ptrs:
+                                tainted_ptrs |= self.locals
+                                changed = True
+                        else:
+                            slot = self.root_of(w[1])
+                            if slot in self.locals and slot not in tainted_ptrs:
+                                tainted_ptrs.add(slot)
+                                changed = True
                     continue
                 if op == OP_LOAD and len(w) >= 4:
-                    if self.root_of(w[3]) in tainted_ptrs and w[2] not in tainted:
+                    reads_tainted = (self.root_of(w[3]) in tainted_ptrs
+                                     if self.pointer_is_known(w[3]) else bool(tainted_ptrs))
+                    if reads_tainted and w[2] not in tainted:
                         tainted.add(w[2])
                         changed = True
                     continue
@@ -289,7 +318,7 @@ class Module:
             return len(w) >= 4 and w[1] not in self.locals
         if op in (OP_IMAGE_WRITE, OP_KILL, 4416, 5380, 224, 225):
             return True                               # image write, kill, terminate, demote, barrier
-        return 227 <= op <= 242                       # atomics
+        return op in ATOMIC_OPS
 
     def influences_output(self, seed):
         tainted, tainted_ptrs = {seed}, set()
@@ -304,7 +333,7 @@ class Module:
                     return True
                 if op == OP_IMAGE_WRITE and len(w) >= 4 and (w[2] in tainted or w[3] in tainted):
                     return True
-                if 227 <= op <= 242 and len(w) >= 4 and w[3] in tainted:
+                if op in ATOMIC_OPS and len(w) >= 4 and w[3] in tainted:
                     return True
             grew = False
             for head, cond in self.branch_cond.items():
@@ -319,10 +348,16 @@ class Module:
                             return True
                         # A store into a local inside the region is control-dependent too: whether
                         # it happened at all is the vote's answer.
-                        slot = self.root_of(w[1]) if op == OP_STORE and len(w) >= 3 else None
-                        if slot is not None and slot in self.locals and slot not in tainted_ptrs:
-                            tainted_ptrs.add(slot)
-                            grew = True
+                        if op == OP_STORE and len(w) >= 3:
+                            if not self.pointer_is_known(w[1]):
+                                if not self.locals <= tainted_ptrs:
+                                    tainted_ptrs |= self.locals
+                                    grew = True
+                            else:
+                                slot = self.root_of(w[1])
+                                if slot in self.locals and slot not in tainted_ptrs:
+                                    tainted_ptrs.add(slot)
+                                    grew = True
                 for op, w in self.blocks.get(merge, []):
                     if op != OP_PHI or len(w) < 5 or w[2] in tainted:
                         continue

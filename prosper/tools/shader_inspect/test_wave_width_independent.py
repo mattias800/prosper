@@ -268,6 +268,75 @@ def mod_taint_through_two_chains(same_value):
     return module(PRE_IDS + [10, 20, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
 
 
+def mod_slot_through_copyobject(tainted_store):
+    """One slot reached through an access chain and an `OpCopyObject` of it.
+
+    `OpCopyObject` derives a pointer without being an access chain, so a root map that followed only
+    chains gave the copy its own identity and lost the store/load dependence. `tainted_store` selects
+    whether the value written is the vote or a constant, which is the only difference between the
+    refusal and its control.
+    """
+    stored = 10 if tainted_store else 11
+    b = (preamble(SC_INPUT)
+         + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
+         + inst(28, 32, 1, 31)
+         + inst(32, 33, SC_FUNCTION, 32) + inst(59, 33, 34, SC_FUNCTION)
+         + inst(32, 35, SC_FUNCTION, 1)
+         + entry()
+         + inst(335, 1, 10, 6, 9)
+         + inst(65, 35, 36, 34, 31)                    # chain into slot 4
+         + inst(62, 36, stored)
+         + inst(83, 35, 37, 36)                        # OpCopyObject of that pointer
+         + inst(61, 1, 38, 37)                         # read back through the COPY
+         + inst(62, 5, 38)
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
+
+
+def mod_region_performs_atomic(op):
+    """A vote-guarded region performs an atomic.
+
+    `op` is the whole experiment: `OpAtomicIAdd` (234) sits inside the numeric window the observable
+    check used, `OpAtomicFAddEXT` (6035) does not, and the modules are otherwise identical -- so a
+    membership test written as a range admitted one and refused the other.
+    """
+    b = (preamble(SC_INPUT)
+         + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
+         + inst(32, 33, SC_STORAGE_BUFFER, 30) + inst(59, 33, 34, SC_STORAGE_BUFFER)
+         + entry()
+         + inst(335, 1, 10, 6, 9)
+         + inst(247, 22, 0)
+         + inst(250, 10, 21, 22)
+         + inst(248, 21) + inst(op, 30, 39, 34, 6, 6, 31) + inst(249, 22)
+         + inst(248, 22) + inst(62, 5, 11) + inst(253))
+    return module(PRE_IDS + [10, 20, 21, 22, 30, 31, 33, 34, 39], b)
+
+
+def mod_region_stores_through_second_chain():
+    """The CONTROL-DEPENDENCE twin of the two-chain fixture.
+
+    The value stored inside the vote-guarded region is a CONSTANT, so no data flow carries the vote;
+    what carries it is whether the store ran at all. The data-flow twin already existed, this path
+    did not -- and they reach the taint through different code.
+    """
+    b = (preamble(SC_INPUT)
+         + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
+         + inst(28, 32, 1, 31)
+         + inst(32, 33, SC_FUNCTION, 32) + inst(59, 33, 34, SC_FUNCTION)
+         + inst(32, 35, SC_FUNCTION, 1)
+         + entry()
+         + inst(335, 1, 10, 6, 9)
+         + inst(247, 22, 0)
+         + inst(250, 10, 21, 22)
+         + inst(248, 21) + inst(65, 35, 36, 34, 31) + inst(62, 36, 11) + inst(249, 22)
+         + inst(248, 22)
+         + inst(65, 35, 37, 34, 31)                    # a SECOND chain into the same slot
+         + inst(61, 1, 38, 37)
+         + inst(62, 5, 38)
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
@@ -351,6 +420,14 @@ def main() -> int:
                    mod_vote_reaches_a_switch())
     expect_refused("a vote stored and reloaded through TWO chains into one local slot",
                    mod_taint_through_two_chains(same_value=False))
+    expect_refused("a vote reaching one slot through an access chain and an OpCopyObject of it",
+                   mod_slot_through_copyobject(tainted_store=True))
+    expect_refused("a vote-guarded region performing an INTEGER atomic",
+                   mod_region_performs_atomic(234))
+    expect_refused("a vote-guarded region performing a FLOAT atomic (outside the old range)",
+                   mod_region_performs_atomic(6035))
+    expect_refused("a vote-guarded region whose store is read back through a second chain",
+                   mod_region_stores_through_second_chain())
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a
@@ -372,6 +449,8 @@ def main() -> int:
                     mod_vote_over_a_local(SC_STORAGE_BUFFER))
     expect_admitted("two chains into one slot carrying a value the vote never touched",
                     mod_taint_through_two_chains(same_value=True))
+    expect_admitted("a chain and an OpCopyObject carrying a value the vote never touched",
+                    mod_slot_through_copyobject(tainted_store=False))
 
     # A module the tool cannot parse must never be counted as proven.
     with tempfile.TemporaryDirectory() as tmp:

@@ -3404,15 +3404,29 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     std::unordered_map<uint32_t, uint32_t> pointer_root;
     for (const SpirvInst& in : insts)
         if (in.op == Op_Variable && in.len >= 3) pointer_root[spirv[in.at + 2]] = spirv[in.at + 2];
+    // Every way one pointer is derived from another. OpCopyObject and the InBounds/Ptr chain forms
+    // each split one slot into two if they are not followed.
+    const auto derives_pointer = [](uint32_t op) {
+        return op == Op_AccessChain || op == 66 /*OpInBoundsAccessChain*/ ||
+               op == 67 /*OpPtrAccessChain*/ || op == 70 /*OpInBoundsPtrAccessChain*/ ||
+               op == 83 /*OpCopyObject*/;
+    };
     for (bool changed = true; changed;) {
         changed = false;
         for (const SpirvInst& in : insts) {
-            if (in.op != Op_AccessChain || in.len < 4) continue;
+            if (!derives_pointer(in.op) || in.len < 4) continue;
             const auto base = pointer_root.find(spirv[in.at + 3]);
             if (base == pointer_root.end()) continue;
             if (pointer_root.emplace(spirv[in.at + 2], base->second).second) changed = true;
         }
     }
+    // An UNKNOWN pointer must not root at itself. That was an identity fallback dressed as a
+    // lookup: a pointer the map has never seen became its own slot, so a store through one id and a
+    // load through another lost the dependence between them -- exactly the defect the root map was
+    // added to fix, reintroduced by its own default. Unknown now means "could be any local", which
+    // is conservative on both sides. (The asymmetry that hid this: an unrooted pointer was already
+    // safe on the STORE side, because a pointer not in `locals` reads as an observable effect.)
+    const auto pointer_is_known = [&](uint32_t ptr) { return pointer_root.count(ptr) != 0; };
     const auto root_of = [&](uint32_t ptr) {
         const auto it = pointer_root.find(ptr);
         return it == pointer_root.end() ? ptr : it->second;
@@ -3434,8 +3448,15 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             case 4416 /*OpTerminateInvocation*/: case 5380 /*OpDemoteToHelperInvocation*/:
             case Op_ControlBarrier: case Op_MemoryBarrier:
                 return true;
+            // Atomics both read and write memory the rest of the draw can see. Named explicitly
+            // rather than as the numeric window `227..242`: the float and flag atomics sit outside
+            // it, so a vote-guarded OpAtomicFAddEXT admitted while the byte-identical module using
+            // OpAtomicIAdd refused. One opcode number was the whole difference.
+            case 318 /*OpAtomicFlagTestAndSet*/: case 319 /*OpAtomicFlagClear*/:
+            case 5614 /*OpAtomicFMinEXT*/: case 5615 /*OpAtomicFMaxEXT*/:
+            case 6035 /*OpAtomicFAddEXT*/:
+                return true;
             default:
-                // Atomics both read and write memory the rest of the draw can see.
                 return in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor;
         }
     };
@@ -3599,15 +3620,24 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 changed = false;
                 for (const SpirvInst& in : insts) {
                     if (in.op == Op_Store && in.len >= 3) {
-                        const uint32_t ptr = root_of(spirv[in.at + 1]), val = spirv[in.at + 2];
-                        if (tainted.count(val) && locals.count(ptr) &&
-                            tainted_ptrs.insert(ptr).second)
-                            changed = true;
+                        const uint32_t raw = spirv[in.at + 1], val = spirv[in.at + 2];
+                        if (tainted.count(val)) {
+                            if (!pointer_is_known(raw)) {          // unknown: could be any of them
+                                for (uint32_t local : locals)
+                                    if (tainted_ptrs.insert(local).second) changed = true;
+                            } else if (locals.count(root_of(raw)) &&
+                                       tainted_ptrs.insert(root_of(raw)).second) {
+                                changed = true;
+                            }
+                        }
                         continue;
                     }
                     if (in.op == Op_Load && in.len >= 4) {
-                        if (tainted_ptrs.count(root_of(spirv[in.at + 3])) &&
-                            tainted.insert(spirv[in.at + 2]).second)
+                        const uint32_t raw = spirv[in.at + 3];
+                        const bool reads_tainted = pointer_is_known(raw)
+                            ? tainted_ptrs.count(root_of(raw)) != 0
+                            : !tainted_ptrs.empty();               // unknown: could be any of them
+                        if (reads_tainted && tainted.insert(spirv[in.at + 2]).second)
                             changed = true;
                         continue;
                     }
@@ -3662,10 +3692,16 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                         // A store into a local inside the region is control-dependent too: whether
                         // it happened at all is the vote's answer, so every later load of that
                         // local carries the vote.
-                        if (in.op == Op_Store && in.len >= 3 &&
-                            locals.count(root_of(spirv[in.at + 1])) &&
-                            tainted_ptrs.insert(root_of(spirv[in.at + 1])).second)
-                            grew = true;
+                        if (in.op == Op_Store && in.len >= 3) {
+                            const uint32_t raw = spirv[in.at + 1];
+                            if (!pointer_is_known(raw)) {
+                                for (uint32_t local : locals)
+                                    if (tainted_ptrs.insert(local).second) grew = true;
+                            } else if (locals.count(root_of(raw)) &&
+                                       tainted_ptrs.insert(root_of(raw)).second) {
+                                grew = true;
+                            }
+                        }
                     }
                 }
                 const auto merge_blk = blocks.find(merge);

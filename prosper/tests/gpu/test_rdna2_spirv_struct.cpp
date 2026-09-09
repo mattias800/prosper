@@ -6884,6 +6884,65 @@ int main() {
             return b;
         };
 
+        // One slot reached through an access chain and an OpCopyObject of it. OpCopyObject derives
+        // a pointer without being a chain, so a root map following only chains gave the copy its own
+        // identity and lost the store/load dependence.
+        auto slot_via_copy = [&](uint32_t stored) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, kFunction, 32}); ins(b, 59, {33, 34, kFunction});
+            ins(b, 32, {35, kFunction, 1});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 65, {35, 36, 34, 31});
+            ins(b, 62, {36, stored});
+            ins(b, 83, {35, 37, 36});                      // OpCopyObject of that pointer
+            ins(b, 61, {1, 38, 37});
+            ins(b, 62, {5, 38});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // A vote-guarded region performing an atomic. 234 (OpAtomicIAdd) sits inside the numeric
+        // window the observable check used and 6035 (OpAtomicFAddEXT) does not, while the modules
+        // are otherwise identical -- so a membership test written as a range admitted one.
+        auto region_atomic = [&](uint32_t atomic_op) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 247, {22, 0});
+            ins(b, 250, {10, 21, 22});
+            ins(b, 248, {21}); ins(b, atomic_op, {30, 39, 34, 6, 6, 31}); ins(b, 249, {22});
+            ins(b, 248, {22}); ins(b, 62, {5, 11}); ins(b, 253, {});
+            return b;
+        };
+
+        // The CONTROL-DEPENDENCE twin of the two-chain fixture: the value stored inside the region
+        // is a CONSTANT, so nothing carries the vote by data flow -- what carries it is whether the
+        // store ran. The two reach the taint through different code.
+        std::vector<uint32_t> region_second_chain = preamble(kInput);
+        {
+            std::vector<uint32_t>& b = region_second_chain;
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, kFunction, 32}); ins(b, 59, {33, 34, kFunction});
+            ins(b, 32, {35, kFunction, 1});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 247, {22, 0});
+            ins(b, 250, {10, 21, 22});
+            ins(b, 248, {21}); ins(b, 65, {35, 36, 34, 31}); ins(b, 62, {36, 11});
+            ins(b, 249, {22});
+            ins(b, 248, {22});
+            ins(b, 65, {35, 37, 34, 31});                  // a SECOND chain into the same slot
+            ins(b, 61, {1, 38, 37});
+            ins(b, 62, {5, 38});
+            ins(b, 253, {});
+        }
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6913,6 +6972,15 @@ int main() {
              two_chains(10), false},
             {"two chains into one slot carrying a value the vote never touched",
              two_chains(11), true},
+            {"a vote reaching one slot through an access chain and an OpCopyObject of it",
+             slot_via_copy(10), false},
+            {"a chain and an OpCopyObject carrying a value the vote never touched",
+             slot_via_copy(11), true},
+            {"a vote-guarded region performing an INTEGER atomic", region_atomic(234), false},
+            {"a vote-guarded region performing a FLOAT atomic outside the old range",
+             region_atomic(6035), false},
+            {"a vote-guarded region whose store is read back through a second chain",
+             region_second_chain, false},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",
