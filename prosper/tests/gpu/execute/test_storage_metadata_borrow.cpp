@@ -167,7 +167,16 @@ struct Fixture {
         auto r = sampled();
         borrow(r, true, "restored full-FF metadata permits a fresh borrow");
         kind = CompressionMetadataKind::Unknown;
+        const auto before = prosper::frontend::live_compute_image_borrow_census();
         borrow(r, false, "unknown metadata kind cannot authorize retained base");
+        const auto after = prosper::frontend::live_compute_image_borrow_census();
+        const auto metadata_reason = static_cast<size_t>(
+            prosper::frontend::ComputeImageBorrowOutcome::MetadataUnproven);
+        const auto missing_reason = static_cast<size_t>(
+            prosper::frontend::ComputeImageBorrowOutcome::NoCacheEntry);
+        check(after.outcomes[metadata_reason] == before.outcomes[metadata_reason] + 1 &&
+                  after.outcomes[missing_reason] == before.outcomes[missing_reason],
+              "public metadata refusal is not overwritten by a missing numeric alias");
         kind = CompressionMetadataKind::Htile;
         borrow(r, false, "HTILE interpretation cannot authorize this DCC result");
         kind = CompressionMetadataKind::Dcc;

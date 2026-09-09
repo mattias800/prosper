@@ -1169,6 +1169,7 @@ enum class ComputeTransferBorrowResult : uint8_t {
     NoCache,
     InvalidCache,
     AuthorityChanged,
+    MetadataUnproven,
 };
 
 bool persistent_compute_buffer_enabled(uint32_t bytes) {
@@ -2747,7 +2748,7 @@ struct VulkanComputeContext {
             return false;
         }
         if (!storage_borrow_metadata_proves_plain(consumer)) {
-            set_outcome(Outcome::AuthorityChanged);
+            set_outcome(Outcome::MetadataUnproven);
             return false;
         }
         if (exact_unchanged || watch_unchanged)
@@ -2837,7 +2838,7 @@ struct VulkanComputeContext {
             return false;
         }
         if (!storage_borrow_metadata_proves_plain(consumer)) {
-            if (result) *result = ComputeTransferBorrowResult::AuthorityChanged;
+            if (result) *result = ComputeTransferBorrowResult::MetadataUnproven;
             if (trace)
                 std::fprintf(stderr,
                              "[compute]   native storage transfer miss: metadata authority\n");
@@ -4317,6 +4318,7 @@ const char* compute_transfer_borrow_result_name(ComputeTransferBorrowResult resu
         case ComputeTransferBorrowResult::NoCache: return "no-cache";
         case ComputeTransferBorrowResult::InvalidCache: return "invalid-cache";
         case ComputeTransferBorrowResult::AuthorityChanged: return "authority-changed";
+        case ComputeTransferBorrowResult::MetadataUnproven: return "metadata-unproven";
     }
     return "unknown";
 }
@@ -4362,6 +4364,7 @@ struct ComputeTransferGateStats {
     uint64_t borrow_no_cache = 0;
     uint64_t borrow_invalid_cache = 0;
     uint64_t borrow_authority_changed = 0;
+    uint64_t borrow_metadata_unproven = 0;
 };
 
 void increment_gate_counter(uint64_t& value, bool condition = true) {
@@ -4502,6 +4505,8 @@ public:
                                borrow_result == ComputeTransferBorrowResult::InvalidCache);
         increment_gate_counter(stats.borrow_authority_changed,
                                borrow_result == ComputeTransferBorrowResult::AuthorityChanged);
+        increment_gate_counter(stats.borrow_metadata_unproven,
+                               borrow_result == ComputeTransferBorrowResult::MetadataUnproven);
         if (detail) {
             std::fprintf(stderr,
                          "[compute-transfer-gates] detail role=%s stage=sampled-gates "
@@ -4650,7 +4655,7 @@ private:
                      "sampled-ordinary2d=%llu format-compatible=%llu "
                      "transfer-dimension=%llu hostless=%llu format-match=%llu "
                      "validation=%llu native-defined=%llu borrow-attempts=%llu hits=%llu "
-                     "no-cache=%llu invalid-cache=%llu authority-changed=%llu\n",
+                     "no-cache=%llu invalid-cache=%llu authority-changed=%llu metadata-unproven=%llu\n",
                      compute_transfer_gate_role_name(role),
                      static_cast<unsigned long long>(s.sampled_gate_evaluated),
                      static_cast<unsigned long long>(s.sampled_cache_candidate),
@@ -4666,7 +4671,8 @@ private:
                      static_cast<unsigned long long>(s.borrow_hits),
                      static_cast<unsigned long long>(s.borrow_no_cache),
                      static_cast<unsigned long long>(s.borrow_invalid_cache),
-                     static_cast<unsigned long long>(s.borrow_authority_changed));
+                     static_cast<unsigned long long>(s.borrow_authority_changed),
+                     static_cast<unsigned long long>(s.borrow_metadata_unproven));
     }
 
     ComputeTransferGateSelector selector_;
@@ -8302,7 +8308,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // misses: Uint32/R32_UINT producer -> Float32/R32_SFLOAT consumer. The
                         // retained source and sampled destination remain distinct images, so an
                         // in-place read/modify/write dispatch cannot alias itself.
-                        if (!borrowed && float32_uint32_transfer_alias &&
+                        if (!borrowed &&
+                            transfer_borrow_result != ComputeTransferBorrowResult::MetadataUnproven &&
+                            float32_uint32_transfer_alias &&
                             compute_transfer_vk_formats_bit_compatible(
                                 r->format, sampled_components,
                                 transfer_alias_storage_format, image_format)) {
@@ -12226,7 +12234,11 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         sampled_resource.format == prosper::gpu::DataFormat::Float10_11_11 && components == 3;
     const bool packed_r10_uint32_alias =
         sampled_resource.format == prosper::gpu::DataFormat::Unorm2_10_10_10 && components == 4;
-    if (!borrowed && (normalized_uint8_alias || normalized_uint16_alias ||
+    // The metadata proof uses the original consumer for every producer alias. A failed proof
+    // cannot be rescued by changing the producer key; preserve its reason instead of reporting
+    // a later alias lookup miss as though metadata had passed.
+    if (!borrowed && observation.outcome != ComputeImageBorrowOutcome::MetadataUnproven &&
+        (normalized_uint8_alias || normalized_uint16_alias ||
                       float16_uint16_alias ||
                       float32_uint32_alias || packed_r11_uint32_alias ||
                       packed_r10_uint32_alias)) {
