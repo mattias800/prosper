@@ -1809,10 +1809,12 @@ HLE(audio2_ctx_destroy) {
     const uint32_t context_slot = one_based_index - 1;
     const bool lifecycle = audio_lifecycle();
     const uint64_t entered_ns = lifecycle ? audio_lifecycle_now_ns() : 0;
+    // Keep diagnostic snapshots off the guest thread's stack, including when disabled. Reserve
+    // once before taking the sink/state locks; no allocation is needed while retiring ports.
+    std::vector<A2LifecyclePort> retired;
+    if (lifecycle) retired.reserve(kA2MaxPorts);
     std::unique_lock<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
     bool close_sink = false;
-    std::array<A2LifecyclePort, kA2MaxPorts> retired{};
-    size_t retired_count = 0;
     uint64_t cleared_ns = 0;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
@@ -1824,7 +1826,7 @@ HLE(audio2_ctx_destroy) {
         for (uint32_t i = 0; i < kA2MaxPorts; ++i) {
             auto& port = g_a2_port_state[i];
             if (port.used && port.context == a0) {
-                if (lifecycle) retired[retired_count++] = audio_lifecycle_port(port, i, cleared_ns);
+                if (lifecycle) retired.push_back(audio_lifecycle_port(port, i, cleared_ns));
                 audio2_clear_slot(port);
             }
         }
@@ -1840,8 +1842,8 @@ HLE(audio2_ctx_destroy) {
             "sink_was_open=%u implicit_ports=%zu\n", (unsigned long long)a0,
             uint32_t(a0 >> 16), unsigned(kA2SinkPortBase + context_slot),
             (unsigned long long)entered_ns, (unsigned long long)cleared_ns,
-            (unsigned long long)closed_ns, unsigned(close_sink), retired_count);
-        for (size_t i = 0; i < retired_count; ++i) audio_lifecycle_emit(retired[i], "context-destroy");
+            (unsigned long long)closed_ns, unsigned(close_sink), retired.size());
+        for (const auto& port : retired) audio_lifecycle_emit(port, "context-destroy");
     }
     return 0;
 }
