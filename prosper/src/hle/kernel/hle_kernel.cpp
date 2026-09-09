@@ -2854,7 +2854,12 @@ namespace {
     // the flag, wakes everyone, and defers destroy+free to the last waiter leaving (or frees now if
     // none are parked). Freeing under a live pthread_cond_wait is a UAF — destroying a condvar with
     // waiters is explicitly UB.
-    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters; };
+    // `cancel_gen` is bumped by sceKernelCancelEventFlag. A waiter captures it on entry and leaves
+    // when it changes, so a cancel releases exactly the threads parked at the time -- distinct from
+    // `deleted`, which also destroys the object. A generation rather than a flag, so a thread that
+    // parks AFTER a cancel is not spuriously released by it.
+    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters;
+                       uint64_t cancel_gen; };
     bool evf_match(uint64_t bits, uint64_t pat, uint32_t mode) {
         return (mode & 0x1) ? ((bits & pat) == pat) : ((bits & pat) != 0);  // AND vs OR
     }
@@ -2918,6 +2923,42 @@ HLE(k_ef_delete)  {
 }
 HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); interruptible_mutex_lock(&e->m); e->bits |= a1; interruptible_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; interruptible_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
+
+// sceKernelCancelEventFlag(ef, setPattern, int* numWaitThreads) -- the last member of the event-flag
+// family prosper did not register. Unregistered it answered the dispatcher's 0 == SCE_OK while doing
+// nothing at all: no waiter released, the bits left stale, and `numWaitThreads` never written, so the
+// guest read its own uninitialised stack as the count of threads it had just cancelled.
+//
+// Found by differential rather than by guessing: normalising a full boot log of BlazBlue Entropy
+// Effect X (PPSA29714, holds on its publisher logos) against The Messenger (PPSA24651, a Unity title
+// that reaches gameplay) leaves exactly ONE prosper-level line that differs -- this NID.
+//
+// ABI captured live (PPSA29714): a0 is the EventFlag, a1 the set pattern (0 observed), a2 a stack
+// out-pointer; a3-a5 are scratch and are not read.
+//
+// Note what the earlier census did NOT establish. It measured `waiters` at each call and found 0 of
+// 3000, which rules out "releasing parked threads is what matters here" -- and says nothing about the
+// out-parameter or the bits, which are the other two things this call does. Testing beside the gap
+// rather than on it is the recurring failure this file's own comments describe.
+//
+// CONFIDENCE: HIGH on the argument layout (live-captured) and on the three effects being the whole
+// contract. CONFIDENCE: MED on the error code for a null handle, inherited from the siblings above.
+HLE(k_ef_cancel)  {
+    auto* e = (EventFlag*)(uintptr_t)a0;
+    if (!e) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    interruptible_mutex_lock(&e->m);
+    const int parked = e->waiters;
+    e->bits = a1;                   // the flag is SET to the pattern, not OR'd into it
+    ++e->cancel_gen;                // release the threads parked right now, and only those
+    interruptible_cond_broadcast(&e->c);
+    pthread_mutex_unlock(&e->m);
+    // The out-parameter the stub never wrote. A guest that branches on "how many did I just
+    // cancel?" was reading stack residue.
+    if (a2) *(int32_t*)(uintptr_t)a2 = parked;
+    if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.cancel    ef=0x%llx bits=0x%llx parked=%d\n",
+                         sctid(), (unsigned long long)a0, (unsigned long long)a1, parked);
+    return 0;
+}
 // A guest RELATIVE microsecond timeout as an absolute CLOCK_REALTIME deadline, for the host
 // primitives that take one (pthread_mutex_timedlock, pthread_rwlock_timed*, sem_timedwait).
 //
@@ -3418,12 +3459,14 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
                          (unsigned long long)e->bits);
     interruptible_mutex_lock(&e->m);
     e->waiters++;
+    const uint64_t entry_cancel_gen = e->cancel_gen;
     if (a4) {
         uint32_t usec = *(uint32_t*)(uintptr_t)a4;
         timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted)
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted &&
+               e->cancel_gen == entry_cancel_gen)
             rc = interruptible_cond_timedwait(&e->c, &e->m, &dl,
                                               GuestWaitKind::EventFlag, (uintptr_t)e);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -3433,7 +3476,8 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!e->deleted && !evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // ETIMEDOUT
     } else {
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted)
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted &&
+               e->cancel_gen == entry_cancel_gen)
             interruptible_cond_wait(&e->c, &e->m, GuestWaitKind::EventFlag, (uintptr_t)e);
     }
     bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
@@ -5244,6 +5288,7 @@ void register_kernel_hle() {
     R("sceKernelCreateEventFlag", k_ef_create); R("sceKernelDeleteEventFlag", k_ef_delete);
     R("sceKernelSetEventFlag", k_ef_set);       R("sceKernelClearEventFlag", k_ef_clear);
     R("sceKernelWaitEventFlag", k_ef_wait);     R("sceKernelPollEventFlag", k_ef_poll);
+    R("sceKernelCancelEventFlag", k_ef_cancel);
     R("sceKernelCreateSema", k_sema_create);    R("sceKernelDeleteSema", k_sema_delete);
     R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
     R("sceKernelPollSema", k_sema_poll);
