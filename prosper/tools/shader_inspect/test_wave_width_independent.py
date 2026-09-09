@@ -160,6 +160,32 @@ def mod_guards_discard():
     return module(PRE_IDS + [10, 20, 21, 22], b)
 
 
+def mod_phi_before_vote(identical):
+    """A divergent branch reconverges in a phi, and the PHI is what the vote reduces.
+
+    Both incoming values are uniform constants, so a rule that asked only "are the incoming values
+    uniform?" called the phi uniform and admitted the module -- while the phi is exactly the
+    divergent predicate that selected it. With `identical`, both edges carry the same constant, and
+    then which edge ran genuinely cannot matter.
+
+    The pair is the experiment: one operand id differs between them and nothing else does, so a phi
+    rule that is inert and one that is too permissive both fail rather than look correct.
+    """
+    lower_value = 11 if identical else 6
+    b = (preamble(SC_INPUT)                            # %9 is a per-pixel load: divergent
+         + inst(248, 20)
+         + inst(247, 23, 0)
+         + inst(250, 9, 21, 22)                        # branch on the DIVERGENT value itself
+         + inst(248, 21) + inst(249, 23)
+         + inst(248, 22) + inst(249, 23)
+         + inst(248, 23)
+         + inst(245, 1, 24, 11, 21, lower_value, 22)   # OpPhi -> %24
+         + inst(335, 1, 10, 6, 24)                     # the vote reduces the PHI
+         + inst(62, 5, 10)
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 21, 22, 23, 24], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
@@ -235,6 +261,8 @@ def main() -> int:
     expect_refused("a divergent vote guarding a discard", mod_guards_discard())
     expect_refused("a vote over a storage buffer THIS SHADER WRITES",
                    mod_uniform_source_but_shader_writes_memory())
+    expect_refused("a vote over a phi whose DIVERGENT branch chose between uniform constants",
+                   mod_phi_before_vote(identical=False))
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a
@@ -250,6 +278,8 @@ def main() -> int:
     # Arm (b).
     expect_admitted("a divergent vote that cannot influence any output", mod_dead_vote())
     expect_admitted("a module with no wave vote at all", mod_no_votes())
+    expect_admitted("a vote over a phi whose edges all carry the SAME value",
+                    mod_phi_before_vote(identical=True))
 
     # A module the tool cannot parse must never be counted as proven.
     with tempfile.TemporaryDirectory() as tmp:

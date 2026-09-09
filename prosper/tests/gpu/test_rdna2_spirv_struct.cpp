@@ -6800,6 +6800,26 @@ int main() {
         ins(uniform_but_writes, 249, {22});
         ins(uniform_but_writes, 248, {22}); ins(uniform_but_writes, 253, {});
 
+        // A divergent branch reconverges in a phi, and the PHI is what the vote reduces. Both
+        // incoming values are uniform constants, so a rule that asked only "are the incoming
+        // values uniform?" called the phi uniform and admitted this -- while the phi IS the
+        // divergent predicate that selected it. The identical-edge variant differs by one operand
+        // id and nothing else, so a phi rule that is inert and one that is too permissive both fail.
+        auto phi_before_vote = [&](uint32_t lower_value) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 248, {20});
+            ins(b, 247, {23, 0});
+            ins(b, 250, {9, 21, 22});          // branch on the DIVERGENT value itself
+            ins(b, 248, {21}); ins(b, 249, {23});
+            ins(b, 248, {22}); ins(b, 249, {23});
+            ins(b, 248, {23});
+            ins(b, 245, {1, 24, 11, 21, lower_value, 22});
+            ins(b, 335, {1, 10, 6, 24});       // the vote reduces the PHI
+            ins(b, 62, {5, 10});
+            ins(b, 253, {});
+            return b;
+        };
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6815,6 +6835,10 @@ int main() {
             {"a divergent vote guarding a STORAGE BUFFER write", guards_uav, false},
             {"a divergent vote guarding a discard", guards_discard, false},
             {"a vote over a storage buffer THIS SHADER WRITES", uniform_but_writes, false},
+            {"a vote over a phi whose DIVERGENT branch chose between uniform constants",
+             phi_before_vote(6), false},
+            {"a vote over a phi whose edges all carry the SAME value",
+             phi_before_vote(11), true},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

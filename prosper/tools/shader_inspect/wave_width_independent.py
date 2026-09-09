@@ -192,7 +192,12 @@ class Module:
                             changed = True
                     continue
                 if op == OP_PHI:
-                    if len(w) > 3 and all(w[i] in uni for i in range(3, len(w) - 1, 2)):
+                    # IDENTICAL incoming values, not merely uniform ones -- a phi chooses between
+                    # its edges, so uniform values say nothing when the branch choosing is
+                    # divergent. `q = phi(true, false)` after `if (divergent)` is exactly the
+                    # divergent predicate, and both constants are uniform. See the C++ twin.
+                    vals = [w[i] for i in range(3, len(w) - 1, 2)]
+                    if vals and all(v == vals[0] for v in vals) and vals[0] in uni:
                         uni.add(w[ri])
                         changed = True
                     continue

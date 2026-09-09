@@ -3481,10 +3481,26 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 continue;
             }
             if (in.op == Op_Phi) {
-                bool all = in.len > 3;
-                for (uint32_t i = 3; i + 1 < in.len; i += 2)
-                    if (!uniform.count(spirv[in.at + i])) { all = false; break; }
-                if (all) { uniform.insert(result); changed = true; }
+                // IDENTICAL incoming values, not merely uniform ones. A phi's whole job is to
+                // choose between its edges, so "every value is uniform" says nothing about the
+                // result when the branch doing the choosing is divergent:
+                //
+                //     p = divergent;  if (p) {} else {};  q = phi(true, false);  a = Any(q)
+                //
+                // both constants are uniform, and q is exactly p. Admitting that vote lets a
+                // 64-lane wave and two 32-lane groups answer differently, which is the defect this
+                // predicate exists to prevent. Identical ids are safe for the opposite reason:
+                // which edge ran cannot matter when every edge carries the same value.
+                //
+                // Proving the SELECTION uniform would admit more, and is left undone rather than
+                // guessed: measured over the 49-module corpus this restriction costs nothing.
+                bool all = in.len > 4;
+                for (uint32_t i = 5; i + 1 < in.len; i += 2)
+                    if (spirv[in.at + i] != spirv[in.at + 3]) { all = false; break; }
+                if (all && uniform.count(spirv[in.at + 3])) {
+                    uniform.insert(result);
+                    changed = true;
+                }
                 continue;
             }
             bool any_operand = false, all_uniform = true;
