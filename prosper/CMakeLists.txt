@@ -869,6 +869,10 @@ if(TARGET prosper_core)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_SOURCE_DIR}/tests/hle/audio/test_audio_flow_publication.py"
                      $<TARGET_FILE:test_audio>)
+    add_test(NAME audio_lifecycle_publication
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tests/hle/audio/test_audio_lifecycle.py"
+                     $<TARGET_FILE:test_audio>)
   endif()
 
   # NGS2 waveform-block streaming (#1059/#1060 part 3): a fed block makes the voice Playing and advances
@@ -3831,6 +3835,14 @@ if(PROSPER_AUDIO_SDL3 AND TARGET SDL3::SDL3)
   target_link_libraries(test_audio_demand PRIVATE prosper_audio_sdl3)
   add_test(NAME audio_demand COMMAND test_audio_demand)
   set_tests_properties(audio_demand PROPERTIES ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")
+  add_test(NAME audio_lifecycle_destroy_race COMMAND test_audio_demand lifecycle-race)
+  set_tests_properties(audio_lifecycle_destroy_race PROPERTIES ENVIRONMENT "SDL_AUDIO_DRIVER=dummy" TIMEOUT 15)
+  add_test(NAME audio_lifecycle_sink COMMAND test_audio_demand lifecycle-sink)
+  set_tests_properties(audio_lifecycle_sink PROPERTIES
+    ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;PROSPER_AUDIO_DEMAND=1;PROSPER_AUDIO_LIFECYCLE=1")
+  add_test(NAME audio_lifecycle_sink_disabled COMMAND test_audio_demand lifecycle-sink)
+  set_tests_properties(audio_lifecycle_sink_disabled PROPERTIES
+    ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;PROSPER_AUDIO_DEMAND=1;PROSPER_AUDIO_LIFECYCLE=0")
   add_test(NAME audio_demand_return_open COMMAND test_audio_demand return-open)
   add_test(NAME audio_demand_ordered_quit COMMAND test_audio_demand ordered-quit)
   set_tests_properties(audio_demand_return_open audio_demand_ordered_quit PROPERTIES

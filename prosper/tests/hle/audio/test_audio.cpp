@@ -547,11 +547,77 @@ static int test_flow_publication() {
     return fails ? 1 : 0;
 }
 
+
+// The Python driver checks actual lifecycle records in enabled/disabled processes. PCM remains
+// independently checked here: scratch reuse after publication must not alter the supplied grain.
+static int test_lifecycle_publication() {
+    audio_reset();
+    CapturingSink sink;
+    audio_set_sink(&sink);
+    uint8_t context_param[0x40]{};
+    CHECK(call("sceAudioOut2ContextResetParam", PTR(context_param)) == 0);
+    *(uint32_t*)(context_param + 0x10) = 64;
+    uint64_t context = 0, old_port = 0, new_port = 0, aux = 0, next_context = 0, next_port = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(context_param), 0, 0, PTR(&context)) == 0);
+    struct PortParam {
+        uint16_t type, pad;
+        uint32_t format, rate, flags;
+        uint64_t user;
+        uint32_t reserved[10];
+    } param{};
+    param.format = 0x200; param.rate = 48000;
+    CHECK(call("sceAudioOut2PortCreate", context, PTR(&param), PTR(&old_port)) == 0);
+    std::vector<float> pcm(128);
+    for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = i % 2 ? -0.5f : 0.25f;
+    const auto original = pcm;
+    uint64_t pointer = PTR(pcm.data());
+    struct Attribute { uint32_t id, reserved; uint64_t value, size; } attr{0, 0, PTR(&pointer), 8};
+    CHECK(call("sceAudioOut2PortSetAttributes", old_port, PTR(&attr), 1) == 0);
+    std::fill(pcm.begin(), pcm.end(), 0.75f); // guest scratch is reused before Push
+    CHECK(call("sceAudioOut2ContextPush", context, 1) == 0);
+    CHECK(sink.outs.size() == 1);
+    if (sink.outs.size() == 1) CHECK(sink.outs[0].pcm.size() == 512 &&
+        std::memcmp(sink.outs[0].pcm.data(), original.data(), 512) == 0);
+    pointer = 0;
+    CHECK(call("sceAudioOut2PortSetAttributes", old_port, PTR(&attr), 1) == 0);
+    pointer = 1; // fault-safe unreadable guest address: nonnull attempt, zero captured frames
+    CHECK(call("sceAudioOut2PortSetAttributes", old_port, PTR(&attr), 1) == 0);
+    CHECK(call("sceAudioOut2PortDestroy", old_port) == 0);
+    CHECK(sink.closes.empty()); // a port retirement must not silently close the context output
+    CHECK(call("sceAudioOut2PortCreate", context, PTR(&param), PTR(&new_port)) == 0);
+    CHECK((new_port & 0xffff) == (old_port & 0xffff) && new_port != old_port);
+    pointer = PTR(pcm.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", new_port, PTR(&attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", context, 1) == 0);
+    CHECK(sink.outs.size() == 2);
+    if (sink.outs.size() == 2) CHECK(sink.outs[1].pcm.size() == 512 &&
+        std::memcmp(sink.outs[1].pcm.data(), pcm.data(), 512) == 0);
+    param.type = 1; // implicit auxiliary retirement must remain distinguishable from MAIN
+    CHECK(call("sceAudioOut2PortCreate", context, PTR(&param), PTR(&aux)) == 0);
+    CHECK(call("sceAudioOut2PortSetAttributes", aux, PTR(&attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", context) == 0);
+    CHECK(sink.closes.size() == 1 && sink.closes[0] == 17);
+    CHECK(call("sceAudioOut2ContextCreate", PTR(context_param), 0, 0, PTR(&next_context)) == 0);
+    CHECK((next_context & 0xffff) == (context & 0xffff) && next_context != context);
+    param.type = 0;
+    CHECK(call("sceAudioOut2PortCreate", next_context, PTR(&param), PTR(&next_port)) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", next_context) == 0);
+    CHECK(sink.closes.size() == 1 && sink.outs.size() == 2); // diagnostics cannot synthesize output
+    std::printf("[lifecycle-fixture] context=0x%llx old=0x%llx new=0x%llx aux=0x%llx "
+                "next_context=0x%llx next_port=0x%llx\n", (unsigned long long)context,
+                (unsigned long long)old_port, (unsigned long long)new_port, (unsigned long long)aux,
+                (unsigned long long)next_context, (unsigned long long)next_port);
+    audio_reset();
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     printf("== test_audio ==\n");
     register_builtin_hle();
     if (argc == 2 && std::strcmp(argv[1], "--flow-publication") == 0)
         return test_flow_publication();
+    if (argc == 2 && std::strcmp(argv[1], "--lifecycle-publication") == 0)
+        return test_lifecycle_publication();
     test_signal_stats();
     test_stereo_downmix();
     test_stamped_grain_verdicts();

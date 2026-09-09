@@ -628,7 +628,21 @@ uint32_t   g_a2_users = 0;
 // interleaved PCM (grain frames from the context param, 256 live). ContextAdvance
 // advances engine state and ContextPush submits the grain to the device. SetAttributes must copy
 // each grain: guests reuse one scratch buffer for multiple ports before Advance/Push (#3411).
+// Opt-in lifecycle-only output. No per-grain log, allocation, routing or pacing change.
+bool audio_lifecycle() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("PROSPER_AUDIO_LIFECYCLE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+uint64_t audio_lifecycle_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 struct A2PortState {
+    uint64_t lifecycle_last_attribute_ns = 0, lifecycle_last_pcm_ns = 0;
+    uint64_t lifecycle_publications = 0, lifecycle_valid_publications = 0;
     bool     used = false;
     uint32_t generation = 0;
     uint64_t context = 0;      // owning context; Push must not submit another context's ports
@@ -1107,6 +1121,33 @@ uint32_t audio2_next_generation(uint32_t generation) {
 
 uint64_t audio2_make_handle(uint64_t tag, uint32_t generation, uint32_t one_based_index) {
     return tag | ((uint64_t)generation << 16) | one_based_index;
+}
+
+// POD snapshots survive slot clearing without copying PCM vectors. All reads occur under
+// g_a2_mx; printing occurs after that lock is released. Explicit and implicit destroys share it.
+struct A2LifecyclePort {
+    uint64_t port = 0, context = 0, event_ns = 0, last_attribute_ns = 0, last_pcm_ns = 0;
+    uint64_t publications = 0, valid_publications = 0;
+    uint32_t frames = 0, type = 0, data_format = 0;
+    bool pending = false;
+};
+A2LifecyclePort audio_lifecycle_port(const A2PortState& port, uint32_t index, uint64_t event_ns) {
+    return {audio2_make_handle(kA2PortTag, port.generation, index + 1), port.context,
+            event_ns, port.lifecycle_last_attribute_ns, port.lifecycle_last_pcm_ns,
+            port.lifecycle_publications, port.lifecycle_valid_publications,
+            port.pcm_frames, port.type, port.data_format, port.pcm_pending};
+}
+void audio_lifecycle_emit(const A2LifecyclePort& p, const char* reason) {
+    if (!p.port) return;
+    std::fprintf(stderr, "[audio-lifecycle-port] event=%s steady_ns=%llu port=0x%llx "
+        "generation=%u context=0x%llx context_generation=%u sink=%u "
+        "last_attribute_ns=%llu last_valid_pcm_ns=%llu publications=%llu valid_publications=%llu "
+        "pending=%u frames=%u type=%u data_format=0x%x\n", reason, (unsigned long long)p.event_ns,
+        (unsigned long long)p.port, uint32_t(p.port >> 16), (unsigned long long)p.context,
+        uint32_t(p.context >> 16), unsigned(kA2SinkPortBase + (p.context & kA2HandleIndexMask) - 1),
+        (unsigned long long)p.last_attribute_ns, (unsigned long long)p.last_pcm_ns,
+        (unsigned long long)p.publications, (unsigned long long)p.valid_publications,
+        unsigned(p.pending), p.frames, p.type, p.data_format);
 }
 
 template <typename Slot>
@@ -1766,19 +1807,42 @@ HLE(audio2_ctx_destroy) {
     if ((a0 & kA2HandleTagMask) != kA2CtxTag || one_based_index < 1 ||
         one_based_index > std::size(g_a2_ctx)) return kA2ErrInvalidParam;
     const uint32_t context_slot = one_based_index - 1;
-    std::lock_guard<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
+    const bool lifecycle = audio_lifecycle();
+    const uint64_t entered_ns = lifecycle ? audio_lifecycle_now_ns() : 0;
+    std::unique_lock<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
     bool close_sink = false;
+    std::array<A2LifecyclePort, kA2MaxPorts> retired{};
+    size_t retired_count = 0;
+    uint64_t cleared_ns = 0;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         A2Context* context = audio2_context_locked(a0);
         if (!context) return kA2ErrInvalidParam;
         close_sink = context->sink_opened;
+        if (lifecycle) cleared_ns = audio_lifecycle_now_ns();
         audio2_clear_slot(*context);
-        for (auto& port : g_a2_port_state)
-            if (port.used && port.context == a0) audio2_clear_slot(port);
+        for (uint32_t i = 0; i < kA2MaxPorts; ++i) {
+            auto& port = g_a2_port_state[i];
+            if (port.used && port.context == a0) {
+                if (lifecycle) retired[retired_count++] = audio_lifecycle_port(port, i, cleared_ns);
+                audio2_clear_slot(port);
+            }
+        }
     }
     if (close_sink)
         if (AudioSink* sink = audio_sink()) sink->close(kA2SinkPortBase + (int)context_slot);
+    const uint64_t closed_ns = lifecycle ? audio_lifecycle_now_ns() : 0;
+    sink_lk.unlock();
+    // Emit after actual sink closure: diagnostics must not extend this stream's draining tail.
+    if (lifecycle) {
+        std::fprintf(stderr, "[audio-lifecycle-context] event=destroy context=0x%llx "
+            "generation=%u sink=%u entered_ns=%llu cleared_ns=%llu close_return_ns=%llu "
+            "sink_was_open=%u implicit_ports=%zu\n", (unsigned long long)a0,
+            uint32_t(a0 >> 16), unsigned(kA2SinkPortBase + context_slot),
+            (unsigned long long)entered_ns, (unsigned long long)cleared_ns,
+            (unsigned long long)closed_ns, unsigned(close_sink), retired_count);
+        for (size_t i = 0; i < retired_count; ++i) audio_lifecycle_emit(retired[i], "context-destroy");
+    }
     return 0;
 }
 
@@ -1838,10 +1902,16 @@ HLE(audio2_port_destroy) {
     A2LOG("sceAudioOut2PortDestroy");
     // Clear the slot so a destroyed port stops being mixed (its guest PCM buffer may be freed and
     // reused) and the slot is reusable by the next PortCreate.
-    std::lock_guard<std::mutex> lk(g_a2_mx);
-    A2PortState* port = audio2_port_locked(a0);
-    if (!port) return kA2ErrInvalidParam;
-    audio2_clear_slot(*port);
+    A2LifecyclePort retired{};
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        uint32_t index = 0;
+        A2PortState* port = audio2_port_locked(a0, &index);
+        if (!port) return kA2ErrInvalidParam;
+        if (audio_lifecycle()) retired = audio_lifecycle_port(*port, index, audio_lifecycle_now_ns());
+        audio2_clear_slot(*port);
+    }
+    audio_lifecycle_emit(retired, "port-destroy");
     return 0;
 }
 
@@ -1933,6 +2003,15 @@ HLE(audio2_port_set_attr) {
                                 output[frame] = value * (1.0f / 32768.0f);
                             }
                         }
+                    }
+                }
+                if (audio_lifecycle()) {
+                    const uint64_t now_ns = audio_lifecycle_now_ns();
+                    port->lifecycle_last_attribute_ns = now_ns; // includes explicit null publication
+                    if (pcm) ++port->lifecycle_publications;
+                    if (pcm && port->pcm_frames) {
+                        ++port->lifecycle_valid_publications;
+                        port->lifecycle_last_pcm_ns = now_ns;
                     }
                 }
                 // Reached-ness: the guest handing us a PCM buffer address is the last step before
