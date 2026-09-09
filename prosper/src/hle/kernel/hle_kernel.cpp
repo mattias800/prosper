@@ -4680,8 +4680,23 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
     }
     if (close_output) CloseHandle(output);
 #else
-    (void)path;
+    // NOT a silent no-op (#3509). See the sibling note in sync_futex.cpp: the caller announces the
+    // dump, so silence here reads as success plus a caller error.
+    //
+    // Nothing to report on POSIX. This function's Windows body walks `g_win_guest_threads`, a
+    // registry populated only by the Win32 guest-thread trampoline, and `interruptible_cond_wait`'s
+    // POSIX arm is `(void)kind;` -- no guest wait is ever registered here. Reporting requires that
+    // registration to exist first, which is its own piece of work rather than a port of this
+    // function.
+    FILE* out = stderr;
+    FILE* opened = nullptr;
+    if (path && *path) { opened = std::fopen(path, "a"); if (opened) out = opened; }
+    std::fprintf(out,
+                 "[thread-trace] UNAVAILABLE on this platform: guest threads and their waits are "
+                 "registered only on Windows (hle_kernel.cpp g_win_guest_threads, sync_futex.cpp "
+                 "interruptible_cond_wait), so there is nothing to walk. See #3509.\n");
     (void)pthread_filter;
+    if (opened) std::fclose(opened);
 #endif
 }
 

@@ -782,7 +782,23 @@ void dump_guest_sync_trace(const char* path) {
     }
     if (opened) std::fclose(opened);
 #else
-    (void)path;
+    // NOT a silent no-op (#3509). The caller prints "timed guest-state dump #N" before calling this,
+    // so returning quietly makes the announcement read as success and the absence of a file read as
+    // the caller's mistake -- which is exactly how this cost a run before being diagnosed.
+    //
+    // There is genuinely nothing to report here: the sync ring, its recorder and the wait
+    // registration it draws from are all inside this file's `#ifdef _WIN32` (opens :33, closes
+    // :262), so on POSIX no event is ever recorded. Porting the DUMPER alone would print an empty
+    // ring, which is a different lie. What that needs is guest-wait registration on POSIX, which is
+    // its own piece of work.
+    FILE* out = stderr;
+    FILE* opened = nullptr;
+    if (path && *path) { opened = std::fopen(path, "a"); if (opened) out = opened; }
+    std::fprintf(out,
+                 "[sync-trace] UNAVAILABLE on this platform: the sync event ring is Windows-only "
+                 "(sync_futex.cpp #ifdef _WIN32), so no events are recorded here and there is "
+                 "nothing to dump. See #3509.\n");
+    if (opened) std::fclose(opened);
 #endif
 }
 
