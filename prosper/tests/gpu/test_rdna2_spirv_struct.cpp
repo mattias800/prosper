@@ -6784,6 +6784,22 @@ int main() {
         ins(guards_discard, 248, {22}); ins(guards_discard, 62, {5, 11});
         ins(guards_discard, 253, {});
 
+        // The uniform branch_only module with ONE extra instruction: an unrelated store into a
+        // second storage buffer, outside the vote's region. That instruction is the whole
+        // experiment -- if the verdict does not flip, "uniform" is only testing which storage class
+        // the pointer had rather than whether the value is invocation-invariant.
+        std::vector<uint32_t> uniform_but_writes = preamble(kStorageBuffer);
+        ins(uniform_but_writes, 32, {40, 2, kStorageBuffer});
+        ins(uniform_but_writes, 59, {40, 41, kStorageBuffer});
+        ins(uniform_but_writes, 335, {1, 10, 6, 9});
+        ins(uniform_but_writes, 248, {20});
+        ins(uniform_but_writes, 62, {41, 11});          // the extra instruction: a UAV write
+        ins(uniform_but_writes, 247, {22, 0});
+        ins(uniform_but_writes, 250, {10, 21, 22});
+        ins(uniform_but_writes, 248, {21}); ins(uniform_but_writes, 62, {5, 11});
+        ins(uniform_but_writes, 249, {22});
+        ins(uniform_but_writes, 248, {22}); ins(uniform_but_writes, 253, {});
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6798,6 +6814,7 @@ int main() {
             {"a BALLOT over a uniform value reaching the output", uniform_ballot, false},
             {"a divergent vote guarding a STORAGE BUFFER write", guards_uav, false},
             {"a divergent vote guarding a discard", guards_discard, false},
+            {"a vote over a storage buffer THIS SHADER WRITES", uniform_but_writes, false},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

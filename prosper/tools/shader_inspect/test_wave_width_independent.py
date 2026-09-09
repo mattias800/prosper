@@ -126,6 +126,28 @@ def mod_guards_storage_buffer_write():
     return module(PRE_IDS + [10, 20, 21, 22, 40, 41], b)
 
 
+def mod_uniform_source_but_shader_writes_memory():
+    """`mod_branch_only(SC_STORAGE_BUFFER)` with ONE extra instruction: an unrelated store into a
+    second storage buffer, outside the vote's region.
+
+    That instruction is the whole experiment. The admitted version and this one differ by nothing
+    else, so if the verdict does not flip, the "uniform" test is not asking whether the value is
+    invocation-invariant -- it is only asking which storage class the pointer had. A buffer this
+    draw writes is not a constant.
+    """
+    b = (preamble(SC_STORAGE_BUFFER)
+         + inst(32, 40, 2, SC_STORAGE_BUFFER)
+         + inst(59, 40, 41, SC_STORAGE_BUFFER)
+         + inst(335, 1, 10, 6, 9)
+         + inst(248, 20)
+         + inst(62, 41, 11)                            # the extra instruction: a UAV write
+         + inst(247, 22, 0)
+         + inst(250, 10, 21, 22)
+         + inst(248, 21) + inst(62, 5, 11) + inst(249, 22)
+         + inst(248, 22) + inst(253))
+    return module(PRE_IDS + [10, 20, 21, 22, 40, 41], b)
+
+
 def mod_guards_discard():
     """The region discards the pixel. Whether the fragment survives is the vote's answer."""
     b = (preamble(SC_INPUT)
@@ -211,6 +233,8 @@ def main() -> int:
     expect_refused("a divergent vote guarding a STORAGE BUFFER write",
                    mod_guards_storage_buffer_write())
     expect_refused("a divergent vote guarding a discard", mod_guards_discard())
+    expect_refused("a vote over a storage buffer THIS SHADER WRITES",
+                   mod_uniform_source_but_shader_writes_memory())
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a

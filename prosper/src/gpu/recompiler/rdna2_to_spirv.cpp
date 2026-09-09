@@ -3341,9 +3341,9 @@ bool spirv_op_is_constant(uint32_t op) {
     }
 }
 
-bool spirv_storage_is_uniform(uint32_t sc) {
-    return sc == 2 /*Uniform*/ || sc == SC_StorageBuffer || sc == SC_PushConstant ||
-           sc == SC_UniformConstant;
+bool spirv_storage_is_uniform(uint32_t sc, bool module_writes_memory) {
+    if (sc == SC_StorageBuffer) return !module_writes_memory;   // a UAV this draw writes is not
+    return sc == 2 /*Uniform*/ || sc == SC_PushConstant || sc == SC_UniformConstant;
 }
 
 }  // namespace
@@ -3425,10 +3425,25 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     // over a provably uniform operand answers identically however the hardware groups lanes, and
     // nothing downstream of it can move. This is the arm that carries the corpus: the guest's
     // `s_cbranch_execz`-style tests are overwhelmingly comparisons of constant-buffer scalars.
+    //
+    // One qualification, and it is the difference between a predicate that happens to be right on
+    // the shaders in hand and one whose argument holds: "uniform" must mean the same value in EVERY
+    // invocation of this draw. A read-only constant buffer satisfies that. A storage buffer this
+    // shader also WRITES does not -- one invocation's store changes what another's load returns --
+    // so when the module writes buffer or image memory at all, StorageBuffer loads stop counting.
+    // Measured, 0 of the 49 corpus modules write any, so the guard costs nothing today.
+    bool writes_memory = false;
+    for (const SpirvInst& in : insts) {
+        if (in.op == Op_ImageWrite ||
+            (in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor)) { writes_memory = true; break; }
+        if (in.op == Op_Store && in.len >= 3 && !locals.count(spirv[in.at + 1]) &&
+            !outputs.count(spirv[in.at + 1])) { writes_memory = true; break; }
+    }
     std::unordered_set<uint32_t> uniform;
     for (const SpirvInst& in : insts) {
         if (spirv_op_is_constant(in.op) && in.len >= 3) uniform.insert(spirv[in.at + 2]);
-        if (in.op == Op_Variable && in.len >= 4 && spirv_storage_is_uniform(spirv[in.at + 3]))
+        if (in.op == Op_Variable && in.len >= 4 &&
+            spirv_storage_is_uniform(spirv[in.at + 3], writes_memory))
             uniform.insert(spirv[in.at + 2]);
     }
     for (bool changed = true; changed;) {
@@ -3456,7 +3471,8 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                     const uint32_t ptr = spirv[in.at + 3];
                     const auto sc = var_storage.find(ptr);
                     const bool from_uniform_var =
-                        sc != var_storage.end() && spirv_storage_is_uniform(sc->second);
+                        sc != var_storage.end() &&
+                        spirv_storage_is_uniform(sc->second, writes_memory);
                     if (from_uniform_var || (uniform.count(ptr) && sc == var_storage.end())) {
                         uniform.insert(result);
                         changed = true;

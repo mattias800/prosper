@@ -139,12 +139,32 @@ class Module:
                 self.succ[current] = [w[2]] + [w[i] for i in range(4, len(w), 2)]
 
     # -- arm (a) -----------------------------------------------------------------------------
+    def _writes_memory(self):
+        """Does this shader write buffer or image memory -- anything but its own locals and colour?
+
+        A storage buffer the same draw writes is not uniform: one invocation's store changes what
+        another's load returns. Constant buffers, push constants and uniform constants are read-only
+        and keep their uniformity regardless.
+        """
+        for op, w in self.insts:
+            if op == OP_IMAGE_WRITE or 227 <= op <= 242:
+                return True
+            if op == OP_STORE and len(w) >= 3 and w[1] not in self.locals \
+                    and w[1] not in self.outputs:
+                return True
+        return False
+
+    def _uniform_storage(self, sc):
+        if sc == STORAGE_SB:
+            return not self._writes_memory()
+        return sc in (STORAGE_UNIFORM, STORAGE_PUSH, STORAGE_UNIFORM_CONSTANT)
+
     def uniform_values(self):
         uni = set()
         for op, w in self.insts:
             if op in CONSTANT_OPS and len(w) >= 3:
                 uni.add(w[2])
-            if op == OP_VARIABLE and len(w) >= 4 and w[3] in UNIFORM_STORAGE:
+            if op == OP_VARIABLE and len(w) >= 4 and self._uniform_storage(w[3]):
                 uni.add(w[2])
         changed = True
         while changed:
@@ -166,7 +186,8 @@ class Module:
                     if len(w) >= 4:
                         ptr = w[3]
                         sc = self.var_storage.get(ptr)
-                        if sc in UNIFORM_STORAGE or (ptr in uni and sc is None):
+                        if (sc is not None and self._uniform_storage(sc)) \
+                                or (ptr in uni and sc is None):
                             uni.add(w[ri])
                             changed = True
                     continue
