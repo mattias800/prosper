@@ -3248,120 +3248,340 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv) {
     return required;
 }
 
-bool fragment_spirv_vote_reaches_output(const std::vector<uint32_t>& spirv) {
-    // Unparseable is unsafe: a module we cannot read has not been shown to keep its vote away from a
-    // pixel, and the whole point of this predicate is that its negative answer is load-bearing.
-    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return true;
+namespace {
 
-    struct Inst { uint32_t op; size_t at; uint32_t len; };
-    std::vector<Inst> insts;
+struct SpirvInst { uint32_t op; size_t at; uint32_t len; };
+
+// ---------------------------------------------------------------------------------------------
+// A shared SPIR-V word model. Following every trailing word as an SSA id treats LITERALS as ids,
+// and a literal that happens to equal a result id fabricates a dataflow edge: measured, that made
+// a vote "reach" an output through OpExtInst, whose word 4 is a GLSL instruction NUMBER in the
+// same numeric range as low result ids. It produced 8 false positives across 49 real modules.
+bool spirv_has_result(uint32_t op) {
+    switch (op) {
+        case Op_Store: case Op_Branch: case Op_BranchConditional:
+        case Op_SelectionMerge: case Op_LoopMerge: case Op_Return: case Op_Kill:
+        case Op_Decorate: case Op_MemberDecorate: case Op_Switch:
+            return false;
+        default: return true;
+    }
+}
+
+// Type instructions carry their result at word 1 (they have no type operand).
+uint32_t spirv_result_word(uint32_t op) {
+    switch (op) {
+        case Op_TypeVoid: case Op_TypeBool: case Op_TypeInt: case Op_TypeFloat:
+        case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage:
+        case 26 /*OpTypeSampler*/:
+        case Op_TypeSampledImage: case Op_TypeArray: case Op_TypeRuntimeArray:
+        case Op_TypeStruct: case Op_TypePointer: case Op_TypeFunction:
+        case Op_ExtInstImport:
+            return 1;
+        default: return 2;
+    }
+}
+
+bool spirv_is_id_operand(uint32_t op, uint32_t i) {
+    switch (op) {
+        case Op_ExtInst:        return i == 3 || i >= 5;          // set id, LITERAL instr, args
+        case Op_Constant:       return false;                     // value words
+        case Op_CompositeExtract: return i == 3;                  // then literal indices
+        case 82 /*OpCompositeInsert*/: return i == 3 || i == 4;
+        case 79 /*OpVectorShuffle*/: return i == 3 || i == 4;     // then literal components
+        case Op_ImageSampleImplicitLod:
+        case Op_ImageSampleExplicitLod:
+        case Op_ImageFetch: case Op_ImageGather:
+            return i == 3 || i == 4 || i >= 6;                    // word 5 is a LITERAL mask
+        case Op_TypeInt: case Op_TypeFloat: return false;
+        case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage: return i == 2;
+        case Op_TypePointer:    return i == 3;                    // word 2 is LITERAL storage
+        case Op_Variable:       return i >= 4;                    // word 3 is LITERAL storage
+        default:                return i >= 3;
+    }
+}
+
+// Values that differ between the invocations of one draw, and so cannot carry uniformity. Listing
+// the DIVERGENT sources rather than the uniform ones is deliberate: an opcode nobody thought about
+// then has to earn uniformity through its operands instead of inheriting it, so an unknown case
+// fails towards "not proven" rather than towards "safe".
+bool spirv_op_is_divergent_source(uint32_t op) {
+    switch (op) {
+        case Op_ImageSampleImplicitLod: case Op_ImageSampleExplicitLod:
+        case Op_ImageSampleDrefImplicitLod: case Op_ImageSampleDrefExplicitLod:
+        case Op_ImageFetch: case Op_ImageGather: case Op_ImageRead:
+        case Op_ImageQuerySizeLod: case Op_ImageQuerySize: case Op_ImageQueryLod:
+        case Op_ImageQueryLevels:
+        case Op_DPdx: case Op_DPdy:
+        case 209 /*OpFwidth*/: case 210 /*OpDPdxFine*/: case 211 /*OpDPdyFine*/:
+        case 212 /*OpFwidthFine*/: case 213 /*OpDPdxCoarse*/: case 214 /*OpDPdyCoarse*/:
+        case 215 /*OpFwidthCoarse*/:
+        case Op_AtomicLoad: case Op_AtomicExchange: case Op_AtomicCompareExchange:
+        case Op_AtomicIAdd: case Op_AtomicISub: case Op_AtomicSMin: case Op_AtomicUMin:
+        case Op_AtomicSMax: case Op_AtomicUMax: case Op_AtomicAnd: case Op_AtomicOr:
+        case Op_AtomicXor:
+        case 57 /*OpFunctionCall*/:
+            return true;
+        default:
+            // Every subgroup instruction: its result depends on which lanes share the group, which
+            // is the very thing under question here.
+            return op >= 333 && op <= 366;
+    }
+}
+
+bool spirv_op_is_constant(uint32_t op) {
+    switch (op) {
+        case 41 /*OpConstantTrue*/: case 42 /*OpConstantFalse*/: case Op_Constant:
+        case 44 /*OpConstantComposite*/: case 45 /*OpConstantSampler*/:
+        case 46 /*OpConstantNull*/:
+        case 48 /*OpSpecConstantTrue*/: case 49 /*OpSpecConstantFalse*/:
+        case 50 /*OpSpecConstant*/: case 51 /*OpSpecConstantComposite*/:
+        case 52 /*OpSpecConstantOp*/:
+            return true;
+        default: return false;
+    }
+}
+
+bool spirv_storage_is_uniform(uint32_t sc) {
+    return sc == 2 /*Uniform*/ || sc == SC_StorageBuffer || sc == SC_PushConstant ||
+           sc == SC_UniformConstant;
+}
+
+}  // namespace
+
+bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
+    // Unparseable is not proven: a module we cannot read has not been shown to be width-independent,
+    // and the whole point of this predicate is that its POSITIVE answer is load-bearing.
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return false;
+
+    std::vector<SpirvInst> insts;
     for (size_t off = 5; off < spirv.size();) {
         const uint32_t len = spirv[off] >> 16;
         const uint32_t op = spirv[off] & 0xffffu;
-        if (!len || len > spirv.size() - off) return true;   // truncated: unsafe, see above
+        if (!len || len > spirv.size() - off) return false;   // truncated: not proven, see above
         insts.push_back({op, off, len});
         off += len;
     }
 
-    std::unordered_set<uint32_t> outputs, locals, tainted, tainted_ptrs;
-    for (const Inst& in : insts) {
+    // --- the votes ------------------------------------------------------------------------------
+    std::vector<std::pair<uint32_t, uint32_t>> votes;   // (result, operand)
+    std::unordered_set<uint32_t> ballots;               // results whose WIDTH is the answer
+    for (const SpirvInst& in : insts) {
+        if (in.op == Op_GroupNonUniformAny && in.len >= 5) {
+            votes.push_back({spirv[in.at + 2], spirv[in.at + 4]});
+        } else if (in.op == Op_GroupNonUniformBallot && in.len >= 5) {
+            votes.push_back({spirv[in.at + 2], spirv[in.at + 4]});
+            ballots.insert(spirv[in.at + 2]);
+        }
+    }
+    if (votes.empty()) return true;                     // nothing width-dependent to prove
+
+    // --- storage classes ------------------------------------------------------------------------
+    std::unordered_map<uint32_t, uint32_t> var_storage;
+    std::unordered_set<uint32_t> outputs, locals;
+    for (const SpirvInst& in : insts) {
         if (in.op != Op_Variable || in.len < 4) continue;
         const uint32_t storage = spirv[in.at + 3];
+        var_storage[spirv[in.at + 2]] = storage;
         if (storage == SC_Output) outputs.insert(spirv[in.at + 2]);
         else if (storage == SC_Function) locals.insert(spirv[in.at + 2]);
     }
-    // An access chain into an output is itself an output pointer.
-    for (const Inst& in : insts)
+    for (const SpirvInst& in : insts)                   // a chain into an output IS an output
         if (in.op == Op_AccessChain && in.len >= 4 && outputs.count(spirv[in.at + 3]))
             outputs.insert(spirv[in.at + 2]);
 
-    for (const Inst& in : insts)
-        if ((in.op == Op_GroupNonUniformAny || in.op == Op_GroupNonUniformBallot) && in.len >= 3)
-            tainted.insert(spirv[in.at + 2]);
-    if (tainted.empty()) return false;                        // no vote at all
-
-    // Instructions with no result id. Treating a branch's target as a result would taint an
-    // unrelated label and turn every voting module into a positive.
-    const auto has_result = [](uint32_t op) {
-        switch (op) {
-            case Op_Store: case Op_Branch: case Op_BranchConditional:
-            case Op_SelectionMerge: case Op_LoopMerge: case Op_Return: case Op_Kill:
-            case Op_Decorate: case Op_MemberDecorate:
-                return false;
-            default: return true;
-        }
-    };
-    // Type instructions carry their result at word 1 (they have no type operand).
-    const auto result_word = [](uint32_t op) -> uint32_t {
-        switch (op) {
-            case Op_TypeVoid: case Op_TypeBool: case Op_TypeInt: case Op_TypeFloat:
-            case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage:
-            case 26 /*OpTypeSampler*/:
-            case Op_TypeSampledImage: case Op_TypeArray: case Op_TypeRuntimeArray:
-            case Op_TypeStruct: case Op_TypePointer: case Op_TypeFunction:
-            case Op_ExtInstImport:
-                return 1;
-            default: return 2;
-        }
-    };
-    // Whether word `i` of an instruction is an ID rather than a LITERAL. Following literals as ids
-    // is not a theoretical concern: it produced 8 false positives across 49 modules here, because
-    // OpExtInst's word 4 is a GLSL instruction number in the same numeric range as low result ids.
-    const auto is_id_operand = [](uint32_t op, uint32_t i, uint32_t len) -> bool {
-        switch (op) {
-            case Op_ExtInst:        return i == 3 || i >= 5;          // set id, LITERAL instr, args
-            case Op_Constant:       return false;                     // value words
-            case Op_CompositeExtract: return i == 3;                  // then literal indices
-            case 82 /*OpCompositeInsert*/: return i == 3 || i == 4;
-            case 79 /*OpVectorShuffle*/: return i == 3 || i == 4;     // then literal components
-            case Op_ImageSampleImplicitLod:
-            case Op_ImageSampleExplicitLod:
-            case Op_ImageFetch: case Op_ImageGather:
-                return i == 3 || i == 4 || i >= 6;                    // word 5 is a LITERAL mask
-            case Op_TypeInt: case Op_TypeFloat: return false;
-            case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage: return i == 2;
-            case Op_TypePointer:    return i == 3;                    // word 2 is LITERAL storage
-            case Op_Variable:       return i >= 4;                    // word 3 is LITERAL storage
-            default:                return i >= 3;
-        }
-        (void)len;
-    };
-
+    // --- arm (a): the vote's operand is wave-uniform ---------------------------------------------
+    // Any(P) reduces P over whatever lanes the group holds. When P takes the same value in every
+    // invocation of the draw, that reduction IS P -- at 64 lanes, at 32, at any width. So a vote
+    // over a provably uniform operand answers identically however the hardware groups lanes, and
+    // nothing downstream of it can move. This is the arm that carries the corpus: the guest's
+    // `s_cbranch_execz`-style tests are overwhelmingly comparisons of constant-buffer scalars.
+    std::unordered_set<uint32_t> uniform;
+    for (const SpirvInst& in : insts) {
+        if (spirv_op_is_constant(in.op) && in.len >= 3) uniform.insert(spirv[in.at + 2]);
+        if (in.op == Op_Variable && in.len >= 4 && spirv_storage_is_uniform(spirv[in.at + 3]))
+            uniform.insert(spirv[in.at + 2]);
+    }
     for (bool changed = true; changed;) {
         changed = false;
-        for (const Inst& in : insts) {
-            if (in.op == Op_Store && in.len >= 3) {
-                const uint32_t ptr = spirv[in.at + 1], val = spirv[in.at + 2];
-                if (tainted.count(val) && locals.count(ptr) && tainted_ptrs.insert(ptr).second)
-                    changed = true;
-                continue;
-            }
-            if (in.op == Op_Load && in.len >= 4) {
-                if (tainted_ptrs.count(spirv[in.at + 3]) &&
-                    tainted.insert(spirv[in.at + 2]).second)
-                    changed = true;
-                continue;
-            }
-            if (!has_result(in.op)) continue;
-            const uint32_t rw = result_word(in.op);
+        for (const SpirvInst& in : insts) {
+            if (!spirv_has_result(in.op)) continue;
+            const uint32_t rw = spirv_result_word(in.op);
             if (in.len <= rw) continue;
             const uint32_t result = spirv[in.at + rw];
-            if (tainted.count(result)) continue;
-            for (uint32_t i = 1; i < in.len; ++i) {
-                if (i == rw || !is_id_operand(in.op, i, in.len)) continue;
-                if (!tainted.count(spirv[in.at + i])) continue;
-                tainted.insert(result);
-                changed = true;
-                break;
+            if (uniform.count(result)) continue;
+            if (in.op == Op_GroupNonUniformAny) {
+                // A vote's own result is uniform once its operand is: an all-lanes reduction of a
+                // value every lane already agrees on. Chained votes resolve by fixed point.
+                if (in.len >= 5 && uniform.count(spirv[in.at + 4])) {
+                    uniform.insert(result);
+                    changed = true;
+                }
+                continue;
             }
+            if (spirv_op_is_divergent_source(in.op)) continue;
+            if (in.op == Op_Load) {
+                // Uniform when it reads a uniform-class variable, or a pointer already proven
+                // uniform -- an access chain with uniform indices into such a variable.
+                if (in.len >= 4) {
+                    const uint32_t ptr = spirv[in.at + 3];
+                    const auto sc = var_storage.find(ptr);
+                    const bool from_uniform_var =
+                        sc != var_storage.end() && spirv_storage_is_uniform(sc->second);
+                    if (from_uniform_var || (uniform.count(ptr) && sc == var_storage.end())) {
+                        uniform.insert(result);
+                        changed = true;
+                    }
+                }
+                continue;
+            }
+            if (in.op == Op_Phi) {
+                bool all = in.len > 3;
+                for (uint32_t i = 3; i + 1 < in.len; i += 2)
+                    if (!uniform.count(spirv[in.at + i])) { all = false; break; }
+                if (all) { uniform.insert(result); changed = true; }
+                continue;
+            }
+            bool any_operand = false, all_uniform = true;
+            for (uint32_t i = 1; i < in.len; ++i) {
+                if (i == rw || !spirv_is_id_operand(in.op, i)) continue;
+                any_operand = true;
+                if (!uniform.count(spirv[in.at + i])) { all_uniform = false; break; }
+            }
+            if (any_operand && all_uniform) { uniform.insert(result); changed = true; }
         }
     }
 
-    for (const Inst& in : insts)
-        if (in.op == Op_Store && in.len >= 3 &&
-            outputs.count(spirv[in.at + 1]) && tainted.count(spirv[in.at + 2]))
-            return true;
-    return false;
+    // --- the CFG, for arm (b) -------------------------------------------------------------------
+    std::unordered_map<uint32_t, std::vector<SpirvInst>> blocks;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> succ;
+    std::unordered_map<uint32_t, uint32_t> merge_of, branch_cond;
+    uint32_t current = 0;
+    for (const SpirvInst& in : insts) {
+        if (in.op == Op_Label && in.len >= 2) {
+            current = spirv[in.at + 1];
+            blocks[current];
+            continue;
+        }
+        if (!current) continue;
+        blocks[current].push_back(in);
+        if ((in.op == Op_SelectionMerge || in.op == Op_LoopMerge) && in.len >= 2) {
+            merge_of[current] = spirv[in.at + 1];
+        } else if (in.op == Op_Branch && in.len >= 2) {
+            succ[current] = {spirv[in.at + 1]};
+        } else if (in.op == Op_BranchConditional && in.len >= 4) {
+            branch_cond[current] = spirv[in.at + 1];
+            succ[current] = {spirv[in.at + 2], spirv[in.at + 3]};
+        } else if (in.op == Op_Switch && in.len >= 3) {
+            std::vector<uint32_t> targets{spirv[in.at + 2]};
+            for (uint32_t i = 4; i < in.len; i += 2) targets.push_back(spirv[in.at + i]);
+            succ[current] = targets;
+        }
+    }
+
+    // --- arm (b): the vote cannot influence a colour output --------------------------------------
+    // Data flow alone is NOT enough, and believing it was is the defect this replaced. A vote used
+    // only as a branch condition never flows into a store, yet it decides WHICH store runs: with
+    // EXEC true in the upper half and false in the lower, a 64-lane any() takes the branch where two
+    // independent 32-lane groups disagree, and the constant the taken block writes lands in one half
+    // only. Measured over the same 49 modules, the value-reachability question clears 49 of 49 while
+    // this one clears 1 -- the earlier predicate was not incomplete at the margin, it was blind to
+    // the whole population.
+    const auto influences_output = [&](uint32_t seed) {
+        std::unordered_set<uint32_t> tainted{seed}, tainted_ptrs;
+        for (int round = 0; round < 16; ++round) {
+            for (bool changed = true; changed;) {           // data flow to a fixed point
+                changed = false;
+                for (const SpirvInst& in : insts) {
+                    if (in.op == Op_Store && in.len >= 3) {
+                        const uint32_t ptr = spirv[in.at + 1], val = spirv[in.at + 2];
+                        if (tainted.count(val) && locals.count(ptr) &&
+                            tainted_ptrs.insert(ptr).second)
+                            changed = true;
+                        continue;
+                    }
+                    if (in.op == Op_Load && in.len >= 4) {
+                        if (tainted_ptrs.count(spirv[in.at + 3]) &&
+                            tainted.insert(spirv[in.at + 2]).second)
+                            changed = true;
+                        continue;
+                    }
+                    if (!spirv_has_result(in.op)) continue;
+                    const uint32_t rw = spirv_result_word(in.op);
+                    if (in.len <= rw) continue;
+                    const uint32_t result = spirv[in.at + rw];
+                    if (tainted.count(result)) continue;
+                    for (uint32_t i = 1; i < in.len; ++i) {
+                        if (i == rw || !spirv_is_id_operand(in.op, i)) continue;
+                        if (!tainted.count(spirv[in.at + i])) continue;
+                        tainted.insert(result);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            for (const SpirvInst& in : insts)                // a tainted value written to a colour
+                if (in.op == Op_Store && in.len >= 3 && outputs.count(spirv[in.at + 1]) &&
+                    tainted.count(spirv[in.at + 2]))
+                    return true;
+
+            bool grew = false;                               // then control dependence
+            for (const auto& entry : branch_cond) {
+                if (!tainted.count(entry.second)) continue;
+                const uint32_t head = entry.first;
+                const auto merge_it = merge_of.find(head);
+                if (merge_it == merge_of.end())
+                    return true;   // unstructured: the region has no bound we can trust
+                const uint32_t merge = merge_it->second;
+                // Every block strictly inside the construct executes only because the vote said so.
+                std::unordered_set<uint32_t> inside;
+                std::vector<uint32_t> stack;
+                if (succ.count(head)) stack = succ[head];
+                while (!stack.empty()) {
+                    const uint32_t b = stack.back();
+                    stack.pop_back();
+                    if (b == merge || !blocks.count(b) || !inside.insert(b).second) continue;
+                    if (succ.count(b))
+                        for (uint32_t s : succ[b]) stack.push_back(s);
+                }
+                for (uint32_t b : inside) {
+                    for (const SpirvInst& in : blocks[b]) {
+                        if (in.op == Op_Store && in.len >= 3 && outputs.count(spirv[in.at + 1]))
+                            return true;
+                        if (in.op == Op_ImageWrite || in.op == Op_Kill) return true;
+                        // A store into a local inside the region is control-dependent too: whether
+                        // it happened at all is the vote's answer, so every later load of that
+                        // local carries the vote.
+                        if (in.op == Op_Store && in.len >= 3 && locals.count(spirv[in.at + 1]) &&
+                            tainted_ptrs.insert(spirv[in.at + 1]).second)
+                            grew = true;
+                    }
+                }
+                const auto merge_blk = blocks.find(merge);
+                if (merge_blk == blocks.end()) continue;
+                for (const SpirvInst& in : merge_blk->second) {
+                    if (in.op != Op_Phi || in.len < 5) continue;
+                    const uint32_t result = spirv[in.at + 2];
+                    if (tainted.count(result)) continue;
+                    bool differs = false;
+                    for (uint32_t i = 5; i + 1 < in.len; i += 2)
+                        if (spirv[in.at + i] != spirv[in.at + 3]) { differs = true; break; }
+                    if (differs) { tainted.insert(result); grew = true; }
+                }
+            }
+            if (!grew) break;
+        }
+        return false;
+    };
+
+    for (const auto& vote : votes) {
+        // A ballot is never cleared by uniformity: its result is a per-lane bit MASK whose width is
+        // the subgroup's, so a 32-lane ballot reports half a mask as though it were whole however
+        // uniform the value being balloted. Only deadness can clear one.
+        if (!ballots.count(vote.first) && uniform.count(vote.second)) continue;
+        if (!influences_output(vote.first)) continue;
+        return false;
+    }
+    return true;
 }
 
 uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv) {

@@ -1231,20 +1231,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // it to {}), so they match nothing and keep the strict exact-width contract. gpu_replay gates on
     // expected_output_hash, so admitting there would have moved the project's offline oracle.
     //
-    // Measured on Windows/NVIDIA, reviewed routes, before -> after refusals (#3464, PR #3480):
-    //   PPSA01885 Evergate        11 -> 0 (title + gameplay routes; title screen's missing 3D
-    //                                      content confirmed restored by eye)
-    //   PPSA02664 Alex Kidd DX     4 -> 0 (title screen confirmed correct by eye; its WORLD has a
-    //                                      separate, unrelated defect -- #3479)
-    //   PPSA04263 Grand Theft Auto V      the original reviewed bank route
+    // Measured on Windows/NVIDIA, reviewed routes (#3464, PR #3480). Modules reporting exactly
+    // WaveAny, and how many of them are PROVABLY width-independent:
+    //   PPSA01885 Evergate         11 of 11 (title + gameplay routes; the title screen's missing
+    //                                        3D content is restored, confirmed by eye)
+    //   PPSA02664 Alex Kidd DX       8 of 8  (title screen confirmed correct by eye; its WORLD has
+    //                                        a separate, unrelated defect -- #3479)
+    //   PPSA13579 Blasphemous 2      1 of 8
+    //   PPSA25009 Blue Prince       18 of 22
+    //   PPSA04263 Grand Theft Auto V         the original reviewed bank route
     //
-    // PPSA13579 and PPSA25009 are on the list even though 1 of 8 and 7 of 22 of their modules let a
-    // vote reach a colour output. That is safe BECAUSE the decision is now per module: those eight
-    // are refused individually and the other 41 run at native width. Admitting a title no longer
-    // means trusting all of its shaders, which is what made a title the wrong unit before.
+    // Two of those titles are on the list although most or some of their modules do NOT clear. That
+    // is safe BECAUSE the decision is per module: the 11 that cannot be proved keep the exact-width
+    // contract and are refused individually. Admitting a title no longer means trusting all of its
+    // shaders, which is what made a title the wrong unit before.
     //
     // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
-    // run away, and with the per-module check the run is confirmation rather than a gamble.
+    // run away, and with the per-module proof the run is confirmation rather than a gamble.
     static const char* const kNativeFragmentVoteTitles[] = {
         "PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009",
     };

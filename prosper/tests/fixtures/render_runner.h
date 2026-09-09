@@ -7157,22 +7157,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // or scalar-reduction qualifier is admitted. Everything else keeps the fail-visible
             // exact-width contract.
             //
-            // Admitted per TITLE by an allowlist in live_renderer.cpp, not globally (#3464 W5,
-            // PR #3480). Every entry has a before/after survey on a reviewed route; the scope is a
-            // queue, not a wall. Counts and the reasoning live on #3464 rather than here, because a
-            // survey total depends on how far each run got and a number restated in a comment goes
-            // stale silently.
-            // Per MODULE, not per title. The reason set says how the vote was PRODUCED; what
-            // matters is whether its value can reach a pixel. Measured across four titles, 8 of 49
-            // modules reporting exactly WaveAny let a vote reach a colour output -- Blue Prince
-            // alone 7 of 22, while 15 of its modules were safe and being refused. A title-wide
-            // answer is wrong in both directions, so the width decision is taken per module.
+            // Two gates, and both are required. The reason set says how the vote was PRODUCED, and
+            // rules out lane identity, ballots, shuffles and scalar reductions -- width-dependent
+            // however they are consumed. The width-independence proof then asks the question that
+            // actually decides a pixel: would this module answer the same over two 32-lane groups
+            // as over one 64-lane wave? See rdna2_to_spirv.hpp for the two grounds a vote clears on
+            // and for why value reachability alone was not one of them.
             //
-            // Both conditions are required. The reason set still gates out lane identity, ballots,
-            // shuffles and scalar reductions, which are width-dependent however they are consumed;
-            // reachability then rejects the WaveAny modules whose vote can change a pixel.
+            // Per MODULE, not per title -- the title allowlist in live_renderer.cpp only stages
+            // which titles are surveyed. Measured across four titles, 38 of 49 modules reporting
+            // exactly WaveAny are provably width-independent and 11 are not, and the split runs
+            // through titles rather than between them (Blue Prince 18 of 22, Blasphemous 2 1 of 8).
+            // A title-wide answer would be wrong in both directions.
             if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny &&
-                !prosper::gpu::fragment_spirv_vote_reaches_output(bd_fs)) {
+                prosper::gpu::fragment_spirv_wave_width_independent(bd_fs)) {
                 const uint64_t shader_key = bd.fs_identity
                     ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
                 static std::mutex native_width_log_mutex;

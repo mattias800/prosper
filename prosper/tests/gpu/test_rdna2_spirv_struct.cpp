@@ -6659,6 +6659,143 @@ int main() {
     }
     printf("  [ok]   packed POS_X/Y_FLOAT system VGPRs source gl_FragCoord\n");
 
+
+    // ---------------------------------------------------------------------------------------
+    // fragment_spirv_wave_width_independent: the shipped predicate behind #3464's native-wave32
+    // allowance. Its POSITIVE answer is what lets a draw run at the host's 32-lane fragment
+    // subgroup instead of being skipped, so the checks that matter are the REFUSALS -- and the
+    // sharpest of them is the counterexample that retired the value-reachability predecessor:
+    //
+    //     let the guest predicate be true in the upper 32 lanes and false in the lower. Branch on
+    //     any(P) and store a constant into the colour output in the taken block. A 64-lane wave
+    //     takes the branch and every lane sees the constant; two independent 32-lane groups
+    //     disagree, and the constant lands in one half only.
+    //
+    // The vote's VALUE never reaches that store -- only the branch does -- so asking whether a vote
+    // can reach an output calls the module safe. It is not.
+    //
+    // Every module below is assembled BY HAND from raw words rather than recompiled, so each case
+    // exists independently of what the emitter happens to produce. The divergent and uniform arms
+    // are the same shapes with one word changed (Input vs StorageBuffer), which is what makes
+    // either verdict meaningful: were the uniform arm inert the second group would fail, and were
+    // it too permissive the first would.
+    {
+        auto ins = [](std::vector<uint32_t>& out, uint32_t op,
+                      std::initializer_list<uint32_t> operands) {
+            out.push_back(((1u + (uint32_t)operands.size()) << 16) | op);
+            for (uint32_t w : operands) out.push_back(w);
+        };
+        // ids: 1 bool, 2 float, 3 vec4, 4 ptr_out, 5 out_var, 6 scope const, 7 ptr_src,
+        //      8 src_var, 9 the vote's predicate, 10 the vote, 11 a constant, 20.. labels
+        const uint32_t kInput = 1, kOutput = 3, kStorageBuffer = 12;
+        auto preamble = [&](uint32_t storage) {
+            std::vector<uint32_t> b{0x07230203u, 0x00010300u, 0, 64, 0};
+            ins(b, 20, {1});                    // OpTypeBool
+            ins(b, 22, {2, 32});                // OpTypeFloat 32
+            ins(b, 23, {3, 2, 4});              // OpTypeVector
+            ins(b, 32, {4, 3, kOutput});        // OpTypePointer Output vec4
+            ins(b, 59, {4, 5, kOutput});        // OpVariable Output
+            ins(b, 43, {2, 6, 3});              // OpConstant, used as the scope literal
+            ins(b, 43, {2, 11, 1});             // OpConstant, the value a taken block stores
+            ins(b, 32, {7, 1, storage});        // OpTypePointer <storage> bool
+            ins(b, 59, {7, 8, storage});        // OpVariable <storage>
+            ins(b, 61, {1, 9, 8});              // OpLoad -> %9
+            return b;
+        };
+        // any(P) guards a block that stores a constant into the colour output.
+        auto branch_only = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(storage);
+            ins(b, 335, {1, 10, 6, 9});         // OpGroupNonUniformAny
+            ins(b, 248, {20});                  // OpLabel
+            ins(b, 247, {22, 0});               // OpSelectionMerge
+            ins(b, 250, {10, 21, 22});          // OpBranchConditional
+            ins(b, 248, {21}); ins(b, 62, {5, 11}); ins(b, 249, {22});
+            ins(b, 248, {22}); ins(b, 253, {});
+            return b;
+        };
+        // The two arms merge in a phi carrying different values, and the phi reaches the output.
+        auto phi_of_constants = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(storage);
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 248, {20});
+            ins(b, 247, {23, 0});
+            ins(b, 250, {10, 21, 22});
+            ins(b, 248, {21}); ins(b, 249, {23});
+            ins(b, 248, {22}); ins(b, 249, {23});
+            ins(b, 248, {23});
+            ins(b, 245, {2, 24, 11, 21, 6, 22});   // OpPhi, a different value per edge
+            ins(b, 62, {5, 24});
+            ins(b, 253, {});
+            return b;
+        };
+        // The one shape the predecessor did catch: the vote's own value is stored.
+        auto value_to_output = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(storage);
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 248, {20}); ins(b, 62, {5, 10}); ins(b, 253, {});
+            return b;
+        };
+
+        struct Case { const char* what; std::vector<uint32_t> spv; bool expect_independent; };
+        std::vector<uint32_t> dead = preamble(kInput);
+        ins(dead, 335, {1, 10, 6, 9});
+        ins(dead, 248, {20});
+        ins(dead, 247, {22, 0});
+        ins(dead, 250, {10, 21, 22});
+        ins(dead, 248, {21}); ins(dead, 129, {2, 25, 11, 11}); ins(dead, 249, {22});
+        ins(dead, 248, {22}); ins(dead, 62, {5, 11}); ins(dead, 253, {});
+
+        std::vector<uint32_t> unstructured = preamble(kInput);
+        ins(unstructured, 335, {1, 10, 6, 9});
+        ins(unstructured, 248, {20});
+        ins(unstructured, 250, {10, 21, 22});      // no OpSelectionMerge: no region to bound
+        ins(unstructured, 248, {21}); ins(unstructured, 249, {22});
+        ins(unstructured, 248, {22}); ins(unstructured, 253, {});
+
+        std::vector<uint32_t> uniform_ballot = preamble(kStorageBuffer);
+        ins(uniform_ballot, 21, {30, 32, 0});      // OpTypeInt 32 unsigned
+        ins(uniform_ballot, 23, {31, 30, 4});      // OpTypeVector uint 4
+        ins(uniform_ballot, 339, {31, 10, 6, 9});  // OpGroupNonUniformBallot
+        ins(uniform_ballot, 248, {20});
+        ins(uniform_ballot, 81, {30, 33, 10, 0});  // OpCompositeExtract .x
+        ins(uniform_ballot, 62, {5, 33});
+        ins(uniform_ballot, 253, {});
+
+        std::vector<uint32_t> no_votes = preamble(kInput);
+        ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
+
+        const Case cases[] = {
+            {"a divergent vote guarding a store to the colour output",
+             branch_only(kInput), false},
+            {"a divergent vote whose arms merge in a phi that reaches the output",
+             phi_of_constants(kInput), false},
+            {"a divergent vote whose value is stored to the colour output",
+             value_to_output(kInput), false},
+            {"a vote-conditioned branch with no merge instruction", unstructured, false},
+            {"a BALLOT over a uniform value reaching the output", uniform_ballot, false},
+            {"a UNIFORM vote guarding a store to the colour output",
+             branch_only(kStorageBuffer), true},
+            {"a UNIFORM vote whose arms merge in a phi that reaches the output",
+             phi_of_constants(kStorageBuffer), true},
+            {"a UNIFORM vote whose value is stored to the colour output",
+             value_to_output(kStorageBuffer), true},
+            {"a divergent vote that cannot influence any output", dead, true},
+            {"a module with no wave vote at all", no_votes, true},
+            {"a module that is not SPIR-V at all", std::vector<uint32_t>{1, 2, 3, 4, 5}, false},
+        };
+        for (const Case& c : cases) {
+            const bool got = fragment_spirv_wave_width_independent(c.spv);
+            if (got != c.expect_independent) {
+                printf("  [FAIL] wave width independence: %s -> %s, expected %s\n", c.what,
+                       got ? "independent" : "NOT PROVEN",
+                       c.expect_independent ? "independent" : "NOT PROVEN");
+                return 1;
+            }
+        }
+        printf("  [ok]   wave width independence: %zu hand-built modules classified as expected\n",
+               sizeof(cases) / sizeof(cases[0]));
+    }
+
     printf("== PASS ==\n");
     return 0;
 }
