@@ -3126,6 +3126,14 @@ if(TARGET prosper_core)
       target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
       add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
 
+      add_executable(test_storage_metadata_borrow tests/gpu/execute/test_storage_metadata_borrow.cpp)
+      target_include_directories(test_storage_metadata_borrow PRIVATE tests frontends)
+      target_link_libraries(test_storage_metadata_borrow PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME storage_metadata_borrow COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+               $<TARGET_FILE:test_storage_metadata_borrow>)
+      set_tests_properties(storage_metadata_borrow PROPERTIES TIMEOUT 60)
+
       add_executable(test_storage_output_conflicts tests/gpu/execute/test_storage_output_conflicts.cpp)
       target_include_directories(test_storage_output_conflicts PRIVATE tests frontends)
       target_link_libraries(test_storage_output_conflicts PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)

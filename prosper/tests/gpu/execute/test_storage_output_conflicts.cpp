@@ -318,6 +318,14 @@ struct Fixture {
             b.dcc_metadata_host_data = reinterpret_cast<uint8_t *>(guest.data());
             b.dcc_metadata_host_data_size = metadata_bytes;
         }
+        // This fixture created B's DCC plane; authorize only that exact correlation.
+        // A shared backend without a renderer must not guess its metadata aspect.
+        set_metadata_kind_query([&](const MetadataKindRequest& request) {
+            return request.resource_addr == b.gpu_addr && request.metadata_addr == b.metadata_addr &&
+                   request.format == b.format && request.num_components == b.num_components &&
+                   request.img_dim == b.img_dim ? CompressionMetadataKind::Dcc
+                                               : CompressionMetadataKind::Unknown;
+        });
         std::fill(guest.begin(), guest.end(),
                   0xffffffffu); // valid all-uncompressed initial metadata
         for (uint32_t av : {0x13579bdfu, 0x31415926u}) {
@@ -364,6 +372,7 @@ struct Fixture {
                   "hosted DCC preserves advertised metadata backing");
             check_graphics(false);
         }
+        set_metadata_kind_query({});
     }
     void late_metadata() {
         // The first image writes ordinary FP16 magenta and resets DCC to all-0xff.

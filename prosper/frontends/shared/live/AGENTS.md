@@ -146,6 +146,14 @@ snapshots naturally. Metadata-only writes require an explicit retention veto bec
 does not cover interpretation metadata. Keep sampled metadata dependencies separate from storage
 metadata reset obligations. Include effective hosted and advertised ranges, and fold exact aliases.
 
+Later dispatches can change a separate metadata plane without touching a retained image's pixel
+allocation. Graphics imports and compute transfer seeds therefore recheck the consumer's complete
+supported DCC plane immediately before borrowing. Unknown metadata kinds, unsupported footprints,
+unreadable or truncated planes and non-plain contents decline the borrow. A supplied hosted plane
+never falls back to guest metadata. This fresh check applies to numeric aliases too; neither an
+earlier all-0xff scan nor the pixel journal proves current metadata. Refusal preserves outstanding
+leases and the existing materialization fallback. `storage_metadata_borrow` guards this boundary.
+
 Zero-address internal backing (such as GDS) is not an architectural guest output.
 Notify actual hosted guest destinations as well as advertised architectural ranges, including for cached
 views absent from a dispatch. Prepare page watches before every actual mutation. The production
