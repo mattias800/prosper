@@ -130,6 +130,16 @@ int main() {
            "...and so is libkernel.prx");
     refuse(R, "/dumps/PPSA00000-app0/libkernel_sys.sprx",
            ModulePathVerdict::SonyLibraryOutsideSceModule, "...and its _sys variant");
+    // One arm per entry of kRootRefusedPlatformPrefixes. Without these, deleting `libc_`, `libmdbg`
+    // or `gaikai` from that array leaves the whole suite green -- measured in the #3508 re-review,
+    // which found zero arms covering those three. They are the precautionary entries prosper does
+    // not HLE, so the stakes are low and the cost of covering them is one line each.
+    refuse(R, "/dumps/PPSA00000-app0/libc_weak.prx",
+           ModulePathVerdict::SonyLibraryOutsideSceModule, "prefix `libc_` is covered");
+    refuse(R, "/dumps/PPSA00000-app0/libmdbg_syscore.sprx",
+           ModulePathVerdict::SonyLibraryOutsideSceModule, "prefix `libmdbg` is covered");
+    refuse(R, "/dumps/PPSA00000-app0/gaikai-player.prx",
+           ModulePathVerdict::SonyLibraryOutsideSceModule, "prefix `gaikai` is covered");
     // The other half of that rule, and the reason it is a prefix LIST rather than "anything starting
     // lib". These are third-party libraries Sony also ships; a title may legitimately ship its own
     // build, and refusing them would break the case this widening exists to serve. Kills: widening
