@@ -154,6 +154,53 @@ def main() -> int:
           "native_width_logged.insert(shader_key).second" in rr,
           "-- admitted would become a DRAW count while still labelled shaders")
 
+    # --- the route actually reaches the title -------------------------------------------------
+    # `snapshots.json` stores `pad_script` relative to `prosper/`, and the emulator resolves it
+    # against ITS OWN working directory. Passing the stored string through made every routed run
+    # print one line -- "[pad] ... cannot open route file: scripts/.../x.pad" -- and then boot with
+    # NO INPUT AT ALL, sit on the title screen for the whole route, and return a plausible shader
+    # count. Three routes and the committed baseline were recorded that way before a human noticed
+    # the game was still on its title screen.
+    #
+    # These arms check the two things that failed: that the resolved path EXISTS on disk (the pad
+    # file is the survey's actual instrument, so a stale name is a dead instrument), and that a run
+    # whose log reports the failure cannot be used as evidence.
+    snapshots = REPO / "prosper" / "tools" / "snapshot" / "snapshots.json"
+    if snapshots.is_file():
+        routes = skip_survey.snapshot_routes(str(snapshots))
+        routed = [r for r in routes if r["pad_script"]]
+        check("some reviewed routes declare a pad script at all", bool(routed),
+              "%d routes, none routed -- the arms below would pass vacuously" % len(routes))
+        missing = [r["name"] for r in routed if not Path(r["pad_script"]).is_file()]
+        check("every reviewed route's pad script resolves to a file that exists",
+              not missing, "missing: %s" % ", ".join(missing))
+        absolute = [r["name"] for r in routed if not Path(r["pad_script"]).is_absolute()]
+        check("every reviewed route's pad script is made ABSOLUTE before it is handed to the app",
+              not absolute,
+              "relative, so the app resolves it against its own cwd: %s" % ", ".join(absolute))
+
+    try:
+        skip_survey.resolve_pad_script("scripts/nothing/here.pad", str(snapshots))
+        raised = False
+    except FileNotFoundError:
+        raised = True
+    check("a route file that does not exist RAISES rather than surveying a boot screen", raised)
+
+    # The runtime half. A path can exist when the corpus starts and still fail to open, so the log
+    # is checked too -- and a row that never got its route must not be usable as a baseline or as a
+    # comparison, which is exactly what `unjudgeable` decides.
+    good = {"exited_early": False, "frames": 900, "device": "some GPU", "elapsed": 150.0,
+            "returncode": 0, "pad_failed": ""}
+    check("a healthy routed row is judgeable", not skip_survey.unjudgeable(good))
+    lost = dict(good, pad_failed="scripts/blasphemous2/reach-first-gameplay.pad")
+    why = skip_survey.unjudgeable(lost)
+    check("a row whose route file never loaded is NOT judgeable", bool(why), why)
+    check("...and says so in terms of the route rather than of frames",
+          "route" in why, why)
+    check("PAD_FAILED matches the emulator's own wording",
+          skip_survey.PAD_FAILED.search(
+              "[pad] PROSPER_PAD_SCRIPT: cannot open route file: scripts/x/y.pad") is not None)
+
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0
 

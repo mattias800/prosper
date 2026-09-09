@@ -90,6 +90,11 @@ SKIP = re.compile(r"\[render\] skip draw=\d+ fs=([0-9a-f]+): fragment shader req
 ADMIT = re.compile(r"\[render\] native-width fragment vote: subgroup (\d+) -> (\d+) "
                    r"\(why=(\S+?)[ )]")
 FPS = re.compile(r"\[app\] [\d.]+ fps \((\d+) frames")
+# Belt and braces against the failure that invalidated every routed run before it was noticed: the
+# path is checked before the corpus starts, and the log is checked after each boot, because a file
+# that exists at check time can still fail to open. A route that delivered no input measured a boot
+# screen, so its count is not evidence of anything.
+PAD_FAILED = re.compile(r"\[pad\][^\n]*cannot open route file: ([^\n]*)")
 # The counts are host-dependent in the extreme: on an AMD host wave64 is native, nothing is refused,
 # and every count is legitimately 0. A baseline recorded on one GPU and compared against another
 # would report every shader as fixed and go green, so the device is recorded and checked.
@@ -152,10 +157,12 @@ def survey(app, dump, seconds, out_dir, route=None):
     # reported for context and never used to suppress a count.
     frames = max([int(m) for m in FPS.findall(text)] or [0])
     device = DEVICE.search(text)
+    pad_failed = PAD_FAILED.search(text)
     return {
         "title": title,
         "route": route["name"] if route else "",
         "routed": bool(route and route.get("pad_script")),
+        "pad_failed": pad_failed.group(1).strip() if pad_failed else "",
         "device": device.group(1).strip() if device else "",
         "frames": frames,
         "elapsed": round(elapsed, 1),
@@ -169,11 +176,39 @@ def survey(app, dump, seconds, out_dir, route=None):
     }
 
 
+def resolve_pad_script(pad_script, snapshots_path):
+    """An ABSOLUTE path to the route file, or raise.
+
+    `snapshots.json` stores `pad_script` relative to the `prosper/` directory, and the emulator
+    resolves it against ITS OWN working directory -- which is wherever the survey was launched from.
+    Passing the stored string through therefore produced
+
+        [pad] PROSPER_PAD_SCRIPT: cannot open route file: scripts/blasphemous2/reach-first-gameplay.pad
+
+    and the title booted with NO INPUT AT ALL, sat on its title screen for the whole route, and
+    returned a shader count that looked entirely reasonable. Every routed survey run before this fix
+    measured a boot screen, including the one that recorded `skip_baseline.json`.
+
+    Raising rather than warning is the point: a route that cannot route must not return a number.
+    """
+    root = Path(snapshots_path).resolve().parent.parent.parent   # tools/snapshot/x.json -> prosper/
+    for candidate in (root / pad_script, Path(pad_script)):
+        if candidate.is_file():
+            return str(candidate.resolve())
+    raise FileNotFoundError(
+        "route file %r does not exist (looked in %s and in the working directory). A route that "
+        "cannot deliver input measures a boot screen, so this aborts rather than surveying one."
+        % (pad_script, root))
+
+
 def snapshot_routes(path, titles=None):
     """Reviewed routes from tools/snapshot/snapshots.json, keyed by the dump they drive.
 
     Reuses what the project already agreed is worth guarding rather than inventing new sequences, and
     reaches the same state every run -- which the human-played baseline could not.
+
+    Every declared route file is resolved and checked HERE, before any title boots, so a broken
+    path costs a second rather than a corpus run. See `resolve_pad_script`.
     """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     entries = data if isinstance(data, list) else data.get("snapshots", data.get("entries", []))
@@ -183,11 +218,12 @@ def snapshot_routes(path, titles=None):
         title = dump.replace("-app0", "")
         if titles and title not in titles:
             continue
+        pad = e.get("pad_script") or ""
         out.append({
             "name": e.get("name", "?"),
             "title": title,
             "dump": dump,
-            "pad_script": e.get("pad_script") or "",
+            "pad_script": resolve_pad_script(pad, path) if pad else "",
             "env": e.get("env") or {},
             "seconds": int(e.get("timeout") or 150),
         })
@@ -211,6 +247,9 @@ def unjudgeable(row):
     Two contract facts both callers rely on: the returned reason is never falsy when there is one
     (they test `if why`), and it reads as a fragment following a title id (they format `"%s %s"`).
     """
+    if row.get("pad_failed"):
+        return ("never loaded its route file (%s), so it measured a boot screen rather than the "
+                "route" % row["pad_failed"])
     if row["exited_early"]:
         return "exited early after %.0fs (rc=%s)" % (row["elapsed"], row["returncode"])
     if not row["frames"]:
