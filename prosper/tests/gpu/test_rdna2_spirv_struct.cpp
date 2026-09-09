@@ -6761,6 +6761,29 @@ int main() {
         ins(uniform_ballot, 62, {5, 33});
         ins(uniform_ballot, 253, {});
 
+        // The effect the region performs is a STORAGE BUFFER write, not a colour store. A check
+        // that only looked for Output stores would call this safe; it is not, because the write
+        // happens in one 32-lane group and not the other and the rest of the draw can read it.
+        std::vector<uint32_t> guards_uav = preamble(kInput);
+        ins(guards_uav, 32, {40, 2, kStorageBuffer});
+        ins(guards_uav, 59, {40, 41, kStorageBuffer});
+        ins(guards_uav, 335, {1, 10, 6, 9});
+        ins(guards_uav, 248, {20});
+        ins(guards_uav, 247, {22, 0});
+        ins(guards_uav, 250, {10, 21, 22});
+        ins(guards_uav, 248, {21}); ins(guards_uav, 62, {41, 11}); ins(guards_uav, 249, {22});
+        ins(guards_uav, 248, {22}); ins(guards_uav, 253, {});
+
+        // Whether the fragment survives at all is the vote's answer.
+        std::vector<uint32_t> guards_discard = preamble(kInput);
+        ins(guards_discard, 335, {1, 10, 6, 9});
+        ins(guards_discard, 248, {20});
+        ins(guards_discard, 247, {22, 0});
+        ins(guards_discard, 250, {10, 21, 22});
+        ins(guards_discard, 248, {21}); ins(guards_discard, 252, {});
+        ins(guards_discard, 248, {22}); ins(guards_discard, 62, {5, 11});
+        ins(guards_discard, 253, {});
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6773,6 +6796,8 @@ int main() {
              value_to_output(kInput), false},
             {"a vote-conditioned branch with no merge instruction", unstructured, false},
             {"a BALLOT over a uniform value reaching the output", uniform_ballot, false},
+            {"a divergent vote guarding a STORAGE BUFFER write", guards_uav, false},
+            {"a divergent vote guarding a discard", guards_discard, false},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

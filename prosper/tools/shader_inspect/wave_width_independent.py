@@ -92,9 +92,19 @@ class Module:
                             if op == OP_VARIABLE and len(w) >= 4}
         self.outputs = {v for v, sc in self.var_storage.items() if sc == STORAGE_OUTPUT}
         self.locals = {v for v, sc in self.var_storage.items() if sc == STORAGE_FUNCTION}
-        for op, w in self.insts:                    # a chain into an output IS an output
-            if op == OP_ACCESS_CHAIN and len(w) >= 4 and w[3] in self.outputs:
-                self.outputs.add(w[2])
+        # Access chains inherit their base's class, transitively; one pass is not enough.
+        changed = True
+        while changed:
+            changed = False
+            for op, w in self.insts:
+                if op != OP_ACCESS_CHAIN or len(w) < 4:
+                    continue
+                if w[3] in self.outputs and w[2] not in self.outputs:
+                    self.outputs.add(w[2])
+                    changed = True
+                if w[3] in self.locals and w[2] not in self.locals:
+                    self.locals.add(w[2])
+                    changed = True
 
         self.votes = []                             # (result, operand)
         self.ballots = set()
@@ -206,12 +216,37 @@ class Module:
                     tainted.add(w[ri])
                     changed = True
 
+    def _observable(self, op, w):
+        """Does this instruction let the rest of the draw see that it ran?
+
+        A store through anything that is not a Function-storage pointer -- a colour attachment, a
+        storage buffer, an image. Restricting this to Output would make a UAV write invisible to the
+        analysis, the same shape of blind spot as the control-dependence one, one level down.
+        """
+        if op == OP_STORE:
+            return len(w) >= 3 and w[1] not in self.locals
+        if op == 63:                                  # OpCopyMemory
+            return len(w) >= 3 and w[1] not in self.locals
+        if op == 64:                                  # OpCopyMemorySized
+            return len(w) >= 4 and w[1] not in self.locals
+        if op in (OP_IMAGE_WRITE, OP_KILL, 4416, 5380, 224, 225):
+            return True                               # image write, kill, terminate, demote, barrier
+        return 227 <= op <= 242                       # atomics
+
     def influences_output(self, seed):
         tainted, tainted_ptrs = {seed}, set()
-        for _ in range(16):
+        # A bounded fixed point, and the bound is conservative on purpose: falling out of the loop
+        # still growing means the closure was NOT complete, so the honest answer is "it might" --
+        # returning False there would admit a module on an unfinished analysis.
+        settled = False
+        for _ in range(32):
             self._dataflow(tainted, tainted_ptrs)
-            for op, w in self.insts:
-                if op == OP_STORE and len(w) >= 3 and w[1] in self.outputs and w[2] in tainted:
+            for op, w in self.insts:                 # a tainted value leaving the shader
+                if op == OP_STORE and len(w) >= 3 and w[1] not in self.locals and w[2] in tainted:
+                    return True
+                if op == OP_IMAGE_WRITE and len(w) >= 4 and (w[2] in tainted or w[3] in tainted):
+                    return True
+                if 227 <= op <= 242 and len(w) >= 4 and w[3] in tainted:
                     return True
             grew = False
             for head, cond in self.branch_cond.items():
@@ -222,9 +257,7 @@ class Module:
                 inside, merge = self._region(head)
                 for b in inside:
                     for op, w in self.blocks[b]:
-                        if op == OP_STORE and len(w) >= 3 and w[1] in self.outputs:
-                            return True
-                        if op in (OP_IMAGE_WRITE, OP_KILL):
+                        if self._observable(op, w):
                             return True
                         # A store into a local inside the region is control-dependent too: whether
                         # it happened at all is the vote's answer.
@@ -239,8 +272,9 @@ class Module:
                         tainted.add(w[2])
                         grew = True
             if not grew:
+                settled = True
                 break
-        return False
+        return not settled
 
 
 def analyse(path):

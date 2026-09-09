@@ -12,7 +12,7 @@ predecessor:
     constant lands in one half only.
 
 The vote's VALUE never reaches the store there -- only the branch does -- so a value-reachability
-predicate calls that module safe. `mod_branch_only_divergent` is exactly that module, and it is the
+predicate calls that module safe. `mod_branch_only(SC_INPUT)` is exactly that module, and it is the
 first check below.
 
 Every module here is assembled BY HAND from raw words, not by recompiling a shader and not through
@@ -108,6 +108,36 @@ def mod_value_to_output(storage):
     return module(PRE_IDS + [10, 20], b)
 
 
+def mod_guards_storage_buffer_write():
+    """The effect the region performs is a STORAGE BUFFER write, not a colour store.
+
+    A predicate that only looked for `Output` stores would call this safe. It is not: the write
+    happens in one 32-lane group and not the other, and the rest of the draw can read it.
+    """
+    b = (preamble(SC_INPUT)
+         + inst(32, 40, 2, SC_STORAGE_BUFFER)          # OpTypePointer StorageBuffer float
+         + inst(59, 40, 41, SC_STORAGE_BUFFER)         # OpVariable StorageBuffer
+         + inst(335, 1, 10, 6, 9)
+         + inst(248, 20)
+         + inst(247, 22, 0)
+         + inst(250, 10, 21, 22)
+         + inst(248, 21) + inst(62, 41, 11) + inst(249, 22)   # then: store into the buffer
+         + inst(248, 22) + inst(253))
+    return module(PRE_IDS + [10, 20, 21, 22, 40, 41], b)
+
+
+def mod_guards_discard():
+    """The region discards the pixel. Whether the fragment survives is the vote's answer."""
+    b = (preamble(SC_INPUT)
+         + inst(335, 1, 10, 6, 9)
+         + inst(248, 20)
+         + inst(247, 22, 0)
+         + inst(250, 10, 21, 22)
+         + inst(248, 21) + inst(252)                   # then: OpKill
+         + inst(248, 22) + inst(62, 5, 11) + inst(253))
+    return module(PRE_IDS + [10, 20, 21, 22], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
@@ -178,6 +208,9 @@ def main() -> int:
                    mod_value_to_output(SC_INPUT))
     expect_refused("a vote-conditioned branch with no merge instruction", mod_unstructured())
     expect_refused("a BALLOT over a uniform value reaching the output", mod_uniform_ballot())
+    expect_refused("a divergent vote guarding a STORAGE BUFFER write",
+                   mod_guards_storage_buffer_write())
+    expect_refused("a divergent vote guarding a discard", mod_guards_discard())
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a

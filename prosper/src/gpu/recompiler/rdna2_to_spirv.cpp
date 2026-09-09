@@ -3385,9 +3385,39 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
         if (storage == SC_Output) outputs.insert(spirv[in.at + 2]);
         else if (storage == SC_Function) locals.insert(spirv[in.at + 2]);
     }
-    for (const SpirvInst& in : insts)                   // a chain into an output IS an output
-        if (in.op == Op_AccessChain && in.len >= 4 && outputs.count(spirv[in.at + 3]))
-            outputs.insert(spirv[in.at + 2]);
+    // Access chains inherit their base's class, transitively. Two passes over the instruction list
+    // are not enough in general, so this runs to a fixed point.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const SpirvInst& in : insts) {
+            if (in.op != Op_AccessChain || in.len < 4) continue;
+            const uint32_t base = spirv[in.at + 3], result = spirv[in.at + 2];
+            if (outputs.count(base) && outputs.insert(result).second) changed = true;
+            if (locals.count(base) && locals.insert(result).second) changed = true;
+        }
+    }
+
+    // What counts as leaving the shader. A store through anything that is not a Function-storage
+    // pointer is observable -- a colour attachment, a storage buffer, an image. Restricting this to
+    // Output would make a UAV write invisible to the analysis, which is the same shape of blind spot
+    // as the control-dependence one, one level down.
+    const auto is_observable_effect = [&](const SpirvInst& in) {
+        switch (in.op) {
+            case Op_Store:
+                return in.len >= 3 && !locals.count(spirv[in.at + 1]);
+            case 63 /*OpCopyMemory*/:
+                return in.len >= 3 && !locals.count(spirv[in.at + 1]);
+            case 64 /*OpCopyMemorySized*/:
+                return in.len >= 4 && !locals.count(spirv[in.at + 1]);
+            case Op_ImageWrite: case Op_Kill:
+            case 4416 /*OpTerminateInvocation*/: case 5380 /*OpDemoteToHelperInvocation*/:
+            case Op_ControlBarrier: case Op_MemoryBarrier:
+                return true;
+            default:
+                // Atomics both read and write memory the rest of the draw can see.
+                return in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor;
+        }
+    };
 
     // --- arm (a): the vote's operand is wave-uniform ---------------------------------------------
     // Any(P) reduces P over whatever lanes the group holds. When P takes the same value in every
@@ -3488,7 +3518,11 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     // the whole population.
     const auto influences_output = [&](uint32_t seed) {
         std::unordered_set<uint32_t> tainted{seed}, tainted_ptrs;
-        for (int round = 0; round < 16; ++round) {
+        // A bounded fixed point, and the bound is conservative on purpose: falling out of the loop
+        // still growing means the closure was NOT complete, so the honest answer is "it might" --
+        // returning false there would admit a module on an unfinished analysis.
+        bool settled = false;
+        for (int round = 0; round < 32 && !settled; ++round) {
             for (bool changed = true; changed;) {           // data flow to a fixed point
                 changed = false;
                 for (const SpirvInst& in : insts) {
@@ -3519,10 +3553,17 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                     }
                 }
             }
-            for (const SpirvInst& in : insts)                // a tainted value written to a colour
-                if (in.op == Op_Store && in.len >= 3 && outputs.count(spirv[in.at + 1]) &&
+            for (const SpirvInst& in : insts) {              // a tainted value leaving the shader
+                if (in.op == Op_Store && in.len >= 3 && !locals.count(spirv[in.at + 1]) &&
                     tainted.count(spirv[in.at + 2]))
                     return true;
+                if (in.op == Op_ImageWrite && in.len >= 4 &&
+                    (tainted.count(spirv[in.at + 2]) || tainted.count(spirv[in.at + 3])))
+                    return true;
+                if (in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor && in.len >= 4 &&
+                    tainted.count(spirv[in.at + 3]))
+                    return true;
+            }
 
             bool grew = false;                               // then control dependence
             for (const auto& entry : branch_cond) {
@@ -3545,9 +3586,7 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 }
                 for (uint32_t b : inside) {
                     for (const SpirvInst& in : blocks[b]) {
-                        if (in.op == Op_Store && in.len >= 3 && outputs.count(spirv[in.at + 1]))
-                            return true;
-                        if (in.op == Op_ImageWrite || in.op == Op_Kill) return true;
+                        if (is_observable_effect(in)) return true;
                         // A store into a local inside the region is control-dependent too: whether
                         // it happened at all is the vote's answer, so every later load of that
                         // local carries the vote.
@@ -3568,9 +3607,9 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                     if (differs) { tainted.insert(result); grew = true; }
                 }
             }
-            if (!grew) break;
+            settled = !grew;
         }
-        return false;
+        return !settled;
     };
 
     for (const auto& vote : votes) {
