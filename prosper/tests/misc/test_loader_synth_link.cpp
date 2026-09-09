@@ -102,6 +102,13 @@ int main() {
     // A module whose only "export" is defined but valueless. linker.cpp has the export predicate
     // written twice (is_exported_symbol, and the inline test where out.exports is built); if those
     // ever drift, this module is accepted by one and rejected by the other.
+    // A DUPLICATE BUILD: every export it has, an earlier module already provides. This is the shape
+    // the collision guard exists for -- Evergate ships libfmod.prx beside libfmodL.prx with the same
+    // export set, and linking both would run two init_arrays and make dlsym answer differently per
+    // handle. Distinct from the `logging` module above, which shares ONE export and provides one of
+    // its own; that is two different libraries, not two builds of one (#3497).
+    SynthModuleSpec subsumed_spec; subsumed_spec.exports = { kShared, kOnlyA };
+
     SynthModuleSpec valueless_spec; valueless_spec.exports = { kShared };
                                     valueless_spec.zero_value_exports = true;
 
@@ -109,6 +116,7 @@ int main() {
     const std::string release_path   = emit("synth_release.prx",   release_spec);
     const std::string logging_path   = emit("synth_logging.prx",   logging_spec);
     const std::string alt_path       = emit("synth_alt.prx",       alt_spec);
+    const std::string subsumed_path  = emit("synth_subsumed.prx",  subsumed_spec);
     const std::string valueless_path = emit("synth_valueless.prx", valueless_spec);
     if (fails) { printf("FAILED (%d) -- fixtures were not written\n", fails); return 1; }
 
@@ -174,7 +182,40 @@ int main() {
               "import census: two resolved cross-module, one stubbed");
     }
 
-    // ---- Arm 2: the collision guard fires -------------------------------------------------------
+    // ---- Arm 2a: the guard fires on a DUPLICATE BUILD -------------------------------------------
+    // Every export of `subsumed` is already provided, so linking it would duplicate a library
+    // wholesale. This is the case the flag was written for and it must keep being skipped.
+    {
+        std::vector<LinkInput> inputs = {
+            { main_path, kBase0 }, { release_path, kBase1 }, { subsumed_path, kBase2 },
+        };
+        inputs[2].skip_on_export_collision = true;
+        Program p; std::string err;
+        const bool ok = link_program(inputs, kStubBase, p, &err);
+        CHECK(ok, "duplicate build: link_program succeeds");
+        CHECK(p.skipped_modules.size() == 1, "duplicate build: the subsumed module is skipped");
+        CHECK(p.mods.size() == 2, "duplicate build: only the two other modules are linked");
+        if (p.skipped_modules.size() == 1) {
+            const auto& sk = p.skipped_modules[0];
+            CHECK(sk.path == subsumed_path, "duplicate build: the skip record names the dropped module");
+            CHECK(sk.owner_path == release_path,
+                  "duplicate build: the skip record names the module that already owns the NID");
+            CHECK(sk.nid == kShared, "duplicate build: the skip record carries the exact colliding NID");
+        }
+        CHECK(p.aliased_exports.empty(), "duplicate build: a skipped module contributes no aliases");
+        CHECK(p.slots.empty(),
+              "duplicate build: a skipped module's unsatisfied import creates no stub slot");
+    }
+
+    // ---- Arm 2b: the guard does NOT fire on two DIFFERENT libraries ------------------------------
+    // `logging` shares one export with `release` and provides one of its own. Under the old
+    // any-collision rule the whole module was dropped and kOnlyB was lost with it -- which is how
+    // Darksiders II lost steam_api_ps5.prx (1199 exports, 19.2% claimed) over a single NID and
+    // BlazBlue lost cri_lips_unity.prx (527 exports, 0.4% claimed) over two (#3497).
+    //
+    // Kills: reverting to "skip on any collision". That makes `mods.size()` 2 and `kOnlyB` absent,
+    // so both assertions below redden -- which is exactly what this arm existed to catch and could
+    // not, when its fixture shared 50% of a two-symbol module and was called a duplicate build.
     {
         std::vector<LinkInput> inputs = {
             { main_path, kBase0 }, { release_path, kBase1 }, { logging_path, kBase2 },
@@ -182,19 +223,16 @@ int main() {
         inputs[2].skip_on_export_collision = true;
         Program p; std::string err;
         const bool ok = link_program(inputs, kStubBase, p, &err);
-        CHECK(ok, "guarded: link_program succeeds");
-        CHECK(p.skipped_modules.size() == 1, "guarded: the colliding module is skipped");
-        CHECK(p.mods.size() == 2, "guarded: only the two non-colliding modules are linked");
-        if (p.skipped_modules.size() == 1) {
-            const auto& s = p.skipped_modules[0];
-            CHECK(s.path == logging_path, "guarded: the skip record names the dropped module");
-            CHECK(s.owner_path == release_path,
-                  "guarded: the skip record names the module that already owns the NID");
-            CHECK(s.nid == kShared, "guarded: the skip record carries the exact colliding NID");
-        }
-        CHECK(p.aliased_exports.empty(), "guarded: a skipped module contributes no aliases");
-        CHECK(export_of(p, kOnlyB) == 0, "guarded: a skipped module contributes no exports at all");
-        CHECK(p.slots.empty(), "guarded: a skipped module's unsatisfied import creates no stub slot");
+        CHECK(ok, "distinct library: link_program succeeds");
+        CHECK(p.skipped_modules.empty(), "distinct library: the module is NOT skipped");
+        CHECK(p.mods.size() == 3, "distinct library: all three modules are linked");
+        CHECK(export_of(p, kOnlyB) == kBase2 + kExp1,
+              "distinct library: its OWN export survives, rather than being lost with it");
+        // First-definition-wins is unchanged, and the alias is recorded rather than silent.
+        CHECK(export_of(p, kShared) == kBase1 + kExp0,
+              "distinct library: the shared NID still resolves to whoever claimed it first");
+        CHECK(p.aliased_exports.size() == 1,
+              "distinct library: the duplicate is REPORTED as an alias, not hidden");
     }
 
     // ---- Arm 3: the mutation that must NOT fire the guard ---------------------------------------
