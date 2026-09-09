@@ -5130,6 +5130,16 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **GTA intro output 18 shortages come from leaving its SDL stream alive after guest
+  `PortDestroy`.** Ruled out for the 2026-09-09 30-second `ea80d412` lifecycle trace (#3435).
+  Guest port 77 and sink 18/open generation 1 each recorded 2,814 valid PCM publications/Puts.
+  The last Put preceded the recorded `PortDestroy` boundary by 961.181 ms; SDL destruction
+  returned 24.526 microseconds after that boundary (timestamped just before clearing the port).
+  Final demand was 45 shortage callbacks out of 748, with the last callback approximately
+  18 ms before that boundary. The production stop
+  preceded retirement, but its intent or scheduling cause is not established. This does not
+  establish smooth playback or justify a buffering change.
+
 - **The HTILE `gpu-preserving` suppression is load-bearing for GTA V's picture.** FALSE, measured
   2026-08-28 (#3089). **And it should never have shipped: the answer was already recorded above in
   this same document** -- "should a write that provably preserves guest bytes invalidate a detached

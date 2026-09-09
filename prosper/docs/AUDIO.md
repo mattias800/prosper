@@ -63,6 +63,8 @@ Missing final records are an unknown shutdown remainder, not zero demand. The ex
 report consumes periodic snapshots; inspect `audio-demand-final` separately for quiesced close
 totals. These diagnostics do not establish whether a production stop was intentional, physical
 XRUNs, or audible continuity. They leave PCM ownership, mixing and pacing unchanged.
+The 2026-09-09 GTA intro trace rules out delayed stream teardown after guest port retirement
+for that measured run; see [GTA V's ruled-out record](GTA5_STATUS.md#ruled-out) and #3435.
 
 ## Layers
 
