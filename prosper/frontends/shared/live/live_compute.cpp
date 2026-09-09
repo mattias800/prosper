@@ -3569,7 +3569,7 @@ struct BoundImage {
     bool exact_storage_bytes() const {
         return native_float_storage || native_uint_storage || packed_r11_storage;
     }
-    uint32_t texel_depth = 1;           // logical Z/layer count represented in the staging buffer
+    uint32_t texel_depth = 1;           // realized 3D depth; ordinary array layers are counted separately
     uint32_t array_layers = 1;           // Vulkan array-layer count (3D depth remains one layer)
     // #3048: the guest-declared mip chain this image materializes, and where each level past zero
     // begins in the staging buffer. 1 (with an empty offset table) is the historical single-level
@@ -9599,7 +9599,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     r->layer_mip_offset_bytes || !staging[i]) continue;
                 const bool volume = r->img_dim == 2 && r->depth > 1 && bi.texel_depth == r->depth;
                 const bool array = r->img_dim == 5 && r->depth > 1 &&
-                    bi.array_layers == r->depth && bi.texel_depth == r->depth;
+                    bi.array_layers == r->depth && bi.texel_depth == 1;
                 if (!array && (bi.array_layers != 1 || (!volume &&
                     (r->depth != 1 || (r->img_dim != 1 && r->img_dim != 5) || bi.texel_depth != 1))))
                     continue;
