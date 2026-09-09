@@ -53,6 +53,17 @@ int queue_timeline_ms() {
     return ms;
 }
 
+bool audio_lifecycle() {
+    static const bool enabled = [] {
+        const char* value = getenv("PROSPER_AUDIO_LIFECYCLE");
+        return value && std::string(value) == "1";
+    }();
+    return enabled;
+}
+uint64_t lifecycle_steady_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 bool audio_debug() {
     static const bool on = getenv("PROSPER_AUDIO_DEBUG") != nullptr;
     return on;
@@ -255,9 +266,10 @@ public:
 
     bool open(int port, const AudioPortInfo& info) override {
         if (port < 1 || port > kMaxPorts) return false;
+        ClosedObservation retired;
         std::lock_guard<std::mutex> lk(mx_);
         Slot& s = slots_[port - 1];
-        if (s.stream) { SDL_DestroyAudioStream(s.stream); s.stream = nullptr; }
+        if (s.stream) destroy_stream_locked(s, port, "reopen", retired);
         SDL_AudioSpec spec{};
         spec.format   = to_sdl_format(info.fmt);
         spec.channels = info.channels;
@@ -272,6 +284,8 @@ public:
         s.demand_started = false;
         s.demand_enabled = false;
         ++s.generation;
+        s.lifecycle_puts = s.lifecycle_last_put_ns = 0;
+        s.lifecycle_last_put_frames = 0;
         if (audio_demand()) {
             s.demand.reset(paused_ ? AudioDemandPhase::Paused : AudioDemandPhase::Startup);
             s.demand_enabled = SDL_SetAudioStreamGetCallback(s.stream, AudioDemandMeter::consume,
@@ -398,6 +412,11 @@ public:
                 s.demand.set_phase(paused_ ? AudioDemandPhase::Paused : AudioDemandPhase::Active);
             }
             if (locked) SDL_UnlockAudioStream(s.stream);
+            if (put_ok && audio_lifecycle()) {
+                ++s.lifecycle_puts;
+                s.lifecycle_last_put_ns = lifecycle_steady_ns();
+                s.lifecycle_last_put_frames = frames;
+            }
             s.dump.write(pcm, frames, s.channels, s.f32);
             // PROSPER_AUDIO_QUEUE_TRACE=1: input queue depth after each handoff.
             // The minimum exposes queue variation hidden by averages, but converted
@@ -484,6 +503,8 @@ public:
             int port = 0, queued = -1, grain = 0;
             bool demand_available = false;
             Sdl3AudioDemandSnapshot demand{};
+            uint64_t puts = 0, last_put_ns = 0;
+            int last_put_frames = 0;
         };
         const bool queue_enabled = queue_timeline_ms() > 0;
         auto demand_last = t0;
@@ -515,6 +536,11 @@ public:
                     if (queue_enabled) sample.queued = SDL_GetAudioStreamQueued(slots_[i].stream);
                     if (report_demand && slots_[i].demand_enabled) {
                         sample.demand.generation = slots_[i].generation;
+                        if (audio_lifecycle()) {
+                            sample.puts = slots_[i].lifecycle_puts;
+                            sample.last_put_ns = slots_[i].lifecycle_last_put_ns;
+                            sample.last_put_frames = slots_[i].lifecycle_last_put_frames;
+                        }
                         sample.demand_available = slots_[i].demand.snapshot(slots_[i].stream, sample.demand);
                     }
                 }
@@ -530,6 +556,18 @@ public:
                     SDL_Log("[audio-queue] t_us=%llu port=%d queued=%d grain=%d",
                             (unsigned long long)t_us, samples[i].port, samples[i].queued, samples[i].grain);
                 if (samples[i].demand_available) {
+                    if (audio_lifecycle()) {
+                        const uint64_t before_ns = lifecycle_steady_ns();
+                        const uint64_t ticks_ns = SDL_GetTicksNS();
+                        const uint64_t after_ns = lifecycle_steady_ns();
+                        SDL_Log("[audio-lifecycle-sink] event=sample port=%d generation=%llu "
+                            "puts=%llu last_put_ns=%llu last_put_frames=%d anchor_before_ns=%llu "
+                            "sdl_ticks_ns=%llu anchor_after_ns=%llu",
+                            samples[i].port, (unsigned long long)samples[i].demand.generation,
+                            (unsigned long long)samples[i].puts, (unsigned long long)samples[i].last_put_ns,
+                            samples[i].last_put_frames, (unsigned long long)before_ns,
+                            (unsigned long long)ticks_ns, (unsigned long long)after_ns);
+                    }
                     const char* phases[] = {"startup", "active", "paused"};
                     for (unsigned phase = 0; phase < 3; ++phase) {
                         const auto& c = samples[i].demand.phases[phase];
@@ -620,9 +658,10 @@ public:
 
     void close(int port) override {
         if (port < 1 || port > kMaxPorts) return;
+        ClosedObservation retired;
         std::lock_guard<std::mutex> lk(mx_);
         Slot& s = slots_[port - 1];
-        if (s.stream) { SDL_DestroyAudioStream(s.stream); s.stream = nullptr; }
+        if (s.stream) destroy_stream_locked(s, port, "close", retired);
         s.demand_enabled = false;
         s.frame_bytes = s.grain_bytes = 0;
         s.dump.finalize();   // a closed port's capture is complete
@@ -664,6 +703,8 @@ private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
                   AudioDemandMeter demand;
                   uint64_t generation = 0;
+                  uint64_t lifecycle_puts = 0, lifecycle_last_put_ns = 0;
+                  int lifecycle_last_put_frames = 0;
                   bool demand_enabled = false, demand_started = false;
                   bool put_failed = false;
                   int freq = 0;                                     // port sample rate for pacing
@@ -687,6 +728,60 @@ private:
                   // copy-construct path, which WavDump's deleted copy would reject.
                   Slot() = default;
     };
+    struct ClosedObservation {
+        int port = 0, last_put_frames = 0;
+        const char* reason = nullptr;
+        uint64_t generation = 0, puts = 0, last_put_ns = 0, begin_ns = 0, end_ns = 0;
+        uint64_t anchor_before_ns = 0, sdl_ticks_ns = 0, anchor_after_ns = 0;
+        bool demand_available = false;
+        Sdl3AudioDemandSnapshot demand{};
+        ~ClosedObservation() {
+            if (!reason) return;
+            SDL_Log("[audio-lifecycle-sink] event=%s port=%d generation=%llu begin_ns=%llu "
+                "destroy_return_ns=%llu puts=%llu last_put_ns=%llu last_put_frames=%d "
+                "anchor_before_ns=%llu sdl_ticks_ns=%llu anchor_after_ns=%llu demand_available=%u",
+                reason, port, (unsigned long long)generation, (unsigned long long)begin_ns,
+                (unsigned long long)end_ns, (unsigned long long)puts, (unsigned long long)last_put_ns,
+                last_put_frames, (unsigned long long)anchor_before_ns, (unsigned long long)sdl_ticks_ns,
+                (unsigned long long)anchor_after_ns, unsigned(demand_available));
+            if (demand_available) {
+                const char* phases[] = {"startup", "active", "paused"};
+                for (unsigned i = 0; i < demand.phases.size(); ++i) {
+                    const auto& c = demand.phases[i];
+                    SDL_Log("[audio-demand-final] port=%d generation=%llu phase=%s calls=%llu "
+                        "requested_bytes=%llu shortfall_calls=%llu additional_bytes=%llu first_ns=%llu last_ns=%llu",
+                        port, (unsigned long long)generation, phases[i], (unsigned long long)c.calls,
+                        (unsigned long long)c.requested_bytes, (unsigned long long)c.shortfall_calls,
+                        (unsigned long long)c.additional_bytes, (unsigned long long)c.first_ns,
+                        (unsigned long long)c.last_ns);
+                }
+            }
+        }
+    };
+    // mx_ excludes output/sampler/reopen while SDL's normal destruction synchronizes its
+    // callbacks. Never lock/detach/pause solely to measure, and never log under a stream lock.
+    void destroy_stream_locked(Slot& s, int port, const char* reason, ClosedObservation& out) {
+        const bool observe = audio_lifecycle();
+        if (observe) {
+            out.reason = reason; out.port = port; out.generation = s.generation;
+            out.puts = s.lifecycle_puts; out.last_put_ns = s.lifecycle_last_put_ns;
+            out.last_put_frames = s.lifecycle_last_put_frames;
+            out.begin_ns = lifecycle_steady_ns();
+        }
+        SDL_DestroyAudioStream(s.stream);
+        s.stream = nullptr;
+        if (observe) {
+            out.end_ns = lifecycle_steady_ns();
+            out.demand_available = s.demand_enabled;
+            out.demand.generation = s.generation;
+            if (out.demand_available) s.demand.snapshot_quiesced(out.demand);
+            // Explicit bounded cross-clock anchor: core timestamps are steady_clock;
+            // demand callback timestamps use SDL_GetTicksNS (an SDL-relative origin).
+            out.anchor_before_ns = lifecycle_steady_ns();
+            out.sdl_ticks_ns = SDL_GetTicksNS();
+            out.anchor_after_ns = lifecycle_steady_ns();
+        }
+    }
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
     // Set when the timeline starts, cleared by stop_queue_timeline(), which then JOINS. Both
