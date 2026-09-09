@@ -221,6 +221,34 @@ int main() {
               snapshot.authority_watch_unknown == authority);
     }
 
+    // A metadata refusal follows a successful pixel-authority proof. Default observation fields
+    // must not invent an unarmed journal or absent watch for this separate refusal.
+    {
+        ComputeImageBorrowCensus census;
+        census.record_import(ComputeImageImportDecline::None);
+        ComputeImageBorrowObservation metadata;
+        metadata.outcome = ComputeImageBorrowOutcome::MetadataUnproven;
+        census.record_outcome(metadata, 4096);
+        const auto snapshot = census.snapshot();
+        CHECK(snapshot.outcomes[static_cast<size_t>(ComputeImageBorrowOutcome::MetadataUnproven)] == 1);
+        CHECK(snapshot.outcomes[static_cast<size_t>(ComputeImageBorrowOutcome::AuthorityChanged)] == 0);
+        CHECK(snapshot.miss_bytes == 4096);
+        CHECK(snapshot.hit_bytes == 0);
+        CHECK(snapshot.authority_journal_overlap == 0);
+        CHECK(snapshot.authority_journal_unarmed == 0);
+        CHECK(snapshot.authority_journal_unjournaled == 0);
+        CHECK(snapshot.authority_journal_undecided == 0);
+        CHECK(snapshot.authority_watch_absent == 0);
+        CHECK(snapshot.authority_watch_dirty == 0);
+        CHECK(snapshot.authority_watch_unknown == 0);
+        char report[prosper::frontend::compute_image_borrow_census_report_bytes];
+        const size_t used = format_compute_image_borrow_census(snapshot, report, sizeof report);
+        const std::string text(report, used);
+        CHECK(text.find("attempted=1") != std::string::npos);
+        CHECK(text.find("metadata_unproven=1 (100.0%)") != std::string::npos);
+        CHECK(text.find("authority_changed=0 (0.0%)") != std::string::npos);
+    }
+
     // ---- 5. A hit is counted as spared bytes, and only a hit -------------------------------
     {
         ComputeImageBorrowCensus census;
@@ -326,6 +354,7 @@ int main() {
         // Present even at zero: an outcome bucket that vanishes when empty cannot be told from one
         // the instrument never reached. That ambiguity has already cost this issue a night (#3307).
         CHECK(text.find("no_cache_entry=0") != std::string::npos);
+        CHECK(text.find("metadata_unproven=0 (0.0%)") != std::string::npos);
         CHECK(text.find("hit=0 (0.0%)") != std::string::npos);
         CHECK(text.find("authority_changed=1 (100.0%)") != std::string::npos);
         CHECK(text.find("journal_unarmed=1") != std::string::npos);
@@ -386,6 +415,7 @@ int main() {
         CHECK(widest_used < sizeof full - 1);
         CHECK(std::count(text.begin(), text.end(), '\n') == 4);
         CHECK(text.find("TRUNCATED") == std::string::npos);
+        CHECK(text.find("metadata_unproven=18446744073709551615") != std::string::npos);
         // The widest report the formatter can produce, against the buffer the production reporter
         // declares. Headroom, not a coincidence.
         CHECK(widest_used + 512 < prosper::frontend::compute_image_borrow_census_report_bytes);

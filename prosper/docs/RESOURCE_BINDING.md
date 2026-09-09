@@ -353,20 +353,25 @@ resource" and "it saw it and rejected it" produce identical evidence while point
 files. Reach for it before concluding anything about descriptor *recovery*: on Earthion (#1590) it
 overturned exactly that conclusion in one run.
 
-**A DCC-compressed SAMPLED surface's cache identity does NOT include its metadata plane, and folding
-that plane into the key is both unnecessary and — as first attempted — ineffective.** #3150 /
-#3149, 2026-08-31. The persistent compute image cache excluded compressed sampled surfaces on the
-theory that base bytes alone could not determine their content; on Stray that exclusion re-detiled
-one 4K FP16 surface 3,860 times in 110 s (98.9% of all tiling work, `PROSPER_TILECENSUS`). The
-theory is wrong for the *sampled* path: the DCC plane's only consumer there is
-`compute_sampled_dcc_fast_clear_rgba8`, whose materialization the admission gate already excludes
-via `!sampled_dcc_fast_clear`, so a cacheable entry's upload is detile + unpack of the BASE bytes
-alone — which the existing validation already covers. More sharply, `gfx10_dcc_fast_clear_rgba8` is
-the **only** DCC decode function in the tree: prosper has no DCC decompressor, so
-metadata-independence is a property of the codebase rather than of one call graph. **Do not re-derive
-the metadata-in-the-key design**: the first revision of #3150 did, and it was rejected twice over —
-the guard was conjoined into only one of three skip proofs (`watch_unchanged` and `exact_unchanged`
-both examine the base range alone, so the upload was skipped anyway), and the premise was unnecessary
-regardless. The *storage* gate is different and still requires an all-`0xff` plane: a storage
-target's base bytes are not authoritative while a live plane exists. `PROSPER_NO_DCC_IMAGE_CACHE=1`
-restores the old exclusion for bisection.
+**The ordinary sampled base-byte decode cache does not need DCC metadata in its identity;
+retained storage-image borrows require a separate metadata proof.** #3150 / #3149,
+2026-08-31; scope clarified by #3482 / #3484, 2026-09-09. The persistent compute image cache
+excluded compressed sampled surfaces on the theory that base bytes alone could not determine
+the cached upload; on Stray that exclusion re-detiled one 4K FP16 surface 3,860 times in 110 s
+(98.9% of all tiling work, `PROSPER_TILECENSUS`). For the ordinary sampled decode, the current
+supported fast-clear probe runs before reuse and its materialization is excluded by
+`!sampled_dcc_fast_clear`. A cacheable entry therefore serves detile + unpack of the BASE bytes,
+which the existing base-range validation covers. This establishes equality with the uncached
+base-byte fallback, not correct decoding of arbitrary compressed metadata or metadata-independence
+of every image source.
+
+The first metadata-in-the-key revision of #3150 was ineffective too: it guarded only one of three
+skip proofs, while `watch_unchanged` and `exact_unchanged` still inspected only base bytes. Do not
+repeat that design for this ordinary decode cache. A retained STORAGE image is a different source:
+it holds completed producer pixels. Both graphics import and compute storage-to-sampled transfer
+must validate the producer's pixel authority **and** prove the original consumer's current complete
+metadata plane plain before borrowing. A separate metadata allocation may change while base bytes,
+page watches and exact mirrors remain unchanged; a producer-format alias retry must not bypass a
+failed metadata proof. Unsupported or incomplete metadata footprints decline the borrow. The
+storage acquisition gate also keeps its own all-`0xff` requirement. `PROSPER_NO_DCC_IMAGE_CACHE=1`
+restores the historical sampled-cache exclusion for bisection.

@@ -31,6 +31,7 @@
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/atomic_image_staging.hpp"  // #3195: the LOGICAL/PHYSICAL atomic-image extent split
 #include "gpu/resources/image_identity.hpp"
+#include "gpu/resources/compressed_source_authority.hpp"
 #include "gpu/resources/spirv_storage_match.hpp"  // #3204: SPIR-V/guest storage agreement  // #3204: named image-identity predicates
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
@@ -237,6 +238,46 @@ bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot
 }
 
 namespace {
+
+// A retained storage image represents the producer's plain pixels. Its base-allocation journal
+// and write watch say nothing about a separate metadata allocation. Recheck the consumer's complete
+// plane at each borrow; address identity or an earlier all-0xff scan cannot prove current contents.
+bool storage_borrow_metadata_proves_plain(const prosper::gpu::ShaderResource& resource) {
+    using namespace prosper::gpu;
+    if (!resource.compression_enabled) return true;
+    // The published DCC footprint describes a single base-level thin 2D plane. Do not use its
+    // all-0xff prefix to certify a selected mip, volume, multisample or layered allocation.
+    if (!resource.metadata_addr || resource.sample_count != 1u ||
+        (resource.img_dim != 1u && resource.img_dim != 5u) || resource.depth != 1u ||
+        resource.declared_mip_levels != 1u || resource.mip_chain_base_level ||
+        resource.mip_chain_max_level || resource.in_mip_tail ||
+        resource.layer_stride_bytes || resource.layer_mip_offset_bytes)
+        return false;
+    const uint32_t components = resource.num_components ? resource.num_components : 1u;
+    const auto kind = classify_compression_metadata_kind({
+        resource.metadata_addr, resource.gpu_addr, resource.format, components, resource.img_dim});
+    if (kind != CompressionMetadataKind::Dcc) return false;
+    const uint64_t bytes = gpu_capture_dcc_metadata_footprint(resource);
+    if (!bytes || bytes > SIZE_MAX || bytes > UINT32_MAX) return false;
+    const uint8_t* metadata = resource.dcc_metadata_host_data;
+    if (metadata) {
+        // A replay-owned plane is the selected source even when truncated. Guest memory at the
+        // same virtual address belongs to a different source and cannot repair this proof.
+        if (resource.dcc_metadata_host_data_size < bytes) return false;
+    } else {
+        if (!guest_readable(resource.metadata_addr, static_cast<uint32_t>(bytes))) return false;
+        metadata = reinterpret_cast<const uint8_t*>(uintptr_t(resource.metadata_addr));
+    }
+    const MetadataPlaneShape shape{
+        .kind = kind, .width = resource.width, .height = resource.height,
+        .depth = resource.depth, .img_dim = resource.img_dim,
+        .sample_count = resource.sample_count, .tile_mode = resource.tile_mode,
+        .format = resource.format, .num_components = components,
+        .meta_pipe_aligned = resource.meta_pipe_aligned,
+    };
+    return resolve_metadata_proof(shape, metadata, static_cast<size_t>(bytes)) ==
+        MetadataProof::ProvesPlain;
+}
 
 const std::array<uint8_t, 65536>& sampled_float16_unorm8_table() {
     static const std::array<uint8_t, 65536> table = [] {
@@ -1128,6 +1169,7 @@ enum class ComputeTransferBorrowResult : uint8_t {
     NoCache,
     InvalidCache,
     AuthorityChanged,
+    MetadataUnproven,
 };
 
 bool persistent_compute_buffer_enabled(uint32_t bytes) {
@@ -2646,13 +2688,14 @@ struct VulkanComputeContext {
 #endif
     }
 
-    // `observation`, when supplied, records WHICH of the five declines below fired. It never
+    // `observation`, when supplied, records which admission check declined. It never
     // changes what the function decides and never evaluates a predicate the decision did not
     // already evaluate -- in particular `write_watch.query()` stays behind exactly the same
     // short circuit, because a census that pays for a query the borrow skips would be measuring
     // its own cost. #3307.
     bool borrow_cached_image_for_graphics(
-        const ComputeImageCacheKey& key, VkImage& image, uint64_t& producer_command_order,
+        const ComputeImageCacheKey& key, const prosper::gpu::ShaderResource& consumer,
+        VkImage& image, uint64_t& producer_command_order,
         prosper::frontend::ComputeImageBorrowObservation* observation = nullptr,
         bool scan_near_miss = false) {
         using Outcome = prosper::frontend::ComputeImageBorrowOutcome;
@@ -2704,6 +2747,10 @@ struct VulkanComputeContext {
             }
             return false;
         }
+        if (!storage_borrow_metadata_proves_plain(consumer)) {
+            set_outcome(Outcome::MetadataUnproven);
+            return false;
+        }
         if (exact_unchanged || watch_unchanged)
             cached.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         cached.last_use = ++image_cache_clock;
@@ -2747,6 +2794,7 @@ struct VulkanComputeContext {
     }
 
     bool borrow_cached_image_for_compute_transfer(const ComputeImageCacheKey& key,
+                                                  const prosper::gpu::ShaderResource& consumer,
                                                   VkImage& image, bool trace = false,
                                                   ComputeTransferBorrowResult* result = nullptr) {
         if (result) *result = ComputeTransferBorrowResult::NotAttempted;
@@ -2787,6 +2835,13 @@ struct VulkanComputeContext {
                              "submit-query=%u watch=%u\n",
                              static_cast<unsigned>(submit_query),
                              cached.write_watch ? 1u : 0u);
+            return false;
+        }
+        if (!storage_borrow_metadata_proves_plain(consumer)) {
+            if (result) *result = ComputeTransferBorrowResult::MetadataUnproven;
+            if (trace)
+                std::fprintf(stderr,
+                             "[compute]   native storage transfer miss: metadata authority\n");
             return false;
         }
         if (exact_unchanged)
@@ -4263,6 +4318,7 @@ const char* compute_transfer_borrow_result_name(ComputeTransferBorrowResult resu
         case ComputeTransferBorrowResult::NoCache: return "no-cache";
         case ComputeTransferBorrowResult::InvalidCache: return "invalid-cache";
         case ComputeTransferBorrowResult::AuthorityChanged: return "authority-changed";
+        case ComputeTransferBorrowResult::MetadataUnproven: return "metadata-unproven";
     }
     return "unknown";
 }
@@ -4308,6 +4364,7 @@ struct ComputeTransferGateStats {
     uint64_t borrow_no_cache = 0;
     uint64_t borrow_invalid_cache = 0;
     uint64_t borrow_authority_changed = 0;
+    uint64_t borrow_metadata_unproven = 0;
 };
 
 void increment_gate_counter(uint64_t& value, bool condition = true) {
@@ -4448,6 +4505,8 @@ public:
                                borrow_result == ComputeTransferBorrowResult::InvalidCache);
         increment_gate_counter(stats.borrow_authority_changed,
                                borrow_result == ComputeTransferBorrowResult::AuthorityChanged);
+        increment_gate_counter(stats.borrow_metadata_unproven,
+                               borrow_result == ComputeTransferBorrowResult::MetadataUnproven);
         if (detail) {
             std::fprintf(stderr,
                          "[compute-transfer-gates] detail role=%s stage=sampled-gates "
@@ -4596,7 +4655,7 @@ private:
                      "sampled-ordinary2d=%llu format-compatible=%llu "
                      "transfer-dimension=%llu hostless=%llu format-match=%llu "
                      "validation=%llu native-defined=%llu borrow-attempts=%llu hits=%llu "
-                     "no-cache=%llu invalid-cache=%llu authority-changed=%llu\n",
+                     "no-cache=%llu invalid-cache=%llu authority-changed=%llu metadata-unproven=%llu\n",
                      compute_transfer_gate_role_name(role),
                      static_cast<unsigned long long>(s.sampled_gate_evaluated),
                      static_cast<unsigned long long>(s.sampled_cache_candidate),
@@ -4612,7 +4671,8 @@ private:
                      static_cast<unsigned long long>(s.borrow_hits),
                      static_cast<unsigned long long>(s.borrow_no_cache),
                      static_cast<unsigned long long>(s.borrow_invalid_cache),
-                     static_cast<unsigned long long>(s.borrow_authority_changed));
+                     static_cast<unsigned long long>(s.borrow_authority_changed),
+                     static_cast<unsigned long long>(s.borrow_metadata_unproven));
     }
 
     ComputeTransferGateSelector selector_;
@@ -8040,9 +8100,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (metadata_bytes && metadata_bytes <= SIZE_MAX &&
                         metadata_bytes <= UINT32_MAX) {
                         sampled_dcc_metadata_bytes = static_cast<size_t>(metadata_bytes);
-                        if (r->dcc_metadata_host_data &&
-                            r->dcc_metadata_host_data_size >= metadata_bytes) {
-                            sampled_dcc_metadata = r->dcc_metadata_host_data;
+                        if (r->dcc_metadata_host_data) {
+                            if (r->dcc_metadata_host_data_size >= metadata_bytes)
+                                sampled_dcc_metadata = r->dcc_metadata_host_data;
                         } else if (guest_readable(
                                        r->metadata_addr,
                                        static_cast<uint32_t>(metadata_bytes))) {
@@ -8147,14 +8207,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // `cache_candidate` gates more than the reuse the argument above covers:
                 // `acquire_cached_image` (replay this decode's result), sampled RETENTION, and
                 // `borrow_cached_image_for_compute_transfer` (seed from a retained STORAGE image --
-                // a different source, not this decode). Widening the gate newly admits compressed
-                // sampled descriptors to that borrow. It is safe, but for its own reason: the
-                // borrow demands `compute_transfer_valid && content_valid` plus a journal, watch or
-                // exact proof over the BASE range since the producing writeback, and the storage
-                // entry it borrows could only have been authorized through the STORAGE gate, which
-                // still requires an all-0xff plane. Diverging would need the plane to go non-0xff
-                // while the base bytes stayed byte-identical, which outside a fast clear -- excluded
-                // upstream -- is not producible.
+                // a different source, not this decode). That borrow separately requires current
+                // plain DCC metadata as well as the producer's base-range authority. Metadata can
+                // change independently after storage writeback, including at a different allocation;
+                // the base-byte decode cache's validation cannot authorize that retained image.
                 //
                 // Kill switch, and it earns its place: this admits a whole class of surface to a
                 // cache it was previously excluded from, so a single variable must restore the old
@@ -8245,14 +8301,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             *r, static_cast<uint32_t>(sampled_guest_need),
                             transfer_native_format);
                         bool borrowed = ctx.borrow_cached_image_for_compute_transfer(
-                            storage_key, bi.compute_transfer_seed, trace,
+                            storage_key, *r, bi.compute_transfer_seed, trace,
                             &transfer_borrow_result);
                         // The producer identity is part of the cache key. Retry only GTA V's exact
                         // one-word numeric-view alias after the consumer's own Float32 identity
                         // misses: Uint32/R32_UINT producer -> Float32/R32_SFLOAT consumer. The
                         // retained source and sampled destination remain distinct images, so an
                         // in-place read/modify/write dispatch cannot alias itself.
-                        if (!borrowed && float32_uint32_transfer_alias &&
+                        if (!borrowed &&
+                            transfer_borrow_result != ComputeTransferBorrowResult::MetadataUnproven &&
+                            float32_uint32_transfer_alias &&
                             compute_transfer_vk_formats_bit_compatible(
                                 r->format, sampled_components,
                                 transfer_alias_storage_format, image_format)) {
@@ -8263,7 +8321,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 static_cast<uint32_t>(sampled_guest_need),
                                 transfer_alias_storage_format);
                             borrowed = ctx.borrow_cached_image_for_compute_transfer(
-                                storage_key, bi.compute_transfer_seed, trace,
+                                storage_key, *r, bi.compute_transfer_seed, trace,
                                 &transfer_borrow_result);
                             if (borrowed && trace)
                                 std::fprintf(stderr,
@@ -12150,7 +12208,7 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     uint64_t producer_command_order = 0;
     prosper::frontend::ComputeImageBorrowObservation observation;
     bool borrowed = context->borrow_cached_image_for_graphics(
-        key, image, producer_command_order, &observation, /*scan_near_miss=*/true);
+        key, sampled_resource, image, producer_command_order, &observation, /*scan_near_miss=*/true);
     // The exact key's near-miss result is kept here and recorded once the import's fate is known.
     // Only the EXACT key is scanned: the alias retry below rewrites `format` and `vk_format` by
     // construction, so its mask would name those two on every miss whether or not they are the
@@ -12176,7 +12234,11 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         sampled_resource.format == prosper::gpu::DataFormat::Float10_11_11 && components == 3;
     const bool packed_r10_uint32_alias =
         sampled_resource.format == prosper::gpu::DataFormat::Unorm2_10_10_10 && components == 4;
-    if (!borrowed && (normalized_uint8_alias || normalized_uint16_alias ||
+    // The metadata proof uses the original consumer for every producer alias. A failed proof
+    // cannot be rescued by changing the producer key; preserve its reason instead of reporting
+    // a later alias lookup miss as though metadata had passed.
+    if (!borrowed && observation.outcome != ComputeImageBorrowOutcome::MetadataUnproven &&
+        (normalized_uint8_alias || normalized_uint16_alias ||
                       float16_uint16_alias ||
                       float32_uint32_alias || packed_r11_uint32_alias ||
                       packed_r10_uint32_alias)) {
@@ -12199,7 +12261,7 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         observation = {};
         g_image_borrow_census.record_alias_retry();
         borrowed = context->borrow_cached_image_for_graphics(
-            key, image, producer_command_order, &observation, /*scan_near_miss=*/false);
+            key, sampled_resource, image, producer_command_order, &observation, /*scan_near_miss=*/false);
     }
     g_image_borrow_census.record_outcome(observation, guest_bytes);
     // Recorded after the retry, because whether the alias RESCUED this lookup decides whether its

@@ -3747,6 +3747,16 @@ int main() {
     dcc_item.launch.groups_y = dcc_item.launch.groups_z = 1;
     dcc_item.code_addr = 0x719dcc;
     if (dcc_shape_ok) {
+        // This standalone fixture owns the DCC plane; no renderer registers its correlation.
+        // Admit only the actual producer identity used by the sampled and graphics consumers.
+        set_metadata_kind_query([&](const MetadataKindRequest& request) {
+            for (const ShaderResource& resource : dcc_rt.resources)
+                if (resource.binding == 5 && request.resource_addr == resource.gpu_addr &&
+                    request.metadata_addr == resource.metadata_addr && request.format == resource.format &&
+                    request.num_components == resource.num_components && request.img_dim == resource.img_dim)
+                    return CompressionMetadataKind::Dcc;
+            return CompressionMetadataKind::Unknown;
+        });
         // Exact current inputs are preserved on the first dispatch too. Completed writeback can
         // immediately promote its exact image; compressed metadata on the next dispatch still
         // forces a fresh seed before re-publishing authority.
@@ -4080,6 +4090,7 @@ int main() {
         CHECK(!prosper::frontend::import_live_compute_storage_image(
                   failed_sampled_output, tiled_bytes, failed_import),
               "failed DCC readback publishes no graphics cache authority");
+        set_metadata_kind_query({});
     }
     // Two storage views may share base texels while only one carries DCC state. They are not safe
     // Vulkan-image aliases: collapsing the compressed view onto an uncompressed owner drops its
