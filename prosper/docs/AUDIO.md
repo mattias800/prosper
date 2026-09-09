@@ -43,6 +43,27 @@ consumption demand with guest FLOW, scheduling and backend measurements before c
 Frontend owners must stop guest producers and call `shutdown_sdl3_audio_sink()` before SDL teardown;
 it joins the sampler and destroys streams before their callback state goes away.
 
+## Output lifecycle measurements (#3435)
+
+Enable `PROSPER_AUDIO_LIFECYCLE=1` with `PROSPER_AUDIO_DEMAND=1` to distinguish production
+stopping from stream retirement. AudioOut2 port/context retirement records preserve the last
+attribute publication, last successfully copied PCM, publication counts, format and generation.
+SDL records successful Put counts and their last timestamp, then final demand totals after normal
+stream destruction has ended callbacks. Failed Puts do not advance these observations. Diagnostic
+allocation failure leaves teardown intact and explicitly marks unavailable port snapshots.
+
+Join guest handles/context generations with the reported sink number and its separate open
+generation. HLE/Put timestamps use `steady_clock`; demand callbacks use SDL ticks. Each SDL
+observation includes a cross-clock reading bracket. That bracket bounds reading latency, not drift
+between the clocks over an earlier interval. Per-second snapshots do not timestamp individual
+shortfalls. No logging or outer sink lock is added to the consumption callback.
+
+The frontend can exit through `_Exit`, so a still-open stream may have only periodic observations.
+Missing final records are an unknown shutdown remainder, not zero demand. The existing delivery
+report consumes periodic snapshots; inspect `audio-demand-final` separately for quiesced close
+totals. These diagnostics do not establish whether a production stop was intentional, physical
+XRUNs, or audible continuity. They leave PCM ownership, mixing and pacing unchanged.
+
 ## Layers
 
 | Layer | File | In `prosper_core`? |
