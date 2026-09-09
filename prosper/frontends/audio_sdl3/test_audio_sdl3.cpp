@@ -77,8 +77,22 @@ int main() {
         CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
         CHECK(amplifier == 0.5f);
         CHECK(channel == guest_gain);
-        set_sdl3_audio_gain(1.0f);                       // leave the rest of the test unattenuated
 
+        // A port opened AFTER the host set its gain -- which is the ordering every real run takes.
+        // prosper-app applies --volume before the guest opens anything (main.cpp), so production
+        // never reaches the device through set_gain() sweeping open slots; it reaches it only
+        // through the apply at stream open. Asserting only on the already-open port left that call
+        // untested, and deleting it kept this test green -- a change that breaks --volume for every
+        // user would have passed.
+        int64_t late = call("sceAudioOutOpen", 1, 0, 0, 256, 48000, 1);
+        CHECK(late >= 1);
+        channel = amplifier = -1.0f;
+        CHECK(sdl3_audio_port_gains_for_test(2, &channel, &amplifier));
+        CHECK(amplifier == 0.5f);                        // the remembered host setting reached it
+        CHECK(channel == 1.0f);                          // and the guest has not spoken for it yet
+        CHECK(call("sceAudioOutClose", (uint64_t)late) == 0);
+
+        set_sdl3_audio_gain(1.0f);                       // leave the rest of the test unattenuated
         CHECK(call("sceAudioOutClose", (uint64_t)h) == 0);
 
         // A host pause freezes the device and blocks producers before they can fill its queue.

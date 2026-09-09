@@ -35,7 +35,7 @@ bool install_sdl3_audio_sink();
 void set_sdl3_audio_paused(bool paused);
 
 // Set the HOST's playback gain -- an amplifier after the guest's own mixer, as a linear multiplier
-// (1.0 = unchanged). Applied via SDL_SetAudioStreamGain on the logical DEVICE each port feeds, so
+// (1.0 = unchanged). Applied via SDL_SetAudioDeviceGain on the logical DEVICE each port feeds, so
 // no sample data is copied or clipped by prosper and the guest's per-port channel gain (which it
 // sets through sceAudioOutSetVolume) is left entirely alone. Deliberately a different knob: the two
 // used to write the same one, so the guest silently undid `--volume` seconds into every boot
