@@ -2,6 +2,7 @@
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gpu/execute/host_read_barrier.hpp"
 #include <vulkan/vulkan.h>
 #include <array>
@@ -18,6 +19,22 @@ inline std::atomic<uint64_t>& gpu_retile_recordings() {
 inline std::atomic<bool>& gpu_retile_poison_output_for_test() {
     static std::atomic<bool> enabled{false};
     return enabled;
+}
+
+// Descriptor-only admission for the paired array path. Dimensionality, selected-layer offset,
+// exact backend representation and byte/stride bounds are checked by the caller.
+// Keep this separate from layout math: a valid base-level fallback does not prove
+// that the descriptor declares only that level or sample.
+inline bool gpu_retile_paired16_descriptor_supported(const prosper::gpu::ShaderResource& resource,
+                                                     uint32_t bpe, uint32_t materialized_mip_levels) {
+    return !(bpe != 2 || resource.sample_count != 1 || resource.declared_mip_levels != 1 ||
+        materialized_mip_levels != 1 || resource.mip_chain_base_level || resource.mip_chain_max_level ||
+        resource.linear_row_pitch_bytes || resource.mip_tail_offset || resource.mip_tail_bytes ||
+        resource.mip_tail_x || resource.mip_tail_y || resource.compression_enabled ||
+        resource.write_compress_enabled || resource.metadata_addr || resource.dcc_metadata_host_data ||
+        (resource.mip_chain_element_width && resource.mip_chain_element_width != resource.width) ||
+        (resource.mip_chain_element_height && resource.mip_chain_element_height != resource.height) ||
+        (resource.mip_chain_bytes_per_block && resource.mip_chain_bytes_per_block != bpe));
 }
 
 struct GpuRetileParameters {

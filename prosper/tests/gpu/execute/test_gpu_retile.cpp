@@ -117,6 +117,43 @@ int run_case(int argc, char** argv) {
               "3D equation writes every physical word exactly once");
     check(!volume_equation_covers_block(9, 8, true),
           "3D coverage guard rejects a collapsed coordinate bit");
+    // Metadata-only predicate checks, not execution of a multi-mip/MSAA image.
+    // Real GPU/CPU integration below separately covers bytes, strides and widths.
+    ShaderResource descriptor{};
+    descriptor.width = descriptor.height = 512;
+    check(gpu_retile_paired16_descriptor_supported(descriptor, 2, 1),
+          "descriptor predicate accepts unspecified allocation hints for an ordinary base view");
+    descriptor.mip_chain_element_width = descriptor.mip_chain_element_height = 512;
+    descriptor.mip_chain_bytes_per_block = 2;
+    check(gpu_retile_paired16_descriptor_supported(descriptor, 2, 1),
+          "descriptor predicate accepts exact allocation hints");
+    check(!gpu_retile_paired16_descriptor_supported(descriptor, 4, 1) &&
+          !gpu_retile_paired16_descriptor_supported(descriptor, 2, 2),
+          "descriptor predicate excludes other native widths and backend mip counts");
+    uint8_t metadata_byte = 0xff;
+    for (unsigned field = 0; field < 16; ++field) {
+        auto changed = descriptor;
+        switch (field) {
+        case 0: changed.sample_count = 2; break;
+        case 1: changed.declared_mip_levels = 2; break;
+        case 2: changed.mip_chain_base_level = 1; break;
+        case 3: changed.mip_chain_max_level = 1; break;
+        case 4: changed.linear_row_pitch_bytes = 1024; break;
+        case 5: changed.mip_tail_offset = 4; break;
+        case 6: changed.mip_tail_bytes = 65536; break;
+        case 7: changed.mip_tail_x = 1; break;
+        case 8: changed.mip_tail_y = 1; break;
+        case 9: changed.compression_enabled = true; break;
+        case 10: changed.write_compress_enabled = true; break;
+        case 11: changed.metadata_addr = reinterpret_cast<uint64_t>(&metadata_byte); break;
+        case 12: changed.dcc_metadata_host_data = &metadata_byte; break;
+        case 13: changed.mip_chain_element_width = 256; break;
+        case 14: changed.mip_chain_element_height = 256; break;
+        case 15: changed.mip_chain_bytes_per_block = 4; break;
+        }
+        check(!gpu_retile_paired16_descriptor_supported(changed, 2, 1),
+              "descriptor-only sample/mip/metadata/pitch/hint change refuses paired retile");
+    }
     check(params.initialize_paired16_array(512, 512, 6, 24, limits) &&
           params.linear_bytes == 3145728 && params.tiled_bytes == 3145728 &&
           params.words[23] == 131072 && params.words[24] == 131072 &&

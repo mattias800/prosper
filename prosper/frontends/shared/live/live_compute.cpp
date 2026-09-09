@@ -9610,14 +9610,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     data_format_bytes(r->format) * (r->num_components ? r->num_components : 1u);
                 // Paired halfwords require a tight, single-mip ordinary array. An
                 // ambiguous view/stride retains the established CPU layout path.
-                if (array && (bpe != 2 || r->sample_count != 1 || r->declared_mip_levels != 1 ||
-                    bi.mip_levels != 1 || r->mip_chain_base_level || r->mip_chain_max_level ||
-                    r->linear_row_pitch_bytes || r->mip_tail_offset || r->mip_tail_bytes ||
-                    r->mip_tail_x || r->mip_tail_y || r->compression_enabled ||
-                    r->write_compress_enabled || r->metadata_addr || r->dcc_metadata_host_data ||
-                    (r->mip_chain_element_width && r->mip_chain_element_width != r->width) ||
-                    (r->mip_chain_element_height && r->mip_chain_element_height != r->height) ||
-                    (r->mip_chain_bytes_per_block && r->mip_chain_bytes_per_block != bpe))) continue;
+                if (array && !gpu_retile_paired16_descriptor_supported(*r, bpe, bi.mip_levels))
+                    continue;
                 const bool layout_ok = array
                     ? bi.retile_parameters.initialize_paired16_array(r->width, r->height, r->depth,
                         r->tile_mode, properties.limits)
