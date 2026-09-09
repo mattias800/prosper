@@ -150,10 +150,15 @@ struct TemporaryBundleFile {
         // process holds open for the whole call still fails after the budget, which is what the
         // "OS sharing restriction refuses replacement" arm in that same test requires: a retry loop
         // that never gave up would turn that refusal into a hang.
+        // Success is the CALL's return value, never the error code. Deciding from GetLastError()
+        // would report success for a failing call that happened to leave it at zero -- a silent
+        // success the unretried version could not reach, and the destructor would then delete the
+        // temporary that was never installed.
+        bool installed = false;
         DWORD install_error = 0;
-        for (unsigned attempt = 0; attempt < 50; ++attempt) {
+        for (unsigned attempt = 0; attempt < 50 && !installed; ++attempt) {
             if (MoveFileExW(payload.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                install_error = 0;
+                installed = true;
                 break;
             }
             install_error = GetLastError();
@@ -161,7 +166,7 @@ struct TemporaryBundleFile {
                 break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        if (install_error) {
+        if (!installed) {
             error = "cannot install bundle: Windows error " + std::to_string(install_error);
             return false;
         }
